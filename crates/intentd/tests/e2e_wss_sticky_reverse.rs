@@ -122,6 +122,38 @@ async fn connect(port: u16) -> PlainWs {
 /// The read budget is a *total* budget across all frames (ping / unrelated
 /// notification loops included), matching the `try_read_text` pattern below
 /// so pings can't extend the wait indefinitely.
+/// Assert the full JSON-RPC 2.0 response envelope: `jsonrpc == "2.0"`, the
+/// request `id` echoed, and exactly one of `result` / `error` with no other
+/// top-level keys. An `error` member carries an integer `code` and a string
+/// `message` (plus optional `data`).
+fn assert_envelope(v: &Value, id: i64, method: &str) {
+    let obj = v
+        .as_object()
+        .unwrap_or_else(|| panic!("{method}: response is not an object: {v}"));
+    assert_eq!(obj.get("jsonrpc"), Some(&json!("2.0")), "{method}: {v}");
+    assert_eq!(obj.get("id"), Some(&json!(id)), "{method}: {v}");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    match (obj.get("result"), obj.get("error")) {
+        (Some(_), None) => assert_eq!(keys, ["id", "jsonrpc", "result"], "{method}: {v}"),
+        (None, Some(err)) => {
+            assert_eq!(keys, ["error", "id", "jsonrpc"], "{method}: {v}");
+            let err = err
+                .as_object()
+                .unwrap_or_else(|| panic!("{method}: error is not an object: {v}"));
+            assert!(err["code"].is_i64(), "{method}: error.code: {v}");
+            assert!(err["message"].is_string(), "{method}: error.message: {v}");
+            let mut err_keys: Vec<&str> = err.keys().map(String::as_str).collect();
+            err_keys.sort_unstable();
+            assert!(
+                err_keys == ["code", "message"] || err_keys == ["code", "data", "message"],
+                "{method}: error keys {err_keys:?}: {v}"
+            );
+        }
+        _ => panic!("{method}: exactly one of result/error required: {v}"),
+    }
+}
+
 async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({
         "jsonrpc": "2.0",
@@ -145,6 +177,7 @@ async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Valu
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json");
                 if v.get("id") == Some(&json!(id)) {
+                    assert_envelope(&v, id, method);
                     return v;
                 }
             }
@@ -944,6 +977,10 @@ async fn workspace_browser_client_pin_rpcs_over_wss() {
     let _ = wss_rpc(&mut aux, 1, "client.hello", hello("desktop-b", false)).await;
     assert_eq!(fx.registry.len(), 3);
 
+    // Every reply below passes through `assert_envelope` (jsonrpc / id echo /
+    // exactly one of result|error) in `wss_rpc`, covering the three new RPCs
+    // on both their success and -32602 paths.
+    //
     // client.list — grouped, ordered by first connection, aggregate capability.
     let listed = wss_rpc(&mut a, 2, "client.list", json!({})).await;
     let clients = listed["result"]["clients"]

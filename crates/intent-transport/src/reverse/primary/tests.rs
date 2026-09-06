@@ -590,6 +590,62 @@ fn live_clients_aggregate_browser_exec_across_connections() {
     ));
 }
 
+/// Regression (#1760 review): "newest hello wins" for the display fields
+/// keys on hello order, not connection-registration order. An older
+/// connection that re-hellos later carries the client's current identity.
+#[test]
+fn live_clients_project_the_most_recent_hello_regardless_of_registration_order() {
+    let reg = PrimaryReverseRegistry::new();
+    let (first, _rx_first) = idle_channel();
+    let (second, _rx_second) = idle_channel();
+    let g_first = reg.register(first, ReverseTransport::Wss);
+    let g_second = reg.register(second, ReverseTransport::Uds);
+    // The later-registered connection hellos first ...
+    g_second.bind(ReverseClientIdentity {
+        name: Some("stale".into()),
+        capabilities: json!({ "browserExec": false, "rev": 1 }),
+        ..identity("x", false)
+    });
+    // ... then the earlier-registered connection hellos with newer data.
+    g_first.bind(ReverseClientIdentity {
+        name: Some("fresh".into()),
+        capabilities: json!({ "browserExec": true, "rev": 2 }),
+        host: ClientHostInfo {
+            hostname: Some("fresh.local".into()),
+            pretty_hostname: Some("Fresh".into()),
+            device_kind: Some("laptop".into()),
+        },
+        ..identity("x", true)
+    });
+
+    let clients = reg.live_clients();
+    assert_eq!(clients.len(), 1);
+    let x = &clients[0];
+    assert_eq!(x.connections, 2);
+    assert_eq!(x.name.as_deref(), Some("fresh"));
+    assert_eq!(x.capabilities["rev"], json!(2));
+    assert_eq!(x.host.hostname.as_deref(), Some("fresh.local"));
+    assert_eq!(x.host.pretty_hostname.as_deref(), Some("Fresh"));
+    assert_eq!(x.host.device_kind.as_deref(), Some("laptop"));
+
+    // A re-hello on the older-registered connection supersedes again.
+    g_second.bind(ReverseClientIdentity {
+        name: Some("freshest".into()),
+        capabilities: json!({ "browserExec": false, "rev": 3 }),
+        ..identity("x", false)
+    });
+    let clients = reg.live_clients();
+    let x = &clients[0];
+    assert_eq!(x.name.as_deref(), Some("freshest"));
+    assert_eq!(x.capabilities["rev"], json!(3));
+    assert_eq!(x.host.hostname.as_deref(), Some("x.local"));
+    assert_eq!(
+        x.capabilities["browserExec"],
+        json!(true),
+        "the aggregate still reflects the eligible connection"
+    );
+}
+
 #[tokio::test]
 async fn dropping_guard_closes_an_accepted_request() {
     let reg = PrimaryReverseRegistry::new();

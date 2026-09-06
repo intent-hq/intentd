@@ -30935,6 +30935,69 @@ mod browser_client_pin {
         assert_eq!(svc.get_workspace(ws).await.unwrap().browser_client_id, None);
     }
 
+    /// Regression (#1760 review): racing setters must not publish
+    /// `workspace:updated` deltas out of order relative to the durable pin.
+    /// The last delta a subscriber sees always equals what the store holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_setters_publish_deltas_in_commit_order() {
+        const ROUNDS: usize = 24;
+        let reg = FakeRegistry::new(&[
+            ("desktop-a", Some("Desktop A"), true),
+            ("desktop-b", Some("Desktop B"), true),
+        ]);
+        let (_t, _r, svc, bus, ws) = setup(reg).await;
+        let svc = Arc::new(svc);
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(ws.0.clone()),
+            ..Default::default()
+        });
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..ROUNDS {
+            let svc = svc.clone();
+            let ws = ws.clone();
+            let target = match i % 3 {
+                0 => Some(ClientId::from_string("desktop-a")),
+                1 => Some(ClientId::from_string("desktop-b")),
+                _ => None,
+            };
+            tasks.spawn(async move {
+                svc.set_workspace_browser_client(ws, target)
+                    .await
+                    .expect("set")
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            joined.expect("join");
+        }
+
+        let mut deltas: Vec<Value> = Vec::new();
+        while deltas.len() < ROUNDS {
+            let batch = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .expect("all deltas delivered")
+                .expect("subscription open");
+            for ev in &batch {
+                let ev = serde_json::to_value(ev).unwrap();
+                assert_eq!(ev["type"], "workspace:updated");
+                deltas.push(ev["data"]["changes"]["browserClientId"].clone());
+            }
+        }
+        assert_eq!(deltas.len(), ROUNDS);
+
+        let durable = svc
+            .get_workspace(ws)
+            .await
+            .unwrap()
+            .browser_client_id
+            .map_or(Value::Null, |c| c.as_str().into());
+        assert_eq!(
+            deltas.last().unwrap(),
+            &durable,
+            "the last published delta is the committed pin: {deltas:?}"
+        );
+    }
+
     #[tokio::test]
     async fn pinned_offline_client_is_a_hard_error_not_a_fallback() {
         // desktop-b hello'd before (client row exists) but is not live now.

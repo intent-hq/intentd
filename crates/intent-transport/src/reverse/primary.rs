@@ -195,6 +195,8 @@ pub struct PrimaryReverseRegistry {
 struct Inner {
     entries: Mutex<VecDeque<Entry>>,
     next_id: AtomicU64,
+    /// Source of [`Entry::hello_seq`]; bumped under the `entries` lock.
+    next_hello_seq: AtomicU64,
     /// Ordered transition queue. Every `send` happens while `entries` is
     /// locked, so queue order is exactly registry-mutation order; the sender
     /// never blocks, so it is safe from `Drop` (abort / unwind paths).
@@ -210,6 +212,7 @@ impl Default for Inner {
         Self {
             entries: Mutex::new(VecDeque::new()),
             next_id: AtomicU64::new(0),
+            next_hello_seq: AtomicU64::new(0),
             transitions,
             transition_rx: Mutex::new(Some(transition_rx)),
         }
@@ -224,6 +227,10 @@ struct Entry {
     connected_at: String,
     /// `None` until the connection's first successful `client.hello`.
     identity: Option<ReverseClientIdentity>,
+    /// Registry-wide monotonic sequence of the hello that set `identity`
+    /// (`0` before the first hello). Orders hellos across connections so
+    /// "newest hello wins" keys on hello order, not registration order.
+    hello_seq: u64,
 }
 
 impl Entry {
@@ -321,6 +328,7 @@ impl PrimaryReverseRegistry {
             transport,
             connected_at: now_iso(),
             identity: None,
+            hello_seq: 0,
         });
         PrimaryReverseGuard {
             registry: Some(self.inner.clone()),
@@ -381,36 +389,44 @@ impl PrimaryReverseRegistry {
     #[must_use]
     pub fn live_clients(&self) -> Vec<LiveClient> {
         let entries = self.inner.lock();
-        let mut clients: Vec<LiveClient> = Vec::new();
+        let mut clients: Vec<(LiveClient, u64)> = Vec::new();
         for entry in entries.iter() {
             let Some(identity) = &entry.identity else {
                 continue;
             };
             match clients
                 .iter_mut()
-                .find(|c| c.client_id == identity.client_id)
+                .find(|(c, _)| c.client_id == identity.client_id)
             {
-                Some(client) => {
+                Some((client, newest_hello)) => {
                     client.connections += 1;
                     client.transports.push(entry.transport);
                     client.browser_exec |= identity.browser_exec();
-                    // Newest hello wins for the display fields.
-                    client.name.clone_from(&identity.name);
-                    client.capabilities.clone_from(&identity.capabilities);
-                    client.host.clone_from(&identity.host);
+                    // Newest hello wins for the display fields — by hello
+                    // sequence, not by which connection registered first.
+                    if entry.hello_seq > *newest_hello {
+                        *newest_hello = entry.hello_seq;
+                        client.name.clone_from(&identity.name);
+                        client.capabilities.clone_from(&identity.capabilities);
+                        client.host.clone_from(&identity.host);
+                    }
                 }
-                None => clients.push(LiveClient {
-                    client_id: identity.client_id.clone(),
-                    name: identity.name.clone(),
-                    capabilities: identity.capabilities.clone(),
-                    host: identity.host.clone(),
-                    browser_exec: identity.browser_exec(),
-                    connections: 1,
-                    transports: vec![entry.transport],
-                    connected_at: entry.connected_at.clone(),
-                }),
+                None => clients.push((
+                    LiveClient {
+                        client_id: identity.client_id.clone(),
+                        name: identity.name.clone(),
+                        capabilities: identity.capabilities.clone(),
+                        host: identity.host.clone(),
+                        browser_exec: identity.browser_exec(),
+                        connections: 1,
+                        transports: vec![entry.transport],
+                        connected_at: entry.connected_at.clone(),
+                    },
+                    entry.hello_seq,
+                )),
             }
         }
+        let mut clients: Vec<LiveClient> = clients.into_iter().map(|(c, _)| c).collect();
         for client in &mut clients {
             let bag = match &mut client.capabilities {
                 Value::Object(map) => map,
@@ -555,6 +571,7 @@ impl PrimaryReverseGuard {
         let Some(pos) = entries.iter().position(|e| e.id == self.id) else {
             return;
         };
+        entries[pos].hello_seq = inner.next_hello_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let previous = entries[pos].identity.replace(identity.clone());
         let same_client = previous
             .as_ref()

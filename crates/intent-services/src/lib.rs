@@ -367,6 +367,10 @@ pub struct Services {
     /// the `agent_queue` table always reflects the newest in-memory state — an
     /// older snapshot can never overwrite a newer one out of mutation order.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes `workspace.setBrowserClient` write + `workspace:updated`
+    /// publish so concurrent setters never emit deltas out of order relative
+    /// to the durable pin; the delta is read back from the committed row.
+    browser_client_pin_gate: Arc<tokio::sync::Mutex<()>>,
     /// Per-entry debounce-hold release timers, keyed by queue-entry id: each
     /// held [`agent_ops::QueuedMessage`] gets a spawned sleeper that flushes
     /// the hold marker at `holdUntil` and kicks delivery. Release/retract
@@ -1111,6 +1115,7 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
             pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks::default(),
             pending_marker_mutation_park: None,
@@ -20646,19 +20651,27 @@ impl WorkspaceApi for Services {
                     )));
                 }
             }
-            store
-                .set_workspace_browser_client(&id, client_id.as_ref())
-                .await?;
-            // Self-sufficient `workspace:updated` delta (§6.5); `null`
-            // spells a cleared pin so clients can drop their copy.
-            let change = client_id
-                .as_ref()
-                .map_or(serde_json::Value::Null, |c| c.as_str().into());
-            publish_event(
-                bus.as_ref(),
-                workspace_updated_event(&id, &serde_json::json!({ "browserClientId": change })),
-            )
-            .await;
+            // Write and announce under one gate: two racing setters would
+            // otherwise publish deltas in the opposite order of their
+            // commits. The delta carries the read-back committed value, not
+            // the requested one.
+            {
+                let _gate = self.browser_client_pin_gate.lock().await;
+                store
+                    .set_workspace_browser_client(&id, client_id.as_ref())
+                    .await?;
+                let committed = store.workspace_browser_client(&id).await?;
+                // Self-sufficient `workspace:updated` delta (§6.5); `null`
+                // spells a cleared pin so clients can drop their copy.
+                let change = committed
+                    .as_ref()
+                    .map_or(serde_json::Value::Null, |c| c.as_str().into());
+                publish_event(
+                    bus.as_ref(),
+                    workspace_updated_event(&id, &serde_json::json!({ "browserClientId": change })),
+                )
+                .await;
+            }
             self.browser_client_state(&id).await
         })
     }
