@@ -7695,6 +7695,84 @@ fn stamp_synthetic_block_ids_is_additive_and_index_stable() {
     assert_eq!(passthrough.content, json!("raw"));
 }
 
+/// `agent.getMessageBlock` pruned-body flag is driven by the store's
+/// evidence, not by the slim flags: only the `(ordinal, field)` pairs the
+/// store reports as compacted gain the additive `inputPruned` /
+/// `outputPruned: true` (existing flags and body untouched). A block that
+/// still carries `*Truncated` after hydration but is NOT in the store's list
+/// (corrupt / undecodable full row, pre-flagged legacy body) is left exactly
+/// as it was; out-of-range ordinals, non-object blocks and non-array content
+/// are ignored.
+#[test]
+fn mark_pruned_tool_bodies_flags_only_store_reported_blocks() {
+    use crate::agent_ops::mark_pruned_tool_bodies;
+    use intent_store::{PrunedToolField, PrunedToolPayload};
+    let mut content = json!([
+        { "type": "tool_use", "id": "tc-1", "name": "bash",
+          "input": { "cmd": "prev" }, "inputTruncated": true, "inputBytes": 9000 },
+        { "type": "tool_result", "id": "b:1", "tool_use_id": "tc-1",
+          "output": "preview…", "outputTruncated": true, "outputBytes": 65536 },
+        { "type": "tool_result", "id": "b:2", "tool_use_id": "tc-2",
+          "output": "corrupt-row preview", "outputTruncated": true, "outputBytes": 70000 },
+        { "type": "tool_result", "id": "b:3", "output": "full body" },
+        "not-an-object",
+    ]);
+    let before = content.clone();
+    let pruned = [
+        PrunedToolPayload {
+            block_ordinal: 0,
+            field: PrunedToolField::ToolUseInput,
+        },
+        PrunedToolPayload {
+            block_ordinal: 1,
+            field: PrunedToolField::ToolResultOutput,
+        },
+        PrunedToolPayload {
+            block_ordinal: 4,
+            field: PrunedToolField::ToolResultOutput,
+        },
+        PrunedToolPayload {
+            block_ordinal: 99,
+            field: PrunedToolField::ToolResultOutput,
+        },
+        PrunedToolPayload {
+            block_ordinal: -1,
+            field: PrunedToolField::ToolUseInput,
+        },
+    ];
+    mark_pruned_tool_bodies(&mut content, &pruned);
+
+    assert_eq!(
+        content[0],
+        json!({ "type": "tool_use", "id": "tc-1", "name": "bash",
+                "input": { "cmd": "prev" }, "inputTruncated": true, "inputBytes": 9000,
+                "inputPruned": true })
+    );
+    assert!(content[0].get("outputPruned").is_none());
+    assert_eq!(
+        content[1],
+        json!({ "type": "tool_result", "id": "b:1", "tool_use_id": "tc-1",
+                "output": "preview…", "outputTruncated": true, "outputBytes": 65536,
+                "outputPruned": true })
+    );
+    assert!(content[1].get("inputPruned").is_none());
+    assert_eq!(
+        content[2], before[2],
+        "a still-truncated block the store does not report is NOT pruned"
+    );
+    assert_eq!(content[3], before[3], "a hydrated block gains no flag");
+    assert_eq!(content[4], before[4]);
+    assert_eq!(content.as_array().map(Vec::len), Some(5));
+
+    let mut untouched = before.clone();
+    mark_pruned_tool_bodies(&mut untouched, &[]);
+    assert_eq!(untouched, before, "no store evidence → nothing flagged");
+
+    let mut raw = json!("not-an-array");
+    mark_pruned_tool_bodies(&mut raw, &pruned);
+    assert_eq!(raw, json!("not-an-array"));
+}
+
 /// `agent_last_message_event_payload` (PROTOCOL §6.5): the id-only echo
 /// enriched with the preview projections derived from the appended row —
 /// assistant rows carry `lastAgentResponse` (+ `lastToolUse` when the row
@@ -31882,9 +31960,9 @@ async fn agent_replace_messages_reconciles_pending_proposals() {
     assert!(session.pending_proposals().is_empty());
 }
 
-/// `agent.editAndRegenerate` truncation re-mints the kept rows and drops the
-/// rest: a pending entry whose carrier survives is remapped to its new row
-/// id; one whose carrier was truncated away is dropped.
+/// `agent.editAndRegenerate` truncation keeps the prefix rows as stored and
+/// drops the rest: a pending entry whose carrier survives stays mapped to its
+/// (unchanged) row id; one whose carrier was truncated away is dropped.
 #[tokio::test]
 async fn agent_edit_truncate_reconciles_pending_proposals() {
     let (_t, svc, ws) = setup().await;
@@ -31929,7 +32007,7 @@ async fn agent_edit_truncate_reconciles_pending_proposals() {
     );
     let _ = u0;
 
-    // Truncate at u1: keeps [u0, a1] under fresh row ids; drops u1 + a2.
+    // Truncate at u1: keeps [u0, a1] untouched; drops u1 + a2.
     let removed = svc
         .agent_edit_truncate_op(&id, &u1.id)
         .await
@@ -31940,8 +32018,9 @@ async fn agent_edit_truncate_reconciles_pending_proposals() {
         .get_agent_messages(&id, None)
         .await
         .expect("messages");
+    assert_eq!(messages.len(), 2);
     let new_carrier = &messages[1].id;
-    assert_ne!(new_carrier, &a1.id, "kept rows are re-minted");
+    assert_eq!(new_carrier, &a1.id, "kept rows keep their ids");
     let session = svc.store().get_agent_session(&id).await.expect("session");
     let pending = session.pending_proposals();
     assert_eq!(
@@ -31951,6 +32030,256 @@ async fn agent_edit_truncate_reconciles_pending_proposals() {
             .collect::<Vec<_>>(),
         vec![("tc-keep", new_carrier.as_str())],
         "surviving entry remapped, truncated-away entry dropped"
+    );
+}
+
+/// `agent.editAndRegenerate` truncation keeps the heavy side rows of the
+/// retained prefix: a tool body the retention sweep already compacted still
+/// serves its stored preview + `outputPruned: true` on `agent.getMessageBlock`
+/// after a LATER user message is edited away, and its replay read is
+/// byte-identical to the pre-edit one; a still-full sibling keeps its body.
+#[tokio::test]
+async fn agent_edit_truncate_keeps_pruned_and_full_side_rows_of_kept_rows() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Truncator").await;
+    let big_out = format!("OUT-HEAD-{}-OUT-TAIL", "o".repeat(20_000));
+    let heavy = |tag: &str| {
+        json!([
+            { "type": "tool_result", "id": format!("{tag}:result"), "tool_use_id": tag,
+              "output": big_out, "is_error": false },
+        ])
+    };
+    svc.store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "u0" }]),
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .expect("append u0");
+    let old = svc
+        .store()
+        .append_agent_message(&id, "assistant", &heavy("tc-old"), "2026-01-01T00:00:01Z")
+        .await
+        .expect("append old");
+    let fresh = svc
+        .store()
+        .append_agent_message(&id, "assistant", &heavy("tc-fresh"), &now_iso())
+        .await
+        .expect("append fresh");
+    let target = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "edit me" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append target");
+    svc.store()
+        .append_agent_message(&id, "assistant", &heavy("tc-after"), &now_iso())
+        .await
+        .expect("append after");
+
+    let cap = 4_000;
+    assert_eq!(
+        svc.store()
+            .compact_tool_payloads_before("2026-02-01T00:00:00Z", cap)
+            .await
+            .expect("compact"),
+        1,
+        "only the back-dated body is compacted"
+    );
+    let replay_before = svc
+        .store()
+        .get_agent_messages_for_replay(&id, cap)
+        .await
+        .expect("replay before");
+    let pruned_before = svc
+        .agent_get_message_block_op(
+            id.clone(),
+            old.id.clone(),
+            "tc-old:result".to_string(),
+            Some(ws.clone()),
+        )
+        .await
+        .expect("pruned block before");
+    assert_eq!(pruned_before["block"]["outputPruned"], json!(true));
+
+    let removed = svc
+        .agent_edit_truncate_op(&id, &target.id)
+        .await
+        .expect("truncate");
+    assert_eq!(removed, 2);
+
+    let pruned_after = svc
+        .agent_get_message_block_op(
+            id.clone(),
+            old.id.clone(),
+            "tc-old:result".to_string(),
+            Some(ws.clone()),
+        )
+        .await
+        .expect("pruned block after");
+    let block = &pruned_after["block"];
+    assert_eq!(block["outputPruned"], json!(true), "{block}");
+    assert_eq!(block["outputTruncated"], json!(true));
+    assert_eq!(block["outputBytes"], json!(big_out.len()));
+    let preview = block["output"].as_str().expect("preview");
+    assert!(big_out.starts_with(preview) && preview.len() < big_out.len());
+    assert_eq!(
+        pruned_after, pruned_before,
+        "pruned block serves identically across the edit"
+    );
+
+    let full = svc
+        .agent_get_message_block_op(
+            id.clone(),
+            fresh.id.clone(),
+            "tc-fresh:result".to_string(),
+            Some(ws.clone()),
+        )
+        .await
+        .expect("full block after");
+    assert_eq!(full["block"]["output"].as_str(), Some(big_out.as_str()));
+    assert!(full["block"].get("outputPruned").is_none());
+    assert!(full["block"].get("outputTruncated").is_none());
+
+    let replay_after = svc
+        .store()
+        .get_agent_messages_for_replay(&id, cap)
+        .await
+        .expect("replay after");
+    assert_eq!(replay_after.len(), 3);
+    assert_eq!(
+        replay_after,
+        replay_before[..3].to_vec(),
+        "replay of the kept prefix is byte-identical to the pre-edit replay"
+    );
+    assert_eq!(
+        replay_after[1].content[0]["outputReplayOriginalChars"],
+        json!(big_out.chars().count()),
+        "the pruned body still replays with its original-length marker"
+    );
+}
+
+/// The retention loop's per-tick body reads `agents.toolPayloadRetentionDays`
+/// LIVE from the registry snapshot: with the default `0` a tick compacts
+/// nothing; once the value is applied at runtime (no restart) the next tick
+/// compacts exactly the bodies older than `now − days` — and it does so even
+/// with the event sweep disabled (`streamRetentionHours == 0`), which must
+/// disable only the event deletes, never the tick's payload step.
+#[tokio::test]
+async fn retention_tick_compacts_tool_payloads_from_live_setting_even_with_event_sweep_off() {
+    use crate::retention::{run_retention_tick_at, RetentionTickOutcome};
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    let (_t, svc, ws) = setup().await;
+    let registry = svc.settings_registry().expect("settings registry");
+    let id = create_agent(&svc, &ws, "Sweeper").await;
+    let big_out = format!("OUT-HEAD-{}-OUT-TAIL", "o".repeat(20_000));
+    let heavy = |tag: &str| {
+        json!([
+            { "type": "tool_result", "id": format!("{tag}:result"), "tool_use_id": tag,
+              "output": big_out, "is_error": false },
+        ])
+    };
+    // `now` is fixed so the 2-day window is exact: `old` is 3 days before
+    // it, `fresh` is 1 day before it.
+    let now = OffsetDateTime::parse("2026-03-10T00:00:00Z", &Rfc3339).expect("now");
+    let old = svc
+        .store()
+        .append_agent_message(&id, "assistant", &heavy("tc-old"), "2026-03-07T00:00:00Z")
+        .await
+        .expect("append old")
+        .id;
+    let fresh = svc
+        .store()
+        .append_agent_message(&id, "assistant", &heavy("tc-fresh"), "2026-03-09T00:00:00Z")
+        .await
+        .expect("append fresh")
+        .id;
+    // One ephemeral event older than any TTL: proves the event sweep really
+    // is off when `streamRetentionHours == 0` (it survives the tick).
+    svc.store()
+        .insert_event(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "file:changed".to_string(),
+            actor: EventActor::default(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({}),
+        })
+        .await
+        .expect("insert stale event");
+    let pruned = |message_id: String| {
+        let store = svc.store().clone();
+        let id = id.clone();
+        async move {
+            store
+                .get_agent_message_by_id_with_pruned(&id, &message_id)
+                .await
+                .expect("read message")
+                .expect("message exists")
+                .1
+                .len()
+        }
+    };
+
+    // Default `toolPayloadRetentionDays = 0`: the sweep is disabled and the
+    // tick leaves both full bodies alone.
+    let settings = registry.snapshot();
+    assert_eq!(
+        crate::tool_payload_retention_days(&settings.effective),
+        None,
+        "default keeps full tool bodies forever"
+    );
+    assert_eq!(
+        run_retention_tick_at(svc.store(), 0, &settings.effective, now).await,
+        RetentionTickOutcome::default(),
+        "disabled sweep compacts nothing"
+    );
+    assert_eq!(pruned(old.clone()).await, 0);
+    assert_eq!(pruned(fresh.clone()).await, 0);
+
+    // Apply the window live; the next tick reads the new snapshot and
+    // compacts only the body older than `now − 2 days` — with the event
+    // sweep still off.
+    registry
+        .apply(&[("agents.toolPayloadRetentionDays".into(), json!(2))])
+        .expect("apply retention days");
+    let settings = registry.snapshot();
+    assert_eq!(
+        run_retention_tick_at(svc.store(), 0, &settings.effective, now).await,
+        RetentionTickOutcome {
+            tool_payloads_compacted: 1,
+            ..RetentionTickOutcome::default()
+        },
+        "one tick compacts exactly the old body; the event sweeps stay off"
+    );
+    assert_eq!(pruned(old.clone()).await, 1, "old body pruned");
+    assert_eq!(pruned(fresh.clone()).await, 0, "fresh body kept in full");
+    let stale_events = svc
+        .store()
+        .delete_ephemeral_events_before("2026-01-02T00:00:00Z")
+        .await
+        .expect("count stale events by deleting them");
+    assert_eq!(
+        stale_events, 1,
+        "the stale ephemeral event survived the tick with streamRetentionHours = 0"
+    );
+
+    // A re-run with the same window is idempotent.
+    assert_eq!(
+        run_retention_tick_at(svc.store(), 0, &settings.effective, now).await,
+        RetentionTickOutcome::default(),
+        "nothing left to compact"
     );
 }
 
@@ -33380,8 +33709,8 @@ async fn dismissal_neutralizes_pending_marker() {
     assert!(svc.questions_pending(&id).await);
 }
 
-/// `agent.editAndRegenerate` truncation re-mints row ids, so the marker is
-/// re-derived from the post-truncation transcript instead of being left
+/// `agent.editAndRegenerate` truncation may drop the marked row, so the marker
+/// is re-derived from the post-truncation transcript instead of being left
 /// dangling (which would wedge the hold forever).
 #[tokio::test]
 async fn edit_truncate_reconciles_pending_marker() {
@@ -33411,7 +33740,7 @@ async fn edit_truncate_reconciles_pending_marker() {
     assert!(svc.questions_pending(&id).await, "hold armed");
 
     // Truncating at the LAST user row keeps the question message, so the
-    // re-derived marker names its new (re-minted) id and the hold stays armed.
+    // re-derived marker still names it and the hold stays armed.
     svc.agent_edit_truncate_op(&id, &target_id)
         .await
         .expect("truncate");
@@ -33425,7 +33754,7 @@ async fn edit_truncate_reconciles_pending_marker() {
     assert_eq!(
         session.pending_questions_message_id(),
         Some(question_id.as_str()),
-        "marker re-derived against the re-minted row id"
+        "marker re-derived against the kept question row"
     );
     assert!(svc.questions_pending(&id).await);
 

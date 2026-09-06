@@ -612,8 +612,10 @@ mod tests {
     /// Seed one row into every [`TRANSFER_TABLES`] entry for `ws` — two for
     /// `completion_watch` (one parent-side, one child-side), each paired with
     /// a synthetic peer workspace id unique to `ws` so the rows can never
-    /// match another seeded workspace's predicate. All values are fixed test
-    /// literals, so string interpolation into SQL is safe here.
+    /// match another seeded workspace's predicate, and two for
+    /// `agent_message_payload` (a full-body row and a retention-compacted
+    /// `*_replay` row). All values are fixed test literals, so string
+    /// interpolation into SQL is safe here.
     async fn seed(store: &Store, ws: &str) {
         let t = "2026-01-01T00:00:00Z";
         let agent = format!("agent-{ws}");
@@ -630,6 +632,7 @@ mod tests {
             format!("INSERT INTO draft (workspace_id, agent_id, client_id, text, updated_at) VALUES ('{ws}', '{agent}', '{client}', 'd', '{t}')"),
             format!("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('m-{ws}', '{agent}', 1, 'user', '[]', '{t}')"),
             format!("INSERT INTO agent_message_payload (message_id, agent_id, block_ordinal, kind, encoding, body) VALUES ('m-{ws}', '{agent}', 0, 'tool_result_output', 'none', X'227822')"),
+            format!("INSERT INTO agent_message_payload (message_id, agent_id, block_ordinal, kind, encoding, body) VALUES ('m-{ws}', '{agent}', 1, 'tool_use_input_replay', 'none', X'7b2274657874223a2278222c226f726967696e616c4368617273223a317d')"),
             format!("INSERT INTO agent_queue (id, agent_id, position, payload, created_at) VALUES ('q-{ws}', '{agent}', 0, '{{}}', '{t}')"),
             format!("INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) VALUES ('{agent}', '{ws}', 'working', '{t}')"),
             format!("INSERT INTO agent_flipped_completion (agent_id, workspace_id, task_note_id, recorded_at) VALUES ('{agent}', '{ws}', 'n1', '{t}')"),
@@ -657,7 +660,8 @@ mod tests {
     /// Every [`TRANSFER_TABLES`] predicate actually selects rows: with every
     /// table seeded for two workspaces, each table reports exactly the target
     /// workspace's rows — 1 everywhere, 2 for `completion_watch` (parent-side
-    /// OR child-side both match) — with a positive byte estimate. The second
+    /// OR child-side both match) and `agent_message_payload` (full + replay
+    /// kinds) — with a positive byte estimate. The second
     /// workspace's rows prove the predicates also *exclude* foreign rows
     /// (notably the `agent_queue`/`agent_message` session subquery and the
     /// `completion_watch` parent/child pair).
@@ -676,7 +680,11 @@ mod tests {
         assert_eq!(stats.len(), TRANSFER_TABLES.len());
         for (i, (name, _)) in TRANSFER_TABLES.iter().enumerate() {
             assert_eq!(stats[i].name, *name, "stats follow TRANSFER_TABLES order");
-            let expected = if *name == "completion_watch" { 2 } else { 1 };
+            let expected = if matches!(*name, "completion_watch" | "agent_message_payload") {
+                2
+            } else {
+                1
+            };
             assert_eq!(
                 stats[i].row_count, expected,
                 "table {name} must count exactly the target workspace's rows"
@@ -741,11 +749,12 @@ mod tests {
             }
             for row in rows.iter_mut() {
                 // Seed appends one user message with content "[]" (2 bytes)
-                // plus one 3-byte agent_message_payload body: the target's
-                // triggers (0103 + 0108) must have rebuilt exactly that.
+                // plus a 3-byte full-body and a 30-byte `*_replay`
+                // agent_message_payload body: the target's triggers
+                // (0103 + 0108) must have rebuilt exactly that.
                 assert_eq!(row["message_count"], 1, "counters rebuilt on target");
                 assert_eq!(row["assistant_message_count"], 0);
-                assert_eq!(row["conversation_bytes"], 5);
+                assert_eq!(row["conversation_bytes"], 35);
                 for counter in COUNTERS {
                     row[counter] = serde_json::json!(0);
                 }

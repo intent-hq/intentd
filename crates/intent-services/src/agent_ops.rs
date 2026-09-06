@@ -2318,6 +2318,41 @@ fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
     message
 }
 
+/// Flag the blocks of a stored message whose full tool body is no longer
+/// retained. `pruned` is the store's evidence, read from the SAME snapshot as
+/// the hydrated body
+/// ([`intent_store::Store::get_agent_message_by_id_with_pruned`]): the retention sweep
+/// (`agents.toolPayloadRetentionDays`) replaced the block's full side row
+/// with a `*_replay` preview, so the hydrated read left the stored slim
+/// preview and its `inputTruncated` / `outputTruncated` (+ `*Bytes`) flags
+/// in place. Those blocks keep the preview and flags untouched and gain the
+/// additive `inputPruned: true` / `outputPruned: true`, so the response
+/// never implies a full body. A block that merely still carries a slim flag
+/// (corrupt or undecodable full row, body that arrived pre-flagged and was
+/// never extracted) is NOT pruned and is left alone — with retention off the
+/// served block is exactly what it was before the sweep existed. Ordinals
+/// index the STORED content array, so this runs before
+/// [`strip_anonymous_tool_blocks`] re-indexes it.
+fn mark_pruned_tool_bodies(content: &mut Value, pruned: &[intent_store::PrunedToolPayload]) {
+    let Some(blocks) = content.as_array_mut() else {
+        return;
+    };
+    for p in pruned {
+        let Some(obj) = usize::try_from(p.block_ordinal)
+            .ok()
+            .and_then(|i| blocks.get_mut(i))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let flag = match p.field {
+            intent_store::PrunedToolField::ToolUseInput => "inputPruned",
+            intent_store::PrunedToolField::ToolResultOutput => "outputPruned",
+        };
+        obj.insert(flag.to_string(), Value::Bool(true));
+    }
+}
+
 /// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
 /// `projection: "slim"`) to one served message. The block bounding itself
 /// lives in [`crate::tool_block::slim_message_blocks`], shared with the live
@@ -3199,9 +3234,12 @@ impl Services {
     /// as `agent.getConversation` (NEVER the slim bounding), so block identity
     /// matches the served conversation byte-for-byte — persisted assistant ids
     /// and serve-time synthetic `{messageId}:{index}` ids both resolve — and
-    /// the returned block is always the full, unprojected body. Bounded cost
-    /// (RPC cost contract): a metadata-only session read plus ONE primary-key
-    /// message row read; the transcript is never hydrated.
+    /// the returned block is the full, unprojected body whenever that body is
+    /// still retained; a payload the retention sweep has compacted returns
+    /// the stored preview with its `*Truncated` / `*Bytes` flags plus
+    /// `inputPruned` / `outputPruned` (see "Retention-pruned bodies" below).
+    /// Bounded cost (RPC cost contract): a metadata-only session read plus
+    /// ONE primary-key message row read; the transcript is never hydrated.
     ///
     /// In-progress rows (monorepo#3647): when the message id is not persisted
     /// but matches the live-turn slot's in-flight message, the block resolves
@@ -3221,6 +3259,17 @@ impl Services {
     /// whole page down rather than just itself. The slim flags
     /// (`inputBytes`/`outputBytes`/`dataBytes`) carry the full body size, so
     /// a client can predict the fetch size before calling.
+    ///
+    /// Retention-pruned bodies (`agents.toolPayloadRetentionDays`): when the
+    /// sweep has compacted a block's full side row into its `*_replay`
+    /// preview, the full body no longer exists anywhere — the message row
+    /// still carries the stored slim preview with its `inputTruncated` /
+    /// `outputTruncated` (+ `*Bytes`) flags after hydration (only the two
+    /// FULL-body kinds are spliced). Such a block is served as that stored
+    /// preview, flags intact, PLUS the additive `inputPruned: true` /
+    /// `outputPruned: true` so a client can tell "the full output is no
+    /// longer retained" from "the fetch returned the full body" and does not
+    /// re-request in a loop.
     pub(crate) async fn agent_get_message_block_op(
         &self,
         agent_id: AgentId,
@@ -3237,12 +3286,18 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
+        // One store snapshot for body + pruned metadata: a sweep committing
+        // between two separate reads would stamp a just-served full body as
+        // pruned (and without its `*Truncated` / `*Bytes` flags).
         let message = match self
             .store
-            .get_agent_message_by_id(&agent_id, &message_id)
+            .get_agent_message_by_id_with_pruned(&agent_id, &message_id)
             .await?
         {
-            Some(m) => m,
+            Some((mut m, pruned)) => {
+                mark_pruned_tool_bodies(&mut m.content, &pruned);
+                m
+            }
             // In-progress fallback (monorepo#3647): an unpersisted id that
             // matches the live-turn slot's in-flight message resolves from
             // the slot's streamed blocks, so blocks slim-truncated on the
@@ -5220,8 +5275,13 @@ impl Services {
 
     /// `agent.editAndRegenerate` truncation step: atomically truncate the
     /// transcript to just BEFORE the (already validated) user message
-    /// `message_id`, dropping it and everything after it. Reuses the
-    /// replaceMessages store machinery (fresh row ids / 0-based `seq`).
+    /// `message_id`, dropping it and everything after it. Only the suffix is
+    /// deleted ([`intent_store::Store::truncate_agent_messages_from`]): the
+    /// kept rows keep their ids, `seq`, and heavy side rows — including the
+    /// retention sweep's `*_replay` previews, which a remint through the
+    /// replaceMessages machinery would have dropped (a compacted block
+    /// hydrates to its slim placeholder, so re-extraction skipped it and the
+    /// cascade swept the preview with the old envelope).
     /// Emits `agent:updated` with `{ truncatedCount, remainingCount }`.
     /// Returns the number of messages removed.
     ///
@@ -5240,35 +5300,27 @@ impl Services {
         let messages = self.store.get_agent_messages(agent_id, None).await?;
         let idx = Self::find_edit_target(&messages, message_id)?;
         let keep = &messages[..idx];
-        let batch: Vec<intent_store::ReplaceMessage<'_>> = keep
-            .iter()
-            .map(|m| intent_store::ReplaceMessage {
-                role: m.role.as_str(),
-                content: &m.content,
-                metadata: m.metadata.as_ref(),
-                created_at: m.created_at.as_str(),
-            })
-            .collect();
-        let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
+        let truncated_count = self
+            .store
+            .truncate_agent_messages_from(agent_id, messages[idx].seq)
+            .await?;
         self.invalidate_agent_list_cache(&session.workspace_id);
-        let truncated_count = messages.len() - inserted.len();
         // Pending questions (PROTOCOL §5.5): truncation drops the rows the
-        // pending-questions marker may name AND re-mints ids for the kept rows
-        // (`replace_agent_messages`), so a surviving marker would be dangling
-        // — and since the derivation never checks that the marked row still
-        // exists, a dangling marker would wedge the pending set forever. The
-        // marker is therefore explicitly RE-DERIVED from the post-truncation
-        // transcript (never tolerated as dangling), which also recomputes the
-        // needs_attention displayStatus and kicks the drain when the
-        // truncation released the hold. The dismissal marker keeps its
-        // existing dangling-tolerant laxity.
-        self.reconcile_pending_questions_marker(&session.workspace_id, agent_id, &inserted)
+        // pending-questions marker may name, so a surviving marker could be
+        // dangling — and since the derivation never checks that the marked
+        // row still exists, a dangling marker would wedge the pending set
+        // forever. The marker is therefore explicitly RE-DERIVED from the
+        // post-truncation transcript (never tolerated as dangling), which
+        // also recomputes the needs_attention displayStatus and kicks the
+        // drain when the truncation released the hold. The dismissal marker
+        // keeps its existing dangling-tolerant laxity.
+        self.reconcile_pending_questions_marker(&session.workspace_id, agent_id, keep)
             .await;
-        // Same re-mint hazard for the pending-proposals list (see
-        // `agent_replace_messages_op`): remap surviving entries onto the
-        // re-minted kept rows and drop entries whose carrying rows were
-        // truncated away.
-        self.reconcile_pending_proposals(&session.workspace_id, agent_id, &inserted)
+        // Same hazard for the pending-proposals list (see
+        // `agent_replace_messages_op`): drop entries whose carrying rows were
+        // truncated away (kept rows keep their ids, so surviving entries map
+        // onto themselves).
+        self.reconcile_pending_proposals(&session.workspace_id, agent_id, keep)
             .await;
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -5277,7 +5329,7 @@ impl Services {
             json!({
                 "agentId": agent_id.0,
                 "truncatedCount": truncated_count,
-                "remainingCount": inserted.len(),
+                "remainingCount": keep.len(),
             }),
         )
         .await;

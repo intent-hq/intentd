@@ -4105,10 +4105,18 @@ impl AgentManager {
         if !self.take_recreated(agent_id) {
             return content.to_string();
         }
+        // The per-block cap is read live so a `config.toml` edit applies to
+        // the next replay without a daemon restart. The bounded replay read
+        // splices every externalized tool body — full row or retention-pruned
+        // `*_replay` row alike — in as the replay-preview block already
+        // truncated to the cap, so the whole transcript's full bodies are
+        // never materialized at once.
+        let tool_content_chars =
+            crate::settings::history_replay_tool_content_chars(&self.services.effective_settings());
         let messages = self
             .services
             .store
-            .get_agent_messages(agent_id, None)
+            .get_agent_messages_for_replay(agent_id, tool_content_chars)
             .await
             .unwrap_or_default();
         // The current user message was already appended → render everything
@@ -4124,8 +4132,11 @@ impl AgentManager {
         if prior.is_empty() {
             return content.to_string();
         }
-        let history_xml =
-            crate::history_xml::format_history_as_xml(prior, crate::history_xml::MAX_HISTORY_CHARS);
+        let history_xml = crate::history_xml::format_history_as_xml(
+            prior,
+            crate::history_xml::MAX_HISTORY_CHARS,
+            tool_content_chars,
+        );
         format!("{history_xml}\n\n{content}")
     }
 

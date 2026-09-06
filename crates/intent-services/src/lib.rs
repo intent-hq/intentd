@@ -114,6 +114,7 @@ pub mod provider_models;
 pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
+pub mod retention;
 mod rtk;
 mod sandbox_ops;
 mod script_ops;
@@ -160,10 +161,11 @@ pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
-    agent_memory_budget_bytes, cleanup_retired_settings, import_legacy_settings,
-    max_concurrent_adapters, max_concurrent_agents, migrate_active_provider_setting,
-    migrate_default_vocabulary, migrate_quick_action_settings, report_to_parent_debounce_seconds,
-    InMemorySecretStore, SecretStore,
+    agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
+    import_legacy_settings, max_concurrent_adapters, max_concurrent_agents,
+    migrate_active_provider_setting, migrate_default_vocabulary, migrate_quick_action_settings,
+    report_to_parent_debounce_seconds, tool_payload_retention_days, InMemorySecretStore,
+    SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
