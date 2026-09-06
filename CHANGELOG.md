@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.30] - 2026-09-06
+
+### 🚀 Features
+
+- *(transport)* Capability-gated, identity-aware reverse registry (REV-2) ([#1756](https://github.com/intent-hq/intentd/pull/1756))
+
+### 📚 Documentation
+
+- *(acp)* Document browser tab display state for agents ([#1758](https://github.com/intent-hq/intentd/pull/1758))
+
+
 ## [0.9.29] - 2026-09-06
 
 ### 🧪 Testing
