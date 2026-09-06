@@ -33,6 +33,7 @@ use crate::agent_ops::{
     live_response_and_digest_from_blocks, parse_model_list_json, parse_model_list_output,
     parse_session_stats_output, resolve_auggie_bin_with,
 };
+use crate::agent_subscriptions::GroupPersistOp;
 use crate::Services;
 use intent_core::MAX_DELEGATION_DEPTH;
 
@@ -2758,6 +2759,66 @@ async fn scoped_group_cancel_racing_spawned_upserts_leaves_no_persisted_row() {
     assert!(
         rows.is_empty(),
         "cancelled group row resurrected by a late spawned upsert: {rows:?}"
+    );
+}
+
+/// Regression (intent#4460, review): a group claimed for delivery
+/// (`take_group_if_ready`) is owned by settlement. `Settle` is enqueued
+/// outside the registry lock and awaited before the group leaves the
+/// registry, so a shrink (`remove_child_from_group`) can interleave while it
+/// is in flight. That shrink must not enqueue an upsert behind `Settle` —
+/// such a snapshot would re-create the settled `delegation_group` row.
+#[tokio::test]
+async fn shrink_after_delivery_claim_does_not_recreate_settled_group_row() {
+    let (_t, svc, _manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child_a = create_agent(&svc, &ws, "Child A").await;
+    let child_b = create_agent(&svc, &ws, "Child B").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child_a);
+    svc.enroll_child_in_group(&gid, &child_b);
+    svc.seal_group_for_parent(&parent).await.expect("sealed");
+    for child in [&child_a, &child_b] {
+        let ev = completion_event(&ws, AGENT_IDLE, child, json!({ "agentId": child.0 }));
+        assert!(
+            svc.record_group_child_completion(&gid, child, false, "done".into(), ev)
+                .await
+        );
+    }
+    assert!(svc.take_group_if_ready(&gid).is_some(), "group claimed");
+
+    // Same lane interleaving as `settle_delegation_group_persisted` racing a
+    // shrink: Settle is queued, the shrink lands while it is in flight, then
+    // the ack is awaited and the group leaves the registry.
+    let ack = svc.enqueue_group_persist_acked(GroupPersistOp::Settle {
+        group_id: gid.clone(),
+        retain_children: Vec::new(),
+    });
+    assert!(svc.remove_child_from_group(&gid, &child_a));
+    Services::await_group_persist(ack).await.expect("settle");
+    svc.finalize_group_delivery(&gid, &[]);
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+
+    // Lane barrier: the lane is FIFO, so an acked op on an unrelated sentinel
+    // id enqueued after the shrink cannot be acked until any shrink upsert
+    // queued behind Settle has been applied. (Never Delete/Settle `gid` here —
+    // that would mask the regression.)
+    let barrier = svc.enqueue_group_persist_acked(GroupPersistOp::Delete(format!(
+        "barrier-{}",
+        uuid::Uuid::new_v4()
+    )));
+    Services::await_group_persist(barrier)
+        .await
+        .expect("lane barrier");
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delegation_group WHERE group_id = ?")
+        .bind(&gid)
+        .fetch_one(svc.store().read_pool())
+        .await
+        .expect("count delegation_group rows");
+    assert_eq!(
+        rows, 0,
+        "settled group row re-created by a shrink upsert enqueued behind Settle"
     );
 }
 

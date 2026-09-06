@@ -1414,7 +1414,10 @@ impl Services {
 
     /// Lane enqueue whose outcome the caller awaits via
     /// [`Services::await_group_persist`] — AFTER releasing the registry lock.
-    fn enqueue_group_persist_acked(&self, op: GroupPersistOp) -> oneshot::Receiver<Result<()>> {
+    pub(crate) fn enqueue_group_persist_acked(
+        &self,
+        op: GroupPersistOp,
+    ) -> oneshot::Receiver<Result<()>> {
         let (tx, rx) = oneshot::channel();
         if self.group_persist_sender().send((op, Some(tx))).is_err() {
             tracing::warn!("delegation_group persistence lane closed; write dropped");
