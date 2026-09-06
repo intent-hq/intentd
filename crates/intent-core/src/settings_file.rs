@@ -35,13 +35,16 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    ACP_NODE_MAX_OLD_SPACE_MB_MAX, ACP_NODE_MAX_OLD_SPACE_MB_MIN, DEFAULT_HOOKS_MAX_PER_AGENT,
+    ACP_NODE_MAX_OLD_SPACE_MB_MAX, ACP_NODE_MAX_OLD_SPACE_MB_MIN,
+    DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS, DEFAULT_HOOKS_MAX_PER_AGENT,
     DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS, DEFAULT_MAX_TOP_LEVEL_AGENTS,
     DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_POLL_SECONDS,
     DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
-    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_WAKE_RESUME_ENABLED,
-    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
-    DEFAULT_WORKSPACE_API_TOON_OUTPUT, MAX_CONCURRENT_ADAPTERS_LIMIT,
+    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
+    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
+    MAX_CONCURRENT_ADAPTERS_LIMIT, TOOL_PAYLOAD_RETENTION_DAYS_MAX,
 };
 use crate::error::{Error, Result};
 
@@ -717,6 +720,20 @@ pub struct AgentsSettings {
     /// one combined wake instead of two (0 disables the debounce — legacy
     /// immediate wake; read live per call, no restart required).
     pub report_to_parent_debounce_seconds: u32,
+    /// `agents.historyReplayToolContentChars` — per-block character cap
+    /// applied to each `tool_use` input and `tool_result` output in the
+    /// recovery replay that rebuilds a lost ACP session; longer bodies are
+    /// middle-truncated (range
+    /// [`HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN`]–[`HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX`];
+    /// read live at replay time, no restart required).
+    pub history_replay_tool_content_chars: u32,
+    /// `agents.toolPayloadRetentionDays` — retention window in days after
+    /// which stored tool payloads older than the window are shrunk to the
+    /// replay-shaped preview (the full body is deleted and cannot be
+    /// recovered); `0` disables the sweep and keeps full bodies forever (max
+    /// [`TOOL_PAYLOAD_RETENTION_DAYS_MAX`]; read live at each sweep tick, no
+    /// restart required).
+    pub tool_payload_retention_days: u32,
     /// `agents.flushQueuedMessages` — how the whole queued-message backlog
     /// is delivered when an idle agent drains its queue: `all` batches every
     /// ready entry into one turn, `systemOnly` batches only system-origin
@@ -741,6 +758,8 @@ impl Default for AgentsSettings {
             max_top_level_agents: DEFAULT_MAX_TOP_LEVEL_AGENTS,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
             report_to_parent_debounce_seconds: DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
+            history_replay_tool_content_chars: DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS,
+            tool_payload_retention_days: DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
             flush_queued_messages: FlushQueuedMessagesMode::All,
             resume_interrupted_on_start: ResumeInterruptedOnStart::Auto,
         }
@@ -1297,6 +1316,26 @@ impl SettingsFile {
                 &format!("must be at least 1, got {top_level}"),
             ));
         }
+        let replay_chars = self.agents.history_replay_tool_content_chars;
+        if !(HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN..=HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX)
+            .contains(&replay_chars)
+        {
+            return Err(bad(
+                "agents.historyReplayToolContentChars",
+                &format!(
+                    "must be between {HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN} and {HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX}, got {replay_chars}"
+                ),
+            ));
+        }
+        let retention_days = self.agents.tool_payload_retention_days;
+        if retention_days > TOOL_PAYLOAD_RETENTION_DAYS_MAX {
+            return Err(bad(
+                "agents.toolPayloadRetentionDays",
+                &format!(
+                    "must be 0 (keep forever) or between 1 and {TOOL_PAYLOAD_RETENTION_DAYS_MAX}, got {retention_days}"
+                ),
+            ));
+        }
         let chars = self.workspace_api.max_output_chars;
         if chars != 0 && !(1_000..=10_000_000).contains(&chars) {
             return Err(bad(
@@ -1645,6 +1684,16 @@ idleReapMinutes = 10
 # two (0 disables the debounce -- immediate wake; read live per call, no
 # restart required).
 reportToParentDebounceSeconds = 30
+# History replay tool content chars -- per-block character cap applied to each
+# tool_use input and tool_result output in the recovery replay that rebuilds a
+# lost ACP session; longer bodies are middle-truncated (500-100000; read live
+# at replay time, no restart required).
+historyReplayToolContentChars = 4000
+# Tool payload retention days -- stored tool payloads older than this many days
+# are shrunk to the replay-shaped preview (the full body is deleted and cannot
+# be recovered); 0 disables the sweep and keeps full bodies forever (max 3650;
+# read live at each sweep tick, no restart required).
+toolPayloadRetentionDays = 0
 # Flush queued messages -- how the queued-message backlog is delivered when
 # an idle agent drains its queue: "all", "systemOnly", or "off".
 flushQueuedMessages = "all"
@@ -1800,6 +1849,14 @@ mod tests {
         assert_eq!(d.agents.max_concurrent, 0);
         assert_eq!(d.agents.max_top_level_agents, DEFAULT_MAX_TOP_LEVEL_AGENTS);
         assert_eq!(d.agents.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
+        assert_eq!(
+            d.agents.history_replay_tool_content_chars,
+            DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS
+        );
+        assert_eq!(
+            d.agents.tool_payload_retention_days,
+            DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS
+        );
         assert_eq!(d.agents.flush_queued_messages, FlushQueuedMessagesMode::All);
         assert_eq!(
             d.events.stream_retention_hours,
@@ -1834,11 +1891,13 @@ mod tests {
     #[test]
     fn camel_case_keys_parse() {
         let parsed = SettingsFile::parse_str(
-            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nflushQueuedMessages = false\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n\n[agentFeatures]\nbackgroundHooks = false\nhostExec = false\nrichChatBlocks = false\n",
+            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nhistoryReplayToolContentChars = 8000\ntoolPayloadRetentionDays = 30\nflushQueuedMessages = false\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n\n[agentFeatures]\nbackgroundHooks = false\nhostExec = false\nrichChatBlocks = false\n",
         )
         .unwrap();
         assert_eq!(parsed.agents.idle_reap_minutes, 5);
         assert_eq!(parsed.agents.max_concurrent, 4);
+        assert_eq!(parsed.agents.history_replay_tool_content_chars, 8000);
+        assert_eq!(parsed.agents.tool_payload_retention_days, 30);
         assert_eq!(
             parsed.agents.flush_queued_messages,
             FlushQueuedMessagesMode::Off
@@ -2228,6 +2287,8 @@ mod tests {
         file.providers.active = Some("claude-code".to_string());
         file.server.ws_api.enabled = true;
         file.agents.idle_reap_minutes = 15;
+        file.agents.history_replay_tool_content_chars = 12_000;
+        file.agents.tool_payload_retention_days = 90;
         // An explicit 0 (off) must survive the round trip as `Some(0)`, never
         // collapsing into the absent-key auto default.
         file.agents.memory_budget_mb = Some(0);
@@ -2753,6 +2814,98 @@ mod tests {
             .is_ok(),
             "the upper bound itself is legal"
         );
+    }
+
+    /// Both retention knobs ship at today's behaviour: an empty file and the
+    /// shipped template resolve to the 4000-char replay cap and a disabled
+    /// (0-day) payload sweep, and the template documents both keys.
+    #[test]
+    fn tool_payload_retention_defaults_and_template_round_trip() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.agents.history_replay_tool_content_chars,
+            DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS
+        );
+        assert_eq!(parsed.agents.tool_payload_retention_days, 0);
+        assert_eq!(DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS, 4000);
+        assert_eq!(DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, 0);
+
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("historyReplayToolContentChars = 4000"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("toolPayloadRetentionDays = 0"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(
+            templated.agents.history_replay_tool_content_chars,
+            DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS
+        );
+        assert_eq!(
+            templated.agents.tool_payload_retention_days,
+            DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS
+        );
+    }
+
+    /// `agents.historyReplayToolContentChars` is bounded on both sides (no
+    /// `0` escape hatch — a 0-char replay block is useless) and
+    /// `agents.toolPayloadRetentionDays` accepts `0` (keep forever) up to
+    /// ten years; out-of-range values fail the load with an error naming the
+    /// key and the value.
+    #[test]
+    fn tool_payload_retention_ranges_are_enforced() {
+        for bound in [
+            HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
+            HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
+        ] {
+            let parsed = SettingsFile::parse_str(&format!(
+                "[agents]\nhistoryReplayToolContentChars = {bound}\n"
+            ))
+            .expect("both bounds are legal");
+            assert_eq!(parsed.agents.history_replay_tool_content_chars, bound);
+        }
+        for bad in ["0", "499", "100001"] {
+            let err = SettingsFile::parse_str(&format!(
+                "[agents]\nhistoryReplayToolContentChars = {bad}\n"
+            ))
+            .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("agents.historyReplayToolContentChars") && msg.contains(bad),
+                "error names the offending key and value: {msg}"
+            );
+        }
+
+        for legal in [0, 1, TOOL_PAYLOAD_RETENTION_DAYS_MAX] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[agents]\ntoolPayloadRetentionDays = {legal}\n"))
+                    .expect("0, 1 and the upper bound are legal");
+            assert_eq!(parsed.agents.tool_payload_retention_days, legal);
+        }
+        for bad in ["3651", "-1"] {
+            let err =
+                SettingsFile::parse_str(&format!("[agents]\ntoolPayloadRetentionDays = {bad}\n"))
+                    .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("agents.toolPayloadRetentionDays"),
+                "error names the offending key: {msg}"
+            );
+        }
+    }
+
+    /// Out-of-range retention values fail `load_or_init` (not just
+    /// `parse_str`) with the file path and key in the message.
+    #[test]
+    fn tool_payload_retention_out_of_range_fails_load_or_init() {
+        let dir = temp_path("retention-range");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[agents]\ntoolPayloadRetentionDays = 4000\n").unwrap();
+        let err = SettingsFile::load_or_init(&path).expect_err("out-of-range value must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("config.toml"), "names the file: {msg}");
+        assert!(
+            msg.contains("agents.toolPayloadRetentionDays") && msg.contains("4000"),
+            "names the key and value: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

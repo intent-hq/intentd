@@ -105,6 +105,8 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agents.acpNodeMaxOldSpaceMb",
     "agents.idleReapMinutes",
     "agents.reportToParentDebounceSeconds",
+    "agents.historyReplayToolContentChars",
+    "agents.toolPayloadRetentionDays",
     "agents.flushQueuedMessages",
     "agents.resumeInterruptedOnStart",
     "events.streamRetentionHours",

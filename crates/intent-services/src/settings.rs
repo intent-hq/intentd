@@ -1524,6 +1524,30 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             None,
             f64::from(intent_core::config::DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS),
         ),
+        number(
+            "agents.historyReplayToolContentChars",
+            "History replay tool content chars",
+            "Per-block character cap applied to each tool_use input and tool_result output in the recovery replay that rebuilds a lost ACP session; longer bodies are middle-truncated (500-100000; applies live at replay time, no restart required)",
+            "agents",
+            Some(f64::from(
+                intent_core::config::HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
+            )),
+            Some(f64::from(
+                intent_core::config::HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
+            )),
+            f64::from(intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS),
+        ),
+        number(
+            "agents.toolPayloadRetentionDays",
+            "Tool payload retention days",
+            "Stored tool payloads older than this many days are shrunk to the replay preview used by the recovery replay; the full body is deleted and cannot be recovered (0 disables the sweep and keeps full bodies forever; max 3650; applies live at each sweep tick, no restart required)",
+            "agents",
+            Some(0.0),
+            Some(f64::from(
+                intent_core::config::TOOL_PAYLOAD_RETENTION_DAYS_MAX,
+            )),
+            f64::from(intent_core::config::DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS),
+        ),
         enumerated(
             "agents.flushQueuedMessages",
             "Flush queued messages",
@@ -1764,6 +1788,26 @@ pub fn max_concurrent_adapters(settings: &SettingsFile) -> u32 {
 #[must_use]
 pub fn report_to_parent_debounce_seconds(settings: &SettingsFile) -> u32 {
     settings.agents.report_to_parent_debounce_seconds
+}
+
+/// The effective `agents.historyReplayToolContentChars` setting: the
+/// per-block character cap applied to each `tool_use` input and
+/// `tool_result` output in the recovery replay. The schema bounds it to
+/// 500–100000, so the value passes through as-is — read live from the
+/// settings snapshot at replay time, no restart required.
+#[must_use]
+pub fn history_replay_tool_content_chars(settings: &SettingsFile) -> usize {
+    settings.agents.history_replay_tool_content_chars as usize
+}
+
+/// The effective `agents.toolPayloadRetentionDays` setting: `Some(days)` when
+/// the payload retention sweep is enabled, `None` when it is `0` (keep full
+/// tool bodies forever, today's behaviour) — read live from the settings
+/// snapshot at each sweep tick, no restart required.
+#[must_use]
+pub fn tool_payload_retention_days(settings: &SettingsFile) -> Option<u32> {
+    let days = settings.agents.tool_payload_retention_days;
+    (days > 0).then_some(days)
 }
 
 /// One-time boot import of legacy `config.toml` keys back into the `SQLite`
@@ -3330,6 +3374,240 @@ mod tests {
             0,
             "0 must pass through — it means disabled, not \"fall back to default\""
         );
+    }
+
+    /// `agents.historyReplayToolContentChars` is a TOML-backed bounded number
+    /// (500–100000, default 4000) in the `agents` category, registered in
+    /// `KNOWN_PATHS`; its catalog default matches the schema default and its
+    /// description states what the cap bounds (chars per `tool_use` input /
+    /// `tool_result` output in the recovery replay). The live accessor passes
+    /// the configured value through.
+    #[test]
+    fn history_replay_tool_content_chars_catalog_entry_is_toml_backed() {
+        let def = find_definition("agents.historyReplayToolContentChars")
+            .expect("agents.historyReplayToolContentChars missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(500.0),
+                max: Some(100_000.0)
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(4000.0)));
+        assert_eq!(
+            intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS,
+            4000
+        );
+        assert_eq!(
+            SettingsFile::default()
+                .agents
+                .history_replay_tool_content_chars,
+            intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS,
+        );
+        assert!(KNOWN_PATHS.contains(&"agents.historyReplayToolContentChars"));
+        for needle in ["tool_use input", "tool_result output", "recovery replay"] {
+            assert!(
+                def.description.contains(needle),
+                "description must state what the cap bounds ({needle}): {}",
+                def.description
+            );
+        }
+        def.validate(&json!(500)).expect("the lower bound is legal");
+        def.validate(&json!(100_000))
+            .expect("the upper bound is legal");
+        assert!(def.validate(&json!(0)).is_err(), "no 0 escape hatch");
+        assert!(def.validate(&json!(499)).is_err());
+        assert!(def.validate(&json!(100_001)).is_err());
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(history_replay_tool_content_chars(&settings), 4000);
+        settings.agents.history_replay_tool_content_chars = 12_000;
+        assert_eq!(history_replay_tool_content_chars(&settings), 12_000);
+    }
+
+    /// `agents.toolPayloadRetentionDays` is a TOML-backed bounded number
+    /// (0 = keep forever, max 3650, default 0) in the `agents` category,
+    /// registered in `KNOWN_PATHS`; its description states that the sweep
+    /// shrinks stored payloads older than N days to the replay preview and
+    /// that 0 disables it. The live accessor maps 0 to `None`.
+    #[test]
+    fn tool_payload_retention_days_catalog_entry_is_toml_backed() {
+        let def = find_definition("agents.toolPayloadRetentionDays")
+            .expect("agents.toolPayloadRetentionDays missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(0.0),
+                max: Some(3650.0)
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(0.0)));
+        assert_eq!(intent_core::config::DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, 0);
+        assert_eq!(
+            SettingsFile::default().agents.tool_payload_retention_days,
+            intent_core::config::DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
+        );
+        assert!(KNOWN_PATHS.contains(&"agents.toolPayloadRetentionDays"));
+        for needle in ["older than", "replay preview", "0 disables"] {
+            assert!(
+                def.description.contains(needle),
+                "description must state the retention semantics ({needle}): {}",
+                def.description
+            );
+        }
+        def.validate(&json!(0))
+            .expect("0 is legal — it keeps full bodies forever");
+        def.validate(&json!(3650))
+            .expect("the upper bound is legal");
+        assert!(def.validate(&json!(3651)).is_err());
+        assert!(def.validate(&json!(-1)).is_err());
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(
+            tool_payload_retention_days(&settings),
+            None,
+            "0 must resolve to None — the sweep is disabled"
+        );
+        settings.agents.tool_payload_retention_days = 30;
+        assert_eq!(tool_payload_retention_days(&settings), Some(30));
+    }
+
+    /// Both retention knobs round-trip through the registry-wired service
+    /// exactly like `workspaceApi.maxOutputChars`: defaults read with
+    /// `default` origin, updates persist to config.toml (`file` origin, never
+    /// `SQLite`) and are visible on the live snapshot, out-of-range values
+    /// reject with `-32602` and leave the prior value untouched, and reset
+    /// restores the defaults.
+    #[tokio::test]
+    async fn tool_payload_retention_settings_round_trip_via_registry() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-retention-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-retention-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let got = svc
+            .get("agents.historyReplayToolContentChars")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(4000.0));
+        assert_eq!(got["origin"], json!("default"));
+        let got = svc
+            .get("agents.toolPayloadRetentionDays")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(0.0));
+        assert_eq!(got["origin"], json!("default"));
+
+        svc.update(&json!([
+            { "path": "agents.historyReplayToolContentChars", "value": 8000 },
+            { "path": "agents.toolPayloadRetentionDays", "value": 30 },
+        ]))
+        .await
+        .expect("update");
+        let got = svc
+            .get("agents.historyReplayToolContentChars")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(8000.0));
+        assert_eq!(got["origin"], json!("file"));
+        let got = svc
+            .get("agents.toolPayloadRetentionDays")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(30.0));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("historyReplayToolContentChars"), "{text}");
+        assert!(text.contains("toolPayloadRetentionDays"), "{text}");
+        for path in [
+            "agents.historyReplayToolContentChars",
+            "agents.toolPayloadRetentionDays",
+        ] {
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed keys must never write a SQLite settings row"
+            );
+        }
+        // The live snapshot every accessor reads sees the update immediately.
+        let live = registry.snapshot().effective.clone();
+        assert_eq!(history_replay_tool_content_chars(&live), 8000);
+        assert_eq!(tool_payload_retention_days(&live), Some(30));
+
+        // Out-of-range values reject via the typed schema (-32602) and the
+        // prior values are untouched.
+        for (path, value) in [
+            ("agents.historyReplayToolContentChars", 499),
+            ("agents.historyReplayToolContentChars", 100_001),
+            ("agents.toolPayloadRetentionDays", 3651),
+        ] {
+            let err = svc
+                .update(&json!([{ "path": path, "value": value }]))
+                .await
+                .expect_err("out-of-range value must reject");
+            assert!(
+                matches!(err, Error::InvalidParams(ref msg) if msg.contains(path)),
+                "expected InvalidParams naming {path}, got {err:?}"
+            );
+        }
+        let got = svc
+            .get("agents.historyReplayToolContentChars")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(8000.0));
+        let got = svc
+            .get("agents.toolPayloadRetentionDays")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(30.0));
+        let live = registry.snapshot().effective.clone();
+        assert_eq!(history_replay_tool_content_chars(&live), 8000);
+        assert_eq!(tool_payload_retention_days(&live), Some(30));
+
+        // 0 (keep forever) is accepted for the retention window.
+        svc.update(&json!([{ "path": "agents.toolPayloadRetentionDays", "value": 0 }]))
+            .await
+            .expect("0 = keep forever must be accepted");
+        assert_eq!(
+            tool_payload_retention_days(&registry.snapshot().effective),
+            None
+        );
+
+        let reset = svc
+            .reset("agents.historyReplayToolContentChars")
+            .await
+            .expect("reset");
+        assert_eq!(reset["value"], json!(4000.0));
+        let reset = svc
+            .reset("agents.toolPayloadRetentionDays")
+            .await
+            .expect("reset");
+        assert_eq!(reset["value"], json!(0.0));
+        let got = svc
+            .get("agents.historyReplayToolContentChars")
+            .await
+            .expect("get");
+        assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
     }
 
     /// `server.maxOutstandingRpcs` is a non-secret TOML-backed bounded number
