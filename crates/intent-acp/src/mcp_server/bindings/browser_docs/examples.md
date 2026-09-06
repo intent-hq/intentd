@@ -163,8 +163,9 @@ state too: `{ reused: true, displayed: false, ... }` means the reuse handed you 
 hidden or inactive tab — `showTab` it, since a dedupe hit never changes visibility.
 
 `showTab` is owner-only (`not-owner` on a tab you do not own) and idempotent on an
-already-visible tab (`focus: true` still activates it); an unknown `tabId` fails as an
-action-result error. `focusTab` keeps its visible-tab semantics and fails on a hidden
+already-displayed tab (`focus: true` still focuses its panel); a visible-but-inactive
+tab is activated in place, not skipped. An unknown `tabId` fails as an action-result
+error. `focusTab` keeps its visible-tab semantics and fails on a hidden
 tab with an error pointing at `showTab`. Note that re-issuing
 `openTab { url, visible: true }` on a URL you already have hidden does NOT reveal it:
 a dedupe hit never changes the reused tab's visibility — use `showTab`.
