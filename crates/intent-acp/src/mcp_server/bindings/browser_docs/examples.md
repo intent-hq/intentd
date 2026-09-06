@@ -15,8 +15,8 @@ when targeting `http://daemon.localhost:8000`:
   ]
 }
 // A matching result may show the rewritten finalUrl instead of the requested alias.
-// Each tab carries its owner, sizing, and visibility info:
-// { tabId: "tab-abc123", url: "http://127.0.0.1:8000/", ownerAgentId: "<your-agent-id>", mode: "emulated", width: 1280, height: 800, visibility: "visible", ... }
+// Each tab carries its owner, sizing, visibility, and display info:
+// { tabId: "tab-abc123", url: "http://127.0.0.1:8000/", ownerAgentId: "<your-agent-id>", mode: "emulated", width: 1280, height: 800, visibility: "visible", displayed: true, ... }
 
 {
   "actions": [
@@ -45,7 +45,7 @@ Tabs are agent-owned: you can only manipulate tabs you own. To work in an unowne
   ]
 }
 // → tabs with ownerAgentId: null and native sizing:
-// { tabId: "tab-user1", url: "http://localhost:5173/", ownerAgentId: null, mode: "native", visibility: "visible", ... }
+// { tabId: "tab-user1", url: "http://localhost:5173/", ownerAgentId: null, mode: "native", visibility: "visible", displayed: true, ... }
 
 // Claim it — atomic, first-claim-wins; ownership transfer and viewport emulation
 // at the given size happen in one step
@@ -107,8 +107,8 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
     { "action": "screenshot", "tabId": "tab-bg1" }
   ]
 }
-// listTabs shows the tab with visibility: "hidden":
-// { tabId: "tab-bg1", url: "http://localhost:5173/", ownerAgentId: "<your-agent-id>", visibility: "hidden", ... }
+// listTabs shows the tab with visibility: "hidden" (hidden tabs are never displayed):
+// { tabId: "tab-bg1", url: "http://localhost:5173/", ownerAgentId: "<your-agent-id>", visibility: "hidden", displayed: false, ... }
 
 // Reveal it when the user should see it — activated in a visible panel without stealing focus
 {
@@ -124,13 +124,43 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
   ]
 }
 
-// Or open directly into the UI in the first place
+// Or open directly into the UI in the first place: the tab is activated in its
+// panel without stealing focus, and the result says whether it is painted.
 {
   "actions": [
     { "action": "openTab", "url": "http://localhost:5173", "visible": true }
   ]
 }
+// → { tabId: "tab-ui1", url: "http://localhost:5173/", displayed: true, ... }
 ```
+
+## Visible but Not Displayed
+
+`visibility: "visible"` means the tab is mounted in the user's panel layout; it does
+not mean the tab is painted. Only a panel's active tab renders, so a visible tab that
+the user (or another open) pushed behind a sibling is `displayed: false` — and a
+screenshot of it fails with a not-painting error. Check `displayed` and bring the tab
+to the front with `showTab` (no focus change) before capturing:
+
+```json
+{
+  "actions": [
+    { "action": "listTabs", "scope": "mine" }
+  ]
+}
+// → { tabId: "tab-ui1", url: "http://localhost:5173/", visibility: "visible", displayed: false, ... }
+
+{
+  "actions": [
+    { "action": "showTab", "tabId": "tab-ui1" },
+    { "action": "screenshot", "tabId": "tab-ui1" }
+  ]
+}
+```
+
+A `visible: true` open that dedupes onto an existing tab reports that tab's real
+state too: `{ reused: true, displayed: false, ... }` means the reuse handed you a
+hidden or inactive tab — `showTab` it, since a dedupe hit never changes visibility.
 
 `showTab` is owner-only (`not-owner` on a tab you do not own) and idempotent on an
 already-visible tab (`focus: true` still activates it); an unknown `tabId` fails as an
