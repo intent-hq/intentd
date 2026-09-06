@@ -33,6 +33,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
     AgentReverseDispatch, ClientId, ReverseDispatchError, ReverseTarget, WorkspaceApi, WorkspaceId,
+    CHIEF_WORKSPACE_ID,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -911,6 +912,324 @@ async fn client_events_keep_registry_order_across_reconnect_and_rehello() {
             .await
             .is_none(),
         "exactly one disconnect for the logical client"
+    );
+
+    fx.ws.stop().await;
+}
+
+/// The REV-2 per-workspace browser-client pin over the wire: `client.list`
+/// groups live connections per `clientId` with the per-client `browserExec`
+/// aggregate (an auxiliary socket without the capability does not mask the
+/// eligible one — the #1756 review follow-up); `workspace.getBrowserClient`
+/// / `setBrowserClient` read, persist, echo and announce the pin
+/// (`workspace:updated { changes: { browserClientId } }`, `browserClientId`
+/// on the `Workspace` payload); an agent `browser.exec` in a pinned
+/// workspace reaches the pinned client's eligible connection and, once that
+/// client is gone, fails with the typed pinned-offline message instead of
+/// falling back; the documented `-32602` rejections hold.
+#[tokio::test]
+async fn workspace_browser_client_pin_rpcs_over_wss() {
+    let fx = boot().await;
+    let mut a = connect(fx.port).await;
+    let _ = wss_rpc(&mut a, 1, "client.hello", hello("desktop-a", true)).await;
+    let mut b = connect(fx.port).await;
+    let _ = wss_rpc(&mut b, 1, "client.hello", hello("desktop-b", true)).await;
+    // desktop-b's newer auxiliary connection lacks the capability.
+    let mut aux = connect(fx.port).await;
+    let _ = wss_rpc(&mut aux, 1, "client.hello", hello("desktop-b", false)).await;
+    assert_eq!(fx.registry.len(), 3);
+
+    // client.list — grouped, ordered by first connection, aggregate capability.
+    let listed = wss_rpc(&mut a, 2, "client.list", json!({})).await;
+    let clients = listed["result"]["clients"]
+        .as_array()
+        .unwrap_or_else(|| panic!("clients array: {listed}"));
+    assert_eq!(clients.len(), 2, "{listed}");
+    assert_eq!(clients[0]["clientId"], "desktop-a");
+    assert_eq!(clients[0]["connections"], 1);
+    assert_eq!(clients[1]["clientId"], "desktop-b");
+    assert_eq!(clients[1]["name"], "Intent Desktop @ desktop-b");
+    assert_eq!(clients[1]["connections"], 2);
+    assert_eq!(clients[1]["transports"], json!(["wss", "wss"]));
+    assert_eq!(
+        clients[1]["capabilities"],
+        json!({ "browserExec": true }),
+        "the newer non-capable socket must not mask the eligible one"
+    );
+    assert!(clients[1]["connectedAt"].is_string());
+    let mut keys: Vec<&str> = clients[1]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "capabilities",
+            "clientId",
+            "connectedAt",
+            "connections",
+            "name",
+            "transports"
+        ]
+    );
+
+    let created = wss_rpc(
+        &mut a,
+        3,
+        "workspace.create",
+        json!({ "title": "Pinned browser" }),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("created id: {created}"))
+        .to_string();
+    assert!(
+        created["result"]["workspace"]
+            .get("browserClientId")
+            .is_none(),
+        "unpinned workspaces omit browserClientId: {created}"
+    );
+
+    // Unpinned: default source, resolved = first-connected eligible client.
+    let got = wss_rpc(
+        &mut a,
+        4,
+        "workspace.getBrowserClient",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        got["result"],
+        json!({ "browserClient": {
+            "source": "default",
+            "resolved": { "clientId": "desktop-a", "name": "Intent Desktop @ desktop-a" }
+        } }),
+        "{got}"
+    );
+
+    let mut sub = connect(fx.port).await;
+    let ack = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:updated"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
+
+    // Pin desktop-b: the setter echoes the get shape and announces the delta.
+    let set = wss_rpc(
+        &mut a,
+        5,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": ws_id, "clientId": "desktop-b" }),
+    )
+    .await;
+    let pinned_state = json!({
+        "clientId": "desktop-b",
+        "source": "workspace",
+        "resolved": { "clientId": "desktop-b", "name": "Intent Desktop @ desktop-b" }
+    });
+    assert_eq!(
+        set["result"],
+        json!({ "browserClient": pinned_state }),
+        "{set}"
+    );
+    let ev = await_event(&mut sub, "workspace:updated", Duration::from_secs(5)).await;
+    assert_eq!(ev["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        ev["data"]["changes"],
+        json!({ "browserClientId": "desktop-b" })
+    );
+    let got = wss_rpc(
+        &mut a,
+        6,
+        "workspace.getBrowserClient",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(got["result"]["browserClient"], pinned_state);
+    let ws_row = wss_rpc(&mut a, 7, "workspace.get", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(
+        ws_row["result"]["workspace"]["browserClientId"],
+        "desktop-b"
+    );
+
+    // An agent browser.exec in the pinned workspace reaches desktop-b's
+    // eligible connection (`b`), not `a` and not the auxiliary socket.
+    let call = tokio::spawn({
+        let api = fx.api.clone();
+        let ws_id = ws_id.clone();
+        async move {
+            api.browser_exec(
+                WorkspaceId::from(ws_id.as_str()),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+            .await
+        }
+    });
+    let fe_result = json!({
+        "success": true,
+        "results": [{ "action": "listTabs", "success": true, "result": [] }]
+    });
+    let forwarded = answer_reverse(&mut b, Duration::from_secs(2), fe_result).await;
+    assert_eq!(forwarded["params"]["workspaceId"], ws_id.as_str());
+    let out = call.await.expect("join").expect("ok");
+    assert_eq!(out["action"], "listTabs");
+    for (name, sock) in [("a", &mut a), ("aux", &mut aux)] {
+        assert!(
+            try_read_text(sock, Duration::from_millis(200))
+                .await
+                .is_none(),
+            "{name} must not see a dispatch pinned to desktop-b's eligible connection"
+        );
+    }
+
+    // Documented rejections — all -32602, none of them touch the pin.
+    let ghost = wss_rpc(
+        &mut a,
+        8,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": ws_id, "clientId": "ghost" }),
+    )
+    .await;
+    assert_eq!(ghost["error"]["code"], -32602, "{ghost}");
+    assert!(
+        ghost["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("ghost")),
+        "{ghost}"
+    );
+    let chief = wss_rpc(
+        &mut a,
+        9,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID, "clientId": "desktop-a" }),
+    )
+    .await;
+    assert_eq!(chief["error"]["code"], -32602, "{chief}");
+    let missing_param = wss_rpc(
+        &mut a,
+        10,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(missing_param["error"]["code"], -32602);
+    assert_eq!(
+        missing_param["error"]["message"],
+        "Missing required parameter: clientId (string | null)"
+    );
+    let wrong_type = wss_rpc(
+        &mut a,
+        11,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": ws_id, "clientId": 42 }),
+    )
+    .await;
+    assert_eq!(wrong_type["error"]["code"], -32602);
+    assert_eq!(
+        wrong_type["error"]["message"],
+        "Invalid parameter: clientId must be a non-empty string or null"
+    );
+    for (id, method) in [
+        (12, "workspace.getBrowserClient"),
+        (13, "workspace.setBrowserClient"),
+    ] {
+        let unknown = wss_rpc(
+            &mut a,
+            id,
+            method,
+            json!({ "workspaceId": "ws-none", "clientId": null }),
+        )
+        .await;
+        assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
+        assert_eq!(unknown["error"]["message"], "Workspace not found");
+    }
+    let got = wss_rpc(
+        &mut a,
+        14,
+        "workspace.getBrowserClient",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["browserClient"], pinned_state,
+        "pin untouched"
+    );
+
+    // desktop-b goes away entirely: the pin stays, resolves to null, and an
+    // agent browser.exec is a hard error naming the persisted client — no
+    // silent fallback to desktop-a.
+    close_and_await_deregistration(b, &fx.registry, 3).await;
+    close_and_await_deregistration(aux, &fx.registry, 2).await;
+    let got = wss_rpc(
+        &mut a,
+        15,
+        "workspace.getBrowserClient",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["browserClient"],
+        json!({ "clientId": "desktop-b", "source": "workspace", "resolved": null }),
+        "{got}"
+    );
+    let err = fx
+        .api
+        .browser_exec(
+            WorkspaceId::from(ws_id.as_str()),
+            vec![json!({ "action": "listTabs" })],
+            None,
+            None,
+        )
+        .await
+        .expect_err("pinned client offline");
+    assert!(
+        matches!(
+            &err,
+            intent_core::Error::Internal(m)
+                if m == "browser.exec: pinned browser client \"Intent Desktop @ desktop-b\" (desktop-b) is not connected"
+        ),
+        "-32603 with the pinned-offline message: {err:?}"
+    );
+    assert!(
+        try_read_text(&mut a, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "no silent fallback to desktop-a"
+    );
+
+    // Clearing with null returns the workspace to the default client.
+    let cleared = wss_rpc(
+        &mut a,
+        16,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": ws_id, "clientId": null }),
+    )
+    .await;
+    assert_eq!(
+        cleared["result"],
+        json!({ "browserClient": {
+            "source": "default",
+            "resolved": { "clientId": "desktop-a", "name": "Intent Desktop @ desktop-a" }
+        } }),
+        "{cleared}"
+    );
+    let ev = await_event(&mut sub, "workspace:updated", Duration::from_secs(5)).await;
+    assert_eq!(ev["data"]["changes"], json!({ "browserClientId": null }));
+    let ws_row = wss_rpc(&mut a, 17, "workspace.get", json!({ "workspaceId": ws_id })).await;
+    assert!(
+        ws_row["result"]["workspace"]
+            .get("browserClientId")
+            .is_none(),
+        "{ws_row}"
     );
 
     fx.ws.stop().await;

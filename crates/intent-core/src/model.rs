@@ -298,6 +298,12 @@ pub struct Workspace {
     /// `worktreePath`, non-git repo paths, pre-existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_mode: Option<CheckoutMode>,
+    /// Per-workspace browser-client pin (REV-2): the logical `clientId`
+    /// agent-initiated `browser.exec` requests for this workspace are routed
+    /// to (`workspace.setBrowserClient`). Omitted (not `null`) when unpinned
+    /// — the first-connected eligible client then serves the workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_client_id: Option<ClientId>,
     /// Disk footprint of the daemon-managed workspace directory
     /// (`<workspaces_root>/<workspaceId>`: repo checkout, tool-outputs, agent
     /// sandboxes, everything). Never populated on `workspace.list` /
@@ -433,6 +439,7 @@ pub fn chief_workspace() -> Workspace {
         waiting: false,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -5112,6 +5119,7 @@ mod tests {
             waiting: false,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

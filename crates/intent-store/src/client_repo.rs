@@ -2,12 +2,8 @@
 //! that survives reconnects, persisted by the `client.hello` handshake. The
 //! ephemeral per-connection id is transport-only and never stored here.
 
-#[cfg(test)]
-use intent_core::Client;
-use intent_core::{now_iso, ClientId, Error, Result};
-#[cfg(test)]
+use intent_core::{now_iso, Client, ClientId, Error, Result};
 use sqlx::sqlite::SqliteRow;
-#[cfg(test)]
 use sqlx::Row;
 
 use crate::Store;
@@ -51,9 +47,14 @@ impl Store {
         Ok(())
     }
 
-    /// Fetch a logical client by id (used by tests + diagnostics).
-    #[cfg(test)]
-    pub(crate) async fn get_client(&self, id: &ClientId) -> Result<Option<Client>> {
+    /// Fetch a logical client by id — `None` when it never completed a
+    /// `client.hello` (the `workspace.setBrowserClient` "never seen" guard
+    /// and the offline-pin display name lookup).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_client(&self, id: &ClientId) -> Result<Option<Client>> {
         let row = sqlx::query(
             "SELECT id, name, capabilities, first_seen, last_seen FROM client WHERE id = ?",
         )
@@ -65,7 +66,6 @@ impl Store {
     }
 }
 
-#[cfg(test)]
 fn map_client_row(r: &SqliteRow) -> Result<Client> {
     let caps_text: String = r.get("capabilities");
     let capabilities = serde_json::from_str(&caps_text)

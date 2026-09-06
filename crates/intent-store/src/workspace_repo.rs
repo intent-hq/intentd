@@ -1,8 +1,8 @@
 //! Workspace repository: insert + list, mapping rows ↔ [`Workspace`] (§9.2).
 
 use intent_core::{
-    now_iso, CheckoutMode, ContextLink, Error, PullRequestInfo, Result, SetupScript, TokenUsage,
-    Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, CheckoutMode, ClientId, ContextLink, Error, PullRequestInfo, Result, SetupScript,
+    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
     CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
@@ -17,7 +17,8 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     status_message, status_image_asset_id, attention, path, repository_path, repository_owner, \
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
-    tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode";
+    tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
+    browser_client_id";
 
 /// SQL behind [`Store::clear_workspace_unread_if_all_seen`], extracted so the
 /// monorepo#4190 plan-shape guard runs `EXPLAIN` on the exact production
@@ -61,7 +62,7 @@ impl Store {
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -97,6 +98,7 @@ impl Store {
             .bind(token_usage_to_db(ws)?)
             .bind(setup_script_to_db(ws)?)
             .bind(checkout_mode_to_db(ws)?)
+            .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
             .bind(auto_commit.map(i64::from))
             .execute(self.write_pool())
             .await
@@ -148,7 +150,7 @@ impl Store {
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
                OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
-             token_usage=?, setup_script=?, checkout_mode=? WHERE id=?",
+             token_usage=?, setup_script=?, checkout_mode=?, browser_client_id=? WHERE id=?",
         )
         .bind(&ws.title)
         .bind(&ws.branch)
@@ -184,6 +186,7 @@ impl Store {
         .bind(token_usage_to_db(ws)?)
         .bind(setup_script_to_db(ws)?)
         .bind(checkout_mode_to_db(ws)?)
+        .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
         .bind(&ws.id.0)
         .execute(self.write_pool())
         .await
@@ -674,6 +677,48 @@ impl Store {
         }
     }
 
+    /// Scoped write of the per-workspace browser-client pin (REV-2,
+    /// `workspace.setBrowserClient`): `None` clears it. Never a full-row
+    /// replace, so a concurrent `workspace.update` cannot be clobbered.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_browser_client(
+        &self,
+        id: &WorkspaceId,
+        client_id: Option<&ClientId>,
+    ) -> Result<()> {
+        let res = sqlx::query("UPDATE workspace SET browser_client_id = ? WHERE id = ?")
+            .bind(client_id.map(|c| c.0.as_str()))
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set browser_client_id failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(())
+    }
+
+    /// The persisted per-workspace browser-client pin; `Ok(None)` when
+    /// unpinned. `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn workspace_browser_client(&self, id: &WorkspaceId) -> Result<Option<ClientId>> {
+        let row = sqlx::query("SELECT browser_client_id FROM workspace WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get browser_client_id failed: {e}")))?;
+        match row {
+            Some(r) => Ok(col::<Option<String>>(&r, "browser_client_id")?.map(ClientId)),
+            None => Err(Error::NotFound(format!("workspace {id}"))),
+        }
+    }
+
     /// List workspaces, filtering archived rows unless `include_archived`.
     /// The seeded virtual [`CHIEF_WORKSPACE_ID`] row is always excluded — Chief
     /// is synthesized on read by the service layer and never surfaces via
@@ -876,6 +921,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         // cow_supported is computed on the emit path (intent-services), never persisted.
         cow_supported: None,
         checkout_mode,
+        browser_client_id: col::<Option<String>>(row, "browser_client_id")?.map(ClientId),
         // disk_usage is computed on the emit path (intent-services), never persisted.
         disk_usage: None,
         pending_delete_at: None,

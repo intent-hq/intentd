@@ -8,9 +8,9 @@
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate, NoteEditInput,
-    NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, TaskAgentLink,
-    WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId, WorkspaceUpdate,
+    ClientId, ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate,
+    NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode,
+    TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId, WorkspaceUpdate,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -622,6 +622,42 @@ async fn dispatch(
                 .await
                 .map_err(workspace_err)?;
             Ok(json!({ "autoCommit": auto_commit }))
+        }
+        "client.list" => {
+            let clients = api.client_list().await.map_err(workspace_err)?;
+            Ok(json!({ "clients": clients }))
+        }
+        "workspace.getBrowserClient" => {
+            let id = require_workspace_id(params)?;
+            let browser_client = api
+                .get_workspace_browser_client(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "browserClient": browser_client }))
+        }
+        "workspace.setBrowserClient" => {
+            let id = require_workspace_id(params)?;
+            let client_id = match params.get("clientId") {
+                Some(Value::String(s)) if !s.trim().is_empty() => {
+                    Some(ClientId::from_string(s.clone()))
+                }
+                Some(Value::Null) => None,
+                Some(_) => {
+                    return Err(invalid_params(
+                        "Invalid parameter: clientId must be a non-empty string or null",
+                    ))
+                }
+                None => {
+                    return Err(invalid_params(
+                        "Missing required parameter: clientId (string | null)",
+                    ))
+                }
+            };
+            let browser_client = api
+                .set_workspace_browser_client(id, client_id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "browserClient": browser_client }))
         }
         "workspace.getSetupScript" => {
             let id = require_workspace_id(params)?;

@@ -1104,6 +1104,7 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -1216,7 +1217,9 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 ///
 /// - **workspace**: `worktree_path`, `repository_path`, and `path` are
 ///   rewritten under `<target_root>/<workspaceId>/`; PR linkage columns are
-///   kept (monitors re-poll).
+///   kept (monitors re-poll); `browser_client_id` is nulled — it names a
+///   client of the source daemon (the `client` table never transfers), so
+///   the imported workspace starts unpinned.
 /// - **`agent_session`**: `acp_session_id` / `backend_session_id` nulled (no
 ///   stale resume, ACP sessions are process-local), `is_active` forced 0;
 ///   in-flight statuses (`active`/`Processing`/`Waiting`) become `idle` with
@@ -1261,6 +1264,9 @@ fn transform_rows(
                         if Path::new(value.as_str()).is_absolute() {
                             *value = ws_dir.to_string_lossy().to_string();
                         }
+                    }
+                    if map.contains_key("browser_client_id") {
+                        map.insert("browser_client_id".into(), serde_json::Value::Null);
                     }
                 }
             }
@@ -1451,6 +1457,23 @@ mod tests {
         assert_eq!(row["worktree_path"], "/target/workspaces/ws-import/repo");
         assert_eq!(row["repository_path"], "/target/workspaces/ws-import/repo");
         assert_eq!(row["path"], "/target/workspaces/ws-import");
+    }
+
+    /// The browser-client pin names a source-daemon client (the `client`
+    /// table never transfers), so the imported workspace starts unpinned;
+    /// archives predating the column import untouched.
+    #[test]
+    fn transform_nulls_workspace_browser_client_pin() {
+        let outcome = transform_one(
+            "workspace",
+            serde_json::json!({ "id": "ws-import", "browser_client_id": "desktop-a" }),
+        );
+        let row = &find(&outcome, "workspace")[0];
+        assert_eq!(row["browser_client_id"], serde_json::Value::Null);
+
+        let outcome = transform_one("workspace", serde_json::json!({ "id": "ws-import" }));
+        let row = &find(&outcome, "workspace")[0];
+        assert!(row.get("browser_client_id").is_none());
     }
 
     /// Relative / null path values are left untouched by the rewrite.

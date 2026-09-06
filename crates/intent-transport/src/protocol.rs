@@ -382,12 +382,24 @@
 //! after explicit user consent. The catalog contains 300 router methods,
 //! 43 fast-path methods, and two aliases: 345 client-callable names.
 //! The five reverse methods are counted separately.
+//!
+//! Version 9.9 adds the REV-2 per-workspace browser-client pin. `client.list`
+//! (global) reports live hello'd connections grouped by `clientId`, a client
+//! counting as `browserExec`-capable when ANY of its live connections
+//! advertises it; `workspace.getBrowserClient` / `workspace.setBrowserClient`
+//! read and persist the pin (`Workspace.browserClientId`, omitted when
+//! unset; `-32602` for Chief / unknown workspace / never-hello'd clientId;
+//! `workspace:updated { changes: { browserClientId } }`). Agent-initiated
+//! `browser.exec` dispatches to the pinned client when set — pinned but
+//! offline is `-32603`, never a silent fallback. The catalog grows by three
+//! router methods — 303 router methods, 43 fast-path, two aliases: 348
+//! client-callable names.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.8";
+pub const PROTOCOL_VERSION: &str = "9.9";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

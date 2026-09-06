@@ -81,6 +81,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -103,7 +104,7 @@ async fn migration_status_reports_current_after_open() {
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112, 113, 114
+            110, 111, 112, 113, 114, 116
         ]
     );
     assert_eq!(
@@ -114,7 +115,7 @@ async fn migration_status_reports_current_after_open() {
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112, 113, 114
+            110, 111, 112, 113, 114, 116
         ]
     );
 }
@@ -4756,6 +4757,66 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
         .is_none());
 }
 
+/// REV-2 per-workspace browser-client pin: NULL (unpinned) by default, a
+/// scoped set/clear round-trips, the column rides `Workspace` reads and the
+/// full-row `update_workspace`, and an unknown workspace is `NotFound`.
+#[tokio::test]
+async fn workspace_browser_client_pin_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    let ws = sample_workspace(&ws_id, "Pinned", false);
+    store.insert_workspace(&ws).await.expect("insert");
+
+    assert_eq!(store.workspace_browser_client(&ws_id).await.unwrap(), None);
+    assert_eq!(
+        store.get_workspace(&ws_id).await.unwrap().browser_client_id,
+        None
+    );
+
+    let desktop = ClientId::from_string("desktop-b");
+    store
+        .set_workspace_browser_client(&ws_id, Some(&desktop))
+        .await
+        .expect("pin");
+    assert_eq!(
+        store.workspace_browser_client(&ws_id).await.unwrap(),
+        Some(desktop.clone())
+    );
+    let loaded = store.get_workspace(&ws_id).await.unwrap();
+    assert_eq!(loaded.browser_client_id, Some(desktop.clone()));
+    let json = serde_json::to_value(&loaded).unwrap();
+    assert_eq!(json["browserClientId"], "desktop-b");
+
+    // The full-row update carries the pin unchanged.
+    store.update_workspace(&loaded).await.expect("update");
+    assert_eq!(
+        store.workspace_browser_client(&ws_id).await.unwrap(),
+        Some(desktop)
+    );
+
+    store
+        .set_workspace_browser_client(&ws_id, None)
+        .await
+        .expect("clear");
+    assert_eq!(store.workspace_browser_client(&ws_id).await.unwrap(), None);
+    let json = serde_json::to_value(store.get_workspace(&ws_id).await.unwrap()).unwrap();
+    assert!(
+        json.get("browserClientId").is_none(),
+        "unpinned workspaces omit browserClientId: {json}"
+    );
+
+    let missing = WorkspaceId::new();
+    assert!(matches!(
+        store.workspace_browser_client(&missing).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        store.set_workspace_browser_client(&missing, None).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
 #[tokio::test]
 async fn draft_round_trip_upsert_get_delete() {
     let tmp = TempDb::new();
@@ -5450,6 +5511,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     diff_summary: None,
                     token_usage: None,
                     cow_supported: None,
+                    browser_client_id: None,
                     display_status: None,
                     waiting: false,
                     checkout_mode: None,

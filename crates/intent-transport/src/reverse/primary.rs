@@ -37,9 +37,10 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub use intent_core::ResolvedClient;
 use intent_core::{
-    now_iso, AgentReverseDispatch, BoxFuture, ClientId, ReverseDispatchError, ReverseTarget,
-    WorkspaceApi, WorkspaceId,
+    now_iso, AgentReverseDispatch, BoxFuture, ClientId, ReverseDispatchError, ReverseLiveClient,
+    ReverseTarget, WorkspaceApi, WorkspaceId,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -141,26 +142,43 @@ impl ClientTransition {
 }
 
 /// One logical client as seen by [`PrimaryReverseRegistry::live_clients`]:
-/// every hello'd connection sharing a `clientId`, grouped. `name` and
-/// `capabilities` come from the newest connection's hello; `connected_at` is
-/// the ISO-8601 registration time of the oldest live connection.
+/// every hello'd connection sharing a `clientId`, grouped. `name` comes from
+/// the newest connection's hello; `capabilities` is the newest hello's bag
+/// with `browserExec` replaced by the per-client aggregate `browser_exec`
+/// (true when ANY live connection advertises it — see the module docs);
+/// `connected_at` is the ISO-8601 registration time of the oldest live
+/// connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveClient {
     pub client_id: ClientId,
     pub name: Option<String>,
     pub capabilities: Value,
+    /// Whether any live connection of this client is `browserExec`-eligible
+    /// — the same predicate `resolve` / `dispatch` route on.
+    pub browser_exec: bool,
     pub connections: usize,
     /// One entry per live connection, oldest first.
     pub transports: Vec<ReverseTransport>,
     pub connected_at: String,
 }
 
-/// The client a [`ReverseTarget`] resolved to (see
-/// [`PrimaryReverseRegistry::resolve`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedClient {
-    pub client_id: ClientId,
-    pub name: Option<String>,
+impl LiveClient {
+    /// The `client.list` wire projection.
+    #[must_use]
+    pub fn to_wire(&self) -> ReverseLiveClient {
+        ReverseLiveClient {
+            client_id: self.client_id.clone(),
+            name: self.name.clone(),
+            capabilities: self.capabilities.clone(),
+            connections: self.connections,
+            transports: self
+                .transports
+                .iter()
+                .map(|t| t.as_str().to_string())
+                .collect(),
+            connected_at: self.connected_at.clone(),
+        }
+    }
 }
 
 /// Registry of live reverse channels ordered by arrival. Cheap to clone
@@ -348,7 +366,10 @@ impl PrimaryReverseRegistry {
     /// Live hello'd connections grouped by `clientId`, ordered by each
     /// client's first connection. Un-hello'd connections are omitted;
     /// ineligible (no `browserExec`) clients are included — this is the
-    /// `client.list` projection, not the eligibility set.
+    /// `client.list` projection, not the eligibility set. Per client,
+    /// `browser_exec` (and the projected `capabilities.browserExec`) is the
+    /// OR over its live connections, so it agrees with what `resolve` routes
+    /// to regardless of hello order.
     ///
     /// # Panics
     ///
@@ -368,6 +389,7 @@ impl PrimaryReverseRegistry {
                 Some(client) => {
                     client.connections += 1;
                     client.transports.push(entry.transport);
+                    client.browser_exec |= identity.browser_exec();
                     // Newest hello wins for the display fields.
                     client.name.clone_from(&identity.name);
                     client.capabilities.clone_from(&identity.capabilities);
@@ -376,11 +398,22 @@ impl PrimaryReverseRegistry {
                     client_id: identity.client_id.clone(),
                     name: identity.name.clone(),
                     capabilities: identity.capabilities.clone(),
+                    browser_exec: identity.browser_exec(),
                     connections: 1,
                     transports: vec![entry.transport],
                     connected_at: entry.connected_at.clone(),
                 }),
             }
+        }
+        for client in &mut clients {
+            let bag = match &mut client.capabilities {
+                Value::Object(map) => map,
+                other => {
+                    *other = Value::Object(serde_json::Map::new());
+                    other.as_object_mut().expect("just set an object")
+                }
+            };
+            bag.insert("browserExec".into(), Value::Bool(client.browser_exec));
         }
         clients
     }
@@ -440,6 +473,17 @@ impl PrimaryReverseRegistry {
 impl AgentReverseDispatch for PrimaryReverseRegistry {
     fn is_connected(&self) -> bool {
         self.primary().is_some()
+    }
+
+    fn resolve(&self, target: &ReverseTarget) -> Result<ResolvedClient, ReverseDispatchError> {
+        PrimaryReverseRegistry::resolve(self, target)
+    }
+
+    fn live_clients(&self) -> Vec<ReverseLiveClient> {
+        PrimaryReverseRegistry::live_clients(self)
+            .iter()
+            .map(LiveClient::to_wire)
+            .collect()
     }
 
     fn dispatch<'a>(

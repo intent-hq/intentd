@@ -194,6 +194,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -22629,6 +22630,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true),
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -22775,6 +22777,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true),
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -22912,6 +22915,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -23044,6 +23048,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(false), // CoW not supported!
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -23175,6 +23180,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // CoW capable!
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -23311,6 +23317,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -24187,6 +24194,7 @@ mod known_repo {
             agent_summary: None,
             diff_summary: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -30631,6 +30639,373 @@ mod browser_exec_reverse {
             .await
             .expect_err("no per-action detail to preserve");
         assert!(matches!(err, Error::Internal(m) if m.contains("CDP not attached")));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REV-2: per-workspace browser-client pin — `client.list`,
+// `workspace.getBrowserClient` / `setBrowserClient`, and the target
+// `browser_exec` dispatches with (unpinned / pinned live / pinned offline /
+// no eligible client).
+// ---------------------------------------------------------------------------
+mod browser_client_pin {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use intent_core::{
+        AgentReverseDispatch, BoxFuture, ClientId, Error, ResolvedClient, ReverseDispatchError,
+        ReverseLiveClient, ReverseTarget, WorkspaceApi, WorkspaceId, CHIEF_WORKSPACE_ID,
+    };
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::{workspace, TempDb, WorkspacesRoot};
+    use crate::{EventBus, Services, SubscriptionFilter};
+
+    /// A dispatcher with a fixed set of live clients: `browser_exec == true`
+    /// entries are eligible. `Default` resolves to the first eligible
+    /// client; `Client` / `Pinned` to the named client when eligible.
+    struct FakeRegistry {
+        clients: Vec<(ClientId, Option<String>, bool)>,
+        calls: Mutex<Vec<(String, Value, ReverseTarget)>>,
+    }
+
+    impl FakeRegistry {
+        fn new(clients: &[(&str, Option<&str>, bool)]) -> Arc<Self> {
+            Arc::new(Self {
+                clients: clients
+                    .iter()
+                    .map(|(id, name, eligible)| {
+                        (
+                            ClientId::from_string(*id),
+                            name.map(str::to_string),
+                            *eligible,
+                        )
+                    })
+                    .collect(),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl AgentReverseDispatch for FakeRegistry {
+        fn is_connected(&self) -> bool {
+            self.clients.iter().any(|c| c.2)
+        }
+        fn resolve(&self, target: &ReverseTarget) -> Result<ResolvedClient, ReverseDispatchError> {
+            let found = match target {
+                ReverseTarget::Default => self.clients.iter().find(|c| c.2),
+                ReverseTarget::Client(id) | ReverseTarget::Pinned(id) => {
+                    self.clients.iter().find(|c| &c.0 == id && c.2)
+                }
+            };
+            match (found, target) {
+                (Some(c), _) => Ok(ResolvedClient {
+                    client_id: c.0.clone(),
+                    name: c.1.clone(),
+                }),
+                (None, ReverseTarget::Default) => Err(ReverseDispatchError::NoClient),
+                (None, ReverseTarget::Client(id) | ReverseTarget::Pinned(id)) => {
+                    Err(ReverseDispatchError::ClientOffline {
+                        client_id: id.clone(),
+                        name: self
+                            .clients
+                            .iter()
+                            .find(|c| &c.0 == id)
+                            .and_then(|c| c.1.clone()),
+                        pinned: matches!(target, ReverseTarget::Pinned(_)),
+                    })
+                }
+            }
+        }
+        fn live_clients(&self) -> Vec<ReverseLiveClient> {
+            self.clients
+                .iter()
+                .map(|(id, name, eligible)| ReverseLiveClient {
+                    client_id: id.clone(),
+                    name: name.clone(),
+                    capabilities: json!({ "browserExec": eligible }),
+                    connections: 1,
+                    transports: vec!["wss".to_string()],
+                    connected_at: "2026-09-06T00:00:00Z".to_string(),
+                })
+                .collect()
+        }
+        fn dispatch<'a>(
+            &'a self,
+            method: &'a str,
+            params: Value,
+            target: ReverseTarget,
+        ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params, target.clone()));
+            let resolved = self.resolve(&target).map(|r| {
+                json!({
+                    "success": true,
+                    "results": [{ "action": "listTabs", "success": true, "result": { "host": r.client_id } }],
+                })
+            });
+            Box::pin(async move { resolved })
+        }
+    }
+
+    async fn setup(
+        registry: Arc<FakeRegistry>,
+    ) -> (TempDb, WorkspacesRoot, Services, EventBus, WorkspaceId) {
+        let tmp = TempDb::new();
+        let root = WorkspacesRoot::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        // Both clients have hello'd at some point (persisted `client` rows).
+        for (id, name) in [("desktop-a", "Desktop A"), ("desktop-b", "Desktop B")] {
+            store
+                .upsert_client(
+                    &ClientId::from_string(id),
+                    Some(name),
+                    Some(&json!({ "browserExec": true })),
+                )
+                .await
+                .expect("client");
+        }
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.path().to_path_buf())
+            .with_event_bus(bus.clone())
+            .with_reverse_dispatch(registry);
+        (tmp, root, svc, bus, ws)
+    }
+
+    fn actions() -> Vec<Value> {
+        vec![json!({ "action": "listTabs" })]
+    }
+
+    #[tokio::test]
+    async fn client_list_projects_live_clients() {
+        let reg =
+            FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true), ("aux", None, false)]);
+        let (_t, _r, svc, _bus, _ws) = setup(reg).await;
+        let clients = svc.client_list().await.expect("list");
+        let wire = serde_json::to_value(&clients).unwrap();
+        assert_eq!(
+            wire,
+            json!([
+                {
+                    "clientId": "desktop-a", "name": "Desktop A",
+                    "capabilities": { "browserExec": true }, "connections": 1,
+                    "transports": ["wss"], "connectedAt": "2026-09-06T00:00:00Z"
+                },
+                {
+                    "clientId": "aux",
+                    "capabilities": { "browserExec": false }, "connections": 1,
+                    "transports": ["wss"], "connectedAt": "2026-09-06T00:00:00Z"
+                }
+            ]),
+            "name is omitted (not null) when the hello carried none"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_list_is_empty_without_a_dispatcher() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store);
+        assert!(svc.client_list().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn unpinned_workspace_reports_default_and_dispatches_default() {
+        let reg = FakeRegistry::new(&[
+            ("desktop-a", Some("Desktop A"), true),
+            ("desktop-b", Some("Desktop B"), true),
+        ]);
+        let (_t, _r, svc, _bus, ws) = setup(reg.clone()).await;
+        let state = svc.get_workspace_browser_client(ws.clone()).await.unwrap();
+        assert_eq!(
+            state,
+            json!({
+                "source": "default",
+                "resolved": { "clientId": "desktop-a", "name": "Desktop A" }
+            }),
+            "clientId is omitted when unpinned"
+        );
+        let out = svc
+            .browser_exec(ws.clone(), actions(), None, None)
+            .await
+            .expect("dispatch");
+        assert_eq!(out["result"]["host"], "desktop-a");
+        assert_eq!(reg.calls.lock().unwrap()[0].2, ReverseTarget::Default);
+    }
+
+    #[tokio::test]
+    async fn no_eligible_client_resolves_null_and_dispatch_says_no_client() {
+        let reg = FakeRegistry::new(&[("aux", None, false)]);
+        let (_t, _r, svc, _bus, ws) = setup(reg).await;
+        let state = svc.get_workspace_browser_client(ws.clone()).await.unwrap();
+        assert_eq!(state, json!({ "source": "default", "resolved": null }));
+        let err = svc
+            .browser_exec(ws, actions(), None, None)
+            .await
+            .expect_err("nothing eligible");
+        assert!(matches!(err, Error::Internal(m) if m == "browser.exec: no client connected"));
+    }
+
+    #[tokio::test]
+    async fn pinned_live_client_is_reported_and_dispatched_to() {
+        let reg = FakeRegistry::new(&[
+            ("desktop-a", Some("Desktop A"), true),
+            ("desktop-b", Some("Desktop B"), true),
+        ]);
+        let (_t, _r, svc, bus, ws) = setup(reg.clone()).await;
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(ws.0.clone()),
+            ..Default::default()
+        });
+
+        let echoed = svc
+            .set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-b")))
+            .await
+            .expect("pin");
+        let expected = json!({
+            "clientId": "desktop-b",
+            "source": "workspace",
+            "resolved": { "clientId": "desktop-b", "name": "Desktop B" }
+        });
+        assert_eq!(echoed, expected, "set echoes the get shape");
+        assert_eq!(
+            svc.get_workspace_browser_client(ws.clone()).await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            svc.get_workspace(ws.clone())
+                .await
+                .unwrap()
+                .browser_client_id,
+            Some(ClientId::from_string("desktop-b")),
+            "the pin rides the Workspace payload"
+        );
+
+        // `workspace:updated` carries the self-sufficient delta.
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        let ev = serde_json::to_value(&batch[0]).unwrap();
+        assert_eq!(ev["type"], "workspace:updated");
+        assert_eq!(
+            ev["data"]["changes"],
+            json!({ "browserClientId": "desktop-b" })
+        );
+
+        // Dispatch goes to the pin, not the first-connected client.
+        let out = svc
+            .browser_exec(ws.clone(), actions(), None, None)
+            .await
+            .expect("dispatch");
+        assert_eq!(out["result"]["host"], "desktop-b");
+        assert_eq!(
+            reg.calls.lock().unwrap()[0].2,
+            ReverseTarget::Pinned(ClientId::from_string("desktop-b"))
+        );
+
+        // Clearing with `null` returns to the default and echoes `null` in
+        // the change delta.
+        let cleared = svc
+            .set_workspace_browser_client(ws.clone(), None)
+            .await
+            .expect("clear");
+        assert_eq!(
+            cleared,
+            json!({
+                "source": "default",
+                "resolved": { "clientId": "desktop-a", "name": "Desktop A" }
+            })
+        );
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        let ev = serde_json::to_value(&batch[0]).unwrap();
+        assert_eq!(ev["data"]["changes"], json!({ "browserClientId": null }));
+        assert_eq!(svc.get_workspace(ws).await.unwrap().browser_client_id, None);
+    }
+
+    #[tokio::test]
+    async fn pinned_offline_client_is_a_hard_error_not_a_fallback() {
+        // desktop-b hello'd before (client row exists) but is not live now.
+        let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
+        let (_t, _r, svc, _bus, ws) = setup(reg.clone()).await;
+        let echoed = svc
+            .set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-b")))
+            .await
+            .expect("an offline-but-known client can be pinned");
+        assert_eq!(
+            echoed,
+            json!({ "clientId": "desktop-b", "source": "workspace", "resolved": null })
+        );
+        let err = svc
+            .browser_exec(ws, actions(), None, None)
+            .await
+            .expect_err("pinned offline");
+        assert!(
+            matches!(
+                &err,
+                Error::Internal(m)
+                    if m == "browser.exec: pinned browser client \"Desktop B\" (desktop-b) is not connected"
+            ),
+            "the offline name comes from the persisted client row: {err:?}"
+        );
+        // The first-connected client was never consulted.
+        assert_eq!(
+            reg.calls.lock().unwrap()[0].2,
+            ReverseTarget::Pinned(ClientId::from_string("desktop-b"))
+        );
+    }
+
+    #[tokio::test]
+    async fn set_rejects_never_seen_client_chief_and_unknown_workspace() {
+        let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
+        let (_t, _r, svc, _bus, ws) = setup(reg).await;
+        let err = svc
+            .set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("ghost")))
+            .await
+            .expect_err("never hello'd");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("ghost")));
+        assert_eq!(
+            svc.get_workspace(ws.clone())
+                .await
+                .unwrap()
+                .browser_client_id,
+            None,
+            "a rejected set leaves the pin untouched"
+        );
+
+        let chief = WorkspaceId::from(CHIEF_WORKSPACE_ID);
+        let err = svc
+            .set_workspace_browser_client(chief.clone(), Some(ClientId::from_string("desktop-a")))
+            .await
+            .expect_err("chief");
+        assert!(matches!(err, Error::InvalidParams(_)));
+        assert_eq!(
+            svc.get_workspace_browser_client(chief).await.unwrap(),
+            json!({
+                "source": "default",
+                "resolved": { "clientId": "desktop-a", "name": "Desktop A" }
+            }),
+            "chief always reads as the default"
+        );
+
+        let missing = WorkspaceId::from("ws-none");
+        assert!(matches!(
+            svc.get_workspace_browser_client(missing.clone()).await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            svc.set_workspace_browser_client(missing, None).await,
+            Err(Error::NotFound(_))
+        ));
     }
 }
 

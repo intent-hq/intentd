@@ -445,6 +445,56 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `client.list` (REV-2, global): live hello'd connections grouped by
+    /// `clientId` — `[{ clientId, name?, capabilities, connections,
+    /// transports, connectedAt }]`, ordered by each client's first
+    /// connection. Empty when no reverse dispatcher is wired.
+    fn client_list(&self) -> BoxFuture<'_, Result<Vec<ReverseLiveClient>>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::client_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.getBrowserClient` (REV-2): the effective browser client for
+    /// agent-initiated `browser.exec` in `id` — `{ clientId?, source:
+    /// "workspace" | "default", resolved: { clientId, name? } | null }`.
+    /// `clientId` is the persisted pin (omitted when unpinned); `resolved`
+    /// is the client a dispatch would reach right now (`null` when the pin
+    /// is offline or, unpinned, no eligible client is connected). `NotFound`
+    /// if the workspace is absent (router maps it to `-32602`).
+    fn get_workspace_browser_client(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::get_workspace_browser_client not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.setBrowserClient` (REV-2): persist (`Some`) or clear
+    /// (`None`) the per-workspace browser-client pin, emit
+    /// `workspace:updated { changes: { browserClientId } }`, and echo the
+    /// `get_workspace_browser_client` shape. `InvalidParams` for the Chief
+    /// workspace or a `clientId` that never completed `client.hello`;
+    /// `NotFound` if the workspace is absent.
+    fn set_workspace_browser_client(
+        &self,
+        id: WorkspaceId,
+        client_id: Option<ClientId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, client_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::set_workspace_browser_client not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Read the durable worktree setup script for a workspace (§5.25). Returns a
     /// default (empty `script`, `updatedAt: 0`) record before the first save.
     /// `NotFound` if the workspace is absent (router maps it to `-32602`).
@@ -6681,6 +6731,38 @@ impl std::fmt::Display for ReverseDispatchError {
 
 impl std::error::Error for ReverseDispatchError {}
 
+/// The client a [`ReverseTarget`] resolved to without dispatching
+/// ([`AgentReverseDispatch::resolve`]) — the `resolved` half of
+/// `workspace.getBrowserClient` (REV-2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedClient {
+    pub client_id: ClientId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// One logical client as reported by `client.list` (REV-2): every live
+/// hello'd connection sharing a `clientId`, grouped. `name` comes from the
+/// newest connection's hello; `capabilities` is the newest hello's bag with
+/// `browserExec` replaced by the per-client aggregate — a client is
+/// `browserExec`-eligible when **any** of its live connections advertises it,
+/// so a later auxiliary socket without the capability never masks an earlier
+/// eligible connection (#1756 review). `transports` carries the wire spelling
+/// (`"uds"` / `"wss"`) of each live connection, oldest first; `connected_at`
+/// is the ISO-8601 registration time of the oldest live connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReverseLiveClient {
+    pub client_id: ClientId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub capabilities: serde_json::Value,
+    pub connections: usize,
+    pub transports: Vec<String>,
+    pub connected_at: String,
+}
+
 /// Agent-initiated daemon→client reverse-RPC seam (REV-1/REV-2, PROTOCOL
 /// §5.14/§12.4).
 ///
@@ -6701,6 +6783,36 @@ pub trait AgentReverseDispatch: Send + Sync {
     /// Whether at least one eligible client is currently connected (i.e. a
     /// [`ReverseTarget::Default`] dispatch would find a target).
     fn is_connected(&self) -> bool;
+
+    /// Resolve `target` without dispatching — the probe behind
+    /// `workspace.getBrowserClient`. Same rules and errors as `dispatch`.
+    /// The default reports nothing connected.
+    ///
+    /// # Errors
+    ///
+    /// `NoClient` when `Default` finds no eligible connection; `ClientOffline`
+    /// when the named client has no live eligible connection.
+    fn resolve(
+        &self,
+        target: &ReverseTarget,
+    ) -> std::result::Result<ResolvedClient, ReverseDispatchError> {
+        match target {
+            ReverseTarget::Default => Err(ReverseDispatchError::NoClient),
+            ReverseTarget::Client(client_id) | ReverseTarget::Pinned(client_id) => {
+                Err(ReverseDispatchError::ClientOffline {
+                    client_id: client_id.clone(),
+                    name: None,
+                    pinned: matches!(target, ReverseTarget::Pinned(_)),
+                })
+            }
+        }
+    }
+
+    /// Live hello'd connections grouped by `clientId` (the `client.list`
+    /// projection). The default reports no clients.
+    fn live_clients(&self) -> Vec<ReverseLiveClient> {
+        Vec::new()
+    }
 
     /// Dispatch a reverse JSON-RPC request to the client `target` resolves to
     /// and await its response.
