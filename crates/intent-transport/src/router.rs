@@ -1337,7 +1337,11 @@ async fn dispatch(
         }
         "map.classify" => {
             let ws = require_ws_note(params)?;
-            let paths = require_string_array(params, "paths")?;
+            let paths = params
+                .get("paths")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| invalid_params("paths must be an array"))?;
             api.map_classify(ws, paths).await.map_err(domain_to_rpc)
         }
         "map.activity" => {

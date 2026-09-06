@@ -4039,6 +4039,7 @@ impl Services {
         root: &intent_core::WorkspaceGitRoot,
     ) -> Result<intent_core::WorkspaceGitRoot> {
         let (stored, inserted) = self.store.upsert_workspace_git_root(root).await?;
+        semantic_map::invalidate_workspace_paths(&stored.workspace_id);
         let event_type = if inserted {
             GIT_ROOT_REGISTERED
         } else {
@@ -4058,6 +4059,7 @@ impl Services {
     pub(crate) async fn unregister_git_root(&self, git_root_id: &WorkspaceGitRootId) -> Result<()> {
         let root = self.store.get_workspace_git_root(git_root_id).await?;
         self.store.delete_workspace_git_root(git_root_id).await?;
+        semantic_map::invalidate_workspace_paths(&root.workspace_id);
         publish_event(
             self.event_bus.as_ref(),
             git_root_unregistered_event(&root.workspace_id, &root.id, &root.path),
@@ -4522,6 +4524,7 @@ impl Services {
             }
             root.updated_at = now_iso();
             self.store.update_workspace_git_root_pr(&root).await?;
+            semantic_map::invalidate_workspace_paths(&root.workspace_id);
             publish_event(
                 self.event_bus.as_ref(),
                 git_root_changed_event(GIT_ROOT_UPDATED, &root),
@@ -12736,12 +12739,13 @@ async fn active_semantic_map(
 
 fn project_map_events(
     manifest: &semantic_map::Manifest,
+    workspace_paths: &semantic_map::WorkspacePaths,
     events: Vec<Event>,
     kinds: &[semantic_map::MapActivityKind],
 ) -> Vec<semantic_map::MapActivity> {
     events
         .iter()
-        .filter_map(|event| semantic_map::project(manifest, event))
+        .filter_map(|event| semantic_map::project_with_paths(manifest, workspace_paths, event))
         .filter(|activity| kinds.is_empty() || kinds.contains(&activity.kind))
         .collect()
 }
@@ -23635,16 +23639,21 @@ impl WorkspaceApi for Services {
     fn map_classify(
         &self,
         workspace_id: WorkspaceId,
-        paths: Vec<String>,
+        paths: Vec<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
             let (manifest, _) = active_semantic_map(&store, &workspace_id).await?;
+            let workspace_paths = semantic_map::workspace_paths(&store, &workspace_id).await?;
+            let paths: Vec<semantic_map::ClassifyPath> =
+                serde_json::from_value(serde_json::Value::Array(paths)).map_err(|error| {
+                    Error::InvalidParams(format!("invalid map classification paths: {error}"))
+                })?;
             let classifier = semantic_map::Classifier::new(&manifest);
             serde_json::to_value(
                 paths
                     .iter()
-                    .map(|path| classifier.classify(path))
+                    .map(|path| classifier.classify_path(&workspace_paths, path))
                     .collect::<Vec<_>>(),
             )
             .map_err(|error| Error::Internal(format!("serialize assignments failed: {error}")))
@@ -23664,6 +23673,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         Box::pin(async move {
             let (manifest, _) = active_semantic_map(&store, &workspace_id).await?;
+            let workspace_paths = semantic_map::workspace_paths(&store, &workspace_id).await?;
             let kinds = kinds
                 .into_iter()
                 .map(|kind| {
@@ -23686,7 +23696,7 @@ impl WorkspaceApi for Services {
                     ..Default::default()
                 })
                 .await?;
-            let activities = project_map_events(&manifest, events, &kinds);
+            let activities = project_map_events(&manifest, &workspace_paths, events, &kinds);
             for activity in &activities {
                 publish_event_transient(bus.as_ref(), &map_activity_event(&workspace_id, activity));
             }
@@ -23705,6 +23715,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             let (manifest, _) = active_semantic_map(&store, &workspace_id).await?;
+            let workspace_paths = semantic_map::workspace_paths(&store, &workspace_id).await?;
             let agent_ids = if let Some(agent_id) = agent_id {
                 vec![agent_id]
             } else if let Some(note_id) = task_note_id {
@@ -23735,7 +23746,7 @@ impl WorkspaceApi for Services {
                     ..Default::default()
                 })
                 .await?;
-            let activities = project_map_events(&manifest, events, &[])
+            let activities = project_map_events(&manifest, &workspace_paths, events, &[])
                 .into_iter()
                 .filter(|activity| {
                     activity

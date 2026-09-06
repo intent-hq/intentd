@@ -861,7 +861,7 @@ impl WorkspaceApi for FakeApi {
     fn map_classify(
         &self,
         _workspace_id: WorkspaceId,
-        paths: Vec<String>,
+        paths: Vec<Value>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move { Ok(serde_json::json!({ "paths": paths })) })
     }
@@ -3802,11 +3802,12 @@ async fn map_methods_route_and_pass_params() {
     assert_eq!(set["result"]["json"]["version"], 1);
 
     let classify = call(
-        r#"{"jsonrpc":"2.0","id":3,"method":"map.classify","params":{"workspaceId":"ws-1","paths":["src/lib.rs"]}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"map.classify","params":{"workspaceId":"ws-1","paths":["src/lib.rs",{"path":"crates/intent-transport/src/router.rs","gitRootId":"intentd"}]}}"#,
     )
     .await
     .unwrap();
     assert_eq!(classify["result"]["paths"][0], "src/lib.rs");
+    assert_eq!(classify["result"]["paths"][1]["gitRootId"], "intentd");
 
     let activity = call(
         r#"{"jsonrpc":"2.0","id":4,"method":"map.activity","params":{"workspaceId":"ws-1","sinceTs":"t0","minutesAgo":5,"agentId":"a1","kinds":["edit"],"limit":25}}"#,

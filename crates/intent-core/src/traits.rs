@@ -3086,7 +3086,7 @@ pub trait WorkspaceApi: Send + Sync {
     fn map_classify(
         &self,
         workspace_id: WorkspaceId,
-        paths: Vec<String>,
+        paths: Vec<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (workspace_id, paths);
         Box::pin(async {

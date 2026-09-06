@@ -5,7 +5,7 @@ use std::sync::Arc;
 use intent_core::{NoteId, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
-use super::{map_err, opt_str, opt_vec_str};
+use super::{map_err, opt_str};
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
@@ -36,8 +36,11 @@ pub(crate) async fn dispatch(
                 .map_err(map_err)
         }
         "classify" => {
-            let paths =
-                opt_vec_str(args, "paths").ok_or_else(|| "paths is required".to_string())?;
+            let paths = args
+                .get("paths")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| "paths must be an array".to_string())?;
             api.map_classify(ws.clone(), paths).await.map_err(map_err)
         }
         "route" => {

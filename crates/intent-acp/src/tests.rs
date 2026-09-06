@@ -9146,7 +9146,7 @@ mod wsapi4_bindings_tests {
 
     use intent_core::{
         AgentDelegateInput, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error,
-        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, Result,
+        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, NoteId, Result,
         TaskGetMyTaskResult, TaskMetadata, TaskStatus, WorkspaceApi, WorkspaceId,
     };
     use serde_json::{json, Value};
@@ -9686,7 +9686,7 @@ mod wsapi4_bindings_tests {
         fn map_classify(
             &self,
             _workspace_id: WorkspaceId,
-            paths: Vec<String>,
+            paths: Vec<Value>,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move { Ok(json!({ "paths": paths })) })
         }
@@ -11445,9 +11445,9 @@ mod wsapi4_bindings_tests {
                 "1",
             ),
             (
-                "return await ws.map.classify(['src/lib.rs']);",
-                "paths.0",
-                "src/lib.rs",
+                "return await ws.map.classify([{ path: 'src/lib.rs', gitRootId: 'root-1' }]);",
+                "paths.0.gitRootId",
+                "root-1",
             ),
             (
                 "return await ws.map.route({ agentId: 'a-1', sinceTs: 't0' });",
@@ -11462,7 +11462,7 @@ mod wsapi4_bindings_tests {
         ] {
             let response = call(&srv, js).await;
             assert_eq!(response["result"]["isError"], json!(false), "{js}");
-            let value: Value = serde_json::from_str(text(&response)).unwrap();
+            let value: Value = serde_json::from_str(&text(&response)).unwrap();
             let actual = key.split('.').fold(&value, |value, part| {
                 part.parse::<usize>()
                     .map_or_else(|_| &value[part], |index| &value[index])
