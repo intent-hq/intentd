@@ -5272,8 +5272,13 @@ impl Services {
 
     /// `agent.editAndRegenerate` truncation step: atomically truncate the
     /// transcript to just BEFORE the (already validated) user message
-    /// `message_id`, dropping it and everything after it. Reuses the
-    /// replaceMessages store machinery (fresh row ids / 0-based `seq`).
+    /// `message_id`, dropping it and everything after it. Only the suffix is
+    /// deleted ([`intent_store::Store::truncate_agent_messages_from`]): the
+    /// kept rows keep their ids, `seq`, and heavy side rows — including the
+    /// retention sweep's `*_replay` previews, which a remint through the
+    /// replaceMessages machinery would have dropped (a compacted block
+    /// hydrates to its slim placeholder, so re-extraction skipped it and the
+    /// cascade swept the preview with the old envelope).
     /// Emits `agent:updated` with `{ truncatedCount, remainingCount }`.
     /// Returns the number of messages removed.
     ///
@@ -5292,35 +5297,27 @@ impl Services {
         let messages = self.store.get_agent_messages(agent_id, None).await?;
         let idx = Self::find_edit_target(&messages, message_id)?;
         let keep = &messages[..idx];
-        let batch: Vec<intent_store::ReplaceMessage<'_>> = keep
-            .iter()
-            .map(|m| intent_store::ReplaceMessage {
-                role: m.role.as_str(),
-                content: &m.content,
-                metadata: m.metadata.as_ref(),
-                created_at: m.created_at.as_str(),
-            })
-            .collect();
-        let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
+        let truncated_count = self
+            .store
+            .truncate_agent_messages_from(agent_id, messages[idx].seq)
+            .await?;
         self.invalidate_agent_list_cache(&session.workspace_id);
-        let truncated_count = messages.len() - inserted.len();
         // Pending questions (PROTOCOL §5.5): truncation drops the rows the
-        // pending-questions marker may name AND re-mints ids for the kept rows
-        // (`replace_agent_messages`), so a surviving marker would be dangling
-        // — and since the derivation never checks that the marked row still
-        // exists, a dangling marker would wedge the pending set forever. The
-        // marker is therefore explicitly RE-DERIVED from the post-truncation
-        // transcript (never tolerated as dangling), which also recomputes the
-        // needs_attention displayStatus and kicks the drain when the
-        // truncation released the hold. The dismissal marker keeps its
-        // existing dangling-tolerant laxity.
-        self.reconcile_pending_questions_marker(&session.workspace_id, agent_id, &inserted)
+        // pending-questions marker may name, so a surviving marker could be
+        // dangling — and since the derivation never checks that the marked
+        // row still exists, a dangling marker would wedge the pending set
+        // forever. The marker is therefore explicitly RE-DERIVED from the
+        // post-truncation transcript (never tolerated as dangling), which
+        // also recomputes the needs_attention displayStatus and kicks the
+        // drain when the truncation released the hold. The dismissal marker
+        // keeps its existing dangling-tolerant laxity.
+        self.reconcile_pending_questions_marker(&session.workspace_id, agent_id, keep)
             .await;
-        // Same re-mint hazard for the pending-proposals list (see
-        // `agent_replace_messages_op`): remap surviving entries onto the
-        // re-minted kept rows and drop entries whose carrying rows were
-        // truncated away.
-        self.reconcile_pending_proposals(&session.workspace_id, agent_id, &inserted)
+        // Same hazard for the pending-proposals list (see
+        // `agent_replace_messages_op`): drop entries whose carrying rows were
+        // truncated away (kept rows keep their ids, so surviving entries map
+        // onto themselves).
+        self.reconcile_pending_proposals(&session.workspace_id, agent_id, keep)
             .await;
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -5329,7 +5326,7 @@ impl Services {
             json!({
                 "agentId": agent_id.0,
                 "truncatedCount": truncated_count,
-                "remainingCount": inserted.len(),
+                "remainingCount": keep.len(),
             }),
         )
         .await;

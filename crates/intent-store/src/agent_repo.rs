@@ -4864,6 +4864,105 @@ impl Store {
         .await
     }
 
+    /// Atomically drop every message of `agent_id` with `seq >= first_dropped_seq`
+    /// and leave the rest UNTOUCHED — ids, `seq`, and every
+    /// `agent_message_payload` side row (full-body, retention-pruned
+    /// `*_replay`, thumbnails) of the kept rows survive as stored. Used by the
+    /// `agent.editAndRegenerate` truncation, which keeps a prefix the store
+    /// already holds: reminting it through [`Store::replace_agent_messages`]
+    /// would re-extract the kept content from its hydrated form, and a block
+    /// the sweep has already compacted hydrates to its slim placeholder (the
+    /// `*_replay` row is not a full body), so re-extraction skipped it and the
+    /// cascade dropped the replay preview for good — the next recovery replay
+    /// then rendered the 2 KiB head instead of the marked middle-truncated
+    /// body, and `agent.getMessageBlock` lost its `*Pruned` evidence.
+    /// Returns the number of rows deleted. The dropped rows' side rows go with
+    /// them through the 0109 cascade trigger (`conversation_bytes` stays
+    /// balanced through the stats triggers), and the `agent_session`
+    /// last-message preview columns are recomputed from the surviving newest
+    /// user / assistant rows inside the same transaction (NULL when none is
+    /// left of that role). Callers are expected to reject busy sessions before
+    /// invoking this, like `replace_agent_messages`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn truncate_agent_messages_from(
+        &self,
+        agent_id: &AgentId,
+        first_dropped_seq: i64,
+    ) -> Result<usize> {
+        let pool = self.write_pool();
+        let newest_of_role_sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM agent_message \
+             WHERE agent_id = ? AND role = ? ORDER BY seq DESC LIMIT 1"
+        );
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool.begin().await.map_err(|e| {
+                Error::Internal(format!("truncate agent messages begin failed: {e}"))
+            })?;
+            let deleted = sqlx::query("DELETE FROM agent_message WHERE agent_id = ? AND seq >= ?")
+                .bind(&agent_id.0)
+                .bind(first_dropped_seq)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("truncate agent messages failed: {e}")))?
+                .rows_affected();
+            // The preview columns derive only from text blocks and the
+            // slim-projected `tool_use.input`, so the stored (slim) content
+            // yields the same values the append path computed from the full
+            // body — no payload hydration needed here.
+            let mut newest: Vec<AgentMessage> = Vec::with_capacity(2);
+            for role in ["assistant", "user"] {
+                let row = sqlx::query(&newest_of_role_sql)
+                    .bind(&agent_id.0)
+                    .bind(role)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("read newest {role} message failed: {e}"))
+                    })?;
+                if let Some(row) = row {
+                    newest.push(map_message_row(&row)?);
+                }
+            }
+            newest.sort_by_key(|m| m.seq);
+            let batch: Vec<OwnedBatchMessage> = newest
+                .iter()
+                .map(|m| {
+                    (
+                        m.role.clone(),
+                        m.content.clone(),
+                        m.metadata.clone(),
+                        m.created_at.clone(),
+                    )
+                })
+                .collect();
+            let (assistant_preview, user_preview, last_message_role, last_tool_use) =
+                batch_preview_col_values(&batch)?;
+            let last_message_id = newest.last().map(|m| m.id.as_str());
+            sqlx::query(
+                "UPDATE agent_session SET last_assistant_preview = ?, last_user_preview = ?, \
+                 last_message_role = ?, last_message_id = ?, last_tool_use_preview = ? \
+                 WHERE id = ?",
+            )
+            .bind(assistant_preview.as_deref())
+            .bind(user_preview.as_deref())
+            .bind(last_message_role.as_deref())
+            .bind(last_message_id)
+            .bind(last_tool_use.as_deref())
+            .bind(&agent_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("update session message previews failed: {e}")))?;
+            tx.commit().await.map_err(|e| {
+                Error::Internal(format!("truncate agent messages commit failed: {e}"))
+            })?;
+            Ok(usize::try_from(deleted).unwrap_or(usize::MAX))
+        })
+        .await
+    }
+
     /// Record an interrupted in-flight agent. Upserts: if a pending row exists
     /// (daemon restarted before resumption), updates to the latest state. Returns
     /// `true` if inserted/updated.
@@ -6524,6 +6623,287 @@ mod tests {
             larger[0].content[2]["outputReplayOriginalChars"],
             serde_json::json!(output_original.expect("over cap"))
         );
+    }
+
+    /// `truncate_agent_messages_from` (the `agent.editAndRegenerate`
+    /// truncation) drops only the suffix: the kept rows keep their ids and
+    /// every side row — a retention-compacted `*_replay` preview AND a still
+    /// full body alike — so the replay read of a kept message is
+    /// byte-identical before and after the edit, the combined
+    /// `getMessageBlock` read still reports the prune, the dropped rows'
+    /// side rows are cascaded, `conversation_bytes` stays balanced, and the
+    /// session preview columns follow the surviving newest rows.
+    #[tokio::test]
+    async fn truncate_from_keeps_prefix_side_rows_across_compaction() {
+        async fn recount(store: &Store, agent: &AgentId) -> i64 {
+            let content_bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(OCTET_LENGTH(content)), 0) FROM agent_message \
+                 WHERE agent_id = ?",
+            )
+            .bind(&agent.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("recount content");
+            let payload_bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(OCTET_LENGTH(body)), 0) FROM agent_message_payload \
+                 WHERE agent_id = ?",
+            )
+            .bind(&agent.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("recount payload");
+            content_bytes + payload_bytes
+        }
+        async fn counter(store: &Store, agent: &AgentId) -> i64 {
+            sqlx::query_scalar("SELECT conversation_bytes FROM agent_session WHERE id = ?")
+                .bind(&agent.0)
+                .fetch_one(store.read_pool())
+                .await
+                .expect("counter")
+        }
+        async fn kinds(store: &Store, message_id: &str) -> Vec<String> {
+            sqlx::query_scalar(
+                "SELECT kind FROM agent_message_payload WHERE message_id = ? ORDER BY kind",
+            )
+            .bind(message_id)
+            .fetch_all(store.read_pool())
+            .await
+            .expect("kinds")
+        }
+
+        let tmp = TempDb::new("test-payload-truncate-from");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_id = WorkspaceId("ws-payload-truncate".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, "2026-01-01T00:00:00Z"))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-payload-truncate".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(
+                &agent_id,
+                &ws_id,
+                "2026-01-01T00:00:00Z",
+                None,
+            ))
+            .await
+            .expect("insert session");
+
+        let heavy = |tag: &str| {
+            serde_json::json!([
+                { "type": "text", "text": format!("{tag} text") },
+                { "type": "tool_use", "id": format!("{tag}:1"), "name": "bash",
+                  "input": { "cmd": format!("{tag}-{}", "i".repeat(12 * 1024)) },
+                  "toolCallId": tag },
+                { "type": "tool_result", "toolCallId": tag,
+                  "output": format!("{tag}-{}", "o".repeat(20 * 1024)) },
+            ])
+        };
+        // [u0, old(assistant, back-dated), u1, fresh(assistant), u2, a2]:
+        // the edit targets u2, so `old` (compacted) and `fresh` (still full)
+        // are both kept; u2 + a2 (heavy, full rows) are dropped.
+        let u0 = store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "u0" }]),
+                "2026-01-01T00:00:00Z",
+            )
+            .await
+            .expect("append u0");
+        let old = store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &heavy("old"),
+                "2026-01-01T00:00:01Z",
+            )
+            .await
+            .expect("append old");
+        let u1 = store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "u1" }]),
+                "2026-03-01T00:00:00Z",
+            )
+            .await
+            .expect("append u1");
+        let fresh = store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &heavy("fresh"),
+                "2026-03-01T00:00:01Z",
+            )
+            .await
+            .expect("append fresh");
+        let u2 = store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "u2" }]),
+                "2026-03-01T00:00:02Z",
+            )
+            .await
+            .expect("append u2");
+        let a2 = store
+            .append_agent_message(&agent_id, "assistant", &heavy("a2"), "2026-03-01T00:00:03Z")
+            .await
+            .expect("append a2");
+
+        let cap = 2_000;
+        assert_eq!(
+            store
+                .compact_tool_payloads_before("2026-02-01T00:00:00Z", cap)
+                .await
+                .expect("compact"),
+            2,
+            "only the back-dated message is compacted"
+        );
+        assert_eq!(
+            kinds(&store, &old.id).await,
+            vec!["tool_result_output_replay", "tool_use_input_replay"]
+        );
+        assert_eq!(
+            kinds(&store, &fresh.id).await,
+            vec!["tool_result_output", "tool_use_input"]
+        );
+        let replay_before = store
+            .get_agent_messages_for_replay(&agent_id, cap)
+            .await
+            .expect("replay before");
+        assert_eq!(replay_before.len(), 6);
+        let (_, pruned_before) = store
+            .get_agent_message_by_id_with_pruned(&agent_id, &old.id)
+            .await
+            .expect("read old")
+            .expect("old exists");
+        assert_eq!(pruned_before.len(), 2);
+        assert_eq!(
+            counter(&store, &agent_id).await,
+            recount(&store, &agent_id).await
+        );
+
+        // The edit: drop u2 and everything after it.
+        let dropped = store
+            .truncate_agent_messages_from(&agent_id, u2.seq)
+            .await
+            .expect("truncate");
+        assert_eq!(dropped, 2);
+
+        let after = store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .expect("messages after");
+        assert_eq!(
+            after.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![
+                u0.id.as_str(),
+                old.id.as_str(),
+                u1.id.as_str(),
+                fresh.id.as_str()
+            ],
+            "kept rows keep their ids"
+        );
+        assert_eq!(
+            after.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![u0.seq, old.seq, u1.seq, fresh.seq],
+            "kept rows keep their seq"
+        );
+        assert_eq!(
+            kinds(&store, &old.id).await,
+            vec!["tool_result_output_replay", "tool_use_input_replay"],
+            "compacted message keeps its replay previews"
+        );
+        assert_eq!(
+            kinds(&store, &fresh.id).await,
+            vec!["tool_result_output", "tool_use_input"],
+            "retained message keeps its full rows"
+        );
+        assert!(kinds(&store, &u2.id).await.is_empty());
+        assert!(
+            kinds(&store, &a2.id).await.is_empty(),
+            "dropped message's side rows are cascaded"
+        );
+        assert_eq!(
+            after[3].content,
+            heavy("fresh"),
+            "retained message still hydrates its full body"
+        );
+        assert_eq!(
+            counter(&store, &agent_id).await,
+            recount(&store, &agent_id).await,
+            "conversation_bytes stays balanced across the truncation"
+        );
+
+        let replay_after = store
+            .get_agent_messages_for_replay(&agent_id, cap)
+            .await
+            .expect("replay after");
+        assert_eq!(
+            replay_after,
+            replay_before[..4].to_vec(),
+            "replay of the kept prefix is byte-identical to the pre-edit replay"
+        );
+        let (old_after, pruned_after) = store
+            .get_agent_message_by_id_with_pruned(&agent_id, &old.id)
+            .await
+            .expect("read old after")
+            .expect("old still exists");
+        assert_eq!(pruned_after, pruned_before, "prune evidence survives");
+        assert_eq!(
+            old_after.content[2]["outputTruncated"],
+            serde_json::json!(true)
+        );
+
+        // Session preview columns follow the surviving newest rows.
+        let projection = store
+            .get_agent_session_message_projection(&agent_id)
+            .await
+            .expect("projection");
+        assert_eq!(projection.message_count, 4);
+        assert_eq!(
+            projection.last_message_id.as_deref(),
+            Some(fresh.id.as_str())
+        );
+        assert_eq!(projection.last_message_role.as_deref(), Some("assistant"));
+        assert_eq!(
+            projection.last_user_text_blocks,
+            Some(vec!["u1".to_string()]),
+            "last user preview follows the kept newest user row"
+        );
+        assert_eq!(
+            projection.last_assistant_text_blocks,
+            Some(vec!["fresh text".to_string()])
+        );
+        assert_eq!(
+            projection
+                .last_tool_use
+                .as_ref()
+                .and_then(|p| p["name"].as_str()),
+            Some("bash")
+        );
+
+        // Truncating to empty clears the previews outright.
+        assert_eq!(
+            store
+                .truncate_agent_messages_from(&agent_id, u0.seq)
+                .await
+                .expect("truncate to empty"),
+            4
+        );
+        assert!(store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .expect("messages empty")
+            .is_empty());
+        assert_eq!(counter(&store, &agent_id).await, 0);
+        let projection = store
+            .get_agent_session_message_projection(&agent_id)
+            .await
+            .expect("projection");
+        assert_eq!(projection, SessionMessageProjection::default());
     }
 
     /// Seed `count` small `agent_message` rows for `agent_id` in one

@@ -31899,9 +31899,9 @@ async fn agent_replace_messages_reconciles_pending_proposals() {
     assert!(session.pending_proposals().is_empty());
 }
 
-/// `agent.editAndRegenerate` truncation re-mints the kept rows and drops the
-/// rest: a pending entry whose carrier survives is remapped to its new row
-/// id; one whose carrier was truncated away is dropped.
+/// `agent.editAndRegenerate` truncation keeps the prefix rows as stored and
+/// drops the rest: a pending entry whose carrier survives stays mapped to its
+/// (unchanged) row id; one whose carrier was truncated away is dropped.
 #[tokio::test]
 async fn agent_edit_truncate_reconciles_pending_proposals() {
     let (_t, svc, ws) = setup().await;
@@ -31946,7 +31946,7 @@ async fn agent_edit_truncate_reconciles_pending_proposals() {
     );
     let _ = u0;
 
-    // Truncate at u1: keeps [u0, a1] under fresh row ids; drops u1 + a2.
+    // Truncate at u1: keeps [u0, a1] untouched; drops u1 + a2.
     let removed = svc
         .agent_edit_truncate_op(&id, &u1.id)
         .await
@@ -31957,8 +31957,9 @@ async fn agent_edit_truncate_reconciles_pending_proposals() {
         .get_agent_messages(&id, None)
         .await
         .expect("messages");
+    assert_eq!(messages.len(), 2);
     let new_carrier = &messages[1].id;
-    assert_ne!(new_carrier, &a1.id, "kept rows are re-minted");
+    assert_eq!(new_carrier, &a1.id, "kept rows keep their ids");
     let session = svc.store().get_agent_session(&id).await.expect("session");
     let pending = session.pending_proposals();
     assert_eq!(
@@ -31968,6 +31969,138 @@ async fn agent_edit_truncate_reconciles_pending_proposals() {
             .collect::<Vec<_>>(),
         vec![("tc-keep", new_carrier.as_str())],
         "surviving entry remapped, truncated-away entry dropped"
+    );
+}
+
+/// `agent.editAndRegenerate` truncation keeps the heavy side rows of the
+/// retained prefix: a tool body the retention sweep already compacted still
+/// serves its stored preview + `outputPruned: true` on `agent.getMessageBlock`
+/// after a LATER user message is edited away, and its replay read is
+/// byte-identical to the pre-edit one; a still-full sibling keeps its body.
+#[tokio::test]
+async fn agent_edit_truncate_keeps_pruned_and_full_side_rows_of_kept_rows() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Truncator").await;
+    let big_out = format!("OUT-HEAD-{}-OUT-TAIL", "o".repeat(20_000));
+    let heavy = |tag: &str| {
+        json!([
+            { "type": "tool_result", "id": format!("{tag}:result"), "tool_use_id": tag,
+              "output": big_out, "is_error": false },
+        ])
+    };
+    svc.store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "u0" }]),
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .expect("append u0");
+    let old = svc
+        .store()
+        .append_agent_message(&id, "assistant", &heavy("tc-old"), "2026-01-01T00:00:01Z")
+        .await
+        .expect("append old");
+    let fresh = svc
+        .store()
+        .append_agent_message(&id, "assistant", &heavy("tc-fresh"), &now_iso())
+        .await
+        .expect("append fresh");
+    let target = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "edit me" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append target");
+    svc.store()
+        .append_agent_message(&id, "assistant", &heavy("tc-after"), &now_iso())
+        .await
+        .expect("append after");
+
+    let cap = 4_000;
+    assert_eq!(
+        svc.store()
+            .compact_tool_payloads_before("2026-02-01T00:00:00Z", cap)
+            .await
+            .expect("compact"),
+        1,
+        "only the back-dated body is compacted"
+    );
+    let replay_before = svc
+        .store()
+        .get_agent_messages_for_replay(&id, cap)
+        .await
+        .expect("replay before");
+    let pruned_before = svc
+        .agent_get_message_block_op(
+            id.clone(),
+            old.id.clone(),
+            "tc-old:result".to_string(),
+            Some(ws.clone()),
+        )
+        .await
+        .expect("pruned block before");
+    assert_eq!(pruned_before["block"]["outputPruned"], json!(true));
+
+    let removed = svc
+        .agent_edit_truncate_op(&id, &target.id)
+        .await
+        .expect("truncate");
+    assert_eq!(removed, 2);
+
+    let pruned_after = svc
+        .agent_get_message_block_op(
+            id.clone(),
+            old.id.clone(),
+            "tc-old:result".to_string(),
+            Some(ws.clone()),
+        )
+        .await
+        .expect("pruned block after");
+    let block = &pruned_after["block"];
+    assert_eq!(block["outputPruned"], json!(true), "{block}");
+    assert_eq!(block["outputTruncated"], json!(true));
+    assert_eq!(block["outputBytes"], json!(big_out.len()));
+    let preview = block["output"].as_str().expect("preview");
+    assert!(big_out.starts_with(preview) && preview.len() < big_out.len());
+    assert_eq!(
+        pruned_after, pruned_before,
+        "pruned block serves identically across the edit"
+    );
+
+    let full = svc
+        .agent_get_message_block_op(
+            id.clone(),
+            fresh.id.clone(),
+            "tc-fresh:result".to_string(),
+            Some(ws.clone()),
+        )
+        .await
+        .expect("full block after");
+    assert_eq!(full["block"]["output"].as_str(), Some(big_out.as_str()));
+    assert!(full["block"].get("outputPruned").is_none());
+    assert!(full["block"].get("outputTruncated").is_none());
+
+    let replay_after = svc
+        .store()
+        .get_agent_messages_for_replay(&id, cap)
+        .await
+        .expect("replay after");
+    assert_eq!(replay_after.len(), 3);
+    assert_eq!(
+        replay_after,
+        replay_before[..3].to_vec(),
+        "replay of the kept prefix is byte-identical to the pre-edit replay"
+    );
+    assert_eq!(
+        replay_after[1].content[0]["outputReplayOriginalChars"],
+        json!(big_out.chars().count()),
+        "the pruned body still replays with its original-length marker"
     );
 }
 
@@ -33397,8 +33530,8 @@ async fn dismissal_neutralizes_pending_marker() {
     assert!(svc.questions_pending(&id).await);
 }
 
-/// `agent.editAndRegenerate` truncation re-mints row ids, so the marker is
-/// re-derived from the post-truncation transcript instead of being left
+/// `agent.editAndRegenerate` truncation may drop the marked row, so the marker
+/// is re-derived from the post-truncation transcript instead of being left
 /// dangling (which would wedge the hold forever).
 #[tokio::test]
 async fn edit_truncate_reconciles_pending_marker() {
@@ -33428,7 +33561,7 @@ async fn edit_truncate_reconciles_pending_marker() {
     assert!(svc.questions_pending(&id).await, "hold armed");
 
     // Truncating at the LAST user row keeps the question message, so the
-    // re-derived marker names its new (re-minted) id and the hold stays armed.
+    // re-derived marker still names it and the hold stays armed.
     svc.agent_edit_truncate_op(&id, &target_id)
         .await
         .expect("truncate");
@@ -33442,7 +33575,7 @@ async fn edit_truncate_reconciles_pending_marker() {
     assert_eq!(
         session.pending_questions_message_id(),
         Some(question_id.as_str()),
-        "marker re-derived against the re-minted row id"
+        "marker re-derived against the kept question row"
     );
     assert!(svc.questions_pending(&id).await);
 

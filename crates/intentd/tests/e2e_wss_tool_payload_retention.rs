@@ -10,7 +10,11 @@
 //!    uncompacted block still hydrates to its full body with no flags, and
 //! 3. replay the pruned block in the recovery `<supervisor>` history
 //!    byte-identically to the uncompacted one — the 4000-char
-//!    middle-truncated body with `truncated="true" original_chars="N"`.
+//!    middle-truncated body with `truncated="true" original_chars="N"`, and
+//! 4. keep 2. and 3. true after `agent.editAndRegenerate` of a LATER user
+//!    message — the truncation must not drop the kept prefix's `*_replay`
+//!    (or full) side rows, so the regenerated turn's replay renders the
+//!    pruned block byte-identically to the pre-edit replay.
 //!
 //! The sweep itself ticks on a ≥5-minute cadence in the daemon, so the test
 //! forces compaction through the same store method the loop calls
@@ -822,5 +826,117 @@ async fn pruned_tool_payload_is_flagged_and_replays_identically_over_wss() {
     assert!(
         old_use_el.contains(&expected_in.replace('"', "&quot;")),
         "pruned tool_use carries the {replay_chars}-char middle-truncated input"
+    );
+
+    // (4) agent.editAndRegenerate on the turn-2 user message: the truncation
+    // keeps both heavy messages and the forced session recreate replays them
+    // again on the regenerated turn. The pruned block must still serve its
+    // preview + `outputPruned` and replay byte-identically to before — a
+    // remint of the kept prefix would have swept its `*_replay` rows.
+    let conv = wss_rpc(
+        &mut rpc,
+        50,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let turn2_user_id = conv["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"]
+                    .as_array()
+                    .is_some_and(|b| b.iter().any(|b| b["text"] == "second turn after prune"))
+        })
+        .and_then(|m| m["id"].as_str())
+        .expect("turn-2 user message id")
+        .to_string();
+    let edited = wss_rpc(
+        &mut rpc,
+        51,
+        "agent.editAndRegenerate",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "messageId": turn2_user_id,
+            "content": "edited second turn",
+        }),
+    )
+    .await;
+    assert_eq!(edited["success"], true, "editAndRegenerate ok: {edited}");
+    assert_eq!(
+        edited["truncatedCount"],
+        json!(2),
+        "turn-2 user + assistant rows dropped: {edited}"
+    );
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:failed") => panic!("agent:failed during regenerated turn: {frame}"),
+            Some("agent:stream:end") => break,
+            _ => {}
+        }
+    }
+    await_session_idle(&mut rpc, 300, &ws_id, &agent_id).await;
+    let mut prompts = prompt_texts(&prompt_log);
+    for _ in 0..100 {
+        if prompts.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        prompts = prompt_texts(&prompt_log);
+    }
+    assert_eq!(
+        prompts.len(),
+        3,
+        "regenerated turn prompted a recreated session: {prompts:?}"
+    );
+    let regen = &prompts[2];
+    assert!(
+        regen.contains("<supervisor>") && !regen.contains("second turn after prune"),
+        "regenerated turn replays only the kept prefix: {regen:?}"
+    );
+    assert_eq!(
+        tool_result_element(regen, "tc-old"),
+        old_result_el,
+        "pruned tool_result replays byte-identically after the edit"
+    );
+    assert_eq!(
+        tool_use_element(regen, "tc-old"),
+        old_use_el,
+        "pruned tool_use replays byte-identically after the edit"
+    );
+    assert_eq!(tool_result_element(regen, "tc-fresh"), fresh_result_el);
+    assert_eq!(tool_use_element(regen, "tc-fresh"), fresh_use_el);
+
+    assert_eq!(
+        payload_kinds(&store, &old_id).await,
+        vec!["tool_result_output_replay", "tool_use_input_replay"],
+        "kept pruned message keeps its replay rows across the edit"
+    );
+    assert_eq!(
+        payload_kinds(&store, &fresh_id).await,
+        vec!["tool_result_output", "tool_use_input"],
+        "kept full message keeps its full rows across the edit"
+    );
+    assert_eq!(
+        get_block(&mut rpc, 60, &agent_id, &old_id, "tc-old:result").await,
+        pruned_result,
+        "pruned block serves identically after the edit"
+    );
+    assert_eq!(
+        get_block(&mut rpc, 61, &agent_id, &old_id, "tc-old").await,
+        pruned_use
+    );
+    assert_eq!(
+        get_block(&mut rpc, 62, &agent_id, &fresh_id, "tc-fresh:result").await,
+        full_result,
+        "full block still hydrates after the edit"
     );
 }
