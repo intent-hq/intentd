@@ -80,8 +80,10 @@ pub(crate) fn classify(value: &Value) -> Option<DraftRequest> {
 }
 
 /// Resolve the connection's effective `clientId` for a draft mutation, minting a
-/// connection-scoped one (and persisting its `client` row to satisfy the draft
-/// FK) when the connection never completed `client.hello`.
+/// connection-scoped one (and persisting a placeholder `client` row to satisfy
+/// the draft FK) when the connection never completed `client.hello`. The
+/// placeholder records no hello, so it is never pinnable via
+/// `workspace.setBrowserClient`.
 async fn resolve_for_write(
     api: &dyn WorkspaceApi,
     client_id: &mut Option<ClientId>,
@@ -90,7 +92,7 @@ async fn resolve_for_write(
         return Ok(id.clone());
     }
     let minted = ClientId::new();
-    api.upsert_client(minted.clone(), None, None)
+    api.ensure_client(minted.clone())
         .await
         .map_err(|e| (-32603, e.to_string()))?;
     *client_id = Some(minted.clone());

@@ -5,11 +5,11 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use intent_core::{
-    events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientId, Comment,
-    CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, Error, EventActor,
-    Hook, HookId, HookState, Note, NoteId, NoteMetadata, NoteVersionAuthor, NoteVisibility,
-    TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientHostInfo,
+    ClientId, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType,
+    Error, EventActor, Hook, HookId, HookState, Note, NoteId, NoteMetadata, NoteVersionAuthor,
+    NoteVisibility, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+    WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -81,6 +81,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -103,7 +104,7 @@ async fn migration_status_reports_current_after_open() {
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112, 113, 114
+            110, 111, 112, 113, 114, 116, 117
         ]
     );
     assert_eq!(
@@ -114,7 +115,7 @@ async fn migration_status_reports_current_after_open() {
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112, 113, 114
+            110, 111, 112, 113, 114, 116, 117
         ]
     );
 }
@@ -4729,22 +4730,44 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let id = ClientId::from_string("cli-abc");
 
+    let host = ClientHostInfo {
+        hostname: Some("mbp.local".to_string()),
+        pretty_hostname: Some("Clement's MacBook Pro".to_string()),
+        device_kind: Some("laptop".to_string()),
+    };
     store
-        .upsert_client(&id, Some("Laptop"), Some(&json!({ "forward": true })))
+        .upsert_client(
+            &id,
+            Some("Laptop"),
+            Some(&json!({ "forward": true })),
+            &host,
+        )
         .await
         .expect("insert client");
     let first = store.get_client(&id).await.expect("get").expect("present");
     assert_eq!(first.name, Some("Laptop".to_string()));
     assert_eq!(first.capabilities, json!({ "forward": true }));
+    assert_eq!(first.host, host, "host identification round-trips");
+    assert!(
+        first.last_hello_at.is_some(),
+        "a hello stamps last_hello_at"
+    );
 
-    // Re-hello updates name/capabilities and touches last_seen; first_seen stays.
+    // Re-hello updates name/capabilities/host and touches last_seen;
+    // first_seen stays. A hello that omits the host triple clears it.
     store
-        .upsert_client(&id, Some("Desktop"), Some(&json!({ "forward": false })))
+        .upsert_client(
+            &id,
+            Some("Desktop"),
+            Some(&json!({ "forward": false })),
+            &ClientHostInfo::default(),
+        )
         .await
         .expect("re-upsert");
     let again = store.get_client(&id).await.expect("get").expect("present");
     assert_eq!(again.name, Some("Desktop".to_string()));
     assert_eq!(again.capabilities, json!({ "forward": false }));
+    assert_eq!(again.host, ClientHostInfo::default());
     assert_eq!(
         again.first_seen, first.first_seen,
         "first_seen is preserved"
@@ -4754,6 +4777,138 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
         .await
         .unwrap()
         .is_none());
+
+    // A draft-only placeholder exists but never hello'd; ensuring an
+    // already-hello'd id is a no-op that keeps its identity and hello stamp.
+    let anon = ClientId::from_string("anon-draft");
+    store.ensure_client(&anon).await.expect("ensure");
+    let placeholder = store.get_client(&anon).await.unwrap().expect("present");
+    assert_eq!(placeholder.name, None);
+    assert_eq!(placeholder.capabilities, json!({}));
+    assert_eq!(placeholder.last_hello_at, None, "no hello recorded");
+    store.ensure_client(&id).await.expect("ensure existing");
+    let kept = store.get_client(&id).await.unwrap().expect("present");
+    assert_eq!(kept, again, "ensure never clobbers a hello'd row");
+
+    // The 0117 upgrade backfill uses `name` as the hello-provenance proxy: a
+    // pre-upgrade *named* row (shaped here by nulling the stamp on a hello'd
+    // row) is stamped from `last_seen`; a pre-upgrade *nameless* row (the
+    // placeholder above) stays unstamped; an already-stamped row is left
+    // alone. Re-run just the backfill statement — the ALTERs in the same
+    // file cannot run twice.
+    let legacy = ClientId::from_string("legacy-named");
+    store
+        .upsert_client(
+            &legacy,
+            Some("Old Laptop"),
+            None,
+            &ClientHostInfo::default(),
+        )
+        .await
+        .expect("insert legacy");
+    sqlx::query("UPDATE client SET last_hello_at = NULL WHERE id = ?")
+        .bind(legacy.as_str())
+        .execute(store.write_pool())
+        .await
+        .expect("shape pre-upgrade row");
+    assert_eq!(
+        store
+            .get_client(&legacy)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_hello_at,
+        None
+    );
+    let backfill = include_str!("../migrations/0117_client_host_identity.sql")
+        .lines()
+        .find(|l| l.starts_with("UPDATE client SET last_hello_at"))
+        .expect("0117 backfill statement");
+    sqlx::raw_sql(backfill)
+        .execute(store.write_pool())
+        .await
+        .expect("re-run backfill");
+    let legacy_row = store.get_client(&legacy).await.unwrap().expect("present");
+    assert_eq!(
+        legacy_row.last_hello_at,
+        Some(legacy_row.last_seen.clone()),
+        "a pre-upgrade named row counts as hello'd at its last touch"
+    );
+    let placeholder = store.get_client(&anon).await.unwrap().expect("present");
+    assert_eq!(
+        placeholder.last_hello_at, None,
+        "a pre-upgrade nameless row fails closed"
+    );
+    let kept = store.get_client(&id).await.unwrap().expect("present");
+    assert_eq!(kept, again, "an already-stamped row keeps its own stamp");
+}
+
+/// REV-2 per-workspace browser-client pin: NULL (unpinned) by default, a
+/// scoped set/clear round-trips, the column rides `Workspace` reads, and an
+/// unknown workspace is `NotFound`. The scoped setter is the column's only
+/// writer after insert: a full-row `update_workspace` from a snapshot read
+/// before the pin must not revert it.
+#[tokio::test]
+async fn workspace_browser_client_pin_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    let ws = sample_workspace(&ws_id, "Pinned", false);
+    store.insert_workspace(&ws).await.expect("insert");
+
+    assert_eq!(store.workspace_browser_client(&ws_id).await.unwrap(), None);
+    let stale = store.get_workspace(&ws_id).await.unwrap();
+    assert_eq!(stale.browser_client_id, None);
+
+    let desktop = ClientId::from_string("desktop-b");
+    store
+        .set_workspace_browser_client(&ws_id, Some(&desktop))
+        .await
+        .expect("pin");
+    assert_eq!(
+        store.workspace_browser_client(&ws_id).await.unwrap(),
+        Some(desktop.clone())
+    );
+    let loaded = store.get_workspace(&ws_id).await.unwrap();
+    assert_eq!(loaded.browser_client_id, Some(desktop.clone()));
+    let json = serde_json::to_value(&loaded).unwrap();
+    assert_eq!(json["browserClientId"], "desktop-b");
+
+    // A general update from a snapshot taken before the pin (a concurrent
+    // `workspace.update` that read early and committed late) leaves the
+    // pin alone; so does one from a fresh snapshot.
+    store.update_workspace(&stale).await.expect("stale update");
+    assert_eq!(
+        store.workspace_browser_client(&ws_id).await.unwrap(),
+        Some(desktop.clone()),
+        "full-row update must not revert the scoped pin"
+    );
+    store.update_workspace(&loaded).await.expect("update");
+    assert_eq!(
+        store.workspace_browser_client(&ws_id).await.unwrap(),
+        Some(desktop)
+    );
+
+    store
+        .set_workspace_browser_client(&ws_id, None)
+        .await
+        .expect("clear");
+    assert_eq!(store.workspace_browser_client(&ws_id).await.unwrap(), None);
+    let json = serde_json::to_value(store.get_workspace(&ws_id).await.unwrap()).unwrap();
+    assert!(
+        json.get("browserClientId").is_none(),
+        "unpinned workspaces omit browserClientId: {json}"
+    );
+
+    let missing = WorkspaceId::new();
+    assert!(matches!(
+        store.workspace_browser_client(&missing).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        store.set_workspace_browser_client(&missing, None).await,
+        Err(Error::NotFound(_))
+    ));
 }
 
 #[tokio::test]
@@ -4767,7 +4922,7 @@ async fn draft_round_trip_upsert_get_delete() {
         .expect("insert ws");
     let client = ClientId::from_string("cli-1");
     store
-        .upsert_client(&client, None, None)
+        .upsert_client(&client, None, None, &ClientHostInfo::default())
         .await
         .expect("client");
     let agent = AgentId::from_string("agent-1");
@@ -4851,7 +5006,7 @@ async fn draft_round_trip_for_workspace_id_without_row() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let client = ClientId::from_string("cli-1");
     store
-        .upsert_client(&client, None, None)
+        .upsert_client(&client, None, None, &ClientHostInfo::default())
         .await
         .expect("client");
     let ws = WorkspaceId::from("__new-workspace__");
@@ -4896,7 +5051,10 @@ async fn draft_fk_drop_migration_preserves_existing_rows() {
         .await
         .expect("insert ws");
     let client = ClientId::from_string("cli-1");
-    store.upsert_client(&client, None, None).await.unwrap();
+    store
+        .upsert_client(&client, None, None, &ClientHostInfo::default())
+        .await
+        .unwrap();
 
     // Restore the pre-0050 shape: 0007 columns + workspace FK, with the 0048
     // `attachments` column appended.
@@ -4976,8 +5134,9 @@ async fn drafts_are_isolated_by_client_and_removed_on_workspace_delete() {
     let agent = AgentId::from_string("agent-1");
     let a = ClientId::from_string("cli-a");
     let b = ClientId::from_string("cli-b");
-    store.upsert_client(&a, None, None).await.unwrap();
-    store.upsert_client(&b, None, None).await.unwrap();
+    let no_host = ClientHostInfo::default();
+    store.upsert_client(&a, None, None, &no_host).await.unwrap();
+    store.upsert_client(&b, None, None, &no_host).await.unwrap();
 
     store
         .upsert_draft(&ws, &agent, &a, "from-a", None)
@@ -5450,6 +5609,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     diff_summary: None,
                     token_usage: None,
                     cow_supported: None,
+                    browser_client_id: None,
                     display_status: None,
                     waiting: false,
                     checkout_mode: None,

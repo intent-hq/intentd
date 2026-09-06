@@ -9,7 +9,9 @@
 
 use std::time::Duration;
 
-use intent_core::{AgentReverseDispatch, ClientId, ReverseDispatchError, ReverseTarget};
+use intent_core::{
+    AgentReverseDispatch, ClientHostInfo, ClientId, ReverseDispatchError, ReverseTarget,
+};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -24,12 +26,17 @@ fn idle_channel() -> (ReverseChannel, mpsc::Receiver<String>) {
 }
 
 /// A `client.hello` identity for logical client `id`, advertising (or not)
-/// the `browserExec` capability.
+/// the `browserExec` capability, with a `hostname` derived from `id`.
 fn identity(id: &str, browser_exec: bool) -> ReverseClientIdentity {
     ReverseClientIdentity {
         client_id: ClientId::from_string(id),
         name: Some(format!("client {id}")),
         capabilities: json!({ "browserExec": browser_exec }),
+        host: ClientHostInfo {
+            hostname: Some(format!("{id}.local")),
+            pretty_hostname: None,
+            device_kind: None,
+        },
     }
 }
 
@@ -498,6 +505,7 @@ fn live_clients_groups_hellod_connections_by_client() {
     assert_eq!(a.client_id.as_str(), "a", "ordered by first connection");
     assert_eq!(a.name.as_deref(), Some("client a"));
     assert_eq!(a.capabilities, json!({ "browserExec": true }));
+    assert_eq!(a.host.hostname.as_deref(), Some("a.local"));
     assert_eq!(a.connections, 2);
     assert_eq!(
         a.transports,
@@ -518,6 +526,124 @@ fn live_clients_groups_hellod_connections_by_client() {
     assert_eq!(clients[1].client_id.as_str(), "a");
     assert_eq!(clients[1].connections, 1);
     assert_eq!(clients[1].transports, vec![ReverseTransport::Uds]);
+}
+
+/// Regression (#1756 review): a client is `browserExec`-eligible when ANY of
+/// its live connections advertises the capability. A later auxiliary socket
+/// sharing the `clientId` without `browserExec` must not mask an earlier
+/// eligible connection in the `client.list` projection — and the aggregate
+/// must agree with what `resolve` / `dispatch` actually route to.
+#[test]
+fn live_clients_aggregate_browser_exec_across_connections() {
+    let reg = PrimaryReverseRegistry::new();
+    let (main, _rx_main) = idle_channel();
+    let (aux, _rx_aux) = idle_channel();
+    let g_main = reg.register(main, ReverseTransport::Wss);
+    g_main.bind(identity("x", true));
+    // Newest hello lacks the capability (e.g. an FE auxiliary JsonRpcClient).
+    let g_aux = reg.register(aux, ReverseTransport::Uds);
+    g_aux.bind(identity("x", false));
+
+    let clients = reg.live_clients();
+    assert_eq!(clients.len(), 1);
+    let x = &clients[0];
+    assert_eq!(x.connections, 2);
+    assert!(
+        x.browser_exec,
+        "any eligible connection makes the client eligible"
+    );
+    assert_eq!(
+        x.capabilities["browserExec"],
+        json!(true),
+        "the projected capability bag reports the aggregate, not the newest hello"
+    );
+    assert!(reg.resolve(&pinned("x")).is_ok());
+    assert_eq!(
+        reg.resolve(&ReverseTarget::Default)
+            .unwrap()
+            .client_id
+            .as_str(),
+        "x"
+    );
+
+    // Same aggregate when the eligible connection is the NEWER one.
+    let reg = PrimaryReverseRegistry::new();
+    let (aux, _rx_aux) = idle_channel();
+    let (main, _rx_main) = idle_channel();
+    let g_aux = reg.register(aux, ReverseTransport::Uds);
+    g_aux.bind(identity("y", false));
+    let g_main = reg.register(main, ReverseTransport::Wss);
+    g_main.bind(identity("y", true));
+    let clients = reg.live_clients();
+    assert!(clients[0].browser_exec);
+    assert_eq!(clients[0].capabilities["browserExec"], json!(true));
+
+    // Dropping the only eligible connection flips the aggregate back.
+    drop(g_main);
+    let clients = reg.live_clients();
+    assert_eq!(clients[0].connections, 1);
+    assert!(!clients[0].browser_exec);
+    assert_eq!(clients[0].capabilities["browserExec"], json!(false));
+    assert!(matches!(
+        reg.resolve(&pinned("y")),
+        Err(ReverseDispatchError::ClientOffline { pinned: true, .. })
+    ));
+}
+
+/// Regression (#1760 review): "newest hello wins" for the display fields
+/// keys on hello order, not connection-registration order. An older
+/// connection that re-hellos later carries the client's current identity.
+#[test]
+fn live_clients_project_the_most_recent_hello_regardless_of_registration_order() {
+    let reg = PrimaryReverseRegistry::new();
+    let (first, _rx_first) = idle_channel();
+    let (second, _rx_second) = idle_channel();
+    let g_first = reg.register(first, ReverseTransport::Wss);
+    let g_second = reg.register(second, ReverseTransport::Uds);
+    // The later-registered connection hellos first ...
+    g_second.bind(ReverseClientIdentity {
+        name: Some("stale".into()),
+        capabilities: json!({ "browserExec": false, "rev": 1 }),
+        ..identity("x", false)
+    });
+    // ... then the earlier-registered connection hellos with newer data.
+    g_first.bind(ReverseClientIdentity {
+        name: Some("fresh".into()),
+        capabilities: json!({ "browserExec": true, "rev": 2 }),
+        host: ClientHostInfo {
+            hostname: Some("fresh.local".into()),
+            pretty_hostname: Some("Fresh".into()),
+            device_kind: Some("laptop".into()),
+        },
+        ..identity("x", true)
+    });
+
+    let clients = reg.live_clients();
+    assert_eq!(clients.len(), 1);
+    let x = &clients[0];
+    assert_eq!(x.connections, 2);
+    assert_eq!(x.name.as_deref(), Some("fresh"));
+    assert_eq!(x.capabilities["rev"], json!(2));
+    assert_eq!(x.host.hostname.as_deref(), Some("fresh.local"));
+    assert_eq!(x.host.pretty_hostname.as_deref(), Some("Fresh"));
+    assert_eq!(x.host.device_kind.as_deref(), Some("laptop"));
+
+    // A re-hello on the older-registered connection supersedes again.
+    g_second.bind(ReverseClientIdentity {
+        name: Some("freshest".into()),
+        capabilities: json!({ "browserExec": false, "rev": 3 }),
+        ..identity("x", false)
+    });
+    let clients = reg.live_clients();
+    let x = &clients[0];
+    assert_eq!(x.name.as_deref(), Some("freshest"));
+    assert_eq!(x.capabilities["rev"], json!(3));
+    assert_eq!(x.host.hostname.as_deref(), Some("x.local"));
+    assert_eq!(
+        x.capabilities["browserExec"],
+        json!(true),
+        "the aggregate still reflects the eligible connection"
+    );
 }
 
 #[tokio::test]

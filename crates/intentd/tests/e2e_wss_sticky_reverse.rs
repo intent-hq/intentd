@@ -19,7 +19,16 @@
 //!   6. `client:connected` / `client:disconnected` reach an
 //!      `events.subscribe` subscriber — including when the heartbeat reaper
 //!      aborts a silent client's task, and in registry order when the same
-//!      client reconnects right behind its own disconnect.
+//!      client reconnects right behind its own disconnect,
+//!   7. a workspace pinned via `workspace.setBrowserClient` routes an agent
+//!      `browser.exec` to the pinned client's eligible connection and fails
+//!      typed (no fallback) once that client is gone.
+//!
+//! The wire contract of the pin RPCs themselves (`client.list`,
+//! `workspace.getBrowserClient` / `setBrowserClient`, their events and
+//! `-32602` paths) is covered over the secure TLS + bearer + fingerprint-pinned
+//! transport in `e2e_wss_browser_client_pin.rs`; this file only sets the pin
+//! as setup for the in-process dispatch assertions.
 
 #![cfg(unix)]
 
@@ -121,6 +130,38 @@ async fn connect(port: u16) -> PlainWs {
 /// The read budget is a *total* budget across all frames (ping / unrelated
 /// notification loops included), matching the `try_read_text` pattern below
 /// so pings can't extend the wait indefinitely.
+/// Assert the full JSON-RPC 2.0 response envelope: `jsonrpc == "2.0"`, the
+/// request `id` echoed, and exactly one of `result` / `error` with no other
+/// top-level keys. An `error` member carries an integer `code` and a string
+/// `message` (plus optional `data`).
+fn assert_envelope(v: &Value, id: i64, method: &str) {
+    let obj = v
+        .as_object()
+        .unwrap_or_else(|| panic!("{method}: response is not an object: {v}"));
+    assert_eq!(obj.get("jsonrpc"), Some(&json!("2.0")), "{method}: {v}");
+    assert_eq!(obj.get("id"), Some(&json!(id)), "{method}: {v}");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    match (obj.get("result"), obj.get("error")) {
+        (Some(_), None) => assert_eq!(keys, ["id", "jsonrpc", "result"], "{method}: {v}"),
+        (None, Some(err)) => {
+            assert_eq!(keys, ["error", "id", "jsonrpc"], "{method}: {v}");
+            let err = err
+                .as_object()
+                .unwrap_or_else(|| panic!("{method}: error is not an object: {v}"));
+            assert!(err["code"].is_i64(), "{method}: error.code: {v}");
+            assert!(err["message"].is_string(), "{method}: error.message: {v}");
+            let mut err_keys: Vec<&str> = err.keys().map(String::as_str).collect();
+            err_keys.sort_unstable();
+            assert!(
+                err_keys == ["code", "message"] || err_keys == ["code", "data", "message"],
+                "{method}: error keys {err_keys:?}: {v}"
+            );
+        }
+        _ => panic!("{method}: exactly one of result/error required: {v}"),
+    }
+}
+
 async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({
         "jsonrpc": "2.0",
@@ -144,6 +185,7 @@ async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Valu
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json");
                 if v.get("id") == Some(&json!(id)) {
+                    assert_envelope(&v, id, method);
                     return v;
                 }
             }
@@ -204,12 +246,17 @@ async fn try_read_text(ws: &mut PlainWs, dur: Duration) -> Option<Value> {
 }
 
 /// `client.hello` params for logical client `client_id`, advertising (or not)
-/// the `browserExec` capability (REV-2 eligibility, PROTOCOL §5.17).
+/// the `browserExec` capability (REV-2 eligibility, PROTOCOL §5.17), with the
+/// client's own host identification (`hostname` / `prettyHostname` /
+/// `deviceKind`, mirroring `host.status`).
 fn hello(client_id: &str, browser_exec: bool) -> Value {
     json!({
         "clientId": client_id,
         "name": format!("Intent Desktop @ {client_id}"),
         "capabilities": { "browserExec": browser_exec },
+        "hostname": format!("{client_id}.local"),
+        "prettyHostname": format!("{client_id} (pretty)"),
+        "deviceKind": "laptop",
     })
 }
 
@@ -911,6 +958,113 @@ async fn client_events_keep_registry_order_across_reconnect_and_rehello() {
             .await
             .is_none(),
         "exactly one disconnect for the logical client"
+    );
+
+    fx.ws.stop().await;
+}
+
+/// A workspace pinned via `workspace.setBrowserClient` routes an agent
+/// `browser.exec` to the pinned client's **eligible** connection (not the
+/// first-connected client, not the pinned client's non-capable auxiliary
+/// socket) and, once that client is gone entirely, fails with the typed
+/// pinned-offline message instead of falling back to the default client. The
+/// pin is set over the wire as setup only — the RPC contract lives in
+/// `e2e_wss_browser_client_pin.rs`.
+#[tokio::test]
+async fn pinned_workspace_browser_exec_routes_to_pinned_client_and_fails_typed_when_gone() {
+    let fx = boot().await;
+    let mut a = connect(fx.port).await;
+    let _ = wss_rpc(&mut a, 1, "client.hello", hello("desktop-a", true)).await;
+    let mut b = connect(fx.port).await;
+    let _ = wss_rpc(&mut b, 1, "client.hello", hello("desktop-b", true)).await;
+    // desktop-b's newer auxiliary connection lacks the capability.
+    let mut aux = connect(fx.port).await;
+    let _ = wss_rpc(&mut aux, 1, "client.hello", hello("desktop-b", false)).await;
+    assert_eq!(fx.registry.len(), 3);
+
+    let created = wss_rpc(
+        &mut a,
+        2,
+        "workspace.create",
+        json!({ "title": "Pinned browser" }),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("created id: {created}"))
+        .to_string();
+    let set = wss_rpc(
+        &mut a,
+        3,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": ws_id, "clientId": "desktop-b" }),
+    )
+    .await;
+    assert_eq!(
+        set["result"]["browserClient"]["resolved"]["clientId"], "desktop-b",
+        "{set}"
+    );
+
+    // An agent browser.exec in the pinned workspace reaches desktop-b's
+    // eligible connection (`b`), not `a` and not the auxiliary socket.
+    let call = tokio::spawn({
+        let api = fx.api.clone();
+        let ws_id = ws_id.clone();
+        async move {
+            api.browser_exec(
+                WorkspaceId::from(ws_id.as_str()),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+            .await
+        }
+    });
+    let fe_result = json!({
+        "success": true,
+        "results": [{ "action": "listTabs", "success": true, "result": [] }]
+    });
+    let forwarded = answer_reverse(&mut b, Duration::from_secs(2), fe_result).await;
+    assert_eq!(forwarded["params"]["workspaceId"], ws_id.as_str());
+    let out = call.await.expect("join").expect("ok");
+    assert_eq!(out["action"], "listTabs");
+    for (name, sock) in [("a", &mut a), ("aux", &mut aux)] {
+        assert!(
+            try_read_text(sock, Duration::from_millis(200))
+                .await
+                .is_none(),
+            "{name} must not see a dispatch pinned to desktop-b's eligible connection"
+        );
+    }
+
+    // desktop-b goes away entirely: the pin stays and an agent browser.exec
+    // is a hard error naming the persisted client — no silent fallback to
+    // desktop-a.
+    close_and_await_deregistration(b, &fx.registry, 2).await;
+    close_and_await_deregistration(aux, &fx.registry, 1).await;
+    let err = fx
+        .api
+        .browser_exec(
+            WorkspaceId::from(ws_id.as_str()),
+            vec![json!({ "action": "listTabs" })],
+            None,
+            None,
+        )
+        .await
+        .expect_err("pinned client offline");
+    assert!(
+        matches!(
+            &err,
+            intent_core::Error::Internal(m)
+                if m == "browser.exec: pinned browser client \"Intent Desktop @ desktop-b\" (desktop-b) is not connected"
+        ),
+        "-32603 with the pinned-offline message: {err:?}"
+    );
+    assert!(
+        try_read_text(&mut a, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "no silent fallback to desktop-a"
     );
 
     fx.ws.stop().await;

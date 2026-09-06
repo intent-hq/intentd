@@ -2,13 +2,13 @@
 
 use std::sync::Mutex;
 
-use intent_core::{BoxFuture, ClientId, Result, WorkspaceApi};
+use intent_core::{BoxFuture, ClientHostInfo, ClientId, Result, WorkspaceApi};
 use serde_json::{json, Value};
 
 use super::*;
 
-/// One recorded `upsert_client` call: `(clientId, name, capabilities)`.
-type UpsertCall = (String, Option<String>, Option<Value>);
+/// One recorded `upsert_client` call: `(clientId, name, capabilities, host)`.
+type UpsertCall = (String, Option<String>, Option<Value>, ClientHostInfo);
 
 /// Records the last `upsert_client` call so tests can assert persistence wiring.
 #[derive(Default)]
@@ -22,8 +22,9 @@ impl WorkspaceApi for RecordingApi {
         client_id: ClientId,
         name: Option<String>,
         capabilities: Option<Value>,
+        host: ClientHostInfo,
     ) -> BoxFuture<'_, Result<()>> {
-        *self.last.lock().unwrap() = Some((client_id.0, name, capabilities));
+        *self.last.lock().unwrap() = Some((client_id.0, name, capabilities, host));
         Box::pin(async { Ok(()) })
     }
 }
@@ -61,6 +62,11 @@ async fn mints_client_id_when_omitted() {
         "omitted capabilities normalize to an empty object"
     );
     assert!(!bound.browser_exec());
+    assert_eq!(
+        bound.host,
+        ClientHostInfo::default(),
+        "omitted host identification stays absent"
+    );
     assert_eq!(
         resp["result"]["protocolVersion"],
         json!(crate::protocol::PROTOCOL_VERSION),
@@ -122,6 +128,58 @@ async fn re_presents_persisted_id_and_is_idempotent() {
     let last = api.last.lock().unwrap().clone().unwrap();
     assert_eq!(last.0, "cli-7f3a");
     assert_eq!(last.2, Some(json!({ "forward": true })));
+    assert_eq!(last.3, ClientHostInfo::default());
+}
+
+/// `hostname` / `prettyHostname` / `deviceKind` mirror the daemon's own
+/// `host.status` identification: parsed when strings, persisted through
+/// `upsert_client`, and carried on the bound reverse identity so
+/// `client.list` can label the client by device. A non-string value reads as
+/// omitted rather than rejecting the hello.
+#[tokio::test]
+async fn host_identification_is_parsed_persisted_and_bound() {
+    let api = RecordingApi::default();
+    let mut binding: Option<ClientId> = None;
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "client.hello",
+        "params": {
+            "clientId": "cli-host", "name": "Intent Desktop",
+            "hostname": "mbp.local", "prettyHostname": "Clement's MacBook Pro",
+            "deviceKind": "laptop"
+        }
+    }))
+    .unwrap();
+    let expected = ClientHostInfo {
+        hostname: Some("mbp.local".to_string()),
+        pretty_hostname: Some("Clement's MacBook Pro".to_string()),
+        device_kind: Some("laptop".to_string()),
+    };
+    let outcome = handle(req, &api, &mut binding, true).await;
+    let bound = outcome.bound.clone().expect("bound identity");
+    assert_eq!(bound.host, expected);
+    let last = api.last.lock().unwrap().clone().unwrap();
+    assert_eq!(last.0, "cli-host");
+    assert_eq!(last.3, expected, "host identification reaches persistence");
+    let resp = parsed(outcome);
+    assert_eq!(resp["result"]["clientId"], json!("cli-host"));
+
+    let partial = classify(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "client.hello",
+        "params": { "clientId": "cli-host", "hostname": 42, "deviceKind": "desktop" }
+    }))
+    .unwrap();
+    let outcome = handle(partial, &api, &mut binding, true).await;
+    let bound = outcome.bound.clone().expect("bound identity");
+    assert_eq!(
+        bound.host,
+        ClientHostInfo {
+            hostname: None,
+            pretty_hostname: None,
+            device_kind: Some("desktop".to_string()),
+        },
+        "non-string members read as omitted; the hello still succeeds"
+    );
+    assert!(parsed(outcome).get("error").is_none());
 }
 
 #[tokio::test]

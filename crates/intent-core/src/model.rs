@@ -298,6 +298,12 @@ pub struct Workspace {
     /// `worktreePath`, non-git repo paths, pre-existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_mode: Option<CheckoutMode>,
+    /// Per-workspace browser-client pin (REV-2): the logical `clientId`
+    /// agent-initiated `browser.exec` requests for this workspace are routed
+    /// to (`workspace.setBrowserClient`). Omitted (not `null`) when unpinned
+    /// — the first-connected eligible client then serves the workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_client_id: Option<ClientId>,
     /// Disk footprint of the daemon-managed workspace directory
     /// (`<workspaces_root>/<workspaceId>`: repo checkout, tool-outputs, agent
     /// sandboxes, everything). Never populated on `workspace.list` /
@@ -433,6 +439,7 @@ pub fn chief_workspace() -> Workspace {
         waiting: false,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -4349,10 +4356,32 @@ pub struct WorkspaceGitRoot {
     pub updated_at: String,
 }
 
+/// Host identification a client supplies about *its own* device in
+/// `client.hello` (§5.17) — the mirror image of the `hostname` /
+/// `prettyHostname` / `deviceKind` triple the daemon reports about itself in
+/// `host.status` / `server.pairingInfo`, with the same semantics: `hostname`
+/// is the OS hostname, `pretty_hostname` the user-facing device name (macOS
+/// Computer Name) falling back to the hostname, `device_kind` the detected
+/// device category. All optional: clients pre-dating the fields send none.
+/// Persisted on the `client` row and refreshed on every hello.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientHostInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pretty_hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_kind: Option<String>,
+}
+
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that
 /// survives reconnects; persisted to the `client` table with `name`,
-/// `capabilities`, `first_seen`, and `last_seen`. The ephemeral per-connection
-/// id is transport-only and never stored here.
+/// `capabilities`, the [`ClientHostInfo`] triple, `first_seen`, and
+/// `last_seen`. `last_hello_at` is `None` for a row minted only to key an
+/// anonymous connection's drafts (§5.16) — such a client never completed
+/// `client.hello`. The ephemeral per-connection id is transport-only and
+/// never stored here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Client {
@@ -4360,8 +4389,12 @@ pub struct Client {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub capabilities: serde_json::Value,
+    #[serde(flatten)]
+    pub host: ClientHostInfo,
     pub first_seen: String,
     pub last_seen: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hello_at: Option<String>,
 }
 
 /// Per-client chat draft (§9.10, §15), keyed by `(workspaceId, agentId,
@@ -5112,6 +5145,7 @@ mod tests {
             waiting: false,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

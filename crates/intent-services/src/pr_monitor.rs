@@ -2473,6 +2473,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,

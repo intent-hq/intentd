@@ -26,8 +26,8 @@ use intent_core::events::{
 };
 use intent_core::{
     chief_workspace, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso, ActorType,
-    AgentDelegateInput, AgentId, AgentLite, AgentSession, AuthorType, BoxFuture, ClientId, Comment,
-    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
+    AgentDelegateInput, AgentId, AgentLite, AgentSession, AuthorType, BoxFuture, ClientHostInfo,
+    ClientId, Comment, CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
     CommentWire, ContentType, ContextItem, CreatedTaskEntry, Draft, Event, EventQueryParams,
@@ -47,7 +47,7 @@ use intent_core::{
     WorkspaceGitRootId, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
     WorkspaceUpdate,
 };
-use intent_core::{AgentReverseDispatch, ReverseTarget};
+use intent_core::{AgentReverseDispatch, ReverseDispatchError, ReverseLiveClient, ReverseTarget};
 use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
@@ -367,6 +367,10 @@ pub struct Services {
     /// the `agent_queue` table always reflects the newest in-memory state — an
     /// older snapshot can never overwrite a newer one out of mutation order.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes `workspace.setBrowserClient` write + `workspace:updated`
+    /// publish so concurrent setters never emit deltas out of order relative
+    /// to the durable pin; the delta is read back from the committed row.
+    browser_client_pin_gate: Arc<tokio::sync::Mutex<()>>,
     /// Per-entry debounce-hold release timers, keyed by queue-entry id: each
     /// held [`agent_ops::QueuedMessage`] gets a spawned sleeper that flushes
     /// the hold marker at `holdUntil` and kicks delivery. Release/retract
@@ -1111,6 +1115,7 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
             pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks::default(),
             pending_marker_mutation_park: None,
@@ -3910,6 +3915,83 @@ impl Services {
     pub fn with_reverse_dispatch(mut self, dispatch: Arc<dyn AgentReverseDispatch>) -> Self {
         self.reverse_dispatch = Some(dispatch);
         self
+    }
+
+    /// The [`ReverseTarget`] an agent-initiated `browser.exec` for
+    /// `workspace_id` dispatches to: `Pinned` when the workspace carries a
+    /// browser-client pin, else `Default`. A workspace the store does not
+    /// know (unit tests, Chief) is unpinned; other store failures propagate.
+    async fn browser_exec_target(&self, workspace_id: &WorkspaceId) -> Result<ReverseTarget> {
+        if workspace_id.is_chief() {
+            return Ok(ReverseTarget::Default);
+        }
+        match self.store.workspace_browser_client(workspace_id).await {
+            Ok(Some(client_id)) => Ok(ReverseTarget::Pinned(client_id)),
+            Ok(None) | Err(Error::NotFound(_)) => Ok(ReverseTarget::Default),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Fill in the display name of a fully offline client from the persisted
+    /// `client` row so the pin-miss error still reads `"<name>" (<clientId>)`
+    /// (the registry only knows names of live connections).
+    async fn name_offline_client(&self, err: ReverseDispatchError) -> ReverseDispatchError {
+        match err {
+            ReverseDispatchError::ClientOffline {
+                client_id,
+                name: None,
+                pinned,
+            } => {
+                let name = self
+                    .store
+                    .get_client(&client_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|c| c.name);
+                ReverseDispatchError::ClientOffline {
+                    client_id,
+                    name,
+                    pinned,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// The `workspace.getBrowserClient` payload for `id`: the persisted pin
+    /// (`clientId` + `source: "workspace"`, else `source: "default"`) and
+    /// `resolved` — the client an agent `browser.exec` would reach right
+    /// now, `null` when the pin is offline or no eligible client is
+    /// connected. Chief has no row and always reports the default.
+    async fn browser_client_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
+        let pinned = if id.is_chief() {
+            None
+        } else {
+            self.store.workspace_browser_client(id).await?
+        };
+        let target = pinned
+            .clone()
+            .map_or(ReverseTarget::Default, ReverseTarget::Pinned);
+        let resolved = self
+            .reverse_dispatch
+            .as_ref()
+            .and_then(|d| d.resolve(&target).ok())
+            .map_or(serde_json::Value::Null, |r| {
+                serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
+            });
+        let mut out = serde_json::Map::new();
+        match pinned {
+            Some(client_id) => {
+                out.insert("clientId".into(), client_id.as_str().into());
+                out.insert("source".into(), "workspace".into());
+            }
+            None => {
+                out.insert("source".into(), "default".into());
+            }
+        }
+        out.insert("resolved".into(), resolved);
+        Ok(serde_json::Value::Object(out))
     }
 
     /// Attach the runtime [`ServerControl`] so `settings.update` can start/stop
@@ -17344,6 +17426,7 @@ impl WorkspaceApi for Services {
                         diff_summary: None,
                         token_usage: None,
                         cow_supported: None,
+                        browser_client_id: None,
                         display_status: None,
                         waiting: false,
                         checkout_mode: None,
@@ -19692,6 +19775,7 @@ impl WorkspaceApi for Services {
                 diff_summary: None,
                 token_usage: None,
                 cow_supported: None,
+                browser_client_id: None,
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
@@ -20522,6 +20606,78 @@ impl WorkspaceApi for Services {
             )
             .await;
             Ok(serde_json::json!({ "enabled": enabled, "source": "workspace" }))
+        })
+    }
+
+    fn client_list(&self) -> BoxFuture<'_, Result<Vec<ReverseLiveClient>>> {
+        let clients = self
+            .reverse_dispatch
+            .as_ref()
+            .map(|d| d.live_clients())
+            .unwrap_or_default();
+        Box::pin(async move { Ok(clients) })
+    }
+
+    fn get_workspace_browser_client(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.browser_client_state(&id).await })
+    }
+
+    fn set_workspace_browser_client(
+        &self,
+        id: WorkspaceId,
+        client_id: Option<ClientId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            // Chief is virtual: no row to pin and no agent browser work runs
+            // there.
+            if id.is_chief() {
+                return Err(Error::InvalidParams(
+                    "cannot set browserClient on chief workspace".to_string(),
+                ));
+            }
+            if let Some(client_id) = &client_id {
+                // Only a client that has completed `client.hello` at least
+                // once can be pinned — an offline-but-known client is fine
+                // (it surfaces as "pinned but not connected"), but a row
+                // minted only to key an anonymous connection's drafts is
+                // not: it can never resolve to a reverse connection.
+                let hello_seen = store
+                    .get_client(client_id)
+                    .await?
+                    .is_some_and(|c| c.last_hello_at.is_some());
+                if !hello_seen {
+                    return Err(Error::InvalidParams(format!(
+                        "unknown clientId {}: the client has never connected",
+                        client_id.as_str()
+                    )));
+                }
+            }
+            // Write, announce and read back under one gate: two racing
+            // setters would otherwise publish deltas in the opposite order of
+            // their commits, or echo the other's pin in their own reply. The
+            // delta carries the read-back committed value, not the requested
+            // one, and the reply is built from the same committed state.
+            let _gate = self.browser_client_pin_gate.lock().await;
+            store
+                .set_workspace_browser_client(&id, client_id.as_ref())
+                .await?;
+            let committed = store.workspace_browser_client(&id).await?;
+            // Self-sufficient `workspace:updated` delta (§6.5); `null`
+            // spells a cleared pin so clients can drop their copy.
+            let change = committed
+                .as_ref()
+                .map_or(serde_json::Value::Null, |c| c.as_str().into());
+            publish_event(
+                bus.as_ref(),
+                workspace_updated_event(&id, &serde_json::json!({ "browserClientId": change })),
+            )
+            .await;
+            self.browser_client_state(&id).await
         })
     }
 
@@ -28612,9 +28768,18 @@ impl WorkspaceApi for Services {
         client_id: ClientId,
         name: Option<String>,
         capabilities: Option<serde_json::Value>,
+        host: ClientHostInfo,
     ) -> BoxFuture<'_, Result<()>> {
         let svc = self.clone();
-        Box::pin(async move { svc.client_hello_upsert(client_id, name, capabilities).await })
+        Box::pin(async move {
+            svc.client_hello_upsert(client_id, name, capabilities, host)
+                .await
+        })
+    }
+
+    fn ensure_client(&self, client_id: ClientId) -> BoxFuture<'_, Result<()>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.client_ensure(client_id).await })
     }
 
     fn draft_get(
@@ -28658,9 +28823,13 @@ impl WorkspaceApi for Services {
     /// there is no per-connection reverse channel to use (the caller is the
     /// daemon-hosted MCP server, not a client connection), so we route the
     /// batch through the injected [`AgentReverseDispatch`]. The target is
-    /// currently always [`ReverseTarget::Default`] (first-connected eligible
-    /// client); tab-host and workspace-pin resolution land with the browser
-    /// tab registry. Attribution fields (`workspaceId`, `agentId`,
+    /// the workspace's pinned browser client ([`ReverseTarget::Pinned`],
+    /// `workspace.setBrowserClient`) when one is set — a pinned-but-offline
+    /// client is a hard `-32603` ("pinned browser client … is not
+    /// connected"), never a silent fallback — else
+    /// [`ReverseTarget::Default`] (first-connected eligible client);
+    /// tab-host resolution lands with the browser tab registry.
+    /// Attribution fields (`workspaceId`, `agentId`,
     /// `tabId`) are threaded into the forwarded params so the FE sees the
     /// same envelope shape the client-triggered path already emits. Result
     /// shaping stays in [`browser_ops`], via the agent-surface variant
@@ -28694,6 +28863,7 @@ impl WorkspaceApi for Services {
                     "browser.exec: no client connected".to_string(),
                 ));
             };
+            let target = self.browser_exec_target(&workspace_id).await?;
             // Shape by *request* arity: the FE aborts a batch on the first
             // failing action, so the reply's results count can be shorter
             // than the batch (see `shape_agent_result`).
@@ -28705,20 +28875,21 @@ impl WorkspaceApi for Services {
                 workspace_id: Some(workspace_id.as_str().to_string()),
             };
             let forwarded = browser_ops::build_forward_params(&args);
-            let response = dispatch
-                .dispatch("browser.exec", forwarded, ReverseTarget::Default)
-                .await
-                .map_err(|e| match e {
-                    intent_core::ReverseDispatchError::NoClient => {
-                        Error::Internal("browser.exec: no client connected".to_string())
-                    }
-                    offline @ intent_core::ReverseDispatchError::ClientOffline { .. } => {
-                        Error::Internal(format!("browser.exec: {offline}"))
-                    }
-                    intent_core::ReverseDispatchError::Transport { message, .. } => {
-                        Error::Internal(format!("browser.exec: {message}"))
-                    }
-                })?;
+            let response = match dispatch.dispatch("browser.exec", forwarded, target).await {
+                Ok(response) => response,
+                Err(ReverseDispatchError::NoClient) => {
+                    return Err(Error::Internal(
+                        "browser.exec: no client connected".to_string(),
+                    ));
+                }
+                Err(offline @ ReverseDispatchError::ClientOffline { .. }) => {
+                    let offline = self.name_offline_client(offline).await;
+                    return Err(Error::Internal(format!("browser.exec: {offline}")));
+                }
+                Err(ReverseDispatchError::Transport { message, .. }) => {
+                    return Err(Error::Internal(format!("browser.exec: {message}")));
+                }
+            };
             browser_ops::shape_agent_result(&response, requested_actions)
                 .map_err(|e| Error::Internal(e.message))
         })
