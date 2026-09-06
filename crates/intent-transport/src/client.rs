@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use crate::events::{error_frame, success_frame};
 use crate::host_env::detect_has_display;
 use crate::protocol::PROTOCOL_VERSION;
+use crate::reverse::ReverseClientIdentity;
 
 /// A classified `client.hello` request awaiting handling by the connection task.
 pub(crate) struct ClientRequest {
@@ -97,6 +98,14 @@ pub(crate) fn server_json(
     server
 }
 
+/// Result of [`handle`]: the response frame (`None` for a notification) and,
+/// on success, the identity the connection now carries — what the connection
+/// task binds onto its reverse-registry entry (REV-2).
+pub(crate) struct HelloOutcome {
+    pub frame: Option<String>,
+    pub bound: Option<ReverseClientIdentity>,
+}
+
 /// Handle a classified `client.hello`: resolve (or mint) the `clientId`, persist
 /// the logical `client` row, set the connection's `client_id` binding, and reply
 /// with `{ clientId, protocolVersion, server }`. The top-level `protocolVersion`
@@ -109,20 +118,26 @@ pub(crate) async fn handle(
     api: &dyn WorkspaceApi,
     client_id: &mut Option<ClientId>,
     is_local: bool,
-) -> Option<String> {
+) -> HelloOutcome {
     if req.client_id_invalid {
-        return frame(
-            req.id_present,
-            &req.id_echo,
-            Err((-32602, "clientId must be a string".to_string())),
-        );
+        return HelloOutcome {
+            frame: frame(
+                req.id_present,
+                &req.id_echo,
+                Err((-32602, "clientId must be a string".to_string())),
+            ),
+            bound: None,
+        };
     }
     let resolved = req.client_id.map(ClientId::from_string).unwrap_or_default();
     if let Err(e) = api
-        .upsert_client(resolved.clone(), req.name, req.capabilities)
+        .upsert_client(resolved.clone(), req.name.clone(), req.capabilities.clone())
         .await
     {
-        return frame(req.id_present, &req.id_echo, Err((-32603, e.to_string())));
+        return HelloOutcome {
+            frame: frame(req.id_present, &req.id_echo, Err((-32603, e.to_string()))),
+            bound: None,
+        };
     }
     *client_id = Some(resolved.clone());
     let server = server_json(
@@ -133,15 +148,22 @@ pub(crate) async fn handle(
         crate::BUILD_COMMIT,
         is_local,
     );
-    frame(
-        req.id_present,
-        &req.id_echo,
-        Ok(json!({
-            "clientId": resolved.as_str(),
-            "protocolVersion": PROTOCOL_VERSION,
-            "server": server,
-        })),
-    )
+    HelloOutcome {
+        frame: frame(
+            req.id_present,
+            &req.id_echo,
+            Ok(json!({
+                "clientId": resolved.as_str(),
+                "protocolVersion": PROTOCOL_VERSION,
+                "server": server,
+            })),
+        ),
+        bound: Some(ReverseClientIdentity {
+            client_id: resolved,
+            name: req.name,
+            capabilities: req.capabilities.unwrap_or_else(|| json!({})),
+        }),
+    }
 }
 
 /// Build the response frame for a `client.hello` result, or `None` for a

@@ -28,8 +28,8 @@ impl WorkspaceApi for RecordingApi {
     }
 }
 
-fn parsed(frame: Option<String>) -> Value {
-    serde_json::from_str(&frame.expect("a response frame")).unwrap()
+fn parsed(outcome: HelloOutcome) -> Value {
+    serde_json::from_str(&outcome.frame.expect("a response frame")).unwrap()
 }
 
 #[tokio::test]
@@ -40,7 +40,12 @@ async fn mints_client_id_when_omitted() {
         "jsonrpc": "2.0", "id": 1, "method": "client.hello", "params": { "name": "Intent" }
     }))
     .unwrap();
-    let resp = parsed(handle(req, &api, &mut binding, true).await);
+    let outcome = handle(req, &api, &mut binding, true).await;
+    let bound = outcome
+        .bound
+        .clone()
+        .expect("a successful hello binds an identity");
+    let resp = parsed(outcome);
     let cid = resp["result"]["clientId"].as_str().unwrap();
     assert!(!cid.is_empty(), "server mints a clientId when omitted");
     assert_eq!(
@@ -48,6 +53,14 @@ async fn mints_client_id_when_omitted() {
         cid,
         "binding is set to the minted id"
     );
+    assert_eq!(bound.client_id.as_str(), cid);
+    assert_eq!(bound.name.as_deref(), Some("Intent"));
+    assert_eq!(
+        bound.capabilities,
+        json!({}),
+        "omitted capabilities normalize to an empty object"
+    );
+    assert!(!bound.browser_exec());
     assert_eq!(
         resp["result"]["protocolVersion"],
         json!(crate::protocol::PROTOCOL_VERSION),
@@ -119,7 +132,12 @@ async fn non_string_client_id_is_invalid_params() {
         "jsonrpc": "2.0", "id": 1, "method": "client.hello", "params": { "clientId": 42 }
     }))
     .unwrap();
-    let resp = parsed(handle(req, &api, &mut binding, true).await);
+    let outcome = handle(req, &api, &mut binding, true).await;
+    assert!(
+        outcome.bound.is_none(),
+        "an invalid hello binds no reverse identity"
+    );
+    let resp = parsed(outcome);
     assert_eq!(resp["error"]["code"], json!(-32602));
     assert_eq!(resp["error"]["data"]["code"], "invalid-params");
     assert!(
@@ -133,11 +151,16 @@ async fn notification_has_no_response_but_sets_binding() {
     let api = RecordingApi::default();
     let mut binding: Option<ClientId> = None;
     let req = classify(&json!({
-        "jsonrpc": "2.0", "method": "client.hello", "params": { "clientId": "cli-9b21" }
+        "jsonrpc": "2.0", "method": "client.hello",
+        "params": { "clientId": "cli-9b21", "capabilities": { "browserExec": true } }
     }))
     .unwrap();
-    assert!(handle(req, &api, &mut binding, true).await.is_none());
+    let outcome = handle(req, &api, &mut binding, true).await;
+    assert!(outcome.frame.is_none());
     assert_eq!(binding.as_ref().unwrap().0, "cli-9b21");
+    let bound = outcome.bound.expect("notification hello still binds");
+    assert_eq!(bound.client_id.as_str(), "cli-9b21");
+    assert!(bound.browser_exec());
 }
 
 #[test]

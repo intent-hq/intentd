@@ -6598,14 +6598,48 @@ pub trait ContextEngine: Send + Sync {
     ) -> std::result::Result<RetrieveResult, ContextError>;
 }
 
-/// Why an agent-initiated reverse RPC could not be delivered (REV-1). Kept as a
-/// small named enum so the service layer can distinguish "no client connected"
-/// from a transport-level failure without inspecting error strings.
+/// Which client an agent-initiated reverse RPC should be delivered to (REV-2).
+///
+/// Resolution is performed by the [`AgentReverseDispatch`] implementation
+/// against its live, capability-eligible connections (a connection is
+/// eligible for `browser.exec` only when its `client.hello` advertised
+/// `capabilities.browserExec === true`, PROTOCOL §5.17):
+///
+/// - [`Client`](Self::Client) / [`Pinned`](Self::Pinned): the named logical
+///   client's **newest** eligible connection; no such connection ⇒
+///   [`ReverseDispatchError::ClientOffline`] (with `pinned` set for `Pinned`).
+///   `Client` is what tab-host routing uses, `Pinned` what the per-workspace
+///   browser-client pin uses — same lookup, distinct error wording.
+/// - [`Default`](Self::Default): the **first-connected** eligible connection;
+///   none ⇒ [`ReverseDispatchError::NoClient`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReverseTarget {
+    /// A specific logical client (e.g. the host of a browser tab).
+    Client(ClientId),
+    /// The workspace's pinned browser client.
+    Pinned(ClientId),
+    /// The first-connected eligible client.
+    Default,
+}
+
+/// Why an agent-initiated reverse RPC could not be delivered (REV-1/REV-2).
+/// Kept as a small named enum so the service layer can distinguish "no client
+/// connected" from a transport-level failure without inspecting error strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReverseDispatchError {
-    /// No client is currently registered as the sticky reverse target — no
-    /// live connection to route the request to.
+    /// No eligible client is currently connected — nothing to route a
+    /// [`ReverseTarget::Default`] request to.
     NoClient,
+    /// The requested [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`]
+    /// client has no live eligible connection. `name` is the client's display
+    /// name when the dispatcher knows it (it may not for a client that is
+    /// fully offline); `pinned` mirrors the target variant so callers can
+    /// word the failure as a pin miss.
+    ClientOffline {
+        client_id: ClientId,
+        name: Option<String>,
+        pinned: bool,
+    },
     /// The reverse RPC could not be completed successfully — covers delivery
     /// failures (e.g. the outbound queue was closed before the request left
     /// the daemon), transport-level failures (timeout waiting for the
@@ -6621,6 +6655,25 @@ impl std::fmt::Display for ReverseDispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReverseDispatchError::NoClient => f.write_str("no client connected"),
+            ReverseDispatchError::ClientOffline {
+                client_id,
+                name,
+                pinned,
+            } => {
+                let kind = if *pinned {
+                    "pinned browser client"
+                } else {
+                    "browser client"
+                };
+                match name {
+                    Some(name) => write!(
+                        f,
+                        "{kind} \"{name}\" ({}) is not connected",
+                        client_id.as_str()
+                    ),
+                    None => write!(f, "{kind} {} is not connected", client_id.as_str()),
+                }
+            }
             ReverseDispatchError::Transport { message, .. } => f.write_str(message),
         }
     }
@@ -6628,30 +6681,34 @@ impl std::fmt::Display for ReverseDispatchError {
 
 impl std::error::Error for ReverseDispatchError {}
 
-/// Agent-initiated daemon→client reverse-RPC seam (REV-1, PROTOCOL §5.14/§12.4).
+/// Agent-initiated daemon→client reverse-RPC seam (REV-1/REV-2, PROTOCOL
+/// §5.14/§12.4).
 ///
-/// Provides the sticky "first client wins" routing decision the service layer
-/// needs when an agent (not a per-connection client) triggers a reverse intent
-/// (currently `browser.exec`). The concrete implementation lives in
-/// `intent-transport` (a shared registry of live `ReverseChannel`s ordered by
-/// arrival); `intent-services` holds it as `Arc<dyn AgentReverseDispatch>` so
-/// the crate graph stays acyclic (§3.2).
+/// Provides the target-selection decision the service layer needs when an
+/// agent (not a per-connection client) triggers a reverse intent (currently
+/// `browser.exec`). The concrete implementation lives in `intent-transport`
+/// (a shared registry of live `ReverseChannel`s that learns each connection's
+/// logical `clientId` and `capabilities` from `client.hello`);
+/// `intent-services` holds it as `Arc<dyn AgentReverseDispatch>` so the crate
+/// graph stays acyclic (§3.2).
 ///
-/// Semantics: `dispatch` returns the same JSON `Value` the connected client
-/// echoed back verbatim, or a [`ReverseDispatchError`] describing why the
-/// request could not be delivered. `is_connected` is a cheap synchronous probe
-/// that lets the service surface a friendlier error before it composes the
-/// forward params.
+/// Semantics: `dispatch` resolves `target` (see [`ReverseTarget`]) and returns
+/// the same JSON `Value` the connected client echoed back verbatim, or a
+/// [`ReverseDispatchError`] describing why the request could not be
+/// delivered. `is_connected` is a cheap synchronous probe that lets the
+/// service surface a friendlier error before it composes the forward params.
 pub trait AgentReverseDispatch: Send + Sync {
-    /// Whether at least one client is currently registered as a reverse target.
+    /// Whether at least one eligible client is currently connected (i.e. a
+    /// [`ReverseTarget::Default`] dispatch would find a target).
     fn is_connected(&self) -> bool;
 
-    /// Dispatch a reverse JSON-RPC request to the sticky primary client and
-    /// await its response.
+    /// Dispatch a reverse JSON-RPC request to the client `target` resolves to
+    /// and await its response.
     fn dispatch<'a>(
         &'a self,
         method: &'a str,
         params: serde_json::Value,
+        target: ReverseTarget,
     ) -> BoxFuture<'a, std::result::Result<serde_json::Value, ReverseDispatchError>>;
 }
 

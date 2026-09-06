@@ -46,7 +46,7 @@ use crate::conn::{outbound_channel, process_frame, ConnSubs};
 #[cfg(any(unix, windows))]
 use crate::forward::ForwardRegistry;
 #[cfg(any(unix, windows))]
-use crate::reverse::ReverseChannel;
+use crate::reverse::{ReverseChannel, ReverseTransport};
 
 /// Derive the Windows named-pipe name for a resolved socket path (the spec's
 /// pipe-name contract, mirrored byte-for-byte by cloudlands-fe):
@@ -158,6 +158,9 @@ where
     let listener = UnixListener::bind(socket_path)?;
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
     tracing::info!(path = %socket_path.display(), "intentd listening on UDS");
+    // REV-2: `client:*` events for the shared registry (no-op when the WSS
+    // listener already spawned the publisher).
+    reverse_registry.spawn_client_event_publisher(api.clone());
 
     tokio::pin!(shutdown);
     let mut backoff = AcceptBackoff::default();
@@ -268,12 +271,13 @@ where
     let mut subs = ConnSubs::default();
     let mut forwards = ForwardRegistry::default();
     let reverse = ReverseChannel::new(out_tx.priority_sender());
-    // REV-1: register this connection's reverse channel with the shared
-    // primary-target set so agent-initiated `browser.exec` calls can route to
-    // whichever client connected first. The guard drops when this function
-    // returns (normal exit, error, or panic-unwind) so failover is exactly the
-    // connection arrival order.
-    let reverse_guard = reverse_registry.register(reverse.clone());
+    // REV-2: register this connection's reverse channel with the shared
+    // target registry; it becomes an eligible `browser.exec` target once
+    // `client.hello` binds an identity advertising `browserExec`. The guard
+    // drops when this function returns (and on panic-unwind), so failover
+    // among eligible connections is exactly the arrival order and the
+    // registry announces `client:disconnected` for a departed logical client.
+    let reverse_guard = reverse_registry.register(reverse.clone(), ReverseTransport::Uds);
     // Per-connection logical-client binding (§16): `None` until `client.hello`.
     let mut client_id: Option<intent_core::ClientId> = None;
     let mut line = Vec::new();
@@ -323,6 +327,7 @@ where
                 &mut subs,
                 &mut forwards,
                 &reverse,
+                &reverse_guard,
                 control.as_ref(),
                 server_pairing_info.as_ref(),
                 &mut client_id,
@@ -441,6 +446,9 @@ where
         .first_pipe_instance(true)
         .create(&pipe_name)?;
     tracing::info!(pipe = %pipe_name, path = %socket_path.display(), "intentd listening on named pipe");
+    // REV-2: `client:*` events for the shared registry (no-op when the WSS
+    // listener already spawned the publisher).
+    reverse_registry.spawn_client_event_publisher(api.clone());
 
     tokio::pin!(shutdown);
     let mut backoff = AcceptBackoff::default();

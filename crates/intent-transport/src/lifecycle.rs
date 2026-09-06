@@ -115,6 +115,10 @@ impl WsInner {
             shutdown_txs.push(shutdown_tx);
         }
         let heartbeat_task = tokio::spawn(self.clone().heartbeat_loop());
+        // REV-2: `client:*` events for the shared registry (no-op when the
+        // UDS listener already spawned the publisher).
+        self.reverse_registry
+            .spawn_client_event_publisher(self.api.clone());
         st.started = true;
         st.port = Some(port);
         st.start_task = None;

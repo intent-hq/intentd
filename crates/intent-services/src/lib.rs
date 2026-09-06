@@ -24,7 +24,6 @@ use intent_core::events::{
     WORKSPACE_SETUP_COMPLETED, WORKSPACE_SETUP_STARTED, WORKSPACE_TOKEN_USAGE_CHANGED,
     WORKSPACE_UPDATED,
 };
-use intent_core::AgentReverseDispatch;
 use intent_core::{
     chief_workspace, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso, ActorType,
     AgentDelegateInput, AgentId, AgentLite, AgentSession, AuthorType, BoxFuture, ClientId, Comment,
@@ -48,6 +47,7 @@ use intent_core::{
     WorkspaceGitRootId, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
     WorkspaceUpdate,
 };
+use intent_core::{AgentReverseDispatch, ReverseTarget};
 use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
@@ -28650,13 +28650,15 @@ impl WorkspaceApi for Services {
         Box::pin(async move { svc.drafts_clear(workspace_id, agent_id, client_id).await })
     }
 
-    /// `browser.exec` — agent-initiated CDP forward (REV-1, PROTOCOL §5.14/§12.4).
+    /// `browser.exec` — agent-initiated CDP forward (REV-2, PROTOCOL §5.14/§12.4).
     ///
     /// When an agent triggers this via the MCP `ws.browser.exec` binding
     /// there is no per-connection reverse channel to use (the caller is the
     /// daemon-hosted MCP server, not a client connection), so we route the
-    /// batch to the first-registered live client via the injected
-    /// [`AgentReverseDispatch`]. Attribution fields (`workspaceId`, `agentId`,
+    /// batch through the injected [`AgentReverseDispatch`]. The target is
+    /// currently always [`ReverseTarget::Default`] (first-connected eligible
+    /// client); tab-host and workspace-pin resolution land with the browser
+    /// tab registry. Attribution fields (`workspaceId`, `agentId`,
     /// `tabId`) are threaded into the forwarded params so the FE sees the
     /// same envelope shape the client-triggered path already emits. Result
     /// shaping stays in [`browser_ops`], via the agent-surface variant
@@ -28701,18 +28703,20 @@ impl WorkspaceApi for Services {
                 workspace_id: Some(workspace_id.as_str().to_string()),
             };
             let forwarded = browser_ops::build_forward_params(&args);
-            let response =
-                dispatch
-                    .dispatch("browser.exec", forwarded)
-                    .await
-                    .map_err(|e| match e {
-                        intent_core::ReverseDispatchError::NoClient => {
-                            Error::Internal("browser.exec: no client connected".to_string())
-                        }
-                        intent_core::ReverseDispatchError::Transport { message, .. } => {
-                            Error::Internal(format!("browser.exec: {message}"))
-                        }
-                    })?;
+            let response = dispatch
+                .dispatch("browser.exec", forwarded, ReverseTarget::Default)
+                .await
+                .map_err(|e| match e {
+                    intent_core::ReverseDispatchError::NoClient => {
+                        Error::Internal("browser.exec: no client connected".to_string())
+                    }
+                    offline @ intent_core::ReverseDispatchError::ClientOffline { .. } => {
+                        Error::Internal(format!("browser.exec: {offline}"))
+                    }
+                    intent_core::ReverseDispatchError::Transport { message, .. } => {
+                        Error::Internal(format!("browser.exec: {message}"))
+                    }
+                })?;
             browser_ops::shape_agent_result(&response, requested_actions)
                 .map_err(|e| Error::Internal(e.message))
         })

@@ -29,7 +29,7 @@ use crate::events::{self, FastPath};
 use crate::forward::{self, ForwardRegistry};
 use crate::host;
 use crate::panic_guard;
-use crate::reverse::ReverseChannel;
+use crate::reverse::{PrimaryReverseGuard, ReverseChannel};
 use crate::router::{
     check_envelope, handle_message, EnvelopeCheck, RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET,
 };
@@ -258,7 +258,10 @@ impl ConnSubs {
 ///
 /// The fast-paths that mutate per-connection state (`reverse.route_response`,
 /// `system.*`, `forward.*`, `client.hello`, `drafts.*`, `events.`/subscription
-/// fast-paths) run inline on the read loop and stay serialized. The two
+/// fast-paths) run inline on the read loop and stay serialized. A successful
+/// `client.hello` also binds the connection's logical identity onto its
+/// `reverse_guard` registry entry (REV-2 target selection) and publishes the
+/// global `client:connected` event when the logical client came online. The two
 /// stateless slow paths — `host::handle` and the [`handle_message`] JSON-RPC
 /// dispatcher — are spawned onto detached tokio tasks that write their response
 /// frame through a cloned outbound sender, so a long-running request (e.g.
@@ -290,6 +293,7 @@ pub(crate) async fn process_frame(
     subs: &mut ConnSubs,
     forwards: &mut ForwardRegistry,
     reverse: &ReverseChannel,
+    reverse_guard: &PrimaryReverseGuard,
     control: Option<&Arc<dyn SystemControl>>,
     server_pairing_info: Option<&Arc<dyn crate::server::ServerPairingInfo>>,
     client_id: &mut Option<ClientId>,
@@ -489,12 +493,18 @@ pub(crate) async fn process_frame(
                     == Some(1);
             // A new hello revokes the previous connection-local operation.
             subs.setup = crate::provider_setup::Connection::default();
-            let frame = panic_guard::guard_frame(
-                &method,
-                rpc_id.clone(),
-                client::handle(req, api.as_ref(), client_id, is_local),
-            )
+            let mut bound = None;
+            let frame = panic_guard::guard_frame(&method, rpc_id.clone(), async {
+                let outcome = client::handle(req, api.as_ref(), client_id, is_local).await;
+                bound = outcome.bound;
+                outcome.frame
+            })
             .await;
+            // REV-2: bind the hello'd identity onto the registry entry; the
+            // registry queues and publishes any `client:*` transition.
+            if let Some(identity) = bound {
+                reverse_guard.bind(identity);
+            }
             subs.setup.authorized = setup_requested
                 && !crate::context::is_tcp_connection()
                 && frame
