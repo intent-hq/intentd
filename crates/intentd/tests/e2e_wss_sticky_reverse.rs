@@ -812,15 +812,23 @@ async fn heartbeat_abort_publishes_client_disconnected() {
     fx.ws.stop().await;
 }
 
-/// Transitions are published in registry-mutation order. A same-client
-/// reconnect dialled the instant the stale entry is gone (the barrier is the
-/// registry length, not a sleep) must yield `client:disconnected` **then**
-/// `client:connected`; a re-hello that moves a connection to another
-/// `clientId` yields the old client's disconnect before the new one's
-/// connect — never a stale disconnect trailing a fresh connect.
+/// Transitions are published in registry-mutation order. The race is forced,
+/// not hoped for: [`WsOptions::cleanup_gate`] parks the closing connection's
+/// loop right after it has left the registry, a same-client reconnect is
+/// registered *inside* that held-open window, and only then is the gate
+/// released. The subscriber must still see `client:disconnected` **then**
+/// `client:connected` (a design that publishes the disconnect from the
+/// closing loop after its cleanup emits them the other way round). A
+/// re-hello that moves a connection to another `clientId` likewise yields
+/// the old client's disconnect before the new one's connect.
 #[tokio::test]
 async fn client_events_keep_registry_order_across_reconnect_and_rehello() {
-    let fx = boot().await;
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let fx = boot_with(WsOptions {
+        cleanup_gate: Some(gate_rx),
+        ..WsOptions::default()
+    })
+    .await;
     let mut sub = connect(fx.port).await;
     let ack = wss_rpc(
         &mut sub,
@@ -837,14 +845,27 @@ async fn client_events_keep_registry_order_across_reconnect_and_rehello() {
     assert_eq!(ev["type"], "client:connected");
     assert_eq!(ev["data"]["clientId"], "desktop-a");
 
-    // Close without draining and dial the replacement as soon as the
-    // registry has forgotten the first connection — i.e. inside the window
-    // between the registry mutation and the event reaching subscribers.
+    // Close the first connection. Its loop leaves the registry (the length
+    // barrier observes that) and then parks on the closed gate, so the
+    // replacement below registers strictly inside the held-open window.
     let _ = first.close(None).await;
     drop(first);
     await_registry_len(&fx.registry, 1).await;
     let mut second = connect(fx.port).await;
     let _ = wss_rpc(&mut second, 1, "client.hello", hello("desktop-a", true)).await;
+    await_registry_len(&fx.registry, 2).await;
+    let clients = fx.registry.live_clients();
+    assert_eq!(
+        clients.len(),
+        1,
+        "reconnect registered in-window: {clients:?}"
+    );
+    assert_eq!(clients[0].client_id.as_str(), "desktop-a");
+    assert_eq!(clients[0].capabilities["browserExec"], true);
+    assert_eq!(clients[0].connections, 1);
+
+    // Release the parked loop; the stale disconnect must still be first.
+    gate_tx.send(true).expect("gate receiver alive");
     let ev1 = await_client_event(&mut sub, Duration::from_secs(2)).await;
     let ev2 = await_client_event(&mut sub, Duration::from_secs(2)).await;
     assert_eq!(
@@ -854,6 +875,9 @@ async fn client_events_keep_registry_order_across_reconnect_and_rehello() {
     );
     assert_eq!(ev1["data"]["clientId"], "desktop-a");
     assert_eq!(ev2["data"]["clientId"], "desktop-a");
+    let clients = fx.registry.live_clients();
+    assert_eq!(clients.len(), 1, "{clients:?}");
+    assert_eq!(clients[0].client_id.as_str(), "desktop-a");
 
     // Re-hello under a different clientId on the same connection.
     let _ = wss_rpc(&mut second, 2, "client.hello", hello("desktop-b", true)).await;

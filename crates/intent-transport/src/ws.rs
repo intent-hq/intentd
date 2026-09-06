@@ -27,7 +27,7 @@ use intent_services::EventBus;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
@@ -81,6 +81,12 @@ pub struct WsOptions {
     /// `/tunnel` caps and timeouts; defaults are production values, tests
     /// shrink them to exercise idle/connect/forward timeout behavior.
     pub tunnel_limits: crate::tunnel::TunnelLimits,
+    /// Test-only seam: when set, a closing connection's loop parks after it
+    /// has left the reverse registry and before the rest of its cleanup runs,
+    /// until the watched value becomes `true`. Lets a test hold that window
+    /// open deterministically (e.g. to register a same-client reconnect inside
+    /// it) instead of racing it. `None` (production) parks nowhere.
+    pub cleanup_gate: Option<watch::Receiver<bool>>,
 }
 
 impl Default for WsOptions {
@@ -95,6 +101,7 @@ impl Default for WsOptions {
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
             rpc_limiter: RpcLimiter::unlimited(),
             tunnel_limits: crate::tunnel::TunnelLimits::default(),
+            cleanup_gate: None,
         }
     }
 }
@@ -166,6 +173,8 @@ pub(crate) struct WsInner {
     pub rpc_limiter: RpcLimiter,
     /// `/tunnel` caps and timeouts (from [`WsOptions::tunnel_limits`]).
     pub tunnel_limits: crate::tunnel::TunnelLimits,
+    /// Test-only post-deregistration gate (from [`WsOptions::cleanup_gate`]).
+    pub cleanup_gate: Option<watch::Receiver<bool>>,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -216,6 +225,7 @@ impl WsApiServer {
             control,
             rpc_limiter: options.rpc_limiter,
             tunnel_limits: options.tunnel_limits,
+            cleanup_gate: options.cleanup_gate,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -254,6 +264,7 @@ impl WsApiServer {
             control,
             rpc_limiter: options.rpc_limiter,
             tunnel_limits: options.tunnel_limits,
+            cleanup_gate: options.cleanup_gate,
         };
         Self {
             inner: Arc::new(inner),
@@ -783,6 +794,9 @@ impl WsInner {
         drop(forwards);
         reverse.close();
         drop(reverse_guard);
+        if let Some(mut gate) = self.cleanup_gate.clone() {
+            let _ = gate.wait_for(|open| *open).await;
+        }
         let _ = sink.close().await;
         self.deregister(id);
     }
