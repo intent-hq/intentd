@@ -2386,6 +2386,7 @@ impl Services {
         ws: &mut Workspace,
         unread: Option<bool>,
     ) {
+        let cow_supported = self.compute_cow_supported().await;
         let mut activity_max = latest_activity_candidate(&[
             ws.last_activity.as_deref(),
             Some(ws.updated_at.as_str()),
@@ -2427,7 +2428,7 @@ impl Services {
         }
         // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
-        ws.cow_supported = self.compute_cow_supported();
+        ws.cow_supported = cow_supported;
         // diskUsage is deliberately NOT populated here: list/get/subscription
         // re-reads never touch the DiskUsageCache or arm walks (rung 3 of the
         // derived-field ladder). Clients fetch it on demand via the dedicated
@@ -2445,13 +2446,14 @@ impl Services {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> WorkspaceAggregateSnapshot {
-        let (max_note_updated_at, task_stats, sessions, unread) = tokio::join!(
+        let (max_note_updated_at, task_stats, sessions, unread, cow_supported) = tokio::join!(
             self.store.max_note_updated_at_by_workspace(workspace_ids),
             self.store.count_task_stats_by_workspace(workspace_ids),
             self.store
                 .list_agent_session_summaries_by_workspace(workspace_ids),
             self.store
                 .workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids),
+            self.compute_cow_supported(),
         );
         let (active_hooks, monitors, legacy_question_tails) = tokio::join!(
             self.store.workspaces_with_active_hooks(workspace_ids),
@@ -2580,7 +2582,7 @@ impl Services {
             active_pr_monitors,
             monitor_pr_signals,
             legacy_question_holds,
-            cow_supported: self.compute_cow_supported(),
+            cow_supported,
         }
     }
 
@@ -2995,28 +2997,16 @@ impl Services {
     }
 
     /// Read whether `CoW` isolation is supported on this machine from the
-    /// prewarmed cache. A cache miss returns `None` immediately: RPC reads never
-    /// start or await filesystem work.
+    /// lifetime cache, awaiting the budgeted single-flight probe on a miss.
     /// Resolves the root like every other consumer — the injected
     /// `workspaces_root`, else [`default_workspaces_root`]
     /// (`$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces`) — so
     /// production daemons, which never inject a root, still report the
-    /// capability. Returns Some(true) if the completed `CoW` probe reports
-    /// Supported, Some(false) on an unsupported filesystem, and None until the
-    /// startup/event prewarm completes or when it cannot run.
-    fn compute_cow_supported(&self) -> Option<bool> {
-        let workspaces_root = self
-            .workspaces_root
-            .clone()
-            .or_else(try_default_workspaces_root)?;
-        self.workspace_aggregates
-            .cached_cow_supported(&workspaces_root)
-    }
-
-    /// Probe `CoW` support on a cache miss, or join the shared startup prewarm.
-    /// This is reserved for the on-demand machine capability RPC; workspace
-    /// list/get paths use [`Self::compute_cow_supported`] and remain cache-only.
-    async fn probe_cow_supported(&self) -> Option<bool> {
+    /// capability. Returns Some(true) if the `CoW` probe reports Supported,
+    /// Some(false) on an unsupported filesystem, and None when it cannot run or
+    /// exceeds the request budget. Over-budget probes continue in the
+    /// background and populate the cache for the next request.
+    async fn compute_cow_supported(&self) -> Option<bool> {
         let workspaces_root = self
             .workspaces_root
             .clone()
@@ -14725,7 +14715,7 @@ impl WorkspaceApi for Services {
             // (§5.1); it is included as true/false when the probe ran and
             // omitted when it could not run (presence-detected by clients).
             let mut caps = serde_json::Map::new();
-            if let Some(cow_supported) = self.probe_cow_supported().await {
+            if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
             Ok(serde_json::Value::Object(caps))

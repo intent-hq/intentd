@@ -1115,8 +1115,8 @@ async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
 /// The lite list path (workspace.subscribe seq-0 snapshot) is self-sufficient
 /// for client status rendering: rows carry `taskStats` (cheap counting query),
 /// `displayStatus` (same derivation as the enriched path — a subsequent
-/// enriched `workspace.get` must agree for the same data), and a prewarmed
-/// `cowSupported`,
+/// enriched `workspace.get` must agree for the same data), and a budgeted
+/// `cowSupported` probe result,
 /// while continuing to omit `agentSummary`/`diffSummary`. The lite read also
 /// seeds the `last_display_statuses` baseline (a seed never emits).
 #[tokio::test]
@@ -1148,36 +1148,20 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
         store.insert_note(&tn).await.expect("task note");
     }
 
-    // A cold read is cache-only: it omits immediately instead of probing the
-    // filesystem from the RPC path.
-    let cold = svc
+    // A cold read awaits the single budgeted probe once for the whole snapshot,
+    // then fans the capability out to every row.
+    let list = svc
         .list_workspaces_lite(true)
         .await
         .expect("cold lite list");
     assert!(
-        cold.iter()
+        list.iter()
             .find(|row| row.id == ws)
             .unwrap()
             .cow_supported
-            .is_none(),
-        "cold CoW cache miss stays absent"
+            .is_some(),
+        "cold snapshot carries cowSupported when the probe completes within budget"
     );
-    svc.prewarm_cow_supported();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if svc.compute_cow_supported().is_some() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("CoW prewarm completes");
-
-    let list = svc
-        .list_workspaces_lite(true)
-        .await
-        .expect("warm lite list");
     let row = list.iter().find(|w| w.id == ws).expect("row in lite list");
     let stats = row.task_stats.as_ref().expect("taskStats populated");
     assert_eq!((stats.total, stats.completed, stats.in_progress), (3, 1, 1));
@@ -25013,7 +24997,7 @@ mod worktree_provisioning {
                 prior: std::env::var_os("INTENTD_WORKSPACES_DIR"),
             };
             std::env::set_var("INTENTD_WORKSPACES_DIR", &root.0);
-            svc.probe_cow_supported().await
+            svc.compute_cow_supported().await
         };
         assert!(
             result.is_some(),
@@ -25041,7 +25025,7 @@ mod worktree_provisioning {
         );
         assert_eq!(
             obj.get("cowSupported").and_then(serde_json::Value::as_bool),
-            svc.compute_cow_supported(),
+            svc.compute_cow_supported().await,
             "capability mirrors the shared workspaces-root probe"
         );
     }

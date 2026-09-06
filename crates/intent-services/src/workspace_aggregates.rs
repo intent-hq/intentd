@@ -98,8 +98,8 @@ impl WorkspaceAggregateCache {
         }
     }
 
-    /// Cache-only read used by workspace list/get paths. A miss omits
-    /// immediately without starting or awaiting filesystem work.
+    /// Cache-only read used to avoid spawning a redundant prewarm task when
+    /// the lifetime-cached capability is already available.
     pub(crate) fn cached_cow_supported(&self, workspaces_root: &PathBuf) -> Option<bool> {
         self.cow.lock().unwrap().get(workspaces_root).copied()
     }
@@ -129,9 +129,9 @@ impl WorkspaceAggregateCache {
         if let Some(v) = self.cow.lock().unwrap().get(&key) {
             return Some(*v);
         }
-        // Share one detached probe per root. Unlike workspace list/get, the
-        // on-demand system capability RPC joins an existing startup prewarm so
-        // a cold request cannot race it and observe an empty capability object.
+        // Share one detached probe per root. Callers join an existing startup
+        // prewarm so a cold request cannot race it and observe an empty
+        // capability value.
         let mut receiver = {
             let mut flights = self.cow_in_flight.lock().unwrap();
             if let Some(receiver) = flights.get(&key) {
