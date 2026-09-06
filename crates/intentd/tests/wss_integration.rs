@@ -7545,7 +7545,8 @@ async fn wss_semantic_map_round_trip() {
         metadata: None,
         data: serde_json::json!({"action":"modify","relativePath":path}),
     });
-    srv.store
+    let seeded = srv
+        .store
         .insert_events(&seeded)
         .await
         .expect("seed map activity");
@@ -7604,6 +7605,7 @@ async fn wss_semantic_map_round_trip() {
         Some(1),
         "lower clamp: {activity}"
     );
+    assert_eq!(activity["result"][0]["id"], seeded[1].id, "{activity}");
     let pushed = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match subscriber.next().await {
@@ -7633,6 +7635,12 @@ async fn wss_semantic_map_round_trip() {
         pushed["params"]["event"]["data"], activity["result"][0],
         "{pushed}"
     );
+    let replay = serde_json::json!({
+        "jsonrpc":"2.0", "id":8, "method":"map.activity",
+        "params":{"workspaceId":ws.0,"agentId":"agent-map","kinds":["edit"],"limit":0}
+    });
+    let replay = wss_call(srv.port, srv.cfg.clone(), &replay.to_string()).await;
+    assert_eq!(replay["result"][0]["id"], activity["result"][0]["id"]);
 
     let extras = (0..499)
         .map(|index| NewEvent {
@@ -7654,7 +7662,7 @@ async fn wss_semantic_map_round_trip() {
             .expect("seed clamp batch");
     }
     let upper = serde_json::json!({
-        "jsonrpc":"2.0", "id":8, "method":"map.activity",
+        "jsonrpc":"2.0", "id":9, "method":"map.activity",
         "params":{"workspaceId":ws.0,"agentId":"agent-map","limit":999}
     });
     let upper = wss_call(srv.port, srv.cfg.clone(), &upper.to_string()).await;
@@ -7663,6 +7671,13 @@ async fn wss_semantic_map_round_trip() {
         Some(500),
         "upper clamp: {upper}"
     );
+    let ids = upper["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|activity| activity["id"].as_str().expect("activity id"))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), 500, "activity ids must be unique: {upper}");
 
     srv.ws.stop().await;
 }

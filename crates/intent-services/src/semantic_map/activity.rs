@@ -24,6 +24,7 @@ pub enum MapActivityKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MapActivity {
+    pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,6 +73,7 @@ pub fn project_with_classifier(
                 .map(|path| classifier.classify(path).region_id);
             let (agent_id, agent_name) = agent_identity(event);
             Some(MapActivity {
+                id: event.id.clone(),
                 region_id,
                 agent_id,
                 agent_name,
@@ -105,6 +107,7 @@ pub fn project_with_classifier(
                 .map(|path| classifier.classify(path).region_id);
             let (agent_id, agent_name) = agent_identity(event);
             Some(MapActivity {
+                id: event.id.clone(),
                 region_id,
                 agent_id,
                 agent_name,
@@ -120,6 +123,7 @@ pub fn project_with_classifier(
         AGENT_STREAM_ACTIVITY => {
             let (agent_id, agent_name) = agent_identity(event);
             Some(MapActivity {
+                id: event.id.clone(),
                 region_id: None,
                 agent_id,
                 agent_name,
@@ -276,9 +280,25 @@ mod tests {
                 ),
             )
             .unwrap();
+            assert_eq!(activity.id, "event-1");
             assert_eq!(activity.kind, expected);
             assert_eq!(activity.region_id.as_deref(), Some("code"));
         }
+    }
+
+    #[test]
+    fn serializes_source_event_id_as_required_activity_id() {
+        let activity = project(
+            &manifest(),
+            &event(
+                FILE_CHANGED,
+                json!({"relativePath":"src/lib.rs","action":"modify"}),
+            ),
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(activity).unwrap();
+        assert_eq!(value["id"], "event-1");
     }
 
     #[test]

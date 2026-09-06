@@ -136,6 +136,7 @@ mod tests {
 
     fn activity(agent: &str, region: &str, path: &str, ts: &str) -> MapActivity {
         MapActivity {
+            id: format!("{agent}:{ts}"),
             region_id: Some(region.into()),
             agent_id: Some(agent.into()),
             agent_name: None,
