@@ -1252,6 +1252,58 @@ pub(crate) fn resolve_provider_id(
         })
 }
 
+/// Resolve the provider id an agent session is actually running on, for
+/// event annotation: the session's persisted `provider` column with the
+/// settings-derived default as the fallback (the same precedence
+/// [`resolve_provider_id`] applies at spawn time), so the reported id matches
+/// the binary the failing turn used.
+///
+/// Best-effort and non-fatal by construction: a store error or an
+/// unresolvable provider yields `None` and the caller simply omits the field.
+/// Nothing durable hangs off this — it exists so a terminal `agent:failed`
+/// can name the provider that failed without the client having to correlate
+/// a follow-up `agent.get` read against a session whose provider a concurrent
+/// `agent.setModel` may already have changed.
+pub(crate) async fn session_provider_id(
+    services: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Option<String> {
+    // Prefer `last_turn_provider` — the identity the FAILING turn actually
+    // committed — over the session's current `provider`. The session row is
+    // mutable: a concurrent `agent.setModel` landing between the running
+    // provider's quota rejection and this read would otherwise name the newly
+    // selected provider as the exhausted one, steering the client's retry away
+    // from the only provider that still works. NULL until the agent's first
+    // turn commits, so the session row remains the fallback.
+    if let Ok((_, Some(turn_provider))) = services
+        .store
+        .get_agent_session_last_turn_model(workspace_id, agent_id)
+        .await
+    {
+        if let Some(resolved) = resolve_provider_id(
+            Some(turn_provider.as_str()),
+            derived_default_provider(&services.effective_settings()).as_deref(),
+        ) {
+            return Some(resolved);
+        }
+    }
+    match services
+        .store
+        .get_agent_session_token_usage(workspace_id, agent_id)
+        .await
+    {
+        Ok((_, _, provider, _)) => resolve_provider_id(
+            provider.as_deref(),
+            derived_default_provider(&services.effective_settings()).as_deref(),
+        ),
+        Err(e) => {
+            tracing::warn!(agent = %agent_id, error = %e, "read provider for event annotation failed");
+            None
+        }
+    }
+}
+
 /// The loud `-32602`-style error for provider resolution that falls through
 /// entirely (monorepo#3044): no explicit provider/model, no session provider,
 /// and no settings-derived default. Mirrors the resolved-but-unavailable
@@ -3427,6 +3479,34 @@ impl Services {
             }
             _ => None,
         };
+        // Quota-exhaustion observation: resolved in the SAME pre-persist seam
+        // as the auth mapping above, for the same reason — this is the last
+        // place the structured `AcpError` still exists, before the final
+        // `map_err` flattens it into the `session/prompt failed: …` wrapper.
+        //
+        // Unlike the auth branch this changes NOTHING durable: the wrapped
+        // error, the persisted `stop_reason`, and the returned error are
+        // byte-identical to before, and the failure stays terminal exactly as
+        // today. The sole consumer is the additive `errorCode`/`providerId`
+        // stamp on the `agent:failed` emit below, which lets the FE offer
+        // "retry on another provider" without string-matching the rendered
+        // prose. Guarded by the same two suppression predicates as that emit
+        // (a pre-output transport failure and an idle timeout both defer their
+        // terminal events to the turn worker) so the provider read only costs
+        // a row on a failure this path actually reports.
+        let (prompt_quota_failure, prompt_quota_provider) = match &result {
+            Err(e)
+                if !pre_output_transport_failure
+                    && !prompt_idle_timeout
+                    && intent_acp::is_quota_exceeded(e) =>
+            {
+                (
+                    true,
+                    session_provider_id(self, workspace_id, agent_id).await,
+                )
+            }
+            _ => (false, None),
+        };
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout {
                 let wrapped = match prompt_auth_message.as_deref() {
@@ -3671,6 +3751,18 @@ impl Services {
                 let mut data = json!({ "agentId": agent_id.0, "error": error_text });
                 if let Some(tid) = turn_id {
                     data["turnId"] = json!(tid);
+                }
+                // Additive quota signal (absent on every other failure, never
+                // `false`/`null`), classified above from the structured
+                // `AcpError`. Same shape and same additive contract as
+                // `sessionCorrupted` on `agent:status-changed`: a structured
+                // restatement of a verdict the daemon already reached, so the
+                // client does not have to re-derive it from prose.
+                if prompt_quota_failure {
+                    crate::agent_manager::stamp_quota_failure(
+                        &mut data,
+                        prompt_quota_provider.as_deref(),
+                    );
                 }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_FAILED, data)
                     .await;

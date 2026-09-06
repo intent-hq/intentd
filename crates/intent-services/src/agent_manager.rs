@@ -10875,6 +10875,96 @@ async fn retry_spawn(
         .unwrap_or_else(|| Error::Internal("spawn retry loop exhausted without error".to_string())))
 }
 
+/// Machine-readable `errorCode` stamped on `agent:failed` when the turn died
+/// because the provider's usage allowance is spent (HTTP 429, an upstream
+/// `rate_limit_error`, an exhausted plan quota — see
+/// [`intent_acp::is_quota_exceeded`]). Before this, the only signal was the
+/// opaque rendered `error` prose, so a client wanting to offer "retry on
+/// another provider" had to pattern-match provider wording that changes
+/// without notice.
+pub(crate) const QUOTA_EXCEEDED_ERROR_CODE: &str = "quota-exceeded";
+
+/// Stamp the additive quota signal onto an `agent:failed` payload: an
+/// `errorCode` naming the machine-readable failure class, plus the
+/// `providerId` whose allowance ran out so the client knows which provider to
+/// steer AWAY from (omitted when the session's provider cannot be resolved —
+/// never `null`).
+///
+/// Strictly additive, on the same terms as `sessionCorrupted` on
+/// `agent:status-changed`: every existing field is untouched, and a
+/// non-quota failure emits byte-identically to before because callers only
+/// reach this after classifying. Shared by BOTH `agent:failed` publishers —
+/// the streaming path's own terminal emit in `agent_session.rs` and
+/// [`publish_terminal_failure_events`] here — so the two can never drift on
+/// field names or the code's spelling.
+pub(crate) fn stamp_quota_failure(data: &mut Value, provider_id: Option<&str>) {
+    data["errorCode"] = json!(QUOTA_EXCEEDED_ERROR_CODE);
+    if let Some(provider_id) = provider_id {
+        data["providerId"] = json!(provider_id);
+    }
+}
+
+#[cfg(test)]
+mod quota_failure_stamp_tests {
+    //! Wire-shape pins for the additive quota signal on `agent:failed`
+    //! ([`super::stamp_quota_failure`]), shared by both publishers.
+
+    use super::*;
+
+    /// The exact payload a quota failure emits: every field the event carried
+    /// before is byte-identical, with `errorCode` + `providerId` appended.
+    #[test]
+    fn stamps_error_code_and_provider_additively() {
+        let mut data =
+            json!({ "agentId": "a1", "error": "session/prompt failed: 429", "turnId": "t1" });
+        stamp_quota_failure(&mut data, Some("claude-code"));
+        assert_eq!(
+            data,
+            json!({
+                "agentId": "a1",
+                "error": "session/prompt failed: 429",
+                "turnId": "t1",
+                "errorCode": "quota-exceeded",
+                "providerId": "claude-code",
+            })
+        );
+    }
+
+    /// An unresolvable provider OMITS the field entirely — never `null`, the
+    /// same absent-not-false contract as `sessionCorrupted`.
+    #[test]
+    fn omits_provider_id_when_unresolved() {
+        let mut data = json!({ "agentId": "a1", "error": "boom" });
+        stamp_quota_failure(&mut data, None);
+        assert_eq!(
+            data,
+            json!({ "agentId": "a1", "error": "boom", "errorCode": "quota-exceeded" })
+        );
+        assert!(data.get("providerId").is_none());
+    }
+
+    /// The flattened wrapper the terminal-failure publisher actually sees —
+    /// `session/prompt failed: {AcpError}` with the 429 nested in the
+    /// JSON-RPC `data` — still classifies, so both publishers stamp the same
+    /// turn identically.
+    #[test]
+    fn flattened_prompt_wrapper_classifies_as_quota() {
+        let acp = intent_acp::AcpError::Rpc(intent_acp::JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(json!("{\"type\":\"rate_limit_error\"}")),
+        });
+        assert!(intent_acp::is_quota_exceeded(&acp));
+        let flattened = format!("{PROMPT_FAILED_PREFIX} {acp}");
+        assert!(intent_acp::message_is_quota_exceeded(&flattened));
+        // An ordinary terminal failure is untouched by the classifier, so it
+        // emits exactly what it emitted before.
+        assert!(!intent_acp::message_is_quota_exceeded(
+            "failed to persist user message to transcript; turn not started"
+        ));
+    }
+}
+
 /// Publish the terminal `agent:failed` + `agent:stream:end` event pair for a
 /// failure the streaming path did NOT already surface. The error message
 /// deliberately excludes recent stderr to avoid leaking secrets (API keys,
@@ -10901,6 +10991,19 @@ async fn publish_terminal_failure_events(
     if let Some(tid) = turn_id {
         failed_data["turnId"] = json!(tid);
         end_data["turnId"] = json!(tid);
+    }
+    // Same additive quota signal the streaming path stamps, so the two
+    // `agent:failed` publishers agree on the wire shape. Classified from the
+    // flattened text rather than an `AcpError`: by the time a failure reaches
+    // this publisher it has been through the `session/prompt failed: …` wrap
+    // boundary (or was never an ACP error at all — a spawn or a pre-turn
+    // persist failure), and the message-level classifier is the only surface
+    // left. The provider read is deliberately inside the branch: a terminal
+    // failure that is not a quota rejection costs exactly what it did before.
+    if intent_acp::message_is_quota_exceeded(error_msg) {
+        let provider_id =
+            crate::agent_session::session_provider_id(&mgr.services, workspace_id, agent_id).await;
+        stamp_quota_failure(&mut failed_data, provider_id.as_deref());
     }
     crate::agent_session::trace_stream_lifecycle(
         turn_id,

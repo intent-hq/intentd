@@ -4206,6 +4206,37 @@ impl Services {
                 &pid,
                 &model_id,
             )?;
+            // Availability gate for a genuine CROSS-provider switch: hold the
+            // target to the same bar as the create/delegate front door
+            // (`ensure_provider_available`: disabled → not-authenticated →
+            // not-installed, one distinct `-32602` each). `ensure_known_provider`
+            // above only says the id is in the catalog — without this a client
+            // could park the session on a provider that is switched off, logged
+            // out, or not installed at all, and the failure would surface a turn
+            // later as a raw spawn error with nothing tying it back to the
+            // `setModel` that caused it.
+            //
+            // Scoped to a switch that actually MOVES the session: an explicit
+            // `providerId` naming a different provider than the session's
+            // current one. Deliberately NOT applied to a same-provider model
+            // change (nor to the no-`providerId` form, which cannot move the
+            // session anywhere) — an agent already running on a provider must
+            // stay able to change its model even while the availability probe
+            // is unhappy (a hard-false cached auth verdict, a provider disabled
+            // in settings after the agent was created), and gating that would
+            // regress behavior that works today.
+            //
+            // Runs AFTER the model-ownership check so the existing error
+            // precedence is unchanged: a request naming a model the target
+            // provider does not own is still rejected for THAT reason,
+            // installed or not.
+            if session.provider.as_deref().filter(|p| !p.is_empty()) != Some(pid.as_str()) {
+                ensure_provider_available(
+                    "agent.setModel",
+                    &pid,
+                    &self.effective_settings().providers,
+                )?;
+            }
             Some(pid)
         } else {
             // Without an explicit providerId the model is validated against

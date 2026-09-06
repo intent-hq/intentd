@@ -3300,6 +3300,10 @@ async fn wss_agent_set_model_provider_id_param() {
         Some(dir.path().to_path_buf()),
     )
     .await;
+    // Hermeticity (monorepo#3162): the cross-provider switch onto grok below
+    // runs the availability gate, so point discovery at a deterministic
+    // executable instead of depending on a real grok on the test host.
+    srv.set_setting("providers.paths", serde_json::json!({ "grok": "/bin/sh" }));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
