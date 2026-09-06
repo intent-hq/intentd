@@ -8,6 +8,8 @@ use intent_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::classifier::Classifier;
+
 pub const MANIFEST_TAG: &str = "semantic-map";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +212,8 @@ fn required_u32(value: Option<&Value>, field: &str) -> Result<u32, ManifestError
 struct CachedManifest {
     note_id: NoteId,
     manifest: Manifest,
+    classifier: Arc<Classifier>,
+    coverage: Option<(Option<String>, usize, usize)>,
 }
 
 #[derive(Clone, Default)]
@@ -228,17 +232,26 @@ impl ManifestLoader {
         store: &Store,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<Manifest>, ManifestLoadError> {
-        if let Some(cached) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(workspace_id)
-            .cloned()
-        {
-            return Ok(Some(cached.manifest));
+        self.load_compiled(store, workspace_id)
+            .await
+            .map(|loaded| loaded.map(|(manifest, _)| manifest))
+    }
+
+    /// Loads the workspace manifest and its shared precompiled classifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when notes cannot be loaded or the manifest note is invalid.
+    pub async fn load_compiled(
+        &self,
+        store: &Store,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<(Manifest, Arc<Classifier>)>, ManifestLoadError> {
+        if let Some(cached) = self.cached(workspace_id) {
+            return Ok(Some((cached.manifest, cached.classifier)));
         }
         let notes = store.list_notes(workspace_id).await?;
-        self.load_from_notes(workspace_id, &notes)
+        self.load_from_notes_compiled(workspace_id, &notes)
             .map_err(ManifestLoadError::Parse)
     }
 
@@ -252,14 +265,17 @@ impl ManifestLoader {
         workspace_id: &WorkspaceId,
         notes: &[Note],
     ) -> Result<Option<Manifest>, ManifestError> {
-        if let Some(cached) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(workspace_id)
-            .cloned()
-        {
-            return Ok(Some(cached.manifest));
+        self.load_from_notes_compiled(workspace_id, notes)
+            .map(|loaded| loaded.map(|(manifest, _)| manifest))
+    }
+
+    fn load_from_notes_compiled(
+        &self,
+        workspace_id: &WorkspaceId,
+        notes: &[Note],
+    ) -> Result<Option<(Manifest, Arc<Classifier>)>, ManifestError> {
+        if let Some(cached) = self.cached(workspace_id) {
+            return Ok(Some((cached.manifest, cached.classifier)));
         }
         let note = notes
             .iter()
@@ -275,17 +291,63 @@ impl ManifestLoader {
             return Ok(None);
         };
         let manifest = parse_manifest(&note.content)?;
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cache.get(workspace_id).cloned() {
+            return Ok(Some((cached.manifest, cached.classifier)));
+        }
+        let classifier = Arc::new(Classifier::new(&manifest));
+        cache.insert(
+            workspace_id.clone(),
+            CachedManifest {
+                note_id: note.id.clone(),
+                manifest: manifest.clone(),
+                classifier: Arc::clone(&classifier),
+                coverage: None,
+            },
+        );
+        Ok(Some((manifest, classifier)))
+    }
+
+    fn cached(&self, workspace_id: &WorkspaceId) -> Option<CachedManifest> {
         self.cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                workspace_id.clone(),
-                CachedManifest {
-                    note_id: note.id.clone(),
-                    manifest: manifest.clone(),
-                },
-            );
-        Ok(Some(manifest))
+            .get(workspace_id)
+            .cloned()
+    }
+
+    pub fn coverage(
+        &self,
+        workspace_id: &WorkspaceId,
+        worktree_version: Option<&str>,
+    ) -> Option<(usize, usize)> {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(workspace_id)
+            .and_then(|cached| cached.coverage.as_ref())
+            .filter(|(version, _, _)| version.as_deref() == worktree_version)
+            .map(|(_, matched, total)| (*matched, *total))
+    }
+
+    pub fn set_coverage(
+        &self,
+        workspace_id: &WorkspaceId,
+        worktree_version: Option<String>,
+        matched: usize,
+        total: usize,
+    ) {
+        if let Some(cached) = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(workspace_id)
+        {
+            cached.coverage = Some((worktree_version, matched, total));
+        }
     }
 
     pub fn invalidate_on_event(&self, event: &Event) -> bool {
@@ -425,5 +487,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(replacement_manifest.regions[0].label, "Replacement");
+    }
+
+    #[test]
+    fn loader_reuses_compiled_classifier_until_manifest_invalidation() {
+        let loader = ManifestLoader::default();
+        let workspace_id = WorkspaceId::from("ws-1");
+        let original = note("map", "2026-01-01T00:00:00Z", "Original");
+        let (_, first) = loader
+            .load_from_notes_compiled(&workspace_id, std::slice::from_ref(&original))
+            .unwrap()
+            .unwrap();
+        for _ in 0..10 {
+            first.classify("src/main.rs");
+        }
+        let (_, reused) = loader
+            .load_from_notes_compiled(&workspace_id, std::slice::from_ref(&original))
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+
+        assert!(loader.invalidate_note_updated(&workspace_id, &original.id));
+        let replacement = note("map", "2026-02-01T00:00:00Z", "Replacement");
+        let (_, rebuilt) = loader
+            .load_from_notes_compiled(&workspace_id, &[replacement])
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+    }
+
+    #[test]
+    fn coverage_cache_tracks_worktree_version() {
+        let loader = ManifestLoader::default();
+        let workspace_id = WorkspaceId::from("ws-1");
+        let manifest = note("map", "2026-01-01T00:00:00Z", "Original");
+        loader
+            .load_from_notes_compiled(&workspace_id, &[manifest])
+            .unwrap()
+            .unwrap();
+        loader.set_coverage(&workspace_id, Some("event-1".into()), 4, 5);
+        assert_eq!(
+            loader.coverage(&workspace_id, Some("event-1")),
+            Some((4, 5))
+        );
+        assert_eq!(loader.coverage(&workspace_id, Some("event-2")), None);
     }
 }

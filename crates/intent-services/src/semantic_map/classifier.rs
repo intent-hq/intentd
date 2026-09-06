@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use ignore::gitignore::GitignoreBuilder;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 
 use super::manifest::Manifest;
@@ -51,50 +51,38 @@ impl ClassifyPath {
 
 #[must_use]
 pub fn classify(manifest: &Manifest, rel_path: &str) -> Assignment {
-    let normalized = normalize_path(rel_path);
-    let path = Path::new(&normalized);
-    let mut assigned: Option<&str> = None;
-
-    for region in &manifest.regions {
-        for pattern in &region.paths {
-            let mut builder = GitignoreBuilder::new("");
-            if builder.add_line(None, pattern).is_err() {
-                continue;
-            }
-            let Ok(gitignore) = builder.build() else {
-                continue;
-            };
-            let pattern_match = gitignore.matched_path_or_any_parents(path, false);
-            if pattern_match.is_ignore() {
-                assigned = Some(&region.id);
-            } else if pattern_match.is_whitelist() && assigned == Some(region.id.as_str()) {
-                assigned = None;
-            }
-        }
-    }
-
-    assigned.map_or_else(
-        || Assignment {
-            region_id: UNSORTED_REGION_ID.to_string(),
-            confidence: AssignmentConfidence::Unsorted,
-        },
-        |region_id| Assignment {
-            region_id: region_id.to_string(),
-            confidence: AssignmentConfidence::Curated,
-        },
-    )
+    Classifier::new(manifest).classify(rel_path)
 }
 
-pub struct Classifier<'a> {
-    manifest: &'a Manifest,
+struct RegionMatcher {
+    region_id: String,
+    gitignore: Gitignore,
+}
+
+pub struct Classifier {
+    regions: Vec<RegionMatcher>,
     assignments: Mutex<HashMap<String, Assignment>>,
 }
 
-impl<'a> Classifier<'a> {
+impl Classifier {
     #[must_use]
-    pub fn new(manifest: &'a Manifest) -> Self {
+    pub fn new(manifest: &Manifest) -> Self {
+        let regions = manifest
+            .regions
+            .iter()
+            .filter_map(|region| {
+                let mut builder = GitignoreBuilder::new("");
+                for pattern in &region.paths {
+                    let _ = builder.add_line(None, pattern);
+                }
+                builder.build().ok().map(|gitignore| RegionMatcher {
+                    region_id: region.id.clone(),
+                    gitignore,
+                })
+            })
+            .collect();
         Self {
-            manifest,
+            regions,
             assignments: Mutex::new(HashMap::new()),
         }
     }
@@ -107,8 +95,31 @@ impl<'a> Classifier<'a> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assignments
             .entry(normalized.clone())
-            .or_insert_with(|| classify(self.manifest, &normalized))
+            .or_insert_with(|| self.classify_uncached(&normalized))
             .clone()
+    }
+
+    fn classify_uncached(&self, normalized: &str) -> Assignment {
+        let path = Path::new(normalized);
+        let mut assigned: Option<&str> = None;
+        for region in &self.regions {
+            let pattern_match = region.gitignore.matched_path_or_any_parents(path, false);
+            if pattern_match.is_ignore() {
+                assigned = Some(&region.region_id);
+            } else if pattern_match.is_whitelist() && assigned == Some(region.region_id.as_str()) {
+                assigned = None;
+            }
+        }
+        assigned.map_or_else(
+            || Assignment {
+                region_id: UNSORTED_REGION_ID.to_string(),
+                confidence: AssignmentConfidence::Unsorted,
+            },
+            |region_id| Assignment {
+                region_id: region_id.to_string(),
+                confidence: AssignmentConfidence::Curated,
+            },
+        )
     }
 
     pub fn classify_path(&self, paths: &WorkspacePaths, input: &ClassifyPath) -> Assignment {
@@ -131,6 +142,8 @@ fn normalize_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use serde_json::json;
 
     use super::*;
@@ -186,6 +199,58 @@ mod tests {
         classifier.classify("./src/main.rs");
         classifier.classify("src/main.rs");
         assert_eq!(classifier.cached_paths(), 1);
+    }
+
+    #[test]
+    fn compiled_classifier_preserves_precedence_golden() {
+        let manifest = manifest();
+        let classifier = Classifier::new(&manifest);
+        let golden = [
+            ("src/main.rs", "code", AssignmentConfidence::Curated),
+            (
+                "src/generated/model.rs",
+                "generated",
+                AssignmentConfidence::Curated,
+            ),
+            (
+                "README.md",
+                UNSORTED_REGION_ID,
+                AssignmentConfidence::Unsorted,
+            ),
+        ];
+        for (path, region_id, confidence) in golden {
+            let assignment = classifier.classify(path);
+            assert_eq!(assignment.region_id, region_id);
+            assert_eq!(assignment.confidence, confidence);
+        }
+    }
+
+    #[test]
+    fn classifies_five_thousand_paths_with_precompiled_matchers() {
+        let mut manifest = manifest();
+        manifest.regions = (0..16)
+            .map(|index| Region {
+                id: format!("region-{index}"),
+                label: format!("Region {index}"),
+                responsibility: format!("Region {index}"),
+                parent: None,
+                anchor: [0.5, 0.5],
+                paths: vec![format!("region-{index}/**")],
+                color: None,
+            })
+            .collect();
+        let classifier = Classifier::new(&manifest);
+        let started = Instant::now();
+        for index in 0..5_000 {
+            let region = index % 16;
+            assert_eq!(
+                classifier
+                    .classify(&format!("region-{region}/src/file-{index}.rs"))
+                    .region_id,
+                format!("region-{region}")
+            );
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

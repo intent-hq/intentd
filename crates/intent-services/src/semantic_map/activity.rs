@@ -48,6 +48,15 @@ pub fn project_with_paths(
     event: &Event,
 ) -> Option<MapActivity> {
     let classifier = Classifier::new(manifest);
+    project_with_classifier(&classifier, workspace_paths, event)
+}
+
+#[must_use]
+pub fn project_with_classifier(
+    classifier: &Classifier,
+    workspace_paths: &WorkspacePaths,
+    event: &Event,
+) -> Option<MapActivity> {
     match event.event_type.as_str() {
         FILE_CHANGED | FILE_CREATED | FILE_DELETED | "file:renamed" => {
             let kind = file_kind(event)?;

@@ -5,7 +5,9 @@ pub mod paths;
 pub mod routes;
 pub mod structural;
 
-pub use activity::{project, project_with_paths, MapActivity, MapActivityKind};
+pub use activity::{
+    project, project_with_classifier, project_with_paths, MapActivity, MapActivityKind,
+};
 pub use classifier::{classify, Assignment, AssignmentConfidence, Classifier, ClassifyPath};
 pub use manifest::{
     parse_manifest, Crossing, Manifest, ManifestError, ManifestLoadError, ManifestLoader,
