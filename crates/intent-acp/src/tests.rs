@@ -1182,6 +1182,61 @@ mod session_tests {
     }
 
     #[test]
+    fn derive_tool_name_recognizes_workspace_api_input_shape() {
+        // intent-hq/intent#4491: auggie titles a `workspace_api` call with the
+        // model-authored `summary` (prose, no `name`, `kind: other`), so only
+        // the `{ code, summary }` input identifies the tool.
+        let input = json!({
+            "code": "return await ws.workspace.proposeSibling({ title: 't', initialPrompt: 'p' })",
+            "summary": "Propose the follow-up settings change",
+        });
+        assert_eq!(
+            session::derive_tool_name("Propose the follow-up settings change", Some(&input)),
+            "workspace_api"
+        );
+        // A prose summary that happens to look like `<name>: <description>`
+        // must not be split into a bogus tool name.
+        assert_eq!(
+            session::derive_tool_name("Note: append the plan to the spec", Some(&input)),
+            "workspace_api"
+        );
+        // Providers that do title the call with the tool name agree.
+        for title in [
+            "workspace_api",
+            "workspace_api_workspace-mcp",
+            "workspace-mcp_workspace_api",
+            "mcp.workspace-mcp.workspace_api",
+            "mcp__workspace-mcp__workspace_api",
+        ] {
+            assert_eq!(
+                session::derive_tool_name(title, Some(&input)),
+                "workspace_api",
+                "title={title}"
+            );
+        }
+        // Both keys are required, as strings; `code` must be non-empty.
+        assert_eq!(
+            session::derive_tool_name("Run some code", Some(&json!({ "code": "return 1" }))),
+            "Run some code"
+        );
+        assert_eq!(
+            session::derive_tool_name("Summarize", Some(&json!({ "summary": "x" }))),
+            "Summarize"
+        );
+        assert_eq!(
+            session::derive_tool_name("Run", Some(&json!({ "code": "", "summary": "empty code" }))),
+            "Run"
+        );
+        assert_eq!(
+            session::derive_tool_name(
+                "Run",
+                Some(&json!({ "code": ["not", "a", "string"], "summary": "x" }))
+            ),
+            "Run"
+        );
+    }
+
+    #[test]
     fn derive_tool_name_strips_opencode_mcp_prefix() {
         // Opencode names MCP tools `<server>_<tool>` (leading prefix), the
         // mirror image of auggie's trailing suffix. Captured from opencode

@@ -600,6 +600,14 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// ACP providers (auggie, codex, opencode, …) deliver a prose `title` (e.g.
 /// `"sub-agent-explore: Explore the AI agent system…"`) rather than the raw
 /// tool name the model invoked. Rules, in order:
+///  0. A `raw_input` carrying the daemon's own `workspace_api` schema — string
+///     `code` plus string `summary` — is `workspace_api` regardless of the
+///     title. Auggie titles an MCP call with the model-authored `summary`
+///     (plain prose, no `name`, `kind: other`), so the input shape is the only
+///     identifier; it is checked before the title rules because a prose summary
+///     can accidentally match the `<name>: <description>` split below
+///     (intent-hq/intent#4491). Providers that do title the call with the
+///     tool name resolve to `workspace_api` through rules 2–4 anyway.
 ///  1. A title of the form `<name>: <description>` (`<name>` a bare identifier
 ///     of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
 ///     becomes the name.
@@ -653,6 +661,9 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// every path.
 #[must_use]
 pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
+    if raw_input.is_some_and(is_workspace_api_input) {
+        return "workspace_api".to_string();
+    }
     if let Some(name) = split_name_prefix(title) {
         return strip_workspace_mcp_affix(name);
     }
@@ -768,6 +779,17 @@ fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
         return Some("web-fetch".to_string());
     }
     None
+}
+
+/// The `workspace_api` MCP tool's input schema: a string `code` (the JS to
+/// run) plus a string `summary` (the model-authored one-line description).
+/// Both keys are required by the schema, and no other daemon or provider
+/// tool carries that pair, so the shape identifies the tool on its own.
+fn is_workspace_api_input(input: &Value) -> bool {
+    let Some(obj) = input.as_object() else {
+        return false;
+    };
+    is_non_empty_string(obj.get("code")) && obj.get("summary").is_some_and(Value::is_string)
 }
 
 /// JS-truthy on a `path`-style field: present, a string, and non-empty.
