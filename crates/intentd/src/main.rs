@@ -4677,15 +4677,6 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
     Some((ttl, interval))
 }
 
-/// Fixed TTL for persisted `agent:tool:call` events, swept on the same tick as
-/// the ephemeral families. Tool calls are the dominant share of the event
-/// table (87% of live data on the dev seat) and no consumer reads them beyond
-/// bounded recent windows — replay uses `agent_message`, live streaming uses
-/// the in-memory bus — so 6h comfortably covers every durable reader
-/// (`event.agentActivity` / `event.workspaceSummary` default to ≤60-minute
-/// windows) while capping steady-state storage at a quarter of the old 24h.
-const TOOL_CALL_RETENTION_HOURS: u32 = 6;
-
 /// Upper bound on pages released per `PRAGMA incremental_vacuum(N)` call in
 /// the retention loop. 2000 pages ≈ 8 MiB at the 4 KiB default page size —
 /// enough to keep up with sweep-driven churn while keeping each call short on
@@ -4698,14 +4689,18 @@ const INCREMENTAL_VACUUM_MAX_PAGES: u32 = 2000;
 /// events (`agent:stream:*`, `file:*`, `terminal:data`, `host:exec:*`,
 /// `script:output`, plus the high-churn state-notification families — see
 /// `Store::delete_ephemeral_events_before`) older than the TTL, plus
-/// `agent:tool:call` events older than [`TOOL_CALL_RETENTION_HOURS`], while
+/// `agent:tool:call` events older than
+/// [`intent_services::retention::TOOL_CALL_RETENTION_HOURS`], while
 /// preserving lifecycle/note/task events; `0` disables the event sweeps but
 /// NOT the loop. Every tick also reads `agents.toolPayloadRetentionDays`
 /// LIVE from the settings registry and, when it is `> 0`, compacts full
 /// tool bodies older than that window into replay previews
 /// (`Store::compact_tool_payloads_before`, at the live
 /// `agents.historyReplayToolContentChars` cap) — so a value set later from
-/// the Settings UI takes effect on the next tick without a restart. After
+/// the Settings UI takes effect on the next tick without a restart. The
+/// sweeps themselves are [`intent_services::retention::run_retention_tick`]
+/// (testable in isolation with a fixed `now`); this loop owns only the timer
+/// and the pool maintenance. After
 /// the sweeps each tick runs a bounded `PRAGMA incremental_vacuum`
 /// ([`INCREMENTAL_VACUUM_MAX_PAGES`]) to release freelist pages back to the
 /// filesystem (effective on incremental-auto-vacuum databases; a no-op
@@ -4732,7 +4727,7 @@ fn spawn_stream_retention_loop(
         let interval = (ttl / 4).clamp(Duration::from_secs(300), max_interval);
         tracing::info!(
             ttl_hours = stream_retention_hours,
-            tool_call_ttl_hours = TOOL_CALL_RETENTION_HOURS,
+            tool_call_ttl_hours = intent_services::retention::TOOL_CALL_RETENTION_HOURS,
             interval_secs = interval.as_secs(),
             "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*, script:output, state-notification churn families, agent:tool:call)"
         );
@@ -4743,56 +4738,14 @@ fn spawn_stream_retention_loop(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if stream_retention_hours > 0 {
-                let cutoff = intent_core::iso_minutes_ago(i64::from(stream_retention_hours) * 60);
-                match store.delete_ephemeral_events_before(&cutoff).await {
-                    Ok(removed) if removed > 0 => {
-                        tracing::info!(
-                            removed,
-                            cutoff,
-                            "event retention sweep trimmed ephemeral events"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "event retention sweep failed"),
-                }
-                let tool_cutoff =
-                    intent_core::iso_minutes_ago(i64::from(TOOL_CALL_RETENTION_HOURS) * 60);
-                match store.delete_tool_call_events_before(&tool_cutoff).await {
-                    Ok(removed) if removed > 0 => {
-                        tracing::info!(
-                            removed,
-                            cutoff = tool_cutoff,
-                            "event retention sweep trimmed agent:tool:call events"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "tool-call retention sweep failed"),
-                }
-            }
-            // Tool-payload retention: both knobs are read live per tick.
+            // Both tool-payload knobs are read live from the registry per tick.
             let settings = settings_registry.snapshot();
-            if let Some(days) = intent_services::tool_payload_retention_days(&settings.effective) {
-                let replay_chars =
-                    intent_services::history_replay_tool_content_chars(&settings.effective);
-                let payload_cutoff = intent_core::iso_minutes_ago(i64::from(days) * 24 * 60);
-                match store
-                    .compact_tool_payloads_before(&payload_cutoff, replay_chars)
-                    .await
-                {
-                    Ok(compacted) if compacted > 0 => {
-                        tracing::info!(
-                            compacted,
-                            cutoff = payload_cutoff,
-                            retention_days = days,
-                            replay_chars,
-                            "tool-payload retention sweep compacted full tool bodies into replay previews"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "tool-payload retention sweep failed"),
-                }
-            }
+            intent_services::retention::run_retention_tick(
+                &store,
+                stream_retention_hours,
+                &settings.effective,
+            )
+            .await;
             match store.incremental_vacuum(INCREMENTAL_VACUUM_MAX_PAGES).await {
                 Ok(freed) if freed > 0 => {
                     tracing::info!(

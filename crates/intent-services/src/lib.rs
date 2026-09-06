@@ -114,6 +114,7 @@ pub mod provider_models;
 pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
+pub mod retention;
 mod rtk;
 mod sandbox_ops;
 mod script_ops;

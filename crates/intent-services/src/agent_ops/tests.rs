@@ -32104,6 +32104,124 @@ async fn agent_edit_truncate_keeps_pruned_and_full_side_rows_of_kept_rows() {
     );
 }
 
+/// The retention loop's per-tick body reads `agents.toolPayloadRetentionDays`
+/// LIVE from the registry snapshot: with the default `0` a tick compacts
+/// nothing; once the value is applied at runtime (no restart) the next tick
+/// compacts exactly the bodies older than `now − days` — and it does so even
+/// with the event sweep disabled (`streamRetentionHours == 0`), which must
+/// disable only the event deletes, never the tick's payload step.
+#[tokio::test]
+async fn retention_tick_compacts_tool_payloads_from_live_setting_even_with_event_sweep_off() {
+    use crate::retention::{run_retention_tick_at, RetentionTickOutcome};
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    let (_t, svc, ws) = setup().await;
+    let registry = svc.settings_registry().expect("settings registry");
+    let id = create_agent(&svc, &ws, "Sweeper").await;
+    let big_out = format!("OUT-HEAD-{}-OUT-TAIL", "o".repeat(20_000));
+    let heavy = |tag: &str| {
+        json!([
+            { "type": "tool_result", "id": format!("{tag}:result"), "tool_use_id": tag,
+              "output": big_out, "is_error": false },
+        ])
+    };
+    // `now` is fixed so the 2-day window is exact: `old` is 3 days before
+    // it, `fresh` is 1 day before it.
+    let now = OffsetDateTime::parse("2026-03-10T00:00:00Z", &Rfc3339).expect("now");
+    let old = svc
+        .store()
+        .append_agent_message(&id, "assistant", &heavy("tc-old"), "2026-03-07T00:00:00Z")
+        .await
+        .expect("append old")
+        .id;
+    let fresh = svc
+        .store()
+        .append_agent_message(&id, "assistant", &heavy("tc-fresh"), "2026-03-09T00:00:00Z")
+        .await
+        .expect("append fresh")
+        .id;
+    // One ephemeral event older than any TTL: proves the event sweep really
+    // is off when `streamRetentionHours == 0` (it survives the tick).
+    svc.store()
+        .insert_event(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "file:changed".to_string(),
+            actor: EventActor::default(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({}),
+        })
+        .await
+        .expect("insert stale event");
+    let pruned = |message_id: String| {
+        let store = svc.store().clone();
+        let id = id.clone();
+        async move {
+            store
+                .get_agent_message_by_id_with_pruned(&id, &message_id)
+                .await
+                .expect("read message")
+                .expect("message exists")
+                .1
+                .len()
+        }
+    };
+
+    // Default `toolPayloadRetentionDays = 0`: the sweep is disabled and the
+    // tick leaves both full bodies alone.
+    let settings = registry.snapshot();
+    assert_eq!(
+        crate::tool_payload_retention_days(&settings.effective),
+        None,
+        "default keeps full tool bodies forever"
+    );
+    assert_eq!(
+        run_retention_tick_at(svc.store(), 0, &settings.effective, now).await,
+        RetentionTickOutcome::default(),
+        "disabled sweep compacts nothing"
+    );
+    assert_eq!(pruned(old.clone()).await, 0);
+    assert_eq!(pruned(fresh.clone()).await, 0);
+
+    // Apply the window live; the next tick reads the new snapshot and
+    // compacts only the body older than `now − 2 days` — with the event
+    // sweep still off.
+    registry
+        .apply(&[("agents.toolPayloadRetentionDays".into(), json!(2))])
+        .expect("apply retention days");
+    let settings = registry.snapshot();
+    assert_eq!(
+        run_retention_tick_at(svc.store(), 0, &settings.effective, now).await,
+        RetentionTickOutcome {
+            tool_payloads_compacted: 1,
+            ..RetentionTickOutcome::default()
+        },
+        "one tick compacts exactly the old body; the event sweeps stay off"
+    );
+    assert_eq!(pruned(old.clone()).await, 1, "old body pruned");
+    assert_eq!(pruned(fresh.clone()).await, 0, "fresh body kept in full");
+    let stale_events = svc
+        .store()
+        .delete_ephemeral_events_before("2026-01-02T00:00:00Z")
+        .await
+        .expect("count stale events by deleting them");
+    assert_eq!(
+        stale_events, 1,
+        "the stale ephemeral event survived the tick with streamRetentionHours = 0"
+    );
+
+    // A re-run with the same window is idempotent.
+    assert_eq!(
+        run_retention_tick_at(svc.store(), 0, &settings.effective, now).await,
+        RetentionTickOutcome::default(),
+        "nothing left to compact"
+    );
+}
+
 /// `agent.resolveProposal` outcome `applied`: removes the entry from the
 /// pending list, persists the `proposalId -> outcome` resolution (both
 /// lifted into the `AgentLite` projection), emits `agent:updated` carrying

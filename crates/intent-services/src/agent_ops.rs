@@ -3234,9 +3234,12 @@ impl Services {
     /// as `agent.getConversation` (NEVER the slim bounding), so block identity
     /// matches the served conversation byte-for-byte — persisted assistant ids
     /// and serve-time synthetic `{messageId}:{index}` ids both resolve — and
-    /// the returned block is always the full, unprojected body. Bounded cost
-    /// (RPC cost contract): a metadata-only session read plus ONE primary-key
-    /// message row read; the transcript is never hydrated.
+    /// the returned block is the full, unprojected body whenever that body is
+    /// still retained; a payload the retention sweep has compacted returns
+    /// the stored preview with its `*Truncated` / `*Bytes` flags plus
+    /// `inputPruned` / `outputPruned` (see "Retention-pruned bodies" below).
+    /// Bounded cost (RPC cost contract): a metadata-only session read plus
+    /// ONE primary-key message row read; the transcript is never hydrated.
     ///
     /// In-progress rows (monorepo#3647): when the message id is not persisted
     /// but matches the live-turn slot's in-flight message, the block resolves
