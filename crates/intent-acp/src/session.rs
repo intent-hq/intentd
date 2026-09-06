@@ -600,6 +600,15 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// ACP providers (auggie, codex, opencode, …) deliver a prose `title` (e.g.
 /// `"sub-agent-explore: Explore the AI agent system…"`) rather than the raw
 /// tool name the model invoked. Rules, in order:
+///  0. An object `raw_input` with a string `code` and a string `summary` is
+///     the daemon's own `workspace_api` tool
+///     ([`intent_core::is_workspace_api_input`]) → `workspace_api`. Checked
+///     before every title rule because auggie titles the call with its
+///     `summary` and carries no identifier anywhere in the frame
+///     (intent-hq/intent#4491): a summary such as `"Inspect: tool calls"`
+///     would otherwise split into a bogus name, and any other summary would
+///     pass through as the recorded name. Titles that already resolve to
+///     `workspace_api` via the rules below are unaffected.
 ///  1. A title of the form `<name>: <description>` (`<name>` a bare identifier
 ///     of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
 ///     becomes the name.
@@ -653,6 +662,9 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// every path.
 #[must_use]
 pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
+    if intent_core::is_workspace_api_input(raw_input) {
+        return "workspace_api".to_string();
+    }
     if let Some(name) = split_name_prefix(title) {
         return strip_workspace_mcp_affix(name);
     }

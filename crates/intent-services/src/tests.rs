@@ -11909,7 +11909,8 @@ mod mcp_callback {
 
         // The registry holds the canonical entry, claimable by nonce.
         let echo = json!({ "output": format!("…\"attachmentId\": \"{nonce}\"…") });
-        let mut batch = registry.claim_at_tool_result(&agent_id, Some(&echo), "unrelated_tool");
+        let mut batch =
+            registry.claim_at_tool_result(&agent_id, Some(&echo), "unrelated_tool", None);
         assert_eq!(batch.len(), 1, "one registered entry claimable by nonce");
         let claimed = batch.remove(0);
         assert_eq!(claimed.id, nonce);
@@ -11967,7 +11968,8 @@ mod mcp_callback {
             .claim_at_tool_result(
                 &intent_core::AgentId::from_string("agent-any"),
                 None,
-                "workspace_api"
+                "workspace_api",
+                None
             )
             .is_empty());
     }
@@ -12015,7 +12017,7 @@ mod mcp_callback {
 
         // No nonce can be echoed (the envelope was discarded), so the claim
         // rides the workspace_api FIFO fallback.
-        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api");
+        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api", None);
         assert_eq!(
             batch.len(),
             1,
@@ -12072,11 +12074,11 @@ mod mcp_callback {
             .expect("tools/call returns a response");
         assert_eq!(resp["result"]["isError"], json!(false));
 
-        let first = registry.claim_at_tool_result(&agent_id, None, "workspace_api");
+        let first = registry.claim_at_tool_result(&agent_id, None, "workspace_api", None);
         assert_eq!(first.len(), 1, "exactly one entry in the claimed batch");
         assert!(
             registry
-                .claim_at_tool_result(&agent_id, None, "workspace_api")
+                .claim_at_tool_result(&agent_id, None, "workspace_api", None)
                 .is_empty(),
             "no second batch left behind (double registration)"
         );
@@ -12126,13 +12128,13 @@ mod mcp_callback {
             .expect("tools/call returns a response");
         assert_eq!(resp["result"]["isError"], json!(false));
 
-        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api");
+        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api", None);
         assert_eq!(batch.len(), 2, "both proposals registered as one batch");
         assert_eq!(batch[0].name, "First");
         assert_eq!(batch[1].name, "Second");
         assert!(
             registry
-                .claim_at_tool_result(&agent_id, None, "workspace_api")
+                .claim_at_tool_result(&agent_id, None, "workspace_api", None)
                 .is_empty(),
             "single batch — nothing left after the claim"
         );
@@ -12181,7 +12183,7 @@ mod mcp_callback {
             .expect("tools/call returns a response");
         assert_eq!(resp["result"]["isError"], json!(false));
 
-        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api");
+        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api", None);
         assert_eq!(batch.len(), 1, "bulk-op proposal registered");
         assert_eq!(batch[0].mime_type, "application/vnd.intent.proposal+json");
         let payload: serde_json::Value =

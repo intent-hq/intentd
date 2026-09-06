@@ -54,6 +54,21 @@ pub fn new_attachment_id() -> String {
     format!("{NONCE_PREFIX}{}", &hex[..12])
 }
 
+/// Whether a tool input has the daemon's own `workspace_api` parameter shape:
+/// an object carrying a string `code` and a string `summary`. Some ACP
+/// providers (auggie) title a `workspace_api` call with its `summary` and
+/// carry no tool identifier anywhere in the frame (intent-hq/intent#4491),
+/// so the input shape is the one signal shared by every provider. Used by
+/// both the name derivation in `intent-acp` and the FIFO claim gate in
+/// [`TurnAttachmentRegistry::claim_at_tool_result`] so the two agree.
+#[must_use]
+pub fn is_workspace_api_input(input: Option<&Value>) -> bool {
+    input.and_then(Value::as_object).is_some_and(|obj| {
+        obj.get("code").is_some_and(Value::is_string)
+            && obj.get("summary").is_some_and(Value::is_string)
+    })
+}
+
 /// Where in the turn transcript a registered attachment is emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentPolicy {
@@ -160,11 +175,15 @@ impl TurnAttachmentRegistry {
     /// Precise path: the serialized `echoed_output` contains a batch member's
     /// nonce (the dispatch layer stamped it into the model-facing output, so
     /// any non-garbled echo carries it). Fallback path: when no nonce matches
-    /// and `tool_name` is the daemon's own `workspace_api` tool, the oldest
-    /// batch with an `AtToolResult` entry is claimed FIFO — a garbled echo
-    /// cannot defeat the attach, and only the tool that registers through
-    /// this registry can trigger the blind claim. Empty when nothing is
-    /// pending (the caller falls back to echo parsing).
+    /// and the call is the daemon's own `workspace_api` tool — EITHER
+    /// `tool_name` contains `workspace_api` OR `tool_input` has the
+    /// `workspace_api` parameter shape ([`is_workspace_api_input`]; a
+    /// provider that titles the call with its `summary` records no usable
+    /// name, intent-hq/intent#4491) — the oldest batch with an
+    /// `AtToolResult` entry is claimed FIFO — a garbled echo cannot defeat
+    /// the attach, and only the tool that registers through this registry
+    /// can trigger the blind claim. Empty when nothing is pending (the caller
+    /// falls back to echo parsing).
     ///
     /// # Panics
     ///
@@ -174,6 +193,7 @@ impl TurnAttachmentRegistry {
         agent_id: &AgentId,
         echoed_output: Option<&Value>,
         tool_name: &str,
+        tool_input: Option<&Value>,
     ) -> Vec<TurnAttachment> {
         let mut inner = self.inner.lock().unwrap();
         let Some(entries) = inner.get_mut(agent_id) else {
@@ -186,10 +206,10 @@ impl TurnAttachmentRegistry {
             .iter()
             .find(|e| is_claimable(e) && !echo.is_empty() && echo.contains(&e.attachment.id))
             .map(|e| e.batch);
+        let is_workspace_api =
+            tool_name.contains("workspace_api") || is_workspace_api_input(tool_input);
         let batch = by_nonce.or_else(|| {
-            tool_name
-                .contains("workspace_api")
-                .then(|| entries.iter().find(|e| is_claimable(e)).map(|e| e.batch))?
+            is_workspace_api.then(|| entries.iter().find(|e| is_claimable(e)).map(|e| e.batch))?
         });
         let Some(batch) = batch else {
             return Vec::new();
@@ -292,10 +312,10 @@ mod tests {
         reg.register(&a, attachment("tar-bbb", AttachmentPolicy::AtToolResult));
         // The echo carries the SECOND nonce — nonce match must beat FIFO.
         let echo = json!({ "output": "…\"attachmentId\": \"tar-bbb\"…" });
-        let claimed = reg.claim_at_tool_result(&a, Some(&echo), "some_other_tool");
+        let claimed = reg.claim_at_tool_result(&a, Some(&echo), "some_other_tool", None);
         assert_eq!(ids(&claimed), vec!["tar-bbb"]);
         // First entry still pending.
-        let rest = reg.claim_at_tool_result(&a, Some(&json!("tar-aaa")), "x");
+        let rest = reg.claim_at_tool_result(&a, Some(&json!("tar-aaa")), "x", None);
         assert_eq!(ids(&rest), vec!["tar-aaa"]);
     }
 
@@ -315,10 +335,10 @@ mod tests {
         reg.register(&a, attachment("tar-b2", AttachmentPolicy::AtToolResult));
         // A nonce match on ANY batch member claims the whole batch, in order.
         let echo = json!({ "output": "…tar-b1b…" });
-        let claimed = reg.claim_at_tool_result(&a, Some(&echo), "x");
+        let claimed = reg.claim_at_tool_result(&a, Some(&echo), "x", None);
         assert_eq!(ids(&claimed), vec!["tar-b1a", "tar-b1b"]);
         // The other batch is untouched.
-        let rest = reg.claim_at_tool_result(&a, None, "workspace_api");
+        let rest = reg.claim_at_tool_result(&a, None, "workspace_api", None);
         assert_eq!(ids(&rest), vec!["tar-b2"]);
     }
 
@@ -330,14 +350,77 @@ mod tests {
         // Garbled echo (no nonce) + foreign tool name → no claim.
         let garbled = json!({ "output": "garbage" });
         assert!(reg
-            .claim_at_tool_result(&a, Some(&garbled), "str_replace")
+            .claim_at_tool_result(&a, Some(&garbled), "str_replace", None)
             .is_empty());
         // Same echo but the daemon's own tool (possibly prefixed) → FIFO claim.
-        let claimed = reg.claim_at_tool_result(&a, Some(&garbled), "workspace-mcp_workspace_api");
+        let claimed =
+            reg.claim_at_tool_result(&a, Some(&garbled), "workspace-mcp_workspace_api", None);
         assert_eq!(ids(&claimed), vec!["tar-aaa"]);
         assert!(reg
-            .claim_at_tool_result(&a, Some(&garbled), "workspace_api")
+            .claim_at_tool_result(&a, Some(&garbled), "workspace_api", None)
             .is_empty());
+    }
+
+    /// intent-hq/intent#4491: a provider that titles the call with its
+    /// `summary` records no usable name, so the `{code, summary}` input
+    /// shape is the second FIFO gate. `{code}` alone or no input does not
+    /// open it; the name gate still works with no input.
+    #[test]
+    fn claim_falls_back_to_fifo_on_workspace_api_input_shape() {
+        let reg = TurnAttachmentRegistry::new();
+        let a = agent();
+        reg.register(&a, attachment("tar-aaa", AttachmentPolicy::AtToolResult));
+        let garbled = json!({ "output": "garbage" });
+        let prose = "Propose a follow-up workspace";
+        assert!(reg
+            .claim_at_tool_result(&a, Some(&garbled), prose, None)
+            .is_empty());
+        assert!(reg
+            .claim_at_tool_result(
+                &a,
+                Some(&garbled),
+                prose,
+                Some(&json!({ "code": "ws.workspace.proposeSibling(p)" }))
+            )
+            .is_empty());
+        assert!(reg
+            .claim_at_tool_result(
+                &a,
+                Some(&garbled),
+                prose,
+                Some(&json!({ "code": "x", "summary": 42 }))
+            )
+            .is_empty());
+        let shaped = json!({
+            "code": "ws.workspace.proposeSibling(p)",
+            "summary": prose,
+            "_acpTitle": prose,
+        });
+        let claimed = reg.claim_at_tool_result(&a, Some(&garbled), prose, Some(&shaped));
+        assert_eq!(ids(&claimed), vec!["tar-aaa"]);
+        assert!(reg
+            .claim_at_tool_result(&a, Some(&garbled), prose, Some(&shaped))
+            .is_empty());
+        // Name gate alone still claims with no input.
+        reg.register(&a, attachment("tar-bbb", AttachmentPolicy::AtToolResult));
+        let claimed = reg.claim_at_tool_result(&a, None, "workspace_api", None);
+        assert_eq!(ids(&claimed), vec!["tar-bbb"]);
+    }
+
+    #[test]
+    fn is_workspace_api_input_requires_string_code_and_summary() {
+        assert!(is_workspace_api_input(Some(
+            &json!({ "code": "return 1", "summary": "One" })
+        )));
+        assert!(!is_workspace_api_input(Some(
+            &json!({ "code": "return 1" })
+        )));
+        assert!(!is_workspace_api_input(Some(&json!({ "summary": "One" }))));
+        assert!(!is_workspace_api_input(Some(
+            &json!({ "code": null, "summary": "One" })
+        )));
+        assert!(!is_workspace_api_input(Some(&json!("code summary"))));
+        assert!(!is_workspace_api_input(None));
     }
 
     #[test]
@@ -346,10 +429,15 @@ mod tests {
         let a = agent();
         reg.register(&a, attachment("tar-end", AttachmentPolicy::AtTurnEnd));
         assert!(reg
-            .claim_at_tool_result(&a, None, "workspace_api")
+            .claim_at_tool_result(&a, None, "workspace_api", None)
             .is_empty());
         assert!(reg
-            .claim_at_tool_result(&AgentId::from_string("agent-other"), None, "workspace_api")
+            .claim_at_tool_result(
+                &AgentId::from_string("agent-other"),
+                None,
+                "workspace_api",
+                None
+            )
             .is_empty());
     }
 
@@ -364,7 +452,7 @@ mod tests {
         assert_eq!(ids(&drained), vec!["tar-e1", "tar-e2"]);
         // Everything (including the unclaimed AtToolResult) is gone.
         assert!(reg
-            .claim_at_tool_result(&a, None, "workspace_api")
+            .claim_at_tool_result(&a, None, "workspace_api", None)
             .is_empty());
         assert!(reg.finish_turn(&a).is_empty());
     }
@@ -400,7 +488,7 @@ mod tests {
             );
         }
         // Oldest were dropped: FIFO claim yields the first surviving entry.
-        let claimed = reg.claim_at_tool_result(&a, None, "workspace_api");
+        let claimed = reg.claim_at_tool_result(&a, None, "workspace_api", None);
         assert_eq!(ids(&claimed), vec!["tar-004"]);
     }
 

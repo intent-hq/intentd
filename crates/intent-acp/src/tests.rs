@@ -1117,6 +1117,100 @@ mod session_tests {
         assert_eq!(session::derive_tool_name("10:15 sync", None), "10:15 sync");
     }
 
+    /// intent-hq/intent#4491: auggie titles a `workspace_api` call with its
+    /// `summary` and carries no tool identifier anywhere in the frame, so the
+    /// `{code, summary}` input shape must resolve the name — ahead of the
+    /// `<name>: <description>` split (a summary with a colon would otherwise
+    /// yield a bogus name) and the prose pass-through.
+    #[test]
+    fn derive_tool_name_recognizes_workspace_api_input_shape() {
+        let shaped = json!({
+            "code": "return await ws.workspace.proposeSibling(p)",
+            "summary": "Inspect how my workspace_api tool calls are recorded",
+        });
+        assert_eq!(
+            session::derive_tool_name(
+                "Inspect how my workspace_api tool calls are recorded",
+                Some(&shaped)
+            ),
+            "workspace_api"
+        );
+        assert_eq!(
+            session::derive_tool_name("Propose a follow-up workspace", Some(&shaped)),
+            "workspace_api"
+        );
+        // A summary shaped like `<name>: <rest>` must not split.
+        assert_eq!(
+            session::derive_tool_name("Inspect: tool calls", Some(&shaped)),
+            "workspace_api"
+        );
+        // Existing title forms still resolve, with or without the input.
+        for title in [
+            "workspace_api",
+            "workspace_api_workspace-mcp",
+            "workspace-mcp_workspace_api",
+            "mcp.workspace-mcp.workspace_api",
+            "mcp__workspace-mcp__workspace_api",
+            "workspace_api_workspace-mcp: Inspect tool calls",
+        ] {
+            assert_eq!(
+                session::derive_tool_name(title, Some(&shaped)),
+                "workspace_api",
+                "title={title}"
+            );
+            assert_eq!(
+                session::derive_tool_name(title, None),
+                "workspace_api",
+                "title={title}"
+            );
+        }
+        // `code` alone or `summary` alone is not the shape: the title rules
+        // apply as before.
+        assert_eq!(
+            session::derive_tool_name("Inspect: tool calls", Some(&json!({ "code": "return 1" }))),
+            "Inspect"
+        );
+        assert_eq!(
+            session::derive_tool_name(
+                "Propose a follow-up workspace",
+                Some(&json!({ "summary": "Propose a follow-up workspace" }))
+            ),
+            "Propose a follow-up workspace"
+        );
+        assert_eq!(
+            session::derive_tool_name(
+                "Propose a follow-up workspace",
+                Some(&json!({ "code": "return 1", "summary": null }))
+            ),
+            "Propose a follow-up workspace"
+        );
+    }
+
+    /// The auggie-shaped `tool_call` frame end to end through the mapper:
+    /// the name is `workspace_api`, the kind stays `other`, and the title /
+    /// input pass through verbatim (the transcript writer echoes the title as
+    /// `input._acpTitle` from `title`, so it must survive intact).
+    #[test]
+    fn maps_auggie_shaped_workspace_api_tool_call() {
+        let summary = "Propose a follow-up workspace";
+        let frame = json!({
+            "sessionUpdate": "tool_call", "toolCallId": "t1", "title": summary,
+            "kind": "other", "status": "in_progress",
+            "rawInput": { "code": "ws.workspace.proposeSibling(p)", "summary": summary },
+        });
+        let update: SessionUpdate = serde_json::from_value(frame).unwrap();
+        let Some(MappedUpdate::ToolCall(call)) = session::map_session_update(&update) else {
+            panic!("tool call expected")
+        };
+        assert_eq!(call.tool_name, "workspace_api");
+        assert_eq!(call.tool_kind, "other");
+        assert_eq!(call.title, summary);
+        assert_eq!(
+            call.input,
+            json!({ "code": "ws.workspace.proposeSibling(p)", "summary": summary })
+        );
+    }
+
     #[test]
     fn derive_tool_name_uses_raw_input_when_title_is_prose() {
         // information_request → codebase-retrieval; "conversation" in the
