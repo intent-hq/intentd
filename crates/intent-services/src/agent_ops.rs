@@ -10427,8 +10427,11 @@ impl Services {
         // no cancelled-in-memory group can rehydrate on restart. (A concurrent
         // `try_fire_group` racing this delete is benign: both deletes are
         // idempotent, and whichever removes the in-memory group first wins.)
+        // Routed through the group persistence lane so a create/enroll upsert
+        // still queued ahead cannot land after it (intent-hq/intent#4460).
         if let Some(group) = &target_group {
-            self.store.delete_delegation_group(&group.group_id).await?;
+            self.delete_delegation_group_persisted(&group.group_id)
+                .await?;
         }
 
         // Parent home workspaces to publish `agent:subscriptions-changed` in
@@ -10451,7 +10454,19 @@ impl Services {
             anchors.push(watch.parent_workspace_id);
         }
         if let Some(group) = target_group {
-            self.remove_group_with_watches(&agent_id, &group.group_id);
+            // The group stayed live between the up-front delete and this
+            // removal, so an enroll/completion upsert may sit on the lane
+            // behind that delete. The removal enqueues a trailing delete
+            // ordered after any such upsert; await it so `success` is not
+            // published while an undelivered row could still rehydrate.
+            if let Some((_, ack)) = self.remove_group_with_watches(&agent_id, &group.group_id) {
+                if let Err(e) = Self::await_group_persist(ack).await {
+                    tracing::warn!(
+                        group = %group.group_id,
+                        "trailing delegation_group delete failed after scoped cancel: {e}"
+                    );
+                }
+            }
             if !anchors.contains(&group.workspace_id) {
                 anchors.push(group.workspace_id);
             }

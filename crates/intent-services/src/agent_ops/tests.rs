@@ -951,12 +951,7 @@ async fn after_all_group_wake_to_retired_parent_drops_group_without_retry() {
         0,
         "no aggregated wake reaches the retired parent"
     );
-    let groups = svc
-        .store()
-        .list_undelivered_groups(&ws)
-        .await
-        .expect("list persisted groups");
-    assert!(groups.is_empty(), "persisted group row deleted");
+    wait_for_persisted_groups(&svc, &ws, 0).await;
     wait_for_persisted_watches(&svc, 0).await;
 }
 
@@ -1013,12 +1008,7 @@ async fn after_all_group_wake_to_unknown_parent_drops_group_without_retry() {
             .is_empty(),
         "no group retry task may be scheduled for an unknown parent"
     );
-    let groups = svc
-        .store()
-        .list_undelivered_groups(&ws)
-        .await
-        .expect("list persisted groups");
-    assert!(groups.is_empty(), "persisted group row deleted");
+    wait_for_persisted_groups(&svc, &ws, 0).await;
     wait_for_persisted_watches(&svc, 0).await;
 }
 
@@ -2716,6 +2706,59 @@ async fn wait_for_persisted_watches(svc: &Services, expected: usize) {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Poll until the persisted undelivered `delegation_group` rows of `ws`
+/// reach `expected` (group persistence and sweeps are spawned, not awaited —
+/// intent#4460).
+async fn wait_for_persisted_groups(svc: &Services, ws: &WorkspaceId, expected: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let rows = svc
+            .store()
+            .list_undelivered_groups(ws)
+            .await
+            .expect("list persisted groups");
+        if rows.len() == expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected {expected} persisted delegation_group rows, found {}",
+            rows.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// intent#4460 product-side probe: a scoped group cancel issued right after
+/// the group is created (its create/enroll upserts spawned but not yet
+/// landed) must not leave a resurrected `delegation_group` row behind — a
+/// stale upsert landing after the cancel's delete would rehydrate the
+/// cancelled group on restart.
+#[tokio::test]
+async fn scoped_group_cancel_racing_spawned_upserts_leaves_no_persisted_row() {
+    let (_t, svc, _manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.agent_cancel_subscriptions_op(ws.clone(), parent.clone(), None, Some(gid.clone()))
+        .await
+        .expect("scoped group cancel");
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    // Give any straggling spawned upsert time to land before checking.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let rows = svc
+        .store()
+        .list_undelivered_groups(&ws)
+        .await
+        .expect("list persisted groups");
+    assert!(
+        rows.is_empty(),
+        "cancelled group row resurrected by a late spawned upsert: {rows:?}"
+    );
 }
 
 /// Restart durability: a completion watch registered before a daemon
