@@ -72,16 +72,7 @@ impl Services {
         expected_revision: u64,
         initial_agent: Option<Value>,
     ) -> Result<Value> {
-        let gate = {
-            let mut locks = self
-                .workspace_draft_promotion_locks
-                .lock()
-                .map_err(|_| Error::Internal("workspace draft promotion lock poisoned".into()))?;
-            locks
-                .entry(id.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
+        let gate = self.workspace_draft_gate(&id)?;
         let _guard = gate.lock().await;
         let draft = self.store.get_workspace_draft(&id).await?;
         let initial_agent = initial_agent
@@ -189,6 +180,19 @@ impl Services {
     }
 
     pub(crate) async fn workspace_draft_delete_op(&self, id: WorkspaceDraftId) -> Result<Value> {
+        let gate = self.workspace_draft_gate(&id)?;
+        let _guard = gate.lock().await;
+        match self.store.get_workspace_draft(&id).await {
+            Ok(draft) if draft.phase == DraftPhase::Promoting => {
+                return Err(Error::Conflict {
+                    current: serde_json::to_value(&draft).map_err(|e| {
+                        Error::Internal(format!("encode workspace draft conflict failed: {e}"))
+                    })?,
+                });
+            }
+            Ok(_) | Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
         let deleted = self.store.delete_workspace_draft(&id).await?;
         if deleted {
             publish_event(
@@ -198,6 +202,17 @@ impl Services {
             .await;
         }
         Ok(json!({ "deleted": deleted }))
+    }
+
+    fn workspace_draft_gate(&self, id: &WorkspaceDraftId) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        let mut locks = self
+            .workspace_draft_promotion_locks
+            .lock()
+            .map_err(|_| Error::Internal("workspace draft promotion lock poisoned".into()))?;
+        Ok(locks
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone())
     }
 
     async fn promotion_result(

@@ -7,7 +7,7 @@ mod common;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Condvar, Mutex, Once};
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
@@ -306,6 +306,82 @@ async fn promotion_restart_after_workspace_insert_recovers_agent_and_turn() {
         .filter(|message| message["role"] == "user")
         .count();
     assert_eq!(first_turns, 1, "restart must not duplicate the first turn");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_waits_for_in_flight_promotion_to_finish() {
+    let root = TempDir::new();
+    let repo = make_repo(&root.0);
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let callback_release = release.clone();
+    let failpoint: WorkspaceDraftPromotionFailpoint = Arc::new(move |_| {
+        entered_tx.send(()).unwrap();
+        let (lock, ready) = &*callback_release;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = ready.wait(released).unwrap();
+        }
+        false
+    });
+    let (_server, port, config) = boot_with_failpoint(&root.0, Some(failpoint)).await;
+    let mut promote_ws = connect(port, config.clone()).await;
+    let mut delete_ws = connect(port, config).await;
+    let draft = rpc(
+        &mut promote_ws,
+        1,
+        "workspaceDraft.create",
+        json!({"source":{"kind":"local","path":repo,"branch":"main","isolation":"in-place"}}),
+    )
+    .await;
+    let draft_id = draft["id"].as_str().unwrap().to_string();
+    let promote_id = draft_id.clone();
+    let promotion = tokio::spawn(async move {
+        rpc(
+            &mut promote_ws,
+            2,
+            "workspaceDraft.promote",
+            json!({"id":promote_id,"expectedRevision":0}),
+        )
+        .await
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .expect("promotion reached post-insert failpoint");
+
+    let delete_id = draft_id.clone();
+    let deletion = tokio::spawn(async move {
+        rpc(
+            &mut delete_ws,
+            3,
+            "workspaceDraft.delete",
+            json!({"id":delete_id}),
+        )
+        .await
+    });
+    sleep(Duration::from_millis(100)).await;
+    assert!(!deletion.is_finished(), "delete must wait for promotion");
+
+    let (lock, ready) = &*release;
+    *lock.lock().unwrap() = true;
+    ready.notify_one();
+    let promoted = timeout(Duration::from_secs(5), promotion)
+        .await
+        .expect("promotion completed")
+        .unwrap();
+    assert_eq!(promoted["draft"]["phase"], "promoted");
+    assert_eq!(
+        promoted["draft"]["promotedWorkspaceId"],
+        promoted["workspace"]["id"]
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(5), deletion)
+            .await
+            .expect("delete completed after promotion")
+            .unwrap(),
+        json!({"deleted":true})
+    );
 }
 
 async fn connect(port: u16, config: Arc<ClientConfig>) -> Ws {
