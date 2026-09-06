@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use intent_core::{
-    now_iso, ClientId, ContextLink, DraftDelivery, DraftIsolation, DraftPhase, DraftSource, Error,
-    WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceDraft, WorkspaceDraftId,
-    WorkspaceId,
+    expand_tilde, now_iso, ClientId, ContextLink, DraftDelivery, DraftIsolation, DraftPhase,
+    DraftSource, Error, WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceDraft,
+    WorkspaceDraftId, WorkspaceId,
 };
 use intent_store::{NewEvent, WorkspaceDraftPatch};
 use serde_json::{json, Map, Value};
@@ -478,8 +478,7 @@ fn promotion_input(
         }
         Some(DraftSource::NewFolder { parent_path, name }) => {
             input.repository_path = Some(
-                PathBuf::from(parent_path)
-                    .join(name)
+                new_folder_target(parent_path, name)
                     .to_string_lossy()
                     .into(),
             );
@@ -495,7 +494,7 @@ async fn validate_new_folder_target(draft: &WorkspaceDraft) -> Result<()> {
     let Some(DraftSource::NewFolder { parent_path, name }) = &draft.source else {
         return Ok(());
     };
-    let path = PathBuf::from(parent_path).join(name);
+    let path = new_folder_target(parent_path, name);
     let metadata = match tokio::fs::metadata(&path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -535,6 +534,10 @@ async fn validate_new_folder_target(draft: &WorkspaceDraft) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn new_folder_target(parent_path: &str, name: &str) -> PathBuf {
+    expand_tilde(parent_path).join(name)
 }
 
 fn parse_patch(mut patch: Map<String, Value>) -> Result<WorkspaceDraftPatch> {

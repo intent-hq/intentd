@@ -932,6 +932,60 @@ async fn new_folder_promotion_initializes_main_and_rejects_non_empty_target() {
 }
 
 #[tokio::test]
+async fn new_folder_tilde_preflight_rejects_populated_target_under_home() {
+    static ENV_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    struct HomeEnvGuard(Option<std::ffi::OsString>);
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    let _lock = ENV_HOME_LOCK.lock().await;
+    let root = TempDir::new();
+    let home = TempDir::new();
+    let _home = HomeEnvGuard(std::env::var_os("HOME"));
+    std::env::set_var("HOME", &home.0);
+    let target = home.0.join("Developer/occupied");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("keep.txt"), "keep\n").unwrap();
+    let (_server, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+    let draft = rpc(
+        &mut ws,
+        1,
+        "workspaceDraft.create",
+        json!({"source":{"kind":"newFolder","parentPath":"~/Developer","name":"occupied"}}),
+    )
+    .await;
+    let rejected = rpc_raw(
+        &mut ws,
+        2,
+        "workspaceDraft.promote",
+        json!({"id":draft["id"],"expectedRevision":0}),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], -32602);
+    assert!(rejected["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not empty"));
+    assert_eq!(
+        std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(
+        rpc(&mut ws, 3, "workspace.list", json!({})).await["workspaces"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn restart_restores_acknowledged_draft_boundaries_and_lost_promote_ack() {
     let root = TempDir::new();
     let repo = make_repo(&root.0);
