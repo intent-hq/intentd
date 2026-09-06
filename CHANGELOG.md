@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.32] - 2026-09-06
+
+### 🐛 Bug Fixes
+
+- *(acp)* Recognize auggie-shaped workspace_api calls so proposals attach ([#1762](https://github.com/intent-hq/intentd/pull/1762))
+
+
 ## [0.9.31] - 2026-09-06
 
 ### 🚀 Features
