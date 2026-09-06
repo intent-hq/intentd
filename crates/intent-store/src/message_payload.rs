@@ -18,10 +18,23 @@
 //! Write-time image thumbnail maps (0097) also land here as message-level
 //! rows (`kind = 'thumbnails'`, `block_ordinal` -1) instead of growing the
 //! `agent_message.thumbnails` column; reads fall back to the legacy column.
+//!
+//! The tool-payload retention sweep (`agents.toolPayloadRetentionDays`)
+//! compacts an old full-body row into a `*_replay` row holding exactly the
+//! replay-shaped preview ([`ReplayPreview`]) and deletes the full body.
+//! Normal hydration ignores replay kinds — a pruned block keeps serving its
+//! inline slim preview + flags — while the recovery-replay read
+//! ([`splice_replay_preview`]) emits the `intent_core::replay_preview` block
+//! contract from either a full row or a replay row, byte-identically.
 
 use std::io::Write as _;
 
+use intent_core::replay_preview::{
+    retruncate_replay_preview, safe_stringify, truncate_marked, INPUT_REPLAY_ORIGINAL_CHARS_KEY,
+    OUTPUT_REPLAY_ORIGINAL_CHARS_KEY,
+};
 use intent_core::{slim_body_size, slim_heavy_body, Error, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Ceiling for a `tool_use.input` / `tool_result.output` body to stay inline
@@ -35,6 +48,12 @@ pub(crate) const PAYLOAD_INLINE_MAX_BYTES: usize = 4096;
 pub(crate) const KIND_TOOL_USE_INPUT: &str = "tool_use_input";
 /// `kind` for an externalized `tool_result.output` body.
 pub(crate) const KIND_TOOL_RESULT_OUTPUT: &str = "tool_result_output";
+/// `kind` for the replay-shaped preview of a pruned `tool_use.input` body
+/// (the full [`KIND_TOOL_USE_INPUT`] row is gone).
+pub(crate) const KIND_TOOL_USE_INPUT_REPLAY: &str = "tool_use_input_replay";
+/// `kind` for the replay-shaped preview of a pruned `tool_result.output` body
+/// (the full [`KIND_TOOL_RESULT_OUTPUT`] row is gone).
+pub(crate) const KIND_TOOL_RESULT_OUTPUT_REPLAY: &str = "tool_result_output_replay";
 /// `kind` for a message-level write-time thumbnails map (0097 successor).
 pub(crate) const KIND_THUMBNAILS: &str = "thumbnails";
 /// `block_ordinal` for message-level rows (the thumbnails map is keyed by
@@ -62,8 +81,10 @@ pub(crate) struct PayloadRow {
 struct HeavyField {
     field: &'static str,
     kind: &'static str,
+    replay_kind: &'static str,
     truncated_flag: &'static str,
     bytes_flag: &'static str,
+    replay_marker: &'static str,
 }
 
 fn heavy_field(block_type: &str) -> Option<HeavyField> {
@@ -71,25 +92,144 @@ fn heavy_field(block_type: &str) -> Option<HeavyField> {
         "tool_use" => Some(HeavyField {
             field: "input",
             kind: KIND_TOOL_USE_INPUT,
+            replay_kind: KIND_TOOL_USE_INPUT_REPLAY,
             truncated_flag: "inputTruncated",
             bytes_flag: "inputBytes",
+            replay_marker: INPUT_REPLAY_ORIGINAL_CHARS_KEY,
         }),
         "tool_result" => Some(HeavyField {
             field: "output",
             kind: KIND_TOOL_RESULT_OUTPUT,
+            replay_kind: KIND_TOOL_RESULT_OUTPUT_REPLAY,
             truncated_flag: "outputTruncated",
             bytes_flag: "outputBytes",
+            replay_marker: OUTPUT_REPLAY_ORIGINAL_CHARS_KEY,
         }),
         _ => None,
     }
 }
 
-/// The block type + field targeted by a side-table row's `kind`.
+/// The block type + field targeted by a full-body side-table row's `kind`.
 fn kind_target(kind: &str) -> Option<(&'static str, HeavyField)> {
     match kind {
         KIND_TOOL_USE_INPUT => Some(("tool_use", heavy_field("tool_use")?)),
         KIND_TOOL_RESULT_OUTPUT => Some(("tool_result", heavy_field("tool_result")?)),
         _ => None,
+    }
+}
+
+/// [`kind_target`] accepting a replay-preview `kind` as well as a full-body one.
+fn replay_kind_target(kind: &str) -> Option<(&'static str, HeavyField)> {
+    match kind {
+        KIND_TOOL_USE_INPUT_REPLAY => Some(("tool_use", heavy_field("tool_use")?)),
+        KIND_TOOL_RESULT_OUTPUT_REPLAY => Some(("tool_result", heavy_field("tool_result")?)),
+        other => kind_target(other),
+    }
+}
+
+/// The `*_replay` kind a full-body row's `kind` compacts into; `None` for
+/// kinds the retention sweep never touches (thumbnails, already-replay rows).
+pub(crate) fn replay_kind_for(kind: &str) -> Option<&'static str> {
+    kind_target(kind).map(|(_, f)| f.replay_kind)
+}
+
+/// Whether `kind` names a replay-preview row (as opposed to a full body).
+pub(crate) fn is_replay_kind(kind: &str) -> bool {
+    kind == KIND_TOOL_USE_INPUT_REPLAY || kind == KIND_TOOL_RESULT_OUTPUT_REPLAY
+}
+
+/// The decoded body of a `*_replay` row: the replay-shaped preview of a
+/// pruned heavy body. Serialized as the JSON object
+/// `{"text": <middle-truncated stringified body>, "originalChars": <N>}`
+/// (then [`encode_body`] like every other row). `text` is what
+/// `truncate_marked(safe_stringify(body), replay_chars)` produced at prune
+/// time and `original_chars` is the full stringified body's char count — for
+/// a body that already fit under the cap, `text` is the whole body and
+/// `original_chars` its own char count (uniform shape; the formatter treats
+/// `preview_chars >= original_chars` as "whole body present").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReplayPreview {
+    pub text: String,
+    pub original_chars: usize,
+}
+
+impl ReplayPreview {
+    /// Produce the replay preview of a decoded full body at `replay_chars`.
+    pub(crate) fn from_body(body: &Value, replay_chars: usize) -> Self {
+        let (text, original) = truncate_marked(&safe_stringify(body), replay_chars);
+        let original_chars = original.unwrap_or_else(|| text.chars().count());
+        Self {
+            text,
+            original_chars,
+        }
+    }
+
+    /// Parse a decoded `*_replay` row body.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the body is not a replay-preview object.
+    pub(crate) fn from_row_body(body: Value) -> Result<Self> {
+        serde_json::from_value(body)
+            .map_err(|e| Error::Internal(format!("decode replay preview body failed: {e}")))
+    }
+
+    /// Serialize + [`encode_body`] for insertion as a `*_replay` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if serialization fails.
+    pub(crate) fn encode(&self) -> Result<(&'static str, Vec<u8>)> {
+        let json = serde_json::to_vec(self)
+            .map_err(|e| Error::Internal(format!("encode replay preview body failed: {e}")))?;
+        Ok(encode_body(&json))
+    }
+}
+
+/// Splice a replay preview into `content` at `block_ordinal`'s heavy field,
+/// emitting the `intent_core::replay_preview` block contract: the heavy field
+/// becomes the preview STRING rendered at `replay_chars`
+/// ([`retruncate_replay_preview`] — re-truncated when the cap shrank since the
+/// preview was produced, never expanded) and the additive
+/// `inputReplayOriginalChars` / `outputReplayOriginalChars` integer carries
+/// the original char count; the write-time `*Truncated` / `*Bytes` flags are
+/// removed like [`splice_payload`] does. `kind` may be the full-body or the
+/// `*_replay` kind — both paths yield the same block for the same body and
+/// cap. Mismatched rows degrade to the stored preview with a WARN.
+pub(crate) fn splice_replay_preview(
+    content: &mut Value,
+    block_ordinal: i64,
+    kind: &str,
+    preview: &ReplayPreview,
+    replay_chars: usize,
+) {
+    let Some((expected_type, f)) = replay_kind_target(kind) else {
+        tracing::warn!(kind, "unknown payload kind; serving stored preview");
+        return;
+    };
+    let block = usize::try_from(block_ordinal)
+        .ok()
+        .and_then(|i| content.as_array_mut()?.get_mut(i));
+    match block {
+        Some(b) if b.get("type").and_then(Value::as_str) == Some(expected_type) => {
+            if let Some(obj) = b.as_object_mut() {
+                let (text, original) =
+                    retruncate_replay_preview(&preview.text, preview.original_chars, replay_chars);
+                let original_chars = original.unwrap_or_else(|| text.chars().count());
+                obj.insert(f.field.to_string(), Value::String(text));
+                obj.insert(f.replay_marker.to_string(), Value::from(original_chars));
+                obj.remove(f.truncated_flag);
+                obj.remove(f.bytes_flag);
+            }
+        }
+        _ => {
+            tracing::warn!(
+                block_ordinal,
+                kind,
+                "payload row does not match its content block; serving stored preview"
+            );
+        }
     }
 }
 

@@ -17,7 +17,8 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use intent_core::replay_preview::{
-    retruncate_replay_preview, INPUT_REPLAY_ORIGINAL_CHARS_KEY, OUTPUT_REPLAY_ORIGINAL_CHARS_KEY,
+    retruncate_replay_preview, safe_stringify, INPUT_REPLAY_ORIGINAL_CHARS_KEY,
+    OUTPUT_REPLAY_ORIGINAL_CHARS_KEY,
 };
 use intent_core::AgentMessage;
 use serde_json::{json, Value};
@@ -89,15 +90,6 @@ fn truncate_tool_content(
             (text, truncated_attrs(original))
         }
         _ => truncate_marked(&safe_stringify(heavy), max_chars),
-    }
-}
-
-/// Stringify a value (TS `safeStringify`): strings pass through; everything else
-/// is JSON-encoded.
-fn safe_stringify(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        _ => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
     }
 }
 

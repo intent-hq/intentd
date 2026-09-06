@@ -3188,6 +3188,18 @@ const PAYLOAD_UPSERT_SQL: &str = "INSERT INTO agent_message_payload \
      ON CONFLICT(message_id, block_ordinal, kind) \
      DO UPDATE SET encoding = excluded.encoding, body = excluded.body";
 
+/// One full-body side row prepared by [`Store::compact_tool_payloads_before`]:
+/// the key of the row to delete plus the `*_replay` row replacing it.
+struct CompactedPayloadRow {
+    message_id: String,
+    agent_id: String,
+    block_ordinal: i64,
+    kind: String,
+    replay_kind: &'static str,
+    replay_encoding: &'static str,
+    replay_body: Vec<u8>,
+}
+
 /// Insert (upsert, see [`PAYLOAD_UPSERT_SQL`]) one message's prepared
 /// `agent_message_payload` rows inside the caller's write transaction.
 async fn insert_payload_rows(
@@ -3878,7 +3890,10 @@ impl Store {
     /// read. Takes the caller's read transaction: message SELECT and payload
     /// SELECT must share one WAL snapshot ([`Store::begin_read_snapshot`]),
     /// or a concurrent replace/delete between them would strand the old
-    /// message rows without their side rows.
+    /// message rows without their side rows. Only the two FULL-body kinds
+    /// are selected: `*_replay` rows (retention-pruned bodies, see
+    /// [`Store::compact_tool_payloads_before`]) are ignored, so a pruned
+    /// block keeps serving its inline slim preview + `*Truncated` flags.
     async fn hydrate_message_payloads(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         messages: &mut [AgentMessage],
@@ -3899,8 +3914,9 @@ impl Store {
             let sql = format!(
                 "SELECT message_id, block_ordinal, kind, encoding, body \
                  FROM agent_message_payload \
-                 WHERE kind != '{}' AND message_id IN ({placeholders})",
-                crate::message_payload::KIND_THUMBNAILS
+                 WHERE kind IN ('{}', '{}') AND message_id IN ({placeholders})",
+                crate::message_payload::KIND_TOOL_USE_INPUT,
+                crate::message_payload::KIND_TOOL_RESULT_OUTPUT
             );
             let mut query = sqlx::query(&sql);
             for id in chunk {
@@ -3942,6 +3958,271 @@ impl Store {
             );
         }
         Ok(())
+    }
+
+    /// Read an agent's whole log shaped for recovery replay (`history_xml`):
+    /// every externalized heavy body — full row or retention-pruned
+    /// `*_replay` row alike — is spliced in as the replay-preview block
+    /// contract (`intent_core::replay_preview`: the heavy field becomes the
+    /// middle-truncated preview string at `replay_chars`, plus the additive
+    /// `inputReplayOriginalChars` / `outputReplayOriginalChars` count), so a
+    /// block renders byte-identically whether or not the sweep has already
+    /// compacted it. Legacy inline-body blocks are returned as stored.
+    ///
+    /// Message SELECT and payload SELECT share one read snapshot like
+    /// [`Store::hydrate_message_payloads`]. Side rows are paged by rowid in
+    /// small batches and each full body is decoded → stringified → truncated
+    /// as soon as it is read, so at most one page of full bodies is ever
+    /// materialized at once — never the whole transcript's. Rows whose
+    /// message is missing from the log (0109 staged rows) are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_agent_messages_for_replay(
+        &self,
+        agent_id: &AgentId,
+        replay_chars: usize,
+    ) -> Result<Vec<AgentMessage>> {
+        const ROWS_PER_PAGE: i64 = 64;
+        let sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? ORDER BY seq ASC"
+        );
+        let mut tx = self.begin_read_snapshot().await?;
+        let rows = sqlx::query(&sql)
+            .bind(&agent_id.0)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("get agent messages for replay failed: {e}")))?;
+        let mut messages: Vec<AgentMessage> =
+            rows.iter().map(map_message_row).collect::<Result<_>>()?;
+        if messages.is_empty() {
+            return Ok(messages);
+        }
+        let index_by_id: std::collections::HashMap<String, usize> = messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.id.clone(), i))
+            .collect();
+        let page_sql = format!(
+            "SELECT rowid AS rid, message_id, block_ordinal, kind, encoding, body \
+             FROM agent_message_payload \
+             WHERE agent_id = ? AND rowid > ? AND kind IN ('{}', '{}', '{}', '{}') \
+             ORDER BY rowid ASC LIMIT ?",
+            crate::message_payload::KIND_TOOL_USE_INPUT,
+            crate::message_payload::KIND_TOOL_RESULT_OUTPUT,
+            crate::message_payload::KIND_TOOL_USE_INPUT_REPLAY,
+            crate::message_payload::KIND_TOOL_RESULT_OUTPUT_REPLAY,
+        );
+        let mut after_rowid: i64 = 0;
+        loop {
+            let rows = sqlx::query(&page_sql)
+                .bind(&agent_id.0)
+                .bind(after_rowid)
+                .bind(ROWS_PER_PAGE)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("get replay payloads failed: {e}")))?;
+            let page_len = rows.len();
+            for row in &rows {
+                after_rowid = col(row, "rid")?;
+                let message_id: String = col(row, "message_id")?;
+                let Some(&idx) = index_by_id.get(&message_id) else {
+                    continue;
+                };
+                let block_ordinal: i64 = col(row, "block_ordinal")?;
+                let kind: String = col(row, "kind")?;
+                let encoding: String = col(row, "encoding")?;
+                let body: Vec<u8> = col(row, "body")?;
+                let preview = crate::message_payload::decode_body(&encoding, &body).and_then(|v| {
+                    if crate::message_payload::is_replay_kind(&kind) {
+                        crate::message_payload::ReplayPreview::from_row_body(v)
+                    } else {
+                        Ok(crate::message_payload::ReplayPreview::from_body(
+                            &v,
+                            replay_chars,
+                        ))
+                    }
+                });
+                match preview {
+                    Ok(preview) => crate::message_payload::splice_replay_preview(
+                        &mut messages[idx].content,
+                        block_ordinal,
+                        &kind,
+                        &preview,
+                        replay_chars,
+                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            message = %message_id,
+                            block_ordinal,
+                            kind,
+                            error = %e,
+                            "decode replay payload failed; serving stored preview"
+                        );
+                    }
+                }
+            }
+            if i64::try_from(page_len).unwrap_or(i64::MAX) < ROWS_PER_PAGE {
+                break;
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Tool-payload retention sweep (`agents.toolPayloadRetentionDays`):
+    /// compact every FULL-body side row (`tool_use_input` /
+    /// `tool_result_output`) whose owning `agent_message.created_at` sorts
+    /// before `cutoff_iso` (RFC 3339 UTC, lexicographic compare like every
+    /// other `created_at` cutoff) into its `*_replay` row — body decoded,
+    /// stringified and middle-truncated to `replay_chars` with the shared
+    /// `intent_core::replay_preview` helpers — and delete the full row.
+    /// The replay row body is the JSON object
+    /// `{"text": <preview>, "originalChars": <N>}`
+    /// ([`crate::message_payload::ReplayPreview`]), `encoding` none|zlib like
+    /// every other row; bodies already under the cap are converted too, so
+    /// every pruned block has the same shape. Returns the number of rows
+    /// compacted.
+    ///
+    /// Work is chunked (≤ 500 rows per scan + one write transaction per
+    /// chunk) so the sweep never holds the write lock for long; the CPU-bound
+    /// decode/truncate of a chunk runs on a blocking thread BEFORE its
+    /// transaction opens. The join on `agent_message` means 0109 staged rows
+    /// (no message row yet) and thumbnails rows are never touched. Delete +
+    /// insert inside one transaction keep the 0108/0109 `conversation_bytes`
+    /// triggers balanced, and a re-run finds nothing left to convert
+    /// (idempotent). A row whose message vanished between scan and write
+    /// (concurrent replace/delete) is skipped, never re-created.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn compact_tool_payloads_before(
+        &self,
+        cutoff_iso: &str,
+        replay_chars: usize,
+    ) -> Result<u64> {
+        const CHUNK: i64 = 500;
+        let pool = self.write_pool();
+        let scan_sql = format!(
+            "SELECT p.rowid AS rid, p.message_id, p.agent_id, p.block_ordinal, p.kind, \
+                    p.encoding, p.body \
+             FROM agent_message_payload p \
+             JOIN agent_message m ON m.id = p.message_id \
+             WHERE p.rowid > ? AND p.kind IN ('{}', '{}') AND m.created_at < ? \
+             ORDER BY p.rowid ASC LIMIT ?",
+            crate::message_payload::KIND_TOOL_USE_INPUT,
+            crate::message_payload::KIND_TOOL_RESULT_OUTPUT,
+        );
+        let mut total: u64 = 0;
+        let mut after_rowid: i64 = 0;
+        loop {
+            let rows = sqlx::query(&scan_sql)
+                .bind(after_rowid)
+                .bind(cutoff_iso)
+                .bind(CHUNK)
+                .fetch_all(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("scan tool payloads failed: {e}")))?;
+            if rows.is_empty() {
+                break;
+            }
+            let page_len = rows.len();
+            let mut scanned = Vec::with_capacity(page_len);
+            for row in &rows {
+                after_rowid = col(row, "rid")?;
+                let message_id: String = col(row, "message_id")?;
+                let agent_id: String = col(row, "agent_id")?;
+                let block_ordinal: i64 = col(row, "block_ordinal")?;
+                let kind: String = col(row, "kind")?;
+                let encoding: String = col(row, "encoding")?;
+                let body: Vec<u8> = col(row, "body")?;
+                scanned.push((message_id, agent_id, block_ordinal, kind, encoding, body));
+            }
+            drop(rows);
+            let converted = tokio::task::spawn_blocking(move || {
+                let mut out: Vec<CompactedPayloadRow> = Vec::with_capacity(scanned.len());
+                for (message_id, agent_id, block_ordinal, kind, encoding, body) in scanned {
+                    let Some(replay_kind) = crate::message_payload::replay_kind_for(&kind) else {
+                        continue;
+                    };
+                    let encoded = crate::message_payload::decode_body(&encoding, &body)
+                        .map(|v| crate::message_payload::ReplayPreview::from_body(&v, replay_chars))
+                        .and_then(|p| p.encode());
+                    match encoded {
+                        Ok((replay_encoding, replay_body)) => out.push(CompactedPayloadRow {
+                            message_id,
+                            agent_id,
+                            block_ordinal,
+                            kind,
+                            replay_kind,
+                            replay_encoding,
+                            replay_body,
+                        }),
+                        Err(e) => {
+                            tracing::warn!(
+                                message = %message_id,
+                                block_ordinal,
+                                kind,
+                                error = %e,
+                                "decode tool payload failed; leaving full row in place"
+                            );
+                        }
+                    }
+                }
+                out
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("payload compaction task failed: {e}")))?;
+
+            let compacted = crate::with_write_txn_retry(|| async {
+                let mut tx = pool.begin().await.map_err(|e| {
+                    Error::Internal(format!("compact tool payloads begin failed: {e}"))
+                })?;
+                let mut n: u64 = 0;
+                for row in &converted {
+                    let deleted = sqlx::query(
+                        "DELETE FROM agent_message_payload \
+                         WHERE message_id = ? AND block_ordinal = ? AND kind = ?",
+                    )
+                    .bind(&row.message_id)
+                    .bind(row.block_ordinal)
+                    .bind(&row.kind)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("compact tool payloads delete failed: {e}"))
+                    })?
+                    .rows_affected();
+                    if deleted == 0 {
+                        continue;
+                    }
+                    sqlx::query(PAYLOAD_UPSERT_SQL)
+                        .bind(&row.message_id)
+                        .bind(&row.agent_id)
+                        .bind(row.block_ordinal)
+                        .bind(row.replay_kind)
+                        .bind(row.replay_encoding)
+                        .bind(&row.replay_body)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("compact tool payloads insert failed: {e}"))
+                        })?;
+                    n += 1;
+                }
+                tx.commit().await.map_err(|e| {
+                    Error::Internal(format!("compact tool payloads commit failed: {e}"))
+                })?;
+                Ok(n)
+            })
+            .await?;
+            total += compacted;
+            if i64::try_from(page_len).unwrap_or(i64::MAX) < CHUNK {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     /// The newest non-`system` message of an agent's log, hydrated as a
@@ -5643,6 +5924,323 @@ mod tests {
                 .await
                 .expect("remaining side rows");
         assert_eq!(remaining, 0, "session delete cascades side rows");
+    }
+
+    /// `(kind, encoding, body)` of every side row of `message_id`, kind-sorted.
+    async fn payload_rows(store: &Store, message_id: &str) -> Vec<(String, String, Vec<u8>)> {
+        sqlx::query_as::<_, (String, String, Vec<u8>)>(
+            "SELECT kind, encoding, body FROM agent_message_payload \
+             WHERE message_id = ? ORDER BY kind",
+        )
+        .bind(message_id)
+        .fetch_all(store.read_pool())
+        .await
+        .expect("payload rows")
+    }
+
+    async fn conversation_bytes_recount(store: &Store, agent: &AgentId) -> i64 {
+        sqlx::query_scalar(
+            "SELECT (SELECT COALESCE(SUM(OCTET_LENGTH(content)), 0) FROM agent_message \
+                     WHERE agent_id = ?1) \
+                  + (SELECT COALESCE(SUM(OCTET_LENGTH(body)), 0) FROM agent_message_payload \
+                     WHERE agent_id = ?1)",
+        )
+        .bind(&agent.0)
+        .fetch_one(store.read_pool())
+        .await
+        .expect("recount")
+    }
+
+    async fn conversation_bytes_counter(store: &Store, agent: &AgentId) -> i64 {
+        sqlx::query_scalar("SELECT conversation_bytes FROM agent_session WHERE id = ?")
+            .bind(&agent.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("counter")
+    }
+
+    /// The retention sweep compacts only full-body rows whose message sorts
+    /// before the cutoff: the replay row carries the shared-helper preview
+    /// (`{"text", "originalChars"}`), the full row is gone, thumbnails /
+    /// newer / 0109-staged rows are untouched, `conversation_bytes` stays
+    /// balanced, a re-run converts nothing, and normal hydration ignores the
+    /// replay row (the pruned block serves its inline slim preview + flags).
+    #[tokio::test]
+    async fn compact_tool_payloads_before_converts_only_old_full_rows() {
+        use intent_core::replay_preview::{safe_stringify, truncate_marked};
+
+        let tmp = TempDb::new("test-payload-compact");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let old_ts = "2026-01-01T00:00:00Z";
+        let new_ts = "2026-06-01T00:00:00Z";
+        let cutoff = "2026-03-01T00:00:00Z";
+        let ws_id = WorkspaceId("ws-payload-compact".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, old_ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-payload-compact".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, old_ts, None))
+            .await
+            .expect("insert session");
+
+        let old_input = serde_json::json!({ "blob": "w".repeat(12 * 1024) });
+        let old_output = "q".repeat(10 * 1024);
+        let old_content = serde_json::json!([
+            { "type": "tool_use", "id": "m:0", "name": "view", "input": old_input,
+              "toolCallId": "t1" },
+            { "type": "tool_result", "toolCallId": "t1", "output": old_output },
+        ]);
+        let old = store
+            .append_agent_message(&agent_id, "assistant", &old_content, old_ts)
+            .await
+            .expect("append old");
+        sqlx::query(
+            "INSERT INTO agent_message_payload \
+             (message_id, agent_id, block_ordinal, kind, encoding, body) \
+             VALUES (?, ?, -1, 'thumbnails', 'none', X'7B7D')",
+        )
+        .bind(&old.id)
+        .bind(&agent_id.0)
+        .execute(store.write_pool())
+        .await
+        .expect("seed thumbnails row");
+        let new_content = serde_json::json!([
+            { "type": "tool_result", "toolCallId": "t2", "output": "n".repeat(10 * 1024) },
+        ]);
+        let new = store
+            .append_agent_message(&agent_id, "assistant", &new_content, new_ts)
+            .await
+            .expect("append new");
+        let staged_block = serde_json::json!(
+            { "type": "tool_result", "toolCallId": "t3", "output": "s".repeat(10 * 1024) }
+        );
+        store
+            .prestage_agent_message_payload(&agent_id, "staged-1", 0, &staged_block)
+            .await
+            .expect("prestage")
+            .expect("staged block is heavy");
+        let staged_before = payload_rows(&store, "staged-1").await;
+        let new_before = payload_rows(&store, &new.id).await;
+        assert_eq!(new_before.len(), 1);
+        assert_eq!(payload_rows(&store, &old.id).await.len(), 3);
+        assert_eq!(
+            conversation_bytes_counter(&store, &agent_id).await,
+            conversation_bytes_recount(&store, &agent_id).await
+        );
+
+        let replay_chars = 2_000;
+        let compacted = store
+            .compact_tool_payloads_before(cutoff, replay_chars)
+            .await
+            .expect("compact");
+        assert_eq!(compacted, 2, "both old full rows compact; nothing else");
+
+        let old_rows = payload_rows(&store, &old.id).await;
+        let kinds: Vec<&str> = old_rows.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "thumbnails",
+                "tool_result_output_replay",
+                "tool_use_input_replay"
+            ],
+            "full rows replaced by replay rows; thumbnails untouched"
+        );
+        for (kind, encoding, body) in &old_rows {
+            if kind == "thumbnails" {
+                continue;
+            }
+            let decoded =
+                crate::message_payload::decode_body(encoding, body).expect("decode replay body");
+            let obj = decoded.as_object().expect("replay body is an object");
+            assert_eq!(
+                obj.len(),
+                2,
+                "replay body is exactly {{text, originalChars}}"
+            );
+            let full = if kind == "tool_use_input_replay" {
+                safe_stringify(&old_content[0]["input"])
+            } else {
+                safe_stringify(&old_content[1]["output"])
+            };
+            let (text, original) = truncate_marked(&full, replay_chars);
+            assert_eq!(obj["text"], serde_json::json!(text));
+            assert_eq!(
+                obj["originalChars"],
+                serde_json::json!(original.expect("over cap"))
+            );
+        }
+        assert_eq!(
+            payload_rows(&store, &new.id).await,
+            new_before,
+            "newer row untouched"
+        );
+        assert_eq!(
+            payload_rows(&store, "staged-1").await,
+            staged_before,
+            "staged row (no message) untouched"
+        );
+        assert_eq!(
+            conversation_bytes_counter(&store, &agent_id).await,
+            conversation_bytes_recount(&store, &agent_id).await,
+            "delete + insert triggers keep the counter balanced"
+        );
+
+        let again = store
+            .compact_tool_payloads_before(cutoff, replay_chars)
+            .await
+            .expect("compact again");
+        assert_eq!(again, 0, "idempotent");
+        assert_eq!(payload_rows(&store, &old.id).await, old_rows);
+
+        let hydrated = store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .expect("hydrate");
+        let stored: String = sqlx::query_scalar("SELECT content FROM agent_message WHERE id = ?")
+            .bind(&old.id)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("stored content");
+        let stored: serde_json::Value = serde_json::from_str(&stored).expect("stored json");
+        assert_eq!(
+            hydrated[0].content, stored,
+            "hydration ignores replay rows: pruned block serves the stored slim preview"
+        );
+        assert_eq!(hydrated[0].content[1]["outputTruncated"], true);
+        assert!(hydrated[0].content[1]
+            .get("outputReplayOriginalChars")
+            .is_none());
+        assert_eq!(
+            hydrated[1].content, new_content,
+            "newer message still hydrates"
+        );
+    }
+
+    /// The replay read emits the replay-preview block contract and is
+    /// byte-identical whether a body is still a full row or already a
+    /// compacted replay row; a smaller cap re-truncates a stored preview to
+    /// exactly what the full body would give; under-cap bodies pass whole.
+    #[tokio::test]
+    async fn replay_read_is_identical_before_and_after_compaction() {
+        use intent_core::replay_preview::{safe_stringify, truncate_marked};
+
+        let tmp = TempDb::new("test-payload-replay-read");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = "2026-01-01T00:00:00Z";
+        let ws_id = WorkspaceId("ws-payload-replay".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-payload-replay".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, ts, None))
+            .await
+            .expect("insert session");
+
+        let input = serde_json::json!({ "path": "a.rs", "blob": "w".repeat(12 * 1024) });
+        let output = format!("{}é{}", "q".repeat(5 * 1024), "z".repeat(5 * 1024));
+        let content = serde_json::json!([
+            { "type": "text", "text": "small text" },
+            { "type": "tool_use", "id": "m:1", "name": "view", "input": input,
+              "toolCallId": "t1" },
+            { "type": "tool_result", "toolCallId": "t1", "output": output },
+            { "type": "tool_result", "toolCallId": "t0", "output": "tiny inline output" },
+        ]);
+        store
+            .append_agent_message(&agent_id, "assistant", &content, ts)
+            .await
+            .expect("append");
+        store
+            .append_agent_message(&agent_id, "user", &serde_json::json!("hi"), ts)
+            .await
+            .expect("append user");
+
+        let cap = 2_000;
+        let before = store
+            .get_agent_messages_for_replay(&agent_id, cap)
+            .await
+            .expect("replay read before");
+        assert_eq!(before.len(), 2);
+        let blocks = before[0].content.as_array().expect("blocks");
+        assert_eq!(blocks[0], content[0], "non-heavy block untouched");
+        assert_eq!(blocks[3], content[3], "inline heavy-field block untouched");
+        let input_full = safe_stringify(&content[1]["input"]);
+        let (input_text, input_original) = truncate_marked(&input_full, cap);
+        assert_eq!(blocks[1]["input"], serde_json::json!(input_text));
+        assert_eq!(
+            blocks[1]["inputReplayOriginalChars"],
+            serde_json::json!(input_original.expect("over cap"))
+        );
+        assert!(blocks[1].get("inputTruncated").is_none());
+        assert!(blocks[1].get("inputBytes").is_none());
+        assert_eq!(blocks[1]["name"], "view");
+        let output_full = safe_stringify(&content[2]["output"]);
+        let (output_text, output_original) = truncate_marked(&output_full, cap);
+        assert_eq!(blocks[2]["output"], serde_json::json!(output_text));
+        assert_eq!(
+            blocks[2]["outputReplayOriginalChars"],
+            serde_json::json!(output_original.expect("over cap"))
+        );
+        assert!(blocks[2].get("outputTruncated").is_none());
+        assert_eq!(before[1].content, serde_json::json!("hi"));
+
+        let whole = store
+            .get_agent_messages_for_replay(&agent_id, 100_000)
+            .await
+            .expect("replay read under cap");
+        let whole_blocks = whole[0].content.as_array().expect("blocks");
+        assert_eq!(whole_blocks[1]["input"], serde_json::json!(input_full));
+        assert_eq!(
+            whole_blocks[1]["inputReplayOriginalChars"],
+            serde_json::json!(input_full.chars().count()),
+            "under-cap body: marker is its own char count"
+        );
+
+        let compacted = store
+            .compact_tool_payloads_before("2026-02-01T00:00:00Z", cap)
+            .await
+            .expect("compact");
+        assert_eq!(compacted, 2);
+
+        let after = store
+            .get_agent_messages_for_replay(&agent_id, cap)
+            .await
+            .expect("replay read after");
+        assert_eq!(
+            after, before,
+            "replay read is byte-identical across compaction"
+        );
+
+        let smaller = store
+            .get_agent_messages_for_replay(&agent_id, 500)
+            .await
+            .expect("replay read smaller cap");
+        let (small_text, small_original) = truncate_marked(&output_full, 500);
+        assert_eq!(
+            smaller[0].content[2]["output"],
+            serde_json::json!(small_text)
+        );
+        assert_eq!(
+            smaller[0].content[2]["outputReplayOriginalChars"],
+            serde_json::json!(small_original.expect("over cap"))
+        );
+        let larger = store
+            .get_agent_messages_for_replay(&agent_id, 100_000)
+            .await
+            .expect("replay read larger cap");
+        assert_eq!(
+            larger[0].content[2]["output"],
+            serde_json::json!(output_text),
+            "a stored preview is never expanded"
+        );
+        assert_eq!(
+            larger[0].content[2]["outputReplayOriginalChars"],
+            serde_json::json!(output_original.expect("over cap"))
+        );
     }
 
     /// Seed `count` small `agent_message` rows for `agent_id` in one

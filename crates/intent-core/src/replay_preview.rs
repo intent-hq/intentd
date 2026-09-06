@@ -15,6 +15,8 @@
 //! is SMALLER than the stored preview it re-truncates; it never expands.
 //! Blocks without the marker keep the full-body path.
 
+use serde_json::Value;
+
 /// Additive marker on a `tool_use` block whose `input` is a replay preview.
 pub const INPUT_REPLAY_ORIGINAL_CHARS_KEY: &str = "inputReplayOriginalChars";
 /// Additive marker on a `tool_result` block whose `output` is a replay preview.
@@ -29,6 +31,18 @@ const MARKER_FIXED_CHARS: usize = "\n... [ characters truncated] ...\n".len();
 
 fn marker(omitted: usize) -> String {
     format!("\n... [{omitted} characters truncated] ...\n")
+}
+
+/// Stringify a heavy tool body for truncation (TS `safeStringify`): strings
+/// pass through; everything else is JSON-encoded. Shared by the formatter's
+/// full-body path and the store's replay-preview producer so both truncate
+/// the same text.
+#[must_use]
+pub fn safe_stringify(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
+    }
 }
 
 /// Middle-truncate `text` to `max_chars`, keeping the head and tail (TS
