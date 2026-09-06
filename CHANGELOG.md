@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.34] - 2026-09-06
+
+### 🚀 Features
+
+- *(browser)* Daemon-owned browser tab registry (store, RPCs, events) ([#1763](https://github.com/intent-hq/intentd/pull/1763))
+
+
 ## [0.9.33] - 2026-09-06
 
 ### 🚀 Features
