@@ -5799,6 +5799,20 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Anonymous-connection draft placeholder: ensure a `client` row exists for
+    /// a connection-scoped `client_id` minted on its first draft write, so the
+    /// draft FK is satisfied. Unlike [`Self::upsert_client`] this records no
+    /// hello — the row is never eligible as a `workspace.setBrowserClient` pin
+    /// — and is a no-op on an existing row (PROTOCOL §5.16).
+    fn ensure_client(&self, client_id: ClientId) -> BoxFuture<'_, Result<()>> {
+        let _ = client_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::ensure_client not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `drafts.get`: the draft for the calling client (`client_id` resolved from
     /// the connection, never a param), or `None` when absent (PROTOCOL §5.16).
     fn draft_get(

@@ -30,6 +30,12 @@ impl Services {
             .await
     }
 
+    /// Anonymous-connection draft placeholder: ensure the `client` row exists
+    /// for a connection-minted id without recording a hello (PROTOCOL §5.16).
+    pub(crate) async fn client_ensure(&self, client_id: ClientId) -> Result<()> {
+        self.store.ensure_client(&client_id).await
+    }
+
     /// `drafts.get`: the calling client's draft for `(workspace, agent)`, or
     /// `None` (PROTOCOL §5.16).
     pub(crate) async fn drafts_get(

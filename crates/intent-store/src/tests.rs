@@ -4748,6 +4748,10 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
     assert_eq!(first.name, Some("Laptop".to_string()));
     assert_eq!(first.capabilities, json!({ "forward": true }));
     assert_eq!(first.host, host, "host identification round-trips");
+    assert!(
+        first.last_hello_at.is_some(),
+        "a hello stamps last_hello_at"
+    );
 
     // Re-hello updates name/capabilities/host and touches last_seen;
     // first_seen stays. A hello that omits the host triple clears it.
@@ -4773,6 +4777,18 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
         .await
         .unwrap()
         .is_none());
+
+    // A draft-only placeholder exists but never hello'd; ensuring an
+    // already-hello'd id is a no-op that keeps its identity and hello stamp.
+    let anon = ClientId::from_string("anon-draft");
+    store.ensure_client(&anon).await.expect("ensure");
+    let placeholder = store.get_client(&anon).await.unwrap().expect("present");
+    assert_eq!(placeholder.name, None);
+    assert_eq!(placeholder.capabilities, json!({}));
+    assert_eq!(placeholder.last_hello_at, None, "no hello recorded");
+    store.ensure_client(&id).await.expect("ensure existing");
+    let kept = store.get_client(&id).await.unwrap().expect("present");
+    assert_eq!(kept, again, "ensure never clobbers a hello'd row");
 }
 
 /// REV-2 per-workspace browser-client pin: NULL (unpinned) by default, a

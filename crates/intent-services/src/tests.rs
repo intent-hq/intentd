@@ -31048,6 +31048,24 @@ mod browser_client_pin {
             "a rejected set leaves the pin untouched"
         );
 
+        // A row minted only to key an anonymous connection's drafts is not a
+        // hello'd client: it has a `client` row but is still rejected.
+        let anon = ClientId::from_string("anon-draft");
+        svc.ensure_client(anon.clone()).await.expect("placeholder");
+        assert!(svc.store.get_client(&anon).await.unwrap().is_some());
+        let err = svc
+            .set_workspace_browser_client(ws.clone(), Some(anon))
+            .await
+            .expect_err("draft-only client");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("anon-draft")));
+        assert_eq!(
+            svc.get_workspace(ws.clone())
+                .await
+                .unwrap()
+                .browser_client_id,
+            None
+        );
+
         let chief = WorkspaceId::from(CHIEF_WORKSPACE_ID);
         let err = svc
             .set_workspace_browser_client(chief.clone(), Some(ClientId::from_string("desktop-a")))

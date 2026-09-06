@@ -4378,8 +4378,10 @@ pub struct ClientHostInfo {
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that
 /// survives reconnects; persisted to the `client` table with `name`,
 /// `capabilities`, the [`ClientHostInfo`] triple, `first_seen`, and
-/// `last_seen`. The ephemeral per-connection id is transport-only and never
-/// stored here.
+/// `last_seen`. `last_hello_at` is `None` for a row minted only to key an
+/// anonymous connection's drafts (§5.16) — such a client never completed
+/// `client.hello`. The ephemeral per-connection id is transport-only and
+/// never stored here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Client {
@@ -4391,6 +4393,8 @@ pub struct Client {
     pub host: ClientHostInfo,
     pub first_seen: String,
     pub last_seen: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hello_at: Option<String>,
 }
 
 /// Per-client chat draft (§9.10, §15), keyed by `(workspaceId, agentId,

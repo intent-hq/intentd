@@ -1176,6 +1176,48 @@ async fn workspace_browser_client_pin_rpcs_over_wss() {
             .is_some_and(|m| m.contains("ghost")),
         "{ghost}"
     );
+    // A connection that never said hello gets a connection-scoped clientId
+    // (and `client` row) minted on its first draft write; that id is not a
+    // hello'd client and is rejected the same way, pin untouched.
+    let mut draft_sub = connect(fx.port).await;
+    let ack = wss_rpc(
+        &mut draft_sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["draft:changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
+    let mut anon = connect(fx.port).await;
+    let set_draft = wss_rpc(
+        &mut anon,
+        1,
+        "drafts.set",
+        json!({ "workspaceId": ws_id, "agentId": "agent-1", "text": "half-typed" }),
+    )
+    .await;
+    assert_eq!(set_draft["result"]["ok"], true, "{set_draft}");
+    let changed = await_event(&mut draft_sub, "draft:changed", Duration::from_secs(5)).await;
+    let minted = changed["data"]["clientId"]
+        .as_str()
+        .expect("draft:changed names the minted clientId")
+        .to_string();
+    let draft_only = wss_rpc(
+        &mut a,
+        17,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": ws_id, "clientId": minted }),
+    )
+    .await;
+    assert_eq!(draft_only["error"]["code"], -32602, "{draft_only}");
+    assert!(
+        draft_only["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(&minted)),
+        "{draft_only}"
+    );
+    close_and_await_deregistration(anon, &fx.registry, 5).await;
+    close_and_await_deregistration(draft_sub, &fx.registry, 4).await;
     let chief = wss_rpc(
         &mut a,
         9,

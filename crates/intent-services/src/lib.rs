@@ -20643,8 +20643,14 @@ impl WorkspaceApi for Services {
             if let Some(client_id) = &client_id {
                 // Only a client that has completed `client.hello` at least
                 // once can be pinned — an offline-but-known client is fine
-                // (it surfaces as "pinned but not connected").
-                if store.get_client(client_id).await?.is_none() {
+                // (it surfaces as "pinned but not connected"), but a row
+                // minted only to key an anonymous connection's drafts is
+                // not: it can never resolve to a reverse connection.
+                let hello_seen = store
+                    .get_client(client_id)
+                    .await?
+                    .is_some_and(|c| c.last_hello_at.is_some());
+                if !hello_seen {
                     return Err(Error::InvalidParams(format!(
                         "unknown clientId {}: the client has never connected",
                         client_id.as_str()
@@ -28770,6 +28776,11 @@ impl WorkspaceApi for Services {
             svc.client_hello_upsert(client_id, name, capabilities, host)
                 .await
         })
+    }
+
+    fn ensure_client(&self, client_id: ClientId) -> BoxFuture<'_, Result<()>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.client_ensure(client_id).await })
     }
 
     fn draft_get(
