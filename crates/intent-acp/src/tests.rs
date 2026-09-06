@@ -1214,6 +1214,36 @@ mod session_tests {
                 "title={title}"
             );
         }
+        // A daemon-stamped `_acpTitle` echo on the input is tolerated.
+        assert_eq!(
+            session::derive_tool_name(
+                "Propose",
+                Some(&json!({ "code": "return 1", "summary": "Propose", "_acpTitle": "Propose" }))
+            ),
+            "workspace_api"
+        );
+        // Explicitly namespaced foreign MCP titles are authoritative: a
+        // foreign tool whose arguments happen to be `{ code, summary }` keeps
+        // its own name and must never be mistaken for the daemon's tool.
+        for (title, name) in [
+            ("mcp.python.execute", "python_execute"),
+            ("mcp__python__execute", "python_execute"),
+        ] {
+            assert_eq!(
+                session::derive_tool_name(title, Some(&input)),
+                name,
+                "title={title}"
+            );
+        }
+        // Extra keys mean another tool's arguments, not the workspace_api
+        // schema.
+        assert_eq!(
+            session::derive_tool_name(
+                "Run Python",
+                Some(&json!({ "code": "print(1)", "summary": "Run Python", "language": "python" }))
+            ),
+            "Run Python"
+        );
         // Both keys are required, as strings; `code` must be non-empty.
         assert_eq!(
             session::derive_tool_name("Run some code", Some(&json!({ "code": "return 1" }))),
@@ -1717,6 +1747,90 @@ mod session_tests {
         assert_eq!(tc.tool_name, "github_list_issues");
         assert_eq!(tc.input["repo"], json!("intent-hq/monorepo"));
         assert_eq!(tc.input["_acpTitle"], json!("List issues"));
+    }
+
+    #[test]
+    fn foreign_mcp_tool_with_code_summary_arguments_never_claims_pending_attachments() {
+        // intent-hq/intent#4491 negative control across the mapper and the
+        // §7.1 registry: a non-workspace_api tool completing while a batch is
+        // pending must not claim it, even when its arguments are shaped
+        // `{ code, summary }`. Codex `server`/`tool` metadata and namespaced
+        // titles are authoritative over the input-shape rule.
+        use intent_core::turn_attachments::{
+            AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry,
+        };
+        use intent_core::AgentId;
+
+        let reg = TurnAttachmentRegistry::new();
+        let agent = AgentId::from_string("agent-4491");
+        let pending = || TurnAttachment {
+            id: "tar-4491".to_string(),
+            policy: AttachmentPolicy::AtToolResult,
+            mime_type: "application/vnd.intent.proposal+json".to_string(),
+            uri: "intent-proposal://workspace-create/x".to_string(),
+            name: "Create workspace".to_string(),
+            text: "{}".to_string(),
+        };
+        let args = json!({ "code": "print(1)", "summary": "Run Python" });
+        let garbled = json!({ "output": "ok" });
+
+        let codex = ToolCall::new("t1", "execute")
+            .kind(ToolKind::Execute)
+            .raw_input(json!({
+                "arguments": args,
+                "server": "python",
+                "tool": "execute",
+            }));
+        let claude = ToolCall::new("t2", "mcp__python__execute")
+            .kind(ToolKind::Execute)
+            .raw_input(args.clone());
+        let codex_title = ToolCall::new("t3", "mcp.python.execute")
+            .kind(ToolKind::Execute)
+            .raw_input(args.clone());
+        for call in [codex, claude, codex_title] {
+            let title = call.title.clone();
+            let MappedUpdate::ToolCall(tc) =
+                session::map_session_update(&SessionUpdate::ToolCall(call)).unwrap()
+            else {
+                panic!("expected tool call");
+            };
+            assert_eq!(tc.tool_name, "python_execute", "title={title}");
+            reg.register(&agent, pending());
+            assert!(
+                reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name)
+                    .is_empty(),
+                "foreign tool {title} must not claim the pending batch"
+            );
+            // The batch is still there for the daemon's own tool.
+            assert_eq!(
+                reg.claim_at_tool_result(&agent, Some(&garbled), "workspace_api")
+                    .len(),
+                1,
+                "title={title}"
+            );
+        }
+
+        // Positive control on the same registry: the auggie-shaped frame
+        // (prose title, `{ code, summary }` input) resolves to workspace_api
+        // and does claim.
+        let auggie = ToolCall::new("t4", "Propose the follow-up")
+            .kind(ToolKind::Other)
+            .raw_input(json!({
+                "code": "return { ok: true }",
+                "summary": "Propose the follow-up",
+            }));
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(auggie)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "workspace_api");
+        reg.register(&agent, pending());
+        assert_eq!(
+            reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name)
+                .len(),
+            1
+        );
     }
 
     #[test]
