@@ -17,7 +17,9 @@
 //!      arrival order and reports a typed `ClientOffline` error when it is
 //!      gone,
 //!   6. `client:connected` / `client:disconnected` reach an
-//!      `events.subscribe` subscriber.
+//!      `events.subscribe` subscriber — including when the heartbeat reaper
+//!      aborts a silent client's task, and in registry order when the same
+//!      client reconnects right behind its own disconnect.
 
 #![cfg(unix)]
 
@@ -65,6 +67,12 @@ struct Fixture {
 }
 
 async fn boot() -> Fixture {
+    boot_with(WsOptions::default()).await
+}
+
+/// [`boot`] with caller-supplied listener options (`base_port` and
+/// `bind_addresses` are always overridden to an ephemeral loopback port).
+async fn boot_with(opts: WsOptions) -> Fixture {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let dir = std::env::temp_dir().join(format!("intentd-sticky-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
@@ -82,7 +90,7 @@ async fn boot() -> Fixture {
     let opts = WsOptions {
         base_port: 0,
         bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
-        ..Default::default()
+        ..opts
     };
     let ws = WsApiServer::new_insecure_with_reverse(api.clone(), bus, opts, registry.clone(), None);
     let port = ws.start().await.expect("start");
@@ -253,6 +261,53 @@ async fn await_event(ws: &mut PlainWs, event_type: &str, dur: Duration) -> Value
             Some(Ok(_)) => {}
             other => panic!("unexpected ws frame: {other:?}"),
         }
+    }
+}
+
+/// Like [`await_event`] but returns the next `client:*` event of either
+/// type, so a caller can assert the *order* of a connected/disconnected pair.
+async fn await_client_event(ws: &mut PlainWs, dur: Duration) -> Value {
+    let deadline = Instant::now() + dur;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for a client:* event"
+        );
+        match timeout(remaining, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for a client:* event"))
+        {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "events.event"
+                    && v["params"]["event"]["type"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("client:"))
+                {
+                    return v["params"]["event"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("unexpected ws frame: {other:?}"),
+        }
+    }
+}
+
+/// Wait (bounded, no fixed sleep) until the registry holds exactly
+/// `expected_len` entries.
+async fn await_registry_len(registry: &PrimaryReverseRegistry, expected_len: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while registry.len() != expected_len {
+        assert!(
+            Instant::now() < deadline,
+            "registry did not reach len={expected_len} within deadline (len={})",
+            registry.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -702,6 +757,137 @@ async fn client_connected_and_disconnected_events_are_published_per_logical_clie
     assert_eq!(ev["data"]["clientId"], "desktop-a");
     assert_eq!(ev["data"]["capabilities"], json!({ "browserExec": true }));
     assert!(fx.registry.live_clients().is_empty());
+
+    fx.ws.stop().await;
+}
+
+/// The heartbeat reaper terminates a silent connection by **aborting** its
+/// task (`ws.rs` `heartbeat_loop`), so the connection loop never reaches its
+/// normal epilogue — the registry entry is dropped by RAII. That departure
+/// must still be announced: `client:disconnected` reaches the subscriber and
+/// the client is gone from `live_clients()`.
+#[tokio::test]
+async fn heartbeat_abort_publishes_client_disconnected() {
+    let fx = boot_with(WsOptions {
+        heartbeat_interval: Duration::from_millis(100),
+        heartbeat_timeout: Duration::from_millis(200),
+        ..WsOptions::default()
+    })
+    .await;
+    let mut sub = connect(fx.port).await;
+    let ack = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["client:connected", "client:disconnected"] }),
+    )
+    .await;
+    assert!(ack.get("error").is_none(), "subscribe failed: {ack}");
+
+    // Hello with the capability, then never poll the socket again so no
+    // pong is ever answered; the reaper aborts the server task.
+    let silent = {
+        let mut silent = connect(fx.port).await;
+        let _ = wss_rpc(&mut silent, 1, "client.hello", hello("desktop-a", true)).await;
+        silent
+    };
+    let ev = await_event(&mut sub, "client:connected", Duration::from_secs(2)).await;
+    assert_eq!(ev["data"]["clientId"], "desktop-a");
+    assert!(fx.registry.is_connected());
+
+    let ev = await_event(&mut sub, "client:disconnected", Duration::from_secs(5)).await;
+    assert_eq!(
+        ev["data"],
+        json!({
+            "clientId": "desktop-a",
+            "name": "Intent Desktop @ desktop-a",
+            "capabilities": { "browserExec": true },
+        })
+    );
+    await_registry_len(&fx.registry, 1).await;
+    assert!(fx.registry.live_clients().is_empty());
+    assert!(!fx.registry.is_connected());
+    drop(silent);
+
+    fx.ws.stop().await;
+}
+
+/// Transitions are published in registry-mutation order. A same-client
+/// reconnect dialled the instant the stale entry is gone (the barrier is the
+/// registry length, not a sleep) must yield `client:disconnected` **then**
+/// `client:connected`; a re-hello that moves a connection to another
+/// `clientId` yields the old client's disconnect before the new one's
+/// connect — never a stale disconnect trailing a fresh connect.
+#[tokio::test]
+async fn client_events_keep_registry_order_across_reconnect_and_rehello() {
+    let fx = boot().await;
+    let mut sub = connect(fx.port).await;
+    let ack = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["client:connected", "client:disconnected"] }),
+    )
+    .await;
+    assert!(ack.get("error").is_none(), "subscribe failed: {ack}");
+
+    let mut first = connect(fx.port).await;
+    let _ = wss_rpc(&mut first, 1, "client.hello", hello("desktop-a", true)).await;
+    let ev = await_client_event(&mut sub, Duration::from_secs(2)).await;
+    assert_eq!(ev["type"], "client:connected");
+    assert_eq!(ev["data"]["clientId"], "desktop-a");
+
+    // Close without draining and dial the replacement as soon as the
+    // registry has forgotten the first connection — i.e. inside the window
+    // between the registry mutation and the event reaching subscribers.
+    let _ = first.close(None).await;
+    drop(first);
+    await_registry_len(&fx.registry, 1).await;
+    let mut second = connect(fx.port).await;
+    let _ = wss_rpc(&mut second, 1, "client.hello", hello("desktop-a", true)).await;
+    let ev1 = await_client_event(&mut sub, Duration::from_secs(2)).await;
+    let ev2 = await_client_event(&mut sub, Duration::from_secs(2)).await;
+    assert_eq!(
+        (ev1["type"].as_str(), ev2["type"].as_str()),
+        (Some("client:disconnected"), Some("client:connected")),
+        "stale disconnect must precede the reconnect: {ev1} then {ev2}"
+    );
+    assert_eq!(ev1["data"]["clientId"], "desktop-a");
+    assert_eq!(ev2["data"]["clientId"], "desktop-a");
+
+    // Re-hello under a different clientId on the same connection.
+    let _ = wss_rpc(&mut second, 2, "client.hello", hello("desktop-b", true)).await;
+    let ev1 = await_client_event(&mut sub, Duration::from_secs(2)).await;
+    let ev2 = await_client_event(&mut sub, Duration::from_secs(2)).await;
+    assert_eq!(ev1["type"], "client:disconnected");
+    assert_eq!(ev1["data"]["clientId"], "desktop-a");
+    assert_eq!(ev2["type"], "client:connected");
+    assert_eq!(ev2["data"]["clientId"], "desktop-b");
+    let clients = fx.registry.live_clients();
+    assert_eq!(clients.len(), 1);
+    assert_eq!(clients[0].client_id.as_str(), "desktop-b");
+
+    // A same-client second connection followed by the first one leaving is
+    // a silent hand-over: exactly one disconnect, only once both are gone.
+    let mut third = connect(fx.port).await;
+    let _ = wss_rpc(&mut third, 1, "client.hello", hello("desktop-b", false)).await;
+    close_and_await_deregistration(second, &fx.registry, 2).await;
+    assert!(
+        try_read_text(&mut sub, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "no client:* event while desktop-b stays live through its other connection"
+    );
+    close_and_await_deregistration(third, &fx.registry, 1).await;
+    let ev = await_client_event(&mut sub, Duration::from_secs(2)).await;
+    assert_eq!(ev["type"], "client:disconnected");
+    assert_eq!(ev["data"]["clientId"], "desktop-b");
+    assert!(
+        try_read_text(&mut sub, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "exactly one disconnect for the logical client"
+    );
 
     fx.ws.stop().await;
 }

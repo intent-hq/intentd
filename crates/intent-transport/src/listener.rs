@@ -42,9 +42,7 @@ use tokio::net::UnixListener;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[cfg(any(unix, windows))]
-use crate::conn::{
-    outbound_channel, process_frame, publish_client_event, ConnSubs, CLIENT_DISCONNECTED,
-};
+use crate::conn::{outbound_channel, process_frame, ConnSubs};
 #[cfg(any(unix, windows))]
 use crate::forward::ForwardRegistry;
 #[cfg(any(unix, windows))]
@@ -160,6 +158,9 @@ where
     let listener = UnixListener::bind(socket_path)?;
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
     tracing::info!(path = %socket_path.display(), "intentd listening on UDS");
+    // REV-2: `client:*` events for the shared registry (no-op when the WSS
+    // listener already spawned the publisher).
+    reverse_registry.spawn_client_event_publisher(api.clone());
 
     tokio::pin!(shutdown);
     let mut backoff = AcceptBackoff::default();
@@ -272,9 +273,10 @@ where
     let reverse = ReverseChannel::new(out_tx.priority_sender());
     // REV-2: register this connection's reverse channel with the shared
     // target registry; it becomes an eligible `browser.exec` target once
-    // `client.hello` binds an identity advertising `browserExec`. The guard is
-    // released when this function returns (and drops on panic-unwind), so
-    // failover among eligible connections is exactly the arrival order.
+    // `client.hello` binds an identity advertising `browserExec`. The guard
+    // drops when this function returns (and on panic-unwind), so failover
+    // among eligible connections is exactly the arrival order and the
+    // registry announces `client:disconnected` for a departed logical client.
     let reverse_guard = reverse_registry.register(reverse.clone(), ReverseTransport::Uds);
     // Per-connection logical-client binding (§16): `None` until `client.hello`.
     let mut client_id: Option<intent_core::ClientId> = None;
@@ -349,14 +351,10 @@ where
     drop(subs);
     drop(forwards);
     reverse.close();
-    let last_of_client = reverse_guard.release();
+    drop(reverse_guard);
     drop(reverse);
     drop(out_tx);
     let _ = writer.await;
-    // REV-2: the logical client lost its last live connection.
-    if let Some(identity) = last_of_client {
-        publish_client_event(api.as_ref(), CLIENT_DISCONNECTED, &identity).await;
-    }
     io_result
 }
 
@@ -448,6 +446,9 @@ where
         .first_pipe_instance(true)
         .create(&pipe_name)?;
     tracing::info!(pipe = %pipe_name, path = %socket_path.display(), "intentd listening on named pipe");
+    // REV-2: `client:*` events for the shared registry (no-op when the WSS
+    // listener already spawned the publisher).
+    reverse_registry.spawn_client_event_publisher(api.clone());
 
     tokio::pin!(shutdown);
     let mut backoff = AcceptBackoff::default();

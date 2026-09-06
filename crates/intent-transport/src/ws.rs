@@ -691,9 +691,10 @@ impl WsInner {
         // REV-2: register this connection's reverse channel with the shared
         // target registry; it becomes an eligible `browser.exec` target once
         // `client.hello` binds an identity advertising `browserExec`. The
-        // guard is released when this loop exits (normal exit, remote close,
-        // heartbeat timeout, shutdown) and drops on panic-unwind, so failover
-        // among eligible connections is exactly the arrival order.
+        // guard drops when this loop exits (normal exit, remote close,
+        // shutdown), on panic-unwind, AND when the heartbeat reaper aborts
+        // this task — the registry announces `client:disconnected` for a
+        // departed logical client on every one of those paths.
         let reverse_guard = self
             .reverse_registry
             .register(reverse.clone(), ReverseTransport::Wss);
@@ -781,14 +782,9 @@ impl WsInner {
         drop(subs);
         drop(forwards);
         reverse.close();
-        let last_of_client = reverse_guard.release();
+        drop(reverse_guard);
         let _ = sink.close().await;
         self.deregister(id);
-        // REV-2: the logical client lost its last live connection.
-        if let Some(identity) = last_of_client {
-            conn::publish_client_event(self.api.as_ref(), conn::CLIENT_DISCONNECTED, &identity)
-                .await;
-        }
     }
 }
 
