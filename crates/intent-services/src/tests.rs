@@ -239,6 +239,76 @@ async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
 }
 
 #[tokio::test]
+async fn semantic_map_manifest_cache_is_shared_and_invalidated_by_its_note_update() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let manifest_json = |label: &str| {
+        format!(
+            "{{\"version\":1,\"regions\":[{{\"id\":\"core\",\"label\":\"{label}\",\"responsibility\":\"Core\",\"anchor\":[0,0],\"paths\":[]}}]}}"
+        )
+    };
+    let mut manifest_note = note(&ws, "map", &manifest_json("Initial"));
+    manifest_note.tags = vec![crate::semantic_map::MANIFEST_TAG.to_string()];
+    store
+        .insert_note(&manifest_note)
+        .await
+        .expect("manifest note");
+    store
+        .insert_note(&note(&ws, "other", "before"))
+        .await
+        .expect("unrelated note");
+    let services = Services::new(store.clone());
+
+    let initial = services.map_get(ws.clone()).await.expect("initial map");
+    assert_eq!(initial["manifest"]["regions"][0]["label"], "Initial");
+
+    manifest_note.content = manifest_json("Store changed");
+    store
+        .update_note(&manifest_note)
+        .await
+        .expect("direct manifest mutation");
+    let cached = services
+        .clone()
+        .map_get(ws.clone())
+        .await
+        .expect("cached map through service clone");
+    assert_eq!(cached["manifest"]["regions"][0]["label"], "Initial");
+
+    services
+        .update_note(
+            ws.clone(),
+            NoteId::from("other"),
+            NoteUpdateInput {
+                content: Some("after".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("unrelated note update");
+    let still_cached = services
+        .map_get(ws.clone())
+        .await
+        .expect("still cached map");
+    assert_eq!(still_cached["manifest"]["regions"][0]["label"], "Initial");
+
+    services
+        .update_note(
+            ws.clone(),
+            manifest_note.id,
+            NoteUpdateInput {
+                content: Some(manifest_json("Refreshed")),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("manifest note update");
+    let refreshed = services.map_get(ws).await.expect("refreshed map");
+    assert_eq!(refreshed["manifest"]["regions"][0]["label"], "Refreshed");
+}
+
+#[tokio::test]
 async fn settings_revision_gate_orders_mutation_before_snapshot() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");

@@ -345,6 +345,8 @@ struct WorkspaceAggregateSnapshot {
 #[derive(Clone)]
 pub struct Services {
     store: Store,
+    /// Parsed semantic-map manifests, shared by every clone and map operation.
+    semantic_map_manifest_loader: semantic_map::ManifestLoader,
     /// Root directory for note assets, laid out as `<root>/<workspaceId>/<assetId>`.
     /// `None` until configured by the composition root; `note.readAsset` errors
     /// when unset.
@@ -1119,6 +1121,7 @@ impl Services {
     pub fn new(store: Store) -> Self {
         Self {
             store,
+            semantic_map_manifest_loader: semantic_map::ManifestLoader::default(),
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
@@ -12720,10 +12723,10 @@ async fn semantic_map_paths(store: &Store, workspace_id: &WorkspaceId) -> Result
 
 async fn active_semantic_map(
     store: &Store,
+    loader: &semantic_map::ManifestLoader,
     workspace_id: &WorkspaceId,
 ) -> Result<(semantic_map::Manifest, Vec<String>)> {
     let paths = semantic_map_paths(store, workspace_id).await?;
-    let loader = semantic_map::ManifestLoader::default();
     let manifest = match loader.load(store, workspace_id).await {
         Ok(Some(manifest)) => manifest,
         Ok(None) => semantic_map::structural_manifest(&paths),
@@ -12740,7 +12743,7 @@ async fn active_semantic_map(
 fn project_map_events(
     manifest: &semantic_map::Manifest,
     workspace_paths: &semantic_map::WorkspacePaths,
-    events: Vec<Event>,
+    events: &[Event],
     kinds: &[semantic_map::MapActivityKind],
 ) -> Vec<semantic_map::MapActivity> {
     events
@@ -21238,6 +21241,9 @@ impl WorkspaceApi for Services {
                     note = refetched;
                 }
             }
+            services
+                .semantic_map_manifest_loader
+                .invalidate_note_updated(&note.workspace_id, &note.id);
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -21304,6 +21310,9 @@ impl WorkspaceApi for Services {
                 .refetched_note
                 .map(|n| n.content)
                 .unwrap_or(new_content);
+            services
+                .semantic_map_manifest_loader
+                .invalidate_note_updated(&note.workspace_id, &note.id);
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -21382,6 +21391,9 @@ impl WorkspaceApi for Services {
                 .refetched_note
                 .map(|n| n.content)
                 .unwrap_or(new_content);
+            services
+                .semantic_map_manifest_loader
+                .invalidate_note_updated(&note.workspace_id, &note.id);
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -21460,6 +21472,9 @@ impl WorkspaceApi for Services {
                 .map(|n| n.content)
                 .unwrap_or(new_content);
             let total_lines_after = final_content.split('\n').count();
+            services
+                .semantic_map_manifest_loader
+                .invalidate_note_updated(&note.workspace_id, &note.id);
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -21615,6 +21630,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<NoteUpdateMetadataResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             if title.is_none() && tags.is_none() {
                 return Err(Error::Internal(
@@ -21649,6 +21665,9 @@ impl WorkspaceApi for Services {
             let now = now_iso();
             note.updated_at = now.clone();
             store.update_note_versioned(&note, expected_version).await?;
+            services
+                .semantic_map_manifest_loader
+                .invalidate_note_updated(&note.workspace_id, &note.id);
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -23548,8 +23567,9 @@ impl WorkspaceApi for Services {
 
     fn map_get(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
+        let loader = self.semantic_map_manifest_loader.clone();
         Box::pin(async move {
-            let (manifest, paths) = active_semantic_map(&store, &workspace_id).await?;
+            let (manifest, paths) = active_semantic_map(&store, &loader, &workspace_id).await?;
             let classifier = semantic_map::Classifier::new(&manifest);
             let matched = paths
                 .iter()
@@ -23642,8 +23662,9 @@ impl WorkspaceApi for Services {
         paths: Vec<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
+        let loader = self.semantic_map_manifest_loader.clone();
         Box::pin(async move {
-            let (manifest, _) = active_semantic_map(&store, &workspace_id).await?;
+            let (manifest, _) = active_semantic_map(&store, &loader, &workspace_id).await?;
             let workspace_paths = semantic_map::workspace_paths(&store, &workspace_id).await?;
             let paths: Vec<semantic_map::ClassifyPath> =
                 serde_json::from_value(serde_json::Value::Array(paths)).map_err(|error| {
@@ -23671,8 +23692,9 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let loader = self.semantic_map_manifest_loader.clone();
         Box::pin(async move {
-            let (manifest, _) = active_semantic_map(&store, &workspace_id).await?;
+            let (manifest, _) = active_semantic_map(&store, &loader, &workspace_id).await?;
             let workspace_paths = semantic_map::workspace_paths(&store, &workspace_id).await?;
             let kinds = kinds
                 .into_iter()
@@ -23696,7 +23718,7 @@ impl WorkspaceApi for Services {
                     ..Default::default()
                 })
                 .await?;
-            let activities = project_map_events(&manifest, &workspace_paths, events, &kinds);
+            let activities = project_map_events(&manifest, &workspace_paths, &events, &kinds);
             for activity in &activities {
                 publish_event_transient(bus.as_ref(), &map_activity_event(&workspace_id, activity));
             }
@@ -23713,8 +23735,9 @@ impl WorkspaceApi for Services {
         since_ts: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
+        let loader = self.semantic_map_manifest_loader.clone();
         Box::pin(async move {
-            let (manifest, _) = active_semantic_map(&store, &workspace_id).await?;
+            let (manifest, _) = active_semantic_map(&store, &loader, &workspace_id).await?;
             let workspace_paths = semantic_map::workspace_paths(&store, &workspace_id).await?;
             let agent_ids = if let Some(agent_id) = agent_id {
                 vec![agent_id]
@@ -23746,7 +23769,7 @@ impl WorkspaceApi for Services {
                     ..Default::default()
                 })
                 .await?;
-            let activities = project_map_events(&manifest, &workspace_paths, events, &[])
+            let activities = project_map_events(&manifest, &workspace_paths, &events, &[])
                 .into_iter()
                 .filter(|activity| {
                     activity

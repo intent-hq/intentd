@@ -293,14 +293,26 @@ impl ManifestLoader {
             return false;
         }
         let note_id = event.data.get("noteId").and_then(Value::as_str);
+        self.invalidate_note_update(&event.workspace_id, note_id)
+    }
+
+    pub(crate) fn invalidate_note_updated(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+    ) -> bool {
+        self.invalidate_note_update(workspace_id, Some(note_id.as_str()))
+    }
+
+    fn invalidate_note_update(&self, workspace_id: &WorkspaceId, note_id: Option<&str>) -> bool {
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let should_remove = cache
-            .get(&event.workspace_id)
+            .get(workspace_id)
             .is_some_and(|cached| note_id.is_none_or(|note_id| cached.note_id.as_str() == note_id));
-        should_remove && cache.remove(&event.workspace_id).is_some()
+        should_remove && cache.remove(workspace_id).is_some()
     }
 }
 
