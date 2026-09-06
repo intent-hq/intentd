@@ -81,9 +81,9 @@ Agent-opened tabs start hidden: `openTab` without `visible: true` creates the ta
 hidden — alive, owned by you, emulated (the sizing invariant above is unchanged),
 returned by `listTabs` with `visibility: "hidden"`, and rendering offscreen — with no
 panel mount and no focus or active-tab change. Pass `visible: true` to open directly
-into the user's panel layout: the tab is mounted AND activated in its panel (so it
-paints) without stealing panel/keyboard focus, and the result carries `displayed`
-(see below). Per-agent `openTab` dedupe matches regardless of
+into the user's panel layout: the tab is mounted AND made its panel's active tab
+without stealing panel/keyboard focus, and the result carries `displayed` (see
+below). Per-agent `openTab` dedupe matches regardless of
 visibility — a same-URL reopen reuses your tab whether it is hidden or visible — and a
 dedupe hit never changes the reused tab's visibility: a hidden tab stays hidden even
 when the `openTab` carried `visible: true` (and a visible tab stays visible).
@@ -100,22 +100,26 @@ Revealing an existing tab is `showTab`-only.
   tab (a no-op success with `focus: false`; `focus: true` still focuses its panel).
   An unknown `tabId` fails as an action-result error naming the unknown id.
 - `listTabs` results carry `visibility: "visible" | "hidden"` on every tab, plus
-  `displayed: boolean` — true only when the tab is actually painted in the UI:
-  visible AND its panel's active tab. `visibility: "visible"` alone does not mean
-  painted: a visible tab that is not its panel's active tab is mounted but renders
-  nothing, so `visibility: "visible", displayed: false` is the "sits behind another
-  tab" state — `showTab` it (default `focus: false`) to bring it to the front. Hidden
-  tabs are always `displayed: false`.
+  `displayed: boolean` — a fact about the saved layout, not a paint guarantee: true
+  when the tab is visible AND its panel's active tab. `visibility: "visible"` alone
+  does not mean the tab can paint: a visible tab that is not its panel's active tab
+  is mounted but renders nothing, so `visibility: "visible", displayed: false` is the
+  "sits behind another tab" state — `showTab` it (default `focus: false`) to bring it
+  to the front. Hidden tabs are always `displayed: false`. A `displayed: true` tab
+  actually paints only while its workspace is in view in the app and its panel is
+  not hidden (e.g. by another panel being zoomed/expanded); `displayed` does not
+  track either condition.
 - `focusTab` is unchanged for visible tabs (activate + focus the panel). On a hidden
   tab it fails with an action-result error directing you to `showTab` — there is no
   focusTab overload that reveals a hidden tab.
 
 Hidden tabs are fully usable for background work — screenshots, evaluation, and
 navigation are deterministic offscreen thanks to viewport emulation. A **visible**
-tab, by contrast, paints only while it is displayed: a screenshot of a
+tab, by contrast, paints only while it is on screen: a screenshot of a
 `visibility: "visible", displayed: false` tab fails with a not-painting error that
-points at `showTab`. Reveal a tab only when the user should see it, and prefer the
-default `focus: false` so you never steal focus.
+points at `showTab`, and even a `displayed: true` tab fails the same way while its
+workspace is not in view or its panel is hidden by zoom. Reveal a tab only when the
+user should see it, and prefer the default `focus: false` so you never steal focus.
 
 Tab operations do not require the workspace to be currently open/visible in the app:
 every action (`openTab` hidden or visible, `closeTab`, `showTab`, `evaluate`,
@@ -131,7 +135,7 @@ carries an additive `warning` string stating that the workspace is not visible s
 UI focus was attempted (the field is absent when the workspace is visible).
 
 ## Basic Actions
-- `{ action: "listTabs", scope? }` - List browser tabs (`scope: "mine" | "unclaimed" | "all"`, default `all`) with ownership, sizing, visibility, and `displayed` (actually painted) info
+- `{ action: "listTabs", scope? }` - List browser tabs (`scope: "mine" | "unclaimed" | "all"`, default `all`) with ownership, sizing, visibility, and `displayed` (visible AND its panel's active tab) info
 - `{ action: "getAccessibilityTree", tabId? }` - Get page structure as YAML
 - `{ action: "screenshot", tabId? }` - Take a screenshot
 - `{ action: "evaluate", expression, tabId? }` - Run JavaScript in the page

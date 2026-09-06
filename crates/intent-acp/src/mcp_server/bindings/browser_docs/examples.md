@@ -125,7 +125,8 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
 }
 
 // Or open directly into the UI in the first place: the tab is activated in its
-// panel without stealing focus, and the result says whether it is painted.
+// panel without stealing focus, and the result says whether it ended up as its
+// panel's active tab (`displayed`).
 {
   "actions": [
     { "action": "openTab", "url": "http://localhost:5173", "visible": true }
@@ -137,10 +138,13 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
 ## Visible but Not Displayed
 
 `visibility: "visible"` means the tab is mounted in the user's panel layout; it does
-not mean the tab is painted. Only a panel's active tab renders, so a visible tab that
+not mean the tab can paint. Only a panel's active tab renders, so a visible tab that
 the user (or another open) pushed behind a sibling is `displayed: false` — and a
 screenshot of it fails with a not-painting error. Check `displayed` and bring the tab
-to the front with `showTab` (no focus change) before capturing:
+to the front with `showTab` (no focus change) before capturing. `displayed` is a
+saved-layout fact (visible AND active in its panel), not a paint guarantee: a
+`displayed: true` tab still paints only while its workspace is in view and its panel
+is not hidden by zoom, so a not-painting error can occur on a displayed tab too.
 
 ```json
 {
