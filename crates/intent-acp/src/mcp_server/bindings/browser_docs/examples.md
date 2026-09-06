@@ -125,14 +125,18 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
 }
 
 // Or open directly into the UI in the first place: the tab is activated in its
-// panel without stealing focus, and the result says whether it ended up as its
-// panel's active tab (`displayed`).
+// panel without stealing focus (on any position), and the result says whether it
+// ended up as its panel's active tab (`displayed`).
 {
   "actions": [
     { "action": "openTab", "url": "http://localhost:5173", "visible": true }
   ]
 }
 // → { tabId: "tab-ui1", url: "http://localhost:5173/", displayed: true, ... }
+// `displayed` is optional on openTab results: when the layout state could not be
+// confirmed (stale tab list, tab not listed) the field is omitted — absent means
+// unknown, not false. Re-check with listTabs, which always reports it:
+// → { tabId: "tab-ui1", url: "http://localhost:5173/", ... }   (no displayed)
 ```
 
 ## Visible but Not Displayed
@@ -165,6 +169,8 @@ is not hidden by zoom, so a not-painting error can occur on a displayed tab too.
 A `visible: true` open that dedupes onto an existing tab reports that tab's real
 state too: `{ reused: true, displayed: false, ... }` means the reuse handed you a
 hidden or inactive tab — `showTab` it, since a dedupe hit never changes visibility.
+As on a fresh open, `displayed` is omitted from the reuse result when the layout
+state is unknown; reuses without `visible: true` never carry it.
 
 `showTab` is owner-only (`not-owner` on a tab you do not own) and idempotent on an
 already-displayed tab (`focus: true` still focuses its panel); a visible-but-inactive

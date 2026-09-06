@@ -82,8 +82,14 @@ hidden — alive, owned by you, emulated (the sizing invariant above is unchange
 returned by `listTabs` with `visibility: "hidden"`, and rendering offscreen — with no
 panel mount and no focus or active-tab change. Pass `visible: true` to open directly
 into the user's panel layout: the tab is mounted AND made its panel's active tab
-without stealing panel/keyboard focus, and the result carries `displayed` (see
-below). Per-agent `openTab` dedupe matches regardless of
+without stealing panel/keyboard focus, on every `position` (`adjacent`, `same`, or a
+`replace` that falls back to a new tab). The `openTab` result carries an **optional**
+`displayed` (see below): present when the layout confirmed the tab's display state,
+absent when that state is unknown (the layout could not be read, or the tab was not
+in the fresh tab list) — absence means unknown, NOT `false`; re-check with
+`listTabs`. Only `visible: true` requests carry it (a dedupe reuse under `visible: true`
+reports the reused tab's real display state); default hidden opens and reuses without
+`visible: true` omit it. Per-agent `openTab` dedupe matches regardless of
 visibility — a same-URL reopen reuses your tab whether it is hidden or visible — and a
 dedupe hit never changes the reused tab's visibility: a hidden tab stays hidden even
 when the `openTab` carried `visible: true` (and a visible tab stays visible).
@@ -99,9 +105,10 @@ Revealing an existing tab is `showTab`-only.
   revealed tab stays visible across app restarts. Idempotent on an already-displayed
   tab (a no-op success with `focus: false`; `focus: true` still focuses its panel).
   An unknown `tabId` fails as an action-result error naming the unknown id.
-- `listTabs` results carry `visibility: "visible" | "hidden"` on every tab, plus
-  `displayed: boolean` — a fact about the saved layout, not a paint guarantee: true
-  when the tab is visible AND its panel's active tab. `visibility: "visible"` alone
+- `listTabs` results carry `visibility: "visible" | "hidden"` on every tab, plus an
+  unconditional `displayed: boolean` — a fact about the saved layout, not a paint
+  guarantee: true when the tab is visible AND its panel's active tab (derived from the
+  panel that holds the tab). `visibility: "visible"` alone
   does not mean the tab can paint: a visible tab that is not its panel's active tab
   is mounted but renders nothing, so `visibility: "visible", displayed: false` is the
   "sits behind another tab" state — `showTab` it (default `focus: false`) to bring it
@@ -156,7 +163,7 @@ UI focus was attempted (the field is absent when the workspace is visible).
 
 ## UI Control
 - `{ action: "openTab", url, position?, visible?, width?, height? }` - Open a new browser tab, owned by you; hidden by default (see Tab Visibility)
-  - visible: true opens directly into the UI, activated in its panel without stealing focus, and the result carries `displayed`; omitted/false creates the tab hidden
+  - visible: true opens directly into the UI, activated in its panel without stealing focus on any position; the result carries `displayed` when the layout confirmed it and omits it when unknown (absent ≠ false); omitted/false creates the tab hidden
   - position: 'adjacent' (default), 'replace', or 'same'
   - width/height: emulated viewport size in CSS px; omitted width defaults to 1280, omitted height to 800
 - `{ action: "showTab", tabId, focus? }` - Activate an owned tab in a visible panel without stealing focus (reveals a hidden tab, or brings a visible-but-inactive one to the front); focus: true also focuses it (see Tab Visibility)
