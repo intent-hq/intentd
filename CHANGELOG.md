@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.28] - 2026-09-06
+
+### ⚡ Performance
+
+- Reduce RPC load-path latency (workspace batching, blocking offload, profiling) ([#1702](https://github.com/intent-hq/intentd/pull/1702))
+
+
 ## [0.9.27] - 2026-09-06
 
 ### 🐛 Bug Fixes
