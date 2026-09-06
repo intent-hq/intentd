@@ -298,6 +298,52 @@ fn statement_counts(log: &str, method: &str) -> Vec<u64> {
         .collect()
 }
 
+/// Poll `daemon.log` from byte `offset` until the tail holds a statement-budget
+/// row for every method in `methods`, and return that tail.
+async fn await_profile_rows(log_path: &Path, offset: usize, methods: &[&str]) -> String {
+    let deadline = tokio::time::Instant::now() + common::rpc_read_timeout();
+    loop {
+        let log = std::fs::read_to_string(log_path).expect("read daemon log");
+        let segment = &log[offset..];
+        if methods
+            .iter()
+            .all(|method| !statement_counts(segment, method).is_empty())
+        {
+            return segment.to_string();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for profile rows; log:\n{log}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Statements `method`'s single profile row in `segment` attributes to the
+/// aggregate plan itself. The read pool grows lazily (min 0, max 32), so an
+/// aggregate fan-out may open new connections mid-dispatch; how many depends on
+/// scheduling, and each one runs sqlx's connection-setup PRAGMA statement
+/// inside the dispatch span. Those setup rows are subtracted so the budget
+/// measures the plan, not pool growth.
+fn plan_statements(segment: &str, method: &str) -> u64 {
+    let rows = statement_counts(segment, method);
+    assert_eq!(
+        rows.len(),
+        1,
+        "one {method} profile row; segment:\n{segment}"
+    );
+    let span = format!("rpc_dispatch{{method=\"{method}\"}}");
+    let connection_setup = strip_ansi(segment)
+        .lines()
+        .filter(|line| {
+            line.contains(&span)
+                && line.contains("sqlx::query")
+                && line.contains("summary=\"PRAGMA journal_mode = WAL;")
+        })
+        .count();
+    rows[0] - u64::try_from(connection_setup).unwrap()
+}
+
 async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -337,9 +383,15 @@ async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
     const MAX_STATEMENTS: u64 = 11;
     let (daemon, port, cfg, socket) = boot(
         "itd-wscost",
-        &[("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "0")],
+        &[
+            ("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "0"),
+            // Surface every `sqlx::query` row so [`plan_statements`] can
+            // tell read-pool connection setup apart from the aggregate plan.
+            ("RUST_LOG", "info,sqlx::query=debug"),
+        ],
     )
     .await;
+    let log_path = daemon.data_dir.join("daemon.log");
     let mut seeded = 0;
     let mut observed = Vec::new();
 
@@ -363,18 +415,11 @@ async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
             );
         }
 
-        // The first concurrent aggregate fan-out lazily opens read-pool
-        // connections; exclude those one-time connection PRAGMAs from the RPC
-        // statement budget just as a long-running daemon does after startup.
-        if target == 1 {
-            let mut warm_ws = connect_ws(port, cfg.clone()).await;
-            let _ = wss_rpc(&mut warm_ws, 9_999, "workspace.list", json!({})).await;
-        }
-
-        let log_path = daemon.data_dir.join("daemon.log");
-        let log = std::fs::read_to_string(&log_path).expect("read daemon log");
-        let list_before = statement_counts(&log, "workspace.list").len();
-        let subscribe_before = statement_counts(&log, "workspace.subscribe").len();
+        // Everything the measured RPCs log lands after this offset, so the
+        // profile rows below are theirs and nobody else's.
+        let log_offset = std::fs::read_to_string(&log_path)
+            .expect("read daemon log")
+            .len();
 
         let mut list_ws = connect_ws(port, cfg.clone()).await;
         let listed = wss_rpc(
@@ -400,24 +445,21 @@ async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
             usize::try_from(target).unwrap()
         );
 
-        let deadline = tokio::time::Instant::now() + common::rpc_read_timeout();
-        let (list_count, subscribe_count) = loop {
-            let log = std::fs::read_to_string(&log_path).expect("read daemon log");
-            let lists = statement_counts(&log, "workspace.list");
-            let subscribes = statement_counts(&log, "workspace.subscribe");
-            if lists.len() > list_before && subscribes.len() > subscribe_before {
-                break (*lists.last().unwrap(), *subscribes.last().unwrap());
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for profile rows; log:\n{log}"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        };
-        assert!(list_count <= MAX_STATEMENTS, "{target} rows: {list_count}");
+        let segment = await_profile_rows(
+            &log_path,
+            log_offset,
+            &["workspace.list", "workspace.subscribe"],
+        )
+        .await;
+        let list_count = plan_statements(&segment, "workspace.list");
+        let subscribe_count = plan_statements(&segment, "workspace.subscribe");
+        assert!(
+            list_count <= MAX_STATEMENTS,
+            "{target} rows: {list_count}; log segment:\n{segment}"
+        );
         assert!(
             subscribe_count <= MAX_STATEMENTS,
-            "{target} rows: {subscribe_count}"
+            "{target} rows: {subscribe_count}; log segment:\n{segment}"
         );
         observed.push((target, list_count, subscribe_count));
     }
