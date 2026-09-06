@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.27] - 2026-09-06
+
+### 🐛 Bug Fixes
+
+- *(services)* Serialize delegation_group persistence through one ordered lane ([#1751](https://github.com/intent-hq/intentd/pull/1751))
+- *(transfer)* Preserve root remotes, tracking refs and upstream through workspace transfer ([#1749](https://github.com/intent-hq/intentd/pull/1749))
+
+
 ## [0.9.26] - 2026-09-05
 
 ### 🐛 Bug Fixes
