@@ -1830,8 +1830,9 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
     }
 }
 
-/// `crossWorkspace.listSiblings` returns only same-`repositoryPath` peers
-/// (self filtered out, other-repo filtered out) with the `PascalCase` status.
+/// `crossWorkspace.listSiblings` returns only same-repository peers — here
+/// matched by `repositoryPath` (self filtered out, other-repo filtered out)
+/// — with the `PascalCase` status.
 #[tokio::test]
 async fn cross_workspace_list_siblings_scopes_to_repository() {
     let tmp = TempDb::new();
@@ -1879,23 +1880,227 @@ async fn cross_workspace_list_siblings_scopes_to_repository() {
     assert!(arr[0]["createdAt"].is_string());
 }
 
-/// A caller with no `repositoryPath` cannot list siblings (mirrors the TS
-/// "not associated with a repository" error).
+/// Workspaces sharing a GitHub owner/name are siblings regardless of their
+/// local `repositoryPath` (self-contained checkouts and direct clones give
+/// each workspace a distinct source path). Owner/name match case-insensitively
+/// and tolerate a `.git` suffix on the name; a different GitHub repo at a
+/// different path is not a sibling.
+#[tokio::test]
+async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mk = |id: &WorkspaceId, repo: Option<&str>, owner: Option<&str>, name: Option<&str>| {
+        let mut w = workspace(id);
+        w.title = id.to_string();
+        w.repository_path = repo.map(str::to_string);
+        w.repository_owner = owner.map(str::to_string);
+        w.repository_name = name.map(str::to_string);
+        w
+    };
+
+    let caller = WorkspaceId::from("ws-caller");
+    let other_path = WorkspaceId::from("ws-other-path");
+    let case_only = WorkspaceId::from("ws-case-only");
+    let git_suffix = WorkspaceId::from("ws-git-suffix");
+    let other_repo = WorkspaceId::from("ws-other-repo");
+    let same_owner_other_name = WorkspaceId::from("ws-same-owner");
+    for w in [
+        mk(
+            &caller,
+            Some("/root/ws-caller/intent"),
+            Some("intent-hq"),
+            Some("intent"),
+        ),
+        mk(
+            &other_path,
+            Some("/root/ws-other-path/intent"),
+            Some("intent-hq"),
+            Some("intent"),
+        ),
+        mk(
+            &case_only,
+            Some("/clones/Intent"),
+            Some("Intent-HQ"),
+            Some("INTENT"),
+        ),
+        mk(
+            &git_suffix,
+            Some("/clones/intent.git"),
+            Some("intent-hq"),
+            Some("intent.git"),
+        ),
+        mk(
+            &other_repo,
+            Some("/root/ws-other-repo/intentd"),
+            Some("intent-hq"),
+            Some("intentd"),
+        ),
+        mk(
+            &same_owner_other_name,
+            Some("/root/ws-same-owner/other"),
+            Some("someone-else"),
+            Some("intent"),
+        ),
+    ] {
+        store.insert_workspace(&w).await.unwrap();
+    }
+
+    let svc = Services::new(store);
+    let v = svc
+        .cross_workspace_list_siblings(caller.clone())
+        .await
+        .expect("siblings");
+    let mut ids: Vec<String> = v
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["ws-case-only", "ws-git-suffix", "ws-other-path"]);
+
+    // The access gate uses the same predicate as the listing.
+    svc.cross_workspace_list_notes(caller.clone(), other_path)
+        .await
+        .expect("same identity, different path is readable");
+    svc.cross_workspace_list_notes(caller.clone(), case_only)
+        .await
+        .expect("case-only difference is readable");
+    for denied in [other_repo, same_owner_other_name] {
+        let err = svc
+            .cross_workspace_list_notes(caller.clone(), denied)
+            .await
+            .expect_err("denied");
+        match err {
+            Error::Internal(m) => assert!(m.contains("Access denied"), "{m}"),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+}
+
+/// Rows without a GitHub identity (local-only repos, or rows the
+/// owner/name backfill has not reached yet) still resolve siblings by an
+/// identical `repositoryPath` — even when only one side carries owner/name.
+#[tokio::test]
+async fn cross_workspace_list_siblings_falls_back_to_repository_path() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mk = |id: &WorkspaceId, repo: Option<&str>, owner: Option<&str>, name: Option<&str>| {
+        let mut w = workspace(id);
+        w.repository_path = repo.map(str::to_string);
+        w.repository_owner = owner.map(str::to_string);
+        w.repository_name = name.map(str::to_string);
+        w
+    };
+
+    // Caller has an identity; the sibling at the same path has none yet.
+    let caller = WorkspaceId::from("ws-caller");
+    let unbackfilled = WorkspaceId::from("ws-unbackfilled");
+    // Local-only pair: neither side has an identity, same path.
+    let local_a = WorkspaceId::from("ws-local-a");
+    let local_b = WorkspaceId::from("ws-local-b");
+    // Same path but only the owner (no name) — identity incomplete, path wins.
+    let partial = WorkspaceId::from("ws-partial");
+    // Different path, no identity: never a sibling of the caller.
+    let unrelated = WorkspaceId::from("ws-unrelated");
+    for w in [
+        mk(&caller, Some("/repo/a"), Some("intent-hq"), Some("intent")),
+        mk(&unbackfilled, Some("/repo/a"), None, None),
+        mk(&local_a, Some("/repo/local"), None, None),
+        mk(&local_b, Some("/repo/local"), None, None),
+        mk(&partial, Some("/repo/a"), Some("intent-hq"), None),
+        mk(&unrelated, Some("/repo/z"), None, None),
+    ] {
+        store.insert_workspace(&w).await.unwrap();
+    }
+
+    let svc = Services::new(store);
+
+    let list_ids = |v: serde_json::Value| {
+        let mut ids: Vec<String> = v
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    let v = svc
+        .cross_workspace_list_siblings(caller.clone())
+        .await
+        .expect("siblings");
+    assert_eq!(list_ids(v), vec!["ws-partial", "ws-unbackfilled"]);
+    svc.cross_workspace_list_notes(caller.clone(), unbackfilled.clone())
+        .await
+        .expect("path fallback grants access");
+
+    // The relation is symmetric: the un-backfilled row sees the caller too.
+    let v = svc
+        .cross_workspace_list_siblings(unbackfilled)
+        .await
+        .expect("siblings");
+    assert_eq!(list_ids(v), vec!["ws-caller", "ws-partial"]);
+
+    let v = svc
+        .cross_workspace_list_siblings(local_a.clone())
+        .await
+        .expect("siblings");
+    assert_eq!(list_ids(v), vec!["ws-local-b"]);
+    svc.cross_workspace_list_notes(local_a.clone(), local_b)
+        .await
+        .expect("local-only pair is readable");
+    let err = svc
+        .cross_workspace_list_notes(local_a, unrelated)
+        .await
+        .expect_err("denied");
+    match err {
+        Error::Internal(m) => assert!(m.contains("Access denied"), "{m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+}
+
+/// A caller with neither a GitHub identity nor a `repositoryPath` cannot list
+/// siblings or read notes (mirrors the TS "not associated with a repository"
+/// error). An identity alone (no path) is sufficient.
 #[tokio::test]
 async fn cross_workspace_list_siblings_requires_repository() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let caller = WorkspaceId::from("ws-norepo");
     store.insert_workspace(&workspace(&caller)).await.unwrap();
+    let identity_only = WorkspaceId::from("ws-identity-only");
+    let mut w = workspace(&identity_only);
+    w.repository_owner = Some("intent-hq".to_string());
+    w.repository_name = Some("intent".to_string());
+    store.insert_workspace(&w).await.unwrap();
     let svc = Services::new(store);
     let err = svc
-        .cross_workspace_list_siblings(caller)
+        .cross_workspace_list_siblings(caller.clone())
         .await
         .expect_err("should error");
     match err {
         Error::Internal(m) => assert!(m.contains("not associated with a repository"), "{m}"),
         other => panic!("expected Internal, got {other:?}"),
     }
+    // The access gate applies the same precondition before checking the target.
+    let err = svc
+        .cross_workspace_list_notes(caller, identity_only.clone())
+        .await
+        .expect_err("should error");
+    match err {
+        Error::Internal(m) => assert!(m.contains("not associated with a repository"), "{m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+    // A GitHub identity without a local path is enough to list.
+    let v = svc
+        .cross_workspace_list_siblings(identity_only)
+        .await
+        .expect("identity-only caller lists");
+    assert!(v.as_array().expect("array").is_empty());
 }
 
 /// Cross-repo `readNote`/`listNotes` are access-denied; a same-repo sibling
