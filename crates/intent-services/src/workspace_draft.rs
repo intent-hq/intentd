@@ -1,4 +1,9 @@
 //! Durable pre-workspace draft operations and promotion orchestration.
+//!
+//! This module owns optimistic draft edits, lifecycle events, and the restart-safe
+//! transition through `workspace.create`. Promotion reuses the draft's immutable
+//! operation key and reconciles the workspace, initial agent, and first turn before
+//! publishing the terminal promoted state.
 
 use std::path::PathBuf;
 use std::sync::Arc;

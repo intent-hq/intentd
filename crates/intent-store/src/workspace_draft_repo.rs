@@ -1,4 +1,8 @@
 //! Durable workspace-draft repository with optimistic revisions.
+//!
+//! The repository persists the client-authored draft object verbatim, including
+//! forward-compatible config keys, and provides the atomic workspace-mapping seam
+//! used by restart-safe promotion.
 
 use intent_core::{
     now_iso, AgentId, ContextLink, DraftDelivery, DraftPhase, DraftSource, Error, Result,
