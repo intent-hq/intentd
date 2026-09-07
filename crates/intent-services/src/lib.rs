@@ -47,7 +47,7 @@ use intent_core::{
     WorkspaceGitRootId, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
     WorkspaceUpdate,
 };
-use intent_core::{AgentReverseDispatch, ReverseDispatchError, ReverseLiveClient, ReverseTarget};
+use intent_core::{AgentReverseDispatch, ReverseDispatchError, ReverseLiveClient};
 use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
@@ -3926,62 +3926,20 @@ impl Services {
         self
     }
 
-    /// The [`ReverseTarget`] an agent-initiated `browser.exec` for
-    /// `workspace_id` dispatches to: `Pinned` when the workspace carries a
-    /// browser-client pin, else `Default`. A workspace the store does not
-    /// know (unit tests, Chief) is unpinned; other store failures propagate.
-    async fn browser_exec_target(&self, workspace_id: &WorkspaceId) -> Result<ReverseTarget> {
-        if workspace_id.is_chief() {
-            return Ok(ReverseTarget::Default);
-        }
-        match self.store.workspace_browser_client(workspace_id).await {
-            Ok(Some(client_id)) => Ok(ReverseTarget::Pinned(client_id)),
-            Ok(None) | Err(Error::NotFound(_)) => Ok(ReverseTarget::Default),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Fill in the display name of a fully offline client from the persisted
-    /// `client` row so the pin-miss error still reads `"<name>" (<clientId>)`
-    /// (the registry only knows names of live connections).
-    async fn name_offline_client(&self, err: ReverseDispatchError) -> ReverseDispatchError {
-        match err {
-            ReverseDispatchError::ClientOffline {
-                client_id,
-                name: None,
-                pinned,
-            } => {
-                let name = self
-                    .store
-                    .get_client(&client_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|c| c.name);
-                ReverseDispatchError::ClientOffline {
-                    client_id,
-                    name,
-                    pinned,
-                }
-            }
-            other => other,
-        }
-    }
-
     /// The `workspace.getBrowserClient` payload for `id`: the persisted pin
     /// (`clientId` + `source: "workspace"`, else `source: "default"`) and
-    /// `resolved` — the client an agent `browser.exec` would reach right
-    /// now, `null` when the pin is offline or no eligible client is
-    /// connected. Chief has no row and always reports the default.
+    /// `resolved` — the driving client an agent `browser.exec` would reach
+    /// right now ([`Self::driving_client_target`]: pin → host of the
+    /// workspace's claimed tabs → first-connected eligible client), `null`
+    /// when that client is offline or no eligible client is connected. Chief
+    /// has no row and always reports the default.
     async fn browser_client_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
         let pinned = if id.is_chief() {
             None
         } else {
             self.store.workspace_browser_client(id).await?
         };
-        let target = pinned
-            .clone()
-            .map_or(ReverseTarget::Default, ReverseTarget::Pinned);
+        let target = self.driving_client_target(id).await?;
         let resolved = self
             .reverse_dispatch
             .as_ref()
@@ -20686,6 +20644,13 @@ impl WorkspaceApi for Services {
                 workspace_updated_event(&id, &serde_json::json!({ "browserClientId": change })),
             )
             .await;
+            // Driving-client switch (REV-2 Model 10): every claimed tab of the
+            // workspace follows the new pin; one `browser:tab-updated` per
+            // moved tab. Clearing the pin moves nothing — the driving client
+            // then falls back to the host of those same claimed tabs.
+            if let Some(new_host) = &committed {
+                self.browser_tabs_migrate_claimed(&id, new_host).await?;
+            }
             self.browser_client_state(&id).await
         })
     }
@@ -28863,12 +28828,20 @@ impl WorkspaceApi for Services {
     /// there is no per-connection reverse channel to use (the caller is the
     /// daemon-hosted MCP server, not a client connection), so we route the
     /// batch through the injected [`AgentReverseDispatch`]. The target is
-    /// the workspace's pinned browser client ([`ReverseTarget::Pinned`],
-    /// `workspace.setBrowserClient`) when one is set — a pinned-but-offline
-    /// client is a hard `-32603` ("pinned browser client … is not
-    /// connected"), never a silent fallback — else
-    /// [`ReverseTarget::Default`] (first-connected eligible client);
-    /// tab-host resolution lands with the browser tab registry.
+    /// the workspace's **driving client** ([`Self::driving_client_target`],
+    /// REV-2 Model 5 & 10: pin → host of the workspace's claimed tabs →
+    /// first-connected eligible client); a driving client that is offline is
+    /// a hard `-32603` ("browser client … for this workspace is not
+    /// connected"), never a silent fallback. Two rules run before dispatch:
+    /// every `tabId` the batch names (envelope or per action) must be an
+    /// open registry tab of this workspace (`-32602` "tab not found"), and
+    /// `listTabs` is answered by the daemon from the registry — all hosts
+    /// aggregated, no reverse call — so a `listTabs` batch never mixes with
+    /// FE-executed actions (`-32602`). After a successful dispatch, a
+    /// `claimTab` that succeeded re-homes the row to the driving client as
+    /// re-resolved at commit time (`browser:tab-updated { changes: {
+    /// hostClientId, ownerAgentId } }`, see
+    /// [`Self::browser_tab_claim_migrate`]).
     /// Attribution fields (`workspaceId`, `agentId`,
     /// `tabId`) are threaded into the forwarded params so the FE sees the
     /// same envelope shape the client-triggered path already emits. Result
@@ -28898,12 +28871,84 @@ impl WorkspaceApi for Services {
                     "browser.exec: actions must be a non-empty array".to_string(),
                 ));
             }
+            // Every tab the batch names must be an open registry tab of this
+            // workspace — before anything is answered or dispatched; the
+            // driving client is the one host, so no per-tab host lookup is
+            // involved (Model 5).
+            let mut named_tabs: Vec<&str> = actions
+                .iter()
+                .filter_map(|a| a["tabId"].as_str())
+                .chain(tab_id.as_deref())
+                .filter(|id| !id.is_empty())
+                .collect();
+            named_tabs.sort_unstable();
+            named_tabs.dedup();
+            for id in &named_tabs {
+                let known = self
+                    .store
+                    .get_browser_tab(id)
+                    .await?
+                    .is_some_and(|tab| tab.workspace_id == workspace_id);
+                if !known {
+                    return Err(Error::InvalidParams(format!(
+                        "browser.exec: tab not found: {id}"
+                    )));
+                }
+            }
+            let list_tabs_count = actions
+                .iter()
+                .filter(|a| a["action"] == browser_tabs::LIST_TABS_ACTION)
+                .count();
+            if list_tabs_count > 0 {
+                if list_tabs_count != actions.len() {
+                    return Err(Error::InvalidParams(
+                        "browser.exec: listTabs is answered by the daemon and cannot be batched \
+                         with other actions"
+                            .to_string(),
+                    ));
+                }
+                let mut results = Vec::with_capacity(actions.len());
+                for action in &actions {
+                    let scope = match &action["scope"] {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(scope) => Some(scope.as_str()),
+                        other => {
+                            return Err(Error::InvalidParams(format!(
+                                "browser.exec: listTabs scope must be \"mine\", \"unclaimed\" or \
+                                 \"all\", got {other}"
+                            )))
+                        }
+                    };
+                    results.push(
+                        self.browser_tabs_list_for_agent(&workspace_id, scope, agent_id.as_ref())
+                            .await?,
+                    );
+                }
+                return Ok(if results.len() == 1 {
+                    results.remove(0)
+                } else {
+                    serde_json::json!({ "results": results })
+                });
+            }
             let Some(dispatch) = self.reverse_dispatch.clone() else {
                 return Err(Error::Internal(
                     "browser.exec: no client connected".to_string(),
                 ));
             };
-            let target = self.browser_exec_target(&workspace_id).await?;
+            let target = self.driving_client_target(&workspace_id).await?;
+            // Claims re-home their tab after the dispatch; record which
+            // client executed them (the commit re-validates the host).
+            let claims: Vec<String> = actions
+                .iter()
+                .filter(|a| a["action"] == "claimTab")
+                .filter_map(|a| a["tabId"].as_str().or(tab_id.as_deref()))
+                .map(str::to_string)
+                .collect();
+            let executed_on = if claims.is_empty() {
+                None
+            } else {
+                dispatch.resolve(&target).ok().map(|r| r.client_id)
+            };
             // Shape by *request* arity: the FE aborts a batch on the first
             // failing action, so the reply's results count can be shorter
             // than the batch (see `shape_agent_result`).
@@ -28911,7 +28956,7 @@ impl WorkspaceApi for Services {
             let args = browser_ops::BrowserExecArgs {
                 actions,
                 tab_id,
-                agent_id: agent_id.map(|a| a.as_str().to_string()),
+                agent_id: agent_id.as_ref().map(|a| a.as_str().to_string()),
                 workspace_id: Some(workspace_id.as_str().to_string()),
             };
             let forwarded = browser_ops::build_forward_params(&args);
@@ -28922,16 +28967,86 @@ impl WorkspaceApi for Services {
                         "browser.exec: no client connected".to_string(),
                     ));
                 }
-                Err(offline @ ReverseDispatchError::ClientOffline { .. }) => {
-                    let offline = self.name_offline_client(offline).await;
-                    return Err(Error::Internal(format!("browser.exec: {offline}")));
-                }
-                Err(ReverseDispatchError::Transport { message, .. }) => {
+                Err(err) => {
+                    let message = self.browser_dispatch_error_message(err).await;
                     return Err(Error::Internal(format!("browser.exec: {message}")));
                 }
             };
+            if let Some(executed_on) = executed_on {
+                for tab_id in browser_ops::successful_claims(&response, &claims) {
+                    self.browser_tab_claim_migrate(&tab_id, &executed_on, agent_id.as_ref())
+                        .await?;
+                }
+            }
             browser_ops::shape_agent_result(&response, requested_actions)
                 .map_err(|e| Error::Internal(e.message))
+        })
+    }
+
+    /// `browser.navigateTab { tabId, url }` (REV-2 Model 4): route a
+    /// navigation request to the client that renders the live tab — the
+    /// workspace's driving client for a claimed tab, the physical host for
+    /// an unclaimed one — as a reverse `browser.exec { action: "navigate"
+    /// }` and echo that action's result envelope. The host then reports the
+    /// resulting navigation through `browser.upsertTab` and every client
+    /// follows the canonical row.
+    fn browser_navigate_tab(
+        &self,
+        tab_id: String,
+        url: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let tab = self
+                .browser_tab_required("browser.navigateTab", &tab_id)
+                .await?;
+            let response = self
+                .browser_tab_dispatch(
+                    "browser.navigateTab",
+                    &tab,
+                    serde_json::json!({ "action": "navigate", "tabId": tab_id, "url": url }),
+                )
+                .await?;
+            browser_ops::shape_result(&response).map_err(|e| Error::Internal(e.message))
+        })
+    }
+
+    /// `browser.closeTab { tabId, force? }` (REV-2 Model 6): route the close
+    /// to the tab's routing target (as `browser_navigate_tab`) so the host's
+    /// own `browser.removeTab` deletes the row. With `force` the row is
+    /// tombstoned daemon-side regardless (after a best-effort routed close
+    /// when the target is reachable); a target that is offline without
+    /// `force` is `Error::Internal`. Unknown tab ⇒ `Error::InvalidParams`.
+    fn browser_close_tab(
+        &self,
+        tab_id: String,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let tab = self
+                .browser_tab_required("browser.closeTab", &tab_id)
+                .await?;
+            let action = serde_json::json!({ "action": "closeTab", "tabId": tab_id });
+            if force {
+                let target = self.browser_tab_route_target(&tab).await?;
+                let reachable = self
+                    .reverse_dispatch
+                    .as_ref()
+                    .is_some_and(|d| d.resolve(&target).is_ok());
+                if reachable {
+                    // The host is told directly; failures fall through to
+                    // the tombstone, which its next sync reconciles.
+                    let _ = self
+                        .browser_tab_dispatch("browser.closeTab", &tab, action)
+                        .await;
+                }
+                self.browser_tab_force_close(&tab_id).await?;
+                return Ok(serde_json::json!({ "ok": true }));
+            }
+            let response = self
+                .browser_tab_dispatch("browser.closeTab", &tab, action)
+                .await?;
+            browser_ops::shape_result(&response).map_err(|e| Error::Internal(e.message))?;
+            Ok(serde_json::json!({ "ok": true }))
         })
     }
 

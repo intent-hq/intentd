@@ -125,8 +125,9 @@ fn extract_fastpath_methods() -> HashSet<String> {
 ///
 /// REV-2 browser tab registry (intent-hq/intent#461): +4 fast-path methods
 /// (`browser.listTabs` / `browser.upsertTab` / `browser.removeTab` /
-/// `browser.syncTabs`), protocol 9.10.
-const EXPECTED_TOTAL_METHODS: usize = 352;
+/// `browser.syncTabs`), protocol 9.10. REV-2 routing: +2 fast-path methods
+/// (`browser.navigateTab` / `browser.closeTab`), protocol 9.11.
+const EXPECTED_TOTAL_METHODS: usize = 354;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
@@ -134,7 +135,7 @@ const EXPECTED_TOTAL_METHODS: usize = 352;
 const EXPECTED_ROUTER_METHODS: usize = 303;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 47;
+const EXPECTED_FASTPATH_METHODS: usize = 49;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;

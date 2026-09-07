@@ -217,6 +217,113 @@ impl Store {
         .await
     }
 
+    /// Claim migration (REV-2 Model 3 & 5): an agent `claimTab` on a tab
+    /// hosted elsewhere was dispatched to the workspace's driving client, so
+    /// the row moves there — `host_client_id` becomes `new_host` and
+    /// `owner_agent_id` the claiming agent. Returns the updated row with the
+    /// field-wise `changes` (`hostClientId` / `ownerAgentId`), or `None` when
+    /// there is no open row or nothing differs (the host already matches and
+    /// the owner is unchanged — the host's own report covers that case).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn reassign_browser_tab_host(
+        &self,
+        tab_id: &str,
+        new_host: &ClientId,
+        owner_agent_id: Option<&AgentId>,
+    ) -> Result<Option<(BrowserTab, serde_json::Value)>> {
+        let pool = self.write_pool().clone();
+        crate::with_write_txn_retry(|| {
+            let pool = pool.clone();
+            let owner_agent_id = owner_agent_id.cloned();
+            async move {
+                let mut tx = begin(&pool, "reassign browser tab host").await?;
+                let Some(StoredTab { tab, closed: false }) = fetch_stored(&mut tx, tab_id).await?
+                else {
+                    return Ok(None);
+                };
+                let mut changes = serde_json::Map::new();
+                if tab.host_client_id != *new_host {
+                    changes.insert(
+                        "hostClientId".to_string(),
+                        serde_json::Value::String(new_host.0.clone()),
+                    );
+                }
+                if owner_agent_id.is_some() && tab.owner_agent_id != owner_agent_id {
+                    changes.insert(
+                        "ownerAgentId".to_string(),
+                        serde_json::json!(owner_agent_id),
+                    );
+                }
+                if changes.is_empty() {
+                    return Ok(None);
+                }
+                let mut updated = tab;
+                updated.host_client_id = new_host.clone();
+                if owner_agent_id.is_some() {
+                    updated.owner_agent_id = owner_agent_id;
+                }
+                updated.updated_at = now_iso();
+                rehome_tab(&mut tx, &updated).await?;
+                commit(tx, "reassign browser tab host").await?;
+                Ok(Some((updated, serde_json::Value::Object(changes))))
+            }
+        })
+        .await
+    }
+
+    /// Driving-client switch (REV-2 Model 10, `workspace.setBrowserClient`):
+    /// every open **claimed** tab (`owner_agent_id` set) of workspace `id`
+    /// not already hosted by `new_host` moves there. Returns each moved row
+    /// with its `changes` (`{ hostClientId }`), oldest first; unclaimed tabs
+    /// stay on their physical host.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails; nothing is
+    /// persisted in that case.
+    pub async fn reassign_claimed_browser_tabs(
+        &self,
+        id: &WorkspaceId,
+        new_host: &ClientId,
+    ) -> Result<Vec<(BrowserTab, serde_json::Value)>> {
+        let pool = self.write_pool().clone();
+        crate::with_write_txn_retry(|| {
+            let pool = pool.clone();
+            async move {
+                let mut tx = begin(&pool, "reassign claimed browser tabs").await?;
+                let rows = sqlx::query(&format!(
+                    "SELECT {COLUMNS} FROM browser_tab \
+                     WHERE workspace_id = ? AND closed_at IS NULL \
+                     AND owner_agent_id IS NOT NULL AND host_client_id <> ? \
+                     ORDER BY created_at, tab_id"
+                ))
+                .bind(&id.0)
+                .bind(&new_host.0)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("list claimed browser tabs failed: {e}")))?;
+                let mut moved = Vec::with_capacity(rows.len());
+                let now = now_iso();
+                for row in &rows {
+                    let mut tab = map_row(row)?.tab;
+                    tab.host_client_id = new_host.clone();
+                    tab.updated_at.clone_from(&now);
+                    rehome_tab(&mut tx, &tab).await?;
+                    moved.push((
+                        tab,
+                        serde_json::json!({ "hostClientId": new_host.0.clone() }),
+                    ));
+                }
+                commit(tx, "reassign claimed browser tabs").await?;
+                Ok(moved)
+            }
+        })
+        .await
+    }
+
     /// Host snapshot reconciliation (`browser.syncTabs`, REV-2 Model 6), one
     /// transaction for the whole reconcile. `snapshot` is the host's full tab
     /// set across workspaces (duplicate ids after the first are ignored). Per
@@ -356,6 +463,25 @@ async fn write_tab(conn: &mut SqliteConnection, tab: &BrowserTab) -> Result<()> 
     .execute(conn)
     .await
     .map_err(|e| Error::Internal(format!("write browser tab failed: {e}")))?;
+    Ok(())
+}
+
+/// The one write allowed to move an open row to another host: the daemon-
+/// initiated claim / driving-client migration (`reassign_*` above). Only the
+/// host, the owner and `updated_at` change; everything else stays as the
+/// previous host last reported it.
+async fn rehome_tab(conn: &mut SqliteConnection, tab: &BrowserTab) -> Result<()> {
+    sqlx::query(
+        "UPDATE browser_tab SET host_client_id = ?, owner_agent_id = ?, updated_at = ? \
+         WHERE tab_id = ? AND closed_at IS NULL",
+    )
+    .bind(&tab.host_client_id.0)
+    .bind(tab.owner_agent_id.as_ref().map(|a| a.0.as_str()))
+    .bind(&tab.updated_at)
+    .bind(&tab.tab_id)
+    .execute(conn)
+    .await
+    .map_err(|e| Error::Internal(format!("rehome browser tab failed: {e}")))?;
     Ok(())
 }
 

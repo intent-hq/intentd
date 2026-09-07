@@ -22,7 +22,19 @@
 //!      client reconnects right behind its own disconnect,
 //!   7. a workspace pinned via `workspace.setBrowserClient` routes an agent
 //!      `browser.exec` to the pinned client's eligible connection and fails
-//!      typed (no fallback) once that client is gone.
+//!      typed (no fallback) once that client is gone,
+//!   8. REV-2 Model 5 routing: an agent `browser.exec` goes to the
+//!      workspace's driving client (the host of its claimed tabs when
+//!      unpinned, even behind a first-connected client), the agent-path
+//!      `listTabs` is answered from the registry across hosts with no reverse
+//!      call, and `browser.navigateTab` routes an unclaimed tab to its
+//!      physical host,
+//!   9. `browser.closeTab` routes to the host while it is online, is a typed
+//!      offline error without `force`, and with `force` tombstones the row
+//!      (`browser:tab-closed`) once the host is gone,
+//!  10. a `claimTab` executed on the driving client re-homes the tab there
+//!      (`browser:tab-updated { changes: { hostClientId, ownerAgentId } }`)
+//!      and a later pin change migrates the claimed tab again.
 //!
 //! The wire contract of the pin RPCs themselves (`client.list`,
 //! `workspace.getBrowserClient` / `setBrowserClient`, their events and
@@ -163,6 +175,14 @@ fn assert_envelope(v: &Value, id: i64, method: &str) {
 }
 
 async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
+    send_request(ws, id, method, params).await;
+    await_response(ws, id, method).await
+}
+
+/// The send half of [`wss_rpc`]: fire `method`/`params` under `id` without
+/// waiting, so a test can play the routed target on *another* socket before
+/// collecting the caller's reply with [`await_response`].
+async fn send_request(ws: &mut PlainWs, id: i64, method: &str, params: Value) {
     let req = json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -172,6 +192,11 @@ async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Valu
     ws.send(Message::Text(req.to_string().into()))
         .await
         .unwrap();
+}
+
+/// The read half of [`wss_rpc`]: the response frame for `id` (envelope
+/// asserted), skipping unrelated frames and echoing pings inline.
+async fn await_response(ws: &mut PlainWs, id: i64, method: &str) -> Value {
     let deadline = Instant::now() + common::rpc_read_timeout();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -358,6 +383,21 @@ async fn await_registry_len(registry: &PrimaryReverseRegistry, expected_len: usi
     }
 }
 
+/// A host-reported tab object for `browser.upsertTab` (unclaimed unless the
+/// caller adds `ownerAgentId`).
+fn tab(tab_id: &str, url: &str) -> Value {
+    json!({ "tabId": tab_id, "url": url, "title": tab_id, "visibility": "visible" })
+}
+
+/// `workspace.create` over `ws`; returns the new workspace id.
+async fn create_workspace(ws: &mut PlainWs, id: i64, title: &str) -> String {
+    let created = wss_rpc(ws, id, "workspace.create", json!({ "title": title })).await;
+    created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("created id: {created}"))
+        .to_string()
+}
+
 /// Play the FE role for the primary client: answer the daemon-initiated
 /// `browser.exec` reverse RPC by echoing `result` under the rev id.
 async fn answer_reverse(ws: &mut PlainWs, dur: Duration, result: Value) -> Value {
@@ -397,14 +437,26 @@ async fn agent_browser_exec_routes_to_first_client_and_fails_over_on_disconnect(
         "both connections must be registered before the first reverse dispatch",
     );
 
+    // The tab an agent batch names must be a registered tab of the
+    // workspace (REV-2 Model 5): A hosts an unclaimed `tab-1`.
+    let ws_id = create_workspace(&mut a, 2, "Sticky").await;
+    let _ = wss_rpc(
+        &mut a,
+        3,
+        "browser.upsertTab",
+        json!({ "workspaceId": ws_id, "tab": tab("tab-1", "https://a.test/") }),
+    )
+    .await;
+
     // First round: call from the "agent" side. Client A is primary and must
     // see the reverse RPC; client B must see nothing.
     let call_a = tokio::spawn({
         let api = fx.api.clone();
+        let ws_id = ws_id.clone();
         async move {
             api.browser_exec(
-                WorkspaceId::from("ws-1"),
-                vec![json!({ "action": "listTabs" })],
+                WorkspaceId::from(ws_id.as_str()),
+                vec![json!({ "action": "getAccessibilityTree" })],
                 Some("tab-1".to_string()),
                 None,
             )
@@ -413,14 +465,14 @@ async fn agent_browser_exec_routes_to_first_client_and_fails_over_on_disconnect(
     });
     let fe_result = json!({
         "success": true,
-        "results": [{ "action": "listTabs", "success": true, "result": [] }]
+        "results": [{ "action": "getAccessibilityTree", "success": true, "result": "- root" }]
     });
     let forwarded = answer_reverse(&mut a, Duration::from_secs(2), fe_result).await;
     assert_eq!(forwarded["params"]["tabId"], "tab-1");
     // REV-1: attribution — the reverse-RPC params must carry `workspaceId`
     // (mirrors the client-triggered `browser.exec` contract in PROTOCOL
     // §5.14 so the FE sees a byte-identical envelope regardless of caller).
-    assert_eq!(forwarded["params"]["workspaceId"], "ws-1");
+    assert_eq!(forwarded["params"]["workspaceId"], ws_id.as_str());
     assert!(
         try_read_text(&mut b, Duration::from_millis(200))
             .await
@@ -428,7 +480,7 @@ async fn agent_browser_exec_routes_to_first_client_and_fails_over_on_disconnect(
         "secondary client must not see the reverse RPC while A is primary",
     );
     let out = call_a.await.expect("join").expect("ok");
-    assert_eq!(out["action"], "listTabs");
+    assert_eq!(out["action"], "getAccessibilityTree");
 
     // Failover: close client A and wait for the server to actually
     // deregister it before dispatching again — the definitive signal that
@@ -467,7 +519,7 @@ async fn agent_browser_exec_without_any_client_reports_no_client_error() {
         .api
         .browser_exec(
             WorkspaceId::from("ws-1"),
-            vec![json!({ "action": "listTabs" })],
+            vec![json!({ "action": "screenshot" })],
             None,
             None,
         )
@@ -553,7 +605,7 @@ async fn agent_browser_exec_skips_clients_without_the_browser_exec_capability() 
         .api
         .browser_exec(
             WorkspaceId::from("ws-1"),
-            vec![json!({ "action": "listTabs" })],
+            vec![json!({ "action": "screenshot" })],
             None,
             None,
         )
@@ -581,7 +633,7 @@ async fn agent_browser_exec_skips_clients_without_the_browser_exec_capability() 
         async move {
             api.browser_exec(
                 WorkspaceId::from("ws-1"),
-                vec![json!({ "action": "listTabs" })],
+                vec![json!({ "action": "screenshot" })],
                 None,
                 None,
             )
@@ -590,12 +642,12 @@ async fn agent_browser_exec_skips_clients_without_the_browser_exec_capability() 
     });
     let fe_result = json!({
         "success": true,
-        "results": [{ "action": "listTabs", "success": true, "result": [] }]
+        "results": [{ "action": "screenshot", "success": true, "result": { "base64": "..." } }]
     });
     let forwarded = answer_reverse(&mut desktop, Duration::from_secs(2), fe_result).await;
     assert_eq!(forwarded["params"]["workspaceId"], "ws-1");
     let out = call.await.expect("join").expect("ok");
-    assert_eq!(out["action"], "listTabs");
+    assert_eq!(out["action"], "screenshot");
     assert!(
         try_read_text(&mut ios, Duration::from_millis(200))
             .await
@@ -733,7 +785,7 @@ async fn pinned_target_offline_reports_typed_error_without_fallback() {
         async move {
             api.browser_exec(
                 WorkspaceId::from("ws-1"),
-                vec![json!({ "action": "listTabs" })],
+                vec![json!({ "action": "screenshot" })],
                 None,
                 None,
             )
@@ -742,7 +794,7 @@ async fn pinned_target_offline_reports_typed_error_without_fallback() {
     });
     let fe_result = json!({
         "success": true,
-        "results": [{ "action": "listTabs", "success": true, "result": [] }]
+        "results": [{ "action": "screenshot", "success": true, "result": { "base64": "..." } }]
     });
     answer_reverse(&mut a, Duration::from_secs(2), fe_result).await;
     call.await.expect("join").expect("ok");
@@ -1013,7 +1065,7 @@ async fn pinned_workspace_browser_exec_routes_to_pinned_client_and_fails_typed_w
         async move {
             api.browser_exec(
                 WorkspaceId::from(ws_id.as_str()),
-                vec![json!({ "action": "listTabs" })],
+                vec![json!({ "action": "screenshot" })],
                 None,
                 None,
             )
@@ -1022,12 +1074,12 @@ async fn pinned_workspace_browser_exec_routes_to_pinned_client_and_fails_typed_w
     });
     let fe_result = json!({
         "success": true,
-        "results": [{ "action": "listTabs", "success": true, "result": [] }]
+        "results": [{ "action": "screenshot", "success": true, "result": { "base64": "..." } }]
     });
     let forwarded = answer_reverse(&mut b, Duration::from_secs(2), fe_result).await;
     assert_eq!(forwarded["params"]["workspaceId"], ws_id.as_str());
     let out = call.await.expect("join").expect("ok");
-    assert_eq!(out["action"], "listTabs");
+    assert_eq!(out["action"], "screenshot");
     for (name, sock) in [("a", &mut a), ("aux", &mut aux)] {
         assert!(
             try_read_text(sock, Duration::from_millis(200))
@@ -1046,7 +1098,7 @@ async fn pinned_workspace_browser_exec_routes_to_pinned_client_and_fails_typed_w
         .api
         .browser_exec(
             WorkspaceId::from(ws_id.as_str()),
-            vec![json!({ "action": "listTabs" })],
+            vec![json!({ "action": "screenshot" })],
             None,
             None,
         )
@@ -1056,9 +1108,9 @@ async fn pinned_workspace_browser_exec_routes_to_pinned_client_and_fails_typed_w
         matches!(
             &err,
             intent_core::Error::Internal(m)
-                if m == "browser.exec: pinned browser client \"Intent Desktop @ desktop-b\" (desktop-b) is not connected"
+                if m == "browser.exec: browser client \"Intent Desktop @ desktop-b\" (desktop-b) for this workspace is not connected"
         ),
-        "-32603 with the pinned-offline message: {err:?}"
+        "-32603 with the driving-client-offline message (Model 5): {err:?}"
     );
     assert!(
         try_read_text(&mut a, Duration::from_millis(200))
@@ -1066,6 +1118,350 @@ async fn pinned_workspace_browser_exec_routes_to_pinned_client_and_fails_typed_w
             .is_none(),
         "no silent fallback to desktop-a"
     );
+
+    fx.ws.stop().await;
+}
+
+/// REV-2 Model 5 routing over two hosts. desktop-a connects first (the
+/// default target) but desktop-b hosts the workspace's claimed tab, so
+/// desktop-b is the unpinned workspace's **driving client**: an agent
+/// `browser.exec` naming desktop-a's tab still dispatches to desktop-b
+/// (one host per workspace, no per-tab lookup). The agent-path `listTabs`
+/// is answered from the registry — both hosts' tabs, decorated with
+/// `hostClientId` / `hostConnected` — and neither socket sees a reverse
+/// call. `browser.navigateTab` on the unclaimed tab routes to its physical
+/// host (desktop-a) as a `navigate` action carrying the tab's attribution.
+#[tokio::test]
+async fn agent_browser_exec_routes_to_the_claimed_tabs_host_and_list_tabs_aggregates_hosts() {
+    let fx = boot().await;
+    let mut a = connect(fx.port).await;
+    let _ = wss_rpc(&mut a, 1, "client.hello", hello("desktop-a", true)).await;
+    let mut b = connect(fx.port).await;
+    let _ = wss_rpc(&mut b, 1, "client.hello", hello("desktop-b", true)).await;
+    assert_eq!(fx.registry.len(), 2);
+
+    let ws_id = create_workspace(&mut a, 2, "Two hosts").await;
+    let _ = wss_rpc(
+        &mut a,
+        3,
+        "browser.upsertTab",
+        json!({ "workspaceId": ws_id, "tab": tab("tab-a", "https://a.test/") }),
+    )
+    .await;
+    let mut claimed = tab("tab-b", "https://b.test/");
+    claimed["ownerAgentId"] = json!("agent-1");
+    claimed["ownerAgentName"] = json!("Agent One");
+    let _ = wss_rpc(
+        &mut b,
+        2,
+        "browser.upsertTab",
+        json!({ "workspaceId": ws_id, "tab": claimed }),
+    )
+    .await;
+
+    // (f) listTabs: answered by the daemon across hosts, no reverse RPC.
+    let listed = fx
+        .api
+        .browser_exec(
+            WorkspaceId::from(ws_id.as_str()),
+            vec![json!({ "action": "listTabs" })],
+            None,
+            None,
+        )
+        .await
+        .expect("listTabs from the registry");
+    assert_eq!(listed["action"], "listTabs");
+    assert_eq!(listed["success"], true);
+    let entries = listed["result"].as_array().expect("tabs array");
+    let mut hosts: Vec<(&str, &str, bool, &Value)> = entries
+        .iter()
+        .map(|e| {
+            (
+                e["tabId"].as_str().unwrap(),
+                e["hostClientId"].as_str().unwrap(),
+                e["hostConnected"].as_bool().unwrap(),
+                &e["ownerAgentId"],
+            )
+        })
+        .collect();
+    hosts.sort_unstable_by_key(|h| h.0);
+    assert_eq!(
+        hosts,
+        [
+            ("tab-a", "desktop-a", true, &Value::Null),
+            ("tab-b", "desktop-b", true, &json!("agent-1")),
+        ],
+        "{listed}"
+    );
+    for (name, sock) in [("a", &mut a), ("b", &mut b)] {
+        assert!(
+            try_read_text(sock, Duration::from_millis(200))
+                .await
+                .is_none(),
+            "{name} must not see a reverse call for the registry-answered listTabs"
+        );
+    }
+
+    // (b) An agent batch — even one naming desktop-a's own tab — goes to the
+    // driving client desktop-b (host of the claimed tab), not first-connected
+    // desktop-a.
+    let call = tokio::spawn({
+        let api = fx.api.clone();
+        let ws_id = ws_id.clone();
+        async move {
+            api.browser_exec(
+                WorkspaceId::from(ws_id.as_str()),
+                vec![json!({ "action": "screenshot" })],
+                Some("tab-a".to_string()),
+                Some(intent_core::AgentId::from("agent-1")),
+            )
+            .await
+        }
+    });
+    let fe_result = json!({
+        "success": true,
+        "results": [{ "action": "screenshot", "success": true, "result": { "base64": "..." } }]
+    });
+    let forwarded = answer_reverse(&mut b, Duration::from_secs(2), fe_result).await;
+    assert_eq!(forwarded["params"]["workspaceId"], ws_id.as_str());
+    assert_eq!(forwarded["params"]["tabId"], "tab-a");
+    assert_eq!(forwarded["params"]["agentId"], "agent-1");
+    let out = call.await.expect("join").expect("ok");
+    assert_eq!(out["action"], "screenshot");
+    assert!(
+        try_read_text(&mut a, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "first-connected desktop-a is not the driving client"
+    );
+
+    // An unknown tabId is rejected before any dispatch.
+    let err = fx
+        .api
+        .browser_exec(
+            WorkspaceId::from(ws_id.as_str()),
+            vec![json!({ "action": "screenshot", "tabId": "tab-nope" })],
+            None,
+            None,
+        )
+        .await
+        .expect_err("unknown tab");
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m) if m == "browser.exec: tab not found: tab-nope"),
+        "{err:?}"
+    );
+
+    // `browser.navigateTab` on the unclaimed tab-a routes to its physical
+    // host desktop-a as a `navigate` action; desktop-b (the caller) only
+    // sees its own response.
+    send_request(
+        &mut b,
+        3,
+        "browser.navigateTab",
+        json!({ "tabId": "tab-a", "url": "https://a.test/next" }),
+    )
+    .await;
+    let fe_result = json!({
+        "success": true,
+        "results": [{ "action": "navigate", "success": true, "result": { "url": "https://a.test/next" } }]
+    });
+    let forwarded = answer_reverse(&mut a, Duration::from_secs(2), fe_result).await;
+    assert_eq!(forwarded["params"]["workspaceId"], ws_id.as_str());
+    assert_eq!(forwarded["params"]["tabId"], "tab-a");
+    assert_eq!(forwarded["params"]["actions"][0]["action"], "navigate");
+    assert_eq!(
+        forwarded["params"]["actions"][0]["url"],
+        "https://a.test/next"
+    );
+    let res = await_response(&mut b, 3, "browser.navigateTab").await;
+    assert_eq!(res["result"]["action"], "navigate", "{res}");
+    assert_eq!(res["result"]["result"]["url"], "https://a.test/next");
+
+    fx.ws.stop().await;
+}
+
+/// `browser.closeTab` routing and the daemon-side tombstone (REV-2 Model 6):
+/// while the host is online the close is a routed `closeTab` action; once
+/// the host is gone a plain close is the typed `-32603` offline error and a
+/// `force` close tombstones the row, publishing `browser:tab-closed` and
+/// dropping the tab from the registry.
+#[tokio::test]
+async fn close_tab_routes_to_the_host_and_force_tombstones_an_offline_host() {
+    let fx = boot().await;
+    let mut a = connect(fx.port).await;
+    let _ = wss_rpc(&mut a, 1, "client.hello", hello("desktop-a", true)).await;
+    let mut b = connect(fx.port).await;
+    let _ = wss_rpc(&mut b, 1, "client.hello", hello("desktop-b", true)).await;
+
+    let ws_id = create_workspace(&mut a, 2, "Close routing").await;
+    let mut sub = connect(fx.port).await;
+    let _ = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["browser:tab-closed"], "workspaceId": ws_id }),
+    )
+    .await;
+    let _ = wss_rpc(
+        &mut b,
+        2,
+        "browser.upsertTab",
+        json!({ "workspaceId": ws_id, "tab": tab("tab-b", "https://b.test/") }),
+    )
+    .await;
+
+    // Online: routed to desktop-b, which acknowledges.
+    send_request(&mut a, 3, "browser.closeTab", json!({ "tabId": "tab-b" })).await;
+    let fe_result = json!({
+        "success": true,
+        "results": [{ "action": "closeTab", "success": true, "result": { "closed": true } }]
+    });
+    let forwarded = answer_reverse(&mut b, Duration::from_secs(2), fe_result).await;
+    assert_eq!(forwarded["params"]["tabId"], "tab-b");
+    assert_eq!(forwarded["params"]["actions"][0]["action"], "closeTab");
+    let res = await_response(&mut a, 3, "browser.closeTab").await;
+    assert_eq!(res["result"], json!({ "ok": true }), "{res}");
+
+    // The host reports the close itself normally; here it goes away
+    // instead, leaving the row open and its host offline.
+    close_and_await_deregistration(b, &fx.registry, 2).await;
+    let res = wss_rpc(&mut a, 4, "browser.closeTab", json!({ "tabId": "tab-b" })).await;
+    assert_eq!(res["error"]["code"], -32603, "{res}");
+    assert_eq!(
+        res["error"]["message"],
+        "internal error: browser.closeTab: browser client \"Intent Desktop @ desktop-b\" (desktop-b) for this workspace is not connected"
+    );
+
+    let res = wss_rpc(
+        &mut a,
+        5,
+        "browser.closeTab",
+        json!({ "tabId": "tab-b", "force": true }),
+    )
+    .await;
+    assert_eq!(res["result"], json!({ "ok": true }), "{res}");
+    let ev = await_event(&mut sub, "browser:tab-closed", Duration::from_secs(2)).await;
+    assert_eq!(ev["workspaceId"], ws_id.as_str());
+    assert_eq!(ev["data"]["tab"]["tabId"], "tab-b");
+    assert_eq!(ev["data"]["tab"]["hostClientId"], "desktop-b");
+    let listed = wss_rpc(
+        &mut a,
+        6,
+        "browser.listTabs",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(listed["result"]["tabs"], json!([]), "{listed}");
+    // A tombstoned id is unknown to the tab-addressed methods.
+    let res = wss_rpc(&mut a, 7, "browser.closeTab", json!({ "tabId": "tab-b" })).await;
+    assert_eq!(res["error"]["code"], -32602, "{res}");
+
+    fx.ws.stop().await;
+}
+
+/// Claim migration (REV-2 Model 5 & 10). desktop-a is the unpinned
+/// workspace's driving client (first connected, no claimed tabs yet), so an
+/// agent `claimTab` on desktop-b's unclaimed tab executes on desktop-a; once
+/// the FE reports success the daemon re-homes the row to desktop-a with the
+/// agent as owner (`browser:tab-updated { changes: { hostClientId,
+/// ownerAgentId } }`). Pinning the workspace to desktop-b afterwards
+/// migrates the claimed tab there again.
+#[tokio::test]
+async fn successful_claim_rehomes_the_tab_to_the_driving_client_and_pin_changes_migrate() {
+    let fx = boot().await;
+    let mut a = connect(fx.port).await;
+    let _ = wss_rpc(&mut a, 1, "client.hello", hello("desktop-a", true)).await;
+    let mut b = connect(fx.port).await;
+    let _ = wss_rpc(&mut b, 1, "client.hello", hello("desktop-b", true)).await;
+
+    let ws_id = create_workspace(&mut a, 2, "Claim migration").await;
+    let mut sub = connect(fx.port).await;
+    let _ = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["browser:tab-updated"], "workspaceId": ws_id }),
+    )
+    .await;
+    let _ = wss_rpc(
+        &mut b,
+        2,
+        "browser.upsertTab",
+        json!({ "workspaceId": ws_id, "tab": tab("tab-b", "https://b.test/") }),
+    )
+    .await;
+
+    let call = tokio::spawn({
+        let api = fx.api.clone();
+        let ws_id = ws_id.clone();
+        async move {
+            api.browser_exec(
+                WorkspaceId::from(ws_id.as_str()),
+                vec![json!({ "action": "claimTab", "tabId": "tab-b", "width": 1280 })],
+                None,
+                Some(intent_core::AgentId::from("agent-1")),
+            )
+            .await
+        }
+    });
+    let fe_result = json!({
+        "success": true,
+        "results": [{ "action": "claimTab", "success": true, "result": { "tabId": "tab-b" } }]
+    });
+    let forwarded = answer_reverse(&mut a, Duration::from_secs(2), fe_result).await;
+    assert_eq!(forwarded["params"]["actions"][0]["action"], "claimTab");
+    assert_eq!(forwarded["params"]["agentId"], "agent-1");
+    let out = call.await.expect("join").expect("ok");
+    assert_eq!(out["action"], "claimTab");
+    assert!(
+        try_read_text(&mut b, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "the claim executes on the driving client, not the tab's physical host"
+    );
+
+    let ev = await_event(&mut sub, "browser:tab-updated", Duration::from_secs(2)).await;
+    assert_eq!(ev["data"]["tab"]["tabId"], "tab-b");
+    assert_eq!(ev["data"]["tab"]["hostClientId"], "desktop-a");
+    assert_eq!(ev["data"]["tab"]["ownerAgentId"], "agent-1");
+    assert_eq!(
+        ev["data"]["changes"],
+        json!({ "hostClientId": "desktop-a", "ownerAgentId": "agent-1" }),
+        "{ev}"
+    );
+    assert_eq!(ev["actor"]["id"], "desktop-a", "{ev}");
+
+    // The migrated claim now makes desktop-a the driving client by claimed
+    // host too; pinning desktop-b moves the claimed tab back.
+    let set = wss_rpc(
+        &mut a,
+        3,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": ws_id, "clientId": "desktop-b" }),
+    )
+    .await;
+    assert!(set.get("error").is_none(), "{set}");
+    let ev = await_event(&mut sub, "browser:tab-updated", Duration::from_secs(2)).await;
+    assert_eq!(ev["data"]["tab"]["tabId"], "tab-b");
+    assert_eq!(ev["data"]["tab"]["hostClientId"], "desktop-b");
+    assert_eq!(ev["data"]["tab"]["ownerAgentId"], "agent-1");
+    assert_eq!(
+        ev["data"]["changes"],
+        json!({ "hostClientId": "desktop-b" }),
+        "{ev}"
+    );
+    let listed = wss_rpc(
+        &mut a,
+        4,
+        "browser.listTabs",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["tabs"][0]["hostClientId"], "desktop-b",
+        "{listed}"
+    );
+    assert_eq!(listed["result"]["tabs"][0]["ownerAgentId"], "agent-1");
 
     fx.ws.stop().await;
 }
