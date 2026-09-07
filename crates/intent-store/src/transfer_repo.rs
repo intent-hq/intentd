@@ -465,9 +465,10 @@ impl Store {
             .map_err(|e| Error::Internal(format!("materialize imported provenance failed: {e}")))?;
 
             let session_rows = sqlx::query(
-                "SELECT id, COALESCE(NULLIF(resolved_model,''), NULLIF(model,''), 'unknown') AS model, \
-                 token_usage, token_usage_baseline FROM agent_session \
-                 WHERE id IN (SELECT value FROM json_each(?))",
+                "SELECT s.id, COALESCE(NULLIF(s.resolved_model,''), NULLIF(s.model,''), 'unknown') AS model, \
+                 s.token_usage, s.token_usage_baseline FROM agent_session s \
+                 WHERE s.id IN (SELECT value FROM json_each(?)) \
+                 AND NOT EXISTS (SELECT 1 FROM agent_usage_cell c WHERE c.agent_id=s.id)",
             )
             .bind(&imported_agent_ids_json)
             .fetch_all(&mut *tx)
@@ -941,10 +942,25 @@ mod tests {
                 ],
             ),
         ];
+        assert!(
+            rows.iter().all(|(table, _)| table != "agent_usage_cell"),
+            "pre-0115 archive has no materialized usage cells"
+        );
         store
             .transfer_import_rows(&rows)
             .await
             .expect("import archive");
+
+        let imported_usage = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("read imported legacy usage");
+        assert_eq!(imported_usage[0].5.len(), 1);
+        assert_eq!(imported_usage[0].5[0].model, "legacy-model");
+        assert_eq!(
+            imported_usage[0].5[0].reported_totals.input_tokens, 70,
+            "legacy session snapshot seeds its missing usage cell"
+        );
 
         store
             .set_agent_session_token_usage(
@@ -976,6 +992,68 @@ mod tests {
                 "legacy and appended rows count exactly once"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn transfer_round_trip_does_not_seed_current_model_when_modern_cells_exist() {
+        let src_db = TempDb::new();
+        let src = Store::open(&src_db.path).await.expect("open source");
+        let t = "2026-01-01T00:00:00Z";
+        let ws_id = WorkspaceId("ws-modern-model-switch".to_string());
+        let agent_id = AgentId("agent-modern-model-switch".to_string());
+        run(
+            &src,
+            format!(
+                "INSERT INTO workspace (id, title, branch, created_at, updated_at) \
+                 VALUES ('{}', 'Modern', 'main', '{t}', '{t}')",
+                ws_id.0
+            ),
+        )
+        .await;
+        run(
+            &src,
+            format!(
+                "INSERT INTO agent_session \
+                 (id, workspace_id, name, status, model, created_at, updated_at) \
+                 VALUES ('{}', '{}', 'Modern', 'idle', 'model-a', '{t}', '{t}')",
+                agent_id.0, ws_id.0
+            ),
+        )
+        .await;
+        src.set_agent_session_token_usage(
+            &ws_id,
+            &agent_id,
+            &TokenUsageTotals {
+                input_tokens: 70,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("persist model-a usage");
+        src.set_agent_session_model(&ws_id, &agent_id, "model-b", None, t)
+            .await
+            .expect("switch model without a new turn");
+
+        let exported = src.transfer_export_rows(&ws_id).await.expect("export");
+        let exported_cells = exported
+            .iter()
+            .find(|(table, _)| table == "agent_usage_cell")
+            .expect("usage-cell table");
+        assert_eq!(exported_cells.1.len(), 1, "modern archive carries one cell");
+
+        let dst_db = TempDb::new();
+        let dst = Store::open(&dst_db.path).await.expect("open target");
+        dst.transfer_import_rows(&exported).await.expect("import");
+        let usage = dst
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("read imported usage");
+        let cells: Vec<_> = usage[0]
+            .5
+            .iter()
+            .map(|cell| (cell.model.as_str(), cell.reported_totals.input_tokens))
+            .collect();
+        assert_eq!(cells, [("model-a", 70)]);
     }
 
     /// The import transaction is atomic: a batch whose LAST table row
