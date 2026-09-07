@@ -7938,7 +7938,7 @@ async fn wss_semantic_map_projects_fresh_source_events_once() {
         .await
         .expect("publish tool call");
 
-    let mut pushed = tokio::time::timeout(Duration::from_millis(1_000), async {
+    let mut pushed = tokio::time::timeout(Duration::from_secs(1), async {
         let mut pushed = Vec::new();
         while pushed.len() < 2 {
             match subscriber.next().await {
