@@ -1883,8 +1883,9 @@ async fn cross_workspace_list_siblings_scopes_to_repository() {
 /// Workspaces sharing a GitHub owner/name are siblings regardless of their
 /// local `repositoryPath` (self-contained checkouts and direct clones give
 /// each workspace a distinct source path). Owner/name match case-insensitively
-/// and tolerate a `.git` suffix on the name; a different GitHub repo at a
-/// different path is not a sibling.
+/// and tolerate a `.git` suffix on the name (in any case, so `INTENT.GIT`
+/// matches `intent`); a different GitHub repo at a different path is not a
+/// sibling.
 #[tokio::test]
 async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
     let tmp = TempDb::new();
@@ -1903,6 +1904,7 @@ async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
     let other_path = WorkspaceId::from("ws-other-path");
     let case_only = WorkspaceId::from("ws-case-only");
     let git_suffix = WorkspaceId::from("ws-git-suffix");
+    let upper_git_suffix = WorkspaceId::from("ws-upper-git-suffix");
     let other_repo = WorkspaceId::from("ws-other-repo");
     let same_owner_other_name = WorkspaceId::from("ws-same-owner");
     for w in [
@@ -1929,6 +1931,12 @@ async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
             Some("/clones/intent.git"),
             Some("intent-hq"),
             Some("intent.git"),
+        ),
+        mk(
+            &upper_git_suffix,
+            Some("/clones/INTENT.GIT"),
+            Some("INTENT-HQ"),
+            Some("INTENT.GIT"),
         ),
         mk(
             &other_repo,
@@ -1958,7 +1966,15 @@ async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
         .map(|s| s["id"].as_str().unwrap().to_string())
         .collect();
     ids.sort();
-    assert_eq!(ids, vec!["ws-case-only", "ws-git-suffix", "ws-other-path"]);
+    assert_eq!(
+        ids,
+        vec![
+            "ws-case-only",
+            "ws-git-suffix",
+            "ws-other-path",
+            "ws-upper-git-suffix"
+        ]
+    );
 
     // The access gate uses the same predicate as the listing.
     svc.cross_workspace_list_notes(caller.clone(), other_path)
@@ -1967,6 +1983,9 @@ async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
     svc.cross_workspace_list_notes(caller.clone(), case_only)
         .await
         .expect("case-only difference is readable");
+    svc.cross_workspace_list_notes(caller.clone(), upper_git_suffix)
+        .await
+        .expect("upper-case .GIT suffix is stripped after lowercasing");
     for denied in [other_repo, same_owner_other_name] {
         let err = svc
             .cross_workspace_list_notes(caller.clone(), denied)

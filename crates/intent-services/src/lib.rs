@@ -9296,16 +9296,17 @@ async fn sibling_workspace_or_throw(
 
 /// Normalized GitHub `(owner, name)` for sibling matching: both parts
 /// non-empty, lowercased (GitHub owner/repo names are case-insensitive), with a
-/// trailing `.git` stripped from the name. `None` when the workspace has no
-/// complete GitHub identity (local-only repo, or not yet backfilled).
+/// trailing `.git` stripped from the lowercased name so `INTENT.GIT` matches
+/// `intent`. `None` when the workspace has no complete GitHub identity
+/// (local-only repo, or not yet backfilled).
 fn github_repository_identity(ws: &Workspace) -> Option<(String, String)> {
-    let owner = ws.repository_owner.as_deref()?.trim();
-    let name = ws.repository_name.as_deref()?.trim();
-    let name = name.strip_suffix(".git").unwrap_or(name);
+    let owner = ws.repository_owner.as_deref()?.trim().to_ascii_lowercase();
+    let name = ws.repository_name.as_deref()?.trim().to_ascii_lowercase();
+    let name = name.strip_suffix(".git").unwrap_or(&name);
     if owner.is_empty() || name.is_empty() {
         return None;
     }
-    Some((owner.to_ascii_lowercase(), name.to_ascii_lowercase()))
+    Some((owner, name.to_string()))
 }
 
 fn nonempty_repository_path(ws: &Workspace) -> Option<&str> {
