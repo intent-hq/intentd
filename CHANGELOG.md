@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.36] - 2026-09-07
+
+### 🧪 Testing
+
+- *(services)* Wait for cat echo to settle before snapshotting terminal buffer ([#1771](https://github.com/intent-hq/intentd/pull/1771))
+
+
 ## [0.9.35] - 2026-09-07
 
 ### 🚀 Features
