@@ -7904,6 +7904,7 @@ async fn wss_semantic_map_projects_fresh_source_events_once() {
         name: Some("Live Mapper".to_string()),
         ..Default::default()
     };
+    let live_started = std::time::Instant::now();
     let changed = srv
         .bus
         .publish(&NewEvent {
@@ -7937,27 +7938,34 @@ async fn wss_semantic_map_projects_fresh_source_events_once() {
         .await
         .expect("publish tool call");
 
-    let mut pushed = Vec::new();
-    while pushed.len() < 2 {
-        let frame = tokio::time::timeout(Duration::from_secs(2), subscriber.next())
-            .await
-            .expect("live map activity timeout");
-        match frame {
-            Some(Ok(Message::Text(text))) => {
-                let value: Value = serde_json::from_str(&text).expect("map activity json");
-                if value["method"] == "events.event" {
-                    assert_eq!(value["params"]["event"]["type"], "map:activity");
-                    pushed.push(value["params"]["event"]["data"].clone());
+    let mut pushed = tokio::time::timeout(Duration::from_millis(1_000), async {
+        let mut pushed = Vec::new();
+        while pushed.len() < 2 {
+            match subscriber.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let value: Value = serde_json::from_str(&text).expect("map activity json");
+                    if value["method"] == "events.event" {
+                        assert_eq!(value["params"]["event"]["type"], "map:activity");
+                        pushed.push(value["params"]["event"]["data"].clone());
+                    }
                 }
+                Some(Ok(Message::Ping(payload))) => subscriber
+                    .send(Message::Pong(payload))
+                    .await
+                    .expect("map activity pong"),
+                Some(Ok(_)) => {}
+                other => panic!("expected live map activity, got {other:?}"),
             }
-            Some(Ok(Message::Ping(payload))) => subscriber
-                .send(Message::Pong(payload))
-                .await
-                .expect("map activity pong"),
-            Some(Ok(_)) => {}
-            other => panic!("expected live map activity, got {other:?}"),
         }
-    }
+        pushed
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "live map activity exceeded the 1000 ms arrival bound (measured latency: {} ms)",
+            live_started.elapsed().as_millis()
+        )
+    });
     pushed.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
     let by_id = pushed
         .iter()
@@ -8004,6 +8012,92 @@ async fn wss_semantic_map_projects_fresh_source_events_once() {
         .collect::<std::collections::HashSet<_>>();
     assert!(replay_ids.contains(changed.id.as_str()), "{replay}");
     assert!(replay_ids.contains(tool_call.id.as_str()), "{replay}");
+
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_semantic_map_manifest_lifecycle_invalidates_cache() {
+    let srv = start(WsOptions::default()).await;
+    let ws = WorkspaceId::new();
+    let root = test_tempdir("intentd-wss-map-lifecycle-");
+    std::fs::create_dir_all(root.path().join("src")).expect("mkdir src");
+    std::fs::write(root.path().join("src/lib.rs"), "pub fn structural() {}\n").expect("write src");
+    let mut workspace = fixture_workspace(&ws);
+    workspace.worktree_path = Some(root.path().to_string_lossy().into_owned());
+    srv.store
+        .insert_workspace(&workspace)
+        .await
+        .expect("insert workspace");
+
+    let manifest = serde_json::json!({
+        "version": 1,
+        "regions": [{
+            "id":"curated-v1", "label":"Curated v1", "responsibility":"First map",
+            "anchor":[0.5,0.5], "paths":["src/**"]
+        }],
+        "crossings": []
+    });
+    let set = serde_json::json!({
+        "jsonrpc":"2.0", "id":1, "method":"map.setManifest",
+        "params":{"workspaceId":ws.0,"json":manifest}
+    });
+    let set = wss_call(srv.port, srv.cfg.clone(), &set.to_string()).await;
+    let note_id = set["result"]["noteId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("manifest note id: {set}"));
+    let get = |id| {
+        serde_json::json!({
+            "jsonrpc":"2.0", "id":id, "method":"map.get",
+            "params":{"workspaceId":ws.0}
+        })
+        .to_string()
+    };
+    let curated = wss_call(srv.port, srv.cfg.clone(), &get(2)).await;
+    assert_eq!(curated["result"]["source"], "curated", "{curated}");
+    assert_eq!(
+        curated["result"]["manifest"]["regions"][0]["id"], "curated-v1",
+        "{curated}"
+    );
+
+    let delete = serde_json::json!({
+        "jsonrpc":"2.0", "id":3, "method":"note.delete",
+        "params":{"workspaceId":ws.0,"noteId":note_id}
+    });
+    let deleted = wss_call(srv.port, srv.cfg.clone(), &delete.to_string()).await;
+    assert_eq!(deleted["result"]["ok"], true, "{deleted}");
+    let structural = wss_call(srv.port, srv.cfg.clone(), &get(4)).await;
+    assert_eq!(structural["result"]["source"], "structural", "{structural}");
+    assert_eq!(
+        structural["result"]["manifest"]["regions"],
+        serde_json::json!([{
+            "id":"src", "label":"Src",
+            "responsibility":"This is where files under src live.",
+            "anchor":[0.5,0.5], "paths":["src/**"]
+        }]),
+        "structural fallback region: {structural}"
+    );
+
+    let replacement = serde_json::json!({
+        "version": 1,
+        "regions": [{
+            "id":"curated-v2", "label":"Curated v2", "responsibility":"Replacement map",
+            "anchor":[0.5,0.5], "paths":["src/**"]
+        }],
+        "crossings": []
+    });
+    let reset = serde_json::json!({
+        "jsonrpc":"2.0", "id":5, "method":"map.setManifest",
+        "params":{"workspaceId":ws.0,"json":replacement}
+    });
+    let reset = wss_call(srv.port, srv.cfg.clone(), &reset.to_string()).await;
+    assert_eq!(reset["result"]["ok"], true, "{reset}");
+    let refreshed = wss_call(srv.port, srv.cfg.clone(), &get(6)).await;
+    assert_eq!(refreshed["result"]["source"], "curated", "{refreshed}");
+    assert_eq!(
+        refreshed["result"]["manifest"]["regions"][0]["id"], "curated-v2",
+        "replacement manifest must invalidate the structural cache: {refreshed}"
+    );
 
     srv.ws.stop().await;
 }
