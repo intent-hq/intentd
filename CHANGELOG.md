@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.38] - 2026-09-07
+
+### 🧪 Testing
+
+- *(services)* Observe ACP terminal output before letting the child exit ([#1776](https://github.com/intent-hq/intentd/pull/1776))
+
+
 ## [0.9.37] - 2026-09-07
 
 ### 🚀 Features
