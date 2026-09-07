@@ -1830,8 +1830,9 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
     }
 }
 
-/// `crossWorkspace.listSiblings` returns only same-`repositoryPath` peers
-/// (self filtered out, other-repo filtered out) with the `PascalCase` status.
+/// `crossWorkspace.listSiblings` returns only same-repository peers — here
+/// matched by `repositoryPath` (self filtered out, other-repo filtered out)
+/// — with the `PascalCase` status.
 #[tokio::test]
 async fn cross_workspace_list_siblings_scopes_to_repository() {
     let tmp = TempDb::new();
@@ -1879,23 +1880,246 @@ async fn cross_workspace_list_siblings_scopes_to_repository() {
     assert!(arr[0]["createdAt"].is_string());
 }
 
-/// A caller with no `repositoryPath` cannot list siblings (mirrors the TS
-/// "not associated with a repository" error).
+/// Workspaces sharing a GitHub owner/name are siblings regardless of their
+/// local `repositoryPath` (self-contained checkouts and direct clones give
+/// each workspace a distinct source path). Owner/name match case-insensitively
+/// and tolerate a `.git` suffix on the name (in any case, so `INTENT.GIT`
+/// matches `intent`); a different GitHub repo at a different path is not a
+/// sibling.
+#[tokio::test]
+async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mk = |id: &WorkspaceId, repo: Option<&str>, owner: Option<&str>, name: Option<&str>| {
+        let mut w = workspace(id);
+        w.title = id.to_string();
+        w.repository_path = repo.map(str::to_string);
+        w.repository_owner = owner.map(str::to_string);
+        w.repository_name = name.map(str::to_string);
+        w
+    };
+
+    let caller = WorkspaceId::from("ws-caller");
+    let other_path = WorkspaceId::from("ws-other-path");
+    let case_only = WorkspaceId::from("ws-case-only");
+    let git_suffix = WorkspaceId::from("ws-git-suffix");
+    let upper_git_suffix = WorkspaceId::from("ws-upper-git-suffix");
+    let other_repo = WorkspaceId::from("ws-other-repo");
+    let same_owner_other_name = WorkspaceId::from("ws-same-owner");
+    for w in [
+        mk(
+            &caller,
+            Some("/root/ws-caller/intent"),
+            Some("intent-hq"),
+            Some("intent"),
+        ),
+        mk(
+            &other_path,
+            Some("/root/ws-other-path/intent"),
+            Some("intent-hq"),
+            Some("intent"),
+        ),
+        mk(
+            &case_only,
+            Some("/clones/Intent"),
+            Some("Intent-HQ"),
+            Some("INTENT"),
+        ),
+        mk(
+            &git_suffix,
+            Some("/clones/intent.git"),
+            Some("intent-hq"),
+            Some("intent.git"),
+        ),
+        mk(
+            &upper_git_suffix,
+            Some("/clones/INTENT.GIT"),
+            Some("INTENT-HQ"),
+            Some("INTENT.GIT"),
+        ),
+        mk(
+            &other_repo,
+            Some("/root/ws-other-repo/intentd"),
+            Some("intent-hq"),
+            Some("intentd"),
+        ),
+        mk(
+            &same_owner_other_name,
+            Some("/root/ws-same-owner/other"),
+            Some("someone-else"),
+            Some("intent"),
+        ),
+    ] {
+        store.insert_workspace(&w).await.unwrap();
+    }
+
+    let svc = Services::new(store);
+    let v = svc
+        .cross_workspace_list_siblings(caller.clone())
+        .await
+        .expect("siblings");
+    let mut ids: Vec<String> = v
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "ws-case-only",
+            "ws-git-suffix",
+            "ws-other-path",
+            "ws-upper-git-suffix"
+        ]
+    );
+
+    // The access gate uses the same predicate as the listing.
+    svc.cross_workspace_list_notes(caller.clone(), other_path)
+        .await
+        .expect("same identity, different path is readable");
+    svc.cross_workspace_list_notes(caller.clone(), case_only)
+        .await
+        .expect("case-only difference is readable");
+    svc.cross_workspace_list_notes(caller.clone(), upper_git_suffix)
+        .await
+        .expect("upper-case .GIT suffix is stripped after lowercasing");
+    for denied in [other_repo, same_owner_other_name] {
+        let err = svc
+            .cross_workspace_list_notes(caller.clone(), denied)
+            .await
+            .expect_err("denied");
+        match err {
+            Error::Internal(m) => assert!(m.contains("Access denied"), "{m}"),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+}
+
+/// Rows without a GitHub identity (local-only repos, or rows the
+/// owner/name backfill has not reached yet) still resolve siblings by an
+/// identical `repositoryPath` — even when only one side carries owner/name.
+#[tokio::test]
+async fn cross_workspace_list_siblings_falls_back_to_repository_path() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mk = |id: &WorkspaceId, repo: Option<&str>, owner: Option<&str>, name: Option<&str>| {
+        let mut w = workspace(id);
+        w.repository_path = repo.map(str::to_string);
+        w.repository_owner = owner.map(str::to_string);
+        w.repository_name = name.map(str::to_string);
+        w
+    };
+
+    // Caller has an identity; the sibling at the same path has none yet.
+    let caller = WorkspaceId::from("ws-caller");
+    let unbackfilled = WorkspaceId::from("ws-unbackfilled");
+    // Local-only pair: neither side has an identity, same path.
+    let local_a = WorkspaceId::from("ws-local-a");
+    let local_b = WorkspaceId::from("ws-local-b");
+    // Same path but only the owner (no name) — identity incomplete, path wins.
+    let partial = WorkspaceId::from("ws-partial");
+    // Different path, no identity: never a sibling of the caller.
+    let unrelated = WorkspaceId::from("ws-unrelated");
+    for w in [
+        mk(&caller, Some("/repo/a"), Some("intent-hq"), Some("intent")),
+        mk(&unbackfilled, Some("/repo/a"), None, None),
+        mk(&local_a, Some("/repo/local"), None, None),
+        mk(&local_b, Some("/repo/local"), None, None),
+        mk(&partial, Some("/repo/a"), Some("intent-hq"), None),
+        mk(&unrelated, Some("/repo/z"), None, None),
+    ] {
+        store.insert_workspace(&w).await.unwrap();
+    }
+
+    let svc = Services::new(store);
+
+    let list_ids = |v: serde_json::Value| {
+        let mut ids: Vec<String> = v
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    let v = svc
+        .cross_workspace_list_siblings(caller.clone())
+        .await
+        .expect("siblings");
+    assert_eq!(list_ids(v), vec!["ws-partial", "ws-unbackfilled"]);
+    svc.cross_workspace_list_notes(caller.clone(), unbackfilled.clone())
+        .await
+        .expect("path fallback grants access");
+
+    // The relation is symmetric: the un-backfilled row sees the caller too.
+    let v = svc
+        .cross_workspace_list_siblings(unbackfilled)
+        .await
+        .expect("siblings");
+    assert_eq!(list_ids(v), vec!["ws-caller", "ws-partial"]);
+
+    let v = svc
+        .cross_workspace_list_siblings(local_a.clone())
+        .await
+        .expect("siblings");
+    assert_eq!(list_ids(v), vec!["ws-local-b"]);
+    svc.cross_workspace_list_notes(local_a.clone(), local_b)
+        .await
+        .expect("local-only pair is readable");
+    let err = svc
+        .cross_workspace_list_notes(local_a, unrelated)
+        .await
+        .expect_err("denied");
+    match err {
+        Error::Internal(m) => assert!(m.contains("Access denied"), "{m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+}
+
+/// A caller with neither a GitHub identity nor a `repositoryPath` cannot list
+/// siblings or read notes (mirrors the TS "not associated with a repository"
+/// error). An identity alone (no path) is sufficient.
 #[tokio::test]
 async fn cross_workspace_list_siblings_requires_repository() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let caller = WorkspaceId::from("ws-norepo");
     store.insert_workspace(&workspace(&caller)).await.unwrap();
+    let identity_only = WorkspaceId::from("ws-identity-only");
+    let mut w = workspace(&identity_only);
+    w.repository_owner = Some("intent-hq".to_string());
+    w.repository_name = Some("intent".to_string());
+    store.insert_workspace(&w).await.unwrap();
     let svc = Services::new(store);
     let err = svc
-        .cross_workspace_list_siblings(caller)
+        .cross_workspace_list_siblings(caller.clone())
         .await
         .expect_err("should error");
     match err {
         Error::Internal(m) => assert!(m.contains("not associated with a repository"), "{m}"),
         other => panic!("expected Internal, got {other:?}"),
     }
+    // The access gate applies the same precondition before checking the target.
+    let err = svc
+        .cross_workspace_list_notes(caller, identity_only.clone())
+        .await
+        .expect_err("should error");
+    match err {
+        Error::Internal(m) => assert!(m.contains("not associated with a repository"), "{m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+    // A GitHub identity without a local path is enough to list.
+    let v = svc
+        .cross_workspace_list_siblings(identity_only)
+        .await
+        .expect("identity-only caller lists");
+    assert!(v.as_array().expect("array").is_empty());
 }
 
 /// Cross-repo `readNote`/`listNotes` are access-denied; a same-repo sibling
@@ -28950,11 +29174,11 @@ mod clone_orchestration {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use intent_core::{WorkspaceApi, WorkspaceCreate};
+    use intent_core::{WorkspaceApi, WorkspaceCreate, WorkspaceId};
     use intent_store::Store;
 
     use super::TempDb;
-    use crate::{EventBus, Services, SubscriptionFilter};
+    use crate::{Error, EventBus, Services, SubscriptionFilter};
 
     /// Drop guard removing a temp directory tree.
     struct TempDir(PathBuf);
@@ -28973,13 +29197,20 @@ mod clone_orchestration {
     /// Init a small git repo with one commit; returns the guard.
     fn seed_repo(prefix: &str) -> TempDir {
         let dir = unique_dir(prefix);
-        let repo = git2::Repository::init(&dir.0).unwrap();
+        seed_repo_at(&dir.0);
+        dir
+    }
+
+    /// Init a small git repo with one commit at `dir` (created if missing).
+    fn seed_repo_at(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let repo = git2::Repository::init(dir).unwrap();
         {
             let mut cfg = repo.config().unwrap();
             cfg.set_str("user.name", "Tester").unwrap();
             cfg.set_str("user.email", "t@e.dev").unwrap();
         }
-        std::fs::write(dir.0.join("README.md"), "init\n").unwrap();
+        std::fs::write(dir.join("README.md"), "init\n").unwrap();
         let mut index = repo.index().unwrap();
         index
             .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
@@ -28989,7 +29220,6 @@ mod clone_orchestration {
         let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
             .unwrap();
-        dir
     }
 
     async fn drain_event_types(sub: &mut crate::Subscription) -> Vec<String> {
@@ -29002,6 +29232,15 @@ mod clone_orchestration {
             }
         }
         types
+    }
+
+    /// Expected `<root>/.repo-cache/<owner>/<repo>` slot for `url`. The cache
+    /// key comes from the host-agnostic URL parse; persisted owner/name do
+    /// not (only strict `github.com` URLs seed them), so tests must not
+    /// derive the slot from the workspace row.
+    fn expected_cache_dir(root: &std::path::Path, url: &str) -> PathBuf {
+        let (owner, repo) = crate::clone_ops::parse_owner_repo(url).expect("owner/repo");
+        root.join(".repo-cache").join(owner).join(repo)
     }
 
     /// `githubUrl` → daemon clones via `file://` (fast, hermetic), sets
@@ -29060,6 +29299,119 @@ mod clone_orchestration {
         assert!(
             done_pos < ws_pos,
             "clone completes before workspace insert: {types:?}"
+        );
+    }
+
+    /// A non-`github.com` clone URL whose path happens to end in
+    /// `<owner>/<repo>` must not persist a GitHub identity: the
+    /// `crossWorkspace.*` sibling predicate trusts owner/name as GitHub
+    /// provenance, so a `file://…/acme/widget.git` (or GitLab) clone at a
+    /// distinct path must not become a sibling of `github.com/acme/widget`.
+    /// Exercised on both create paths — explicit `clonePath` and the
+    /// self-contained repo-cache hydration.
+    #[tokio::test]
+    async fn non_github_url_clone_is_not_sibling_of_github_identity() {
+        let parent = unique_dir("intentd-nongh-src");
+        let source = parent.0.join("acme").join("widget.git");
+        seed_repo_at(&source);
+        let url = format!("file://{}", source.to_string_lossy());
+        // Sanity: the host-agnostic parse (cache key) does yield acme/widget,
+        // so the persisted row must be distinguishing on the host alone.
+        assert_eq!(
+            crate::clone_ops::parse_owner_repo(&url),
+            Some(("acme".to_string(), "widget".to_string()))
+        );
+
+        let root = unique_dir("intentd-nongh-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let github = WorkspaceId::from("ws-github");
+        let mut gh = super::workspace(&github);
+        gh.repository_path = Some("/root/ws-github/widget".to_string());
+        gh.repository_owner = Some("acme".to_string());
+        gh.repository_name = Some("widget".to_string());
+        store.insert_workspace(&gh).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus);
+
+        let clone_target = unique_dir("intentd-nongh-target");
+        let explicit = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url.clone()),
+                    clone_path: Some(
+                        clone_target
+                            .0
+                            .join("checkout")
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create with clonePath")
+            .workspace;
+        let hydrated = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create via repo cache")
+            .workspace;
+
+        for (label, ws) in [("clonePath", &explicit), ("cache", &hydrated)] {
+            assert_eq!(
+                ws.repository_owner, None,
+                "{label}: non-github URL must not seed repositoryOwner"
+            );
+            assert_ne!(
+                ws.repository_path.as_deref(),
+                gh.repository_path.as_deref(),
+                "{label}: distinct checkout path"
+            );
+            let v = svc
+                .cross_workspace_list_siblings(ws.id.clone())
+                .await
+                .expect("siblings");
+            let ids: Vec<&str> = v
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|s| s["id"].as_str().unwrap())
+                .collect();
+            assert!(
+                !ids.contains(&"ws-github"),
+                "{label}: github workspace listed as sibling: {ids:?}"
+            );
+            for (from, to) in [
+                (ws.id.clone(), github.clone()),
+                (github.clone(), ws.id.clone()),
+            ] {
+                let err = svc
+                    .cross_workspace_list_notes(from, to)
+                    .await
+                    .expect_err("denied");
+                match err {
+                    Error::Internal(m) => assert!(m.contains("Access denied"), "{label}: {m}"),
+                    other => panic!("{label}: expected Internal, got {other:?}"),
+                }
+            }
+        }
+        let v = svc
+            .cross_workspace_list_siblings(github)
+            .await
+            .expect("siblings");
+        assert!(
+            v.as_array().expect("array").is_empty(),
+            "github workspace has no siblings: {v}"
         );
     }
 
@@ -29189,7 +29541,8 @@ mod clone_orchestration {
 
     /// Cache miss: the first `githubUrl`-only create clones into the repo
     /// cache, hydrates a standalone checkout, streams `git:clone:*` frames
-    /// before `workspace:created`, and derives owner/name from the URL.
+    /// before `workspace:created`. A non-`github.com` URL keys the cache but
+    /// does not seed `repositoryOwner` (basename fallback still names the row).
     #[tokio::test]
     async fn create_hydrates_from_cache_on_miss() {
         let source = seed_repo("intentd-hydrate-src");
@@ -29222,19 +29575,21 @@ mod clone_orchestration {
             "base commit SHA recorded from the checkout"
         );
         drop(repo);
-        // Owner/name derived from the URL (file:// → last two segments).
-        assert!(ws.repository_owner.is_some(), "owner derived from URL");
+        // A `file://` URL is not a GitHub identity: owner stays unset; name
+        // falls back to the checkout basename (the slugged URL last segment).
+        assert_eq!(
+            ws.repository_owner, None,
+            "non-github URL must not seed repositoryOwner"
+        );
+        let checkout = PathBuf::from(ws.repository_path.as_deref().unwrap());
         assert_eq!(
             ws.repository_name.as_deref(),
-            source.0.file_name().map(|n| n.to_str().unwrap()),
-            "name derived from URL"
+            checkout.file_name().map(|n| n.to_str().unwrap()),
+            "name falls back to the checkout basename"
         );
-        // The cache exists at `<root>/.repo-cache/<owner>/<repo>`.
-        let cache = root
-            .0
-            .join(".repo-cache")
-            .join(ws.repository_owner.as_deref().unwrap())
-            .join(ws.repository_name.as_deref().unwrap());
+        // The cache exists at `<root>/.repo-cache/<owner>/<repo>`, keyed by
+        // the host-agnostic URL parse.
+        let cache = expected_cache_dir(&root.0, &url);
         assert!(cache.join(".git").exists(), "repo cache populated");
         // The clone event stream ran before the workspace insert.
         let types = drain_event_types(&mut sub).await;
@@ -29277,11 +29632,7 @@ mod clone_orchestration {
             .await
             .expect("first create")
             .workspace;
-        let cache = root
-            .0
-            .join(".repo-cache")
-            .join(ws1.repository_owner.as_deref().unwrap())
-            .join(ws1.repository_name.as_deref().unwrap());
+        let cache = expected_cache_dir(&root.0, &url);
         let marker = cache.join(".git").join("intent-cache-marker");
         std::fs::write(&marker, "keep").unwrap();
 
@@ -29520,11 +29871,7 @@ mod clone_orchestration {
             .expect("create")
             .workspace;
         let checkout = PathBuf::from(ws.repository_path.as_deref().unwrap());
-        let cache = root
-            .0
-            .join(".repo-cache")
-            .join(ws.repository_owner.as_deref().unwrap())
-            .join(ws.repository_name.as_deref().unwrap());
+        let cache = expected_cache_dir(&root.0, &url);
         assert!(checkout.exists() && cache.exists());
 
         svc.delete_workspace(ws.id.clone()).await.expect("delete");

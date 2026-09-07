@@ -9257,9 +9257,9 @@ async fn fetch_note_peer(
 }
 
 /// Resolve a sibling workspace for the `crossWorkspace.*` reads, enforcing that
-/// the caller and target share the same `repositoryPath`. Mirrors the TS
-/// `getSiblingWorkspaceOrThrow` messages; all failures surface as
-/// [`Error::Internal`] (→ `-32603`) to match the TS handler.
+/// the caller and target share a repository per [`workspaces_share_repository`].
+/// Mirrors the TS `getSiblingWorkspaceOrThrow` messages; all failures surface
+/// as [`Error::Internal`] (→ `-32603`) to match the TS handler.
 async fn sibling_workspace_or_throw(
     store: &Store,
     current_workspace_id: &WorkspaceId,
@@ -9272,14 +9272,11 @@ async fn sibling_workspace_or_throw(
         }
         Err(e) => return Err(e),
     };
-    let repo_path = match current.repository_path.as_deref() {
-        Some(p) if !p.is_empty() => p.to_string(),
-        _ => {
-            return Err(Error::Internal(
-                "Current workspace is not associated with a repository".to_string(),
-            ));
-        }
-    };
+    if !has_repository_identity(&current) {
+        return Err(Error::Internal(
+            "Current workspace is not associated with a repository".to_string(),
+        ));
+    }
     let target = match store.get_workspace(target_workspace_id).await {
         Ok(w) => w,
         Err(Error::NotFound(_)) => {
@@ -9289,12 +9286,57 @@ async fn sibling_workspace_or_throw(
         }
         Err(e) => return Err(e),
     };
-    if target.repository_path.as_deref() != Some(repo_path.as_str()) {
+    if !workspaces_share_repository(&current, &target) {
         return Err(Error::Internal(
             "Access denied: Can only access workspaces in the same repository".to_string(),
         ));
     }
     Ok(target)
+}
+
+/// Normalized GitHub `(owner, name)` for sibling matching: both parts
+/// non-empty, lowercased (GitHub owner/repo names are case-insensitive), with a
+/// trailing `.git` stripped from the lowercased name so `INTENT.GIT` matches
+/// `intent`. `None` when the workspace has no complete GitHub identity
+/// (local-only repo, or not yet backfilled).
+fn github_repository_identity(ws: &Workspace) -> Option<(String, String)> {
+    let owner = ws.repository_owner.as_deref()?.trim().to_ascii_lowercase();
+    let name = ws.repository_name.as_deref()?.trim().to_ascii_lowercase();
+    let name = name.strip_suffix(".git").unwrap_or(&name);
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((owner, name.to_string()))
+}
+
+fn nonempty_repository_path(ws: &Workspace) -> Option<&str> {
+    ws.repository_path.as_deref().filter(|p| !p.is_empty())
+}
+
+/// Caller precondition for `crossWorkspace.*`: the workspace can be placed in
+/// a repository by either its GitHub owner/name or its local source path.
+fn has_repository_identity(ws: &Workspace) -> bool {
+    github_repository_identity(ws).is_some() || nonempty_repository_path(ws).is_some()
+}
+
+/// The single sibling predicate shared by `crossWorkspace.listSiblings` and
+/// the `readNote` / `listNotes` access gate, so the two cannot drift. Two
+/// workspaces share a repository when either their GitHub owner/name match
+/// (case-insensitive, `.git` tolerated) — which links checkouts of the same
+/// repo at different local paths — or their non-empty source
+/// `repository_path`s are equal (local-only repos, and rows the owner/name
+/// backfill has not reached yet). Identity of the two rows is not checked;
+/// callers filter self out.
+fn workspaces_share_repository(a: &Workspace, b: &Workspace) -> bool {
+    if let (Some(ia), Some(ib)) = (github_repository_identity(a), github_repository_identity(b)) {
+        if ia == ib {
+            return true;
+        }
+    }
+    matches!(
+        (nonempty_repository_path(a), nonempty_repository_path(b)),
+        (Some(pa), Some(pb)) if pa == pb
+    )
 }
 
 /// Prefix each line with a right-aligned 1-based line number (`"   1 | text"`),
@@ -16164,20 +16206,15 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            let repo_path = match current.repository_path.as_deref() {
-                Some(p) if !p.is_empty() => p.to_string(),
-                _ => {
-                    return Err(Error::Internal(
-                        "Current workspace is not associated with a repository".to_string(),
-                    ));
-                }
-            };
+            if !has_repository_identity(&current) {
+                return Err(Error::Internal(
+                    "Current workspace is not associated with a repository".to_string(),
+                ));
+            }
             let all = store.list_workspaces(true).await?;
             let siblings: Vec<serde_json::Value> = all
                 .into_iter()
-                .filter(|w| {
-                    w.id != workspace_id && w.repository_path.as_deref() == Some(repo_path.as_str())
-                })
+                .filter(|w| w.id != workspace_id && workspaces_share_repository(&current, w))
                 .map(|w| {
                     serde_json::json!({
                         "id": w.id,
@@ -16937,11 +16974,20 @@ impl WorkspaceApi for Services {
                                     )
                                     .await;
                                 }
-                                if input.repository_owner.is_none() {
-                                    input.repository_owner = Some(owner);
-                                }
-                                if input.repository_name.is_none() {
-                                    input.repository_name = Some(name.clone());
+                                // Persisted owner/name carry GitHub identity
+                                // (the `crossWorkspace.*` sibling predicate
+                                // trusts them), so only a strict `github.com`
+                                // URL seeds them; the host-agnostic pair above
+                                // keys the cache slot only.
+                                if let Some((gh_owner, gh_name)) =
+                                    Self::parse_github_owner_repo(url)
+                                {
+                                    if input.repository_owner.is_none() {
+                                        input.repository_owner = Some(gh_owner);
+                                    }
+                                    if input.repository_name.is_none() {
+                                        input.repository_name = Some(gh_name);
+                                    }
                                 }
                                 // The workspace checkout IS the repository
                                 // (self-contained; the cache can be deleted
@@ -17027,7 +17073,10 @@ impl WorkspaceApi for Services {
                             })?;
                             input.repository_path =
                                 Some(target.to_string_lossy().to_string());
-                            if let Some((owner, name)) = clone_ops::parse_owner_repo(url) {
+                            // Strict `github.com` host only: persisted owner/name
+                            // are trusted as GitHub identity by the
+                            // `crossWorkspace.*` sibling predicate.
+                            if let Some((owner, name)) = Self::parse_github_owner_repo(url) {
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
                                 }
