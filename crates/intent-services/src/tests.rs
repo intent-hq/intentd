@@ -34865,6 +34865,24 @@ mod turn_token_usage {
         assert_eq!(cells.len(), 1);
         assert_eq!(cells[0].totals.input_tokens, 70);
         assert_eq!(cells[0].human_messages, 1);
+
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 0, 0, 0)), None)
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace after continued report")
+            .token_usage
+            .expect("usage after continued report");
+        assert_eq!(usage.totals.input_tokens, 100);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100);
+        assert_eq!(usage.by_model["model-a"].input_tokens, 100);
+        let cells = usage.by_agent_model.expect("cross-filter cells");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].totals.input_tokens, 100);
+        assert_eq!(cells[0].human_messages, 1);
     }
 
     /// An identical snapshot re-report leaves the tally unchanged and emits no
