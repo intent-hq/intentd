@@ -67,7 +67,11 @@ pub fn project_with_classifier(
                 .or_else(|| event.data.get("path"))
                 .and_then(Value::as_str)
                 .filter(|path| !path.is_empty())
-                .map(|path| workspace_paths.normalize(path, event_git_root_id(event)));
+                .and_then(|path| {
+                    workspace_paths
+                        .normalize(path, event_git_root_id(event))
+                        .ok()
+                });
             let region_id = path
                 .as_deref()
                 .map(|path| classifier.classify(path).region_id);
@@ -94,11 +98,13 @@ pub fn project_with_classifier(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let input = event.data.get("input");
-            let path = input.and_then(find_path).map(|path| {
-                workspace_paths.normalize(
-                    &path,
-                    event_git_root_id(event).or_else(|| input.and_then(find_git_root_id)),
-                )
+            let path = input.and_then(find_path).and_then(|path| {
+                workspace_paths
+                    .normalize(
+                        &path,
+                        event_git_root_id(event).or_else(|| input.and_then(find_git_root_id)),
+                    )
+                    .ok()
             });
             let is_read = path.is_some() && is_read_tool(tool_name, tool_kind);
             let region_id = path
@@ -354,5 +360,18 @@ mod tests {
             activity.path.as_deref(),
             Some("packages/intentd/crates/intent-transport/src/router.rs")
         );
+    }
+
+    #[test]
+    fn rejects_non_workspace_relative_activity_paths() {
+        for path in ["/src/lib.rs", "../src/lib.rs", r"C:\src\lib.rs"] {
+            let activity = project(
+                &manifest(),
+                &event(FILE_CHANGED, json!({"relativePath":path,"action":"modify"})),
+            )
+            .unwrap();
+            assert_eq!(activity.path, None, "accepted {path:?}");
+            assert_eq!(activity.region_id, None, "classified {path:?}");
+        }
     }
 }
