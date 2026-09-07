@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.35] - 2026-09-07
+
+### 🚀 Features
+
+- *(browser)* Route agent browser.exec via the workspace driving client (REV-2) ([#1770](https://github.com/intent-hq/intentd/pull/1770))
+
+
 ## [0.9.34] - 2026-09-06
 
 ### 🚀 Features
