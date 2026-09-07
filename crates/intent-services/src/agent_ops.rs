@@ -4336,8 +4336,6 @@ impl Services {
                 .delete_agent_session(session_ws, &agent_id)
                 .await?;
             self.invalidate_agent_list_cache(session_ws);
-            self.recompute_workspace_token_usage(session_ws, false)
-                .await?;
         }
         self.agent_queues
             .lock()
@@ -5156,8 +5154,6 @@ impl Services {
         }
         self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
             .await;
-        self.recompute_workspace_token_usage(&session.workspace_id, false)
-            .await?;
         // Stored-on-write pending-questions markers (PROTOCOL §5.5), same
         // contract as the turn-end and user-send persists: an appended
         // assistant row bearing question blocks arms the pending marker, an
@@ -5307,8 +5303,6 @@ impl Services {
         // (dropping entries whose blocks are gone).
         self.reconcile_pending_proposals(&session.workspace_id, &agent_id, &inserted)
             .await;
-        self.recompute_workspace_token_usage(&session.workspace_id, false)
-            .await?;
         Ok(json!({ "success": true, "messages": inserted }))
     }
 
@@ -5398,8 +5392,6 @@ impl Services {
         // onto themselves).
         self.reconcile_pending_proposals(&session.workspace_id, agent_id, keep)
             .await;
-        self.recompute_workspace_token_usage(&session.workspace_id, false)
-            .await?;
         self.publish_agent_mutation_event(
             &session.workspace_id,
             agent_id,
@@ -6081,8 +6073,6 @@ impl Services {
                     self.maybe_emit_display_status_changed(&session.workspace_id)
                         .await;
                 }
-                self.recompute_workspace_token_usage(&session.workspace_id, false)
-                    .await?;
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(append_err) => {

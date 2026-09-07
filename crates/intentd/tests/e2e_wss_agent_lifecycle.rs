@@ -13782,11 +13782,12 @@ async fn proposal_lifted_from_collapsed_output_over_chat_subscribe() {
     );
 }
 
-/// Live token-usage capture over the real WSS transport (§5.23 / §6.5): the
-/// mock agent reports an end-of-turn `usage` snapshot on its `PromptResponse`
-/// (the ACP `unstable_end_turn_token_usage` extension); the daemon persists it
-/// and emits `workspace:tokenUsage-changed` immediately (no periodic scan),
-/// with `cachedReadTokens`/`cachedWriteTokens` mapped to
+/// Token-usage publication cadence over the real WSS transport (§5.23 / §6.5):
+/// a transcript-only append does not publish or materialize usage. The mock
+/// agent then reports an end-of-turn `usage` snapshot on its `PromptResponse`
+/// (the ACP `unstable_end_turn_token_usage` extension); detached accounting
+/// persists it and emits `workspace:tokenUsage-changed` without waiting for a
+/// periodic scan, with `cachedReadTokens`/`cachedWriteTokens` mapped to
 /// `cacheReadTokens`/`cacheCreationTokens`. A second turn's larger cumulative
 /// snapshot REPLACES the first (never summed), and `workspace.getTokenUsage`
 /// returns the same tally over the wire.
@@ -13872,11 +13873,32 @@ async fn token_usage_captured_at_turn_end_over_wss() {
         .expect("agent id")
         .to_string();
 
+    // A transcript-only append has no ACP turn and must not synchronously
+    // materialize or publish token/message usage. The next accounting or
+    // reconciliation pass will include this source row.
+    let appended = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.appendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "role": "user",
+            "contentBlocks": [{ "type": "text", "text": "transcript only" }],
+        }),
+    )
+    .await;
+    assert_eq!(appended["success"], true, "appendMessage ok: {appended}");
+    assert!(
+        wss_event_opt(&mut sub, 1).await.is_none(),
+        "transcript-only append must not publish tokenUsage-changed"
+    );
+
     // Turn 1 — the tokenUsage-changed event carries the mapped snapshot
     // (§6.5 self-sufficient payload: { workspaceId, tokenUsage }).
     let sent = wss_rpc(
         &mut rpc,
-        11,
+        12,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
     )
@@ -13902,7 +13924,7 @@ async fn token_usage_captured_at_turn_end_over_wss() {
     // NOT 170/130).
     let sent2 = wss_rpc(
         &mut rpc,
-        12,
+        13,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "SECOND_TURN please" }),
     )
@@ -13922,7 +13944,7 @@ async fn token_usage_captured_at_turn_end_over_wss() {
     // by agent and model (§5.23 response shape).
     let read = wss_rpc(
         &mut rpc,
-        13,
+        14,
         "workspace.getTokenUsage",
         json!({ "workspaceId": ws_id }),
     )

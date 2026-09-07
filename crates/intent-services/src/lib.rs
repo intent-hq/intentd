@@ -8658,8 +8658,6 @@ impl Services {
                 )
                 .await?;
             self.invalidate_agent_list_cache(workspace_id);
-            self.recompute_workspace_token_usage(workspace_id, false)
-                .await?;
             Ok(serde_json::json!({ "success": true, "queued": false }))
         }
     }
