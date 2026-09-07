@@ -28871,38 +28871,10 @@ impl WorkspaceApi for Services {
                     "browser.exec: actions must be a non-empty array".to_string(),
                 ));
             }
-            let list_tabs_count = actions
-                .iter()
-                .filter(|a| a["action"] == browser_tabs::LIST_TABS_ACTION)
-                .count();
-            if list_tabs_count > 0 {
-                if list_tabs_count != actions.len() {
-                    return Err(Error::InvalidParams(
-                        "browser.exec: listTabs is answered by the daemon and cannot be batched \
-                         with other actions"
-                            .to_string(),
-                    ));
-                }
-                let mut results = Vec::with_capacity(actions.len());
-                for action in &actions {
-                    results.push(
-                        self.browser_tabs_list_for_agent(
-                            &workspace_id,
-                            action["scope"].as_str(),
-                            agent_id.as_ref(),
-                        )
-                        .await?,
-                    );
-                }
-                return Ok(if results.len() == 1 {
-                    results.remove(0)
-                } else {
-                    serde_json::json!({ "results": results })
-                });
-            }
             // Every tab the batch names must be an open registry tab of this
-            // workspace; the driving client is the one host, so no per-tab
-            // host lookup is involved (Model 5).
+            // workspace — before anything is answered or dispatched; the
+            // driving client is the one host, so no per-tab host lookup is
+            // involved (Model 5).
             let mut named_tabs: Vec<&str> = actions
                 .iter()
                 .filter_map(|a| a["tabId"].as_str())
@@ -28922,6 +28894,41 @@ impl WorkspaceApi for Services {
                         "browser.exec: tab not found: {id}"
                     )));
                 }
+            }
+            let list_tabs_count = actions
+                .iter()
+                .filter(|a| a["action"] == browser_tabs::LIST_TABS_ACTION)
+                .count();
+            if list_tabs_count > 0 {
+                if list_tabs_count != actions.len() {
+                    return Err(Error::InvalidParams(
+                        "browser.exec: listTabs is answered by the daemon and cannot be batched \
+                         with other actions"
+                            .to_string(),
+                    ));
+                }
+                let mut results = Vec::with_capacity(actions.len());
+                for action in &actions {
+                    let scope = match &action["scope"] {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(scope) => Some(scope.as_str()),
+                        other => {
+                            return Err(Error::InvalidParams(format!(
+                                "browser.exec: listTabs scope must be \"mine\", \"unclaimed\" or \
+                                 \"all\", got {other}"
+                            )))
+                        }
+                    };
+                    results.push(
+                        self.browser_tabs_list_for_agent(&workspace_id, scope, agent_id.as_ref())
+                            .await?,
+                    );
+                }
+                return Ok(if results.len() == 1 {
+                    results.remove(0)
+                } else {
+                    serde_json::json!({ "results": results })
+                });
             }
             let Some(dispatch) = self.reverse_dispatch.clone() else {
                 return Err(Error::Internal(

@@ -9035,6 +9035,78 @@ mod wsapi6_bindings_tests {
         assert!(api.browser_exec_calls.lock().unwrap().is_empty());
     }
 
+    // `ws.browser.listTabs(scope?)` (REV-2 Model 5): a one-action `listTabs`
+    // batch through the seam, with the caller attributed and the envelope
+    // unwrapped to the bare tab array.
+    #[tokio::test]
+    async fn browser_list_tabs_unwraps_the_registry_envelope() {
+        let (srv, api) = server_with_caller("agent-77");
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": true,
+            "results": [{
+                "action": "listTabs",
+                "success": true,
+                "result": [
+                    { "tabId": "t-1", "ownerAgentId": null, "hostClientId": "desktop-a", "hostConnected": true },
+                    { "tabId": "t-2", "ownerAgentId": "agent-77", "hostClientId": "desktop-b", "hostConnected": false }
+                ]
+            }]
+        }));
+        let resp = call(&srv, "return await ws.browser.listTabs('mine');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        let tabs = v.as_array().expect("bare tab array");
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[1]["tabId"], json!("t-2"));
+        assert_eq!(tabs[1]["hostClientId"], json!("desktop-b"));
+
+        let calls = api.browser_exec_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (actions, tab_id, agent_id) = &calls[0];
+        assert_eq!(
+            actions,
+            &vec![json!({ "action": "listTabs", "scope": "mine" })]
+        );
+        assert_eq!(tab_id.as_deref(), None);
+        assert_eq!(agent_id.as_deref(), Some("agent-77"));
+    }
+
+    #[tokio::test]
+    async fn browser_list_tabs_omits_scope_when_not_given() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.browser.listTabs();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.browser_exec_calls.lock().unwrap();
+        assert_eq!(calls[0].0, vec![json!({ "action": "listTabs" })]);
+        assert_eq!(calls[0].2, None);
+    }
+
+    #[tokio::test]
+    async fn browser_list_tabs_rejects_non_string_scope_without_calling_trait() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.browser.listTabs(42);").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("scope must be"));
+        assert!(api.browser_exec_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn browser_list_tabs_surfaces_the_action_error_as_a_throw() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "listTabs scope \"mine\" requires an agent caller",
+            "results": [{
+                "action": "listTabs",
+                "success": false,
+                "error": "listTabs scope \"mine\" requires an agent caller"
+            }]
+        }));
+        let resp = call(&srv, "return await ws.browser.listTabs('mine');").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("requires an agent caller"));
+    }
+
     #[tokio::test]
     async fn browser_docs_returns_topic_text_verbatim() {
         let (srv, _api) = server();

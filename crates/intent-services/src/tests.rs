@@ -31495,7 +31495,7 @@ mod browser_routing {
         assert_eq!(no_agent["success"], false, "mine needs an agent caller");
         let err = svc
             .browser_exec(
-                ws,
+                ws.clone(),
                 vec![json!({ "action": "listTabs", "scope": "yours" })],
                 None,
                 None,
@@ -31503,6 +31503,41 @@ mod browser_routing {
             .await
             .expect_err("bad scope");
         assert!(matches!(err, Error::InvalidParams(m) if m.contains("scope")));
+        // A present non-string scope is rejected, not read as the default.
+        for bad in [json!(42), json!({}), json!([])] {
+            let err = svc
+                .browser_exec(
+                    ws.clone(),
+                    vec![json!({ "action": "listTabs", "scope": bad })],
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("non-string scope");
+            assert!(matches!(err, Error::InvalidParams(m) if m.contains("scope")));
+        }
+        // The registry answer still honours the tab-id contract: an unknown
+        // tab named by the envelope or the action is `-32602`.
+        for (action, envelope) in [
+            (json!({ "action": "listTabs" }), Some("ghost".to_string())),
+            (json!({ "action": "listTabs", "tabId": "ghost" }), None),
+        ] {
+            let err = svc
+                .browser_exec(ws.clone(), vec![action], envelope, None)
+                .await
+                .expect_err("unknown tab");
+            assert!(matches!(err, Error::InvalidParams(m) if m.contains("tab not found: ghost")));
+        }
+        let scoped = svc
+            .browser_exec(
+                ws,
+                vec![json!({ "action": "listTabs" })],
+                Some("t-user".to_string()),
+                None,
+            )
+            .await
+            .expect("known envelope tab");
+        assert_eq!(scoped["success"], true);
     }
 
     /// Model 5: a `claimTab` the driving client executed on a tab another
