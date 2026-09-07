@@ -358,7 +358,7 @@ pub struct Services {
     /// Parsed semantic-map manifests, shared by every clone and map operation.
     semantic_map_manifest_loader: semantic_map::ManifestLoader,
     /// One post-persistence projector shared by every clone of this service.
-    _map_activity_projection_task: Option<Arc<MapActivityProjectionTask>>,
+    map_activity_projection_task: Option<Arc<MapActivityProjectionTask>>,
     /// Root directory for note assets, laid out as `<root>/<workspaceId>/<assetId>`.
     /// `None` until configured by the composition root; `note.readAsset` errors
     /// when unset.
@@ -1134,7 +1134,7 @@ impl Services {
         Self {
             store,
             semantic_map_manifest_loader: semantic_map::ManifestLoader::default(),
-            _map_activity_projection_task: None,
+            map_activity_projection_task: None,
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
@@ -3941,7 +3941,7 @@ impl Services {
                 }
             }
         });
-        self._map_activity_projection_task = Some(Arc::new(MapActivityProjectionTask { handle }));
+        self.map_activity_projection_task = Some(Arc::new(MapActivityProjectionTask { handle }));
         self.event_bus = Some(bus);
         self
     }
