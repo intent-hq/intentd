@@ -150,7 +150,7 @@ Namespaces (index — full signatures in API below):
   ws.agent.* — create/delegate/message/watch agents
   ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
-  ws.map.* — semantic codebase map reads, authoring, classification, and routes
+  ws.map.* — map
   ws.script.* — saved build/test/service scripts
   ws.host.* — host.exec = one-shot host command exec
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot and host.exec
@@ -381,7 +381,7 @@ Namespaces (index — full signatures in API below):
   ws.agent.* — create/delegate/message/watch agents
   ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
-  ws.map.* — semantic codebase map reads, authoring, classification, and routes
+  ws.map.* — map
   ws.script.* — saved build/test/service scripts
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
   ws.browser.* — Chrome DevTools browser automation
@@ -887,7 +887,8 @@ pub(crate) const NAMESPACE_INDEX_HEADER: &str =
 /// the signatures + one-line summaries live in the system prompt (under
 /// [`WORKSPACE_API_SYSTEM_PROMPT_HEADING`]) rather than below, with
 /// `ws.help()` as the full-docs fallback.
-pub(crate) const NAMESPACE_INDEX_HEADER_COMPACT: &str = "Namespaces (index — condensed: system-prompt \"Workspace API Reference\"; full docs: ws.help()):";
+pub(crate) const NAMESPACE_INDEX_HEADER_COMPACT: &str =
+    "Namespaces (system-prompt \"Workspace API Reference\"; full: ws.help()):";
 
 /// Heading of the system-prompt section that carries the condensed `ws.*` API
 /// reference (signatures + one-line summaries) for providers whose client
@@ -1268,6 +1269,7 @@ mod tests {
     const BINDINGS_BROWSER: &str = include_str!("bindings/browser.rs");
     const BINDINGS_AGENT: &str = include_str!("bindings/agent.rs");
     const BINDINGS_EVENT: &str = include_str!("bindings/event.rs");
+    const BINDINGS_MAP: &str = include_str!("bindings/map.rs");
     const BINDINGS_GIT: &str = include_str!("bindings/git.rs");
     const BINDINGS_HOST: &str = include_str!("bindings/host.rs");
     const BINDINGS_HOOK: &str = include_str!("bindings/hook.rs");
@@ -1298,6 +1300,7 @@ mod tests {
             ("browser", BINDINGS_BROWSER),
             ("agent", BINDINGS_AGENT),
             ("event", BINDINGS_EVENT),
+            ("map", BINDINGS_MAP),
             ("git", BINDINGS_GIT),
             ("host", BINDINGS_HOST),
             ("hook", BINDINGS_HOOK),
@@ -1993,15 +1996,15 @@ mod tests {
     }
 
     // Size budget for the system-prompt copy: the all-defaults non-chief
-    // rendering (the common case for truncating providers) stays under 21.5k
+    // rendering (the common case for truncating providers) stays under 22.5k
     // chars — roughly half the ~40k full text.
     #[test]
     fn condensed_description_size_budget() {
         let condensed =
             condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &[]);
         assert!(
-            condensed.len() < 21_500,
-            "condensed all-on description is {} bytes, over the 21.5k budget",
+            condensed.len() < 22_500,
+            "condensed all-on description is {} bytes, over the 22.5k budget",
             condensed.len()
         );
     }

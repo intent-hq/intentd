@@ -427,7 +427,7 @@
 //! 49 fast-path methods, and two aliases: 354 client-callable names. The
 //! five reverse methods are counted separately.
 //!
-//! Version 9.12 adds the semantic codebase map (§5.45): five `map.*` router
+//! Version 9.12 adds the semantic codebase map (§5.46): five `map.*` router
 //! methods plus the transient `map:activity` event. The catalog contains 308
 //! router methods, 49 fast-path methods, and two aliases: 359 client-callable
 //! names. The five reverse methods remain counted separately.
