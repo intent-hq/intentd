@@ -7656,7 +7656,7 @@ async fn wss_semantic_map_round_trip() {
         "lower clamp: {activity}"
     );
     assert_eq!(activity["result"][0]["id"], seeded[1].id, "{activity}");
-    let pushed = tokio::time::timeout(Duration::from_secs(10), async {
+    let pushed = tokio::time::timeout(Duration::from_millis(200), async {
         loop {
             match subscriber.next().await {
                 Some(Ok(Message::Text(text))) => {
@@ -7670,20 +7670,14 @@ async fn wss_semantic_map_round_trip() {
                     .await
                     .expect("map event pong"),
                 Some(Ok(_)) => {}
-                other => panic!("expected map activity event, got {other:?}"),
+                other => panic!("expected open map subscription, got {other:?}"),
             }
         }
     })
-    .await
-    .expect("map activity push timeout");
-    assert_eq!(pushed["method"], "events.event", "{pushed}");
-    assert_eq!(
-        pushed["params"]["event"]["type"], "map:activity",
-        "{pushed}"
-    );
-    assert_eq!(
-        pushed["params"]["event"]["data"], activity["result"][0],
-        "{pushed}"
+    .await;
+    assert!(
+        pushed.is_err(),
+        "map.activity is replay-only and must not broadcast: {pushed:?}"
     );
     let replay = serde_json::json!({
         "jsonrpc":"2.0", "id":8, "method":"map.activity",
@@ -7898,20 +7892,41 @@ async fn wss_semantic_map_projects_fresh_source_events_once() {
         }
     }
 
-    let actor = EventActor {
+    let file_actor = EventActor {
+        actor_type: ActorType::System,
+        id: None,
+        name: Some("File watcher".to_string()),
+        ..Default::default()
+    };
+    let agent_actor = EventActor {
         actor_type: ActorType::Agent,
         id: Some("agent-live-map".to_string()),
         name: Some("Live Mapper".to_string()),
         ..Default::default()
     };
     let live_started = std::time::Instant::now();
+    let non_agent_file = srv
+        .bus
+        .publish(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: "2026-09-07T05:00:00Z".to_string(),
+            event_type: "file:created".to_string(),
+            actor: file_actor,
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({"action":"create","relativePath":"src/system.rs"}),
+        })
+        .await
+        .expect("publish non-agent file create");
     let changed = srv
         .bus
         .publish(&NewEvent {
             workspace_id: ws.clone(),
             timestamp: "2026-09-07T05:00:01Z".to_string(),
             event_type: "file:changed".to_string(),
-            actor: actor.clone(),
+            actor: agent_actor.clone(),
             session_id: Some("agent-live-map".to_string()),
             correlation_id: None,
             parent_event_id: None,
@@ -7926,7 +7941,7 @@ async fn wss_semantic_map_projects_fresh_source_events_once() {
             workspace_id: ws.clone(),
             timestamp: "2026-09-07T05:00:02Z".to_string(),
             event_type: "agent:tool:call".to_string(),
-            actor,
+            actor: agent_actor,
             session_id: Some("agent-live-map".to_string()),
             correlation_id: None,
             parent_event_id: None,
@@ -7940,7 +7955,7 @@ async fn wss_semantic_map_projects_fresh_source_events_once() {
 
     let mut pushed = tokio::time::timeout(Duration::from_secs(1), async {
         let mut pushed = Vec::new();
-        while pushed.len() < 2 {
+        while pushed.len() < 3 {
             match subscriber.next().await {
                 Some(Ok(Message::Text(text))) => {
                     let value: Value = serde_json::from_str(&text).expect("map activity json");
@@ -7971,6 +7986,9 @@ async fn wss_semantic_map_projects_fresh_source_events_once() {
         .iter()
         .map(|activity| (activity["id"].as_str().unwrap(), activity))
         .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(by_id[non_agent_file.id.as_str()]["regionId"], "code");
+    assert_eq!(by_id[non_agent_file.id.as_str()]["kind"], "create");
+    assert!(by_id[non_agent_file.id.as_str()]["agentId"].is_null());
     assert_eq!(by_id[changed.id.as_str()]["regionId"], "code");
     assert_eq!(by_id[changed.id.as_str()]["kind"], "edit");
     assert_eq!(by_id[tool_call.id.as_str()]["regionId"], "code");

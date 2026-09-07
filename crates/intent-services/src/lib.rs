@@ -12970,13 +12970,6 @@ async fn publish_live_map_activity(
     bus: &EventBus,
     event: &Event,
 ) {
-    if event
-        .event_type
-        .starts_with(intent_core::events::FILE_PREFIX)
-        && event.actor.actor_type != ActorType::Agent
-    {
-        return;
-    }
     let classifier = match loader.load_compiled(store, &event.workspace_id).await {
         Ok(Some((_, classifier))) => classifier,
         Ok(None) => return,
@@ -24027,7 +24020,6 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
-        let bus = self.event_bus.clone();
         let loader = self.semantic_map_manifest_loader.clone();
         Box::pin(async move {
             let (_, classifier, _) = active_semantic_map(&store, &loader, &workspace_id).await?;
@@ -24054,9 +24046,6 @@ impl WorkspaceApi for Services {
                 },
             )
             .await?;
-            for activity in &activities {
-                publish_event_transient(bus.as_ref(), &map_activity_event(&workspace_id, activity));
-            }
             serde_json::to_value(activities)
                 .map_err(|error| Error::Internal(format!("serialize map activity failed: {error}")))
         })
