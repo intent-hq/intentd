@@ -15777,3 +15777,129 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
     assert_eq!(srv.ws.client_count(), 0, "all clients must be reclaimed");
     srv.ws.stop().await;
 }
+
+/// `crossWorkspace.*` over the real WSS wire resolves siblings by GitHub
+/// identity (§5.11): two workspaces checked out from the same
+/// `repositoryOwner`/`repositoryName` at DIFFERENT source `repositoryPath`s
+/// are siblings — matched case-insensitively with a `.git` suffix tolerated —
+/// while a workspace from a different GitHub repo is not. `listSiblings`
+/// returns exactly the same-identity sibling with the documented fields,
+/// `readNote` succeeds against it, and the same `readNote` against the
+/// different-identity workspace is denied with the -32603 access error.
+#[tokio::test]
+async fn wss_cross_workspace_siblings_resolve_by_github_identity() {
+    let srv = start(WsOptions::default()).await;
+
+    let caller_id = WorkspaceId::new();
+    let mut caller = fixture_workspace(&caller_id);
+    caller.title = "Caller".to_string();
+    caller.repository_path = Some("/repos/checkout-a/intentd".to_string());
+    caller.repository_owner = Some("Intent-HQ".to_string());
+    caller.repository_name = Some("intentd".to_string());
+
+    let sibling_id = WorkspaceId::new();
+    let mut sibling = fixture_workspace(&sibling_id);
+    sibling.title = "Sibling".to_string();
+    sibling.branch = "feat/sibling".to_string();
+    sibling.repository_path = Some("/repos/checkout-b/intentd".to_string());
+    sibling.repository_owner = Some("intent-hq".to_string());
+    sibling.repository_name = Some("intentd.git".to_string());
+
+    let other_id = WorkspaceId::new();
+    let mut other = fixture_workspace(&other_id);
+    other.title = "Other repo".to_string();
+    other.repository_path = Some("/repos/checkout-c/cloudlands-fe".to_string());
+    other.repository_owner = Some("intent-hq".to_string());
+    other.repository_name = Some("cloudlands-fe".to_string());
+
+    for w in [&caller, &sibling, &other] {
+        srv.store
+            .insert_workspace(w)
+            .await
+            .expect("insert workspace");
+    }
+    srv.store
+        .insert_note(&fixture_note(&sibling_id, "spec", "line one\nline two"))
+        .await
+        .expect("insert sibling spec");
+    srv.store
+        .insert_note(&fixture_note(&other_id, "spec", "other spec"))
+        .await
+        .expect("insert other spec");
+
+    // listSiblings: only the same-identity workspace, with the documented fields.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listSiblings","params":{{"workspaceId":"{}"}}}}"#,
+        caller_id.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 1, "envelope: {resp}");
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    let siblings = resp["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("result must be an array: {resp}"));
+    assert_eq!(siblings.len(), 1, "exactly one sibling: {resp}");
+    let row = &siblings[0];
+    let mut keys: Vec<&str> = row
+        .as_object()
+        .expect("sibling row is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["branch", "createdAt", "id", "status", "title", "updatedAt"],
+        "documented sibling fields: {row}"
+    );
+    assert_eq!(row["id"], sibling_id.0, "{row}");
+    assert_eq!(row["title"], "Sibling", "{row}");
+    assert_eq!(row["branch"], "feat/sibling", "{row}");
+    assert_eq!(row["status"], "Active", "{row}");
+    assert_eq!(row["createdAt"], sibling.created_at, "{row}");
+    assert_eq!(row["updatedAt"], sibling.updated_at, "{row}");
+
+    // readNote against the same-identity sibling succeeds.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"crossWorkspace.readNote","params":{{"workspaceId":"{}","targetWorkspaceId":"{}","noteId":"spec"}}}}"#,
+        caller_id.0, sibling_id.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 2, "envelope: {resp}");
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    let note = &resp["result"];
+    assert_eq!(note["id"], "spec", "{note}");
+    assert_eq!(note["title"], "spec", "{note}");
+    assert_eq!(note["content"], "line one\nline two", "{note}");
+    assert_eq!(
+        note["numberedContent"], "   1 | line one\n   2 | line two",
+        "{note}"
+    );
+    assert_eq!(note["sourceWorkspaceId"], sibling_id.0, "{note}");
+    assert_eq!(note["sourceWorkspaceTitle"], "Sibling", "{note}");
+    assert_eq!(note["branch"], "feat/sibling", "{note}");
+    assert_eq!(note["lineCount"], 2, "{note}");
+
+    // readNote against the different-identity workspace is denied (-32603).
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"crossWorkspace.readNote","params":{{"workspaceId":"{}","targetWorkspaceId":"{}","noteId":"spec"}}}}"#,
+        caller_id.0, other_id.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 3, "envelope: {resp}");
+    assert!(
+        resp.get("result").is_none(),
+        "must not carry a result: {resp}"
+    );
+    assert_eq!(resp["error"]["code"], -32603, "{resp}");
+    assert_eq!(resp["error"]["message"], "Internal error", "{resp}");
+    assert_eq!(
+        resp["error"]["data"], "Access denied: Can only access workspaces in the same repository",
+        "{resp}"
+    );
+
+    srv.ws.stop().await;
+}
