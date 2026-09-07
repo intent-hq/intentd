@@ -309,6 +309,160 @@ async fn semantic_map_manifest_cache_is_shared_and_invalidated_by_its_note_updat
 }
 
 #[tokio::test]
+async fn semantic_map_structural_fallback_is_single_flight_and_cached() {
+    let root = test_tempdir("intentd-semantic-map-structural-");
+    std::fs::create_dir_all(root.path().join("src")).expect("mkdir src");
+    std::fs::write(root.path().join("src/lib.rs"), "pub fn mapped() {}\n").expect("write src");
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let mut workspace = workspace(&ws);
+    workspace.worktree_path = Some(root.path().to_string_lossy().into_owned());
+    store.insert_workspace(&workspace).await.expect("ws");
+    let services = Services::new(store);
+    crate::semantic_map::structural::reset_structural_scan_count(root.path());
+
+    let concurrent_services = services.clone();
+    let (first, second) = tokio::join!(
+        services.map_get(ws.clone()),
+        concurrent_services.map_get(ws.clone())
+    );
+    assert_eq!(first.unwrap()["source"], "structural");
+    assert_eq!(second.unwrap()["source"], "structural");
+    services.map_get(ws.clone()).await.expect("warm map one");
+    services.map_get(ws.clone()).await.expect("warm map two");
+    assert_eq!(
+        crate::semantic_map::structural::structural_scan_count(root.path()),
+        1
+    );
+
+    for (index, event_type) in ["file:changed", "gitRoot:updated"].into_iter().enumerate() {
+        services
+            .store()
+            .insert_event(&intent_store::NewEvent {
+                workspace_id: ws.clone(),
+                timestamp: format!("2030-01-01T00:00:0{index}Z"),
+                event_type: event_type.to_string(),
+                actor: intent_core::EventActor {
+                    actor_type: intent_core::ActorType::System,
+                    ..Default::default()
+                },
+                session_id: None,
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data: serde_json::json!({}),
+            })
+            .await
+            .expect("insert tree-changing event");
+        services
+            .map_get(ws.clone())
+            .await
+            .expect("map after tree-changing event");
+        assert_eq!(
+            crate::semantic_map::structural::structural_scan_count(root.path()),
+            index + 2
+        );
+    }
+}
+
+#[tokio::test]
+async fn semantic_map_manifest_delete_and_tag_removal_reveal_structural_fallback() {
+    let root = test_tempdir("intentd-semantic-map-lifecycle-");
+    std::fs::write(root.path().join("README.md"), "# mapped\n").expect("write readme");
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let mut workspace = workspace(&ws);
+    workspace.worktree_path = Some(root.path().to_string_lossy().into_owned());
+    store.insert_workspace(&workspace).await.expect("ws");
+    let services = Services::new(store);
+    let manifest = serde_json::json!({
+        "version": 1,
+        "regions": [{
+            "id": "core", "label": "Core", "responsibility": "Core",
+            "anchor": [0, 0], "paths": ["src/**"]
+        }]
+    });
+
+    let set = services
+        .map_set_manifest(ws.clone(), manifest.clone())
+        .await
+        .expect("set manifest");
+    let note_id = NoteId::from(set["noteId"].as_str().expect("note id"));
+    assert_eq!(
+        services.map_get(ws.clone()).await.unwrap()["source"],
+        "curated"
+    );
+    services
+        .update_note_metadata(
+            ws.clone(),
+            note_id.clone(),
+            None,
+            Some(Vec::new()),
+            None,
+            None,
+        )
+        .await
+        .expect("remove manifest tag");
+    assert_eq!(
+        services.map_get(ws.clone()).await.unwrap()["source"],
+        "structural"
+    );
+
+    let set = services
+        .map_set_manifest(ws.clone(), manifest)
+        .await
+        .expect("set replacement manifest");
+    let note_id = NoteId::from(set["noteId"].as_str().expect("replacement note id"));
+    assert_eq!(
+        services.map_get(ws.clone()).await.unwrap()["source"],
+        "curated"
+    );
+    services
+        .delete_note(ws.clone(), note_id, None)
+        .await
+        .expect("delete manifest");
+    assert_eq!(services.map_get(ws).await.unwrap()["source"], "structural");
+}
+
+#[tokio::test]
+async fn semantic_map_classify_rejects_unsafe_and_oversized_paths() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let services = Services::new(store);
+    services
+        .map_set_manifest(ws.clone(), serde_json::json!({"version":1,"regions":[]}))
+        .await
+        .expect("set manifest");
+
+    for invalid in ["/src/lib.rs", "../src/lib.rs", r"C:\src\lib.rs"] {
+        let error = services
+            .map_classify(ws.clone(), vec![serde_json::json!(invalid)])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidParams(_)), "{error}");
+        assert!(error.to_string().contains("paths[0]"), "{error}");
+    }
+    let too_many = (0..=crate::semantic_map::MAX_CLASSIFY_PATHS)
+        .map(|index| serde_json::json!(format!("src/{index}.rs")))
+        .collect();
+    assert!(matches!(
+        services.map_classify(ws.clone(), too_many).await,
+        Err(Error::InvalidParams(_))
+    ));
+    let too_large = "a".repeat(crate::semantic_map::MAX_CLASSIFY_BYTES + 1);
+    assert!(matches!(
+        services
+            .map_classify(ws, vec![serde_json::json!(too_large)])
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
+}
+
+#[tokio::test]
 async fn settings_revision_gate_orders_mutation_before_snapshot() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");

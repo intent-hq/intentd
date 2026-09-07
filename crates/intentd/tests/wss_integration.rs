@@ -7504,6 +7504,41 @@ async fn wss_semantic_map_round_trip() {
     });
     let invalid = wss_call(srv.port, srv.cfg.clone(), &invalid.to_string()).await;
     assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    for (id, invalid_manifest, field) in [
+        (
+            20,
+            serde_json::json!({"version":1,"regions":[{"id":"","label":"Empty","responsibility":"Invalid","anchor":[0,0],"paths":[]}]}),
+            "regions[0].id",
+        ),
+        (
+            21,
+            serde_json::json!({"version":1,"regions":[{"id":"same","label":"One","responsibility":"First","anchor":[0,0],"paths":[]},{"id":"same","label":"Two","responsibility":"Second","anchor":[1,1],"paths":[]}]}),
+            "regions[1].id",
+        ),
+        (
+            22,
+            serde_json::json!({"version":1,"regions":[{"id":"one","label":"One","responsibility":"First","anchor":[0,0],"paths":[]}],"crossings":[{"from":"one","to":"missing","label":"calls"}]}),
+            "crossings[0].to",
+        ),
+        (
+            23,
+            serde_json::json!({"version":1,"regions":[],"extension":true}),
+            "extension",
+        ),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc":"2.0", "id":id, "method":"map.setManifest",
+            "params":{"workspaceId":ws.0,"json":invalid_manifest}
+        });
+        let response = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(field)),
+            "{response}"
+        );
+    }
     let curated = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert_eq!(curated["result"]["source"], "curated", "{curated}");
     assert_eq!(
@@ -7522,6 +7557,21 @@ async fn wss_semantic_map_round_trip() {
             {"regionId":"code","confidence":"curated"},
             {"regionId":"unsorted","confidence":"unsorted"}
         ])
+    );
+    let unsafe_classify = serde_json::json!({
+        "jsonrpc":"2.0", "id":24, "method":"map.classify",
+        "params":{"workspaceId":ws.0,"paths":["../outside.rs"]}
+    });
+    let unsafe_classify = wss_call(srv.port, srv.cfg.clone(), &unsafe_classify.to_string()).await;
+    assert_eq!(
+        unsafe_classify["error"]["code"], -32602,
+        "{unsafe_classify}"
+    );
+    assert!(
+        unsafe_classify["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("paths[0]")),
+        "{unsafe_classify}"
     );
 
     let actor = EventActor {

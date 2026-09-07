@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::classifier::Classifier;
+use super::paths::normalize_workspace_relative_pattern;
 
 pub const MANIFEST_TAG: &str = "semantic-map";
 
@@ -83,9 +84,9 @@ impl std::error::Error for ManifestError {}
 /// Returns an error when the document is not valid JSON or violates the manifest schema.
 pub fn parse_manifest(content: &str) -> Result<Manifest, ManifestError> {
     let json = fenced_json(content)?;
-    let value: Value = serde_json::from_str(json)
+    let mut value: Value = serde_json::from_str(json)
         .map_err(|error| ManifestError::new("document", error.to_string()))?;
-    validate_manifest(&value)?;
+    validate_manifest(&mut value)?;
     serde_json::from_value(value).map_err(|error| ManifestError::new("document", error.to_string()))
 }
 
@@ -110,10 +111,15 @@ fn fenced_json(content: &str) -> Result<&str, ManifestError> {
     Ok(body[..closing].trim())
 }
 
-fn validate_manifest(value: &Value) -> Result<(), ManifestError> {
+fn validate_manifest(value: &mut Value) -> Result<(), ManifestError> {
     let object = value
-        .as_object()
+        .as_object_mut()
         .ok_or_else(|| ManifestError::new("document", "must be a JSON object"))?;
+    reject_unknown_fields(
+        object.keys(),
+        "document",
+        &["version", "regions", "crossings"],
+    )?;
     let version = required_u32(object.get("version"), "version")?;
     if version != 1 {
         return Err(ManifestError::new(
@@ -121,9 +127,16 @@ fn validate_manifest(value: &Value) -> Result<(), ManifestError> {
             "unsupported manifest version",
         ));
     }
-    let regions = required_array(object.get("regions"), "regions")?;
-    for (index, region) in regions.iter().enumerate() {
-        validate_region(region, index)?;
+    let regions = required_array_mut(object.get_mut("regions"), "regions")?;
+    let mut region_ids = HashSet::with_capacity(regions.len());
+    for (index, region) in regions.iter_mut().enumerate() {
+        let id = validate_region(region, index)?;
+        if !region_ids.insert(id.clone()) {
+            return Err(ManifestError::new(
+                format!("regions[{index}].id"),
+                format!("duplicate region id {id:?}"),
+            ));
+        }
     }
     if let Some(crossings) = object.get("crossings") {
         for (index, crossing) in required_array(Some(crossings), "crossings")?
@@ -134,22 +147,53 @@ fn validate_manifest(value: &Value) -> Result<(), ManifestError> {
             let crossing = crossing
                 .as_object()
                 .ok_or_else(|| ManifestError::new(&prefix, "must be an object"))?;
+            reject_unknown_fields(crossing.keys(), &prefix, &["from", "to", "label"])?;
             for field in ["from", "to", "label"] {
                 required_string(crossing.get(field), &format!("{prefix}.{field}"))?;
+            }
+            for field in ["from", "to"] {
+                let endpoint = required_string(crossing.get(field), &format!("{prefix}.{field}"))?;
+                if !region_ids.contains(endpoint) {
+                    return Err(ManifestError::new(
+                        format!("{prefix}.{field}"),
+                        "must reference an existing region",
+                    ));
+                }
             }
         }
     }
     Ok(())
 }
 
-fn validate_region(value: &Value, index: usize) -> Result<(), ManifestError> {
+fn validate_region(value: &mut Value, index: usize) -> Result<String, ManifestError> {
     let prefix = format!("regions[{index}]");
     let region = value
-        .as_object()
+        .as_object_mut()
         .ok_or_else(|| ManifestError::new(&prefix, "must be an object"))?;
+    reject_unknown_fields(
+        region.keys(),
+        &prefix,
+        &[
+            "id",
+            "label",
+            "responsibility",
+            "parent",
+            "anchor",
+            "paths",
+            "color",
+        ],
+    )?;
     for field in ["id", "label", "responsibility"] {
         required_string(region.get(field), &format!("{prefix}.{field}"))?;
     }
+    let id = required_string(region.get("id"), &format!("{prefix}.id"))?;
+    if id.trim().is_empty() {
+        return Err(ManifestError::new(
+            format!("{prefix}.id"),
+            "must not be empty",
+        ));
+    }
+    let id = id.to_string();
     if let Some(parent) = region.get("parent") {
         required_string(Some(parent), &format!("{prefix}.parent"))?;
     }
@@ -174,11 +218,37 @@ fn validate_region(value: &Value, index: usize) -> Result<(), ManifestError> {
             ));
         }
     }
-    for (path_index, path) in required_array(region.get("paths"), &format!("{prefix}.paths"))?
-        .iter()
-        .enumerate()
+    for (path_index, path) in
+        required_array_mut(region.get_mut("paths"), &format!("{prefix}.paths"))?
+            .iter_mut()
+            .enumerate()
     {
-        required_string(Some(path), &format!("{prefix}.paths[{path_index}]"))?;
+        let field = format!("{prefix}.paths[{path_index}]");
+        let normalized = normalize_workspace_relative_pattern(required_string(Some(path), &field)?)
+            .map_err(|error| ManifestError::new(&field, error.to_string()))?;
+        *path = Value::String(normalized);
+    }
+    Ok(id)
+}
+
+fn reject_unknown_fields<'a>(
+    fields: impl Iterator<Item = &'a String>,
+    prefix: &str,
+    allowed: &[&str],
+) -> Result<(), ManifestError> {
+    if let Some(field) = fields
+        .filter(|field| !allowed.contains(&field.as_str()))
+        .min()
+    {
+        let field = if prefix == "document" {
+            field.clone()
+        } else {
+            format!("{prefix}.{field}")
+        };
+        return Err(ManifestError::new(
+            field,
+            "unknown field for manifest version 1",
+        ));
     }
     Ok(())
 }
@@ -200,6 +270,16 @@ fn required_array<'a>(
         .ok_or_else(|| ManifestError::new(field, "must be an array"))
 }
 
+fn required_array_mut<'a>(
+    value: Option<&'a mut Value>,
+    field: &str,
+) -> Result<&'a mut Vec<Value>, ManifestError> {
+    value
+        .ok_or_else(|| ManifestError::new(field, "is required"))?
+        .as_array_mut()
+        .ok_or_else(|| ManifestError::new(field, "must be an array"))
+}
+
 fn required_u32(value: Option<&Value>, field: &str) -> Result<u32, ManifestError> {
     let value = value.ok_or_else(|| ManifestError::new(field, "is required"))?;
     let number = value
@@ -210,7 +290,8 @@ fn required_u32(value: Option<&Value>, field: &str) -> Result<u32, ManifestError
 
 #[derive(Clone)]
 struct CachedManifest {
-    note_id: NoteId,
+    note_id: Option<NoteId>,
+    worktree_version: Option<String>,
     manifest: Manifest,
     classifier: Arc<Classifier>,
     coverage: Option<(Option<String>, usize, usize)>,
@@ -219,6 +300,7 @@ struct CachedManifest {
 #[derive(Clone, Default)]
 pub struct ManifestLoader {
     cache: Arc<Mutex<HashMap<WorkspaceId, CachedManifest>>>,
+    structural_gates: Arc<Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl ManifestLoader {
@@ -302,7 +384,8 @@ impl ManifestLoader {
         cache.insert(
             workspace_id.clone(),
             CachedManifest {
-                note_id: note.id.clone(),
+                note_id: Some(note.id.clone()),
+                worktree_version: None,
                 manifest: manifest.clone(),
                 classifier: Arc::clone(&classifier),
                 coverage: None,
@@ -317,6 +400,59 @@ impl ManifestLoader {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(workspace_id)
             .cloned()
+    }
+
+    pub async fn structural_guard(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = self
+            .structural_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(workspace_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        gate.lock_owned().await
+    }
+
+    pub fn invalidate_structural_if_stale(
+        &self,
+        workspace_id: &WorkspaceId,
+        worktree_version: Option<&str>,
+    ) -> bool {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let should_remove = cache.get(workspace_id).is_some_and(|cached| {
+            cached.manifest.source == ManifestSource::Structural
+                && cached.worktree_version.as_deref() != worktree_version
+        });
+        remove_cached(&mut cache, workspace_id, should_remove)
+    }
+
+    pub fn cache_structural(
+        &self,
+        workspace_id: &WorkspaceId,
+        worktree_version: Option<String>,
+        manifest: Manifest,
+        classifier: Arc<Classifier>,
+        coverage: (usize, usize),
+    ) {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                workspace_id.clone(),
+                CachedManifest {
+                    note_id: None,
+                    worktree_version: worktree_version.clone(),
+                    manifest,
+                    classifier,
+                    coverage: Some((worktree_version, coverage.0, coverage.1)),
+                },
+            );
     }
 
     pub fn coverage(
@@ -363,7 +499,23 @@ impl ManifestLoader {
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> bool {
-        self.invalidate_note_update(workspace_id, Some(note_id.as_str()))
+        self.invalidate_note_changed(workspace_id, note_id, false)
+    }
+
+    pub(crate) fn invalidate_note_changed(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        is_manifest: bool,
+    ) -> bool {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let should_remove = cache.get(workspace_id).is_some_and(|cached| {
+            cached.note_id.as_ref().is_some_and(|id| id == note_id) || is_manifest
+        });
+        remove_cached(&mut cache, workspace_id, should_remove)
     }
 
     fn invalidate_note_update(&self, workspace_id: &WorkspaceId, note_id: Option<&str>) -> bool {
@@ -371,10 +523,31 @@ impl ManifestLoader {
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let should_remove = cache
-            .get(workspace_id)
-            .is_some_and(|cached| note_id.is_none_or(|note_id| cached.note_id.as_str() == note_id));
-        should_remove && cache.remove(workspace_id).is_some()
+        let should_remove = cache.get(workspace_id).is_some_and(|cached| {
+            note_id.is_none_or(|note_id| {
+                cached
+                    .note_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == note_id)
+            })
+        });
+        remove_cached(&mut cache, workspace_id, should_remove)
+    }
+}
+
+fn remove_cached(
+    cache: &mut HashMap<WorkspaceId, CachedManifest>,
+    workspace_id: &WorkspaceId,
+    should_remove: bool,
+) -> bool {
+    if !should_remove {
+        return false;
+    }
+    if let Some(cached) = cache.remove(workspace_id) {
+        cached.classifier.clear_cache();
+        true
+    } else {
+        false
     }
 }
 
@@ -438,6 +611,36 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.field, "regions[0].anchor[0]");
         assert!(error.to_string().contains("regions[0].anchor[0]"));
+    }
+
+    #[test]
+    fn rejects_duplicate_empty_and_dangling_region_references() {
+        for (document, field) in [
+            (
+                r#"{"version":1,"regions":[{"id":"","label":"A","responsibility":"R","anchor":[0,0],"paths":[]}]}"#,
+                "regions[0].id",
+            ),
+            (
+                r#"{"version":1,"regions":[{"id":"a","label":"A","responsibility":"R","anchor":[0,0],"paths":[]},{"id":"a","label":"B","responsibility":"R","anchor":[1,1],"paths":[]}]}"#,
+                "regions[1].id",
+            ),
+            (
+                r#"{"version":1,"regions":[{"id":"a","label":"A","responsibility":"R","anchor":[0,0],"paths":[]}],"crossings":[{"from":"a","to":"missing","label":"calls"}]}"#,
+                "crossings[0].to",
+            ),
+        ] {
+            assert_eq!(parse_manifest(document).unwrap_err().field, field);
+        }
+    }
+
+    #[test]
+    fn version_one_rejects_unknown_fields_and_normalizes_patterns() {
+        let error = parse_manifest(r#"{"version":1,"regions":[],"extension":true}"#).unwrap_err();
+        assert_eq!(error.field, "extension");
+        let error = parse_manifest(r#"{"version":1,"regions":[{"id":"a","label":"A","responsibility":"R","anchor":[0,0],"paths":[],"extension":true}]}"#).unwrap_err();
+        assert_eq!(error.field, "regions[0].extension");
+        let manifest = parse_manifest(r#"{"version":1,"regions":[{"id":"a","label":"A","responsibility":"R","anchor":[0,0],"paths":["src\\**","!src\\generated\\**"]}]}"#).unwrap();
+        assert_eq!(manifest.regions[0].paths, ["src/**", "!src/generated/**"]);
     }
 
     #[test]

@@ -12697,34 +12697,27 @@ const MAP_EVENT_TYPES: [&str; 6] = [
     AGENT_STREAM_ACTIVITY,
 ];
 
-async fn semantic_map_paths(store: &Store, workspace_id: &WorkspaceId) -> Result<Vec<String>> {
+async fn semantic_map_paths(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+) -> Result<semantic_map::StructuralScan> {
     let workspace = store.get_workspace(workspace_id).await?;
     let Some(root) = git_ops::worktree_path(&workspace) else {
-        return Ok(Vec::new());
+        return Ok(semantic_map::StructuralScan::default());
     };
-    tokio::task::spawn_blocking(move || {
-        ignore::WalkBuilder::new(&root)
-            .hidden(false)
-            .filter_entry(|entry| {
-                !matches!(
-                    entry.file_name().to_str(),
-                    Some(".git" | "target" | "node_modules")
-                )
-            })
-            .build()
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-            .filter_map(|entry| {
-                entry
-                    .path()
-                    .strip_prefix(&root)
-                    .ok()
-                    .map(|path| path.to_string_lossy().replace('\\', "/"))
-            })
-            .collect()
-    })
-    .await
-    .map_err(|error| Error::Internal(format!("semantic map scan failed: {error}")))
+    let scan = tokio::task::spawn_blocking(move || semantic_map::scan_structural_paths(&root))
+        .await
+        .map_err(|error| Error::Internal(format!("semantic map scan failed: {error}")))?;
+    if scan.walk_errors > 0 || scan.limit_reached {
+        tracing::warn!(
+            workspace_id = %workspace_id,
+            walk_errors = scan.walk_errors,
+            limit_reached = scan.limit_reached,
+            files = scan.paths.len(),
+            "semantic map structural scan was incomplete"
+        );
+    }
+    Ok(scan)
 }
 
 async fn active_semantic_map(
@@ -12734,16 +12727,59 @@ async fn active_semantic_map(
 ) -> Result<(
     semantic_map::Manifest,
     Arc<semantic_map::Classifier>,
-    Option<Vec<String>>,
+    Option<(usize, usize)>,
 )> {
+    let mut worktree_version = semantic_map_worktree_version(store, workspace_id).await?;
+    loader.invalidate_structural_if_stale(workspace_id, worktree_version.as_deref());
+    if let Some((manifest, classifier)) = load_semantic_map(loader, store, workspace_id).await? {
+        let coverage = (manifest.source == semantic_map::ManifestSource::Structural)
+            .then(|| loader.coverage(workspace_id, worktree_version.as_deref()))
+            .flatten();
+        return Ok((manifest, classifier, coverage));
+    }
+
+    let _guard = loader.structural_guard(workspace_id).await;
+    worktree_version = semantic_map_worktree_version(store, workspace_id).await?;
+    loader.invalidate_structural_if_stale(workspace_id, worktree_version.as_deref());
+    if let Some((manifest, classifier)) = load_semantic_map(loader, store, workspace_id).await? {
+        let coverage = (manifest.source == semantic_map::ManifestSource::Structural)
+            .then(|| loader.coverage(workspace_id, worktree_version.as_deref()))
+            .flatten();
+        return Ok((manifest, classifier, coverage));
+    }
+
+    let scan = semantic_map_paths(store, workspace_id).await?;
+    let manifest = semantic_map::structural_manifest(&scan.paths);
+    let classifier = Arc::new(semantic_map::Classifier::new(&manifest));
+    let coverage = (
+        scan.paths
+            .iter()
+            .filter(|path| {
+                classifier.classify(path).confidence != semantic_map::AssignmentConfidence::Unsorted
+            })
+            .count(),
+        scan.paths.len(),
+    );
+    if let Some(cached) = load_semantic_map(loader, store, workspace_id).await? {
+        return Ok((cached.0, cached.1, None));
+    }
+    loader.cache_structural(
+        workspace_id,
+        worktree_version,
+        manifest.clone(),
+        Arc::clone(&classifier),
+        coverage,
+    );
+    Ok((manifest, classifier, Some(coverage)))
+}
+
+async fn load_semantic_map(
+    loader: &semantic_map::ManifestLoader,
+    store: &Store,
+    workspace_id: &WorkspaceId,
+) -> Result<Option<(semantic_map::Manifest, Arc<semantic_map::Classifier>)>> {
     match loader.load_compiled(store, workspace_id).await {
-        Ok(Some(cached)) => Ok((cached.0, cached.1, None)),
-        Ok(None) => {
-            let paths = semantic_map_paths(store, workspace_id).await?;
-            let manifest = semantic_map::structural_manifest(&paths);
-            let classifier = Arc::new(semantic_map::Classifier::new(&manifest));
-            Ok((manifest, classifier, Some(paths)))
-        }
+        Ok(cached) => Ok(cached),
         Err(semantic_map::ManifestLoadError::Store(error)) => Err(error),
         Err(semantic_map::ManifestLoadError::Parse(error)) => Err(Error::InvalidParams(format!(
             "invalid semantic map: {error}"
@@ -12763,6 +12799,9 @@ async fn semantic_map_worktree_version(
                 FILE_CREATED.to_string(),
                 FILE_DELETED.to_string(),
                 "file:renamed".to_string(),
+                GIT_ROOT_REGISTERED.to_string(),
+                GIT_ROOT_UPDATED.to_string(),
+                GIT_ROOT_UNREGISTERED.to_string(),
             ],
             limit: Some(1),
             ..Default::default()
@@ -21182,6 +21221,15 @@ impl WorkspaceApi for Services {
                     if let Some(refetched) = outcome.refetched_note {
                         note = refetched;
                     }
+                    services
+                        .semantic_map_manifest_loader
+                        .invalidate_note_changed(
+                            &note.workspace_id,
+                            &note.id,
+                            note.tags
+                                .iter()
+                                .any(|tag| tag == semantic_map::MANIFEST_TAG),
+                        );
                     publish_event(
                         bus.as_ref(),
                         note_change_event(
@@ -21278,7 +21326,13 @@ impl WorkspaceApi for Services {
             }
             services
                 .semantic_map_manifest_loader
-                .invalidate_note_updated(&note.workspace_id, &note.id);
+                .invalidate_note_changed(
+                    &note.workspace_id,
+                    &note.id,
+                    note.tags
+                        .iter()
+                        .any(|tag| tag == semantic_map::MANIFEST_TAG),
+                );
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -21347,7 +21401,13 @@ impl WorkspaceApi for Services {
                 .unwrap_or(new_content);
             services
                 .semantic_map_manifest_loader
-                .invalidate_note_updated(&note.workspace_id, &note.id);
+                .invalidate_note_changed(
+                    &note.workspace_id,
+                    &note.id,
+                    note.tags
+                        .iter()
+                        .any(|tag| tag == semantic_map::MANIFEST_TAG),
+                );
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -21428,7 +21488,13 @@ impl WorkspaceApi for Services {
                 .unwrap_or(new_content);
             services
                 .semantic_map_manifest_loader
-                .invalidate_note_updated(&note.workspace_id, &note.id);
+                .invalidate_note_changed(
+                    &note.workspace_id,
+                    &note.id,
+                    note.tags
+                        .iter()
+                        .any(|tag| tag == semantic_map::MANIFEST_TAG),
+                );
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -21509,7 +21575,13 @@ impl WorkspaceApi for Services {
             let total_lines_after = final_content.split('\n').count();
             services
                 .semantic_map_manifest_loader
-                .invalidate_note_updated(&note.workspace_id, &note.id);
+                .invalidate_note_changed(
+                    &note.workspace_id,
+                    &note.id,
+                    note.tags
+                        .iter()
+                        .any(|tag| tag == semantic_map::MANIFEST_TAG),
+                );
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -21619,6 +21691,15 @@ impl WorkspaceApi for Services {
                 Some(n) => (n.content, n.updated_at),
                 None => (clean, now),
             };
+            services
+                .semantic_map_manifest_loader
+                .invalidate_note_changed(
+                    &note.workspace_id,
+                    &note.id,
+                    note.tags
+                        .iter()
+                        .any(|tag| tag == semantic_map::MANIFEST_TAG),
+                );
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -21702,7 +21783,13 @@ impl WorkspaceApi for Services {
             store.update_note_versioned(&note, expected_version).await?;
             services
                 .semantic_map_manifest_loader
-                .invalidate_note_updated(&note.workspace_id, &note.id);
+                .invalidate_note_changed(
+                    &note.workspace_id,
+                    &note.id,
+                    note.tags
+                        .iter()
+                        .any(|tag| tag == semantic_map::MANIFEST_TAG),
+                );
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -21751,6 +21838,9 @@ impl WorkspaceApi for Services {
                 .delete_note_versioned(&workspace_id, &note_id, expected_version)
                 .await?;
             services.crdt_notes.remove(&workspace_id, &note_id);
+            services
+                .semantic_map_manifest_loader
+                .invalidate_note_updated(&workspace_id, &note_id);
             publish_event(
                 bus.as_ref(),
                 note_change_event(&workspace_id, &note_id, &note.title, NOTE_DELETED, "delete"),
@@ -23604,32 +23694,26 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let loader = self.semantic_map_manifest_loader.clone();
         Box::pin(async move {
-            let (manifest, classifier, structural_paths) =
+            let (manifest, classifier, structural_coverage) =
                 active_semantic_map(&store, &loader, &workspace_id).await?;
-            let (matched, total) = if let Some(paths) = structural_paths {
-                let matched = paths
-                    .iter()
-                    .filter(|path| {
-                        classifier.classify(path).confidence
-                            != semantic_map::AssignmentConfidence::Unsorted
-                    })
-                    .count();
-                (matched, paths.len())
+            let (matched, total) = if let Some(coverage) = structural_coverage {
+                coverage
             } else {
                 let worktree_version = semantic_map_worktree_version(&store, &workspace_id).await?;
                 if let Some(coverage) = loader.coverage(&workspace_id, worktree_version.as_deref())
                 {
                     coverage
                 } else {
-                    let paths = semantic_map_paths(&store, &workspace_id).await?;
-                    let matched = paths
+                    let scan = semantic_map_paths(&store, &workspace_id).await?;
+                    let matched = scan
+                        .paths
                         .iter()
                         .filter(|path| {
                             classifier.classify(path).confidence
                                 != semantic_map::AssignmentConfidence::Unsorted
                         })
                         .count();
-                    let coverage = (matched, paths.len());
+                    let coverage = (matched, scan.paths.len());
                     loader.set_coverage(&workspace_id, worktree_version, coverage.0, coverage.1);
                     coverage
                 }
@@ -23720,19 +23804,39 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let loader = self.semantic_map_manifest_loader.clone();
         Box::pin(async move {
-            let (_, classifier, _) = active_semantic_map(&store, &loader, &workspace_id).await?;
-            let workspace_paths = semantic_map::workspace_paths(&store, &workspace_id).await?;
             let paths: Vec<semantic_map::ClassifyPath> =
                 serde_json::from_value(serde_json::Value::Array(paths)).map_err(|error| {
                     Error::InvalidParams(format!("invalid map classification paths: {error}"))
                 })?;
-            serde_json::to_value(
-                paths
-                    .iter()
-                    .map(|path| classifier.classify_path(&workspace_paths, path))
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(|error| Error::Internal(format!("serialize assignments failed: {error}")))
+            if paths.len() > semantic_map::MAX_CLASSIFY_PATHS {
+                return Err(Error::InvalidParams(format!(
+                    "paths: must contain at most {} entries",
+                    semantic_map::MAX_CLASSIFY_PATHS
+                )));
+            }
+            let total_bytes = paths
+                .iter()
+                .map(semantic_map::ClassifyPath::byte_len)
+                .sum::<usize>();
+            if total_bytes > semantic_map::MAX_CLASSIFY_BYTES {
+                return Err(Error::InvalidParams(format!(
+                    "paths: total path data must not exceed {} bytes",
+                    semantic_map::MAX_CLASSIFY_BYTES
+                )));
+            }
+            let (_, classifier, _) = active_semantic_map(&store, &loader, &workspace_id).await?;
+            let workspace_paths = semantic_map::workspace_paths(&store, &workspace_id).await?;
+            let assignments = paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    classifier
+                        .classify_path(&workspace_paths, path)
+                        .map_err(|error| Error::InvalidParams(format!("paths[{index}]: {error}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            serde_json::to_value(assignments)
+                .map_err(|error| Error::Internal(format!("serialize assignments failed: {error}")))
         })
     }
 

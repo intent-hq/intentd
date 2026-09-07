@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -6,9 +6,12 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 
 use super::manifest::Manifest;
-use super::paths::WorkspacePaths;
+use super::paths::{WorkspacePathError, WorkspacePaths};
 
 pub const UNSORTED_REGION_ID: &str = "unsorted";
+pub const CLASSIFIER_MEMO_CAPACITY: usize = 4_096;
+pub const MAX_CLASSIFY_PATHS: usize = 1_024;
+pub const MAX_CLASSIFY_BYTES: usize = 256 * 1_024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -47,6 +50,12 @@ impl ClassifyPath {
             Self::Rooted { path, git_root_id } => (path, git_root_id.as_deref()),
         }
     }
+
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        let (path, git_root_id) = self.parts();
+        path.len() + git_root_id.map_or(0, str::len)
+    }
 }
 
 #[must_use]
@@ -61,7 +70,13 @@ struct RegionMatcher {
 
 pub struct Classifier {
     regions: Vec<RegionMatcher>,
-    assignments: Mutex<HashMap<String, Assignment>>,
+    assignments: Mutex<AssignmentMemo>,
+}
+
+#[derive(Default)]
+struct AssignmentMemo {
+    entries: HashMap<String, Assignment>,
+    insertion_order: VecDeque<String>,
 }
 
 impl Classifier {
@@ -83,20 +98,38 @@ impl Classifier {
             .collect();
         Self {
             regions,
-            assignments: Mutex::new(HashMap::new()),
+            assignments: Mutex::new(AssignmentMemo::default()),
         }
     }
 
     pub fn classify(&self, rel_path: &str) -> Assignment {
         let normalized = normalize_path(rel_path);
-        let mut assignments = self
+        if let Some(assignment) = self
+            .assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .get(&normalized)
+            .cloned()
+        {
+            return assignment;
+        }
+        let assignment = self.classify_uncached(&normalized);
+        let mut memo = self
             .assignments
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assignments
-            .entry(normalized.clone())
-            .or_insert_with(|| self.classify_uncached(&normalized))
-            .clone()
+        if let Some(cached) = memo.entries.get(&normalized) {
+            return cached.clone();
+        }
+        if memo.entries.len() == CLASSIFIER_MEMO_CAPACITY {
+            if let Some(evicted) = memo.insertion_order.pop_front() {
+                memo.entries.remove(&evicted);
+            }
+        }
+        memo.insertion_order.push_back(normalized.clone());
+        memo.entries.insert(normalized, assignment.clone());
+        assignment
     }
 
     fn classify_uncached(&self, normalized: &str) -> Assignment {
@@ -122,9 +155,27 @@ impl Classifier {
         )
     }
 
-    pub fn classify_path(&self, paths: &WorkspacePaths, input: &ClassifyPath) -> Assignment {
+    /// Classifies a path after workspace-relative normalization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is absolute or contains parent traversal.
+    pub fn classify_path(
+        &self,
+        paths: &WorkspacePaths,
+        input: &ClassifyPath,
+    ) -> Result<Assignment, WorkspacePathError> {
         let (path, git_root_id) = input.parts();
-        self.classify(&paths.normalize(path, git_root_id))
+        Ok(self.classify(&paths.normalize(path, git_root_id)?))
+    }
+
+    pub(crate) fn clear_cache(&self) {
+        let mut memo = self
+            .assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        memo.entries.clear();
+        memo.insertion_order.clear();
     }
 
     #[cfg(test)]
@@ -132,6 +183,7 @@ impl Classifier {
         self.assignments
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
             .len()
     }
 }
@@ -202,6 +254,15 @@ mod tests {
     }
 
     #[test]
+    fn classifier_memo_is_bounded() {
+        let classifier = Classifier::new(&manifest());
+        for index in 0..(CLASSIFIER_MEMO_CAPACITY + 100) {
+            classifier.classify(&format!("src/file-{index}.rs"));
+        }
+        assert_eq!(classifier.cached_paths(), CLASSIFIER_MEMO_CAPACITY);
+    }
+
+    #[test]
     fn compiled_classifier_preserves_precedence_golden() {
         let manifest = manifest();
         let classifier = Classifier::new(&manifest);
@@ -266,7 +327,7 @@ mod tests {
             git_root_id: Some("intentd-root".into()),
         };
         assert_eq!(
-            classifier.classify_path(&paths, &rooted).region_id,
+            classifier.classify_path(&paths, &rooted).unwrap().region_id,
             "transport-rpc"
         );
         assert_eq!(
@@ -275,6 +336,7 @@ mod tests {
                     &paths,
                     &ClassifyPath::Path("crates/intent-transport/src/router.rs".into())
                 )
+                .unwrap()
                 .confidence,
             AssignmentConfidence::Unsorted
         );

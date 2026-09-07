@@ -1,10 +1,72 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use intent_core::events::{GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED};
 use intent_core::{Event, WorkspaceGitRoot, WorkspaceId};
 use intent_store::Store;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspacePathError(String);
+
+impl fmt::Display for WorkspacePathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorkspacePathError {}
+
+/// Lexically normalizes a workspace-relative path without consulting the filesystem.
+///
+/// Both POSIX and Windows separators are accepted. Absolute paths, Windows drive/prefix
+/// paths, parent traversal, and empty paths are rejected.
+///
+/// # Errors
+///
+/// Returns an error when `path` is not a non-empty workspace-relative path.
+pub fn normalize_workspace_relative_path(path: &str) -> Result<String, WorkspacePathError> {
+    let normalized = path.replace('\\', "/");
+    if normalized.starts_with('/')
+        || normalized
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
+    {
+        return Err(WorkspacePathError("must be workspace-relative".to_string()));
+    }
+    let mut components = Vec::new();
+    for component in normalized.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                return Err(WorkspacePathError(
+                    "must not contain parent traversal".to_string(),
+                ));
+            }
+            component => components.push(component),
+        }
+    }
+    if components.is_empty() {
+        return Err(WorkspacePathError("must not be empty".to_string()));
+    }
+    Ok(components.join("/"))
+}
+
+pub(crate) fn normalize_workspace_relative_pattern(
+    pattern: &str,
+) -> Result<String, WorkspacePathError> {
+    let (negated, pattern) = pattern
+        .strip_prefix('!')
+        .map_or((false, pattern), |pattern| (true, pattern));
+    let normalized = normalize_workspace_relative_path(pattern)?;
+    Ok(if negated {
+        format!("!{normalized}")
+    } else {
+        normalized
+    })
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct WorkspacePaths {
@@ -26,17 +88,24 @@ impl WorkspacePaths {
         Self { prefixes }
     }
 
-    #[must_use]
-    pub fn normalize(&self, path: &str, git_root_id: Option<&str>) -> String {
-        let path = crate::file_tracking::normalize_path(path);
+    /// Normalizes a path and prefixes it with its registered git-root location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `path` or the combined workspace path is unsafe.
+    pub fn normalize(
+        &self,
+        path: &str,
+        git_root_id: Option<&str>,
+    ) -> Result<String, WorkspacePathError> {
+        let path = normalize_workspace_relative_path(path)?;
         let Some(prefix) = git_root_id.and_then(|id| self.prefixes.get(id)) else {
-            return path;
+            return Ok(path);
         };
-        match (prefix.is_empty(), path.is_empty()) {
-            (true, _) => path,
-            (_, true) => prefix.clone(),
-            _ => format!("{prefix}/{path}"),
+        if prefix.is_empty() {
+            return Ok(path);
         }
+        normalize_workspace_relative_path(&format!("{prefix}/{path}"))
     }
 
     #[cfg(test)]
@@ -129,6 +198,36 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+
+    #[test]
+    fn validates_cross_platform_workspace_relative_paths() {
+        assert_eq!(
+            normalize_workspace_relative_path(r".\src\lib.rs").unwrap(),
+            "src/lib.rs"
+        );
+        for invalid in [
+            "/src/lib.rs",
+            r"\server\share\file.rs",
+            "C:/src/lib.rs",
+            "../src/lib.rs",
+            "src/../lib.rs",
+            "",
+        ] {
+            assert!(
+                normalize_workspace_relative_path(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_negated_manifest_patterns() {
+        assert_eq!(
+            normalize_workspace_relative_pattern(r"!src\generated\**").unwrap(),
+            "!src/generated/**"
+        );
+        assert!(normalize_workspace_relative_pattern("!/absolute/**").is_err());
+    }
 
     #[test]
     fn unregistered_root_invalidates_the_workspace_cache() {

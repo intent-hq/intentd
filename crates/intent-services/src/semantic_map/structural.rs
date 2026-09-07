@@ -1,6 +1,116 @@
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use super::manifest::{Manifest, ManifestSource, Region};
+
+pub const STRUCTURAL_SCAN_MAX_FILES: usize = 100_000;
+pub const STRUCTURAL_SCAN_MAX_DURATION: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Default)]
+pub struct StructuralScan {
+    pub paths: Vec<String>,
+    pub walk_errors: usize,
+    pub limit_reached: bool,
+}
+
+/// Walks a worktree for structural-map inputs, bounded by file count and wall time.
+#[must_use]
+pub fn scan_structural_paths(root: &Path) -> StructuralScan {
+    record_structural_scan(root);
+    let entries = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .filter_entry(|entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "target" | "node_modules")
+            )
+        })
+        .build()
+        .map(|entry| {
+            entry.map(|entry| {
+                entry
+                    .file_type()
+                    .is_some_and(|kind| kind.is_file())
+                    .then(|| entry.path().to_path_buf())
+            })
+        });
+    collect_structural_paths(
+        root,
+        entries,
+        STRUCTURAL_SCAN_MAX_FILES,
+        STRUCTURAL_SCAN_MAX_DURATION,
+    )
+}
+
+#[cfg(test)]
+fn record_structural_scan(root: &Path) {
+    *structural_scan_counts()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(root.to_path_buf())
+        .or_default() += 1;
+}
+
+#[cfg(not(test))]
+fn record_structural_scan(_root: &Path) {}
+
+fn collect_structural_paths<I, E>(
+    root: &Path,
+    entries: I,
+    max_files: usize,
+    max_duration: Duration,
+) -> StructuralScan
+where
+    I: IntoIterator<Item = Result<Option<PathBuf>, E>>,
+{
+    let started = Instant::now();
+    let mut scan = StructuralScan::default();
+    for entry in entries {
+        if scan.paths.len() >= max_files || started.elapsed() >= max_duration {
+            scan.limit_reached = true;
+            break;
+        }
+        match entry {
+            Ok(Some(path)) => {
+                if let Ok(relative) = path.strip_prefix(root) {
+                    scan.paths
+                        .push(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+            Ok(None) => {}
+            Err(_) => scan.walk_errors += 1,
+        }
+    }
+    scan
+}
+
+#[cfg(test)]
+fn structural_scan_counts() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>
+{
+    static COUNTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
+    > = std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn reset_structural_scan_count(root: &Path) {
+    structural_scan_counts()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(root);
+}
+
+#[cfg(test)]
+pub(crate) fn structural_scan_count(root: &Path) -> usize {
+    structural_scan_counts()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(root)
+        .copied()
+        .unwrap_or_default()
+}
 
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
@@ -120,5 +230,28 @@ mod tests {
             .anchor
             .iter()
             .all(|value| (0.0..=1.0).contains(value))));
+    }
+
+    #[test]
+    fn walker_counts_injected_errors_and_honors_file_bound() {
+        let root = Path::new("/workspace");
+        let entries: Vec<Result<Option<PathBuf>, &str>> = vec![
+            Ok(Some(root.join("src/lib.rs"))),
+            Err("injected walk error"),
+            Ok(Some(root.join("src/main.rs"))),
+        ];
+        let scan = collect_structural_paths(root, entries, 1, Duration::from_secs(60));
+        assert_eq!(scan.paths, ["src/lib.rs"]);
+        assert_eq!(scan.walk_errors, 0);
+        assert!(scan.limit_reached);
+
+        let errors = collect_structural_paths(
+            root,
+            vec![Err::<Option<PathBuf>, _>("injected walk error")],
+            10,
+            Duration::from_secs(60),
+        );
+        assert_eq!(errors.walk_errors, 1);
+        assert!(!errors.limit_reached);
     }
 }
