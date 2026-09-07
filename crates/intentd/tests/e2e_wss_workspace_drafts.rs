@@ -16,6 +16,7 @@ use intent_core::{
 };
 use intent_services::{
     EventBus, Services, WorkspaceDraftPreTransitionHook, WorkspaceDraftPromotionFailpoint,
+    WorkspaceDraftPromotionStage,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -211,8 +212,9 @@ async fn promotion_restart_after_workspace_insert_recovers_agent_and_turn() {
     let repo = make_repo(&root.0);
     let fail_draft = Arc::new(Mutex::new(None::<String>));
     let fail_draft_probe = fail_draft.clone();
-    let failpoint: WorkspaceDraftPromotionFailpoint = Arc::new(move |draft_id| {
-        fail_draft_probe.lock().unwrap().as_deref() == Some(draft_id.as_str())
+    let failpoint: WorkspaceDraftPromotionFailpoint = Arc::new(move |draft_id, stage| {
+        stage == WorkspaceDraftPromotionStage::WorkspaceMapped
+            && fail_draft_probe.lock().unwrap().as_deref() == Some(draft_id.as_str())
     });
     let (server, port, config) = boot_with_failpoint(&root.0, Some(failpoint)).await;
     let mut ws = connect(port, config).await;
@@ -328,7 +330,10 @@ async fn delete_waits_for_in_flight_promotion_to_finish() {
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let callback_release = release.clone();
-    let failpoint: WorkspaceDraftPromotionFailpoint = Arc::new(move |_| {
+    let failpoint: WorkspaceDraftPromotionFailpoint = Arc::new(move |_, stage| {
+        if stage != WorkspaceDraftPromotionStage::WorkspaceMapped {
+            return false;
+        }
         entered_tx.send(()).unwrap();
         let (lock, ready) = &*callback_release;
         let mut released = lock.lock().unwrap();
@@ -388,12 +393,73 @@ async fn delete_waits_for_in_flight_promotion_to_finish() {
         promoted["draft"]["promotedWorkspaceId"],
         promoted["workspace"]["id"]
     );
+    let workspace_id = WorkspaceId::from(promoted["workspace"]["id"].as_str().unwrap());
     assert_eq!(
         timeout(Duration::from_secs(5), deletion)
             .await
             .expect("delete completed after promotion")
             .unwrap(),
         json!({"deleted":true})
+    );
+    let store = Store::open(&root.0.join("intentd.db")).await.unwrap();
+    store
+        .get_workspace(&workspace_id)
+        .await
+        .expect("deleting a promoted draft must not delete its workspace");
+    store.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_update_and_delete_are_safe_and_delete_is_idempotent() {
+    let root = TempDir::new();
+    let repo = make_repo(&root.0);
+    let (_server, port, config) = boot(&root.0).await;
+    let mut update_ws = connect(port, config.clone()).await;
+    let mut delete_ws = connect(port, config).await;
+    let draft = rpc(
+        &mut update_ws,
+        10,
+        "workspaceDraft.create",
+        json!({"source":{"kind":"local","path":repo,"branch":"main","isolation":"in-place"}}),
+    )
+    .await;
+    let draft_id = draft["id"].as_str().unwrap();
+
+    let (update, delete) = tokio::join!(
+        rpc_raw(
+            &mut update_ws,
+            11,
+            "workspaceDraft.update",
+            json!({"id":draft_id,"expectedRevision":0,"patch":{"title":"raced"}}),
+        ),
+        rpc_raw(
+            &mut delete_ws,
+            12,
+            "workspaceDraft.delete",
+            json!({"id":draft_id}),
+        )
+    );
+    assert_eq!(delete["result"], json!({"deleted":true}));
+    assert!(
+        update.get("result").is_some() || update["error"]["code"].is_number(),
+        "concurrent update must either commit before delete or return a domain error: {update}"
+    );
+    assert_eq!(
+        rpc(
+            &mut delete_ws,
+            13,
+            "workspaceDraft.delete",
+            json!({"id":draft_id})
+        )
+        .await,
+        json!({"deleted":false})
+    );
+    assert!(
+        rpc(&mut update_ws, 14, "workspace.list", json!({})).await["workspaces"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "draft update/delete race must not create a workspace"
     );
 }
 
@@ -666,14 +732,23 @@ enum PromotionCrashPoint {
 async fn assert_promotion_retry_at_crash_point(point: PromotionCrashPoint) {
     let root = TempDir::new();
     let repo = make_repo(&root.0);
-    let mapped_crash = matches!(
-        point,
-        PromotionCrashPoint::AfterMappingBeforeAgent
-            | PromotionCrashPoint::AfterAgentBeforeFirstTurn
-            | PromotionCrashPoint::AfterFirstTurn
-    );
-    let failpoint = mapped_crash
-        .then(|| Arc::new(|_: &WorkspaceDraftId| true) as WorkspaceDraftPromotionFailpoint);
+    let fail_stage = match point {
+        PromotionCrashPoint::AfterMappingBeforeAgent => {
+            Some(WorkspaceDraftPromotionStage::WorkspaceMapped)
+        }
+        PromotionCrashPoint::AfterAgentBeforeFirstTurn => {
+            Some(WorkspaceDraftPromotionStage::InitialAgentCreated)
+        }
+        PromotionCrashPoint::AfterFirstTurn => {
+            Some(WorkspaceDraftPromotionStage::InitialTurnCreated)
+        }
+        PromotionCrashPoint::BeforeWorkspaceInsert
+        | PromotionCrashPoint::AfterInsertBeforeMapping => None,
+    };
+    let failpoint = fail_stage.map(|expected| {
+        Arc::new(move |_: &WorkspaceDraftId, actual| actual == expected)
+            as WorkspaceDraftPromotionFailpoint
+    });
     let (server, port, config) = boot_with_failpoint(&root.0, failpoint).await;
     let mut ws = connect(port, config).await;
     let draft = rpc(
@@ -760,38 +835,34 @@ async fn assert_promotion_retry_at_crash_point(point: PromotionCrashPoint) {
                 .as_str()
                 .expect("workspace and mapping commit atomically")
                 .to_string();
-            if !matches!(point, PromotionCrashPoint::AfterMappingBeforeAgent) {
-                let created = rpc(
-                    &mut ws,
-                    4,
-                    "agent.create",
-                    json!({
-                        "workspaceId":workspace_id,
-                        "name":"Coordinator",
-                        "provider":"codex",
-                        "metadata":{
-                            "isInitialAgent":true,
-                            "isFirstWorkspaceAgent":true,
-                            "initialMessage":"first turn"
-                        }
-                    }),
-                )
-                .await;
-                let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
-                if matches!(point, PromotionCrashPoint::AfterFirstTurn) {
-                    rpc(
-                        &mut ws,
-                        5,
-                        "agent.sendMessage",
-                        json!({
-                            "workspaceId":workspace_id,
-                            "agentId":agent_id,
-                            "content":"first turn"
-                        }),
-                    )
-                    .await;
-                }
+            let store = Store::open(&root.0.join("intentd.db")).await.unwrap();
+            let sessions = store
+                .list_agent_session_summaries(&WorkspaceId::from(workspace_id.as_str()))
+                .await
+                .unwrap();
+            let expected_agents = usize::from(!matches!(
+                point,
+                PromotionCrashPoint::AfterMappingBeforeAgent
+            ));
+            assert_eq!(
+                sessions.len(),
+                expected_agents,
+                "promotion seam must fire at the requested agent boundary"
+            );
+            if let Some(session) = sessions.first() {
+                let persisted = store.get_agent_session(&session.id).await.unwrap();
+                let user_turns = persisted
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == "user")
+                    .count();
+                assert_eq!(
+                    user_turns,
+                    usize::from(matches!(point, PromotionCrashPoint::AfterFirstTurn)),
+                    "promotion seam must fire at the requested first-turn boundary"
+                );
             }
+            store.close().await;
         }
     }
 

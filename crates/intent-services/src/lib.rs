@@ -52,8 +52,17 @@ use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
+/// Durable boundary where an integration test may interrupt workspace draft promotion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceDraftPromotionStage {
+    WorkspaceMapped,
+    InitialAgentCreated,
+    InitialTurnCreated,
+}
+
 /// Integration-test callback for interrupting workspace draft promotion.
-pub type WorkspaceDraftPromotionFailpoint = Arc<dyn Fn(&WorkspaceDraftId) -> bool + Send + Sync>;
+pub type WorkspaceDraftPromotionFailpoint =
+    Arc<dyn Fn(&WorkspaceDraftId, WorkspaceDraftPromotionStage) -> bool + Send + Sync>;
 
 /// Integration-test callback immediately before the Editing→Promoting transition.
 pub type WorkspaceDraftPreTransitionHook = Arc<dyn Fn(&WorkspaceDraftId) + Send + Sync>;
@@ -368,8 +377,7 @@ pub struct Services {
     /// Per-draft single-flight gates for idempotent promotion. Shared by clones.
     workspace_draft_promotion_locks:
         Arc<Mutex<HashMap<WorkspaceDraftId, Arc<tokio::sync::Mutex<()>>>>>,
-    /// Integration-test seam immediately after the workspace/draft transaction
-    /// commits, before post-insert setup or initial-agent creation.
+    /// Integration-test seam at durable workspace-draft promotion boundaries.
     workspace_draft_promotion_failpoint: Option<WorkspaceDraftPromotionFailpoint>,
     /// Integration-test seam after the promotion snapshot and before its phase transition.
     workspace_draft_pre_transition_hook: Option<WorkspaceDraftPreTransitionHook>,
@@ -1253,8 +1261,7 @@ impl Services {
         }
     }
 
-    /// Install an integration-test promotion failpoint. Returning `true` after
-    /// the workspace/draft transaction simulates process loss before initial-agent creation.
+    /// Install an integration-test promotion failpoint at durable creation boundaries.
     #[must_use]
     pub fn with_workspace_draft_promotion_failpoint(
         mut self,
@@ -18165,7 +18172,9 @@ impl WorkspaceApi for Services {
                         if services
                             .workspace_draft_promotion_failpoint
                             .as_ref()
-                            .is_some_and(|failpoint| failpoint(draft_id))
+                            .is_some_and(|failpoint| {
+                                failpoint(draft_id, WorkspaceDraftPromotionStage::WorkspaceMapped)
+                            })
                         {
                             return Err(Error::Internal(
                                 "injected workspace draft promotion crash after workspace insert"
@@ -18360,6 +18369,22 @@ impl WorkspaceApi for Services {
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );
+                        if input.workspace_draft_id.as_ref().is_some_and(|draft_id| {
+                            services
+                                .workspace_draft_promotion_failpoint
+                                .as_ref()
+                                .is_some_and(|failpoint| {
+                                    failpoint(
+                                        draft_id,
+                                        WorkspaceDraftPromotionStage::InitialAgentCreated,
+                                    )
+                                })
+                        }) {
+                            return Err(Error::Internal(
+                                "injected workspace draft promotion crash after initial agent"
+                                    .into(),
+                            ));
+                        }
                         // Extract file_blocks and context_references from the created
                         // agent (STAB-69: thread them into the first turn so attachments
                         // on the initial prompt reach the ACP). Image blocks come from
@@ -18413,12 +18438,34 @@ impl WorkspaceApi for Services {
                                         .await
                                 }
                             };
-                            if let Err(e) = send {
-                                tracing::warn!(
-                                    workspace = %ws.id.as_str(),
-                                    error = %e,
-                                    "workspace.create: failed to start initial agent turn"
-                                );
+                            let turn_created = match send {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        workspace = %ws.id.as_str(),
+                                        error = %e,
+                                        "workspace.create: failed to start initial agent turn"
+                                    );
+                                    false
+                                }
+                            };
+                            if turn_created
+                                && input.workspace_draft_id.as_ref().is_some_and(|draft_id| {
+                                services
+                                    .workspace_draft_promotion_failpoint
+                                    .as_ref()
+                                    .is_some_and(|failpoint| {
+                                        failpoint(
+                                            draft_id,
+                                            WorkspaceDraftPromotionStage::InitialTurnCreated,
+                                        )
+                                    })
+                                })
+                            {
+                                return Err(Error::Internal(
+                                    "injected workspace draft promotion crash after initial turn"
+                                        .into(),
+                                ));
                             }
                         }
                         initial_agent = created.get("agent").cloned();
