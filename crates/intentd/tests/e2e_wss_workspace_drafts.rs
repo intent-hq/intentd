@@ -654,6 +654,221 @@ async fn assert_single_workspace_agent_and_turn(ws: &mut Ws, workspace_id: &str,
     );
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PromotionCrashPoint {
+    BeforeWorkspaceInsert,
+    AfterInsertBeforeMapping,
+    AfterMappingBeforeAgent,
+    AfterAgentBeforeFirstTurn,
+    AfterFirstTurn,
+}
+
+async fn assert_promotion_retry_at_crash_point(point: PromotionCrashPoint) {
+    let root = TempDir::new();
+    let repo = make_repo(&root.0);
+    let mapped_crash = matches!(
+        point,
+        PromotionCrashPoint::AfterMappingBeforeAgent
+            | PromotionCrashPoint::AfterAgentBeforeFirstTurn
+            | PromotionCrashPoint::AfterFirstTurn
+    );
+    let failpoint = mapped_crash
+        .then(|| Arc::new(|_: &WorkspaceDraftId| true) as WorkspaceDraftPromotionFailpoint);
+    let (server, port, config) = boot_with_failpoint(&root.0, failpoint).await;
+    let mut ws = connect(port, config).await;
+    let draft = rpc(
+        &mut ws,
+        1,
+        "workspaceDraft.create",
+        json!({
+            "intentText":"first turn",
+            "source":{"kind":"local","path":repo,"branch":"main","isolation":"in-place"}
+        }),
+    )
+    .await;
+    let draft_id = draft["id"].as_str().unwrap().to_string();
+    let operation_key = draft["operationKey"].as_str().unwrap().to_string();
+    let initial_agent = json!({
+        "name":"Coordinator",
+        "provider":"codex",
+        "prompt":"first turn"
+    });
+    let mut retry_revision = 0;
+
+    match point {
+        PromotionCrashPoint::BeforeWorkspaceInsert => {
+            let store = Store::open(&root.0.join("intentd.db")).await.unwrap();
+            let promoting = store
+                .set_workspace_draft_phase(
+                    &WorkspaceDraftId::from(draft_id.as_str()),
+                    intent_core::DraftPhase::Promoting,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(promoting.revision, 1);
+            assert!(store.list_workspaces(false).await.unwrap().is_empty());
+            store.close().await;
+        }
+        PromotionCrashPoint::AfterInsertBeforeMapping => {
+            let pool = sqlx::SqlitePool::connect(&format!(
+                "sqlite://{}?mode=rwc",
+                root.0.join("intentd.db").display()
+            ))
+            .await
+            .unwrap();
+            sqlx::query(
+                "CREATE TRIGGER crash_before_draft_mapping AFTER INSERT ON workspace \
+                 BEGIN SELECT RAISE(ABORT, 'injected crash before draft mapping'); END",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let interrupted = rpc_raw(
+                &mut ws,
+                2,
+                "workspaceDraft.promote",
+                json!({"id":draft_id,"expectedRevision":0,"initialAgent":initial_agent}),
+            )
+            .await;
+            assert_eq!(interrupted["error"]["code"], -32603);
+            sqlx::query("DROP TRIGGER crash_before_draft_mapping")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+            let retained = rpc(&mut ws, 3, "workspaceDraft.get", json!({"id":draft_id})).await;
+            retry_revision = retained["revision"].as_u64().unwrap();
+            assert!(retained["promotedWorkspaceId"].is_null());
+            let store = Store::open(&root.0.join("intentd.db")).await.unwrap();
+            assert!(store.list_workspaces(false).await.unwrap().is_empty());
+            store.close().await;
+        }
+        PromotionCrashPoint::AfterMappingBeforeAgent
+        | PromotionCrashPoint::AfterAgentBeforeFirstTurn
+        | PromotionCrashPoint::AfterFirstTurn => {
+            let interrupted = rpc_raw(
+                &mut ws,
+                2,
+                "workspaceDraft.promote",
+                json!({"id":draft_id,"expectedRevision":0,"initialAgent":initial_agent}),
+            )
+            .await;
+            assert_eq!(interrupted["error"]["code"], -32603);
+            let retained = rpc(&mut ws, 3, "workspaceDraft.get", json!({"id":draft_id})).await;
+            let workspace_id = retained["promotedWorkspaceId"]
+                .as_str()
+                .expect("workspace and mapping commit atomically")
+                .to_string();
+            if !matches!(point, PromotionCrashPoint::AfterMappingBeforeAgent) {
+                let created = rpc(
+                    &mut ws,
+                    4,
+                    "agent.create",
+                    json!({
+                        "workspaceId":workspace_id,
+                        "name":"Coordinator",
+                        "provider":"codex",
+                        "metadata":{
+                            "isInitialAgent":true,
+                            "isFirstWorkspaceAgent":true,
+                            "initialMessage":"first turn"
+                        }
+                    }),
+                )
+                .await;
+                let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+                if matches!(point, PromotionCrashPoint::AfterFirstTurn) {
+                    rpc(
+                        &mut ws,
+                        5,
+                        "agent.sendMessage",
+                        json!({
+                            "workspaceId":workspace_id,
+                            "agentId":agent_id,
+                            "content":"first turn"
+                        }),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    drop(ws);
+    drop(server);
+    let (_restarted, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+    let recovered = rpc(
+        &mut ws,
+        6,
+        "workspaceDraft.promote",
+        json!({
+            "id":draft_id,
+            "expectedRevision":retry_revision,
+            "initialAgent":initial_agent
+        }),
+    )
+    .await;
+    assert_eq!(recovered["draft"]["operationKey"], operation_key);
+    assert_eq!(recovered["draft"]["phase"], "promoted");
+    let workspace_id = recovered["workspace"]["id"].as_str().unwrap();
+    let agent_id = recovered["initialAgent"]["id"].as_str().unwrap();
+    assert_single_workspace_agent_and_turn(&mut ws, workspace_id, agent_id).await;
+
+    let independent = rpc(
+        &mut ws,
+        7,
+        "workspaceDraft.create",
+        json!({
+            "source":{"kind":"local","path":repo,"branch":"main","isolation":"in-place"}
+        }),
+    )
+    .await;
+    assert_ne!(independent["operationKey"], operation_key);
+    let separately_promoted = rpc(
+        &mut ws,
+        8,
+        "workspaceDraft.promote",
+        json!({"id":independent["id"],"expectedRevision":0}),
+    )
+    .await;
+    assert_ne!(separately_promoted["workspace"]["id"], workspace_id);
+    assert_eq!(
+        rpc(&mut ws, 9, "workspace.list", json!({})).await["workspaces"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "a different immutable operation key must create a distinct workspace"
+    );
+}
+
+#[tokio::test]
+async fn promote_retry_before_workspace_insert_is_exactly_once_per_operation_key() {
+    assert_promotion_retry_at_crash_point(PromotionCrashPoint::BeforeWorkspaceInsert).await;
+}
+
+#[tokio::test]
+async fn promote_retry_after_insert_before_mapping_rolls_back_and_is_exactly_once() {
+    assert_promotion_retry_at_crash_point(PromotionCrashPoint::AfterInsertBeforeMapping).await;
+}
+
+#[tokio::test]
+async fn promote_retry_after_mapping_before_agent_is_exactly_once_per_operation_key() {
+    assert_promotion_retry_at_crash_point(PromotionCrashPoint::AfterMappingBeforeAgent).await;
+}
+
+#[tokio::test]
+async fn promote_retry_after_agent_before_first_turn_is_exactly_once_per_operation_key() {
+    assert_promotion_retry_at_crash_point(PromotionCrashPoint::AfterAgentBeforeFirstTurn).await;
+}
+
+#[tokio::test]
+async fn promote_retry_after_first_turn_is_exactly_once_per_operation_key() {
+    assert_promotion_retry_at_crash_point(PromotionCrashPoint::AfterFirstTurn).await;
+}
+
 #[tokio::test]
 async fn draft_crud_promote_replay_events_and_setup_result() {
     let root = TempDir::new();
@@ -1185,6 +1400,228 @@ async fn concurrent_clients_surface_revision_conflict_and_share_one_promotion() 
         first_promotion["initialAgent"]["id"].as_str().unwrap(),
     )
     .await;
+}
+
+#[tokio::test]
+async fn two_clients_cover_update_promote_delete_orderings_without_orphans() {
+    #[derive(Clone, Copy)]
+    enum Ordering {
+        UpdatePromoteDelete,
+        PromoteUpdateDelete,
+        DeleteUpdatePromote,
+    }
+
+    let root = TempDir::new();
+    let repo = make_repo(&root.0);
+    let (_server, port, config) = boot(&root.0).await;
+    let mut first = connect(port, config.clone()).await;
+    let mut second = connect(port, config).await;
+    let mut expected_workspaces = 0;
+
+    for (index, ordering) in [
+        Ordering::UpdatePromoteDelete,
+        Ordering::PromoteUpdateDelete,
+        Ordering::DeleteUpdatePromote,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let draft = rpc(
+            &mut first,
+            20,
+            "workspaceDraft.create",
+            json!({
+                "intentText":format!("ordering-{index}"),
+                "source":{"kind":"local","path":repo,"branch":"main","isolation":"in-place"}
+            }),
+        )
+        .await;
+        let draft_id = draft["id"].as_str().unwrap();
+        match ordering {
+            Ordering::UpdatePromoteDelete => {
+                let updated = rpc(
+                    &mut first,
+                    21,
+                    "workspaceDraft.update",
+                    json!({"id":draft_id,"expectedRevision":0,"patch":{"title":"updated"}}),
+                )
+                .await;
+                assert_eq!(updated["revision"], 1);
+                let promoted = rpc(
+                    &mut second,
+                    22,
+                    "workspaceDraft.promote",
+                    json!({"id":draft_id,"expectedRevision":1}),
+                )
+                .await;
+                assert_eq!(promoted["draft"]["phase"], "promoted");
+                expected_workspaces += 1;
+                assert_eq!(
+                    rpc(
+                        &mut first,
+                        23,
+                        "workspaceDraft.delete",
+                        json!({"id":draft_id})
+                    )
+                    .await,
+                    json!({"deleted":true})
+                );
+            }
+            Ordering::PromoteUpdateDelete => {
+                let promoted = rpc(
+                    &mut first,
+                    24,
+                    "workspaceDraft.promote",
+                    json!({"id":draft_id,"expectedRevision":0}),
+                )
+                .await;
+                assert_eq!(promoted["draft"]["phase"], "promoted");
+                expected_workspaces += 1;
+                let stale = rpc_raw(
+                    &mut second,
+                    25,
+                    "workspaceDraft.update",
+                    json!({"id":draft_id,"expectedRevision":0,"patch":{"title":"too late"}}),
+                )
+                .await;
+                assert_eq!(stale["error"]["code"], -32009);
+                assert_eq!(
+                    rpc(
+                        &mut second,
+                        26,
+                        "workspaceDraft.delete",
+                        json!({"id":draft_id})
+                    )
+                    .await,
+                    json!({"deleted":true})
+                );
+            }
+            Ordering::DeleteUpdatePromote => {
+                assert_eq!(
+                    rpc(
+                        &mut first,
+                        27,
+                        "workspaceDraft.delete",
+                        json!({"id":draft_id})
+                    )
+                    .await,
+                    json!({"deleted":true})
+                );
+                let update = rpc_raw(
+                    &mut second,
+                    28,
+                    "workspaceDraft.update",
+                    json!({"id":draft_id,"expectedRevision":0,"patch":{"title":"deleted"}}),
+                )
+                .await;
+                let promote = rpc_raw(
+                    &mut second,
+                    29,
+                    "workspaceDraft.promote",
+                    json!({"id":draft_id,"expectedRevision":0}),
+                )
+                .await;
+                assert!(update["error"]["code"].is_number());
+                assert!(promote["error"]["code"].is_number());
+            }
+        }
+        assert_eq!(
+            rpc(&mut first, 30, "workspace.list", json!({})).await["workspaces"]
+                .as_array()
+                .unwrap()
+                .len(),
+            expected_workspaces
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_expected_revision_is_rejected_by_every_revisioned_mutation() {
+    let root = TempDir::new();
+    let repo = make_repo(&root.0);
+    let (_server, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+    let draft = rpc(
+        &mut ws,
+        31,
+        "workspaceDraft.create",
+        json!({"source":{"kind":"local","path":repo,"branch":"main","isolation":"in-place"}}),
+    )
+    .await;
+    let draft_id = draft["id"].as_str().unwrap();
+    let updated = rpc(
+        &mut ws,
+        32,
+        "workspaceDraft.update",
+        json!({"id":draft_id,"expectedRevision":0,"patch":{"intentText":"current"}}),
+    )
+    .await;
+    assert_eq!(updated["revision"], 1);
+
+    for (id, method, params) in [
+        (
+            33,
+            "workspaceDraft.update",
+            json!({"id":draft_id,"expectedRevision":0,"patch":{"intentText":"stale"}}),
+        ),
+        (
+            34,
+            "workspaceDraft.promote",
+            json!({"id":draft_id,"expectedRevision":0}),
+        ),
+    ] {
+        let conflict = rpc_raw(&mut ws, id, method, params).await;
+        assert_eq!(conflict["error"]["code"], -32009, "{method}: {conflict}");
+        assert_eq!(conflict["error"]["data"]["current"]["revision"], 1);
+        assert_eq!(
+            conflict["error"]["data"]["current"]["intentText"],
+            "current"
+        );
+    }
+}
+
+#[tokio::test]
+async fn draft_config_unknown_keys_survive_create_update_and_restart_round_trip() {
+    let root = TempDir::new();
+    let (server, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+    let original = json!({
+        "model":"gpt-test",
+        "setupScript":"echo ready",
+        "futureFlag":true,
+        "futureObject":{"mode":"strict","levels":[1,2,3]}
+    });
+    let created = rpc(
+        &mut ws,
+        35,
+        "workspaceDraft.create",
+        json!({"config":original}),
+    )
+    .await;
+    let draft_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["config"], original);
+    let updated_config = json!({
+        "model":"gpt-test",
+        "setupScript":"echo ready",
+        "futureFlag":false,
+        "futureObject":{"mode":"strict","levels":[1,2,3],"newKey":"kept"},
+        "anotherUnknown":"preserved"
+    });
+    let updated = rpc(
+        &mut ws,
+        36,
+        "workspaceDraft.update",
+        json!({"id":draft_id,"expectedRevision":0,"patch":{"config":updated_config}}),
+    )
+    .await;
+    assert_eq!(updated["config"], updated_config);
+    drop(ws);
+    drop(server);
+
+    let (_restarted, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+    let restored = rpc(&mut ws, 37, "workspaceDraft.get", json!({"id":draft_id})).await;
+    assert_eq!(restored["config"], updated_config);
 }
 
 #[tokio::test]
