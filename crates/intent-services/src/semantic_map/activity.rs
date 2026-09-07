@@ -374,4 +374,9 @@ mod tests {
             assert_eq!(activity.region_id, None, "classified {path:?}");
         }
     }
+
+    #[test]
+    fn ignores_unrelated_event_types() {
+        assert!(project(&manifest(), &event("note:updated", json!({}))).is_none());
+    }
 }

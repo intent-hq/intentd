@@ -7732,6 +7732,169 @@ async fn wss_semantic_map_round_trip() {
     srv.ws.stop().await;
 }
 
+#[tokio::test]
+async fn wss_semantic_map_projects_fresh_source_events_once() {
+    let srv = start(WsOptions::default()).await;
+    let ws = WorkspaceId::new();
+    let root = test_tempdir("intentd-wss-map-live-");
+    std::fs::create_dir_all(root.path().join("src")).expect("mkdir src");
+    let mut workspace = fixture_workspace(&ws);
+    workspace.worktree_path = Some(root.path().to_string_lossy().into_owned());
+    srv.store
+        .insert_workspace(&workspace)
+        .await
+        .expect("insert workspace");
+
+    let set = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "map.setManifest",
+        "params": {"workspaceId": ws.0, "json": {
+            "version": 1,
+            "regions": [{
+                "id":"code", "label":"Code", "responsibility":"Runtime code",
+                "anchor":[0.5,0.5], "paths":["src/**"]
+            }],
+            "crossings": []
+        }}
+    });
+    let set = wss_call(srv.port, srv.cfg.clone(), &set.to_string()).await;
+    assert_eq!(set["result"]["ok"], true, "{set}");
+
+    let mut subscriber = connect_ws(srv.port, srv.cfg.clone()).await;
+    let subscribe = serde_json::json!({
+        "jsonrpc":"2.0", "id":2, "method":"events.subscribe",
+        "params":{"workspaceId":ws.0,"eventTypes":["map:*"]}
+    });
+    subscriber
+        .send(Message::Text(subscribe.to_string().into()))
+        .await
+        .expect("subscribe");
+    loop {
+        match subscriber.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let value: Value = serde_json::from_str(&text).expect("subscribe json");
+                if value["id"] == 2 {
+                    break;
+                }
+            }
+            Some(Ok(Message::Ping(payload))) => subscriber
+                .send(Message::Pong(payload))
+                .await
+                .expect("subscribe pong"),
+            Some(Ok(_)) => {}
+            other => panic!("expected subscribe response, got {other:?}"),
+        }
+    }
+
+    let actor = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-live-map".to_string()),
+        name: Some("Live Mapper".to_string()),
+        ..Default::default()
+    };
+    let changed = srv
+        .bus
+        .publish(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: "2026-09-07T05:00:01Z".to_string(),
+            event_type: "file:changed".to_string(),
+            actor: actor.clone(),
+            session_id: Some("agent-live-map".to_string()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({"action":"modify","relativePath":"src/lib.rs"}),
+        })
+        .await
+        .expect("publish file change");
+    let tool_call = srv
+        .bus
+        .publish(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: "2026-09-07T05:00:02Z".to_string(),
+            event_type: "agent:tool:call".to_string(),
+            actor,
+            session_id: Some("agent-live-map".to_string()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({
+                "toolName":"view", "toolKind":"file", "input":{"path":"src/lib.rs"}
+            }),
+        })
+        .await
+        .expect("publish tool call");
+
+    let mut pushed = Vec::new();
+    while pushed.len() < 2 {
+        let frame = tokio::time::timeout(Duration::from_secs(2), subscriber.next())
+            .await
+            .expect("live map activity timeout");
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                let value: Value = serde_json::from_str(&text).expect("map activity json");
+                if value["method"] == "events.event" {
+                    assert_eq!(value["params"]["event"]["type"], "map:activity");
+                    pushed.push(value["params"]["event"]["data"].clone());
+                }
+            }
+            Some(Ok(Message::Ping(payload))) => subscriber
+                .send(Message::Pong(payload))
+                .await
+                .expect("map activity pong"),
+            Some(Ok(_)) => {}
+            other => panic!("expected live map activity, got {other:?}"),
+        }
+    }
+    pushed.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+    let by_id = pushed
+        .iter()
+        .map(|activity| (activity["id"].as_str().unwrap(), activity))
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(by_id[changed.id.as_str()]["regionId"], "code");
+    assert_eq!(by_id[changed.id.as_str()]["kind"], "edit");
+    assert_eq!(by_id[tool_call.id.as_str()]["regionId"], "code");
+    assert_eq!(by_id[tool_call.id.as_str()]["kind"], "read");
+    let duplicate = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            match subscriber.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let value: Value = serde_json::from_str(&text).expect("map activity json");
+                    if value["method"] == "events.event" {
+                        break value;
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => subscriber
+                    .send(Message::Pong(payload))
+                    .await
+                    .expect("duplicate-check pong"),
+                Some(Ok(_)) => {}
+                other => panic!("expected open map subscription, got {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        duplicate.is_err(),
+        "source events must each produce exactly one live map frame: {duplicate:?}"
+    );
+
+    let replay = serde_json::json!({
+        "jsonrpc":"2.0", "id":3, "method":"map.activity",
+        "params":{"workspaceId":ws.0,"agentId":"agent-live-map","limit":10}
+    });
+    let replay = wss_call(srv.port, srv.cfg.clone(), &replay.to_string()).await;
+    let replay_ids = replay["result"]
+        .as_array()
+        .expect("activity array")
+        .iter()
+        .map(|activity| activity["id"].as_str().expect("activity id"))
+        .collect::<std::collections::HashSet<_>>();
+    assert!(replay_ids.contains(changed.id.as_str()), "{replay}");
+    assert!(replay_ids.contains(tool_call.id.as_str()), "{replay}");
+
+    srv.ws.stop().await;
+}
+
 /// Minimal `Note` fixture used by `task.list` seeding below.
 fn fixture_note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
     let ts = now_iso();

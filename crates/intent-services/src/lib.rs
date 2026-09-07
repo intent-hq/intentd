@@ -339,6 +339,16 @@ struct WorkspaceAggregateSnapshot {
     cow_supported: Option<bool>,
 }
 
+struct MapActivityProjectionTask {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MapActivityProjectionTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// Aggregate service handle wired by the binary composition root. It implements
 /// `WorkspaceApi` so it can be handed to `intent-acp` as `Arc<dyn WorkspaceApi>`
 /// (§6.8) and dispatched to by the transport router.
@@ -347,6 +357,8 @@ pub struct Services {
     store: Store,
     /// Parsed semantic-map manifests, shared by every clone and map operation.
     semantic_map_manifest_loader: semantic_map::ManifestLoader,
+    /// One post-persistence projector shared by every clone of this service.
+    _map_activity_projection_task: Option<Arc<MapActivityProjectionTask>>,
     /// Root directory for note assets, laid out as `<root>/<workspaceId>/<assetId>`.
     /// `None` until configured by the composition root; `note.readAsset` errors
     /// when unset.
@@ -1122,6 +1134,7 @@ impl Services {
         Self {
             store,
             semantic_map_manifest_loader: semantic_map::ManifestLoader::default(),
+            _map_activity_projection_task: None,
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
@@ -3914,6 +3927,21 @@ impl Services {
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
         // The MCP hub publishes `mcp.servers:status-changed` onto the same bus.
         self.mcp_hub.set_event_bus(bus.clone());
+        let mut source_events = bus.subscribe(SubscriptionFilter {
+            event_types: MAP_EVENT_TYPES.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        });
+        let store = self.store.clone();
+        let loader = self.semantic_map_manifest_loader.clone();
+        let projection_bus = bus.clone();
+        let handle = tokio::spawn(async move {
+            while let Some(events) = source_events.recv().await {
+                for event in events {
+                    publish_live_map_activity(&store, &loader, &projection_bus, &event).await;
+                }
+            }
+        });
+        self._map_activity_projection_task = Some(Arc::new(MapActivityProjectionTask { handle }));
         self.event_bus = Some(bus);
         self
     }
@@ -12842,6 +12870,63 @@ fn map_activity_event(
         metadata: None,
         data: serde_json::to_value(activity).unwrap_or_else(|_| serde_json::json!({})),
     }
+}
+
+async fn publish_live_map_activity(
+    store: &Store,
+    loader: &semantic_map::ManifestLoader,
+    bus: &EventBus,
+    event: &Event,
+) {
+    if event
+        .event_type
+        .starts_with(intent_core::events::FILE_PREFIX)
+        && event.actor.actor_type != ActorType::Agent
+    {
+        return;
+    }
+    let classifier = match loader.load_compiled(store, &event.workspace_id).await {
+        Ok(Some((_, classifier))) => classifier,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                workspace_id = %event.workspace_id,
+                source_event_id = %event.id,
+                source_event_type = %event.event_type,
+                error = %error,
+                "failed to load semantic map for live activity projection"
+            );
+            return;
+        }
+    };
+    let workspace_paths = match semantic_map::workspace_paths(store, &event.workspace_id).await {
+        Ok(paths) => paths,
+        Err(Error::NotFound(_)) => return,
+        Err(error) => {
+            tracing::warn!(
+                workspace_id = %event.workspace_id,
+                source_event_id = %event.id,
+                source_event_type = %event.event_type,
+                error = %error,
+                "failed to load workspace paths for live map activity projection"
+            );
+            return;
+        }
+    };
+    let Some(activity) = project_map_events(
+        &classifier,
+        &workspace_paths,
+        std::slice::from_ref(event),
+        &[],
+    )
+    .into_iter()
+    .next() else {
+        return;
+    };
+    publish_event_transient(
+        Some(bus),
+        &map_activity_event(&event.workspace_id, &activity),
+    );
 }
 
 /// Best-effort workspace lookup by worktree path (§6.5). Path-scoped git
