@@ -2293,15 +2293,54 @@ mod tests {
 
     // ---- ACP `PtyTerminalHost` adapter ----
 
-    /// ACP terminal create → output → `wait_for_exit` happy path.
+    /// Load-independent exit barrier for ACP terminal tests (monorepo#573,
+    /// intent-hq/intent#4555). The child must print its output and then park
+    /// on `exec cat`: this polls `output` until `marker` is present, sends
+    /// canonical-mode EOF (`^D`) so `cat` — and thus the child — exits 0
+    /// naturally, awaits that exit under a generous bounded deadline, and
+    /// returns the observed output.
     ///
-    /// Load-independent (monorepo#573): the child prints the marker and then
-    /// stays alive (`exec cat`) until the test has *observed* the output, so
-    /// the host's reader thread can never lose the race where a fast-exiting
-    /// child closes the PTY slave before the first `read()` and macOS discards
-    /// the buffered output. Only then does the test send canonical-mode EOF
-    /// (`^D`) so `cat` — and thus the child — exits 0 naturally, awaited with
-    /// a generous bounded deadline.
+    /// Exit reaping and the PTY reader thread are independent, so a
+    /// `wait_for_exit` that resolves does not imply the child's final chunk
+    /// has reached the buffer — reading right after it races the reader under
+    /// CPU contention. A fast-exiting child can also close the PTY slave
+    /// before the first `read()`, and macOS then discards the buffered output
+    /// entirely. Observing the marker *before* letting the child exit closes
+    /// both windows.
+    async fn acp_observe_then_exit(
+        pty: &PtyHost,
+        adapter: &PtyTerminalHost,
+        id: &str,
+        marker: &str,
+    ) -> String {
+        let pty_id = PtyId::parse(id).expect("wire id parses");
+        let deadline = Instant::now() + LONG_TIMEOUT;
+        let output = loop {
+            let info = adapter.output(id.to_string()).await.unwrap();
+            if info.output.contains(marker) {
+                break info.output;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ACP output must surface {marker:?}; got: {:?}",
+                info.output
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        pty.write(pty_id, b"\x04").unwrap();
+
+        let exit = tokio::time::timeout(LONG_TIMEOUT, adapter.wait_for_exit(id.to_string()))
+            .await
+            .expect("child exits within the generous deadline")
+            .unwrap();
+        assert_eq!(exit.exit_code, Some(0));
+        assert!(exit.signal.is_none());
+        output
+    }
+
+    /// ACP terminal create → output → `wait_for_exit` happy path
+    /// (load-independent via `acp_observe_then_exit`).
     #[tokio::test]
     async fn acp_create_output_and_wait_for_exit() {
         let pty = host();
@@ -2318,30 +2357,7 @@ mod tests {
             output_byte_limit: None,
         };
         let id = adapter.create(params).await.unwrap();
-        let pty_id = PtyId::parse(&id).expect("wire id parses");
-
-        let deadline = Instant::now() + LONG_TIMEOUT;
-        loop {
-            let info = adapter.output(id.clone()).await.unwrap();
-            if info.output.contains("acp-output") {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "ACP output must surface the child's stdout; got: {:?}",
-                info.output
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        pty.write(pty_id, b"\x04").unwrap();
-
-        let exit = tokio::time::timeout(LONG_TIMEOUT, adapter.wait_for_exit(id))
-            .await
-            .expect("child exits within the generous deadline")
-            .unwrap();
-        assert_eq!(exit.exit_code, Some(0));
-        assert!(exit.signal.is_none());
+        acp_observe_then_exit(&pty, &adapter, &id, "acp-output").await;
     }
 
     /// intent-hq/intent#4142: a `terminal/create` that omits `cwd` falls back
@@ -2377,28 +2393,24 @@ mod tests {
             command: "sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                "printf 'cwd=%s email=%s\\n' \"$(pwd)\" \"$GIT_AUTHOR_EMAIL\"".to_string(),
+                // Trailing sentinel line: once it is observed, the data line
+                // before it is complete in the buffer.
+                "printf 'cwd=%s email=%s\\nacp-cwd-done\\n' \"$(pwd)\" \"$GIT_AUTHOR_EMAIL\"; exec cat"
+                    .to_string(),
             ],
             env: Vec::new(),
             cwd: None,
             output_byte_limit: None,
         };
         let id = adapter.create(params).await.unwrap();
-        let exit = tokio::time::timeout(LONG_TIMEOUT, adapter.wait_for_exit(id.clone()))
-            .await
-            .expect("child exits within the deadline")
-            .unwrap();
-        assert_eq!(exit.exit_code, Some(0));
-        let out = adapter.output(id).await.unwrap();
+        let out = acp_observe_then_exit(&pty, &adapter, &id, "acp-cwd-done").await;
         assert!(
-            out.output.contains(&format!("cwd={}", dir.display())),
-            "spawn falls back to the session cwd; got {:?}",
-            out.output
+            out.contains(&format!("cwd={}", dir.display())),
+            "spawn falls back to the session cwd; got {out:?}"
         );
         assert!(
-            out.output.contains("email=session@example.com"),
-            "identity resolved from the session cwd's repo; got {:?}",
-            out.output
+            out.contains("email=session@example.com"),
+            "identity resolved from the session cwd's repo; got {out:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2455,21 +2467,14 @@ mod tests {
             // Grok-style packed shell line (would ENOENT under argv-only
             // spawn). `/bin/sh` rather than a hard-coded `/bin/bash` so the
             // test is portable to hosts without bash.
-            command: "/bin/sh -c 'printf shell-mode-ok\\n'".to_string(),
+            command: "/bin/sh -c 'printf shell-mode-ok\\n; exec cat'".to_string(),
             args: Vec::new(),
             env: Vec::new(),
             cwd: None,
             output_byte_limit: None,
         };
         let id = adapter.create(params).await.unwrap();
-        let exit = adapter.wait_for_exit(id.clone()).await.unwrap();
-        assert_eq!(exit.exit_code, Some(0));
-        let out = adapter.output(id).await.unwrap();
-        assert!(
-            out.output.contains("shell-mode-ok"),
-            "expected shell-mode-ok in output, got {:?}",
-            out.output
-        );
+        acp_observe_then_exit(&pty, &adapter, &id, "shell-mode-ok").await;
     }
 
     #[tokio::test]
