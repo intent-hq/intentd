@@ -17,9 +17,9 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
-    now_iso, ActorType, AgentReverseDispatch, ContentType, EventActor, Note, NoteId, NoteMetadata,
-    NoteVisibility, Result as CoreResult, ReverseTarget, TaskMetadata, TaskStatus, Workspace,
-    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, ActorType, AgentId, AgentReverseDispatch, ContentType, EventActor, Note, NoteId,
+    NoteMetadata, NoteVisibility, Result as CoreResult, ReverseTarget, TaskMetadata, TaskStatus,
+    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
 use intent_store::{NewEvent, Store};
@@ -7728,6 +7728,119 @@ async fn wss_semantic_map_round_trip() {
         .map(|activity| activity["id"].as_str().expect("activity id"))
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(ids.len(), 500, "activity ids must be unique: {upper}");
+
+    let filtered_actor = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-filter-map".to_string()),
+        name: Some("Filter Mapper".to_string()),
+        ..Default::default()
+    };
+    let filtered_edit = srv
+        .store
+        .insert_event(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: "2026-09-06T02:00:00Z".to_string(),
+            event_type: "file:changed".to_string(),
+            actor: filtered_actor.clone(),
+            session_id: Some("agent-filter-map".to_string()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({"action":"modify","relativePath":"src/lib.rs"}),
+        })
+        .await
+        .expect("seed filtered edit");
+    let non_matching = (0..50)
+        .map(|index| NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: format!("2026-09-06T03:00:{index:02}Z"),
+            event_type: "file:created".to_string(),
+            actor: filtered_actor.clone(),
+            session_id: Some("agent-filter-map".to_string()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({"action":"create","relativePath":"src/generated.rs"}),
+        })
+        .collect::<Vec<_>>();
+    srv.store
+        .insert_events(&non_matching)
+        .await
+        .expect("seed non-matching activity");
+    let filtered = serde_json::json!({
+        "jsonrpc":"2.0", "id":10, "method":"map.activity",
+        "params":{
+            "workspaceId":ws.0, "agentId":"agent-filter-map",
+            "kinds":["edit"], "limit":1
+        }
+    });
+    let filtered = wss_call(srv.port, srv.cfg.clone(), &filtered.to_string()).await;
+    assert_eq!(
+        filtered["result"],
+        serde_json::json!([{
+            "id": filtered_edit.id,
+            "regionId":"code", "agentId":"agent-filter-map",
+            "agentName":"Filter Mapper", "path":"src/lib.rs",
+            "kind":"edit", "ts":"2026-09-06T02:00:00Z"
+        }]),
+        "limit must apply after kind filtering: {filtered}"
+    );
+
+    let task_agents = ["agent-task-map-a", "agent-task-map-b"];
+    let mut task = fixture_note(&ws, "task-map-route", "# Map route");
+    task.metadata.task = Some(TaskMetadata {
+        status: TaskStatus::InProgress,
+        assigned_agent_ids: task_agents.iter().copied().map(AgentId::from).collect(),
+        ..Default::default()
+    });
+    srv.store
+        .insert_note(&task)
+        .await
+        .expect("insert route task");
+    let task_events = [
+        (task_agents[0], "2026-09-05T00:00:01Z", "src/lib.rs"),
+        (task_agents[1], "2026-09-05T00:00:02Z", "tests/map.rs"),
+        (task_agents[0], "2026-09-05T00:00:03Z", "tests/map.rs"),
+        (task_agents[1], "2026-09-05T00:00:04Z", "src/lib.rs"),
+    ]
+    .map(|(agent_id, timestamp, path)| NewEvent {
+        workspace_id: ws.clone(),
+        timestamp: timestamp.to_string(),
+        event_type: "file:changed".to_string(),
+        actor: EventActor {
+            actor_type: ActorType::Agent,
+            id: Some(agent_id.to_string()),
+            name: None,
+            ..Default::default()
+        },
+        session_id: Some(agent_id.to_string()),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({"action":"modify","relativePath":path}),
+    });
+    srv.store
+        .insert_events(&task_events)
+        .await
+        .expect("seed task route activity");
+    let task_route = serde_json::json!({
+        "jsonrpc":"2.0", "id":11, "method":"map.route",
+        "params":{"workspaceId":ws.0,"taskNoteId":"task-map-route"}
+    });
+    let task_route = wss_call(srv.port, srv.cfg.clone(), &task_route.to_string()).await;
+    assert_eq!(
+        task_route["result"]["visits"],
+        serde_json::json!(["code", "tests"]),
+        "task route must ignore newer unrelated activity: {task_route}"
+    );
+    assert_eq!(
+        task_route["result"]["transitions"],
+        serde_json::json!([
+            {"from":"code","to":"tests","count":1,"evidence":["tests/map.rs"],"label":"verified by"},
+            {"from":"tests","to":"code","count":1,"evidence":["src/lib.rs"]}
+        ]),
+        "task route must retain each assigned agent: {task_route}"
+    );
 
     srv.ws.stop().await;
 }

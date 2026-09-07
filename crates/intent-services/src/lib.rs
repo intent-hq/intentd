@@ -12725,6 +12725,9 @@ const MAP_EVENT_TYPES: [&str; 6] = [
     AGENT_STREAM_ACTIVITY,
 ];
 
+const MAP_ACTIVITY_SOURCE_PAGE_SIZE: i64 = 500;
+const MAP_ACTIVITY_SCAN_FACTOR: i64 = 100;
+
 async fn semantic_map_paths(
     store: &Store,
     workspace_id: &WorkspaceId,
@@ -12853,6 +12856,95 @@ fn project_map_events(
         })
         .filter(|activity| kinds.is_empty() || kinds.contains(&activity.kind))
         .collect()
+}
+
+fn map_event_types_for_kinds(kinds: &[semantic_map::MapActivityKind]) -> Vec<String> {
+    let includes_file = kinds.is_empty()
+        || kinds.iter().any(|kind| {
+            matches!(
+                kind,
+                semantic_map::MapActivityKind::Edit
+                    | semantic_map::MapActivityKind::Create
+                    | semantic_map::MapActivityKind::Delete
+                    | semantic_map::MapActivityKind::Move
+            )
+        });
+    MAP_EVENT_TYPES
+        .iter()
+        .filter(|event_type| match **event_type {
+            FILE_CHANGED | FILE_CREATED | FILE_DELETED | "file:renamed" => includes_file,
+            AGENT_TOOL_CALL => {
+                kinds.is_empty()
+                    || kinds.iter().any(|kind| {
+                        matches!(
+                            kind,
+                            semantic_map::MapActivityKind::Read
+                                | semantic_map::MapActivityKind::Tool
+                        )
+                    })
+            }
+            AGENT_STREAM_ACTIVITY => {
+                kinds.is_empty() || kinds.contains(&semantic_map::MapActivityKind::Thinking)
+            }
+            _ => false,
+        })
+        .map(ToString::to_string)
+        .collect()
+}
+
+struct MapActivityQuery<'a> {
+    workspace_id: &'a WorkspaceId,
+    kinds: &'a [semantic_map::MapActivityKind],
+    agent_id: Option<String>,
+    since: Option<String>,
+    limit: i64,
+}
+
+async fn query_map_activities(
+    store: &Store,
+    classifier: &semantic_map::Classifier,
+    workspace_paths: &semantic_map::WorkspacePaths,
+    query: MapActivityQuery<'_>,
+) -> Result<Vec<semantic_map::MapActivity>> {
+    // Projection can reject a source event or refine one source type into
+    // multiple map kinds. Bound the fallback scan while allowing routine
+    // sparse filters to fill their requested result page.
+    let max_source_events = query
+        .limit
+        .saturating_mul(MAP_ACTIVITY_SCAN_FACTOR)
+        .max(MAP_ACTIVITY_SOURCE_PAGE_SIZE);
+    let result_limit = usize::try_from(query.limit)
+        .map_err(|_| Error::Internal("invalid map activity result limit".to_string()))?;
+    let mut offset = 0;
+    let mut activities = Vec::with_capacity(result_limit);
+
+    while offset < max_source_events && activities.len() < result_limit {
+        let page_limit = MAP_ACTIVITY_SOURCE_PAGE_SIZE.min(max_source_events - offset);
+        let events = store
+            .query_events(&EventQuery {
+                workspace_id: Some(query.workspace_id.clone()),
+                event_types: map_event_types_for_kinds(query.kinds),
+                actor_id: query.agent_id.clone(),
+                since: query.since.clone(),
+                limit: Some(page_limit),
+                offset: Some(offset),
+                ..Default::default()
+            })
+            .await?;
+        let event_count = i64::try_from(events.len()).unwrap_or(page_limit);
+        activities.extend(project_map_events(
+            classifier,
+            workspace_paths,
+            &events,
+            query.kinds,
+        ));
+        offset += event_count;
+        if event_count < page_limit {
+            break;
+        }
+    }
+    activities.truncate(result_limit);
+    Ok(activities)
 }
 
 fn map_activity_event(
@@ -23949,20 +24041,19 @@ impl WorkspaceApi for Services {
                 })
                 .collect::<Result<Vec<semantic_map::MapActivityKind>>>()?;
             let limit = limit.unwrap_or(50).clamp(1, 500);
-            let events = store
-                .query_events(&EventQuery {
-                    workspace_id: Some(workspace_id.clone()),
-                    event_types: MAP_EVENT_TYPES
-                        .iter()
-                        .map(|kind| (*kind).to_string())
-                        .collect(),
-                    actor_id: agent_id,
+            let activities = query_map_activities(
+                &store,
+                &classifier,
+                &workspace_paths,
+                MapActivityQuery {
+                    workspace_id: &workspace_id,
+                    kinds: &kinds,
+                    agent_id,
                     since: since_ts.or_else(|| minutes_ago.map(iso_minutes_ago)),
-                    limit: Some(limit),
-                    ..Default::default()
-                })
-                .await?;
-            let activities = project_map_events(&classifier, &workspace_paths, &events, &kinds);
+                    limit,
+                },
+            )
+            .await?;
             for activity in &activities {
                 publish_event_transient(bus.as_ref(), &map_activity_event(&workspace_id, activity));
             }
@@ -23984,7 +24075,7 @@ impl WorkspaceApi for Services {
             let (manifest, classifier, _) =
                 active_semantic_map(&store, &loader, &workspace_id).await?;
             let workspace_paths = semantic_map::workspace_paths(&store, &workspace_id).await?;
-            let agent_ids = if let Some(agent_id) = agent_id {
+            let mut agent_ids = if let Some(agent_id) = agent_id {
                 vec![agent_id]
             } else if let Some(note_id) = task_note_id {
                 fetch_note(&store, &workspace_id, &note_id)
@@ -24001,28 +24092,29 @@ impl WorkspaceApi for Services {
             if agent_ids.is_empty() {
                 return Ok(serde_json::json!({ "visits": [], "transitions": [] }));
             }
-            let events = store
-                .query_events(&EventQuery {
-                    workspace_id: Some(workspace_id),
-                    event_types: MAP_EVENT_TYPES
-                        .iter()
-                        .map(|kind| (*kind).to_string())
-                        .collect(),
-                    actor_id: (agent_ids.len() == 1).then(|| agent_ids[0].clone()),
-                    since: since_ts.clone(),
-                    limit: Some(500),
-                    ..Default::default()
-                })
-                .await?;
-            let activities = project_map_events(&classifier, &workspace_paths, &events, &[])
-                .into_iter()
-                .filter(|activity| {
-                    activity
-                        .agent_id
-                        .as_ref()
-                        .is_some_and(|id| agent_ids.contains(id))
-                })
-                .collect::<Vec<_>>();
+            agent_ids.sort_unstable();
+            agent_ids.dedup();
+            let mut activities = Vec::new();
+            for agent_id in agent_ids {
+                activities.extend(
+                    query_map_activities(
+                        &store,
+                        &classifier,
+                        &workspace_paths,
+                        MapActivityQuery {
+                            workspace_id: &workspace_id,
+                            kinds: &[],
+                            agent_id: Some(agent_id),
+                            since: since_ts.clone(),
+                            limit: 500,
+                        },
+                    )
+                    .await?,
+                );
+            }
+            activities
+                .sort_by(|left, right| right.ts.cmp(&left.ts).then_with(|| right.id.cmp(&left.id)));
+            activities.truncate(500);
             let route = semantic_map::derive_route(
                 &manifest,
                 &activities,
