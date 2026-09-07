@@ -200,6 +200,12 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          (agents re-register explicit roots) on the target",
     ),
     (
+        "browser_tab",
+        "rows mirror live Chrome DevTools tabs on a specific host client \
+         (`host_client_id` is a per-daemon client id); the tabs do not exist on \
+         the target host and are re-reported by `browser.syncTabs` on reconnect",
+    ),
+    (
         "workspace_draft",
         "pre-promotion drafts are daemon-owned and not workspace-scoped; they can \
          contain source-host paths and client ids, while promoted workspace state \

@@ -107,6 +107,10 @@ pub use model::{
     WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
+pub use model::{
+    BrowserTab, BrowserTabInput, BrowserTabSize, BrowserTabSyncResult, BrowserTabUpsertOutcome,
+    BrowserTabVisibility,
+};
 pub use path_utils::prewarm_login_shell_path;
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
 pub use server_control::ServerControl;
@@ -121,5 +125,6 @@ pub use traits::{
     ReverseLiveClient, ReverseTarget, WorkspaceApi,
 };
 pub use turn_attachments::{
-    new_attachment_id, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
+    is_workspace_api_input, new_attachment_id, AttachmentPolicy, TurnAttachment,
+    TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
 };

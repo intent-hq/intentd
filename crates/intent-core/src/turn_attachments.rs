@@ -54,6 +54,31 @@ pub fn new_attachment_id() -> String {
     format!("{NONCE_PREFIX}{}", &hex[..12])
 }
 
+/// The `workspace_api` MCP tool's input schema: a string `code` (the JS to
+/// run) plus a string `summary` (the model-authored one-line description),
+/// and nothing else. Both keys are required by the schema and no daemon tool
+/// carries that pair, so the exact shape identifies the tool on its own; any
+/// extra key (other than a daemon-stamped `_acpTitle` echo) means some other
+/// tool's arguments and disqualifies the match. Some ACP providers (auggie)
+/// title a `workspace_api` call with its `summary` and carry no tool
+/// identifier anywhere in the frame (intent-hq/intent#4491), so the input
+/// shape is the one signal shared by every provider. Used by both the name
+/// derivation in `intent-acp` and the FIFO claim gate in
+/// [`TurnAttachmentRegistry::claim_at_tool_result`] so the two agree.
+#[must_use]
+pub fn is_workspace_api_input(input: &Value) -> bool {
+    let Some(obj) = input.as_object() else {
+        return false;
+    };
+    obj.get("code")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+        && obj.get("summary").is_some_and(Value::is_string)
+        && obj
+            .keys()
+            .all(|k| matches!(k.as_str(), "code" | "summary" | "_acpTitle"))
+}
+
 /// Where in the turn transcript a registered attachment is emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentPolicy {
@@ -160,11 +185,25 @@ impl TurnAttachmentRegistry {
     /// Precise path: the serialized `echoed_output` contains a batch member's
     /// nonce (the dispatch layer stamped it into the model-facing output, so
     /// any non-garbled echo carries it). Fallback path: when no nonce matches
-    /// and `tool_name` is the daemon's own `workspace_api` tool, the oldest
+    /// and the call is the daemon's own `workspace_api` tool — EITHER
+    /// `tool_name` contains `workspace_api` OR `unidentified_input` carries
+    /// the `workspace_api` schema ([`is_workspace_api_input`]) — the oldest
     /// batch with an `AtToolResult` entry is claimed FIFO — a garbled echo
     /// cannot defeat the attach, and only the tool that registers through
-    /// this registry can trigger the blind claim. Empty when nothing is
-    /// pending (the caller falls back to echo parsing).
+    /// this registry can trigger the blind claim.
+    ///
+    /// `unidentified_input` is the call's input ONLY when the frame carried
+    /// no authoritative tool identifier — no MCP `server`/`tool` metadata, no
+    /// `mcp.<server>.<tool>` / `mcp__<server>__<tool>` title — so the recorded
+    /// name is whatever the mapper made of a prose title (auggie titles the
+    /// call with its model-authored `summary`; intent-hq/intent#4491). The
+    /// caller passes `None` for an authoritatively named call: the shape
+    /// gate is a second line of defense for the identifier-less frame (should
+    /// a title rule ever pre-empt the mapper's shape rule again), not a way
+    /// around the authoritative-name ordering — a foreign tool whose
+    /// arguments happen to be `{ code, summary }` keeps its own name, and
+    /// the registry cannot tell that from the (unwrapped) input alone. Empty
+    /// when nothing is pending (the caller falls back to echo parsing).
     ///
     /// # Panics
     ///
@@ -174,6 +213,7 @@ impl TurnAttachmentRegistry {
         agent_id: &AgentId,
         echoed_output: Option<&Value>,
         tool_name: &str,
+        unidentified_input: Option<&Value>,
     ) -> Vec<TurnAttachment> {
         let mut inner = self.inner.lock().unwrap();
         let Some(entries) = inner.get_mut(agent_id) else {
@@ -186,10 +226,10 @@ impl TurnAttachmentRegistry {
             .iter()
             .find(|e| is_claimable(e) && !echo.is_empty() && echo.contains(&e.attachment.id))
             .map(|e| e.batch);
+        let is_workspace_api = tool_name.contains("workspace_api")
+            || unidentified_input.is_some_and(is_workspace_api_input);
         let batch = by_nonce.or_else(|| {
-            tool_name
-                .contains("workspace_api")
-                .then(|| entries.iter().find(|e| is_claimable(e)).map(|e| e.batch))?
+            is_workspace_api.then(|| entries.iter().find(|e| is_claimable(e)).map(|e| e.batch))?
         });
         let Some(batch) = batch else {
             return Vec::new();
@@ -292,10 +332,10 @@ mod tests {
         reg.register(&a, attachment("tar-bbb", AttachmentPolicy::AtToolResult));
         // The echo carries the SECOND nonce — nonce match must beat FIFO.
         let echo = json!({ "output": "…\"attachmentId\": \"tar-bbb\"…" });
-        let claimed = reg.claim_at_tool_result(&a, Some(&echo), "some_other_tool");
+        let claimed = reg.claim_at_tool_result(&a, Some(&echo), "some_other_tool", None);
         assert_eq!(ids(&claimed), vec!["tar-bbb"]);
         // First entry still pending.
-        let rest = reg.claim_at_tool_result(&a, Some(&json!("tar-aaa")), "x");
+        let rest = reg.claim_at_tool_result(&a, Some(&json!("tar-aaa")), "x", None);
         assert_eq!(ids(&rest), vec!["tar-aaa"]);
     }
 
@@ -315,10 +355,10 @@ mod tests {
         reg.register(&a, attachment("tar-b2", AttachmentPolicy::AtToolResult));
         // A nonce match on ANY batch member claims the whole batch, in order.
         let echo = json!({ "output": "…tar-b1b…" });
-        let claimed = reg.claim_at_tool_result(&a, Some(&echo), "x");
+        let claimed = reg.claim_at_tool_result(&a, Some(&echo), "x", None);
         assert_eq!(ids(&claimed), vec!["tar-b1a", "tar-b1b"]);
         // The other batch is untouched.
-        let rest = reg.claim_at_tool_result(&a, None, "workspace_api");
+        let rest = reg.claim_at_tool_result(&a, None, "workspace_api", None);
         assert_eq!(ids(&rest), vec!["tar-b2"]);
     }
 
@@ -330,14 +370,108 @@ mod tests {
         // Garbled echo (no nonce) + foreign tool name → no claim.
         let garbled = json!({ "output": "garbage" });
         assert!(reg
-            .claim_at_tool_result(&a, Some(&garbled), "str_replace")
+            .claim_at_tool_result(&a, Some(&garbled), "str_replace", None)
             .is_empty());
         // Same echo but the daemon's own tool (possibly prefixed) → FIFO claim.
-        let claimed = reg.claim_at_tool_result(&a, Some(&garbled), "workspace-mcp_workspace_api");
+        let claimed =
+            reg.claim_at_tool_result(&a, Some(&garbled), "workspace-mcp_workspace_api", None);
         assert_eq!(ids(&claimed), vec!["tar-aaa"]);
         assert!(reg
-            .claim_at_tool_result(&a, Some(&garbled), "workspace_api")
+            .claim_at_tool_result(&a, Some(&garbled), "workspace_api", None)
             .is_empty());
+    }
+
+    /// intent-hq/intent#4491: a provider that titles the call with its
+    /// `summary` records no usable name, so the `workspace_api` schema on
+    /// the identifier-less input is the second FIFO gate, independent of
+    /// whatever name the mapper recorded. `{code}` alone, a non-string
+    /// `summary`, an extra key, or no input does not open it; the name gate
+    /// still works with no input.
+    #[test]
+    fn claim_falls_back_to_fifo_on_workspace_api_shaped_unidentified_input() {
+        let reg = TurnAttachmentRegistry::new();
+        let a = agent();
+        reg.register(&a, attachment("tar-aaa", AttachmentPolicy::AtToolResult));
+        let garbled = json!({ "output": "garbage" });
+        let prose = "Propose a follow-up workspace";
+        assert!(reg
+            .claim_at_tool_result(&a, Some(&garbled), prose, None)
+            .is_empty());
+        for shaped_wrong in [
+            json!({ "code": "ws.workspace.proposeSibling(p)", "_acpTitle": prose }),
+            json!({ "code": "x", "summary": 42, "_acpTitle": prose }),
+            json!({ "code": "x", "summary": prose, "_acpTitle": prose, "language": "py" }),
+        ] {
+            assert!(
+                reg.claim_at_tool_result(&a, Some(&garbled), prose, Some(&shaped_wrong))
+                    .is_empty(),
+                "input={shaped_wrong}"
+            );
+        }
+        // The mapper split `"Inspect: tool calls"` into a bogus name — the
+        // gate does not care what the recorded name is.
+        let shaped = json!({
+            "code": "ws.workspace.proposeSibling(p)",
+            "summary": prose,
+            "_acpTitle": prose,
+        });
+        let claimed = reg.claim_at_tool_result(&a, Some(&garbled), "Inspect", Some(&shaped));
+        assert_eq!(ids(&claimed), vec!["tar-aaa"]);
+        assert!(reg
+            .claim_at_tool_result(&a, Some(&garbled), prose, Some(&shaped))
+            .is_empty());
+        // Name gate alone still claims with no input.
+        reg.register(&a, attachment("tar-bbb", AttachmentPolicy::AtToolResult));
+        let claimed = reg.claim_at_tool_result(&a, None, "workspace_api", None);
+        assert_eq!(ids(&claimed), vec!["tar-bbb"]);
+    }
+
+    /// Authoritative names win: a foreign tool whose arguments happen to be
+    /// `{ code, summary }` was identified by MCP metadata or a namespaced
+    /// title, so the caller withholds its input (`None`) and the shape gate
+    /// stays shut — the batch waits for the daemon's own tool. The registry
+    /// cannot distinguish that input from auggie's by itself, which is why
+    /// the contract puts the provenance check on the caller.
+    #[test]
+    fn foreign_tool_with_workspace_api_shaped_arguments_does_not_claim() {
+        let reg = TurnAttachmentRegistry::new();
+        let a = agent();
+        reg.register(&a, attachment("tar-aaa", AttachmentPolicy::AtToolResult));
+        let garbled = json!({ "output": "ok" });
+        assert!(reg
+            .claim_at_tool_result(&a, Some(&garbled), "python_execute", None)
+            .is_empty());
+        let claimed = reg.claim_at_tool_result(&a, Some(&garbled), "workspace_api", None);
+        assert_eq!(ids(&claimed), vec!["tar-aaa"]);
+    }
+
+    #[test]
+    fn is_workspace_api_input_requires_exact_schema() {
+        assert!(is_workspace_api_input(
+            &json!({ "code": "return 1", "summary": "One" })
+        ));
+        assert!(is_workspace_api_input(
+            &json!({ "code": "return 1", "summary": "One", "_acpTitle": "One" })
+        ));
+        assert!(!is_workspace_api_input(&json!({ "code": "return 1" })));
+        assert!(!is_workspace_api_input(&json!({ "summary": "One" })));
+        assert!(!is_workspace_api_input(
+            &json!({ "code": null, "summary": "One" })
+        ));
+        assert!(!is_workspace_api_input(
+            &json!({ "code": "", "summary": "One" })
+        ));
+        assert!(!is_workspace_api_input(
+            &json!({ "code": ["x"], "summary": "One" })
+        ));
+        assert!(!is_workspace_api_input(
+            &json!({ "code": "x", "summary": 42 })
+        ));
+        assert!(!is_workspace_api_input(
+            &json!({ "code": "print(1)", "summary": "Run", "language": "python" })
+        ));
+        assert!(!is_workspace_api_input(&json!("code summary")));
+        assert!(!is_workspace_api_input(&Value::Null));
     }
 
     #[test]
@@ -346,10 +480,15 @@ mod tests {
         let a = agent();
         reg.register(&a, attachment("tar-end", AttachmentPolicy::AtTurnEnd));
         assert!(reg
-            .claim_at_tool_result(&a, None, "workspace_api")
+            .claim_at_tool_result(&a, None, "workspace_api", None)
             .is_empty());
         assert!(reg
-            .claim_at_tool_result(&AgentId::from_string("agent-other"), None, "workspace_api")
+            .claim_at_tool_result(
+                &AgentId::from_string("agent-other"),
+                None,
+                "workspace_api",
+                None
+            )
             .is_empty());
     }
 
@@ -364,7 +503,7 @@ mod tests {
         assert_eq!(ids(&drained), vec!["tar-e1", "tar-e2"]);
         // Everything (including the unclaimed AtToolResult) is gone.
         assert!(reg
-            .claim_at_tool_result(&a, None, "workspace_api")
+            .claim_at_tool_result(&a, None, "workspace_api", None)
             .is_empty());
         assert!(reg.finish_turn(&a).is_empty());
     }
@@ -400,7 +539,7 @@ mod tests {
             );
         }
         // Oldest were dropped: FIFO claim yields the first surviving entry.
-        let claimed = reg.claim_at_tool_result(&a, None, "workspace_api");
+        let claimed = reg.claim_at_tool_result(&a, None, "workspace_api", None);
         assert_eq!(ids(&claimed), vec!["tar-004"]);
     }
 

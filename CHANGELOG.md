@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.35] - 2026-09-07
+
+### 🚀 Features
+
+- *(browser)* Route agent browser.exec via the workspace driving client (REV-2) ([#1770](https://github.com/intent-hq/intentd/pull/1770))
+
+
+## [0.9.34] - 2026-09-06
+
+### 🚀 Features
+
+- *(browser)* Daemon-owned browser tab registry (store, RPCs, events) ([#1763](https://github.com/intent-hq/intentd/pull/1763))
+
+### 🐛 Bug Fixes
+
+- *(attach)* Input-shape second gate for the workspace_api FIFO claim ([#1765](https://github.com/intent-hq/intentd/pull/1765))
+
+
+## [0.9.33] - 2026-09-06
+
+### 🚀 Features
+
+- Per-workspace browser-client pin + client.list RPCs (REV-2) ([#1760](https://github.com/intent-hq/intentd/pull/1760))
+
+
 ## [0.9.32] - 2026-09-06
 
 ### 🐛 Bug Fixes

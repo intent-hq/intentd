@@ -883,6 +883,118 @@ mod tests {
         needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// Count non-overlapping occurrences of a non-empty `needle` in `haystack`.
+    fn count_sub(haystack: &[u8], needle: &[u8]) -> usize {
+        assert!(!needle.is_empty(), "count_sub requires a non-empty needle");
+        let mut count = 0;
+        let mut i = 0;
+        while i + needle.len() <= haystack.len() {
+            if &haystack[i..i + needle.len()] == needle {
+                count += 1;
+                i += needle.len();
+            } else {
+                i += 1;
+            }
+        }
+        count
+    }
+
+    /// Output-complete barrier (intent#4521): poll `read` until it yields
+    /// exactly `expected` copies of `needle` AND the same bytes as the previous
+    /// read, then return that stable snapshot. `needle` must include the line
+    /// terminator when the caller expects complete lines — the PTY read loop
+    /// appends arbitrary chunks, so a bare marker can be present before its
+    /// trailing CRLF has been drained.
+    async fn settled_output(
+        mut read: impl FnMut() -> Option<Vec<u8>>,
+        needle: &[u8],
+        expected: usize,
+    ) -> Vec<u8> {
+        let mut prev: Option<Vec<u8>> = None;
+        poll_until(
+            || {
+                let bytes = read()?;
+                let settled =
+                    count_sub(&bytes, needle) == expected && prev.as_deref() == Some(&bytes[..]);
+                prev = Some(bytes.clone());
+                settled.then_some(bytes)
+            },
+            TIMEOUT,
+        )
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "output never settled with {expected} copies of {:?}; last read: {:?}",
+                String::from_utf8_lossy(needle),
+                prev.map(|b| String::from_utf8_lossy(&b).into_owned())
+            )
+        })
+    }
+
+    /// `settled_output` over a terminal's unlimited `get_buffer` read. For a
+    /// `cat` PTY the tty echo and cat's own output arrive as separate chunks,
+    /// so a snapshot taken on the first appearance of a marker can still grow.
+    async fn settled_buffer(pty: &PtyHost, id: &str, needle: &[u8], expected: usize) -> Vec<u8> {
+        settled_output(
+            || {
+                let v = get_buffer(pty, id, None).ok()?;
+                Some(decode(v["data"].as_str()?))
+            },
+            needle,
+            expected,
+        )
+        .await
+    }
+
+    /// Regression for the barrier itself: a marker whose trailing CRLF lands
+    /// in a later chunk must not satisfy the barrier just because two identical
+    /// partial reads were observed.
+    #[tokio::test]
+    async fn settled_output_waits_for_delayed_line_terminator() {
+        let partial = b"buffer-test\r\nbuffer-test".to_vec();
+        let complete = b"buffer-test\r\nbuffer-test\r\n".to_vec();
+        let reads = [
+            partial.clone(),
+            partial.clone(),
+            partial,
+            complete.clone(),
+            complete.clone(),
+        ];
+        let mut calls = 0;
+        let out = settled_output(
+            || {
+                let r = reads[calls.min(reads.len() - 1)].clone();
+                calls += 1;
+                Some(r)
+            },
+            b"buffer-test\r\n",
+            2,
+        )
+        .await;
+        assert_eq!(out, complete);
+        assert_eq!(
+            calls, 5,
+            "must settle on the second identical complete read"
+        );
+    }
+
+    #[test]
+    fn count_sub_counts_non_overlapping_matches() {
+        assert_eq!(count_sub(b"", b"ab"), 0);
+        assert_eq!(count_sub(b"abab", b"ab"), 2);
+        assert_eq!(count_sub(b"aaa", b"aa"), 1);
+        assert_eq!(
+            count_sub(b"buffer-test\r\nbuffer-test", b"buffer-test\r\n"),
+            1
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty needle")]
+    fn count_sub_rejects_empty_needle() {
+        let _ = count_sub(b"abc", b"");
+    }
+
     fn decode(data: &str) -> Vec<u8> {
         base64::engine::general_purpose::STANDARD
             .decode(data)
@@ -1893,17 +2005,11 @@ mod tests {
         write(pty.as_ref(), &id, "!!!not base64!!!").unwrap_err();
         resize(pty.as_ref(), &id, 120, 50).unwrap();
 
-        let full = poll_until(
-            || {
-                let v = get_buffer(pty.as_ref(), &id, None).ok()?;
-                let bytes = decode(v["data"].as_str()?);
-                contains_sub(&bytes, b"buffer-test").then_some(bytes)
-            },
-            TIMEOUT,
-        )
-        .await
-        .expect("echoed output must reach the buffer");
-        assert!(contains_sub(&full, b"buffer-test"));
+        // Steady state for a `cat` PTY: the tty echo plus cat's output, both
+        // CRLF-terminated, and nothing further. Wait for both complete lines
+        // before taking the snapshot the limit cases below are compared against.
+        let full = settled_buffer(pty.as_ref(), &id, b"buffer-test\r\n", 2).await;
+        assert_eq!(full, b"buffer-test\r\nbuffer-test\r\n");
 
         let capped = get_buffer(pty.as_ref(), &id, Some(4)).unwrap();
         assert_eq!(

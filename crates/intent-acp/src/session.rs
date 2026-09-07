@@ -409,6 +409,16 @@ pub struct MappedToolCall {
     /// The real tool name (`data.toolName`), derived from the ACP title via
     /// [`derive_tool_name`].
     pub tool_name: String,
+    /// Whether [`tool_name`](Self::tool_name) came from an authoritative
+    /// identifier — MCP `server`/`tool` metadata (Antigravity meta, the codex
+    /// nested-MCP wrapper) or a namespaced title (`mcp.<server>.<tool>`,
+    /// `mcp__<server>__<tool>`) — rather than from a prose title or an input
+    /// shape. Consumers that infer identity from the input shape (the §7.1
+    /// registry's `workspace_api` claim gate) must not do so for an
+    /// authoritatively named call: the unwrapped input no longer carries the
+    /// identifier, and a foreign tool's `{ code, summary }` arguments must
+    /// keep its own name (intent-hq/intent#4491).
+    pub name_authoritative: bool,
     /// The raw human-readable ACP title (`data.title`), verbatim.
     pub title: String,
     /// `data.toolKind`: one of file|terminal|search|note|git|other.
@@ -523,7 +533,7 @@ fn resolve_input_and_name(
     title: &str,
     raw_input: Option<&Value>,
     meta: Option<&serde_json::Map<String, Value>>,
-) -> (Value, String) {
+) -> (Value, String, bool) {
     // Antigravity wraps MCP arguments and identifies the tool in ACP metadata.
     // Require both captured markers and the matching title to avoid unwrapping
     // an unrelated provider's legitimate `arguments` parameter.
@@ -545,24 +555,28 @@ fn resolve_input_and_name(
                 if let Some(acp_title) = raw_input.and_then(|v| v.get("_acpTitle")) {
                     input.insert("_acpTitle".into(), acp_title.clone());
                 }
-                return (Value::Object(input), strip_workspace_mcp_affix(title));
+                return (Value::Object(input), strip_workspace_mcp_affix(title), true);
             }
         }
     }
     if let Some((input, rewritten)) = unwrap_codex_mcp_input(raw_input) {
         // `server`/`tool` are authoritative: a foreign tool whose arguments
         // happen to be `{ code, summary }` must keep its own name.
-        let name = derive_tool_name_inner(&rewritten, Some(&input), false);
-        return (input, name);
+        let (name, _) = derive_tool_name_inner(&rewritten, Some(&input), false);
+        return (input, name, true);
     }
-    let name = derive_tool_name(title, raw_input);
-    (raw_input.cloned().unwrap_or(Value::Null), name)
+    let (name, authoritative) = derive_tool_name_inner(title, raw_input, true);
+    (
+        raw_input.cloned().unwrap_or(Value::Null),
+        name,
+        authoritative,
+    )
 }
 
 /// Map a fresh `tool_call` (status defaults to "started").
 fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
     let title = tool_call.title.clone();
-    let (input, tool_name) = resolve_input_and_name(
+    let (input, tool_name, name_authoritative) = resolve_input_and_name(
         &title,
         tool_call.raw_input.as_ref(),
         tool_call.meta.as_ref(),
@@ -574,6 +588,7 @@ fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
         output: tool_call.raw_output.clone(),
         status: tool_status_word(tool_call.status),
         tool_name,
+        name_authoritative,
         title,
     }
 }
@@ -582,7 +597,7 @@ fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
 fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
     let fields = &update.fields;
     let title = fields.title.clone().unwrap_or_default();
-    let (input, tool_name) =
+    let (input, tool_name, name_authoritative) =
         resolve_input_and_name(&title, fields.raw_input.as_ref(), update.meta.as_ref());
     MappedToolCall {
         tool_kind: tool_kind_word(fields.kind.unwrap_or_default(), &tool_name),
@@ -592,6 +607,7 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
         input,
         output: fields.raw_output.clone(),
         tool_name,
+        name_authoritative,
         title,
     }
 }
@@ -619,7 +635,9 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///     happen to be `{ code, summary }` keeps its own name.
 ///  3. A `raw_input` carrying the daemon's own `workspace_api` schema — an
 ///     object holding exactly a non-empty string `code` plus a string
-///     `summary` (an `_acpTitle` echo is tolerated) — is `workspace_api`
+///     `summary` (an `_acpTitle` echo is tolerated;
+///     [`intent_core::is_workspace_api_input`], shared with the §7.1
+///     registry's claim gate) — is `workspace_api`
 ///     regardless of the title. Auggie titles an MCP call with the
 ///     model-authored `summary` (plain prose, no `name`, `kind: other`), so
 ///     the input shape is the only identifier; it is checked before the
@@ -669,43 +687,46 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// every path.
 #[must_use]
 pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
-    derive_tool_name_inner(title, raw_input, true)
+    derive_tool_name_inner(title, raw_input, true).0
 }
 
 /// [`derive_tool_name`] with the `workspace_api` input-shape rule (rule 3)
 /// switchable off for callers that already hold an authoritative tool name.
+/// The second element is `true` when the name came from a namespaced MCP
+/// title (rules 1–2), i.e. an authoritative identifier
+/// ([`MappedToolCall::name_authoritative`]).
 fn derive_tool_name_inner(
     title: &str,
     raw_input: Option<&Value>,
     infer_workspace_api: bool,
-) -> String {
+) -> (String, bool) {
     if let Some(rewritten) = split_codex_mcp_title(title) {
-        return strip_workspace_mcp_affix(&rewritten);
+        return (strip_workspace_mcp_affix(&rewritten), true);
     }
     if let Some(rewritten) = split_claude_mcp_title(title) {
-        return strip_workspace_mcp_affix(&rewritten);
+        return (strip_workspace_mcp_affix(&rewritten), true);
     }
-    if infer_workspace_api && raw_input.is_some_and(is_workspace_api_input) {
-        return "workspace_api".to_string();
+    if infer_workspace_api && raw_input.is_some_and(intent_core::is_workspace_api_input) {
+        return ("workspace_api".to_string(), false);
     }
     if let Some(name) = split_name_prefix(title) {
-        return strip_workspace_mcp_affix(name);
+        return (strip_workspace_mcp_affix(name), false);
     }
     let stripped = strip_workspace_mcp_affix(title);
     if stripped != title {
-        return stripped;
+        return (stripped, false);
     }
     // Opencode's fetch tool is titled `webfetch`; normalize to the canonical
     // builtin name so downstream consumers match on one spelling.
     if title == "webfetch" {
-        return "web-fetch".to_string();
+        return ("web-fetch".to_string(), false);
     }
     if let Some(input) = raw_input {
         if let Some(from_input) = derive_tool_name_from_input(title, input) {
-            return from_input;
+            return (from_input, false);
         }
     }
-    stripped
+    (stripped, false)
 }
 
 /// Inspect an ACP `raw_input` object for shapes that unambiguously identify a
@@ -797,23 +818,6 @@ fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
         return Some("web-fetch".to_string());
     }
     None
-}
-
-/// The `workspace_api` MCP tool's input schema: a string `code` (the JS to
-/// run) plus a string `summary` (the model-authored one-line description),
-/// and nothing else. Both keys are required by the schema and no daemon tool
-/// carries that pair, so the exact shape identifies the tool on its own; any
-/// extra key (other than a daemon-stamped `_acpTitle` echo) means some other
-/// tool's arguments and disqualifies the match.
-fn is_workspace_api_input(input: &Value) -> bool {
-    let Some(obj) = input.as_object() else {
-        return false;
-    };
-    is_non_empty_string(obj.get("code"))
-        && obj.get("summary").is_some_and(Value::is_string)
-        && obj
-            .keys()
-            .all(|k| matches!(k.as_str(), "code" | "summary" | "_acpTitle"))
 }
 
 /// JS-truthy on a `path`-style field: present, a string, and non-empty.

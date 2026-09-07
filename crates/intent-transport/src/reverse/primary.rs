@@ -33,7 +33,7 @@
 //! the `client:connected` of a same-client reconnect, and an aborted
 //! connection's departure is announced exactly like an explicit close.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -192,8 +192,82 @@ pub struct PrimaryReverseRegistry {
     inner: Arc<Inner>,
 }
 
+/// Presence of one logical client with at least one live hello'd
+/// connection — the indexed projection behind
+/// [`PrimaryReverseRegistry::host_presence`]. Maintained under the registry
+/// lock by every mutation (`bind` / removal), never rebuilt on read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientPresence {
+    /// The hello `name` of the client's most recent hello (newest wins, as
+    /// for [`LiveClient`]).
+    pub name: Option<String>,
+    /// Live hello'd connections sharing the `clientId`.
+    pub connections: usize,
+}
+
+/// Everything guarded by the registry lock: the arrival-ordered connection
+/// entries plus the two indexes derived from them.
+#[derive(Default)]
+struct State {
+    entries: VecDeque<Entry>,
+    presence: HashMap<ClientId, ClientPresence>,
+    /// Entry id → the `clientId` its hello bound, for hello'd connections
+    /// only. Backs [`PrimaryReverseGuard::bound_client_id`] (the per-report
+    /// host-identity lookup on the `browser.*` write path) so it never walks
+    /// `entries`. Maintained by `bind` / removal alongside `presence`.
+    bound: HashMap<u64, ClientId>,
+}
+
+impl State {
+    /// Account a hello'd connection of `identity` in the presence index.
+    /// Call after the connection's entry carries `identity`.
+    fn presence_add(&mut self, identity: &ReverseClientIdentity) {
+        self.presence
+            .entry(identity.client_id.clone())
+            .or_insert_with(|| ClientPresence {
+                name: None,
+                connections: 0,
+            })
+            .connections += 1;
+        self.presence_refresh_name(&identity.client_id);
+    }
+
+    /// Drop one hello'd connection of `client_id` from the presence index;
+    /// the client disappears with its last connection, otherwise its name
+    /// falls back to the newest remaining hello. Call after the connection's
+    /// entry no longer carries `client_id`.
+    fn presence_remove(&mut self, client_id: &ClientId) {
+        if let Some(entry) = self.presence.get_mut(client_id) {
+            entry.connections = entry.connections.saturating_sub(1);
+            if entry.connections == 0 {
+                self.presence.remove(client_id);
+                return;
+            }
+        }
+        self.presence_refresh_name(client_id);
+    }
+
+    /// Re-derive `client_id`'s presence name from its live entries with the
+    /// same rule as [`PrimaryReverseRegistry::live_clients`] (the highest
+    /// live [`Entry::hello_seq`] wins — hello order, not registration
+    /// order), so the index never keeps the name of a connection that
+    /// dropped or re-hello'd under another id. Mutation path only; reads
+    /// stay O(1).
+    fn presence_refresh_name(&mut self, client_id: &ClientId) {
+        let Some(presence) = self.presence.get_mut(client_id) else {
+            return;
+        };
+        presence.name = self
+            .entries
+            .iter()
+            .filter(|e| e.has_client(client_id))
+            .max_by_key(|e| e.hello_seq)
+            .and_then(|e| e.identity.as_ref().and_then(|i| i.name.clone()));
+    }
+}
+
 struct Inner {
-    entries: Mutex<VecDeque<Entry>>,
+    state: Mutex<State>,
     next_id: AtomicU64,
     /// Source of [`Entry::hello_seq`]; bumped under the `entries` lock.
     next_hello_seq: AtomicU64,
@@ -210,7 +284,7 @@ impl Default for Inner {
     fn default() -> Self {
         let (transitions, transition_rx) = mpsc::unbounded_channel();
         Self {
-            entries: Mutex::new(VecDeque::new()),
+            state: Mutex::new(State::default()),
             next_id: AtomicU64::new(0),
             next_hello_seq: AtomicU64::new(0),
             transitions,
@@ -248,21 +322,21 @@ impl Entry {
 }
 
 impl Inner {
-    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Entry>> {
-        self.entries
-            .lock()
-            .expect("primary reverse entries poisoned")
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().expect("primary reverse entries poisoned")
     }
 
     /// Remove entry `id` and return its channel. When the entry was the last
     /// live connection of its logical client, a `Disconnected` transition is
     /// queued before the lock is released.
     fn remove(&self, id: u64) -> Option<ReverseChannel> {
-        let mut entries = self.lock();
-        let pos = entries.iter().position(|e| e.id == id)?;
-        let entry = entries.remove(pos)?;
+        let mut state = self.lock();
+        let pos = state.entries.iter().position(|e| e.id == id)?;
+        let entry = state.entries.remove(pos)?;
+        state.bound.remove(&id);
         if let Some(identity) = entry.identity {
-            if !entries.iter().any(|e| e.has_client(&identity.client_id)) {
+            state.presence_remove(&identity.client_id);
+            if !state.presence.contains_key(&identity.client_id) {
                 let _ = self
                     .transitions
                     .send(ClientTransition::Disconnected(identity));
@@ -322,7 +396,7 @@ impl PrimaryReverseRegistry {
         transport: ReverseTransport,
     ) -> PrimaryReverseGuard {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        self.inner.lock().push_back(Entry {
+        self.inner.lock().entries.push_back(Entry {
             id,
             channel,
             transport,
@@ -346,7 +420,7 @@ impl PrimaryReverseRegistry {
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     #[must_use]
     pub fn primary(&self) -> Option<ReverseChannel> {
-        resolve_entry(&self.inner.lock(), &ReverseTarget::Default)
+        resolve_entry(&self.inner.lock().entries, &ReverseTarget::Default)
             .ok()
             .map(|e| e.channel.clone())
     }
@@ -363,8 +437,8 @@ impl PrimaryReverseRegistry {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn resolve(&self, target: &ReverseTarget) -> Result<ResolvedClient, ReverseDispatchError> {
-        let entries = self.inner.lock();
-        let entry = resolve_entry(&entries, target)?;
+        let state = self.inner.lock();
+        let entry = resolve_entry(&state.entries, target)?;
         let identity = entry
             .identity
             .as_ref()
@@ -388,9 +462,9 @@ impl PrimaryReverseRegistry {
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     #[must_use]
     pub fn live_clients(&self) -> Vec<LiveClient> {
-        let entries = self.inner.lock();
+        let state = self.inner.lock();
         let mut clients: Vec<(LiveClient, u64)> = Vec::new();
-        for entry in entries.iter() {
+        for entry in &state.entries {
             let Some(identity) = &entry.identity else {
                 continue;
             };
@@ -440,6 +514,31 @@ impl PrimaryReverseRegistry {
         clients
     }
 
+    /// Presence of the given logical clients: one O(1) index lookup per
+    /// distinct id under a single lock acquisition, independent of how many
+    /// connections the daemon holds. Absent keys are offline. This is the
+    /// `browser.listTabs` `hostName` / `hostConnected` decoration source —
+    /// the index is maintained by registry mutations (rung 1 of the derived
+    /// field ladder), so a list of N tabs costs O(N) regardless of client
+    /// count.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    pub fn host_presence(&self, hosts: &HashSet<&ClientId>) -> HashMap<ClientId, ClientPresence> {
+        let state = self.inner.lock();
+        hosts
+            .iter()
+            .filter_map(|id| {
+                state
+                    .presence
+                    .get(*id)
+                    .map(|presence| ((*id).clone(), presence.clone()))
+            })
+            .collect()
+    }
+
     /// Number of live registrations, hello'd or not (test / diagnostic aid
     /// only).
     ///
@@ -448,7 +547,7 @@ impl PrimaryReverseRegistry {
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().len()
+        self.inner.lock().entries.len()
     }
 
     /// Claim the consumer end of the transition queue. Only the first call
@@ -514,7 +613,7 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
         params: Value,
         target: ReverseTarget,
     ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
-        let channel = resolve_entry(&self.inner.lock(), &target).map(|e| e.channel.clone());
+        let channel = resolve_entry(&self.inner.lock().entries, &target).map(|e| e.channel.clone());
         Box::pin(async move {
             let channel = channel?;
             let timeout = request_timeout(method, &params);
@@ -554,6 +653,34 @@ async fn publish_client_event(api: &dyn WorkspaceApi, transition: &ClientTransit
 }
 
 impl PrimaryReverseGuard {
+    /// The registry this guard is registered in (`None` for a detached guard),
+    /// so a connection-task fast-path can read presence
+    /// ([`PrimaryReverseRegistry::host_presence`]) without threading the
+    /// registry handle separately.
+    #[must_use]
+    pub fn registry(&self) -> Option<PrimaryReverseRegistry> {
+        self.registry.as_ref().map(|inner| PrimaryReverseRegistry {
+            inner: Arc::clone(inner),
+        })
+    }
+
+    /// The `clientId` this connection bound through a successful
+    /// `client.hello` ([`Self::bind`]), or `None` when it never said hello.
+    /// This is the identity the host-only `browser.*` registry methods gate
+    /// on — unlike the connection's `client_id` slot, which `drafts.*` also
+    /// mints lazily without a handshake. One O(1) index lookup under the
+    /// registry lock, independent of how many connections the daemon holds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    pub fn bound_client_id(&self) -> Option<ClientId> {
+        let inner = self.registry.as_ref()?;
+        let state = inner.lock();
+        state.bound.get(&self.id).cloned()
+    }
+
     /// Attach (or replace, on re-hello) this connection's logical identity
     /// after a successful `client.hello`. Queues the resulting logical-client
     /// transitions (a `Disconnected` for a previous `clientId` this
@@ -567,31 +694,32 @@ impl PrimaryReverseGuard {
         let Some(inner) = &self.registry else {
             return;
         };
-        let mut entries = inner.lock();
-        let Some(pos) = entries.iter().position(|e| e.id == self.id) else {
+        let mut state = inner.lock();
+        let Some(pos) = state.entries.iter().position(|e| e.id == self.id) else {
             return;
         };
-        entries[pos].hello_seq = inner.next_hello_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let previous = entries[pos].identity.replace(identity.clone());
+        state.entries[pos].hello_seq = inner.next_hello_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let previous = state.entries[pos].identity.replace(identity.clone());
+        state.bound.insert(self.id, identity.client_id.clone());
         let same_client = previous
             .as_ref()
             .is_some_and(|p| p.client_id == identity.client_id);
         if same_client {
+            // Re-hello under the same id: only the display fields move.
+            state.presence_refresh_name(&identity.client_id);
             return;
         }
-        let live_elsewhere = |client_id: &ClientId| {
-            entries
-                .iter()
-                .any(|e| e.id != self.id && e.has_client(client_id))
-        };
         if let Some(previous) = previous {
-            if !live_elsewhere(&previous.client_id) {
+            state.presence_remove(&previous.client_id);
+            if !state.presence.contains_key(&previous.client_id) {
                 let _ = inner
                     .transitions
                     .send(ClientTransition::Disconnected(previous));
             }
         }
-        if !live_elsewhere(&identity.client_id) {
+        let first_connection = !state.presence.contains_key(&identity.client_id);
+        state.presence_add(&identity);
+        if first_connection {
             let _ = inner
                 .transitions
                 .send(ClientTransition::Connected(identity));

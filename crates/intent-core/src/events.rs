@@ -464,6 +464,21 @@ pub const SKILLS_CHANGED: &str = "skills:changed";
 // `{ workspaceId }`.
 pub const SPECIALISTS_CHANGED: &str = "specialists:changed";
 
+// Daemon-owned browser tab registry events (REV-2, intent-hq/intent#461).
+// Workspace-scoped; the self-sufficient payload is `{ tab }` for
+// `browser:tab-opened` / `browser:tab-closed` and `{ tab, changes }` for
+// `browser:tab-updated`, where `changes` is the field-wise diff of the
+// host-reported wire fields (url / requestedUrl / title / owner / visibility /
+// emulatedSize). Emitted from the host-reporting RPCs (`browser.upsertTab`,
+// `browser.removeTab`, `browser.syncTabs`); a report that changes nothing
+// emits nothing. A `tabId` is bound to the workspace that created it: a
+// report naming another `workspaceId` is rejected (-32602) rather than moving
+// the row, since a move would strand the old workspace's subscribers with a
+// ghost tab.
+pub const BROWSER_TAB_OPENED: &str = "browser:tab-opened";
+pub const BROWSER_TAB_UPDATED: &str = "browser:tab-updated";
+pub const BROWSER_TAB_CLOSED: &str = "browser:tab-closed";
+
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
 pub const ALL_EVENT_TYPES: &[&str] = &[
@@ -606,6 +621,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     APP_WORKSPACE_OPEN,
     SKILLS_CHANGED,
     SPECIALISTS_CHANGED,
+    BROWSER_TAB_OPENED,
+    BROWSER_TAB_UPDATED,
+    BROWSER_TAB_CLOSED,
 ];
 
 /// True iff `event_type` is part of the canonical taxonomy.

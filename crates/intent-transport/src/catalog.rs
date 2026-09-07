@@ -341,15 +341,21 @@ pub(crate) const METHOD_ALIASES: &[(&str, &str)] =
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 39 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 49 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
 /// `pairing.rs`, `server.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
 /// performance or to access per-connection state (e.g., `client_id` binding for
-/// drafts).
+/// drafts and the host-only `browser.*Tab*` registry reports).
 #[cfg(test)]
 pub(crate) const FASTPATH_METHODS: &[&str] = &[
+    "browser.closeTab",
     "browser.exec",
+    "browser.listTabs",
+    "browser.navigateTab",
+    "browser.removeTab",
+    "browser.syncTabs",
+    "browser.upsertTab",
     "client.hello",
     "drafts.clear",
     "drafts.get",

@@ -395,20 +395,52 @@
 //! router methods — 303 router methods, 43 fast-path, two aliases: 348
 //! client-callable names.
 //!
-//! Version 9.10 is an additive minor bump over 9.9 that adds the seven
+//! Version 9.10 adds the daemon-owned browser tab registry (REV-2 Model 2 & 6).
+//! Four additive fast-path methods: `browser.listTabs` (any client; entries
+//! decorated with `hostName` / `hostConnected` from the live reverse
+//! registry) and the host-only reports `browser.upsertTab`,
+//! `browser.removeTab`, and `browser.syncTabs`, which are keyed by the
+//! connection's `client.hello` identity (never a wire parameter) and answer
+//! `-32602` on an un-hello'd connection or when a report would move a known
+//! `tabId` to another workspace. Three additive workspace events:
+//! `browser:tab-opened`, `browser:tab-updated`, `browser:tab-closed`. The
+//! catalog contains 303 router methods, 47 fast-path methods, and two
+//! aliases: 352 client-callable names. The five reverse methods are
+//! counted separately.
+//!
+//! Version 9.11 routes agent browser traffic through the registry (REV-2
+//! Model 3–6 & 10). Agent-initiated `browser.exec` dispatches to the
+//! workspace's **driving client** — the pin, else the host of the
+//! workspace's claimed tabs, else the first-connected eligible client — and
+//! answers `listTabs` itself from the registry (all hosts aggregated,
+//! `hostClientId` / `hostName` / `hostConnected` per entry); a `claimTab`
+//! executed on the driving client re-homes the tab's row there
+//! (`browser:tab-updated { changes: { hostClientId, ownerAgentId } }`), and
+//! `workspace.setBrowserClient` moves every claimed tab to the new pin. Two
+//! additive fast-path methods (any client): `browser.navigateTab { tabId,
+//! url }` routes a navigation to the tab's driving client / host and echoes
+//! the action envelope; `browser.closeTab { tabId, force? }` routes the
+//! close, or with `force` (or an offline target) tombstones the row
+//! daemon-side and publishes `browser:tab-closed`. Unknown `tabId` is
+//! `-32602`; an offline target is `-32603` ("browser client … for this
+//! workspace is not connected"). The catalog contains 303 router methods,
+//! 49 fast-path methods, and two aliases: 354 client-callable names. The
+//! five reverse methods are counted separately.
+//!
+//! Version 9.12 is an additive minor bump over 9.11 that adds the seven
 //! daemon-global `workspaceDraft.*` router methods (§5.1.1): durable CRUD,
 //! optimistic-revision update, idempotent promotion through
 //! `workspace.create`, delivery reconciliation, and delete. It also adds the
 //! `workspace-draft:*` event family (§6.5) and the optional persisted
 //! `Workspace.setupResult` projection. The catalog grows by seven router
-//! methods — 310 router methods, 43 fast-path, two aliases: 355
+//! methods — 310 router methods, 49 fast-path, two aliases: 361
 //! client-callable names.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.10";
+pub const PROTOCOL_VERSION: &str = "9.12";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

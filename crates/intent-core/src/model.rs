@@ -4548,6 +4548,221 @@ pub struct Draft {
     pub updated_at: String,
 }
 
+/// Visibility of a daemon-owned browser tab (REV-2). `hidden` is an
+/// agent-owned-tab state only; user tabs are always `visible`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserTabVisibility {
+    #[default]
+    Visible,
+    Hidden,
+}
+
+impl BrowserTabVisibility {
+    /// Stored / wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BrowserTabVisibility::Visible => "visible",
+            BrowserTabVisibility::Hidden => "hidden",
+        }
+    }
+
+    /// Parse the stored spelling; unknown values fall back to `Visible`.
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "hidden" => BrowserTabVisibility::Hidden,
+            _ => BrowserTabVisibility::Visible,
+        }
+    }
+}
+
+/// Emulated viewport of a browser tab (`{ width, height }`, CSS pixels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTabSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Daemon-owned logical browser tab (REV-2 Model 2). Persisted to the
+/// `browser_tab` table; the daemon is the shared source of truth for every
+/// connected client. `host_client_id` is the logical client whose process owns
+/// the live webview — CDP-backed actions run there and it reports canonical
+/// `url` / `title`; every other client is a viewer. `tab_id` is minted by the
+/// host and unique per daemon. Panel geometry is client-local and never
+/// stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTab {
+    pub tab_id: String,
+    pub workspace_id: WorkspaceId,
+    pub host_client_id: ClientId,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_name: Option<String>,
+    #[serde(default)]
+    pub visibility: BrowserTabVisibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emulated_size: Option<BrowserTabSize>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl BrowserTab {
+    /// Field-wise diff against a host report: every wire field whose value
+    /// differs from the stored row, keyed by wire name and carrying the
+    /// reported value (`null` when cleared). Empty when the report matches —
+    /// the "nothing changed ⇒ no event" test.
+    #[must_use]
+    pub fn changes_from(
+        &self,
+        input: &BrowserTabInput,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut changes = serde_json::Map::new();
+        if self.workspace_id != input.workspace_id {
+            changes.insert(
+                "workspaceId".to_string(),
+                serde_json::Value::String(input.workspace_id.0.clone()),
+            );
+        }
+        if self.url != input.url {
+            changes.insert(
+                "url".to_string(),
+                serde_json::Value::String(input.url.clone()),
+            );
+        }
+        if self.requested_url != input.requested_url {
+            changes.insert(
+                "requestedUrl".to_string(),
+                serde_json::json!(input.requested_url),
+            );
+        }
+        if self.title != input.title {
+            changes.insert("title".to_string(), serde_json::json!(input.title));
+        }
+        if self.owner_agent_id != input.owner_agent_id {
+            changes.insert(
+                "ownerAgentId".to_string(),
+                serde_json::json!(input.owner_agent_id),
+            );
+        }
+        if self.owner_agent_name != input.owner_agent_name {
+            changes.insert(
+                "ownerAgentName".to_string(),
+                serde_json::json!(input.owner_agent_name),
+            );
+        }
+        if self.visibility != input.visibility {
+            changes.insert(
+                "visibility".to_string(),
+                serde_json::json!(input.visibility),
+            );
+        }
+        if self.emulated_size != input.emulated_size {
+            changes.insert(
+                "emulatedSize".to_string(),
+                serde_json::json!(input.emulated_size),
+            );
+        }
+        changes
+    }
+
+    /// Overwrite the host-reported fields from `input`, leaving the
+    /// daemon-owned host / timestamps untouched.
+    pub fn apply_input(&mut self, input: BrowserTabInput) {
+        let BrowserTabInput {
+            tab_id: _,
+            workspace_id,
+            url,
+            requested_url,
+            title,
+            owner_agent_id,
+            owner_agent_name,
+            visibility,
+            emulated_size,
+        } = input;
+        self.workspace_id = workspace_id;
+        self.url = url;
+        self.requested_url = requested_url;
+        self.title = title;
+        self.owner_agent_id = owner_agent_id;
+        self.owner_agent_name = owner_agent_name;
+        self.visibility = visibility;
+        self.emulated_size = emulated_size;
+    }
+}
+
+/// Host-reported tab state: a [`BrowserTab`] minus the daemon-owned fields
+/// (host and timestamps). The `tab` param of `browser.upsertTab` (with
+/// `workspaceId` taken from the envelope) and each entry of the
+/// `browser.syncTabs` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTabInput {
+    pub tab_id: String,
+    pub workspace_id: WorkspaceId,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_name: Option<String>,
+    #[serde(default)]
+    pub visibility: BrowserTabVisibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emulated_size: Option<BrowserTabSize>,
+}
+
+/// Outcome of a host-reported `browser.upsertTab`: the persisted row plus
+/// how it changed, so the caller can emit `browser:tab-opened` (new row) or
+/// `browser:tab-updated { changes }` (field-wise diff of the wire fields) — or
+/// nothing when the report matched the stored state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserTabUpsertOutcome {
+    Opened(BrowserTab),
+    Updated {
+        tab: BrowserTab,
+        changes: serde_json::Value,
+    },
+    Unchanged(BrowserTab),
+}
+
+impl BrowserTabUpsertOutcome {
+    /// The persisted row regardless of outcome.
+    #[must_use]
+    pub fn tab(&self) -> &BrowserTab {
+        match self {
+            BrowserTabUpsertOutcome::Opened(tab)
+            | BrowserTabUpsertOutcome::Updated { tab, .. }
+            | BrowserTabUpsertOutcome::Unchanged(tab) => tab,
+        }
+    }
+}
+
+/// Result of a host's `browser.syncTabs` reconciliation (REV-2 Model 6).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BrowserTabSyncResult {
+    /// Tab ids the host must drop: closed daemon-side while it was offline,
+    /// or hosted by another client.
+    pub drop: Vec<String>,
+    /// Rows created by the snapshot (⇒ `browser:tab-opened`).
+    pub opened: Vec<BrowserTab>,
+    /// Rows whose wire fields changed (⇒ `browser:tab-updated`).
+    pub updated: Vec<(BrowserTab, serde_json::Value)>,
+    /// Rows of this host absent from the snapshot (⇒ `browser:tab-closed`).
+    pub closed: Vec<BrowserTab>,
+}
+
 /// A persistently-registered repository (parity with the TS `KnownRepo`). Backs
 /// the `repo.list` method that populates the Create-Workspace picker. Timestamps
 /// are ISO-8601 strings; `owner` is omitted from the wire when absent.
