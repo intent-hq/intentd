@@ -23,6 +23,14 @@
 //! logical `clientId` from `client.hello` (§5.17) — never a wire parameter —
 //! which is why they are transport interceptors like `drafts.*`. A connection
 //! that never said hello cannot host tabs (`-32602`).
+//!
+//! REV-2 routing (Model 3–6, protocol 9.11) adds the tab-addressed
+//! `browser.navigateTab { tabId, url }` and `browser.closeTab { tabId,
+//! force? }` (any client): the daemon looks the tab up in the registry
+//! (`-32602` when unknown) and routes the request to the client that must
+//! perform it — the workspace's driving client for a claimed tab, the
+//! physical host for an unclaimed one — as a reverse `browser.exec`; an
+//! offline target is `-32603` unless `force` tombstones the row daemon-side.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -47,6 +55,10 @@ pub(crate) enum BrowserMethod {
     RemoveTab,
     /// `browser.syncTabs` — host-only full-snapshot reconciliation.
     SyncTabs,
+    /// `browser.navigateTab` — routed navigation of one registered tab.
+    NavigateTab,
+    /// `browser.closeTab` — routed (or forced daemon-side) close of one tab.
+    CloseTab,
 }
 
 impl BrowserMethod {
@@ -102,6 +114,8 @@ pub(crate) fn classify(value: &Value) -> Option<BrowserRequest> {
         "browser.upsertTab" => BrowserMethod::UpsertTab,
         "browser.removeTab" => BrowserMethod::RemoveTab,
         "browser.syncTabs" => BrowserMethod::SyncTabs,
+        "browser.navigateTab" => BrowserMethod::NavigateTab,
+        "browser.closeTab" => BrowserMethod::CloseTab,
         _ => return None,
     };
     let params = obj
@@ -142,6 +156,8 @@ pub(crate) async fn handle(
         BrowserMethod::UpsertTab => frame_result(&id_echo, upsert_tab(&params, &tabs).await),
         BrowserMethod::RemoveTab => frame_result(&id_echo, remove_tab(&params, &tabs).await),
         BrowserMethod::SyncTabs => frame_result(&id_echo, sync_tabs(&params, &tabs).await),
+        BrowserMethod::NavigateTab => frame_result(&id_echo, navigate_tab(&params, &tabs).await),
+        BrowserMethod::CloseTab => frame_result(&id_echo, close_tab(&params, &tabs).await),
     };
     if !id_present {
         return None;
@@ -310,6 +326,37 @@ async fn sync_tabs(
         .await
         .map_err(|e| domain_err(&e))?;
     Ok(json!({ "drop": drop }))
+}
+
+/// `browser.navigateTab { tabId, url }` (any client) → the routed
+/// `navigate` action's result envelope.
+async fn navigate_tab(
+    params: &Map<String, Value>,
+    tabs: &TabContext<'_>,
+) -> Result<Value, (i32, String)> {
+    let tab_id = required_str(params, "tabId")?;
+    let url = required_str(params, "url")?;
+    tabs.api
+        .browser_navigate_tab(tab_id.to_string(), url.to_string())
+        .await
+        .map_err(|e| domain_err(&e))
+}
+
+/// `browser.closeTab { tabId, force? }` (any client) → `{ ok: true }`.
+async fn close_tab(
+    params: &Map<String, Value>,
+    tabs: &TabContext<'_>,
+) -> Result<Value, (i32, String)> {
+    let tab_id = required_str(params, "tabId")?;
+    let force = match params.get("force") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(invalid("Invalid parameter: force must be a boolean")),
+    };
+    tabs.api
+        .browser_close_tab(tab_id.to_string(), force)
+        .await
+        .map_err(|e| domain_err(&e))
 }
 
 /// Why a [`exec`] call could not be satisfied. `code()` maps each to a

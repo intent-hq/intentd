@@ -4,14 +4,17 @@
 //! on the connected frontend. The binding validates the actions envelope,
 //! forwards it via the [`WorkspaceApi::browser_exec`] seam (the concrete impl
 //! wraps a per-connection reverse channel — see `intent-transport::browser`),
-//! and echoes the FE's reshaped result. `browser.docs` is offline: it returns
-//! the ported `BROWSER_DOCS` topic text verbatim, matching the reference
-//! `BrowserDocsTool` in `browser-tools.ts`.
+//! and echoes the FE's reshaped result. `browser.listTabs` is the registry
+//! read (REV-2 Model 5): a one-action `listTabs` batch through the same seam,
+//! which the daemon answers from its tab registry — every host of the
+//! workspace aggregated — unwrapped to the bare tab array. `browser.docs` is
+//! offline: it returns the ported `BROWSER_DOCS` topic text verbatim,
+//! matching the reference `BrowserDocsTool` in `browser-tools.ts`.
 
 use std::sync::Arc;
 
 use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::{map_err, req_str};
 
@@ -26,6 +29,7 @@ pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.browser = {
         exec: (actions, tabId) => host({ method: 'browser.exec', args: { actions, tabId } }),
+        listTabs: (scope) => host({ method: 'browser.listTabs', args: { scope } }),
         docs: (topic) => host({ method: 'browser.docs', args: { topic } }),
     };
 ";
@@ -39,6 +43,7 @@ pub(crate) async fn dispatch(
 ) -> Result<Value, String> {
     match method {
         "exec" => exec(api, ws, caller_agent_id, args).await,
+        "listTabs" => list_tabs(api, ws, caller_agent_id, args).await,
         "docs" => docs(args),
         other => Err(format!("host: unknown method `browser.{other}`")),
     }
@@ -67,6 +72,34 @@ async fn exec(
     api.browser_exec(ws.clone(), actions, tab_id, caller_agent_id.cloned())
         .await
         .map_err(map_err)
+}
+
+async fn list_tabs(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let mut action = json!({ "action": "listTabs" });
+    match args.get("scope") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(scope)) => {
+            action["scope"] = Value::String(scope.clone());
+        }
+        Some(_) => return Err("scope must be \"mine\", \"unclaimed\" or \"all\"".to_string()),
+    }
+    let envelope = api
+        .browser_exec(ws.clone(), vec![action], None, caller_agent_id.cloned())
+        .await
+        .map_err(map_err)?;
+    if envelope["success"] == true {
+        Ok(envelope["result"].clone())
+    } else {
+        Err(envelope["error"]
+            .as_str()
+            .unwrap_or("browser.listTabs failed")
+            .to_string())
+    }
 }
 
 fn docs(args: &Value) -> Result<Value, String> {

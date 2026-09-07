@@ -5937,6 +5937,46 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `browser.navigateTab { tabId, url }` (any client, REV-2 Model 4):
+    /// route a navigation request to the client that must perform it — the
+    /// workspace's driving client for a claimed tab, the physical host for an
+    /// unclaimed one — as a reverse `browser.exec { action: "navigate" }`,
+    /// and echo that action's result envelope. Unknown tab ⇒
+    /// `Error::InvalidParams`; target offline ⇒ `Error::Internal`.
+    fn browser_navigate_tab(
+        &self,
+        tab_id: String,
+        url: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (tab_id, url);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_navigate_tab not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `browser.closeTab { tabId, force? }` (any client, REV-2 Model 6):
+    /// route the close to the tab's routing target (as
+    /// `browser_navigate_tab`); the host's own report then removes the row.
+    /// With `force`, or when the target is offline, the row is tombstoned
+    /// daemon-side and `browser:tab-closed` published (the host is told to
+    /// drop it on its next `browser.syncTabs`). Unknown tab ⇒
+    /// `Error::InvalidParams`; target offline without `force` ⇒
+    /// `Error::Internal`. Returns `{ ok: true }`.
+    fn browser_close_tab(
+        &self,
+        tab_id: String,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (tab_id, force);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_close_tab not implemented".to_string(),
+            ))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // file.* — workspace-scoped filesystem access (PROTOCOL §5.10). Every path
     // is validated within the resolved workspace root; access-denied and other

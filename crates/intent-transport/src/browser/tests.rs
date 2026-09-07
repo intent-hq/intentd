@@ -324,6 +324,40 @@ impl WorkspaceApi for MemTabs {
             .collect();
         Box::pin(async move { Ok(drop) })
     }
+
+    fn browser_navigate_tab(&self, tab_id: String, url: String) -> BoxFuture<'_, Result<Value>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("navigate:{tab_id}:{url}"));
+        let known = self.tabs.lock().unwrap().contains_key(&tab_id);
+        Box::pin(async move {
+            if known {
+                Ok(json!({ "action": "navigate", "success": true, "result": { "url": url } }))
+            } else {
+                Err(Error::InvalidParams(format!(
+                    "browser.navigateTab: tab not found: {tab_id}"
+                )))
+            }
+        })
+    }
+
+    fn browser_close_tab(&self, tab_id: String, force: bool) -> BoxFuture<'_, Result<Value>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("close:{tab_id}:{force}"));
+        let known = self.tabs.lock().unwrap().contains_key(&tab_id);
+        Box::pin(async move {
+            if known {
+                Ok(json!({ "ok": true }))
+            } else {
+                Err(Error::InvalidParams(format!(
+                    "browser.closeTab: tab not found: {tab_id}"
+                )))
+            }
+        })
+    }
 }
 
 fn client(id: &str) -> ClientId {
@@ -377,6 +411,8 @@ async fn classify_recognizes_registry_methods() {
         ("browser.upsertTab", "UpsertTab"),
         ("browser.removeTab", "RemoveTab"),
         ("browser.syncTabs", "SyncTabs"),
+        ("browser.navigateTab", "NavigateTab"),
+        ("browser.closeTab", "CloseTab"),
     ] {
         let req = classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": method }))
             .unwrap_or_else(|| panic!("{method} is classified"));
@@ -386,6 +422,8 @@ async fn classify_recognizes_registry_methods() {
             BrowserMethod::UpsertTab => "UpsertTab",
             BrowserMethod::RemoveTab => "RemoveTab",
             BrowserMethod::SyncTabs => "SyncTabs",
+            BrowserMethod::NavigateTab => "NavigateTab",
+            BrowserMethod::CloseTab => "CloseTab",
         };
         assert_eq!(got, expected, "{method}");
     }
@@ -399,11 +437,104 @@ fn only_host_reports_need_the_bound_identity() {
         ("browser.upsertTab", true),
         ("browser.removeTab", true),
         ("browser.syncTabs", true),
+        ("browser.navigateTab", false),
+        ("browser.closeTab", false),
     ] {
         let req = classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": method }))
             .unwrap_or_else(|| panic!("{method} is classified"));
         assert_eq!(req.method.reports_as_host(), expected, "{method}");
     }
+}
+
+#[tokio::test]
+async fn navigate_tab_routes_through_the_service_and_echoes_the_envelope() {
+    let api = MemTabs::with_tab("tab-1", "client-a");
+    let resp = call(
+        "browser.navigateTab",
+        json!({ "tabId": "tab-1", "url": "https://b.test/" }),
+        &api,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(resp["result"]["action"], "navigate");
+    assert_eq!(resp["result"]["success"], true);
+    assert_eq!(
+        api.calls.lock().unwrap().as_slice(),
+        ["navigate:tab-1:https://b.test/"]
+    );
+}
+
+#[tokio::test]
+async fn navigate_tab_validates_params_before_the_service() {
+    let api = MemTabs::with_tab("tab-1", "client-a");
+    for params in [
+        json!({ "url": "https://b.test/" }),
+        json!({ "tabId": "tab-1" }),
+        json!({ "tabId": "", "url": "https://b.test/" }),
+    ] {
+        let resp = call("browser.navigateTab", params.clone(), &api, None, None).await;
+        assert_eq!(resp["error"]["code"], -32602, "{params}");
+    }
+    assert!(api.calls.lock().unwrap().is_empty());
+    let resp = call(
+        "browser.navigateTab",
+        json!({ "tabId": "nope", "url": "https://b.test/" }),
+        &api,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("tab not found: nope"));
+}
+
+#[tokio::test]
+async fn close_tab_parses_force_and_answers_ok() {
+    let api = MemTabs::with_tab("tab-1", "client-a");
+    let resp = call(
+        "browser.closeTab",
+        json!({ "tabId": "tab-1" }),
+        &api,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(resp["result"], json!({ "ok": true }));
+    let resp = call(
+        "browser.closeTab",
+        json!({ "tabId": "tab-1", "force": true }),
+        &api,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(resp["result"], json!({ "ok": true }));
+    assert_eq!(
+        api.calls.lock().unwrap().as_slice(),
+        ["close:tab-1:false", "close:tab-1:true"]
+    );
+    let resp = call(
+        "browser.closeTab",
+        json!({ "tabId": "tab-1", "force": "yes" }),
+        &api,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    let resp = call(
+        "browser.closeTab",
+        json!({ "tabId": "nope" }),
+        &api,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
 }
 
 #[tokio::test]
