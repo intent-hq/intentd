@@ -16974,11 +16974,20 @@ impl WorkspaceApi for Services {
                                     )
                                     .await;
                                 }
-                                if input.repository_owner.is_none() {
-                                    input.repository_owner = Some(owner);
-                                }
-                                if input.repository_name.is_none() {
-                                    input.repository_name = Some(name.clone());
+                                // Persisted owner/name carry GitHub identity
+                                // (the `crossWorkspace.*` sibling predicate
+                                // trusts them), so only a strict `github.com`
+                                // URL seeds them; the host-agnostic pair above
+                                // keys the cache slot only.
+                                if let Some((gh_owner, gh_name)) =
+                                    Self::parse_github_owner_repo(url)
+                                {
+                                    if input.repository_owner.is_none() {
+                                        input.repository_owner = Some(gh_owner);
+                                    }
+                                    if input.repository_name.is_none() {
+                                        input.repository_name = Some(gh_name);
+                                    }
                                 }
                                 // The workspace checkout IS the repository
                                 // (self-contained; the cache can be deleted
@@ -17064,7 +17073,10 @@ impl WorkspaceApi for Services {
                             })?;
                             input.repository_path =
                                 Some(target.to_string_lossy().to_string());
-                            if let Some((owner, name)) = clone_ops::parse_owner_repo(url) {
+                            // Strict `github.com` host only: persisted owner/name
+                            // are trusted as GitHub identity by the
+                            // `crossWorkspace.*` sibling predicate.
+                            if let Some((owner, name)) = Self::parse_github_owner_repo(url) {
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
                                 }
