@@ -28838,9 +28838,10 @@ impl WorkspaceApi for Services {
     /// `listTabs` is answered by the daemon from the registry — all hosts
     /// aggregated, no reverse call — so a `listTabs` batch never mixes with
     /// FE-executed actions (`-32602`). After a successful dispatch, a
-    /// `claimTab` that succeeded on a tab hosted elsewhere re-homes the row
-    /// to the driving client (`browser:tab-updated { changes: {
-    /// hostClientId, ownerAgentId } }`).
+    /// `claimTab` that succeeded re-homes the row to the driving client as
+    /// re-resolved at commit time (`browser:tab-updated { changes: {
+    /// hostClientId, ownerAgentId } }`, see
+    /// [`Self::browser_tab_claim_migrate`]).
     /// Attribution fields (`workspaceId`, `agentId`,
     /// `tabId`) are threaded into the forwarded params so the FE sees the
     /// same envelope shape the client-triggered path already emits. Result
@@ -28928,15 +28929,15 @@ impl WorkspaceApi for Services {
                 ));
             };
             let target = self.driving_client_target(&workspace_id).await?;
-            // Claims re-home their tab to whichever client executed them, so
-            // resolve the driving client's identity up front.
+            // Claims re-home their tab after the dispatch; record which
+            // client executed them (the commit re-validates the host).
             let claims: Vec<String> = actions
                 .iter()
                 .filter(|a| a["action"] == "claimTab")
                 .filter_map(|a| a["tabId"].as_str().or(tab_id.as_deref()))
                 .map(str::to_string)
                 .collect();
-            let driving_client = if claims.is_empty() {
+            let executed_on = if claims.is_empty() {
                 None
             } else {
                 dispatch.resolve(&target).ok().map(|r| r.client_id)
@@ -28964,9 +28965,9 @@ impl WorkspaceApi for Services {
                     return Err(Error::Internal(format!("browser.exec: {message}")));
                 }
             };
-            if let Some(driving_client) = driving_client {
+            if let Some(executed_on) = executed_on {
                 for tab_id in browser_ops::successful_claims(&response, &claims) {
-                    self.browser_tab_claim_migrate(&tab_id, &driving_client, agent_id.as_ref())
+                    self.browser_tab_claim_migrate(&tab_id, &executed_on, agent_id.as_ref())
                         .await?;
                 }
             }

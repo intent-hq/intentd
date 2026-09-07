@@ -198,36 +198,70 @@ impl Services {
         Ok(json!({ "action": LIST_TABS_ACTION, "success": true, "result": result }))
     }
 
-    /// Claim migration (REV-2 Model 5): after the driving client `new_host`
-    /// successfully executed an agent's `claimTab` on `tab_id`, re-home the
-    /// row there with `agent_id` as owner and publish `browser:tab-updated {
-    /// changes: { hostClientId, ownerAgentId } }`. A tab already hosted by
-    /// the driving client is left to the host's own report (no event).
+    /// Claim migration (REV-2 Model 5): after `executed_on` — the driving
+    /// client when the dispatch started — successfully executed an agent's
+    /// `claimTab` on `tab_id`, re-home the row to the workspace's driving
+    /// client with `agent_id` as owner and publish `browser:tab-updated {
+    /// changes: { hostClientId, ownerAgentId } }`. A tab already hosted
+    /// there only records the owner (`changes: { ownerAgentId }`); a row
+    /// already in the target state is a no-op with no event.
+    ///
+    /// The host is validated at **commit** time, under the tab gate: the
+    /// driving client is re-resolved and a claim whose dispatch overlapped
+    /// a `workspace.setBrowserClient` lands on the *new* driving client
+    /// (one host per workspace, Model 3 & 10) rather than on the client
+    /// that happened to execute it. Either interleaving with the pin
+    /// setter's own claimed-tab migration converges on the new pin.
     pub(crate) async fn browser_tab_claim_migrate(
         &self,
         tab_id: &str,
-        new_host: &ClientId,
+        executed_on: &ClientId,
         agent_id: Option<&AgentId>,
     ) -> Result<()> {
         let _gate = self.browser_tab_gate.lock().await;
         let Some(current) = self.store.get_browser_tab(tab_id).await? else {
             return Ok(());
         };
-        if current.host_client_id == *new_host {
-            return Ok(());
-        }
+        let new_host = self
+            .claim_commit_host(&current.workspace_id, executed_on)
+            .await?;
         if let Some((tab, changes)) = self
             .store
-            .reassign_browser_tab_host(tab_id, new_host, agent_id)
+            .reassign_browser_tab_host(tab_id, &new_host, agent_id)
             .await?
         {
             publish_event(
                 self.event_bus.as_ref(),
-                tab_event(BROWSER_TAB_UPDATED, new_host, &tab, Some(&changes)),
+                tab_event(BROWSER_TAB_UPDATED, &new_host, &tab, Some(&changes)),
             )
             .await;
         }
         Ok(())
+    }
+
+    /// The client a confirmed claim commits as host: the workspace's driving
+    /// client as of now — a pin or claimed-tab host even while offline (the
+    /// pin setter re-homes to an offline pin the same way), the resolved
+    /// default otherwise — falling back to the client that executed the
+    /// claim only when nothing else is known.
+    async fn claim_commit_host(
+        &self,
+        workspace_id: &WorkspaceId,
+        executed_on: &ClientId,
+    ) -> Result<ClientId> {
+        let target = self.driving_client_target(workspace_id).await?;
+        let resolved = self
+            .reverse_dispatch
+            .as_ref()
+            .and_then(|d| d.resolve(&target).ok())
+            .map(|r| r.client_id);
+        Ok(match (target, resolved) {
+            (_, Some(client_id)) => client_id,
+            (ReverseTarget::Pinned(client_id) | ReverseTarget::Client(client_id), None) => {
+                client_id
+            }
+            (ReverseTarget::Default, None) => executed_on.clone(),
+        })
     }
 
     /// Driving-client switch (REV-2 Model 10): move every claimed tab of

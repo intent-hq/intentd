@@ -31565,7 +31565,8 @@ mod browser_routing {
             evs[0]["data"]["changes"],
             json!({ "hostClientId": "desktop-a", "ownerAgentId": "agent-1" })
         );
-        // Re-homing the same tab to its current host is a no-op (no event).
+        // Re-homing the same tab to its current host and owner is a no-op
+        // (no event).
         svc.browser_tab_claim_migrate(
             "user-tab",
             &ClientId::from_string("desktop-a"),
@@ -31580,6 +31581,39 @@ mod browser_routing {
             .unwrap()
             .iter()
             .all(|t| t.host_client_id == ClientId::from_string("desktop-a")));
+
+        // A claim of a tab the driving client already hosts records the
+        // owner immediately (no wait for the host's own report) with
+        // `changes: { ownerAgentId }` only.
+        register_tab(&svc, &ws, "local-tab", "desktop-a", None).await;
+        let events = tokio::spawn({
+            let bus = bus.clone();
+            let ws = ws.clone();
+            async move { tab_events(&bus, &ws, 1).await }
+        });
+        tokio::task::yield_now().await;
+        svc.browser_tab_claim_migrate(
+            "local-tab",
+            &ClientId::from_string("desktop-a"),
+            Some(&agent("agent-1")),
+        )
+        .await
+        .expect("same-host claim");
+        let row = svc
+            .store
+            .get_browser_tab("local-tab")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.host_client_id, ClientId::from_string("desktop-a"));
+        assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
+        let evs = events.await.unwrap();
+        assert_eq!(evs[0]["type"], "browser:tab-updated");
+        assert_eq!(evs[0]["data"]["tab"]["tabId"], "local-tab");
+        assert_eq!(
+            evs[0]["data"]["changes"],
+            json!({ "ownerAgentId": "agent-1" })
+        );
     }
 
     /// Model 5 (end to end through `browser_exec`): the FE's real success
@@ -31689,6 +31723,190 @@ mod browser_routing {
         assert_eq!(
             dispatch.0.lock().unwrap()[1],
             ReverseTarget::Client(ClientId::from_string("desktop-a"))
+        );
+    }
+
+    /// Model 3 & 10 (one host per workspace): a claim whose dispatch to the
+    /// pinned client is still in flight when `workspace.setBrowserClient`
+    /// switches the pin commits against the driving client *at commit
+    /// time* — the claimed rows land on the new pin, never on the client
+    /// that executed the claim — and the tab events stay gated.
+    #[tokio::test]
+    async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client() {
+        use std::sync::{Arc, Mutex};
+
+        use intent_core::{AgentReverseDispatch, BoxFuture, ResolvedClient, ReverseDispatchError};
+        use tokio::sync::Notify;
+
+        struct HeldClaim {
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+            targets: Mutex<Vec<ReverseTarget>>,
+        }
+        impl AgentReverseDispatch for HeldClaim {
+            fn is_connected(&self) -> bool {
+                true
+            }
+            fn resolve(
+                &self,
+                target: &ReverseTarget,
+            ) -> Result<ResolvedClient, ReverseDispatchError> {
+                Ok(ResolvedClient {
+                    client_id: match target {
+                        ReverseTarget::Default => ClientId::from_string("desktop-a"),
+                        ReverseTarget::Client(c) | ReverseTarget::Pinned(c) => c.clone(),
+                    },
+                    name: None,
+                })
+            }
+            fn dispatch<'a>(
+                &'a self,
+                _method: &'a str,
+                params: Value,
+                target: ReverseTarget,
+            ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
+                self.targets.lock().unwrap().push(target);
+                let results: Vec<Value> = params["actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|a| {
+                        json!({
+                            "action": "claimTab", "success": true,
+                            "result": { "tabId": a["tabId"], "ownerAgentId": "agent-1", "width": 1024, "height": 800 }
+                        })
+                    })
+                    .collect();
+                Box::pin(async move {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                    Ok(json!({ "success": true, "results": results }))
+                })
+            }
+        }
+
+        let tmp = super::TempDb::new();
+        let root = super::WorkspacesRoot::new();
+        let store = intent_store::Store::open(&tmp.path).await.unwrap();
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&super::workspace(&ws))
+            .await
+            .unwrap();
+        for (id, name) in [("desktop-a", "Desktop A"), ("desktop-b", "Desktop B")] {
+            store
+                .upsert_client(
+                    &ClientId::from_string(id),
+                    Some(name),
+                    Some(&json!({ "browserExec": true })),
+                    &intent_core::ClientHostInfo::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let bus = EventBus::new(store.clone());
+        let dispatch = Arc::new(HeldClaim {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            targets: Mutex::new(Vec::new()),
+        });
+        let svc = Arc::new(
+            Services::new(store)
+                .with_workspaces_root(root.path().to_path_buf())
+                .with_event_bus(bus.clone())
+                .with_reverse_dispatch(dispatch.clone()),
+        );
+        // Unclaimed tabs on both clients; the pin is desktop-a.
+        register_tab(&svc, &ws, "tab-on-a", "desktop-a", None).await;
+        register_tab(&svc, &ws, "tab-on-b", "desktop-b", None).await;
+        svc.set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-a")))
+            .await
+            .expect("pin a");
+
+        let events = tokio::spawn({
+            let bus = bus.clone();
+            let ws = ws.clone();
+            async move { tab_events(&bus, &ws, 2).await }
+        });
+        tokio::task::yield_now().await;
+
+        // The claim dispatches to the pinned client and its reply is held.
+        let claim = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws.clone();
+            async move {
+                svc.browser_exec(
+                    ws,
+                    vec![
+                        json!({ "action": "claimTab", "tabId": "tab-on-a", "width": 1024 }),
+                        json!({ "action": "claimTab", "tabId": "tab-on-b", "width": 1024 }),
+                    ],
+                    None,
+                    Some(agent("agent-1")),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), dispatch.started.notified())
+            .await
+            .expect("claim dispatched");
+        assert_eq!(
+            dispatch.targets.lock().unwrap().as_slice(),
+            [ReverseTarget::Pinned(ClientId::from_string("desktop-a"))]
+        );
+
+        // The pin switches while the claim is in flight; nothing is claimed
+        // yet, so the setter migrates no row.
+        svc.set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-b")))
+            .await
+            .expect("pin b");
+        for (id, host) in [("tab-on-a", "desktop-a"), ("tab-on-b", "desktop-b")] {
+            let row = svc.store.get_browser_tab(id).await.unwrap().unwrap();
+            assert_eq!(row.host_client_id, ClientId::from_string(host));
+            assert!(row.owner_agent_id.is_none());
+        }
+
+        // The held reply lands: both rows commit to the *current* driving
+        // client (desktop-b), not the executor (desktop-a).
+        dispatch.release.notify_one();
+        let out = claim.await.unwrap().expect("claim");
+        assert_eq!(out["results"].as_array().map(Vec::len), Some(2));
+        assert_eq!(out["results"][0]["success"], true);
+        assert_eq!(out["results"][1]["success"], true);
+        for id in ["tab-on-a", "tab-on-b"] {
+            let row = svc.store.get_browser_tab(id).await.unwrap().unwrap();
+            assert_eq!(
+                row.host_client_id,
+                ClientId::from_string("desktop-b"),
+                "{id} must live on the driving client"
+            );
+            assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
+        }
+        let evs = events.await.unwrap();
+        assert_eq!(evs[0]["type"], "browser:tab-updated");
+        assert_eq!(evs[0]["data"]["tab"]["tabId"], "tab-on-a");
+        assert_eq!(
+            evs[0]["data"]["changes"],
+            json!({ "hostClientId": "desktop-b", "ownerAgentId": "agent-1" })
+        );
+        assert_eq!(evs[1]["type"], "browser:tab-updated");
+        assert_eq!(evs[1]["data"]["tab"]["tabId"], "tab-on-b");
+        assert_eq!(
+            evs[1]["data"]["changes"],
+            json!({ "ownerAgentId": "agent-1" })
+        );
+        // desktop-b is the one host of the workspace: a later agent call
+        // resolves the pin, and clearing it keeps the claimed-tab host.
+        assert_eq!(
+            svc.driving_client_target(&ws).await.unwrap(),
+            ReverseTarget::Pinned(ClientId::from_string("desktop-b"))
+        );
+        svc.set_workspace_browser_client(ws.clone(), None)
+            .await
+            .expect("clear pin");
+        assert_eq!(
+            svc.driving_client_target(&ws).await.unwrap(),
+            ReverseTarget::Client(ClientId::from_string("desktop-b"))
         );
     }
 
