@@ -2,6 +2,337 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.38] - 2026-09-07
+
+### 🧪 Testing
+
+- *(services)* Observe ACP terminal output before letting the child exit ([#1776](https://github.com/intent-hq/intentd/pull/1776))
+
+
+## [0.9.37] - 2026-09-07
+
+### 🚀 Features
+
+- Match crossWorkspace siblings by GitHub repo identity ([#1774](https://github.com/intent-hq/intentd/pull/1774))
+
+
+## [0.9.36] - 2026-09-07
+
+### 🧪 Testing
+
+- *(services)* Wait for cat echo to settle before snapshotting terminal buffer ([#1771](https://github.com/intent-hq/intentd/pull/1771))
+
+
+## [0.9.35] - 2026-09-07
+
+### 🚀 Features
+
+- *(browser)* Route agent browser.exec via the workspace driving client (REV-2) ([#1770](https://github.com/intent-hq/intentd/pull/1770))
+
+
+## [0.9.34] - 2026-09-06
+
+### 🚀 Features
+
+- *(browser)* Daemon-owned browser tab registry (store, RPCs, events) ([#1763](https://github.com/intent-hq/intentd/pull/1763))
+
+### 🐛 Bug Fixes
+
+- *(attach)* Input-shape second gate for the workspace_api FIFO claim ([#1765](https://github.com/intent-hq/intentd/pull/1765))
+
+
+## [0.9.33] - 2026-09-06
+
+### 🚀 Features
+
+- Per-workspace browser-client pin + client.list RPCs (REV-2) ([#1760](https://github.com/intent-hq/intentd/pull/1760))
+
+
+## [0.9.32] - 2026-09-06
+
+### 🐛 Bug Fixes
+
+- *(acp)* Recognize auggie-shaped workspace_api calls so proposals attach ([#1762](https://github.com/intent-hq/intentd/pull/1762))
+
+
+## [0.9.31] - 2026-09-06
+
+### 🚀 Features
+
+- *(agents)* Configurable tool-payload replay cap and retention compaction ([#1757](https://github.com/intent-hq/intentd/pull/1757))
+
+
+## [0.9.30] - 2026-09-06
+
+### 🚀 Features
+
+- *(transport)* Capability-gated, identity-aware reverse registry (REV-2) ([#1756](https://github.com/intent-hq/intentd/pull/1756))
+
+### 📚 Documentation
+
+- *(acp)* Document browser tab display state for agents ([#1758](https://github.com/intent-hq/intentd/pull/1758))
+
+
+## [0.9.29] - 2026-09-06
+
+### 🧪 Testing
+
+- *(services)* Cover shrink-after-delivery-claim on a settled delegation group ([#1752](https://github.com/intent-hq/intentd/pull/1752))
+- *(intentd)* Make WSS statement-count e2e immune to lazy read-pool growth ([#1755](https://github.com/intent-hq/intentd/pull/1755))
+
+
+## [0.9.28] - 2026-09-06
+
+### ⚡ Performance
+
+- Reduce RPC load-path latency (workspace batching, blocking offload, profiling) ([#1702](https://github.com/intent-hq/intentd/pull/1702))
+
+
+## [0.9.27] - 2026-09-06
+
+### 🐛 Bug Fixes
+
+- *(services)* Serialize delegation_group persistence through one ordered lane ([#1751](https://github.com/intent-hq/intentd/pull/1751))
+- *(transfer)* Preserve root remotes, tracking refs and upstream through workspace transfer ([#1749](https://github.com/intent-hq/intentd/pull/1749))
+
+
+## [0.9.26] - 2026-09-05
+
+### 🐛 Bug Fixes
+
+- *(providers)* Bump codex-acp npx pin to 1.9.0 ([#1741](https://github.com/intent-hq/intentd/pull/1741))
+
+### ⚙️ Miscellaneous Tasks
+
+- Update Cargo.lock dependencies
+
+
+## [0.9.25] - 2026-09-05
+
+### 🚀 Features
+
+- Add managed Antigravity setup ([#1742](https://github.com/intent-hq/intentd/pull/1742))
+
+### 🐛 Bug Fixes
+
+- *(transport)* Carry persisted assistant metadata on chat terminal deltas ([#1746](https://github.com/intent-hq/intentd/pull/1746))
+
+
+## [0.9.24] - 2026-09-04
+
+### 🚀 Features
+
+- Back off accept loops on EMFILE, raise RLIMIT_NOFILE, and report fd usage in system.status ([#1740](https://github.com/intent-hq/intentd/pull/1740))
+
+
+## [0.9.23] - 2026-09-04
+
+### 🚀 Features
+
+- *(protocol)* Add isBackground to workspace agentSummary agent rows ([#1700](https://github.com/intent-hq/intentd/pull/1700))
+
+### 🐛 Bug Fixes
+
+- *(services)* Register the idle debouncer atomically with the count drop ([#1736](https://github.com/intent-hq/intentd/pull/1736))
+- *(settings)* Keep stored secrets when settings.update echoes the redaction placeholder ([#1738](https://github.com/intent-hq/intentd/pull/1738))
+
+### 🧪 Testing
+
+- *(agent-manager)* Spawn the agent_root_pids fixture child as a group leader ([#1734](https://github.com/intent-hq/intentd/pull/1734))
+- *(tunnel)* Unset INTENTD_TAILCAT_BIN in the missing-binary test ([#1732](https://github.com/intent-hq/intentd/pull/1732))
+- *(e2e)* Detach stdio in the DaemonGuard drop test so nextest sees no leak ([#1733](https://github.com/intent-hq/intentd/pull/1733))
+
+
+## [0.9.22] - 2026-09-04
+
+### 🐛 Bug Fixes
+
+- *(tests)* Poll for watch retirement after the terminal wake in the WSS watch e2e ([#1729](https://github.com/intent-hq/intentd/pull/1729))
+- *(transfer)* Carry unpublished submodule commits in the transfer archive ([#1727](https://github.com/intent-hq/intentd/pull/1727))
+
+
+## [0.9.21] - 2026-09-04
+
+### 🐛 Bug Fixes
+
+- *(services)* Tell the model when recovery replays truncated its tool output ([#1726](https://github.com/intent-hq/intentd/pull/1726))
+
+
+## [0.9.20] - 2026-09-04
+
+### 📚 Documentation
+
+- *(providers)* State inherited NODE_OPTIONS first in heap-cap precedence ([#1724](https://github.com/intent-hq/intentd/pull/1724))
+
+
+## [0.9.19] - 2026-09-04
+
+### 🐛 Bug Fixes
+
+- *(agent)* Claim a completion watch before its terminal wake is sent ([#1718](https://github.com/intent-hq/intentd/pull/1718))
+
+
+## [0.9.18] - 2026-09-04
+
+### 🚀 Features
+
+- *(github)* Add github.issues.get and issue author/timestamps ([#1716](https://github.com/intent-hq/intentd/pull/1716))
+- *(workspace)* Add workspace.localChanges RPC ([#1717](https://github.com/intent-hq/intentd/pull/1717))
+
+### 🐛 Bug Fixes
+
+- *(agent)* Emit normal-completion stream:end when an interrupt races a persisted turn ([#1720](https://github.com/intent-hq/intentd/pull/1720))
+- *(antigravity)* Classify authenticate RPC timeout as login timeout ([#1721](https://github.com/intent-hq/intentd/pull/1721))
+- Honor providers.paths override for claude-code and bump adapter pin to 0.73.0 ([#1714](https://github.com/intent-hq/intentd/pull/1714))
+
+
+## [0.9.17] - 2026-09-04
+
+### 🚀 Features
+
+- *(harness)* Mint v2.3 with a levers-focused Suggested Next Steps hint ([#1713](https://github.com/intent-hq/intentd/pull/1713))
+- *(agent)* Report workspace task status counts in ws.agent.snapshot() ([#1712](https://github.com/intent-hq/intentd/pull/1712))
+
+
+## [0.9.16] - 2026-09-04
+
+### 🚀 Features
+
+- Report detected device kind ([#1706](https://github.com/intent-hq/intentd/pull/1706))
+- *(agent)* Stop parking automatic deliveries behind pending questions ([#1710](https://github.com/intent-hq/intentd/pull/1710))
+
+
+## [0.9.15] - 2026-09-03
+
+### 🚀 Features
+
+- *(harness)* Mint v2.2 with a one-sentence workspace status message ([#1705](https://github.com/intent-hq/intentd/pull/1705))
+- *(transport)* Expose availableIps bind candidates on server.pairingInfo ([#1708](https://github.com/intent-hq/intentd/pull/1708))
+
+
+## [0.9.14] - 2026-09-03
+
+### 🚀 Features
+
+- Add isolated Antigravity ACP provider ([#1665](https://github.com/intent-hq/intentd/pull/1665))
+
+
+## [0.9.13] - 2026-09-03
+
+### 🚀 Features
+
+- *(settings)* Add agents.acpNodeMaxOldSpaceMb and plumb it into ACP spawn env ([#1701](https://github.com/intent-hq/intentd/pull/1701))
+
+
+## [0.9.12] - 2026-09-03
+
+### 🐛 Bug Fixes
+
+- *(services)* Guard task.createPrerequisite content against numbered note.read paste ([#1698](https://github.com/intent-hq/intentd/pull/1698))
+
+
+## [0.9.11] - 2026-09-03
+
+### 🚀 Features
+
+- Expose note saveAsset to agents ([#1682](https://github.com/intent-hq/intentd/pull/1682))
+- Capture Claude CLI identity in provider auth status ([#1685](https://github.com/intent-hq/intentd/pull/1685))
+- Monitoring-idle advisories never consume agent watches ([#1686](https://github.com/intent-hq/intentd/pull/1686))
+
+### 🐛 Bug Fixes
+
+- *(intentd)* Actionable error when the tailcat sidecar is missing ([#1687](https://github.com/intent-hq/intentd/pull/1687))
+- Honor legacy Codex model selections and prevent silent fallback ([#1675](https://github.com/intent-hq/intentd/pull/1675))
+- Reject numbered note.read presentation on note write paths ([#1688](https://github.com/intent-hq/intentd/pull/1688))
+
+
+## [0.9.10] - 2026-09-03
+
+### 🐛 Bug Fixes
+
+- Complete pending merges with both parents in commit helper ([#1678](https://github.com/intent-hq/intentd/pull/1678))
+- Honor explicit Claude CLI authentication status ([#1666](https://github.com/intent-hq/intentd/pull/1666))
+
+### 🧪 Testing
+
+- Fix full-suite gate timeouts and identity hermeticity ([#1681](https://github.com/intent-hq/intentd/pull/1681))
+
+
+## [0.9.9] - 2026-09-03
+
+### 🚀 Features
+
+- *(transport)* Never advertise loopback in pairing hosts + tailcat picker note ([#1672](https://github.com/intent-hq/intentd/pull/1672))
+
+### ⚡ Performance
+
+- *(store)* Answer unread derivation from a partial covering index ([#1661](https://github.com/intent-hq/intentd/pull/1661))
+
+### 🧪 Testing
+
+- *(services)* Isolate durable phase of report_delivered watch test from spawned persists ([#1667](https://github.com/intent-hq/intentd/pull/1667))
+- *(git)* Make fetch timeout fixture deterministic against host network posture ([#1668](https://github.com/intent-hq/intentd/pull/1668))
+- *(acp)* Make git_repo fixture independent of host init.defaultBranch ([#1669](https://github.com/intent-hq/intentd/pull/1669))
+- *(intentd)* Portable stand-in sitter process name for the WSS update fixture ([#1670](https://github.com/intent-hq/intentd/pull/1670))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(sitter)* Bump intentd-sitter to 0.1.8 ([#1674](https://github.com/intent-hq/intentd/pull/1674))
+
+
+## [0.9.8] - 2026-09-02
+
+### 🐛 Bug Fixes
+
+- *(services)* Stop infinite advisory-wake retries to retired watchers ([#1655](https://github.com/intent-hq/intentd/pull/1655))
+
+### 🧪 Testing
+
+- *(services)* Make settings-default-effort tests hermetic (seed providers.paths for auggie) ([#1664](https://github.com/intent-hq/intentd/pull/1664))
+- *(git)* Make identity tests hermetic vs inherited GIT_* env ([#1659](https://github.com/intent-hq/intentd/pull/1659))
+
+
+## [0.9.7] - 2026-09-02
+
+### 🚀 Features
+
+- Live provider test-prompt RPC + supportsTestPrompt catalog flag ([#1657](https://github.com/intent-hq/intentd/pull/1657))
+- One-time boot migration removes providers.active from config.toml ([#1658](https://github.com/intent-hq/intentd/pull/1658))
+
+
+## [0.9.6] - 2026-09-02
+
+### 🚀 Features
+
+- Normalize legacy compound model values on settings read ([#1651](https://github.com/intent-hq/intentd/pull/1651))
+- *(store)* Migrate compound provider:model session ids to the split pair ([#1653](https://github.com/intent-hq/intentd/pull/1653))
+- Specialist model triple (frontmatter + modelOptions + hints) ([#1654](https://github.com/intent-hq/intentd/pull/1654))
+
+### 🐛 Bug Fixes
+
+- *(services)* Map ACP auth-required session failures to actionable login error and demote cached verdict ([#1650](https://github.com/intent-hq/intentd/pull/1650))
+
+
+## [0.9.5] - 2026-09-02
+
+### 🚀 Features
+
+- *(services)* Export commit-identity GIT_* env into agent-spawned processes ([#1644](https://github.com/intent-hq/intentd/pull/1644))
+- Add monotonic settings revisions ([#1636](https://github.com/intent-hq/intentd/pull/1636))
+- Defer attention-request surfacing until agent turn ends ([#1639](https://github.com/intent-hq/intentd/pull/1639))
+- Add ws.agent.listSpecialists() workspace binding ([#1641](https://github.com/intent-hq/intentd/pull/1641))
+- Surface tracked open PRs grouped by state in agent snapshot ([#1643](https://github.com/intent-hq/intentd/pull/1643))
+- Hard-reject compound model ids on the wire ([#1647](https://github.com/intent-hq/intentd/pull/1647))
+- Resolve providers without compound model prefixes ([#1648](https://github.com/intent-hq/intentd/pull/1648))
+
+### 🐛 Bug Fixes
+
+- *(store)* Rank search.messages from dense context table, not fat rows ([#1640](https://github.com/intent-hq/intentd/pull/1640))
+- Merge configured Codex catalog entries ([#1621](https://github.com/intent-hq/intentd/pull/1621))
+- *(services)* Claude-code ACP auth fallback no longer treats model list as proof of auth ([#1642](https://github.com/intent-hq/intentd/pull/1642))
+- *(services)* Fail fast on hard-false cached auth verdict at agent create/delegate ([#1645](https://github.com/intent-hq/intentd/pull/1645))
+
+
 ## [0.9.4] - 2026-09-01
 
 ### 🐛 Bug Fixes

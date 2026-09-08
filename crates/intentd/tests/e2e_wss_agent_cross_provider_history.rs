@@ -552,6 +552,14 @@ async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
         second_text.contains("The previous ACP session was lost"),
         "supervisor preamble present: {second_text:?}"
     );
+    // intent#3696: the replay tells the model its tool blocks are abbreviated
+    // by the replay (not failed/empty tools) and how to recover one output.
+    assert!(
+        second_text.contains("abbreviated by the recovery replay")
+            && second_text.contains("does NOT mean the tool failed or returned empty output")
+            && second_text.contains("re-run that ONE call once"),
+        "supervisor preamble carries the truncation hint: {second_text:?}"
+    );
     assert!(
         second_text.contains("XPROV_FIRST_USER_TURN")
             && second_text.contains("XPROV_E2E_ASSISTANT_REPLY"),
@@ -757,6 +765,10 @@ async fn cross_provider_switch_skips_foreign_session_load() {
     assert!(
         text.contains("<supervisor>") && text.contains("</supervisor>"),
         "history replayed as <supervisor> XML: {text:?}"
+    );
+    assert!(
+        text.contains("abbreviated by the recovery replay"),
+        "replay preamble carries the truncation hint (intent#3696): {text:?}"
     );
     assert!(
         text.contains("XLS_FIRST_USER_TURN") && text.contains("XLS_ASSISTANT_REPLY"),

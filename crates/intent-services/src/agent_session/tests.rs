@@ -778,6 +778,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -1737,7 +1738,7 @@ async fn interruption_flush_adopts_prestaged_payloads() {
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
         .await
         .expect("pinned slot flushes");
-    assert_eq!(flushed.message_id.as_deref(), Some("m1"));
+    assert_eq!(flushed.outcome.appended_message_id(), Some("m1"));
 
     let read = services
         .store
@@ -2339,6 +2340,230 @@ async fn registered_attachment_survives_garbled_tool_echo() {
         .is_empty());
 }
 
+/// intent-hq/intent#4491: the auggie shape — `title` = the call's `summary`,
+/// no tool identifier anywhere, `rawInput` = `{code, summary}`, and a
+/// garbled completion echo — through the full turn. The recorded `tool_use`
+/// name must be `workspace_api` (derived from the input shape), the summary
+/// must still be echoed as `_acpTitle`, and the registered attachment must be
+/// claimed on the name-less `tool_call_update`: the claim resolves the name
+/// AND the recorded input (`_acpTitle` included) from first sight, so both
+/// registry gates see the frame.
+#[tokio::test]
+async fn auggie_shaped_workspace_api_call_claims_registered_attachment() {
+    let summary = "Propose a follow-up workspace";
+    let tool_call = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": summary, "kind": "other", "status": "in_progress",
+                "rawInput": { "code": "ws.workspace.proposeSibling(p)", "summary": summary } }
+        }
+    })
+    .to_string();
+    let tool_done = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed",
+                "rawOutput": { "output": "[tool ran] {\"ok\": tru…(truncated)" } }
+        }
+    })
+    .to_string();
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with(vec![tool_call, tool_done]);
+    services.turn_attachments().register(
+        &agent_id,
+        test_attachment("tar-aug1", intent_core::AttachmentPolicy::AtToolResult),
+    );
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("go")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    let mid = &messages[0].id;
+    let blocks = messages[0].content.as_array().expect("content is array");
+    assert_eq!(blocks.len(), 3, "tool_use + tool_result + registered block");
+    assert_eq!(
+        blocks[0],
+        json!({ "type": "tool_use", "id": format!("{mid}:0"), "name": "workspace_api",
+          "input": { "code": "ws.workspace.proposeSibling(p)", "summary": summary,
+                     "_acpTitle": summary },
+          "toolCallId": "t1",
+          "metadata": { "toolKind": "other", "status": "completed" } })
+    );
+    assert_eq!(
+        blocks[2],
+        json!({ "type": "resource", "id": format!("{mid}:2"), "resource": {
+            "uri": "intent-proposal://settings-change/Registered",
+            "name": "Registered",
+            "mimeType": "application/vnd.intent.proposal+json",
+            "text": "{\"kind\":\"settings-change\",\"attachmentId\":\"tar-aug1\"}" } })
+    );
+    assert!(services
+        .turn_attachments()
+        .finish_turn(&agent_id)
+        .is_empty());
+}
+
+/// A `tool_call` / `tool_call_update` pair routed through the real claim
+/// site with a bare transcript (no ACP round trip).
+fn tool_call_notification(update: &Value) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({ "sessionId": ACP_SID, "update": update }),
+    }
+}
+
+/// intent-hq/intent#4491 negative control at the real claim site: a foreign
+/// tool identified authoritatively — codex `server`/`tool` metadata, a
+/// `mcp__<server>__<tool>` title, a `mcp.<server>.<tool>` title — whose
+/// arguments happen to be `{ code, summary }` AND whose title equals the
+/// model-authored `summary` must never claim a pending `workspace_api` batch
+/// on a garbled completion. The recorded input is indistinguishable from
+/// auggie's (the codex unwrap strips `server`/`tool`; a summary may equal a
+/// namespaced title), so only the mapper's provenance keeps the gate shut.
+#[tokio::test]
+async fn summary_titled_foreign_tool_never_claims_registered_attachment() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let args = |summary: &str| json!({ "code": "print(1)", "summary": summary });
+    let frames = [
+        (
+            "t1",
+            "Run Python",
+            json!({ "arguments": args("Run Python"), "server": "python", "tool": "execute" }),
+        ),
+        ("t2", "mcp__python__execute", args("mcp__python__execute")),
+        ("t3", "mcp.python.execute", args("mcp.python.execute")),
+    ];
+    for (id, title, raw_input) in frames {
+        let mut transcript = super::Transcript::new("m1".to_string());
+        services.turn_attachments().register(
+            &agent_id,
+            test_attachment("tar-foreign", intent_core::AttachmentPolicy::AtToolResult),
+        );
+        services
+            .route_notification(
+                &tool_call_notification(&json!({
+                    "sessionUpdate": "tool_call", "toolCallId": id, "title": title,
+                    "kind": "execute", "status": "in_progress", "rawInput": raw_input })),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+        services
+            .route_notification(
+                &tool_call_notification(&json!({
+                    "sessionUpdate": "tool_call_update", "toolCallId": id,
+                    "status": "completed", "rawOutput": { "output": "ok" } })),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+        let blocks = transcript.into_blocks();
+        assert_eq!(blocks[0]["name"], "python_execute", "title={title}");
+        assert!(
+            intent_core::is_workspace_api_input(&blocks[0]["input"]),
+            "recorded input is workspace_api-shaped: title={title}"
+        );
+        assert_eq!(
+            blocks.len(),
+            2,
+            "tool_use + tool_result only, no attached resource: title={title}"
+        );
+        // The batch is still pending for the daemon's own tool.
+        let claimed = services.turn_attachments().claim_at_tool_result(
+            &agent_id,
+            None,
+            "workspace_api",
+            None,
+        );
+        assert_eq!(claimed.len(), 1, "title={title}");
+        assert_eq!(claimed[0].id, "tar-foreign", "title={title}");
+    }
+}
+
+/// intent-hq/intent#4491 (sparse-input ordering): a prose-titled first sight
+/// with `rawInput: null` records the prose as the name and only an
+/// `_acpTitle` placeholder as the input; the completed update then supplies
+/// the first `{ code, summary }` input alongside a garbled echo. The claim
+/// must inspect the update's fresh input — not the persisted placeholder —
+/// so the shape gate opens even though the recorded name never became
+/// `workspace_api`. This is the recorded-input path's own coverage: with the
+/// name gate alone the batch would be dropped.
+#[tokio::test]
+async fn sparse_input_workspace_api_call_claims_on_the_update_that_supplies_input() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let prose = "Propose a follow-up workspace";
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.turn_attachments().register(
+        &agent_id,
+        test_attachment("tar-sparse", intent_core::AttachmentPolicy::AtToolResult),
+    );
+    services
+        .route_notification(
+            &tool_call_notification(&json!({
+                "sessionUpdate": "tool_call", "toolCallId": "t1", "title": prose,
+                "kind": "other", "status": "in_progress", "rawInput": null })),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    assert_eq!(transcript.tool_name_for("t1"), Some(prose));
+    services
+        .route_notification(
+            &tool_call_notification(&json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed",
+                "rawInput": { "code": "ws.workspace.proposeSibling(p)", "summary": prose },
+                "rawOutput": { "output": "[tool ran] {\"ok\": tru…(truncated)" } })),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    let blocks = transcript.into_blocks();
+    assert_eq!(blocks.len(), 3, "tool_use + tool_result + registered block");
+    assert_eq!(blocks[0]["name"], prose, "the recorded name stays prose");
+    assert_eq!(
+        blocks[0]["input"],
+        json!({ "code": "ws.workspace.proposeSibling(p)", "summary": prose, "_acpTitle": prose })
+    );
+    assert_eq!(
+        blocks[2]["resource"]["text"],
+        "{\"kind\":\"settings-change\",\"attachmentId\":\"tar-sparse\"}"
+    );
+    assert_eq!(
+        services
+            .turn_attachments()
+            .claim_at_tool_result(&agent_id, None, "workspace_api", None)
+            .len(),
+        0,
+        "the batch was consumed by the claim"
+    );
+}
+
 /// §7.1 `AtTurnEnd` policy: attachments registered with the turn-end policy
 /// are appended as trailing resource blocks when the turn finalizes, and
 /// unclaimed `AtToolResult` leftovers are dropped (not attached, not leaked
@@ -2480,7 +2705,7 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
     // The user's ANSWER resolves the questions (appended via the op so the
     // pending-questions marker clears — the send paths carry the same
     // resolution, exercised elsewhere), then turn 2 persists a question-free
-    // tail: the turn-end recompute retires the hold and emits the demotion.
+    // tail: the turn-end recompute retires the pending set and emits the demotion.
     let asked_id = bus
         .store()
         .get_agent_messages(&agent_id, None)
@@ -2526,7 +2751,7 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
     );
 }
 
-/// Stored-on-write pending-questions marker (PROTOCOL §5.5, question hold):
+/// Stored-on-write pending-questions marker (PROTOCOL §5.5):
 /// the turn-end persist writes the marker under the turn's message id when the
 /// assistant tail bears question blocks, and a subsequent question-FREE turn
 /// leaves it in place (pendingness survives the agent's own later turns).
@@ -2577,7 +2802,7 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
         Some(asked_id.as_str()),
         "turn end persists the pending-questions marker"
     );
-    assert!(services.question_hold_active(&agent_id).await);
+    assert!(services.questions_pending(&agent_id).await);
 
     // A question-free turn must NOT clear the marker.
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
@@ -2604,8 +2829,8 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
         "a question-free turn end must not clear the marker"
     );
     assert!(
-        services.question_hold_active(&agent_id).await,
-        "hold survives the agent's later turn"
+        services.questions_pending(&agent_id).await,
+        "pending questions survive the agent's later turn"
     );
 }
 
@@ -2910,7 +3135,7 @@ async fn delayed_question_set_cannot_resurrect_answered_marker() {
         None,
         "delayed set must not resurrect the answered marker"
     );
-    assert!(!services.question_hold_active(&agent_id).await);
+    assert!(!services.questions_pending(&agent_id).await);
     assert!(
         timeout(Duration::from_millis(300), sub.recv())
             .await
@@ -2970,7 +3195,7 @@ async fn append_message_op_answer_row_retires_needs_attention() {
         .await
         .expect("plain appendMessage succeeds");
     assert!(
-        services.question_hold_active(&agent_id).await,
+        services.questions_pending(&agent_id).await,
         "a plain user row must not resolve the pending Q&A"
     );
     assert!(
@@ -3006,7 +3231,7 @@ async fn append_message_op_answer_row_retires_needs_attention() {
 
 /// monorepo#1266 regression (raise): an assistant row with a trailing
 /// question resource block appended via `agent.appendMessage` activates the
-/// question hold, so the op's own recompute must promote the workspace's
+/// pending set, so the op's own recompute must promote the workspace's
 /// displayStatus to `needs_attention` and emit the transition.
 #[tokio::test]
 async fn append_message_op_question_row_raises_needs_attention() {
@@ -3039,7 +3264,7 @@ async fn append_message_op_question_row_raises_needs_attention() {
 }
 
 /// monorepo#1266 regression: `agent.replaceMessages` swaps the whole
-/// transcript, which can move the question-hold derivation in either
+/// transcript, which can move the pending-questions derivation in either
 /// direction — a swap whose question row is answered retires
 /// `needs_attention`, a swap ending on an unanswered question-bearing
 /// assistant row raises it again. Both flips must emit. The swap re-mints row
@@ -3106,7 +3331,7 @@ async fn replace_messages_op_moves_needs_attention_both_ways() {
 }
 
 /// monorepo#1266 transition-only guard: an `agent.appendMessage` mutation
-/// that does NOT move the derivation (a user row onto an already-hold-free
+/// that does NOT move the derivation (a user row onto an already question-free
 /// transcript) recomputes silently — no `workspace:displayStatus-changed`.
 #[tokio::test]
 async fn append_message_op_without_derivation_change_emits_nothing() {
@@ -3187,6 +3412,53 @@ async fn stale_anonymous_tool_update_is_dropped_not_persisted() {
         ]),
         "the anonymous tool_use block (and its errored tool_result) are never persisted"
     );
+}
+
+#[tokio::test]
+async fn antigravity_candidate_commit_preserves_concurrent_session_and_metadata() {
+    for expected_old in [None, Some("stale-id")] {
+        let (_tmp, services, bus, agent_id, ws) = setup().await;
+        if let Some(old) = expected_old {
+            bus.store()
+                .set_acp_session_id(&ws, &agent_id, old)
+                .await
+                .unwrap();
+        }
+        let (conn, _rx, _agent) =
+            connect_with_session_result(claude_shaped_thought_level_session_result());
+        let prepared = services
+            .prepare_acp_session(&conn, &agent_id, "/tmp/ws", Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            bus.store()
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap()
+                .acp_session_id
+                .as_deref(),
+            expected_old,
+            "session/new alone must not persist a candidate"
+        );
+        bus.store()
+            .replace_acp_session_id(&ws, &agent_id, expected_old.unwrap_or(""), "winner-id")
+            .await
+            .unwrap();
+        let winner_levels = vec!["low".to_string(), "high".to_string()];
+        bus.store()
+            .set_agent_effort_levels(&ws, &agent_id, Some(&winner_levels), &now_iso())
+            .await
+            .unwrap();
+        let before = bus.store().get_agent_session(&agent_id).await.unwrap();
+        let result = services
+            .commit_antigravity_acp_session(prepared, expected_old)
+            .await;
+        assert!(matches!(result, Err(intent_core::Error::Conflict { .. })));
+        let after = bus.store().get_agent_session(&agent_id).await.unwrap();
+        assert_eq!(after.acp_session_id.as_deref(), Some("winner-id"));
+        assert_eq!(after.model, before.model);
+        assert_eq!(after.effort_levels, Some(winner_levels));
+    }
 }
 
 #[tokio::test]
@@ -4843,7 +5115,10 @@ async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
 
 /// Task C boundary: a NON-transient error (a terminal 4xx) is NOT enrolled even
 /// when a suspend overlapped — the classifier rejects it, so the turn surfaces
-/// terminally with `agent:failed` and no `interrupted_agent` row.
+/// terminally with `agent:failed` and no `interrupted_agent` row. (A 404, not
+/// a 401: an auth-flavored 4xx now takes the auth-required mapping instead of
+/// the ordinary wrapper — pinned separately by
+/// `map_acp_session_error_maps_auth_and_demotes_verdict`.)
 #[tokio::test]
 async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
@@ -4851,7 +5126,7 @@ async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
         Duration::from_secs(120),
     ))));
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(Vec::new(), "HTTP 401 Unauthorized");
+        connect_with_prompt_rpc_error(Vec::new(), "HTTP 404 Not Found");
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
@@ -6296,7 +6571,8 @@ async fn open_session_resolves_and_persists_effective_model() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d13");
-    session.model = Some("claude-code:default".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("default".to_string());
     bus.store()
         .insert_agent_session(&session)
         .await
@@ -6309,7 +6585,7 @@ async fn open_session_resolves_and_persists_effective_model() {
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(
         stored.model.as_deref(),
-        Some("claude-code:default"),
+        Some("default"),
         "placeholder model untouched — never rewritten to a display name"
     );
     let (_, resolved, _, _) = bus
@@ -6333,7 +6609,8 @@ async fn open_session_never_overwrites_explicit_model() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d13-explicit");
-    session.model = Some("claude-code:sonnet".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("sonnet".to_string());
     bus.store()
         .insert_agent_session(&session)
         .await
@@ -6346,7 +6623,7 @@ async fn open_session_never_overwrites_explicit_model() {
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(
         stored.model.as_deref(),
-        Some("claude-code:sonnet"),
+        Some("sonnet"),
         "explicit model untouched"
     );
     let (_, resolved, _, _) = bus
@@ -6361,7 +6638,7 @@ async fn open_session_never_overwrites_explicit_model() {
     );
 }
 
-/// D14: a bracketed explicit pick (`claude-code:claude-fable-5[1m]`) resolves
+/// D14: a bracketed explicit pick (`claude-fable-5[1m]`) resolves
 /// its display identity ("Fable 5") from the matching option entry — the
 /// version-less name "Fable" is skipped for the version-bearing description —
 /// while the raw stored id keeps driving provider configuration.
@@ -6370,7 +6647,8 @@ async fn open_session_resolves_explicit_bracketed_pick_display_model() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d14-fable");
-    session.model = Some("claude-code:claude-fable-5[1m]".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("claude-fable-5[1m]".to_string());
     bus.store()
         .insert_agent_session(&session)
         .await
@@ -6383,7 +6661,7 @@ async fn open_session_resolves_explicit_bracketed_pick_display_model() {
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(
         stored.model.as_deref(),
-        Some("claude-code:claude-fable-5[1m]"),
+        Some("claude-fable-5[1m]"),
         "raw explicit id untouched — still drives provider configuration"
     );
     let (_, resolved, _, _) = bus
@@ -6403,7 +6681,8 @@ async fn open_session_unmatched_explicit_pick_clears_previous_resolution() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d14-unmatched");
-    session.model = Some("claude-code:claude-haiku-4-5".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("claude-haiku-4-5".to_string());
     bus.store()
         .insert_agent_session(&session)
         .await
@@ -6414,7 +6693,7 @@ async fn open_session_unmatched_explicit_pick_clears_previous_resolution() {
         .set_agent_session_resolved_model(
             &ws,
             &session.id,
-            Some("claude-code:claude-haiku-4-5"),
+            Some("claude-haiku-4-5"),
             Some("Haiku 4.5"),
         )
         .await
@@ -6430,7 +6709,7 @@ async fn open_session_unmatched_explicit_pick_clears_previous_resolution() {
         .get_agent_session_token_usage(&ws, &session.id)
         .await
         .expect("read resolved model");
-    assert_eq!(model.as_deref(), Some("claude-code:claude-haiku-4-5"));
+    assert_eq!(model.as_deref(), Some("claude-haiku-4-5"));
     assert_eq!(resolved, None, "stale resolution overwritten by None");
 }
 
@@ -6470,7 +6749,8 @@ async fn open_session_without_config_options_keeps_placeholder() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d13-none");
-    session.model = Some("claude-code:default".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("default".to_string());
     bus.store()
         .insert_agent_session(&session)
         .await
@@ -6481,7 +6761,7 @@ async fn open_session_without_config_options_keeps_placeholder() {
         .await
         .expect("open session");
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
-    assert_eq!(stored.model.as_deref(), Some("claude-code:default"));
+    assert_eq!(stored.model.as_deref(), Some("default"));
     let (_, resolved, _, _) = bus
         .store()
         .get_agent_session_token_usage(&ws, &session.id)
@@ -6499,19 +6779,15 @@ async fn open_session_placeholder_unresolvable_clears_stale_resolution() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d13-stale");
-    session.model = Some("claude-code:default".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("default".to_string());
     bus.store()
         .insert_agent_session(&session)
         .await
         .expect("insert");
     let landed = bus
         .store()
-        .set_agent_session_resolved_model(
-            &ws,
-            &session.id,
-            Some("claude-code:default"),
-            Some("Opus 4.8"),
-        )
+        .set_agent_session_resolved_model(&ws, &session.id, Some("default"), Some("Opus 4.8"))
         .await
         .expect("seed stale resolution");
     assert!(landed);
@@ -6525,7 +6801,7 @@ async fn open_session_placeholder_unresolvable_clears_stale_resolution() {
         .get_agent_session_token_usage(&ws, &session.id)
         .await
         .expect("read resolved model");
-    assert_eq!(model.as_deref(), Some("claude-code:default"));
+    assert_eq!(model.as_deref(), Some("default"));
     assert_eq!(resolved, None, "stale resolution overwritten by None");
 }
 
@@ -6536,7 +6812,8 @@ async fn resume_session_resolves_and_persists_effective_model() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d13-resume");
-    session.model = Some("claude-code:default".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("default".to_string());
     session.acp_session_id = Some(ACP_SID.to_string());
     bus.store()
         .insert_agent_session(&session)
@@ -6549,7 +6826,7 @@ async fn resume_session_resolves_and_persists_effective_model() {
         .expect("resume")
         .expect("resume yields opened session");
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
-    assert_eq!(stored.model.as_deref(), Some("claude-code:default"));
+    assert_eq!(stored.model.as_deref(), Some("default"));
     let (_, resolved, _, _) = bus
         .store()
         .get_agent_session_token_usage(&ws, &session.id)
@@ -6992,7 +7269,7 @@ async fn pinned_live_turn_survives_the_guard_drop_until_the_interrupt_flush_clea
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
         .await
         .expect("the pinned slot is still there to flush");
-    assert_eq!(flushed.message_id.as_deref(), Some("m1"));
+    assert_eq!(flushed.outcome.appended_message_id(), Some("m1"));
     assert!(
         services.agent_live_turn(agent_id.clone()).is_none(),
         "the flush releases the pin with the slot"
@@ -7075,9 +7352,14 @@ async fn interrupt_flush_releases_the_pin_when_the_worker_already_persisted_the_
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::AgentStopped, None)
         .await
         .expect("the pinned slot is still there to flush");
+    assert_eq!(
+        flushed.outcome,
+        super::InterruptFlushOutcome::AlreadyPersisted("m1".to_string()),
+        "the durable full row won the collision — reported as a completed turn, not an interruption"
+    );
     assert!(
-        flushed.message_id.is_none(),
-        "the durable full row won the collision"
+        flushed.outcome.appended_message_id().is_none(),
+        "no interrupted row was appended"
     );
     assert!(
         services.agent_live_turn(agent_id.clone()).is_none(),
@@ -7145,7 +7427,7 @@ async fn interrupt_flush_persists_the_update_routed_after_the_pin() {
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
         .await
         .expect("the pinned slot is still there to flush");
-    assert_eq!(flushed.message_id.as_deref(), Some("m1"));
+    assert_eq!(flushed.outcome.appended_message_id(), Some("m1"));
     assert!(flushed.had_output, "the flushed slot carried blocks");
     assert_eq!(
         flushed.text_blocks,
@@ -7211,7 +7493,7 @@ async fn zero_output_completion_in_the_abort_gap_still_flushes_a_marker_row() {
         "a zero-block turn produced no output — the stop-redelivery arm depends on this"
     );
     assert_eq!(
-        flushed.message_id.as_deref(),
+        flushed.outcome.appended_message_id(),
         Some("m1"),
         "the interrupted marker row is still recorded"
     );
@@ -7291,7 +7573,7 @@ async fn normal_zero_output_turn_end_leaves_the_pinned_slot_to_the_teardown_flus
         .expect("the pinned slot is still there to flush");
     assert!(!flushed.had_output, "a zero-block turn produced no output");
     assert!(
-        flushed.message_id.is_some(),
+        flushed.outcome.appended_message_id().is_some(),
         "the interrupted marker row is recorded"
     );
 }
@@ -7367,8 +7649,8 @@ async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
         )
         .await;
     assert_eq!(
-        enrolled.as_deref(),
-        Some("m1"),
+        enrolled,
+        super::InterruptFlushOutcome::Appended("m1".to_string()),
         "the enrollment row is durable"
     );
     assert!(
@@ -7385,9 +7667,28 @@ async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
         .await
         .expect("the pinned slot survived to its owner");
+    match &flushed.outcome {
+        super::InterruptFlushOutcome::AlreadyInterrupted {
+            message_id,
+            metadata,
+        } => {
+            assert_eq!(message_id, "m1", "the enrollment row won the collision");
+            assert_eq!(
+                metadata.get("interrupted"),
+                Some(&json!(true)),
+                "the collision is reported as an interrupted row, not a completed turn: {metadata}"
+            );
+            assert_eq!(
+                metadata.get("interruptReason"),
+                Some(&json!("system_suspend")),
+                "the durable row's own reason is surfaced: {metadata}"
+            );
+        }
+        other => panic!("expected AlreadyInterrupted, got {other:?}"),
+    }
     assert!(
-        flushed.message_id.is_none(),
-        "the enrollment row won the collision"
+        flushed.outcome.appended_message_id().is_none(),
+        "this flush appended nothing"
     );
     assert!(flushed.had_output, "the turn really did produce output");
     assert!(
@@ -7442,7 +7743,11 @@ async fn interrupt_flush_records_pending_proposals_from_the_partial_tail() {
             true,
         )
         .await;
-    assert_eq!(flushed.as_deref(), Some("m1"), "the partial row is durable");
+    assert_eq!(
+        flushed,
+        super::InterruptFlushOutcome::Appended("m1".to_string()),
+        "the partial row is durable"
+    );
 
     let session = services
         .store
@@ -7483,8 +7788,9 @@ async fn abandoned_slot_survives_guard_drop_and_turn_end_clear() {
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
         .await
         .expect("the pinned slot was there to flush");
-    assert!(
-        flushed.message_id.is_none(),
+    assert_eq!(
+        flushed.outcome,
+        super::InterruptFlushOutcome::Failed,
         "precondition: the store rejected the append, so nothing was persisted"
     );
     assert!(
@@ -8444,4 +8750,167 @@ async fn resolve_session_is_orchestrator_project_tier_via_repository_path() {
             .await,
         "project-tier orchestrator must resolve via repositoryPath fallback"
     );
+}
+
+/// Classification pin for [`super::is_acp_auth_required`]: the dedicated
+/// `Auth` variant and RPC errors matching the shared auth-required matcher
+/// (401 code or auth-flavored message, e.g. claude-code's `-32000
+/// "Authentication required"`, intent-hq/intent#3178) are auth-required;
+/// other RPC errors and transport failures are not.
+#[test]
+fn is_acp_auth_required_classifies_variants() {
+    use intent_acp::{AcpError, JsonRpcError};
+    let rpc = |code: i64, message: &str| {
+        AcpError::Rpc(JsonRpcError {
+            code,
+            message: message.to_string(),
+            data: None,
+        })
+    };
+    assert!(super::is_acp_auth_required(&AcpError::Auth(
+        "login required".into()
+    )));
+    assert!(super::is_acp_auth_required(&rpc(
+        -32000,
+        "Authentication required"
+    )));
+    assert!(super::is_acp_auth_required(&rpc(401, "nope")));
+    assert!(!super::is_acp_auth_required(&rpc(-32603, "internal error")));
+    assert!(!super::is_acp_auth_required(&AcpError::Transport(
+        "pipe closed".into()
+    )));
+}
+
+/// [`super::map_acp_session_error`] (intent-hq/intent#3941): an
+/// auth-required ACP failure maps to the same actionable
+/// `Error::InvalidParams` login message the create/delegate gate emits AND
+/// demotes the provider's cached auth verdict to a hard `false`; any other
+/// failure keeps the opaque `Error::Internal("{context} failed: {e}")`
+/// shape and leaves the cache alone.
+#[test]
+fn map_acp_session_error_maps_auth_and_demotes_verdict() {
+    use intent_acp::{AcpError, JsonRpcError};
+    use intent_core::Error;
+    // "pi" is a probe provider no other test seeds, so the demotion is
+    // observable without racing parallel gate tests (which use "mock").
+    crate::provider_auth::seed_auth_verdict_for_tests("pi", None);
+
+    let err = super::map_acp_session_error(
+        "session/new",
+        &AcpError::Rpc(JsonRpcError {
+            code: -32000,
+            message: "Authentication required".into(),
+            data: None,
+        }),
+        "pi",
+    );
+    match err {
+        Error::InvalidParams(msg) => {
+            assert!(msg.starts_with("session/new: "), "{msg}");
+            assert!(
+                msg.contains(&crate::provider_auth::not_authenticated_message("pi")),
+                "{msg}"
+            );
+        }
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+    assert_eq!(
+        crate::provider_auth::cached_auth_verdict("pi"),
+        Some(false),
+        "auth-required failure must demote the cached verdict"
+    );
+    crate::provider_auth::seed_auth_verdict_for_tests("pi", None);
+
+    let err = super::map_acp_session_error(
+        "session/prompt",
+        &AcpError::Transport("pipe closed".into()),
+        "pi",
+    );
+    match err {
+        Error::Internal(msg) => {
+            assert!(msg.starts_with("session/prompt failed:"), "{msg}");
+        }
+        other => panic!("expected Internal, got {other:?}"),
+    }
+    assert_eq!(
+        crate::provider_auth::cached_auth_verdict("pi"),
+        None,
+        "non-auth failure must not touch the cached verdict"
+    );
+}
+
+/// The auth-mapped `session/prompt` failure is recognized by the turn
+/// worker's dedupe classifier so the terminal `agent:failed` +
+/// `agent:stream:end` pair is emitted exactly once (PR #1650 review): the
+/// composed message (`"session/prompt: "` + the shared login message) must
+/// start with `PROMPT_AUTH_REQUIRED_PREFIX` for every provider the runtime
+/// can demote, and only that `InvalidParams` shape classifies.
+#[test]
+fn prompt_auth_required_turn_error_matches_mapped_shape() {
+    use intent_core::Error;
+    for id in ["auggie", "claude-code", "codex", "opencode", "droid", "pi"] {
+        let msg = format!(
+            "session/prompt: {}",
+            crate::provider_auth::not_authenticated_message(id)
+        );
+        assert!(
+            msg.starts_with(super::PROMPT_AUTH_REQUIRED_PREFIX),
+            "{id}: {msg}"
+        );
+        assert!(
+            super::prompt_auth_required_turn_error(&Error::InvalidParams(msg)),
+            "{id}"
+        );
+    }
+    // Other InvalidParams shapes, mid-string mentions, and Internal errors
+    // never classify — they still need the worker-emitted event pair.
+    for err in [
+        Error::InvalidParams("agent.create: provider \"pi\" is not authenticated".into()),
+        Error::InvalidParams(format!(
+            "bad params: {}session/prompt: provider \"pi\"",
+            "prefix "
+        )),
+        Error::Internal(format!(
+            "session/prompt: {}",
+            crate::provider_auth::not_authenticated_message("pi")
+        )),
+    ] {
+        assert!(!super::prompt_auth_required_turn_error(&err), "{err:?}");
+    }
+}
+
+/// The auth-required `session/load` mapping is recognized by
+/// `load_auth_required_error` so `AgentManager::start_session` propagates the
+/// actionable login error instead of falling through to recreate (PR #1650
+/// review): the composed message (`"session/load: "` + the shared login
+/// message) must start with `LOAD_AUTH_REQUIRED_PREFIX` for every demotable
+/// provider, and only that `InvalidParams` shape classifies.
+#[test]
+fn load_auth_required_error_matches_mapped_shape() {
+    use intent_core::Error;
+    for id in ["auggie", "claude-code", "codex", "opencode", "droid", "pi"] {
+        let msg = format!(
+            "session/load: {}",
+            crate::provider_auth::not_authenticated_message(id)
+        );
+        assert!(
+            msg.starts_with(super::LOAD_AUTH_REQUIRED_PREFIX),
+            "{id}: {msg}"
+        );
+        assert!(
+            super::load_auth_required_error(&Error::InvalidParams(msg)),
+            "{id}"
+        );
+    }
+    // Ordinary load failures (the Internal wrapper) and other InvalidParams
+    // shapes never classify — start_session still falls through to recreate.
+    for err in [
+        Error::Internal("session/load failed: transport closed".into()),
+        Error::InvalidParams(format!(
+            "session/prompt: {}",
+            crate::provider_auth::not_authenticated_message("pi")
+        )),
+    ] {
+        assert!(!super::load_auth_required_error(&err), "{err:?}");
+    }
 }

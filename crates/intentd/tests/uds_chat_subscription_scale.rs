@@ -187,6 +187,7 @@ fn seed_workspace(idx: usize) -> Workspace {
         waiting: false,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

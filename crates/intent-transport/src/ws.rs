@@ -27,7 +27,7 @@ use intent_services::EventBus;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
@@ -38,11 +38,12 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role, WebSoc
 use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::WebSocketStream;
 
+use crate::accept_backoff::{sleep_unless_shutdown, AcceptBackoff, AcceptFailure};
 use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenStore};
 use crate::conn::{self, ConnSubs};
 use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
-use crate::reverse::{PrimaryReverseRegistry, ReverseChannel};
+use crate::reverse::{PrimaryReverseRegistry, ReverseChannel, ReverseTransport};
 use crate::rpc_limit::RpcLimiter;
 use crate::tls::TlsCertificate;
 
@@ -80,6 +81,12 @@ pub struct WsOptions {
     /// `/tunnel` caps and timeouts; defaults are production values, tests
     /// shrink them to exercise idle/connect/forward timeout behavior.
     pub tunnel_limits: crate::tunnel::TunnelLimits,
+    /// Test-only seam: when set, a closing connection's loop parks after it
+    /// has left the reverse registry and before the rest of its cleanup runs,
+    /// until the watched value becomes `true`. Lets a test hold that window
+    /// open deterministically (e.g. to register a same-client reconnect inside
+    /// it) instead of racing it. `None` (production) parks nowhere.
+    pub cleanup_gate: Option<watch::Receiver<bool>>,
 }
 
 impl Default for WsOptions {
@@ -94,6 +101,7 @@ impl Default for WsOptions {
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
             rpc_limiter: RpcLimiter::unlimited(),
             tunnel_limits: crate::tunnel::TunnelLimits::default(),
+            cleanup_gate: None,
         }
     }
 }
@@ -165,6 +173,8 @@ pub(crate) struct WsInner {
     pub rpc_limiter: RpcLimiter,
     /// `/tunnel` caps and timeouts (from [`WsOptions::tunnel_limits`]).
     pub tunnel_limits: crate::tunnel::TunnelLimits,
+    /// Test-only post-deregistration gate (from [`WsOptions::cleanup_gate`]).
+    pub cleanup_gate: Option<watch::Receiver<bool>>,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -215,6 +225,7 @@ impl WsApiServer {
             control,
             rpc_limiter: options.rpc_limiter,
             tunnel_limits: options.tunnel_limits,
+            cleanup_gate: options.cleanup_gate,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -253,6 +264,7 @@ impl WsApiServer {
             control,
             rpc_limiter: options.rpc_limiter,
             tunnel_limits: options.tunnel_limits,
+            cleanup_gate: options.cleanup_gate,
         };
         Self {
             inner: Arc::new(inner),
@@ -377,18 +389,23 @@ impl WsInner {
     /// configured the raw TCP stream is first wrapped in TLS (production posture,
     /// `wss://`); in insecure dev mode the plain TCP stream drives the HTTP
     /// upgrade directly (`ws://`). A failed accept is logged, never fatal
-    /// (post-bind durable error handler). Dropping the listener on exit frees
-    /// the port before `stop()` returns.
+    /// (post-bind durable error handler); descriptor exhaustion backs off with
+    /// jitter instead of spinning (intent-hq/intent#4390). Dropping the
+    /// listener on exit frees the port before `stop()` returns.
     pub(crate) async fn accept_loop(
         self: Arc<Self>,
         listener: TcpListener,
         mut shutdown: oneshot::Receiver<()>,
     ) {
+        let mut backoff = AcceptBackoff::default();
         loop {
             tokio::select! {
                 _ = &mut shutdown => break,
                 accepted = listener.accept() => match accepted {
                     Ok((tcp, _peer)) => {
+                        if let Some(failures) = backoff.on_success() {
+                            tracing::info!(failures, "ws accept recovered");
+                        }
                         let me = self.clone();
                         tokio::spawn(async move {
                             let _ = tcp.set_nodelay(true);
@@ -404,7 +421,22 @@ impl WsInner {
                             }
                         });
                     }
-                    Err(e) => tracing::warn!(error = %e, "ws accept failed"),
+                    Err(e) => match backoff.on_error(&e) {
+                        AcceptFailure::Backoff { delay, streak, warn } => {
+                            if warn {
+                                tracing::warn!(
+                                    error = %e,
+                                    streak,
+                                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                                    "ws accept failed: out of descriptors, backing off"
+                                );
+                            }
+                            if sleep_unless_shutdown(delay, &mut shutdown).await {
+                                break;
+                            }
+                        }
+                        AcceptFailure::Other => tracing::warn!(error = %e, "ws accept failed"),
+                    },
                 }
             }
         }
@@ -667,12 +699,16 @@ impl WsInner {
         let mut subs = ConnSubs::default();
         let mut forwards = ForwardRegistry::default();
         let reverse = ReverseChannel::new(app_tx.priority_sender());
-        // REV-1: register this connection's reverse channel with the shared
-        // primary-target set so agent-initiated `browser.exec` calls can route
-        // to whichever client connected first. Guard drops when this loop
-        // returns (normal exit, remote close, heartbeat timeout, shutdown), so
-        // failover is exactly the connection arrival order.
-        let _reverse_guard = self.reverse_registry.register(reverse.clone());
+        // REV-2: register this connection's reverse channel with the shared
+        // target registry; it becomes an eligible `browser.exec` target once
+        // `client.hello` binds an identity advertising `browserExec`. The
+        // guard drops when this loop exits (normal exit, remote close,
+        // shutdown), on panic-unwind, AND when the heartbeat reaper aborts
+        // this task — the registry announces `client:disconnected` for a
+        // departed logical client on every one of those paths.
+        let reverse_guard = self
+            .reverse_registry
+            .register(reverse.clone(), ReverseTransport::Wss);
         // Per-connection logical-client binding (§16): `None` until `client.hello`.
         let mut client_id: Option<intent_core::ClientId> = None;
         loop {
@@ -703,7 +739,7 @@ impl WsInner {
                         // Wrap in connection context (is_tcp=true for WSS) so server.*
                         // RPCs gate on real origin, not the locality flag (§5.2).
                         let frame_ok = crate::context::with_connection_context(true, async {
-                            conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, self.control.as_ref(), self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local, &self.rpc_limiter).await
+                            conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, &reverse_guard, self.control.as_ref(), self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local, &self.rpc_limiter).await
                         }).await;
                         if !frame_ok {
                             break;
@@ -757,6 +793,10 @@ impl WsInner {
         drop(subs);
         drop(forwards);
         reverse.close();
+        drop(reverse_guard);
+        if let Some(mut gate) = self.cleanup_gate.clone() {
+            let _ = gate.wait_for(|open| *open).await;
+        }
         let _ = sink.close().await;
         self.deregister(id);
     }

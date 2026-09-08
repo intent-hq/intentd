@@ -964,6 +964,14 @@ async fn task_block_author_list_assign_flow_over_wss() {
         json!(task_id),
         "assign updated: {evt}"
     );
+    // The in_progress status materializes onto the parent's linked checkbox
+    // line (`[ ]` → `[/]`), which takes its own `note:updated`.
+    let evt = next_event(&mut sub, &["note:updated"], 10).await;
+    assert_eq!(
+        evt["data"]["noteId"],
+        json!(parent_id),
+        "parent materialized: {evt}"
+    );
 
     let evt = next_event(&mut sub, &["task:status-changed"], 10).await;
     assert_eq!(evt["data"]["noteId"], json!(task_id));
@@ -1003,6 +1011,64 @@ async fn task_block_author_list_assign_flow_over_wss() {
     )
     .await;
     assert_eq!(got["task"]["status"], json!("in_progress"), "task: {got}");
+
+    // The parent's linked row now reads the materialized in-progress char.
+    let tasks = wss_rpc(
+        &mut rpc,
+        6,
+        "note.listTasks",
+        json!({ "workspaceId": ws_id, "noteId": parent_id }),
+    )
+    .await;
+    assert_eq!(tasks[0]["status"], json!("in-progress"), "rows: {tasks}");
+    assert_eq!(tasks[0]["taskNoteId"], json!(task_id));
+
+    // Complete: a checkbox-level write on the parent's linked line redirects
+    // to the task note (intent-hq/intent#4255) — the task transitions
+    // in_progress → complete and the parent char follows via materialization.
+    let done = wss_rpc(
+        &mut rpc,
+        7,
+        "task.updateStatus",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": parent_id,
+            "taskText": "Ship It",
+            "status": "done",
+        }),
+    )
+    .await;
+    assert_eq!(
+        done,
+        json!({ "ok": true, "noteId": parent_id, "taskText": "Ship It", "status": "done" }),
+        "updateStatus: {done}"
+    );
+    let evt = next_event(&mut sub, &["task:status-changed"], 10).await;
+    assert_eq!(evt["data"]["noteId"], json!(task_id), "redirected: {evt}");
+    assert_eq!(evt["data"]["previousStatus"], json!("in_progress"));
+    assert_eq!(evt["data"]["newStatus"], json!("complete"));
+    let evt = next_event(&mut sub, &["note:updated"], 10).await;
+    assert_eq!(
+        evt["data"]["noteId"],
+        json!(parent_id),
+        "parent materialized: {evt}"
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        8,
+        "task.get",
+        json!({ "workspaceId": ws_id, "taskNoteId": task_id }),
+    )
+    .await;
+    assert_eq!(got["task"]["status"], json!("complete"), "task: {got}");
+    let tasks = wss_rpc(
+        &mut rpc,
+        9,
+        "note.listTasks",
+        json!({ "workspaceId": ws_id, "noteId": parent_id }),
+    )
+    .await;
+    assert_eq!(tasks[0]["status"], json!("done"), "rows: {tasks}");
 }
 
 /// End-to-end `task:created` over WSS (docs/protocol/06-events.md §6.5): every path where a

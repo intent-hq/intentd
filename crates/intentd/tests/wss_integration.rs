@@ -18,8 +18,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
     now_iso, AgentReverseDispatch, ContentType, Note, NoteId, NoteMetadata, NoteVisibility,
-    Result as CoreResult, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    Result as CoreResult, ReverseTarget, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity,
+    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
 use intent_store::Store;
@@ -249,9 +249,19 @@ async fn start_with_auggie(opts: WsOptions, auggie_bin: Option<std::path::PathBu
 /// [`start_with_auggie`] with an optional persisted models-cache dir so
 /// `models.list` cache-fallback tests (§5.30) can seed a last-good entry.
 async fn start_with_auggie_and_models_cache(
+    opts: WsOptions,
+    auggie_bin: Option<std::path::PathBuf>,
+    models_cache_dir: Option<std::path::PathBuf>,
+) -> Server {
+    start_with_control(opts, auggie_bin, models_cache_dir, None).await
+}
+
+/// Build + start a WSS listener with an optional system control implementation.
+async fn start_with_control(
     mut opts: WsOptions,
     auggie_bin: Option<std::path::PathBuf>,
     models_cache_dir: Option<std::path::PathBuf>,
+    system_control: Option<Arc<dyn SystemControl>>,
 ) -> Server {
     let (api, bus, store, registry, dir) = make_services(auggie_bin, models_cache_dir).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
@@ -270,7 +280,7 @@ async fn start_with_auggie_and_models_cache(
         &token_store,
         opts,
         reverse_registry.clone(),
-        None,
+        system_control,
     )
     .expect("server");
     let cfg = client_config(&tls.fingerprint256);
@@ -350,6 +360,21 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).expect("json"),
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// One authenticated WSS round-trip preserving the literal response bytes.
+async fn wss_call_text(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> String {
+    let mut ws = connect_ws(port, cfg).await;
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send");
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => return text.to_string(),
             Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
@@ -985,7 +1010,7 @@ async fn wss_oversized_message_terminates_connection() {
 #[tokio::test]
 async fn wss_agent_create_rejects_client_supplied_agent_id() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1113,7 +1138,7 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
 #[tokio::test]
 async fn wss_agent_lite_omits_initial_message() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1241,7 +1266,7 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
     }
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1484,7 +1509,7 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     }
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1805,7 +1830,7 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
 async fn wss_agent_list_caps_previews_get_serves_full() {
     const BUDGET: usize = intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES;
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1959,12 +1984,17 @@ async fn wss_agent_list_caps_previews_get_serves_full() {
 /// `tokenUsage` entirely (absent, never null) and archived rows additionally
 /// omit `agentSummary`, while active rows keep it; the `workspace.subscribe`
 /// seq-0 snapshot rows omit `tokenUsage` the same way; `workspace.get` keeps
-/// both fields for detail reads, archived included.
+/// both fields for detail reads, archived included. The active row's
+/// `agentSummary.agents[]` also carries the additive `isBackground` flag
+/// (monorepo#3789): `true` for a background session, omitted for foreground.
 #[tokio::test]
 async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     use std::collections::BTreeMap;
 
-    use intent_core::{AgentId, AgentSession, AgentStatus, TokenUsage, TokenUsageTotals};
+    use intent_core::{
+        AgentId, AgentSession, AgentStatus, Hook, HookId, HookState, PrMonitor, PrMonitorId,
+        PrMonitorState, TokenUsage, TokenUsageTotals,
+    };
 
     let srv = start(WsOptions::default()).await;
 
@@ -1996,6 +2026,8 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     };
     let ws_active = WorkspaceId::new();
     let mut active = fixture_workspace(&ws_active);
+    active.created_at = "2026-01-01T00:00:00Z".to_string();
+    active.updated_at = active.created_at.clone();
     active.token_usage = Some(usage.clone());
     srv.store
         .insert_workspace(&active)
@@ -2003,6 +2035,8 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         .expect("insert active workspace");
     let ws_archived = WorkspaceId::new();
     let mut archived = fixture_workspace(&ws_archived);
+    archived.created_at = "2026-01-02T00:00:00Z".to_string();
+    archived.updated_at = archived.created_at.clone();
     archived.archived = true;
     archived.archived_at = Some(now_iso());
     archived.token_usage = Some(usage);
@@ -2057,14 +2091,90 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         pending_delete_at: None,
         retired_at: None,
     };
+    let mut active_session = mk_session("agent-slim-a", &ws_active);
+    active_session.metadata = Some(serde_json::json!({
+        "pendingQuestionsMessageId": "msg-pending"
+    }));
     srv.store
-        .insert_agent_session(&mk_session("agent-slim-a", &ws_active))
+        .insert_agent_session(&active_session)
         .await
         .expect("insert active-workspace session");
     srv.store
         .insert_agent_session(&mk_session("agent-slim-b", &ws_archived))
         .await
         .expect("insert archived-workspace session");
+    let mut background = mk_session("agent-slim-bg", &ws_active);
+    background.is_background = true;
+    srv.store
+        .insert_agent_session(&background)
+        .await
+        .expect("insert background active-workspace session");
+    srv.store
+        .append_agent_message_with_id(
+            &active_session.id,
+            "msg-pending",
+            "assistant",
+            &serde_json::json!([
+                { "type": "text", "text": "I have a question." },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "intent-question://shape-test",
+                        "mimeType": "application/vnd.intent.question+json",
+                        "text": "{\"question\":\"?\"}"
+                    }
+                }
+            ]),
+            None,
+            "2026-01-03T00:00:00Z",
+        )
+        .await
+        .expect("append pending question message");
+    srv.store
+        .insert_hook(&Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws_active.clone(),
+            agent_id: active_session.id.clone(),
+            name: "shape hook".to_string(),
+            code: "return { dispatch: false };".to_string(),
+            delay_ms: 10_000,
+            cron: None,
+            run_at: None,
+            state: HookState::Scheduled,
+            created_at: "2026-01-03T00:00:00Z".to_string(),
+            last_run_at: None,
+            next_run_at: Some("2026-01-03T01:00:00Z".to_string()),
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some("2026-01-04T00:00:00Z".to_string()),
+            perpetual: false,
+            dispatch_count: 0,
+        })
+        .await
+        .expect("insert active hook");
+    srv.store
+        .insert_pr_monitor(&PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: ws_archived.clone(),
+            agent_id: AgentId("agent-slim-b".to_string()),
+            repo_owner: "acme".to_string(),
+            repo_name: "widgets".to_string(),
+            pr_number: 7,
+            state: PrMonitorState::Active,
+            last_snapshot: None,
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: "2026-01-03T00:00:00Z".to_string(),
+            updated_at: "2026-01-03T00:00:00Z".to_string(),
+        })
+        .await
+        .expect("insert active PR monitor");
 
     // workspace.list (includeArchived): tokenUsage absent on every row;
     // agentSummary absent on the archived row, present on the active one.
@@ -2085,6 +2195,13 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         .iter()
         .find(|w| w["id"] == ws_archived.0.as_str())
         .expect("archived row");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![ws_active.0.as_str(), ws_archived.0.as_str()],
+        "workspace.list preserves store ordering"
+    );
     assert!(
         row_active.get("tokenUsage").is_none(),
         "list rows omit tokenUsage (monorepo#3041): {row_active}"
@@ -2100,6 +2217,57 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     assert!(
         row_archived.get("agentSummary").is_none(),
         "archived list rows omit agentSummary (monorepo#3041): {row_archived}"
+    );
+    // `isBackground` on agentSummary rows (monorepo#3789): present `true` for
+    // the background session, absent (never `false`) for the foreground one —
+    // asserted on every surface that serves the active workspace's summary
+    // (`workspace.list` here, `workspace.get` below).
+    let assert_is_background_rows = |ws: &Value, surface: &str| {
+        let summary_agents = ws["agentSummary"]["agents"]
+            .as_array()
+            .expect("agentSummary.agents array");
+        let fg = summary_agents
+            .iter()
+            .find(|a| a["id"] == "agent-slim-a")
+            .expect("foreground agent row");
+        let bg = summary_agents
+            .iter()
+            .find(|a| a["id"] == "agent-slim-bg")
+            .expect("background agent row");
+        assert!(
+            fg.get("isBackground").is_none(),
+            "{surface}: foreground agentSummary row omits isBackground: {fg}"
+        );
+        assert_eq!(
+            bg["isBackground"], true,
+            "{surface}: background agentSummary row carries isBackground: {bg}"
+        );
+    };
+    assert_is_background_rows(row_active, "workspace.list");
+    assert_eq!(
+        row_active["attention"], "unread",
+        "batch unread signal: {row_active}"
+    );
+    assert_eq!(
+        row_active["displayStatus"], "needs_attention",
+        "pending-question marker survives bulk session enrichment: {row_active}"
+    );
+    assert_eq!(
+        row_active["waiting"], true,
+        "active hook signal: {row_active}"
+    );
+    assert_eq!(
+        row_archived["waiting"], true,
+        "active PR-monitor signal: {row_archived}"
+    );
+    assert_eq!(
+        row_active["tags"],
+        serde_json::json!([]),
+        "empty sets stay arrays"
+    );
+    assert!(
+        row_active.get("pullRequests").is_none(),
+        "optional empty field stays omitted"
     );
 
     // workspace.get keeps both fields for detail reads — archived included.
@@ -2122,6 +2290,9 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
             ws["agentSummary"].is_object(),
             "workspace.get keeps agentSummary: {ws}"
         );
+        if ws_id == &ws_active {
+            assert_is_background_rows(ws, "workspace.get");
+        }
     }
 
     // workspace.subscribe seq-0 snapshot (lite list path, global channel —
@@ -2161,6 +2332,14 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     assert_eq!(snap["params"]["kind"], "snapshot", "{snap}");
     assert_eq!(snap["params"]["seq"], 0, "{snap}");
     let snap_rows = snap["params"]["snapshot"].as_array().expect("snapshot");
+    assert_eq!(
+        snap_rows
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![ws_active.0.as_str(), ws_archived.0.as_str()],
+        "workspace.subscribe preserves store ordering"
+    );
     for ws_id in [&ws_active, &ws_archived] {
         let row = snap_rows
             .iter()
@@ -2170,7 +2349,21 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
             row.get("tokenUsage").is_none(),
             "seq-0 snapshot rows omit tokenUsage (monorepo#3041): {row}"
         );
+        assert_eq!(
+            row["waiting"], true,
+            "batched hook/PR waiting signal: {row}"
+        );
     }
+    let active_snap = snap_rows
+        .iter()
+        .find(|row| row["id"] == ws_active.0.as_str())
+        .unwrap();
+    assert_eq!(active_snap["attention"], "unread");
+    assert_eq!(active_snap["displayStatus"], "needs_attention");
+    assert!(
+        active_snap.get("agentSummary").is_none(),
+        "lite shape stays slim"
+    );
 
     srv.ws.stop().await;
 }
@@ -2182,7 +2375,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
 #[tokio::test]
 async fn wss_agent_send_message_rejects_unknown_agent() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2258,7 +2451,7 @@ async fn wss_agent_send_message_rejects_unknown_agent() {
 #[tokio::test]
 async fn wss_agent_queue_message_rejects_unknown_agent() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2335,7 +2528,7 @@ async fn wss_agent_queue_message_rejects_unknown_agent() {
 #[tokio::test]
 async fn wss_agent_diagnostics_reports_queue_snapshots() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2440,7 +2633,7 @@ async fn wss_agent_diagnostics_flags_stale_queue_entry() {
             .expect("load settings registry"),
     );
     registry
-        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
         .expect("seed default provider");
     let services = Services::new(store.clone())
         .with_assets_root(dir.path().join("assets"))
@@ -2575,7 +2768,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
             .expect("load settings registry"),
     );
     registry
-        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
         .expect("seed default provider");
     let services = Services::new(store.clone())
         .with_assets_root(dir.path().join("assets"))
@@ -2670,7 +2863,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
 #[tokio::test]
 async fn wss_agent_create_and_set_model_reject_unknown_provider() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2787,6 +2980,132 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
         got["result"]["agent"]["model"], model_before,
         "model must be unchanged after the rejected setModel: {got}"
     );
+
+    srv.ws.stop().await;
+}
+
+/// Legacy compound rows serialize SPLIT over the real WSS transport
+/// (migration 0113 + the read backstop): a row seeded directly in the DB
+/// with a compound `provider:model` id — as an older daemon could have
+/// persisted it — comes back from `agent.get` and `agent.list` with the
+/// bare model and the prefix-won provider; no wire payload ever carries a
+/// colon-compound model id. An effort-lookalike bare id (`opus[1m]`) passes
+/// through untouched.
+#[tokio::test]
+async fn wss_agent_reads_serialize_legacy_compound_rows_split() {
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Compound Split"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Seed the legacy rows straight into the store — the wire hard-rejects
+    // compound ids (-32602), so only a pre-0113 daemon could have written
+    // them. Bypassing the RPC layer is the point: prove the READ path splits.
+    let create_agent = |name: &str, id: i64| {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"{name}"}}}}"#
+        );
+        let port = srv.port;
+        let cfg = srv.cfg.clone();
+        async move {
+            let created = wss_call(port, cfg, &frame).await;
+            created["result"]["agent"]["id"]
+                .as_str()
+                .expect("agent id")
+                .to_string()
+        }
+    };
+    let compound_id = create_agent("Legacy", 2).await;
+    let bare_id = create_agent("Bare", 3).await;
+    sqlx::query("UPDATE agent_session SET model = 'anthropic:claude-opus-4', provider = 'stale' WHERE id = ?")
+        .bind(&compound_id)
+        .execute(srv.store.write_pool())
+        .await
+        .expect("seed compound row");
+    sqlx::query(
+        "UPDATE agent_session SET model = 'opus[1m]', provider = 'claude-code' WHERE id = ?",
+    )
+    .bind(&bare_id)
+    .execute(srv.store.write_pool())
+    .await
+    .expect("seed effort-lookalike row");
+
+    // agent.get: the compound row serializes split — prefix wins provider.
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.get","params":{{"agentId":"{compound_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["agent"]["model"],
+        Value::from("claude-opus-4"),
+        "agent.get must serialize the split model: {got}"
+    );
+    assert_eq!(
+        got["result"]["agent"]["provider"],
+        Value::from("anthropic"),
+        "agent.get must serialize the prefix-won provider: {got}"
+    );
+
+    // agent.list: same split on the summary projection, and the
+    // effort-lookalike bare id passes through untouched.
+    let listed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let agents = listed["result"]["agents"].as_array().expect("agents");
+    let by_id = |id: &str| {
+        agents
+            .iter()
+            .find(|a| a["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("agent {id} in list: {listed}"))
+    };
+    let compound = by_id(&compound_id);
+    assert_eq!(
+        compound["model"],
+        Value::from("claude-opus-4"),
+        "agent.list must serialize the split model: {listed}"
+    );
+    assert_eq!(
+        compound["provider"],
+        Value::from("anthropic"),
+        "agent.list must serialize the prefix-won provider: {listed}"
+    );
+    let bare = by_id(&bare_id);
+    assert_eq!(
+        bare["model"],
+        Value::from("opus[1m]"),
+        "effort-lookalike bare id must pass through untouched: {listed}"
+    );
+    assert_eq!(
+        bare["provider"],
+        Value::from("claude-code"),
+        "bare id must not disturb the provider: {listed}"
+    );
+
+    // No wire payload carries a compound id.
+    for agent in agents {
+        let model = agent["model"].as_str().unwrap_or_default();
+        assert!(
+            !model.contains(':'),
+            "no listed agent may serve a compound model id: {listed}"
+        );
+    }
 
     srv.ws.stop().await;
 }
@@ -3243,7 +3562,7 @@ async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
 #[tokio::test]
 async fn wss_agent_create_widened_params_round_trip() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3367,7 +3686,7 @@ async fn wss_agent_mark_seen_round_trip() {
         }
     }
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3579,7 +3898,7 @@ async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
         .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
     }
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3724,7 +4043,7 @@ async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
 #[tokio::test]
 async fn wss_agent_session_shape_rpcs_round_trip() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3999,7 +4318,7 @@ async fn wss_agent_reasoning_effort_round_trip() {
 #[tokio::test]
 async fn wss_agent_delegate_persists_reasoning_effort() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     // Hermeticity (monorepo#3162): point discovery at a deterministic
     // executable so the delegate availability check passes without a real
     // auggie on the test host.
@@ -4088,7 +4407,7 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
         Some(dir.path().to_path_buf()),
     )
     .await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -4186,7 +4505,8 @@ async fn wss_agent_create_applies_settings_default_reasoning_effort() {
         Some(dir.path().to_path_buf()),
     )
     .await;
-    srv.set_setting("model.default", serde_json::json!("auggie:fable-5"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    srv.set_setting("model.default", serde_json::json!("fable-5"));
     srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
     let created_ws = wss_call(
         srv.port,
@@ -4205,7 +4525,7 @@ async fn wss_agent_create_applies_settings_default_reasoning_effort() {
     let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert_eq!(
         created["result"]["agent"]["model"],
-        Value::from("auggie:fable-5"),
+        Value::from("fable-5"),
         "settings default model pinned: {created}"
     );
     assert_eq!(
@@ -4301,7 +4621,7 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
         Some(dir.path().to_path_buf()),
     )
     .await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
     let created_ws = wss_call(
         srv.port,
@@ -4335,7 +4655,7 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
     );
 
     // A configured settings default outranks the catalog rung.
-    srv.set_setting("model.default", serde_json::json!("auggie:fable-5"));
+    srv.set_setting("model.default", serde_json::json!("fable-5"));
     let frame = format!(
         r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Settings wins"}}}}"#
     );
@@ -4344,7 +4664,7 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
     assert_eq!(created["id"], 3);
     assert_eq!(
         created["result"]["agent"]["model"],
-        Value::from("auggie:fable-5"),
+        Value::from("fable-5"),
         "the settings chain outranks the catalog default: {created}"
     );
 
@@ -4467,6 +4787,7 @@ async fn wss_providers_catalog_round_trip() {
             "pi",
             "droid",
             "grok",
+            "antigravity",
             "mock"
         ],
         "one row per registry entry, registry order: {resp}"
@@ -4520,7 +4841,10 @@ async fn wss_providers_catalog_round_trip() {
 
     // mock's env-var gate passes the raw field through regardless of the
     // daemon environment.
-    let mock = &providers[9];
+    let mock = providers
+        .iter()
+        .find(|provider| provider["id"] == "mock")
+        .unwrap();
     assert_eq!(
         mock["requiresEnvVar"].as_str(),
         Some("MOCK_AGENT_SCRIPT_PATH")
@@ -5726,7 +6050,7 @@ async fn wss_agent_enhance_prompt_round_trip() {
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
     // Provider-neutrality: set auggie as active provider (these operations are auggie-specific).
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
 
     let resp = wss_call(
         srv.port,
@@ -5769,7 +6093,7 @@ async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
         "printf '🤖\\n<augment-enhanced-prompt>never runs</augment-enhanced-prompt>\\n'",
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("claude-code"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5791,8 +6115,8 @@ async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
 #[cfg(unix)]
 #[tokio::test]
 async fn wss_agent_enhance_prompt_unavailable_when_settings_unset() {
-    // Gate closed on unset settings: with neither `model.default` nor
-    // `providers.active` configured, the derived default is undecidable and
+    // Gate closed on unset settings: with `model.defaultProvider` not
+    // configured, the derived default is undecidable and
     // the gate must resolve CLOSED — falling through to the first registered
     // provider would always be auggie and functionally reinstate the removed
     // hardcoded default (coordinator ruling; matches FE #759 where unset
@@ -5822,21 +6146,22 @@ async fn wss_agent_enhance_prompt_unavailable_when_settings_unset() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn wss_agent_enhance_prompt_model_default_prefix_outranks_active() {
-    // Gate precedence: the effective provider derives from the `model.default`
-    // compound prefix FIRST, then `providers.active`. Both directions:
-    // a non-auggie prefix closes the gate even with auggie active, and an
-    // auggie prefix opens it even with a non-auggie active provider. An
-    // unknown prefix is not trusted — it falls through to `providers.active`.
+async fn wss_agent_enhance_prompt_gate_follows_model_default_provider() {
+    // Gate precedence: the effective provider derives from
+    // `model.defaultProvider` alone — `model.default` is a bare model id and
+    // never carries a provider. Both directions: a non-auggie default
+    // provider closes the gate regardless of `model.default`, and an auggie
+    // one opens it. An unknown default provider is not trusted → closed.
     let (_auggie_dir, bin) = fake_auggie_script(
         "prefix-enhance",
         "printf '🤖\\n<augment-enhanced-prompt>Enhanced: via prefix</augment-enhanced-prompt>\\n'",
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
 
-    // Direction 1: claude-code prefix outranks auggie active → gate closes.
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
-    srv.set_setting("model.default", serde_json::json!("claude-code:sonnet4.5"));
+    // Direction 1: claude-code default provider → gate closes; the
+    // `model.default` value is irrelevant to provider derivation.
+    srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
+    srv.set_setting("model.default", serde_json::json!("sonnet4.5"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5850,12 +6175,11 @@ async fn wss_agent_enhance_prompt_model_default_prefix_outranks_active() {
             "available": false,
             "reason": "enhance-prompt requires auggie as the effective default provider"
         }),
-        "non-auggie model.default prefix outranks auggie providers.active"
+        "non-auggie model.defaultProvider closes the gate"
     );
 
-    // Direction 2: auggie prefix outranks claude-code active → gate passes.
-    srv.set_setting("providers.active", serde_json::json!("claude-code"));
-    srv.set_setting("model.default", serde_json::json!("auggie:sonnet4.5"));
+    // Direction 2: auggie default provider → gate passes.
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5865,12 +6189,11 @@ async fn wss_agent_enhance_prompt_model_default_prefix_outranks_active() {
     assert_eq!(resp["id"], 38);
     assert_eq!(
         resp["result"]["enhanced"], "Enhanced: via prefix",
-        "auggie model.default prefix outranks non-auggie providers.active"
+        "auggie model.defaultProvider opens the gate"
     );
 
-    // Unknown prefix: falls through to providers.active (auggie) → gate passes.
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
-    srv.set_setting("model.default", serde_json::json!("typo:foo"));
+    // An unknown model.defaultProvider is not trusted → gate closes.
+    srv.set_setting("model.defaultProvider", serde_json::json!("typo"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5879,8 +6202,9 @@ async fn wss_agent_enhance_prompt_model_default_prefix_outranks_active() {
     .await;
     assert_eq!(resp["id"], 39);
     assert_eq!(
-        resp["result"]["enhanced"], "Enhanced: via prefix",
-        "unknown model.default prefix falls through to providers.active"
+        resp["result"]["available"],
+        serde_json::json!(false),
+        "unknown model.defaultProvider closes the gate"
     );
     srv.ws.stop().await;
 }
@@ -5892,7 +6216,7 @@ async fn wss_agent_enhance_prompt_parse_failure_is_internal_error() {
     // the documented -32603 parse failure (§5.31).
     let (_auggie_dir, bin) = fake_auggie_script("notags", "printf '🤖\\nno tags here\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5917,7 +6241,7 @@ async fn wss_agent_enhance_prompt_cli_missing_is_internal_error() {
         Some(std::path::PathBuf::from("/nonexistent/intentd-wss/auggie")),
     )
     .await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5971,7 +6295,7 @@ async fn wss_agent_complete_once_round_trip() {
         "printf '\u{1b}[32m🔧 Tool call: noise\u{1b}[0m\\n🤖\\nfix-login-flow\\n'",
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
 
     let resp = wss_call(
         srv.port,
@@ -6023,7 +6347,7 @@ async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() 
     let (_adapter_dir, bin) =
         fake_acp_adapter_script("complete", r#"{"response":"🤖\nfix-login-flow"}"#);
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("codex"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
     srv.set_setting(
         "providers.paths",
         serde_json::json!({ "codex": bin.to_string_lossy() }),
@@ -6058,7 +6382,7 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
     std::fs::write(&bin, "#!/bin/sh\nexit 9\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("codex"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
     srv.set_setting(
         "providers.paths",
         serde_json::json!({ "codex": bin.to_string_lossy() }),
@@ -6074,6 +6398,255 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
     assert_eq!(resp["error"]["code"], -32603);
     let data = resp["error"]["data"].as_str().unwrap_or_default();
     assert!(data.starts_with("codex: "), "unexpected data: {data}");
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
+    // host.providerTestPrompt (§5.14) over the real wire, both terminal
+    // shapes against the mock ACP fixture. A provider whose adapter answers
+    // the live "say hello" turn is `{ ok: true }` and the cached
+    // host.providerAuthStatus verdict is promoted to a hard `true`; an
+    // adapter that rejects session/prompt with an auth-required JSON-RPC
+    // error is `{ ok: false, reason: "auth-required" }` and the verdict is
+    // demoted to `false` — observed here through non-forced
+    // host.providerAuthStatus reads, which serve the cache before any probe.
+    //
+    // One sequential test (not two) because the daemon runs in-process and
+    // the auth-verdict cache is process-global: two parallel tests promoting
+    // and demoting the same provider would race each other's assertions.
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping providerTestPrompt e2e: node not on PATH");
+        return;
+    }
+    let (_ok_dir, ok_bin) = fake_acp_adapter_script("test-prompt-ok", r#"{"response":"hello"}"#);
+    let (_auth_dir, auth_bin) = fake_acp_adapter_script(
+        "test-prompt-auth",
+        r#"{"promptRpcError":{"code":-32000,"message":"Authentication required"}}"#,
+    );
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "codex": ok_bin.to_string_lossy() }),
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":70,"method":"host.providerTestPrompt","params":{"providerId":"codex"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 70);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({ "ok": true }),
+        "a live answered turn is a bare pass: {resp}"
+    );
+    let status = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":71,"method":"host.providerAuthStatus","params":{"providerId":"codex"}}"#,
+    )
+    .await;
+    assert_eq!(
+        status["result"]["providers"][0]["authenticated"], true,
+        "a passed test prompt promotes the cached verdict: {status}"
+    );
+
+    // Same provider, now behind an adapter that rejects the prompt with the
+    // claude-code auth-required shape (-32000 + auth-pattern message).
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "codex": auth_bin.to_string_lossy() }),
+    );
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":72,"method":"host.providerTestPrompt","params":{"providerId":"codex"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 72);
+    assert_eq!(resp["result"]["ok"], false);
+    assert_eq!(
+        resp["result"]["reason"], "auth-required",
+        "the -32000/auth-pattern mapping from the spawn-feedback seam: {resp}"
+    );
+    assert!(
+        resp["result"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("authentication required"),
+        "message carries the adapter's error: {resp}"
+    );
+    let status = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":73,"method":"host.providerAuthStatus","params":{"providerId":"codex"}}"#,
+    )
+    .await;
+    assert_eq!(
+        status["result"]["providers"][0]["authenticated"], false,
+        "an auth-required test prompt demotes the cached verdict: {status}"
+    );
+    srv.ws.stop().await;
+}
+
+/// Like [`fake_acp_adapter_script`] but the wrapper also points the fixture's
+/// `MOCK_AGENT_SESSION_LOG` seam at `session_log`, so the test can read back
+/// the `NODE_OPTIONS` the daemon handed the child (the fixture records it on
+/// every `session/new`).
+#[cfg(unix)]
+fn fake_acp_adapter_script_with_session_log(
+    tag: &str,
+    behavior: &str,
+    session_log: &Path,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = format!(
+        "{}/tests/fixtures/mock-acp-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let dir = test_tempdir(&format!("intentd-wss-acp-{tag}-"));
+    let bin = dir.path().join("opencode");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nMOCK_AGENT_BEHAVIOR='{behavior}' MOCK_AGENT_SESSION_LOG={:?} exec node {fixture:?} \"$@\"\n",
+            session_log.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, bin)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_acp_node_max_old_space_mb_setting_reaches_provider_test_prompt_child() {
+    // `agents.acpNodeMaxOldSpaceMb` (§5.12, intent-hq/intent#4330) over the
+    // real wire: the unset key reads back as `null` with the catalog default
+    // (8192) on the definition, an out-of-range update is `-32602`, and an
+    // in-range update lands as `NODE_OPTIONS=
+    // --max-old-space-size=<MB>` on the NEXT provider child — observed here
+    // via host.providerTestPrompt against a Node-runtime provider (opencode)
+    // pinned to the mock fixture, which records its inherited NODE_OPTIONS on
+    // `session/new`. This pins the wire shape end to end: `settings.get`
+    // reports Number settings as floats, so the host-side reader must parse
+    // `4096.0` — an integer-only read silently kept the default.
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping acpNodeMaxOldSpaceMb e2e: node not on PATH");
+        return;
+    }
+    let log_dir = test_tempdir("intentd-wss-heapcap-log-");
+    let session_log = log_dir.path().join("sessions.txt");
+    let (_adapter_dir, bin) = fake_acp_adapter_script_with_session_log(
+        "heap-cap",
+        r#"{"response":"hello"}"#,
+        &session_log,
+    );
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "opencode": bin.to_string_lossy() }),
+    );
+
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":80,"method":"settings.get","params":{"path":"agents.acpNodeMaxOldSpaceMb"}}"#,
+    )
+    .await;
+    assert_eq!(got["id"], 80);
+    assert_eq!(
+        got["result"]["value"],
+        Value::Null,
+        "unset key reads null (the spawn path resolves the catalog default): {got}"
+    );
+    assert_eq!(got["result"]["origin"], "default", "{got}");
+    assert_eq!(
+        got["result"]["definition"]["defaultValue"],
+        serde_json::json!(8192.0),
+        "catalog default on the wire: {got}"
+    );
+
+    let rejected = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":81,"method":"settings.update","params":{"changes":[{"path":"agents.acpNodeMaxOldSpaceMb","value":512}]}}"#,
+    )
+    .await;
+    assert_eq!(rejected["id"], 81);
+    assert_eq!(
+        rejected["error"]["code"], -32602,
+        "below the 1024 MB floor is invalid params: {rejected}"
+    );
+
+    let applied = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":82,"method":"settings.update","params":{"changes":[{"path":"agents.acpNodeMaxOldSpaceMb","value":4096}]}}"#,
+    )
+    .await;
+    assert_eq!(applied["id"], 82);
+    assert_eq!(
+        applied["result"]["applied"][0]["path"], "agents.acpNodeMaxOldSpaceMb",
+        "applied: {applied}"
+    );
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":83,"method":"settings.get","params":{"path":"agents.acpNodeMaxOldSpaceMb"}}"#,
+    )
+    .await;
+    assert_eq!(
+        got["result"]["value"],
+        serde_json::json!(4096.0),
+        "updated cap reads back as a float: {got}"
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":84,"method":"host.providerTestPrompt","params":{"providerId":"opencode"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 84);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({ "ok": true }),
+        "the probe turn against the mock passes: {resp}"
+    );
+
+    let raw = std::fs::read_to_string(&session_log).expect("mock session log written");
+    let lines: Vec<Value> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("session log line json"))
+        .collect();
+    assert_eq!(lines.len(), 1, "one session/new for the probe: {lines:?}");
+    assert_eq!(lines[0]["method"], "session/new");
+    // Both the env override and an inherited `NODE_OPTIONS` that already caps
+    // the heap legitimately win over the setting (the daemon never clobbers a
+    // parent cap), so the child-side assertion only holds in a clean env —
+    // same guard as the intent-acp spawn tests.
+    let parent_caps_heap = std::env::var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB").is_ok()
+        || std::env::var("NODE_OPTIONS").is_ok_and(|v| v.contains("--max-old-space-size"));
+    if parent_caps_heap {
+        eprintln!(
+            "skipping NODE_OPTIONS assertion: parent env already caps the heap ({:?})",
+            lines[0]["nodeOptions"]
+        );
+    } else {
+        let node_options = lines[0]["nodeOptions"]
+            .as_str()
+            .expect("probe child inherited NODE_OPTIONS");
+        assert!(
+            node_options.contains("--max-old-space-size=4096"),
+            "probe child NODE_OPTIONS carries the configured cap, got {node_options:?}"
+        );
+    }
     srv.ws.stop().await;
 }
 
@@ -6128,7 +6701,7 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
         n
     };
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("codex"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
     srv.set_setting(
         "providers.paths",
         serde_json::json!({ "codex": bin.to_string_lossy() }),
@@ -6248,7 +6821,7 @@ async fn wss_agent_complete_once_unavailable_when_adapter_unresolvable() {
         return;
     }
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("codex"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6274,7 +6847,7 @@ async fn wss_agent_complete_once_unavailable_when_provider_has_no_one_shot() {
     // `{ available: false, reason }` result instead of an error.
     let (_auggie_dir, bin) = fake_auggie_script("gated-complete", "printf '🤖\\nnever-runs\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("opencode"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("opencode"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6287,7 +6860,7 @@ async fn wss_agent_complete_once_unavailable_when_provider_has_no_one_shot() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "completeOnce is not supported for the effective default provider: opencode"
+            "reason": "completeOnce is not supported for the resolved provider: opencode"
         })
     );
     srv.ws.stop().await;
@@ -6319,16 +6892,17 @@ async fn wss_agent_complete_once_unavailable_when_settings_unset() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn wss_agent_complete_once_model_default_prefix_outranks_active() {
-    // Gate precedence mirror of the enhance-prompt test: `model.default`
-    // compound prefix outranks `providers.active` in both directions.
+async fn wss_agent_complete_once_gate_follows_model_default_provider() {
+    // Gate precedence mirror of the enhance-prompt test: the effective
+    // provider derives from `model.defaultProvider` alone — `model.default`
+    // is a bare model id and never carries a provider.
     let (_auggie_dir, bin) = fake_auggie_script("prefix-complete", "printf '🤖\\nvia-prefix\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
 
-    // Direction 1: an opencode prefix (no one-shot route) outranks auggie
-    // active → the auggie CLI path is not taken.
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
-    srv.set_setting("model.default", serde_json::json!("opencode:some-model"));
+    // Direction 1: an opencode default provider (no one-shot route) → the
+    // auggie CLI path is not taken, regardless of `model.default`.
+    srv.set_setting("model.defaultProvider", serde_json::json!("opencode"));
+    srv.set_setting("model.default", serde_json::json!("some-model"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6340,14 +6914,15 @@ async fn wss_agent_complete_once_model_default_prefix_outranks_active() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "completeOnce is not supported for the effective default provider: opencode"
+            "reason": "completeOnce is not supported for the resolved provider: opencode"
         }),
-        "non-auggie model.default prefix outranks auggie providers.active"
+        "non-auggie model.defaultProvider routes away from the auggie CLI"
     );
 
-    // Direction 2: auggie prefix outranks a non-auggie active provider.
-    srv.set_setting("providers.active", serde_json::json!("opencode"));
-    srv.set_setting("model.default", serde_json::json!("auggie:sonnet4.5"));
+    // Direction 2: an auggie default provider takes the CLI path. The
+    // configured foreign bare model is dropped by the ownership guard, so
+    // the CLI runs on its own default.
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6357,7 +6932,7 @@ async fn wss_agent_complete_once_model_default_prefix_outranks_active() {
     assert_eq!(resp["id"], 46);
     assert_eq!(
         resp["result"]["text"], "via-prefix",
-        "auggie model.default prefix outranks non-auggie providers.active"
+        "auggie model.defaultProvider takes the CLI path"
     );
     srv.ws.stop().await;
 }
@@ -6373,7 +6948,7 @@ async fn wss_agent_complete_once_resolves_quick_action_settings() {
     // observable in the `{ text }` envelope.
     let (_auggie_dir, bin) = fake_auggie_script("quick-actions", "printf '🤖\\n%s\\n' \"$*\"");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     srv.set_setting("quickActions.defaultModel", serde_json::json!("sonnet4.5"));
     srv.set_setting(
         "quickActions.typeOverrides",
@@ -6419,6 +6994,46 @@ async fn wss_agent_complete_once_resolves_quick_action_settings() {
     srv.ws.stop().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_provider() {
+    // A user-authored `quickActions.defaultModel = "codex:gpt-5"` (legacy
+    // compound; the wire rejects compounds but user files are never
+    // rejected) splits on read into a (codex, gpt-5) pair and routes the
+    // one-shot over the ephemeral ACP route — with `model.defaultProvider`
+    // left UNSET, proving a decidable compound rung opens the gate on its
+    // own instead of dying on the closed-gate path.
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping legacy compound quick-action e2e: node not on PATH");
+        return;
+    }
+    let (_adapter_dir, bin) =
+        fake_acp_adapter_script("compound-quick", r#"{"response":"🤖\ncompound-routed"}"#);
+    let srv = start(WsOptions::default()).await;
+    // Seed via reload() — the live-reload watcher path for an externally
+    // edited config.toml — since settings.update rejects compound values.
+    srv.registry
+        .reload(&format!(
+            "[providers.paths]\ncodex = {:?}\n\n[quickActions]\ndefaultModel = \"codex:gpt-5\"\n",
+            bin.to_string_lossy()
+        ))
+        .expect("reload legacy config");
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":52,"method":"agent.completeOnce","params":{"prompt":"msg"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 52);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({ "text": "compound-routed" }),
+        "a legacy compound quick-action value must route to its own provider"
+    );
+    srv.ws.stop().await;
+}
+
 #[tokio::test]
 async fn wss_agent_complete_once_cli_missing_is_internal_error() {
     // A missing/unspawnable auggie binary surfaces as -32603 rather than
@@ -6428,7 +7043,7 @@ async fn wss_agent_complete_once_cli_missing_is_internal_error() {
         Some(std::path::PathBuf::from("/nonexistent/intentd-wss/auggie")),
     )
     .await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6449,7 +7064,7 @@ async fn wss_agent_complete_once_timeout_reaps_and_errors() {
     // failure, no session/agent state is leaked.
     let (_auggie_dir, bin) = fake_auggie_script("complete-slow", "sleep 30");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6825,6 +7440,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -7339,8 +7955,14 @@ async fn wss_git_commit_details_round_trip() {
     let repo_dir = test_tempdir("intentd-wssgit-");
     let repo = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
+        // Strip inherited GIT_AUTHOR_*/GIT_COMMITTER_* so the repo-local
+        // user.* config below wins (env outranks config; monorepo#4191).
         let ok = std::process::Command::new("git")
             .current_dir(&repo)
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL")
             .args(args)
             .status()
             .expect("run git")
@@ -7658,6 +8280,129 @@ async fn wss_git_root_list_and_scoped_reads_round_trip() {
         &format!(
             r#"{{"jsonrpc":"2.0","id":10,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}","commitHash":"{nested_head}","gitRootId":"nope"}}}}"#
         ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
+/// `workspace.localChanges` over WSS (§5.1): a workspace whose primary
+/// worktree has a never-pushed commit and an untracked file, plus a registered
+/// secondary root, answers `{ roots, hasUnpushedCommits, hasUncommittedChanges }`
+/// with the primary row first and the secondary row carrying its `gitRootId`;
+/// a missing `workspaceId` and an unknown workspace are both `-32602`.
+#[tokio::test]
+async fn wss_workspace_local_changes_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    let repo_dir = test_tempdir("intentd-wsslocalchanges-");
+    let repo = repo_dir.path().to_path_buf();
+    let nested = repo.join("vendor/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let git = |dir: &std::path::PathBuf, args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    for dir in [&repo, &nested] {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        git(dir, &["add", "seed.txt"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+    }
+    // Primary: one untracked file. Nested: clean worktree.
+    std::fs::write(repo.join("scratch.txt"), "wip\n").unwrap();
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS localChanges WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+    let primary_path = created["result"]["workspace"]["worktreePath"]
+        .as_str()
+        .expect("worktreePath")
+        .to_string();
+
+    let ts = now_iso();
+    let root = intent_core::WorkspaceGitRoot {
+        id: intent_core::WorkspaceGitRootId::new(),
+        workspace_id: WorkspaceId::from(ws_id.as_str()),
+        path: nested.to_string_lossy().into_owned(),
+        source: intent_core::WorkspaceGitRootSource::Agent,
+        repo_owner: None,
+        repo_name: None,
+        registered_by_agent_ids: vec![intent_core::AgentId::from("agent-1")],
+        registered_commit_sha: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        pull_requests: None,
+        created_at: ts.clone(),
+        updated_at: ts,
+    };
+    srv.store
+        .upsert_workspace_git_root(&root)
+        .await
+        .expect("register root");
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.localChanges","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 2);
+    let result = &resp["result"];
+    assert_eq!(result["hasUnpushedCommits"], true, "{resp}");
+    assert_eq!(result["hasUncommittedChanges"], true, "{resp}");
+    let roots = result["roots"].as_array().expect("roots");
+    assert_eq!(roots.len(), 2, "{resp}");
+
+    assert_eq!(roots[0]["kind"], "primary");
+    assert!(roots[0].get("gitRootId").is_none(), "{resp}");
+    assert_eq!(roots[0]["path"], primary_path);
+    assert!(roots[0]["branch"].as_str().is_some_and(|b| !b.is_empty()));
+    assert_eq!(roots[0]["hasRemoteRefs"], false);
+    assert_eq!(roots[0]["unpushedCount"], 1);
+    assert_eq!(roots[0]["uncommittedCount"], 1);
+    assert!(roots[0].get("error").is_none(), "{resp}");
+
+    assert_eq!(roots[1]["kind"], "secondary");
+    assert_eq!(roots[1]["gitRootId"], root.id.as_str());
+    assert_eq!(roots[1]["path"], root.path);
+    assert_eq!(roots[1]["hasRemoteRefs"], false);
+    assert_eq!(roots[1]["unpushedCount"], 1);
+    assert_eq!(roots[1]["uncommittedCount"], 0);
+    assert!(roots[1].get("error").is_none(), "{resp}");
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"workspace.localChanges","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"workspace.localChanges","params":{"workspaceId":"nope"}}"#,
     )
     .await;
     assert_eq!(resp["error"]["code"], -32602);
@@ -8072,8 +8817,14 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     let repo_dir = test_tempdir("intentd-wssacgs-");
     let repo = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
+        // Strip inherited GIT_AUTHOR_*/GIT_COMMITTER_* so the repo-local
+        // user.* config below wins (env outranks config; monorepo#4191).
         let ok = std::process::Command::new("git")
             .current_dir(&repo)
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL")
             .args(args)
             .status()
             .expect("run git")
@@ -8953,6 +9704,185 @@ async fn wss_note_set_content_non_ascii_merge_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Regression for monorepo#4208 over the real WSS wire: writing the
+/// line-numbered `note.read` display presentation (`   N | line`) back via
+/// `note.setContent` must be rejected with -32602 and leave the note
+/// untouched, while the same Markdown without the prefixes still persists.
+#[tokio::test]
+async fn wss_note_set_content_rejects_numbered_read_presentation() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Numbered Guard"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let seed = "# Spec\n\n## Goal\n- [ ] item";
+    let numbered = "   1 | # Spec\n   2 | \n   3 | ## Goal\n   4 | - [ ] item";
+    let raw_edit = "# Spec\n\n## Goal\n- [ ] item\n- [ ] new item";
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"note.create",
+            "params":{"workspaceId":ws_id,"title":"Guarded","content":seed}})
+            .to_string(),
+        ],
+    )
+    .await;
+    let note_id = sess[0]["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"note.setContent",
+                "params":{"workspaceId":ws_id,"noteId":note_id,"content":numbered}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":4,"method":"note.get",
+                "params":{"workspaceId":ws_id,"noteId":note_id}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":5,"method":"note.setContent",
+                "params":{"workspaceId":ws_id,"noteId":note_id,"content":raw_edit}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":6,"method":"note.get",
+                "params":{"workspaceId":ws_id,"noteId":note_id}})
+            .to_string(),
+        ],
+    )
+    .await;
+    for (i, resp) in sess.iter().enumerate() {
+        assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+        assert_eq!(
+            resp["id"].as_i64(),
+            Some(i64::try_from(i).expect("value fits in i64") + 3),
+            "envelope: {resp}"
+        );
+    }
+    assert_eq!(
+        sess[0]["error"]["code"], -32602,
+        "numbered presentation is rejected as invalid params: {}",
+        sess[0]
+    );
+    let msg = sess[0]["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("note.read") && msg.contains("rawContent"),
+        "error names the remediation: {msg}"
+    );
+    assert_eq!(
+        sess[1]["result"]["note"]["content"], seed,
+        "rejected write leaves the note unchanged: {}",
+        sess[1]
+    );
+    assert!(
+        sess[2].get("error").is_none(),
+        "raw Markdown write succeeds: {}",
+        sess[2]
+    );
+    assert_eq!(
+        sess[3]["result"]["note"]["content"], raw_edit,
+        "raw Markdown persisted verbatim: {}",
+        sess[3]
+    );
+
+    srv.ws.stop().await;
+}
+
+/// Regression for monorepo#4299 over the real WSS wire: `task.createPrerequisite`
+/// materializes note content outside the `note.*` surface, so its `content`
+/// must hit the same numbered-`note.read` guard — -32602, no child note
+/// created — while raw Markdown still creates the prerequisite.
+#[tokio::test]
+async fn wss_task_create_prerequisite_rejects_numbered_read_presentation() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Prereq Numbered Guard"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let raw = "# Step\n\n- [ ] do it";
+    let numbered = "   1 | # Step\n   2 | \n   3 | - [ ] do it";
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"task.createPrerequisite",
+                "params":{"workspaceId":ws_id,"dependentNoteId":"spec","title":"Numbered Step","content":numbered}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"note.list",
+                "params":{"workspaceId":ws_id}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":4,"method":"task.createPrerequisite",
+                "params":{"workspaceId":ws_id,"dependentNoteId":"spec","title":"Raw Step","content":raw}})
+            .to_string(),
+        ],
+    )
+    .await;
+    for (i, resp) in sess.iter().enumerate() {
+        assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+        assert_eq!(
+            resp["id"].as_i64(),
+            Some(i64::try_from(i).expect("value fits in i64") + 2),
+            "envelope: {resp}"
+        );
+    }
+    assert_eq!(
+        sess[0]["error"]["code"], -32602,
+        "numbered presentation is rejected as invalid params: {}",
+        sess[0]
+    );
+    let msg = sess[0]["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("note.read") && msg.contains("rawContent"),
+        "error names the remediation: {msg}"
+    );
+    let rows = sess[1]["result"]["notes"].as_array().expect("notes array");
+    assert!(
+        rows.iter().all(|n| n["title"] != "Numbered Step"),
+        "rejected createPrerequisite must persist no child note: {}",
+        sess[1]
+    );
+    assert!(
+        sess[2].get("error").is_none(),
+        "raw Markdown content creates the prerequisite: {}",
+        sess[2]
+    );
+    assert_eq!(sess[2]["result"]["ok"], true, "{}", sess[2]);
+    assert_eq!(sess[2]["result"]["title"], "Raw Step", "{}", sess[2]);
+    let child_id = sess[2]["result"]["prerequisiteNoteId"]
+        .as_str()
+        .expect("prerequisiteNoteId")
+        .to_string();
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({"jsonrpc":"2.0","id":5,"method":"note.get",
+            "params":{"workspaceId":ws_id,"noteId":child_id}})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["note"]["content"], raw,
+        "raw Markdown persisted verbatim: {got}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `git.showFile` over WSS (PROTOCOL §5.6 extensions): file content at a
 /// revision (`HEAD` / `HEAD^`), the empty-content fallback for a path missing
 /// at the ref, and -32603 for an unresolvable ref.
@@ -9306,17 +10236,58 @@ async fn wss_browser_screenshot_reverse_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Make `ws` an eligible agent `browser.exec` target (REV-2): send a
+/// `client.hello` advertising `capabilities.browserExec` and wait for its
+/// reply, answering pings inline. Once the reply is in, the server-side
+/// connection loop has bound the identity onto its reverse-registry entry.
+async fn hello_browser_host(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+    client_id: &str,
+) {
+    hello_with(ws, client_id, r#"{"browserExec":true}"#).await;
+}
+
+/// `client.hello` on `ws` as logical client `client_id` with the given
+/// `capabilities` JSON object, waiting for the reply (pings answered inline).
+async fn hello_with(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+    client_id: &str,
+    capabilities: &str,
+) {
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":"hello","method":"client.hello","params":{{"clientId":"{client_id}","capabilities":{capabilities}}}}}"#
+    );
+    ws.send(Message::Text(frame.into()))
+        .await
+        .expect("send hello");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json frame");
+                    if v["id"] == "hello" {
+                        assert!(v.get("result").is_some(), "hello failed: {v}");
+                        break;
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    ws.send(Message::Pong(payload)).await.expect("pong");
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected hello reply, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("client.hello reply");
+}
+
 #[tokio::test]
 async fn wss_disconnect_wakes_accepted_screenshot_request() {
     let srv = start(WsOptions::default()).await;
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while srv.reverse_registry.is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("reverse registration");
+    hello_browser_host(&mut ws, "cli-disconnect").await;
+    assert!(srv.reverse_registry.is_connected());
 
     let reverse_registry = srv.reverse_registry.clone();
     let request = tokio::spawn(async move {
@@ -9324,6 +10295,7 @@ async fn wss_disconnect_wakes_accepted_screenshot_request() {
             .dispatch(
                 "browser.exec",
                 serde_json::json!({ "actions": [{ "action": "screenshot" }] }),
+                ReverseTarget::Default,
             )
             .await
     });
@@ -9367,13 +10339,8 @@ async fn wss_heartbeat_abort_wakes_accepted_screenshot_request() {
     })
     .await;
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while srv.reverse_registry.is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("reverse registration");
+    hello_browser_host(&mut ws, "cli-heartbeat").await;
+    assert!(srv.reverse_registry.is_connected());
 
     let reverse_registry = srv.reverse_registry.clone();
     let request = tokio::spawn(async move {
@@ -9381,6 +10348,7 @@ async fn wss_heartbeat_abort_wakes_accepted_screenshot_request() {
             .dispatch(
                 "browser.exec",
                 serde_json::json!({ "actions": [{ "action": "screenshot" }] }),
+                ReverseTarget::Default,
             )
             .await
     });
@@ -9409,6 +10377,133 @@ async fn wss_heartbeat_abort_wakes_accepted_screenshot_request() {
         .expect_err("request fails on heartbeat abort");
     assert!(err.to_string().contains("closed"), "unexpected: {err}");
     assert!(srv.reverse_registry.is_empty());
+    srv.ws.stop().await;
+}
+
+/// Read `ws` until an `events.event` of `event_type` for `client_id`
+/// arrives (bounded), answering pings inline. Returns the event object.
+async fn await_client_event(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+    event_type: &str,
+    client_id: &str,
+) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json frame");
+                    let event = &v["params"]["event"];
+                    if v["method"] == "events.event"
+                        && event["type"] == event_type
+                        && event["data"]["clientId"] == client_id
+                    {
+                        break event.clone();
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    ws.send(Message::Pong(payload)).await.expect("pong");
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected {event_type} event, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
+}
+
+/// REV-2 over the production TLS + bearer-auth path: capability gating and
+/// the `client:*` lifecycle events. An authenticated connection that never
+/// hellos, and one that hellos without `capabilities.browserExec`, are not
+/// eligible `browser.exec` targets; the one that advertises the capability
+/// is, and its arrival and its departure (here via the heartbeat reaper's
+/// task abort) reach an `events.subscribe` subscriber on another
+/// authenticated connection.
+#[tokio::test]
+async fn wss_tls_capability_gating_and_client_lifecycle_events() {
+    let srv = start(WsOptions {
+        heartbeat_interval: Duration::from_millis(100),
+        heartbeat_timeout: Duration::from_millis(300),
+        ..WsOptions::default()
+    })
+    .await;
+    let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":"sub","method":"events.subscribe","params":{"eventTypes":["client:connected","client:disconnected"]}}"#
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send subscribe");
+    let ack = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match sub.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["id"] == "sub" {
+                        break v;
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => sub.send(Message::Pong(p)).await.expect("pong"),
+                Some(Ok(_)) => {}
+                other => panic!("expected subscribe ack, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("subscribe ack");
+    assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
+
+    // Authenticated but never hello'd (iOS-like): registered, not eligible.
+    let _silent = connect_ws(srv.port, srv.cfg.clone()).await;
+    // Hello'd without the capability (FE auxiliary socket): not eligible.
+    let mut aux = connect_ws(srv.port, srv.cfg.clone()).await;
+    hello_with(&mut aux, "tls-aux", "{}").await;
+    let ev = await_client_event(&mut sub, "client:connected", "tls-aux").await;
+    assert_eq!(
+        ev["data"],
+        serde_json::json!({ "clientId": "tls-aux", "capabilities": {} })
+    );
+    assert!(
+        !srv.reverse_registry.is_connected(),
+        "no eligible target without capabilities.browserExec"
+    );
+    assert!(matches!(
+        srv.reverse_registry.resolve(&ReverseTarget::Default),
+        Err(intent_core::ReverseDispatchError::NoClient)
+    ));
+
+    // The desktop hellos with the capability: eligible, and announced.
+    let mut desktop = connect_ws(srv.port, srv.cfg.clone()).await;
+    hello_browser_host(&mut desktop, "tls-desktop").await;
+    assert!(srv.reverse_registry.is_connected());
+    let resolved = srv
+        .reverse_registry
+        .resolve(&ReverseTarget::Default)
+        .expect("eligible target");
+    assert_eq!(resolved.client_id.as_str(), "tls-desktop");
+    let ev = await_client_event(&mut sub, "client:connected", "tls-desktop").await;
+    assert_eq!(ev["workspaceId"], "");
+    assert_eq!(
+        ev["data"],
+        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true } })
+    );
+
+    // Leave `desktop` unpolled: no pongs, so the heartbeat reaper aborts its
+    // task. The departure is still announced and the client is gone.
+    let ev = await_client_event(&mut sub, "client:disconnected", "tls-desktop").await;
+    assert_eq!(
+        ev["data"],
+        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true } })
+    );
+    assert!(!srv.reverse_registry.is_connected());
+    assert!(srv
+        .reverse_registry
+        .live_clients()
+        .iter()
+        .all(|c| c.client_id.as_str() != "tls-desktop"));
+    drop(desktop);
+    drop(aux);
     srv.ws.stop().await;
 }
 
@@ -9725,7 +10820,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -10371,7 +11466,7 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -10588,7 +11683,7 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -10719,7 +11814,7 @@ async fn wss_agent_get_message_block_serves_full_block() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -10885,7 +11980,7 @@ async fn wss_extracted_payload_round_trip_slim_and_full() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -11040,7 +12135,7 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -11704,6 +12799,178 @@ async fn wss_workspace_transfer_plan_round_trip() {
     .await;
     assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
     assert_eq!(resp["error"]["message"], "Workspace not found", "{resp}");
+
+    srv.ws.stop().await;
+}
+
+/// `workspace.transfer.plan` over the real WSS transport (PROTOCOL §5.1) for
+/// a worktree whose submodule checkout points at a commit that exists only
+/// locally: the plan carries exactly one `submodule-unpublished-commits`
+/// warning naming the submodule path, short sha and branch, and
+/// `manifest.git.submodules` lists the finding as
+/// `{ name, path, commitSha, branch, carried: true, published: false }`.
+/// After the commit is
+/// pushed to the submodule's origin the warning and the entry are gone.
+#[tokio::test]
+async fn wss_workspace_transfer_plan_reports_unpublished_submodule_commits() {
+    let srv = start(WsOptions::default()).await;
+    let root_dir = test_tempdir("intentd-wss-transfer-submodule-");
+    let root = root_dir.path().to_path_buf();
+    let git = |dir: &std::path::Path, args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "protocol.file.allow=always"])
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let init_repo = |dir: &std::path::Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("README.md"), "hello\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+    };
+
+    // Submodule origin: a bare repo seeded with one commit. Superproject
+    // tracks it at `sub`, checked out on `main` (attached).
+    init_repo(&root.join("sub-src"));
+    git(&root, &["clone", "-q", "--bare", "sub-src", "origin.git"]);
+    let origin = root.join("origin.git");
+    let sup = root.join("super");
+    init_repo(&sup);
+    git(
+        &sup,
+        &["submodule", "add", "-q", origin.to_str().unwrap(), "sub"],
+    );
+    git(&sup, &["commit", "-q", "-m", "add submodule"]);
+    let sub = sup.join("sub");
+    git(&sub, &["checkout", "-q", "main"]);
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS Transfer Submodule","worktreePath":"{}","path":"{}"}}}}"#,
+        sup.display(),
+        sup.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+    let plan_frame = |id: u32| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"workspace.transfer.plan","params":{{"workspaceId":"{ws_id}"}}}}"#
+        )
+    };
+
+    // Everything published: no warning, empty submodules list.
+    let resp = wss_call(srv.port, srv.cfg.clone(), &plan_frame(2)).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 2, "envelope: {resp}");
+    let plan = &resp["result"]["plan"];
+    assert_eq!(plan["manifest"]["git"]["hasRepository"], true, "{resp}");
+    assert_eq!(
+        plan["manifest"]["git"]["submodules"],
+        serde_json::json!([]),
+        "published submodule yields no entry: {resp}"
+    );
+    assert!(
+        !plan["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .any(|w| w["code"] == "submodule-unpublished-commits"),
+        "published submodule yields no warning: {resp}"
+    );
+    let clean_bundle = plan["estimatedGitBundleBytes"].as_u64().expect("bundle");
+
+    // A commit made inside the submodule checkout and never pushed.
+    std::fs::write(sub.join("wip.txt"), "wip\n").unwrap();
+    git(&sub, &["add", "wip.txt"]);
+    git(&sub, &["commit", "-q", "-m", "local wip"]);
+    let sha = git(&sub, &["rev-parse", "HEAD"]);
+
+    let resp = wss_call(srv.port, srv.cfg.clone(), &plan_frame(3)).await;
+    assert_eq!(resp["id"], 3, "envelope: {resp}");
+    let plan = &resp["result"]["plan"];
+    let warnings = plan["warnings"].as_array().expect("warnings array");
+    let sub_warns: Vec<_> = warnings
+        .iter()
+        .filter(|w| w["code"] == "submodule-unpublished-commits")
+        .collect();
+    assert_eq!(sub_warns.len(), 1, "exactly one submodule warning: {resp}");
+    let message = sub_warns[0]["message"].as_str().expect("message string");
+    assert!(
+        message.contains(&format!("sub @ {} (main)", &sha[..7])),
+        "warning names path, short sha and branch: {resp}"
+    );
+    assert!(
+        message.contains("will ride in the archive"),
+        "worktree finding is carried: {resp}"
+    );
+    assert_eq!(
+        plan["manifest"]["git"]["submodules"],
+        serde_json::json!([{
+            "name": "sub",
+            "path": "sub",
+            "commitSha": sha,
+            "branch": "main",
+            "carried": true,
+            "published": false
+        }]),
+        "manifest lists the unpublished submodule: {resp}"
+    );
+    assert!(
+        plan["estimatedGitBundleBytes"].as_u64().expect("bundle") > clean_bundle,
+        "estimate grows by the submodule objects: {resp}"
+    );
+    let total = plan["totalSizeBytes"].as_u64().expect("total");
+    let db = plan["dbRowBytes"].as_u64().expect("db");
+    let assets = plan["assetBytes"].as_u64().expect("assets");
+    let attachments = plan["attachmentBytes"].as_u64().expect("attachments");
+    let bundle = plan["estimatedGitBundleBytes"].as_u64().expect("bundle");
+    assert_eq!(
+        total,
+        db + assets + attachments + bundle,
+        "size breakdown still sums: {resp}"
+    );
+    // The superproject sees the gitlink move; the plan itself never wrote.
+    assert_eq!(
+        plan["manifest"]["git"]["dirtyFiles"],
+        serde_json::json!(["sub"]),
+        "{resp}"
+    );
+
+    // Publishing the commit clears the warning and the manifest entry.
+    git(&sub, &["push", "-q", "origin", "main"]);
+    let resp = wss_call(srv.port, srv.cfg.clone(), &plan_frame(4)).await;
+    assert_eq!(resp["id"], 4, "envelope: {resp}");
+    let plan = &resp["result"]["plan"];
+    assert_eq!(
+        plan["manifest"]["git"]["submodules"],
+        serde_json::json!([]),
+        "pushed submodule commit yields no entry: {resp}"
+    );
+    assert!(
+        !plan["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .any(|w| w["code"] == "submodule-unpublished-commits"),
+        "pushed submodule commit yields no warning: {resp}"
+    );
 
     srv.ws.stop().await;
 }
@@ -12898,9 +14165,10 @@ async fn wss_workspace_import_commit_materializes_git() {
     src_ws.repository_path = Some(repo.to_string_lossy().into_owned());
     src_ws.repository_name = Some("test-repo".to_string());
     let staging = src.path().join("staging");
-    let (bundle_path, refs) =
-        intent_services::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
-            .expect("bundle");
+    let intent_services::transfer_git::TransferBundle {
+        bundle_path, refs, ..
+    } = intent_services::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
+        .expect("bundle");
     assert!(
         refs.workspace_wip_commit_sha.is_some(),
         "source was dirty: {refs:?}"
@@ -13018,6 +14286,788 @@ async fn wss_workspace_import_commit_materializes_git() {
     );
 
     srv.ws.stop().await;
+}
+
+/// Export → import round trip over the real WSS transport between two daemons
+/// (§5.1) for a worktree whose submodule checkout sits on a commit that
+/// exists only locally (intent-hq/intent#4219): the source daemon's export
+/// carries the submodule's own bundle (`git/submodules/0.bundle`, listed in
+/// the ready event's `manifest.git.submodules` with `carried: true`), and
+/// the target daemon's `workspace.import.commit` hydrates the submodule from
+/// it — initialized at the unpublished commit on its original branch, with
+/// the original origin URL and no trace of the staging bundle path — while
+/// the superproject's dirty gitlink lands exactly as on the source.
+/// Finalizing the export without archiving restores the source. Skips when
+/// `git` is unavailable on PATH.
+#[tokio::test]
+async fn wss_transfer_round_trip_hydrates_unpublished_submodule() {
+    use base64::Engine as _;
+
+    if std::process::Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_or(true, |s| !s.success())
+    {
+        eprintln!("skipping WSS submodule transfer E2E: git not available");
+        return;
+    }
+
+    let git = |dir: &std::path::Path, args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "protocol.file.allow=always"])
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let init_repo = |dir: &std::path::Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("README.md"), "hello\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+    };
+
+    // Source: superproject `super` tracking `sub` (origin = bare repo), with
+    // one commit made inside the submodule checkout and never pushed.
+    let root_dir = test_tempdir("intentd-wss-transfer-submodule-rt-");
+    let root = root_dir.path().to_path_buf();
+    init_repo(&root.join("sub-src"));
+    git(&root, &["clone", "-q", "--bare", "sub-src", "origin.git"]);
+    let origin = root.join("origin.git");
+    let sup = root.join("super");
+    init_repo(&sup);
+    git(
+        &sup,
+        &["submodule", "add", "-q", origin.to_str().unwrap(), "sub"],
+    );
+    git(&sup, &["commit", "-q", "-m", "add submodule"]);
+    let sub = sup.join("sub");
+    git(&sub, &["checkout", "-q", "main"]);
+    std::fs::write(sub.join("wip.txt"), "wip\n").unwrap();
+    git(&sub, &["add", "wip.txt"]);
+    git(&sub, &["commit", "-q", "-m", "local wip"]);
+    let sha = git(&sub, &["rev-parse", "HEAD"]);
+    let src_status = git(&sup, &["status", "--porcelain"]);
+    assert_eq!(src_status, "M sub", "source gitlink is modified");
+
+    let source = start(WsOptions::default()).await;
+    let target = start(WsOptions::default()).await;
+
+    let created = wss_call(
+        source.port,
+        source.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS Submodule Transfer","worktreePath":"{}","path":"{}"}}}}"#,
+            sup.display(),
+            sup.display(),
+        ),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace id: {created}"))
+        .to_string();
+
+    // Subscribe BEFORE start so this connection sees the build's events.
+    let mut sub_ws = connect_ws(source.port, source.cfg.clone()).await;
+    sub_ws
+        .send(Message::Text(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":100,"method":"events.subscribe","params":{{"eventTypes":["workspace:transfer:ready","workspace:transfer:failed"],"workspaceId":"{ws_id}"}}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .expect("send subscribe");
+    loop {
+        match sub_ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json");
+                assert!(v["result"]["subscriptionId"].is_string(), "subscribe: {v}");
+                break;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+
+    let started = wss_call(
+        source.port,
+        source.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.export.start","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let export_id = started["result"]["exportId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("exportId: {started}"))
+        .to_string();
+
+    let ready = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] != "events.event" {
+                        continue;
+                    }
+                    let event = &v["params"]["event"];
+                    match event["type"].as_str() {
+                        Some("workspace:transfer:ready") => return event.clone(),
+                        Some("workspace:transfer:failed") => panic!("export failed: {event}"),
+                        _ => {}
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for workspace:transfer:ready");
+    let data = &ready["data"];
+    assert_eq!(data["exportId"], export_id.as_str(), "{ready}");
+    let manifest = data["manifest"].clone();
+    assert_eq!(manifest["workspaceId"], ws_id.as_str(), "{ready}");
+    assert_eq!(
+        manifest["git"]["submodules"],
+        serde_json::json!([{
+            "name": "sub", "path": "sub", "commitSha": sha, "branch": "main", "carried": true,
+            "published": false
+        }]),
+        "ready manifest lists the carried submodule commit: {ready}"
+    );
+    let size = data["archiveSizeBytes"].as_u64().expect("size");
+    let sha256 = data["archiveSha256"].as_str().expect("sha").to_string();
+    let total_chunks = data["totalChunks"].as_u64().expect("totalChunks");
+
+    // Relay: chunked reads on the source → begin/chunk/commit on the target.
+    let begin = wss_call(
+        target.port,
+        target.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.import.begin","params":{{"manifest":{manifest},"archiveSizeBytes":{size},"archiveSha256":"{sha256}"}}}}"#
+        ),
+    )
+    .await;
+    let import_id = begin["result"]["importId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("importId: {begin}"))
+        .to_string();
+    let mut archive = Vec::new();
+    for seq in 0..total_chunks {
+        let chunk = wss_call(
+            source.port,
+            source.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"workspace.export.read","params":{{"exportId":"{export_id}","seq":{seq}}}}}"#,
+                10 + seq
+            ),
+        )
+        .await;
+        let b64 = chunk["result"]["data"]
+            .as_str()
+            .unwrap_or_else(|| panic!("chunk data: {chunk}"));
+        archive.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .expect("base64"),
+        );
+        let put = wss_call(
+            target.port,
+            target.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"workspace.import.chunk","params":{{"importId":"{import_id}","seq":{seq},"data":"{b64}"}}}}"#,
+                50 + seq
+            ),
+        )
+        .await;
+        assert_eq!(put["result"]["seq"], seq, "{put}");
+    }
+    assert_eq!(archive.len() as u64, size);
+    assert_eq!(sha256_hex(&archive), sha256);
+    {
+        let reader = std::io::Cursor::new(&archive);
+        let mut zip = zip::ZipArchive::new(reader).expect("valid zip");
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            names.contains(&"git/submodules/0.bundle".to_string()),
+            "archive carries the submodule bundle: {names:?}"
+        );
+    }
+
+    let committed = wss_call(
+        target.port,
+        target.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":90,"method":"workspace.import.commit","params":{{"importId":"{import_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(committed["result"]["workspace"]["id"], ws_id, "{committed}");
+    let checkout = std::path::PathBuf::from(
+        committed["result"]["workspace"]["repositoryPath"]
+            .as_str()
+            .unwrap_or_else(|| panic!("repositoryPath: {committed}")),
+    );
+    assert!(
+        checkout.starts_with(target.dir.path().join("workspaces").join(&ws_id)),
+        "checkout under the target's workspaces root: {}",
+        checkout.display()
+    );
+    assert_eq!(committed["result"]["workspace"]["checkoutMode"], "direct");
+
+    // The hydrated submodule: at the unpublished commit, on its branch, with
+    // its original origin, content present, gitlink dirty as on the source.
+    let dst_sub = checkout.join("sub");
+    assert!(dst_sub.join(".git").exists(), "submodule initialized");
+    assert_eq!(git(&dst_sub, &["rev-parse", "HEAD"]), sha);
+    assert_eq!(git(&dst_sub, &["branch", "--show-current"]), "main");
+    assert_eq!(
+        std::fs::read_to_string(dst_sub.join("wip.txt")).expect("submodule file"),
+        "wip\n"
+    );
+    assert_eq!(
+        git(&dst_sub, &["remote", "get-url", "origin"]),
+        origin.to_str().unwrap()
+    );
+    assert_eq!(
+        git(&checkout, &["config", "submodule.sub.url"]),
+        origin.to_str().unwrap()
+    );
+    assert_eq!(git(&checkout, &["status", "--porcelain"]), src_status);
+    assert!(
+        git(&checkout, &["submodule", "status"]).starts_with(&format!("+{sha}")),
+        "gitlink differs from HEAD exactly as on the source"
+    );
+    // No config under the checkout mentions the target's staging area.
+    for config in [
+        checkout.join(".git/config"),
+        checkout.join(".git/modules/sub/config"),
+    ] {
+        let text = std::fs::read_to_string(&config).expect("config");
+        assert!(
+            !text.contains(".bundle"),
+            "{} references a bundle path:\n{text}",
+            config.display()
+        );
+    }
+    // The superproject itself has no remotes (the bundle was the only source).
+    assert_eq!(git(&checkout, &["remote"]), "");
+
+    // Finalize on the source without archiving: the WIP snapshot is unwound
+    // and the source is exactly as before the export.
+    let finalized = wss_call(
+        source.port,
+        source.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":91,"method":"workspace.export.finalize","params":{{"exportId":"{export_id}","archiveSource":false}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(finalized["result"]["finalized"], true, "{finalized}");
+    assert_eq!(git(&sup, &["status", "--porcelain"]), src_status);
+    assert_eq!(git(&sub, &["rev-parse", "HEAD"]), sha);
+
+    source.ws.stop().await;
+    target.ws.stop().await;
+}
+
+/// Regression for intent-hq/intent#4438: real WSS export/import preserves
+/// publication knowledge offline, without hiding local commits or dirty files.
+/// Only the clean, published imported fixture is archived; source WIP is unwound.
+#[tokio::test]
+async fn wss_transfer_preserves_remote_state() {
+    use base64::Engine as _;
+    use std::io::{Read as _, Write as _};
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("run fixture git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("utf8 git output")
+    }
+
+    async fn rpc(srv: &Server, method: &str, params: Value) -> Value {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(60),
+            wss_call(srv.port, srv.cfg.clone(), &frame.to_string()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{method} timed out"));
+        assert_eq!(response["jsonrpc"], "2.0", "{method}: {response}");
+        assert_eq!(response["id"], 1, "{method}: {response}");
+        response
+    }
+
+    async fn import(srv: &Server, manifest: &Value, archive: &[u8]) -> Value {
+        let begun = rpc(
+            srv,
+            "workspace.import.begin",
+            serde_json::json!({
+                "manifest": manifest, "archiveSizeBytes": archive.len(),
+                "archiveSha256": sha256_hex(archive)
+            }),
+        )
+        .await;
+        let import_id = begun["result"]["importId"].as_str().expect("importId");
+        let chunk_size = usize::try_from(
+            begun["result"]["maxChunkBytes"]
+                .as_u64()
+                .expect("maxChunkBytes"),
+        )
+        .unwrap();
+        for (seq, bytes) in archive.chunks(chunk_size).enumerate() {
+            let chunk = rpc(
+                srv,
+                "workspace.import.chunk",
+                serde_json::json!({
+                    "importId": import_id, "seq": seq,
+                    "data": base64::engine::general_purpose::STANDARD.encode(bytes)
+                }),
+            )
+            .await;
+            assert_eq!(chunk["result"]["seq"], seq, "{chunk}");
+        }
+        rpc(
+            srv,
+            "workspace.import.commit",
+            serde_json::json!({ "importId": import_id }),
+        )
+        .await
+    }
+
+    fn entry(archive: &[u8], name: &str) -> Vec<u8> {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive)).unwrap();
+        let mut bytes = Vec::new();
+        zip.by_name(name).unwrap().read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// The archive with only `git/refs.json` replaced; the bundle bytes are
+    /// untouched, so a rejection is purely metadata validation.
+    fn relabel(archive: &[u8], tampered_refs: &Value) -> Vec<u8> {
+        let mut original = zip::ZipArchive::new(std::io::Cursor::new(archive)).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for index in 0..original.len() {
+            let mut file = original.by_index(index).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            if file.name() == "git/refs.json" {
+                bytes = serde_json::to_vec(tampered_refs).unwrap();
+            }
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            writer.start_file(file.name(), options).unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        let tampered = writer.finish().unwrap().into_inner();
+        assert_eq!(
+            entry(&tampered, "git/repo.bundle"),
+            entry(archive, "git/repo.bundle")
+        );
+        tampered
+    }
+
+    /// A relabeled archive must fail remote metadata validation on a fresh
+    /// daemon, leave no workspace row or directory behind, keep unrelated
+    /// files, and never touch the source.
+    async fn assert_relabel_rejected(
+        manifest: &Value,
+        tampered: &[u8],
+        ws_id: &WorkspaceId,
+        repo: &Path,
+        head: &str,
+        published: &str,
+        case: &str,
+    ) {
+        let rejected_target = start(WsOptions::default()).await;
+        let unrelated = rejected_target.dir.path().join("workspaces/keep.txt");
+        std::fs::write(&unrelated, "keep\n").unwrap();
+        let rejected = import(&rejected_target, manifest, tampered).await;
+        assert_eq!(rejected["error"]["code"], -32603, "{case}: {rejected}");
+        assert!(
+            rejected["error"]["data"]
+                .as_str()
+                .unwrap()
+                .contains("remote transfer cannot safely preserve configured Git behavior"),
+            "{case}: must fail remote metadata validation, not an unrelated import step: {rejected}"
+        );
+        assert!(
+            !rejected_target
+                .dir
+                .path()
+                .join("workspaces")
+                .join(&ws_id.0)
+                .exists(),
+            "{case}"
+        );
+        let listed = rpc(&rejected_target, "workspace.list", serde_json::json!({})).await;
+        assert!(
+            listed["result"]["workspaces"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{case}: {listed}"
+        );
+        assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "keep\n");
+        assert_eq!(git(repo, &["rev-parse", "HEAD"]).trim(), head, "{case}");
+        assert_eq!(
+            git(repo, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+            published,
+            "{case}"
+        );
+        rejected_target.ws.stop().await;
+    }
+
+    let source = start(WsOptions::default()).await;
+    let target = start(WsOptions::default()).await;
+    // Any accidental remote contact reaches only this loopback sentinel, never
+    // an external Git server. A queued connection fails the final assertion.
+    let remote = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    remote.set_nonblocking(true).unwrap();
+    let remote_url = format!("http://{}/published.git", remote.local_addr().unwrap());
+
+    // The last fixture's branch is a legal local branch spelled like the
+    // tracking ref: the bundle advertises its local-only tip only as
+    // `refs/heads/refs/remotes/origin/forged`, which Git fetch DWIM would
+    // also resolve for a bare `refs/remotes/origin/forged` source (R6).
+    let alias = "refs/remotes/origin/forged";
+    for (local_commits, dirty, branch) in [
+        (0, false, "main"),
+        (2, false, "main"),
+        (2, true, "main"),
+        (2, false, alias),
+    ] {
+        let repo_dir = test_tempdir("intentd-wss-transfer-remotes-");
+        let repo = repo_dir.path();
+        git(repo, &["init", "-q", "-b", branch]);
+        git(repo, &["config", "user.name", "Test"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "commit.gpgsign", "false"]);
+        for file in ["staged.txt", "unstaged.txt"] {
+            std::fs::write(repo.join(file), "published\n").unwrap();
+        }
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "published seed"]);
+        let published = git(repo, &["rev-parse", "HEAD"]).trim().to_string();
+        git(repo, &["remote", "add", "origin", &remote_url]);
+        git(
+            repo,
+            &["update-ref", "refs/remotes/origin/main", &published],
+        );
+        git(repo, &["branch", "--set-upstream-to=origin/main", branch]);
+        for index in 0..local_commits {
+            std::fs::write(repo.join("local.txt"), format!("local {index}\n")).unwrap();
+            git(repo, &["add", "local.txt"]);
+            git(repo, &["commit", "-q", "-m", "unpublished local work"]);
+        }
+        if dirty {
+            std::fs::write(repo.join("staged.txt"), "staged change\n").unwrap();
+            git(repo, &["add", "staged.txt"]);
+            std::fs::write(repo.join("unstaged.txt"), "unstaged change\n").unwrap();
+            std::fs::write(repo.join("untracked.txt"), "untracked change\n").unwrap();
+        }
+        let head = git(repo, &["rev-parse", "HEAD"]).trim().to_string();
+        let porcelain = git(repo, &["status", "--porcelain"]);
+        let staged = git(repo, &["diff", "--cached", "--binary"]);
+        let unstaged = git(repo, &["diff", "--binary"]);
+        let ws_id = WorkspaceId::new();
+        let mut workspace = fixture_workspace(&ws_id);
+        workspace.path = Some(repo.to_string_lossy().into_owned());
+        workspace.worktree_path = workspace.path.clone();
+        workspace.repository_path = workspace.path.clone();
+        workspace.repository_name = Some("published".into());
+        workspace.branch = branch.into();
+        workspace.base_ref = None;
+        workspace.base_commit_sha = Some(head.clone());
+        source.store.insert_workspace(&workspace).await.unwrap();
+        let params = serde_json::json!({ "workspaceId": ws_id.0 });
+        let status_params = serde_json::json!({ "workspaceId": ws_id.0, "forceRefresh": true });
+        let before_status = rpc(&source, "git.status", status_params.clone()).await;
+        let before_changes = rpc(&source, "workspace.localChanges", params.clone()).await;
+
+        // Subscribe before export.start; the ready event carries the exact
+        // manifest/checksum used by the production client's chunk relay.
+        let mut events = connect_ws(source.port, source.cfg.clone()).await;
+        events
+            .send(Message::Text(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 100, "method": "events.subscribe",
+                    "params": { "workspaceId": ws_id.0, "eventTypes": [
+                        "workspace:transfer:ready", "workspace:transfer:failed"
+                    ] }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let ack: Value = serde_json::from_str(&text).unwrap();
+                        assert_eq!(ack["id"], 100, "{ack}");
+                        assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
+                        break;
+                    }
+                    Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
+                    Some(Ok(_)) => {}
+                    other => panic!("subscribe ended: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("subscribe timeout");
+        let started = rpc(&source, "workspace.export.start", params.clone()).await;
+        let export_id = started["result"]["exportId"].as_str().expect("exportId");
+        let ready = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match events.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["method"] != "events.event" {
+                            continue;
+                        }
+                        let event = &frame["params"]["event"];
+                        assert_ne!(event["type"], "workspace:transfer:failed", "{event}");
+                        if event["type"] == "workspace:transfer:ready" {
+                            assert_eq!(event["data"]["exportId"], export_id, "{event}");
+                            return event["data"].clone();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
+                    Some(Ok(_)) => {}
+                    other => panic!("export stream ended: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("export ready timeout");
+        assert_eq!(ready["manifest"]["workspaceId"], ws_id.0);
+        let mut archive = Vec::new();
+        for seq in 0..ready["totalChunks"].as_u64().expect("totalChunks") {
+            let chunk = rpc(
+                &source,
+                "workspace.export.read",
+                serde_json::json!({ "exportId": export_id, "seq": seq }),
+            )
+            .await;
+            archive.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(chunk["result"]["data"].as_str().expect("chunk data"))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(ready["archiveSizeBytes"], archive.len());
+        assert_eq!(ready["archiveSha256"], sha256_hex(&archive));
+        let refs: Value = serde_json::from_slice(&entry(&archive, "git/refs.json")).unwrap();
+        assert_eq!(refs["workspaceWipCommitSha"].is_string(), dirty, "{refs}");
+        assert_eq!(refs["workspaceBranch"], branch, "{refs}");
+        assert_eq!(
+            refs["remotes"][0]["trackingRefs"][0]["refName"],
+            "refs/remotes/origin/main"
+        );
+        assert_eq!(refs["remotes"][0]["trackingRefs"][0]["sha"], published);
+        assert!(refs["remotes"][0]["trackingRefs"][0]["bundleRef"].is_string());
+        if dirty {
+            assert_ne!(git(repo, &["rev-parse", "HEAD"]).trim(), head);
+        }
+
+        let committed = import(&target, &ready["manifest"], &archive).await;
+        assert_eq!(
+            committed["result"]["workspace"]["id"], ws_id.0,
+            "{committed}"
+        );
+        let checkout = std::path::PathBuf::from(
+            committed["result"]["workspace"]["repositoryPath"]
+                .as_str()
+                .expect("checkout"),
+        );
+        assert!(checkout.starts_with(target.dir.path().join("workspaces").join(&ws_id.0)));
+        assert_eq!(committed["result"]["workspace"]["checkoutMode"], "direct");
+        let finalized = rpc(
+            &source,
+            "workspace.export.finalize",
+            serde_json::json!({ "exportId": export_id, "archiveSource": false }),
+        )
+        .await;
+        assert_eq!(finalized["result"]["finalized"], true, "{finalized}");
+        assert_eq!(finalized["result"]["workspace"]["status"], "Active");
+
+        // Both sides are checked after WIP cleanup. The real history, index,
+        // working tree, remote ref and configured upstream must all survive.
+        for (srv, path) in [(&source, repo), (&target, checkout.as_path())] {
+            assert_eq!(git(path, &["rev-parse", "HEAD"]).trim(), head);
+            assert_eq!(git(path, &["status", "--porcelain"]), porcelain);
+            assert_eq!(git(path, &["diff", "--cached", "--binary"]), staged);
+            assert_eq!(git(path, &["diff", "--binary"]), unstaged);
+            assert_eq!(git(path, &["remote"]).trim(), "origin");
+            assert_eq!(
+                git(path, &["remote", "get-url", "origin"]).trim(),
+                remote_url
+            );
+            assert_eq!(git(path, &["rev-parse", "@{upstream}"]).trim(), published);
+            assert_eq!(
+                git(path, &["rev-parse", "--symbolic-full-name", "@{upstream}"]).trim(),
+                "refs/remotes/origin/main"
+            );
+            assert_eq!(git(path, &["for-each-ref", "refs/intent/transfer"]), "");
+            if dirty {
+                assert_eq!(
+                    std::fs::read_to_string(path.join("untracked.txt")).unwrap(),
+                    "untracked change\n"
+                );
+            }
+            let status = rpc(srv, "git.status", status_params.clone()).await;
+            assert_eq!(status["result"], before_status["result"], "{status}");
+            // `git.status` counts against `refs/remotes/origin/<branch>` by
+            // naming convention, so the alias branch reports no upstream there
+            // while `@{upstream}` and `workspace.localChanges` still see it.
+            let convention_upstream = branch == "main";
+            assert_eq!(status["result"]["hasUpstream"], convention_upstream);
+            let expected_ahead = if convention_upstream {
+                local_commits
+            } else {
+                0
+            };
+            assert_eq!(status["result"]["ahead"], expected_ahead);
+            assert_eq!(
+                status["result"]["unpushedCount"],
+                if convention_upstream {
+                    serde_json::json!(local_commits)
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(status["result"]["behind"], 0);
+            assert_eq!(status["result"]["diverged"], false);
+            assert_eq!(status["result"]["hasUncommittedChanges"], dirty);
+            assert_eq!(status["result"]["hasUntrackedFiles"], dirty);
+            let changes = rpc(srv, "workspace.localChanges", params.clone()).await;
+            let result = &changes["result"];
+            assert_eq!(result["hasUnpushedCommits"], local_commits > 0, "{changes}");
+            assert_eq!(result["hasUncommittedChanges"], dirty, "{changes}");
+            assert_eq!(result["roots"].as_array().unwrap().len(), 1);
+            let root = &result["roots"][0];
+            assert_eq!(root["kind"], "primary");
+            assert_eq!(root["path"], path.to_str().unwrap());
+            assert_eq!(root["branch"], branch);
+            assert_eq!(root["hasRemoteRefs"], true);
+            assert_eq!(root["unpushedCount"], local_commits);
+            assert_eq!(root["uncommittedCount"], if dirty { 3 } else { 0 });
+            assert!(root.get("error").is_none(), "{root}");
+            let mut normalized = result.clone();
+            normalized["roots"][0]["path"] = before_changes["result"]["roots"][0]["path"].clone();
+            assert_eq!(normalized, before_changes["result"]);
+        }
+        if local_commits == 0 {
+            let archived = rpc(&target, "workspace.archive", params.clone()).await;
+            assert_eq!(
+                archived["result"]["workspace"]["archived"], true,
+                "{archived}"
+            );
+            let stored = rpc(&target, "workspace.get", params.clone()).await;
+            assert_eq!(
+                stored["result"]["workspace"]["status"], "Archived",
+                "{stored}"
+            );
+        } else if !dirty {
+            // Relabel only metadata: a genuine bundled local base must not
+            // become a remote publication source (R5), even with a matching SHA.
+            let mut tampered_refs = refs.clone();
+            assert_eq!(refs["baseSha"], head);
+            assert!(refs["baseBundleRef"].is_string());
+            tampered_refs["remotes"][0]["trackingRefs"][0]["bundleRef"] =
+                refs["baseBundleRef"].clone();
+            tampered_refs["remotes"][0]["trackingRefs"][0]["sha"] = serde_json::json!(head);
+            assert_relabel_rejected(
+                &ready["manifest"],
+                &relabel(&archive, &tampered_refs),
+                &ws_id,
+                repo,
+                &head,
+                &published,
+                "R5 base anchor",
+            )
+            .await;
+            if branch == alias {
+                // Drop the anchor so the legacy `refName` fallback becomes the
+                // fetch source, and spell it as the bundled local branch (R6).
+                let bundle_dir = test_tempdir("intentd-wss-transfer-bundle-");
+                let bundle_file = bundle_dir.path().join("exported.bundle");
+                std::fs::write(&bundle_file, entry(&archive, "git/repo.bundle")).unwrap();
+                let heads = git(
+                    repo,
+                    &["bundle", "list-heads", bundle_file.to_str().unwrap()],
+                );
+                assert!(
+                    heads.contains(&format!("{head} refs/heads/{alias}")),
+                    "{heads}"
+                );
+                assert!(
+                    !heads.lines().any(|h| h.ends_with(&format!(" {alias}"))),
+                    "{heads}"
+                );
+                let mut tampered_refs = refs.clone();
+                let tracking = tampered_refs["remotes"][0]["trackingRefs"][0]
+                    .as_object_mut()
+                    .unwrap();
+                tracking.remove("bundleRef");
+                tracking.insert("refName".into(), serde_json::json!(alias));
+                tracking.insert("sha".into(), serde_json::json!(head));
+                assert_relabel_rejected(
+                    &ready["manifest"],
+                    &relabel(&archive, &tampered_refs),
+                    &ws_id,
+                    repo,
+                    &head,
+                    &published,
+                    "R6 fallback branch alias",
+                )
+                .await;
+            }
+        }
+    }
+    assert!(
+        matches!(remote.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "transfer/status/archive must not contact the configured remote"
+    );
+    source.ws.stop().await;
+    target.ws.stop().await;
 }
 
 /// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
@@ -13360,6 +15410,8 @@ impl SystemControl for WatchHealthControl {
             tc_address: None,
             hostname: "test".to_string(),
             pretty_hostname: "test".to_string(),
+            device_kind: None,
+            hardware_model: None,
             cpu_percent: 0.0,
             memory_bytes: 0,
             child_processes: None,
@@ -13375,7 +15427,17 @@ impl SystemControl for WatchHealthControl {
                 total_roots: s.total_roots,
                 failed_roots: s.failed_roots,
             }),
+            fd_count: None,
+            fd_limit: None,
             update_supported: false,
+        }
+    }
+    fn host_environment(&self) -> intent_transport::HostEnvironment {
+        intent_transport::HostEnvironment {
+            hostname: "test".to_string(),
+            pretty_hostname: "test".to_string(),
+            device_kind: None,
+            hardware_model: None,
         }
     }
     fn request_shutdown(&self) {}
@@ -13569,6 +15631,275 @@ async fn wss_file_ops_symlink_escape_rejected() {
     );
     let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert_eq!(resp["result"], serde_json::json!("ok"), "{resp}");
+
+    srv.ws.stop().await;
+}
+
+/// Moving `file.list` / `file.tree` to the blocking pool must not alter their
+/// legacy bare-array payloads, field order, or JSON-RPC envelope bytes.
+#[tokio::test]
+async fn wss_file_list_and_tree_preserve_serialized_shape() {
+    let srv = start(WsOptions::default()).await;
+    let dir = test_tempdir("intentd-wss-file-enumeration-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    std::fs::create_dir(root.join("single")).expect("create fixture directory");
+    std::fs::write(root.join("single/only.txt"), "x").expect("write fixture file");
+
+    let ws_id = WorkspaceId::new();
+    let mut workspace = fixture_workspace(&ws_id);
+    workspace.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store
+        .insert_workspace(&workspace)
+        .await
+        .expect("insert workspace");
+
+    let list = wss_call_text(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":101,"method":"file.list","params":{{"workspaceId":"{}","path":"single"}}}}"#,
+            ws_id.0
+        ),
+    )
+    .await;
+    assert_eq!(
+        list,
+        r#"{"jsonrpc":"2.0","result":[{"name":"only.txt","type":"file"}],"id":101}"#
+    );
+
+    let tree = wss_call_text(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":102,"method":"file.tree","params":{{"workspaceId":"{}","path":"single"}}}}"#,
+            ws_id.0
+        ),
+    )
+    .await;
+    assert_eq!(
+        tree,
+        r#"{"jsonrpc":"2.0","result":[{"path":"single/only.txt","name":"only.txt","isDirectory":false}],"id":102}"#
+    );
+
+    srv.ws.stop().await;
+}
+
+/// Disconnecting during a blocking-pool traversal detaches that work without
+/// pinning an async worker or retaining the dead WSS connection.
+#[tokio::test]
+async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
+    let control: Arc<dyn SystemControl> = Arc::new(WatchHealthControl {
+        health: WatchHealth::default(),
+    });
+    let srv = start_with_control(WsOptions::default(), None, None, Some(control)).await;
+    let dir = test_tempdir("intentd-wss-file-disconnect-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let heavy = root.join("heavy");
+    std::fs::create_dir(&heavy).expect("create heavy fixture directory");
+    for index in 0..20_000 {
+        std::fs::write(heavy.join(format!("file-{index:05}.txt")), "x")
+            .expect("write heavy fixture file");
+    }
+
+    let ws_id = WorkspaceId::new();
+    let mut workspace = fixture_workspace(&ws_id);
+    workspace.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store
+        .insert_workspace(&workspace)
+        .await
+        .expect("insert workspace");
+
+    let mut enumeration = connect_ws(srv.port, srv.cfg.clone()).await;
+    let mut status = connect_ws(srv.port, srv.cfg.clone()).await;
+    enumeration
+        .send(Message::Text(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":201,"method":"file.tree","params":{{"workspaceId":"{}","path":"heavy"}}}}"#,
+                ws_id.0
+            )
+            .into(),
+        ))
+        .await
+        .expect("send heavy file.tree request");
+
+    // Give dispatch time to enter the blocking traversal, then simulate an
+    // abrupt client disconnect rather than waiting for its large response.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    drop(enumeration);
+
+    let started = std::time::Instant::now();
+    status
+        .send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":202,"method":"system.status"}"#
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send system.status");
+    let response = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match status.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let response: Value = serde_json::from_str(&text).expect("status json");
+                    if response["id"] == 202 {
+                        break response;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected system.status response, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("system.status stayed responsive during detached traversal");
+    assert!(response["result"].is_object(), "system.status: {response}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "system.status was delayed by file.tree"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while srv.ws.client_count() > 1 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        srv.ws.client_count(),
+        1,
+        "disconnected enumeration client must be reclaimed"
+    );
+
+    status.close(None).await.expect("close status client");
+    drop(status);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while srv.ws.client_count() != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(srv.ws.client_count(), 0, "all clients must be reclaimed");
+    srv.ws.stop().await;
+}
+
+/// `crossWorkspace.*` over the real WSS wire resolves siblings by GitHub
+/// identity (§5.11): two workspaces checked out from the same
+/// `repositoryOwner`/`repositoryName` at DIFFERENT source `repositoryPath`s
+/// are siblings — matched case-insensitively with a `.git` suffix tolerated —
+/// while a workspace from a different GitHub repo is not. `listSiblings`
+/// returns exactly the same-identity sibling with the documented fields,
+/// `readNote` succeeds against it, and the same `readNote` against the
+/// different-identity workspace is denied with the -32603 access error.
+#[tokio::test]
+async fn wss_cross_workspace_siblings_resolve_by_github_identity() {
+    let srv = start(WsOptions::default()).await;
+
+    let caller_id = WorkspaceId::new();
+    let mut caller = fixture_workspace(&caller_id);
+    caller.title = "Caller".to_string();
+    caller.repository_path = Some("/repos/checkout-a/intentd".to_string());
+    caller.repository_owner = Some("Intent-HQ".to_string());
+    caller.repository_name = Some("intentd".to_string());
+
+    let sibling_id = WorkspaceId::new();
+    let mut sibling = fixture_workspace(&sibling_id);
+    sibling.title = "Sibling".to_string();
+    sibling.branch = "feat/sibling".to_string();
+    sibling.repository_path = Some("/repos/checkout-b/intentd".to_string());
+    sibling.repository_owner = Some("intent-hq".to_string());
+    sibling.repository_name = Some("intentd.git".to_string());
+
+    let other_id = WorkspaceId::new();
+    let mut other = fixture_workspace(&other_id);
+    other.title = "Other repo".to_string();
+    other.repository_path = Some("/repos/checkout-c/cloudlands-fe".to_string());
+    other.repository_owner = Some("intent-hq".to_string());
+    other.repository_name = Some("cloudlands-fe".to_string());
+
+    for w in [&caller, &sibling, &other] {
+        srv.store
+            .insert_workspace(w)
+            .await
+            .expect("insert workspace");
+    }
+    srv.store
+        .insert_note(&fixture_note(&sibling_id, "spec", "line one\nline two"))
+        .await
+        .expect("insert sibling spec");
+    srv.store
+        .insert_note(&fixture_note(&other_id, "spec", "other spec"))
+        .await
+        .expect("insert other spec");
+
+    // listSiblings: only the same-identity workspace, with the documented fields.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listSiblings","params":{{"workspaceId":"{}"}}}}"#,
+        caller_id.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 1, "envelope: {resp}");
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    let siblings = resp["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("result must be an array: {resp}"));
+    assert_eq!(siblings.len(), 1, "exactly one sibling: {resp}");
+    let row = &siblings[0];
+    let mut keys: Vec<&str> = row
+        .as_object()
+        .expect("sibling row is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["branch", "createdAt", "id", "status", "title", "updatedAt"],
+        "documented sibling fields: {row}"
+    );
+    assert_eq!(row["id"], sibling_id.0, "{row}");
+    assert_eq!(row["title"], "Sibling", "{row}");
+    assert_eq!(row["branch"], "feat/sibling", "{row}");
+    assert_eq!(row["status"], "Active", "{row}");
+    assert_eq!(row["createdAt"], sibling.created_at, "{row}");
+    assert_eq!(row["updatedAt"], sibling.updated_at, "{row}");
+
+    // readNote against the same-identity sibling succeeds.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"crossWorkspace.readNote","params":{{"workspaceId":"{}","targetWorkspaceId":"{}","noteId":"spec"}}}}"#,
+        caller_id.0, sibling_id.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 2, "envelope: {resp}");
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    let note = &resp["result"];
+    assert_eq!(note["id"], "spec", "{note}");
+    assert_eq!(note["title"], "spec", "{note}");
+    assert_eq!(note["content"], "line one\nline two", "{note}");
+    assert_eq!(
+        note["numberedContent"], "   1 | line one\n   2 | line two",
+        "{note}"
+    );
+    assert_eq!(note["sourceWorkspaceId"], sibling_id.0, "{note}");
+    assert_eq!(note["sourceWorkspaceTitle"], "Sibling", "{note}");
+    assert_eq!(note["branch"], "feat/sibling", "{note}");
+    assert_eq!(note["lineCount"], 2, "{note}");
+
+    // readNote against the different-identity workspace is denied (-32603).
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"crossWorkspace.readNote","params":{{"workspaceId":"{}","targetWorkspaceId":"{}","noteId":"spec"}}}}"#,
+        caller_id.0, other_id.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 3, "envelope: {resp}");
+    assert!(
+        resp.get("result").is_none(),
+        "must not carry a result: {resp}"
+    );
+    assert_eq!(resp["error"]["code"], -32603, "{resp}");
+    assert_eq!(resp["error"]["message"], "Internal error", "{resp}");
+    assert_eq!(
+        resp["error"]["data"], "Access denied: Can only access workspaces in the same repository",
+        "{resp}"
+    );
 
     srv.ws.stop().await;
 }

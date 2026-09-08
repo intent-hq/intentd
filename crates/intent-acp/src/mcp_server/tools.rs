@@ -35,10 +35,14 @@ pub(crate) struct ToolDef {
 }
 
 /// One delegation model option a specialist declares (PROTOCOL §5.11
-/// `modelOptions`): the internal compound model id plus the author's hint.
+/// `modelOptions`): the `{ provider?, model, hint, reasoningEffort? }` triple.
 pub struct SpecialistModelOption {
-    /// Internal compound model id (e.g. `opencode:kimi-k3`), passed verbatim
-    /// as the `model` param of `ws.agent.delegate` / `ws.agent.create`.
+    /// Provider the option pins (e.g. `opencode`), passed as the `provider`
+    /// param of `ws.agent.delegate` / `ws.agent.create` when the option is
+    /// chosen; empty when the author declared none (any provider).
+    pub provider: String,
+    /// Bare model id (e.g. `kimi-k3`), passed verbatim as the `model` param
+    /// of `ws.agent.delegate` / `ws.agent.create`.
     pub model: String,
     /// Free-text hint for choosing this option; empty when the author gave none.
     pub hint: String,
@@ -52,8 +56,8 @@ pub struct SpecialistModelOption {
 pub struct SpecialistModelOptions {
     /// Specialist id (the `specialist` param of delegate/create).
     pub specialist: String,
-    /// Compound id a no-`model` delegate would pin, as resolved by the same
-    /// resolver the `resolvedModel` preview uses; `None` when resolution
+    /// Bare model id a no-`model` delegate would pin, as resolved by the
+    /// same resolver the `resolvedModel` preview uses; `None` when resolution
     /// yields the provider CLI default.
     pub default_model: Option<String>,
     /// Ordered options as authored in the winning tier's frontmatter.
@@ -162,7 +166,7 @@ API:
   ws.workspace.info() → { id, path }  // Current workspace ID + absolute path.
   ws.workspace.details() → { id, title, hasTitle, status, statusMessage, statusImageAssetId, branch, repositoryName, tags }  // Workspace metadata; `status` is the lifecycle enum and `statusMessage` is the user-facing work summary.
   ws.workspace.setTitle(title) → { ok, title, branch, skipped? }  // Set a short 1-5 word workspace title. May rename the branch if it is still auto-generated; returns `skipped` if the workspace already has a custom title.
-  ws.workspace.setStatusMessage(message) → { ok, statusMessage }  // Set or clear the 1-2 sentence user-facing workspace status message; does not change lifecycle `status` or task statuses. Pass an empty string or null to clear.
+  ws.workspace.setStatusMessage(message) → { ok, statusMessage }  // Set or clear the user-facing workspace status message shown on the workspace card: one plain sentence, ideally under 15 words, naming what is being worked on and where it stands (no counts, check lists, or implementation details); does not change lifecycle `status` or task statuses. Pass an empty string or null to clear.
   ws.workspace.setStatusImage({ data, mimeType, originalName? } | null) → { ok, statusImageAssetId, url? }  // Set or clear the workspace status screenshot shown on the workspace card. `data` is base64 image bytes (a `data:` URL prefix is accepted), `mimeType` must be image/*. Pass null to clear. Unavailable in the chief-of-staff workspace.
   ws.workspace.setAgentName(name) → { ok, name }  // Rename the current agent session. Call this early in your first response and use a short 1-5 word task-focused name.
   ws.workspace.archive() → { ok, status, archivedAt }  // Archive the current workspace. ONLY call this on explicit user request (same convention as user-requested commits). Refuses if other agents are running or queued (no override); unavailable in the chief-of-staff workspace.
@@ -171,11 +175,12 @@ API:
 
   ws.app.question.ask({ header, question, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. REQUIRED: `header` (short topic label), `question` (the prompt text), and `options` — an array of at least 2 OBJECTS [{ label, description? }] (NOT bare strings); do NOT add an "Other" option, a free-form answer is always offered automatically. Example: ws.app.question.ask({ header: "Auth method", question: "Which auth should the endpoint use?", options: [{ label: "OAuth", description: "OAuth 2.0 flow" }, { label: "API key", description: "Static key in header" }] }). Call once per question (aim for at most ~4 questions per turn); `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
 
-  ws.note.read(id) → { id, title, content, tags, ... }  // Read a note. Use id=`spec` for the workspace spec. Content has line numbers like `   1 | text`.
+  ws.note.read(id) → { id, title, content, rawContent, tags, ... }  // Read a note. Use id=`spec` for the workspace spec. `content` is a DISPLAY rendering with line numbers like `   1 | text` — never write it back; `rawContent` is the editable Markdown to use for read-modify-write (the write ops reject numbered content).
   ws.note.create(title, content, tags?) → { id, title, tags, link, markdownLink, convertedCount, createdTaskNoteIds, createdTasks, warnings }  // Create a new note and return canonical `intent://local/{workspaceId}/note/{noteId}` links. Share `markdownLink` with users so they can open the note. `@@@task` blocks in the content auto-convert into linked task notes, and the result carries the conversion's `createdTasks` + `warnings` like the content-write ops. DO NOT use this for the spec: the spec already exists as note ID `spec`; edit or add to it instead.
   ws.note.list(tag?) → [{ id, title, tags, ... }]  // List notes. Optional tag filter narrows results.
   ws.note.listTasks(id) → [{ text, status, taskNoteId, linkedTaskNoteId, lineNumber, ... }]  // Faster than `read()` when you only need checkbox/task IDs. Use `taskNoteId` for delegation; `linkedTaskNoteId` is a backward-compatible alias.
   ws.note.readAsset(asset) → { assetId, mimeType, data, sizeKb }  // `asset` can be an asset ID or `workspace-asset://...` URL. Image assets (PNG, JPEG, GIF, WebP) are returned as native image content blocks (the model sees the image directly); non-image assets return the JSON object.
+  ws.note.saveAsset({ data, mimeType, originalName? }) → { assetId, path, url }  // Save base64 media data as a note asset. Supported MIME types: image/png, image/jpeg, image/jpg, image/gif, image/webp, image/svg+xml, image/bmp, image/tiff, video/mp4, video/webm. MIME parameters are not accepted. A `data:<mime>;base64,` URL prefix is accepted. Embed the returned `url` in markdown.
   ws.note.setContent(id, content, confirmReplacement?) → { ... }  // ⚠️ FULL REPLACEMENT: replaces the entire note. Prefer `add()` / `edit()` / `editLines()` unless you intentionally want to overwrite everything.
     If the new content is much shorter, call again with `confirmReplacement=true`. `@@@task` blocks auto-convert into linked task notes; the fence line takes optional `key=` / `dependsOn=` / `conflictsWith=` / `effort=` attributes (see `ws.task.convertBlocks`), and every content-write result (`add` / `edit` / `editLines` / `setContent`) carries the conversion's `createdTasks` + `warnings`.
   ws.note.add(id, { content, heading?, position? }) → { ... }  // Safest way to add information without losing existing content. Prefer this when asked to "add", "put", "document", or "include" something.
@@ -217,25 +222,25 @@ API:
     You can override specialist defaults with `model` (a bare model id — compound `provider:model` ids are rejected; pass `provider` separately), `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
     With `topLevel: true` (foreground top-level callers only; gated by `agentFeatures.peerAgents`) the created agent is a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only; the result carries `sponsorAgentId` and no `subscriptionId`) and a sponsor preamble telling it of its independent standing is prepended to your message. Top-level agents are FOREGROUND by default (`isBackground: false`); `taskNoteId` is rejected, and the call is refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Watch it explicitly with `watch` if you care about its completion.
   ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
-    Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started. A child idling with active background hooks or PR monitors is not complete: the watch delivers ONE advisory wake instead — an `"immediate"`-mode (ungrouped) watch is consumed by it (`watchStillArmed: false`; re-arm `ws.agent.watch` for the genuine completion), while an `"after_all"` group watch stays armed (`watchStillArmed: true`, informational only — no re-arm needed; the group still settles on genuine completions). See `ws.agent.watch`.
+    Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started. A child idling with active background hooks or PR monitors is not complete: the watch delivers ONE advisory wake per continuous waiting period instead (`watchStillArmed: true`, informational only — advisories never consume a watch) and stays armed for the genuine settlement; an `"after_all"` group likewise stays open until genuine completions. See `ws.agent.watch`.
     `model` must be a bare model id — compound `provider:model` ids are rejected with `-32602`. `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
     Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason, a top-level `summary` (started/held/skipped/errors counts) plus a prominent `warning` when ZERO tasks started (a zero-started call owes no completion wake; in `after_all` mode with no open delegation group an immediate advisory wake is delivered instead of silence), and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, delivery?, ... }  // Send a message to another agent. Delivers with interrupt priority by DEFAULT: the target is stopped mid-response and the message is delivered immediately. Pass `priority="queue"` to opt out and queue the message if the target is busy; the third argument also takes an options object `{ priority?, replacePending? }`.
-    `ok: true` does not always mean delivered NOW — read the `delivery` outcome: `"delivered"` (driving a turn now), `"queued"` (parked in the target's queue, drained when its turn ends; raw flag `queued: true`), or `"held"` (parked behind the target's unanswered structured questions, delivered once they resolve; raw flag `heldForQuestions: true`).
+    `ok: true` does not always mean delivered NOW — read the `delivery` outcome: `"delivered"` (driving a turn now) or `"queued"` (parked in the target's queue, drained when its turn ends; raw flag `queued: true`).
     Only ONE pending message per sender per target: while an earlier message of yours is still in the target's queue, a second send is refused with `ok: false` + `refused: true` + your `pendingMessageId` + the target's current `queue` + an `instruction`. Remediation: keep the pending entry as-is, or re-send ONE message combining everything with `replacePending: true` — one call that sends the new message and then retracts your pending entry, so a failed send never loses it (the result reports `replaced`/`replacedMessageId`, or `replaceOutcome: "drained"`/`"none"`/`"error"` when the entry delivered first, was absent, or the retraction failed). Manual `ws.agent.removeQueuedMessage` + re-send still works but is NOT atomic. Either way a re-sent message lands at the END of the queue.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, delivery?, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. Same interrupt-by-default delivery as `send()`; `priority="queue"` opts out. Same `delivery` outcomes, single-pending-message rule, `refused: true` refusal shape, and `{ priority?, replacePending? }` options-object third argument as `send()` — a refusal additionally echoes `taskNoteId`, and a mid-call assignee change skips the retraction with `replaceOutcome: "reassigned"`.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
-  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A target that goes idle while still owning active background hooks or PR monitors is NOT complete — instead of deferring silently, you get ONE advisory wake per continuous waiting period (metadata `childExternallyWaiting: true` + `watchStillArmed: false`, with `waitingOnHooks` / `waitingOnPrMonitors` naming them) that CONSUMES the one-shot watch: re-arm `ws.agent.watch` if you still want its genuine completion — the re-armed watch stays silent through further monitoring idles in the SAME waiting period and fires at the real completion/failure/deletion; if the target runs a real turn and goes monitoring-idle again, that NEW waiting period delivers a fresh advisory. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
+  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A target that goes idle while still owning active background hooks or PR monitors is NOT complete — instead of deferring silently, you get ONE advisory wake per continuous waiting period (metadata `childExternallyWaiting: true` + `watchStillArmed: true`, with `waitingOnHooks` / `waitingOnPrMonitors` naming them) that does NOT consume the watch: it stays armed, silent through further monitoring idles in the SAME waiting period, and fires at the real completion/failure/deletion; if the target runs a real turn and goes monitoring-idle again, that NEW waiting period delivers a fresh advisory. Cancel with `ws.agent.unwatch` if you no longer want the wake. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(optsOrIncludeCompleted?) → [agents]  // Lists agents in this workspace. Terminal-status rows (completed/error/deleted) are omitted unless `includeCompleted` is true. A bare boolean is the legacy `includeCompleted`; the object form takes `{ includeCompleted?, scope?, parentAgentId? }` — `scope: "top-level"` keeps only agents with no parent, `scope: "subagents"` only agents with a parent, and `parentAgentId` only that agent's direct sub-agents (cannot be combined with `scope: "top-level"`).
   ws.agent.listSpecialists() → [specialists]  // Specialist catalog with model dispatch hints; prompt bodies omitted. The live counterpart to the session-start specialist hints; each row is `{ id, name, description, hidden?, aliases?, defaultModel?, modelOptions }`.
-    `defaultModel` is `{ provider, model }` (what a no-`model` delegate would pin; omitted when resolution yields the provider default); `modelOptions` is `[{ model, hint?, reasoningEffort? }]`.
+    `defaultModel` is `{ provider, model, reasoningEffort? }` with bare `model` (what a no-`model` delegate would pin, including the effort it would apply; omitted when resolution yields the provider default); `modelOptions` is `[{ provider?, model, hint?, reasoningEffort? }]` with bare `model` (pass `provider` when the option pins one).
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage, activity timestamps, and the pending message queue (`queue` + `queueLength`; entries in the getQueue shape with `content` truncated to 200 chars).
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries. Check it for an entry with your `fromAgentId` before sending again — the single-pending-message rule on `ws.agent.send` refuses a second send while one is pending.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected. This is the remediation when `ws.agent.send` / `ws.agent.sendToTask` refuse a second send under the single-pending-message rule: remove the pending entry, then re-send ONE combined message.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
-  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, prMonitors?, prs?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with " (changes pending)" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls). Zero/absent fields are omitted; `time` is current UTC.
+  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, prMonitors?, prs?, tasks?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with " (changes pending)" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls). `tasks` counts the workspace's task notes per non-terminal status (`not_started`/`waiting`/`discussion_needed`/`blocked`/`in_progress`/`review_required`, e.g. `{"in_progress":2,"review_required":1}`; `complete`/`cancelled` never listed). Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history. Served under the slim projection: oversized tool/image block bodies arrive truncated (`inputTruncated`/`outputTruncated`) with stable block ids — hydrate one in full with `ws.agent.getMessageBlock`. A mid-turn read includes the in-flight turn's partial assistant message (tool calls/blocks streamed so far) as a trailing `inProgress: true` row, so a busy agent's latest activity is visible without waiting for the turn to end.
   ws.agent.getMessageBlock(agentId, messageId, blockId) → { block }  // Fetch ONE full content block of a persisted message — the on-demand hydration counterpart to the slim `readConversation` truncation markers.
@@ -284,9 +289,10 @@ API:
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run. On a `runAt` hook the triggered run IS the one-shot fire: the hook fires EARLY and retires (whether or not it dispatched) — the one-shot contract is honored over the timestamp, so there is no later run at the original fire time.
 
-  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing + visibility info), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800; hidden by default — pass `visible: true` to open into the UI), `showTab` (reveal a hidden owned tab — activates it in a visible panel without stealing focus; `focus: true` also focuses it), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
-    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors. Agent-opened tabs start hidden (`visibility: "hidden"` in `listTabs`); reveal them with `showTab` — `focusTab` fails on hidden tabs. Actions work even when the workspace is not visible in the app: focus/activation applies to the saved layout, and `showTab {focus:true}` / `focusTab` / `openTab {visible:true}` skip the UI focus attempt, carrying a workspace-not-visible `warning` string in their result.
+  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing + visibility info and `displayed` — a layout fact: visible AND its panel's active tab), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800; hidden by default — pass `visible: true` to open into the UI, activated in its panel without stealing focus on any `position`; the result then carries `displayed` when the layout confirmed it and omits it when unknown — absent is not `false`), `showTab` (activate an owned tab in a visible panel without stealing focus — reveals a hidden tab or brings a visible-but-inactive one to the front; `focus: true` also focuses it), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
+    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors. Agent-opened tabs start hidden (`visibility: "hidden"` in `listTabs`); reveal them with `showTab` — `focusTab` fails on hidden tabs. A `visibility: "visible"` tab with `displayed: false` sits behind another tab in its panel and never paints — `showTab` it first; `displayed: true` is a layout fact, not a paint guarantee: the tab paints (and so screenshots) only while its workspace is in view and its panel is not hidden (e.g. by zoom). Actions work even when the workspace is not visible in the app: focus/activation applies to the saved layout, and `showTab {focus:true}` / `focusTab` / `openTab {visible:true}` skip the UI focus attempt, carrying a workspace-not-visible `warning` string in their result.
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, ownership/sizing rules, `waitFor` options, and longer examples.
+  ws.browser.listTabs(scope?) → [tabs]  // This workspace's tabs from the daemon registry, all clients. `scope` is `"mine"` | `"unclaimed"` | `"all"` (default `all`). Each entry carries the `listTabs` action's fields (`tabId`, `url`, `title?`, `ownerAgentId`, `ownerAgentName?`, `mode` + `width`/`height` when emulated, `visibility`) plus `hostClientId`, `hostName?`, and `hostConnected` naming the client that renders it. Same data as `ws.browser.exec([{ action: "listTabs", scope }])`, unwrapped to the bare array.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
 
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
@@ -384,7 +390,7 @@ API:
   ws.workspace.info() → { id, path }  // Current workspace ID + absolute path.
   ws.workspace.details() → { id, title, hasTitle, status, statusMessage, statusImageAssetId, branch, repositoryName, tags }  // Workspace metadata; `status` is the lifecycle enum and `statusMessage` is the user-facing work summary.
   ws.workspace.setTitle(title) → { ok, title, branch, skipped? }  // Set a short 1-5 word workspace title. May rename the branch if it is still auto-generated; returns `skipped` if the workspace already has a custom title.
-  ws.workspace.setStatusMessage(message) → { ok, statusMessage }  // Set or clear the 1-2 sentence user-facing workspace status message; does not change lifecycle `status` or task statuses. Pass an empty string or null to clear.
+  ws.workspace.setStatusMessage(message) → { ok, statusMessage }  // Set or clear the user-facing workspace status message shown on the workspace card: one plain sentence, ideally under 15 words, naming what is being worked on and where it stands (no counts, check lists, or implementation details); does not change lifecycle `status` or task statuses. Pass an empty string or null to clear.
   ws.workspace.setStatusImage({ data, mimeType, originalName? } | null) → { ok, statusImageAssetId, url? }  // Set or clear the workspace status screenshot shown on the workspace card. `data` is base64 image bytes (a `data:` URL prefix is accepted), `mimeType` must be image/*. Pass null to clear. Unavailable in the chief-of-staff workspace.
   ws.workspace.setAgentName(name) → { ok, name }  // Rename the current agent session. Call this early in your first response and use a short 1-5 word task-focused name.
   ws.workspace.archive() → { ok, status, archivedAt }  // Archive the current workspace. ONLY call this on explicit user request (same convention as user-requested commits). Refuses if other agents are running or queued (no override); unavailable in the chief-of-staff workspace.
@@ -419,11 +425,12 @@ API:
   ws.app.workspaces.list({ filter?, sort? }) → workspaces[]  // Chief workspace only. Cross-workspace metadata list with query/status/repository/tags filtering.
   ws.app.workspaces.open(id, { openInNewWindow? }?) → { ok, queued }  // Chief workspace only. Opens a workspace through workspace-operations-saga. Pass `{ openInNewWindow: true }` to open in a new window.
 
-  ws.note.read(id) → { id, title, content, tags, ... }  // Read a note. Use id=`spec` for the workspace spec. Content has line numbers like `   1 | text`.
+  ws.note.read(id) → { id, title, content, rawContent, tags, ... }  // Read a note. Use id=`spec` for the workspace spec. `content` is a DISPLAY rendering with line numbers like `   1 | text` — never write it back; `rawContent` is the editable Markdown to use for read-modify-write (the write ops reject numbered content).
   ws.note.create(title, content, tags?) → { id, title, tags, link, markdownLink, convertedCount, createdTaskNoteIds, createdTasks, warnings }  // Create a new note and return canonical `intent://local/{workspaceId}/note/{noteId}` links. Share `markdownLink` with users so they can open the note. `@@@task` blocks in the content auto-convert into linked task notes, and the result carries the conversion's `createdTasks` + `warnings` like the content-write ops. DO NOT use this for the spec: the spec already exists as note ID `spec`; edit or add to it instead.
   ws.note.list(tag?) → [{ id, title, tags, ... }]  // List notes. Optional tag filter narrows results.
   ws.note.listTasks(id) → [{ text, status, taskNoteId, linkedTaskNoteId, lineNumber, ... }]  // Faster than `read()` when you only need checkbox/task IDs. Use `taskNoteId` for delegation; `linkedTaskNoteId` is a backward-compatible alias.
   ws.note.readAsset(asset) → { assetId, mimeType, data, sizeKb }  // `asset` can be an asset ID or `workspace-asset://...` URL. Image assets (PNG, JPEG, GIF, WebP) are returned as native image content blocks (the model sees the image directly); non-image assets return the JSON object.
+  ws.note.saveAsset({ data, mimeType, originalName? }) → { assetId, path, url }  // Save base64 media data as a note asset. Supported MIME types: image/png, image/jpeg, image/jpg, image/gif, image/webp, image/svg+xml, image/bmp, image/tiff, video/mp4, video/webm. MIME parameters are not accepted. A `data:<mime>;base64,` URL prefix is accepted. Embed the returned `url` in markdown.
   ws.note.setContent(id, content, confirmReplacement?) → { ... }  // ⚠️ FULL REPLACEMENT: replaces the entire note. Prefer `add()` / `edit()` / `editLines()` unless you intentionally want to overwrite everything.
     If the new content is much shorter, call again with `confirmReplacement=true`. `@@@task` blocks auto-convert into linked task notes; the fence line takes optional `key=` / `dependsOn=` / `conflictsWith=` / `effort=` attributes (see `ws.task.convertBlocks`), and every content-write result (`add` / `edit` / `editLines` / `setContent`) carries the conversion's `createdTasks` + `warnings`.
   ws.note.add(id, { content, heading?, position? }) → { ... }  // Safest way to add information without losing existing content. Prefer this when asked to "add", "put", "document", or "include" something.
@@ -465,23 +472,23 @@ API:
     You can override specialist defaults with `model` (a bare model id — compound `provider:model` ids are rejected; pass `provider` separately), `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
     With `topLevel: true` (foreground top-level callers only; gated by `agentFeatures.peerAgents`) the created agent is a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only; the result carries `sponsorAgentId` and no `subscriptionId`) and a sponsor preamble telling it of its independent standing is prepended to your message. Top-level agents are FOREGROUND by default (`isBackground: false`); `taskNoteId` is rejected, and the call is refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Watch it explicitly with `watch` if you care about its completion.
   ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
-    Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started. A child idling with active background hooks or PR monitors is not complete: the watch delivers ONE advisory wake instead — an `"immediate"`-mode (ungrouped) watch is consumed by it (`watchStillArmed: false`; re-arm `ws.agent.watch` for the genuine completion), while an `"after_all"` group watch stays armed (`watchStillArmed: true`, informational only — no re-arm needed; the group still settles on genuine completions). See `ws.agent.watch`.
+    Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started. A child idling with active background hooks or PR monitors is not complete: the watch delivers ONE advisory wake per continuous waiting period instead (`watchStillArmed: true`, informational only — advisories never consume a watch) and stays armed for the genuine settlement; an `"after_all"` group likewise stays open until genuine completions. See `ws.agent.watch`.
     `model` must be a bare model id — compound `provider:model` ids are rejected with `-32602`. `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
     Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason, a top-level `summary` (started/held/skipped/errors counts) plus a prominent `warning` when ZERO tasks started (a zero-started call owes no completion wake; in `after_all` mode with no open delegation group an immediate advisory wake is delivered instead of silence), and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, delivery?, ... }  // Send a message to another agent. Delivers with interrupt priority by DEFAULT: the target is stopped mid-response and the message is delivered immediately. Pass `priority="queue"` to opt out and queue the message if the target is busy; the third argument also takes an options object `{ priority?, replacePending? }`.
-    `ok: true` does not always mean delivered NOW — read the `delivery` outcome: `"delivered"` (driving a turn now), `"queued"` (parked in the target's queue, drained when its turn ends; raw flag `queued: true`), or `"held"` (parked behind the target's unanswered structured questions, delivered once they resolve; raw flag `heldForQuestions: true`).
+    `ok: true` does not always mean delivered NOW — read the `delivery` outcome: `"delivered"` (driving a turn now) or `"queued"` (parked in the target's queue, drained when its turn ends; raw flag `queued: true`).
     Only ONE pending message per sender per target: while an earlier message of yours is still in the target's queue, a second send is refused with `ok: false` + `refused: true` + your `pendingMessageId` + the target's current `queue` + an `instruction`. Remediation: keep the pending entry as-is, or re-send ONE message combining everything with `replacePending: true` — one call that sends the new message and then retracts your pending entry, so a failed send never loses it (the result reports `replaced`/`replacedMessageId`, or `replaceOutcome: "drained"`/`"none"`/`"error"` when the entry delivered first, was absent, or the retraction failed). Manual `ws.agent.removeQueuedMessage` + re-send still works but is NOT atomic. Either way a re-sent message lands at the END of the queue.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, delivery?, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. Same interrupt-by-default delivery as `send()`; `priority="queue"` opts out. Same `delivery` outcomes, single-pending-message rule, `refused: true` refusal shape, and `{ priority?, replacePending? }` options-object third argument as `send()` — a refusal additionally echoes `taskNoteId`, and a mid-call assignee change skips the retraction with `replaceOutcome: "reassigned"`.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
-  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A target that goes idle while still owning active background hooks or PR monitors is NOT complete — instead of deferring silently, you get ONE advisory wake per continuous waiting period (metadata `childExternallyWaiting: true` + `watchStillArmed: false`, with `waitingOnHooks` / `waitingOnPrMonitors` naming them) that CONSUMES the one-shot watch: re-arm `ws.agent.watch` if you still want its genuine completion — the re-armed watch stays silent through further monitoring idles in the SAME waiting period and fires at the real completion/failure/deletion; if the target runs a real turn and goes monitoring-idle again, that NEW waiting period delivers a fresh advisory. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
+  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A target that goes idle while still owning active background hooks or PR monitors is NOT complete — instead of deferring silently, you get ONE advisory wake per continuous waiting period (metadata `childExternallyWaiting: true` + `watchStillArmed: true`, with `waitingOnHooks` / `waitingOnPrMonitors` naming them) that does NOT consume the watch: it stays armed, silent through further monitoring idles in the SAME waiting period, and fires at the real completion/failure/deletion; if the target runs a real turn and goes monitoring-idle again, that NEW waiting period delivers a fresh advisory. Cancel with `ws.agent.unwatch` if you no longer want the wake. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(optsOrIncludeCompleted?) → [agents]  // Lists agents in this workspace. Terminal-status rows (completed/error/deleted) are omitted unless `includeCompleted` is true. A bare boolean is the legacy `includeCompleted`; the object form takes `{ includeCompleted?, scope?, parentAgentId? }` — `scope: "top-level"` keeps only agents with no parent, `scope: "subagents"` only agents with a parent, and `parentAgentId` only that agent's direct sub-agents (cannot be combined with `scope: "top-level"`).
   ws.agent.listSpecialists() → [specialists]  // Specialist catalog with model dispatch hints; prompt bodies omitted. The live counterpart to the session-start specialist hints; each row is `{ id, name, description, hidden?, aliases?, defaultModel?, modelOptions }`.
-    `defaultModel` is `{ provider, model }` (what a no-`model` delegate would pin; omitted when resolution yields the provider default); `modelOptions` is `[{ model, hint?, reasoningEffort? }]`.
+    `defaultModel` is `{ provider, model, reasoningEffort? }` with bare `model` (what a no-`model` delegate would pin, including the effort it would apply; omitted when resolution yields the provider default); `modelOptions` is `[{ provider?, model, hint?, reasoningEffort? }]` with bare `model` (pass `provider` when the option pins one).
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
-  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, prMonitors?, prs?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with " (changes pending)" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls). Zero/absent fields are omitted; `time` is current UTC.
+  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, prMonitors?, prs?, tasks?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with " (changes pending)" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls). `tasks` counts the workspace's task notes per non-terminal status (`not_started`/`waiting`/`discussion_needed`/`blocked`/`in_progress`/`review_required`, e.g. `{"in_progress":2,"review_required":1}`; `complete`/`cancelled` never listed). Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history. Slim projection: oversized tool/image block bodies arrive truncated with stable block ids. Mid-turn reads append the in-flight turn's partial message as a trailing `inProgress: true` row.
   ws.agent.getMessageBlock(agentId, messageId, blockId) → { block }  // Fetch ONE full content block of a persisted message — hydrates the truncated slim blocks from `readConversation`.
@@ -528,9 +535,10 @@ API:
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run. On a `runAt` hook the triggered run IS the one-shot fire: the hook fires EARLY and retires (whether or not it dispatched) — the one-shot contract is honored over the timestamp, so there is no later run at the original fire time.
 
-  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing + visibility info), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800; hidden by default — pass `visible: true` to open into the UI), `showTab` (reveal a hidden owned tab — activates it in a visible panel without stealing focus; `focus: true` also focuses it), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
-    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors. Agent-opened tabs start hidden (`visibility: "hidden"` in `listTabs`); reveal them with `showTab` — `focusTab` fails on hidden tabs. Actions work even when the workspace is not visible in the app: focus/activation applies to the saved layout, and `showTab {focus:true}` / `focusTab` / `openTab {visible:true}` skip the UI focus attempt, carrying a workspace-not-visible `warning` string in their result.
+  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing + visibility info and `displayed` — a layout fact: visible AND its panel's active tab), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800; hidden by default — pass `visible: true` to open into the UI, activated in its panel without stealing focus on any `position`; the result then carries `displayed` when the layout confirmed it and omits it when unknown — absent is not `false`), `showTab` (activate an owned tab in a visible panel without stealing focus — reveals a hidden tab or brings a visible-but-inactive one to the front; `focus: true` also focuses it), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
+    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors. Agent-opened tabs start hidden (`visibility: "hidden"` in `listTabs`); reveal them with `showTab` — `focusTab` fails on hidden tabs. A `visibility: "visible"` tab with `displayed: false` sits behind another tab in its panel and never paints — `showTab` it first; `displayed: true` is a layout fact, not a paint guarantee: the tab paints (and so screenshots) only while its workspace is in view and its panel is not hidden (e.g. by zoom). Actions work even when the workspace is not visible in the app: focus/activation applies to the saved layout, and `showTab {focus:true}` / `focusTab` / `openTab {visible:true}` skip the UI focus attempt, carrying a workspace-not-visible `warning` string in their result.
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, ownership/sizing rules, `waitFor` options, and longer examples.
+  ws.browser.listTabs(scope?) → [tabs]  // This workspace's tabs from the daemon registry, all clients. `scope` is `"mine"` | `"unclaimed"` | `"all"` (default `all`). Each entry carries the `listTabs` action's fields (`tabId`, `url`, `title?`, `ownerAgentId`, `ownerAgentName?`, `mode` + `width`/`height` when emulated, `visibility`) plus `hostClientId`, `hostName?`, and `hostConnected` naming the client that renders it. Same data as `ws.browser.exec([{ action: "listTabs", scope }])`, unwrapped to the bare array.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
 
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
@@ -1161,11 +1169,13 @@ fn inject_model_options(base: &str, model_options: &[SpecialistModelOptions]) ->
 }
 
 /// Render the injected continuation block: one header line plus one line per
-/// specialist naming its resolved default (`` default `<compound id>` ``, or
+/// specialist naming its resolved default (`` default `<model>` ``, or
 /// `default: provider default` when resolution yields the provider CLI
-/// default) followed by its options as `` `<compound id>` (<hint>) `` entries
-/// (the hint parenthetical is omitted when empty, and an option's declared
-/// reasoning effort is appended to it as `effort: <level>`). All lines are
+/// default) followed by its options as `` `<model>` (<hint>) `` entries. An
+/// option that pins a provider is shown as `` `model` on <provider> `` (pass
+/// the provider as the `provider` param — `model` is always the bare id); the
+/// hint parenthetical is omitted when empty, and an option's declared
+/// reasoning effort is appended to it as `effort: <level>`. All lines are
 /// indented ≥4 so the `[agentFeatures]` pruning treats them as continuation
 /// lines of the `ws.agent.delegate` entry. Author-supplied text is flattened
 /// onto one line so a multi-line hint cannot break the description's line
@@ -1174,9 +1184,9 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
     let flat = |s: &str| s.replace(['\n', '\r'], " ");
     let mut block = String::from(
         "    Specialist model options (for `ws.agent.delegate`/`ws.agent.create` \
-         pass a BARE model id as `model` — an option shown as compound \
-         `provider:model` splits into `provider` + bare `model`, compound ids \
-         are rejected; omit `model` to use the \
+         pass the BARE model id as `model` — compound `provider:model` ids are \
+         rejected; an option shown as `model` on <provider> also takes that \
+         provider as the `provider` param; omit `model` to use the \
          specialist's default; on `ws.agent.delegate` an option's `effort` is \
          applied automatically unless you pass an explicit `reasoningEffort` — \
          `ws.agent.create` applies only the `reasoningEffort` you pass):\n",
@@ -1190,6 +1200,11 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
             None => "default: provider default".to_string(),
         }];
         entries.extend(spec.options.iter().map(|o| {
+            use std::fmt::Write as _;
+            let mut entry = format!("`{}`", flat(&o.model));
+            if !o.provider.is_empty() {
+                let _ = write!(entry, " on {}", flat(&o.provider));
+            }
             let mut paren: Vec<String> = Vec::new();
             if !o.hint.is_empty() {
                 paren.push(flat(&o.hint));
@@ -1197,11 +1212,10 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
             if !o.reasoning_effort.is_empty() {
                 paren.push(format!("effort: {}", flat(&o.reasoning_effort)));
             }
-            if paren.is_empty() {
-                format!("`{}`", flat(&o.model))
-            } else {
-                format!("`{}` ({})", flat(&o.model), paren.join("; "))
+            if !paren.is_empty() {
+                let _ = write!(entry, " ({})", paren.join("; "));
             }
+            entry
         }));
         block.push_str(&entries.join(", "));
         block.push('\n');
@@ -2004,9 +2018,10 @@ mod tests {
     fn condensed_description_injects_model_options() {
         let options = vec![SpecialistModelOptions {
             specialist: "implementor".to_string(),
-            default_model: Some("auggie:claude-opus-5".to_string()),
+            default_model: Some("claude-opus-5".to_string()),
             options: vec![SpecialistModelOption {
-                model: "opencode:kimi-k3".to_string(),
+                provider: "opencode".to_string(),
+                model: "kimi-k3".to_string(),
                 hint: "cheap".to_string(),
                 reasoning_effort: String::new(),
             }],
@@ -2014,9 +2029,8 @@ mod tests {
         let condensed =
             condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &options);
         assert!(
-            condensed.contains(
-                "implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"
-            ),
+            condensed
+                .contains("implementor: default `claude-opus-5`, `kimi-k3` on opencode (cheap)"),
             "condensed description must carry the specialist model options"
         );
         let delegate_pos = condensed.find("  ws.agent.delegate(").unwrap();
@@ -2683,6 +2697,23 @@ mod tests {
         }
     }
 
+    // The snapshot help documents `tasks`: the field in the signature, the
+    // non-terminal status keys, and the complete/cancelled exclusion.
+    #[test]
+    fn snapshot_help_documents_task_status_counts() {
+        for description in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            assert!(
+                description.contains("prMonitors?, prs?, tasks?, pendingAttention?"),
+                "missing `tasks?` in the snapshot signature"
+            );
+            assert!(description.contains("`tasks` counts the workspace's task notes"));
+            assert!(description.contains(
+                "`not_started`/`waiting`/`discussion_needed`/`blocked`/`in_progress`/`review_required`"
+            ));
+            assert!(description.contains("`complete`/`cancelled` never listed"));
+        }
+    }
+
     // The dispatch-deny mapping: gated frame methods name their feature,
     // un-gated methods and enabled toggles pass through.
     #[test]
@@ -2799,15 +2830,17 @@ mod tests {
         vec![
             SpecialistModelOptions {
                 specialist: "implementor".to_string(),
-                default_model: Some("auggie:claude-opus-5".to_string()),
+                default_model: Some("claude-opus-5".to_string()),
                 options: vec![
                     SpecialistModelOption {
-                        model: "opencode:kimi-k3".to_string(),
+                        provider: "opencode".to_string(),
+                        model: "kimi-k3".to_string(),
                         hint: "cheap".to_string(),
                         reasoning_effort: String::new(),
                     },
                     SpecialistModelOption {
-                        model: "auggie:opus".to_string(),
+                        provider: String::new(),
+                        model: "opus".to_string(),
                         hint: String::new(),
                         reasoning_effort: String::new(),
                     },
@@ -2818,7 +2851,8 @@ mod tests {
                 specialist: "verifier".to_string(),
                 default_model: None,
                 options: vec![SpecialistModelOption {
-                    model: "grok:grok-5".to_string(),
+                    provider: "grok".to_string(),
+                    model: "grok-5".to_string(),
                     hint: "fast reviews".to_string(),
                     reasoning_effort: String::new(),
                 }],
@@ -2847,9 +2881,10 @@ mod tests {
     }
 
     // Options are injected as continuation lines directly under the
-    // `ws.agent.delegate` doc entry: the resolved default first, then compound
-    // id + hint per specialist, the hint parenthetical omitted when empty, and
-    // the next method line (`ws.agent.send`) still follows.
+    // `ws.agent.delegate` doc entry: the resolved default first, then bare
+    // model (+ provider suffix) + hint per specialist, the hint parenthetical
+    // omitted when empty, and the next method line (`ws.agent.send`) still
+    // follows.
     #[test]
     fn model_options_injected_into_delegate_docs() {
         let features = AgentFeaturesSettings::default();
@@ -2866,15 +2901,17 @@ mod tests {
             );
             assert!(
                 got.contains(
-                    "implementor: default `auggie:claude-opus-5`, \
-                     `opencode:kimi-k3` (cheap), `auggie:opus`"
+                    "implementor: default `claude-opus-5`, \
+                     `kimi-k3` on opencode (cheap), `opus`"
                 ),
                 "chief={is_chief}: implementor options line missing/miswritten:\n{got}"
             );
             // An unresolved default renders the provider-CLI-default label
             // rather than a fabricated id.
             assert!(
-                got.contains("verifier: default: provider default, `grok:grok-5` (fast reviews)"),
+                got.contains(
+                    "verifier: default: provider default, `grok-5` on grok (fast reviews)"
+                ),
                 "chief={is_chief}: verifier options line missing/miswritten:\n{got}"
             );
             // The block sits between the delegate entry and the next method
@@ -2915,11 +2952,13 @@ mod tests {
             default_model: None,
             options: vec![
                 SpecialistModelOption {
+                    provider: String::new(),
                     model: "fable-5".to_string(),
                     hint: "hard tasks".to_string(),
                     reasoning_effort: "high".to_string(),
                 },
                 SpecialistModelOption {
+                    provider: String::new(),
                     model: "sonnet5".to_string(),
                     hint: String::new(),
                     reasoning_effort: "low".to_string(),
@@ -2958,7 +2997,7 @@ mod tests {
         );
         assert!(!got.contains("ws.hook."), "pruned namespace resurfaced");
         assert!(
-            got.contains("implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"),
+            got.contains("implementor: default `claude-opus-5`, `kimi-k3` on opencode (cheap)"),
             "options block missing on a pruned description"
         );
     }
@@ -2969,9 +3008,10 @@ mod tests {
     fn model_options_flatten_multiline_hints() {
         let options = vec![SpecialistModelOptions {
             specialist: "implementor".to_string(),
-            default_model: Some("auggie:claude-opus-5".to_string()),
+            default_model: Some("claude-opus-5".to_string()),
             options: vec![SpecialistModelOption {
-                model: "opencode:kimi-k3".to_string(),
+                provider: "opencode".to_string(),
+                model: "kimi-k3".to_string(),
                 hint: "line one\nline two".to_string(),
                 reasoning_effort: String::new(),
             }],
@@ -2983,7 +3023,7 @@ mod tests {
             false,
         );
         assert!(
-            got.contains("`opencode:kimi-k3` (line one line two)"),
+            got.contains("`kimi-k3` on opencode (line one line two)"),
             "multi-line hint not flattened:\n{got}"
         );
     }

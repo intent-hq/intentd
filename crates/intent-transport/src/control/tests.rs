@@ -40,6 +40,8 @@ impl FakeControl {
                 tc_address: Some("tc7f2a91.tailcat.net".to_string()),
                 hostname: "studio.local".to_string(),
                 pretty_hostname: "Clement's Mac Studio".to_string(),
+                device_kind: Some("macStudio".to_string()),
+                hardware_model: Some("Mac Studio".to_string()),
                 cpu_percent: 12.5,
                 memory_bytes: 104_857_600,
                 child_processes: Some(4),
@@ -55,6 +57,8 @@ impl FakeControl {
                     total_roots: 5,
                     failed_roots: 0,
                 }),
+                fd_count: Some(312),
+                fd_limit: Some(10240),
                 update_supported: true,
             },
             shutdown_called: AtomicBool::new(false),
@@ -84,6 +88,14 @@ impl FakeControl {
 impl SystemControl for FakeControl {
     fn status(&self) -> SystemStatus {
         self.status.clone()
+    }
+    fn host_environment(&self) -> crate::host_env::HostEnvironment {
+        crate::host_env::HostEnvironment {
+            hostname: self.status.hostname.clone(),
+            pretty_hostname: self.status.pretty_hostname.clone(),
+            device_kind: self.status.device_kind.clone(),
+            hardware_model: self.status.hardware_model.clone(),
+        }
     }
     fn request_shutdown(&self) {
         self.shutdown_called.store(true, Ordering::SeqCst);
@@ -167,6 +179,8 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["host"]["os"], "macos");
     assert_eq!(local["host"]["arch"], "aarch64");
     assert_eq!(local["host"]["hasDisplay"], true);
+    assert_eq!(local["host"]["deviceKind"], "macStudio");
+    assert_eq!(local["host"]["hardwareModel"], "Mac Studio");
     // Supervision probe (intent-hq/intent#3875): a plain boolean, always
     // present, so a client can gate its update affordance without probing
     // system.requestUpdate.
@@ -204,6 +218,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         tc_address: None,
         hostname: "intent".to_string(),
         pretty_hostname: "intent".to_string(),
+        device_kind: None,
+        hardware_model: None,
         cpu_percent: 0.0,
         memory_bytes: 0,
         child_processes: None,
@@ -215,6 +231,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         workspaces_disk_available_bytes: None,
         workspaces_disk_total_bytes: None,
         file_watch: None,
+        fd_count: None,
+        fd_limit: None,
         update_supported: false,
     };
     let v = status_json(&status, true);
@@ -245,11 +263,16 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     assert!(!obj.contains_key("workspacesDiskTotalBytes"));
     // Watcher registry not started yet ⇒ fileWatch is ABSENT, not null.
     assert!(!obj.contains_key("fileWatch"));
+    // No descriptor sample / unreadable limit ⇒ fd fields are ABSENT, not null.
+    assert!(!obj.contains_key("fdCount"));
+    assert!(!obj.contains_key("fdLimit"));
     // Tunnel disabled/down ⇒ tcAddress is ABSENT (presence-detected), not null.
     assert!(!obj.contains_key("tcAddress"));
     // Unsupervised daemon ⇒ updateSupported is PRESENT and false — a plain
     // boolean, never absent or null.
     assert_eq!(v["updateSupported"], false);
+    assert!(v["host"].get("deviceKind").is_none());
+    assert!(v["host"].get("hardwareModel").is_none());
 }
 
 /// The descendant-tree fields ride `system.status` so a debug
@@ -324,6 +347,24 @@ fn status_json_carries_the_file_watch_coverage_when_available() {
     });
     let v = status_json(&status, true);
     assert_eq!(v["fileWatch"]["failedRoots"], 3);
+}
+
+/// The descriptor gauge rides `system.status` (intent-hq/intent#4390) so a
+/// debug bundle can attribute EMFILE symptoms to descriptor pressure: the
+/// daemon's open count next to the soft limit it runs under.
+#[test]
+fn status_json_carries_the_fd_count_and_limit_when_sampled() {
+    let v = status_json(&FakeControl::new().status, true);
+    assert_eq!(v["fdCount"], 312);
+    assert_eq!(v["fdLimit"], 10240);
+
+    // The two are independent: a readable limit with no count sample yet (or
+    // a platform without a countable fd table) still serves the limit alone.
+    let mut status = FakeControl::new().status;
+    status.fd_count = None;
+    let v = status_json(&status, true);
+    assert!(!v.as_object().unwrap().contains_key("fdCount"));
+    assert_eq!(v["fdLimit"], 10240);
 }
 
 #[tokio::test]

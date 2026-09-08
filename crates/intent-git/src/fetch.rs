@@ -276,16 +276,24 @@ mod tests {
 
     /// The wall-clock timeout kills the child and returns a structured error
     /// rather than letting it run indefinitely. Simulated by pointing `git`
-    /// at a bare remote it must reach through a non-routable IP: OpenSSH will
-    /// hang the TCP connect, and the timeout must fire.
+    /// at a loopback listener that is never accepted from: the kernel
+    /// completes the TCP handshake into the backlog, the child sends its
+    /// HTTP request and then stalls forever waiting for a response, so the
+    /// timeout must fire. (A reserved TEST-NET-1 IP was used before, but
+    /// some environments reject it immediately with "Network is
+    /// unreachable" instead of stalling — intent-hq/monorepo#4210.)
     #[test]
     fn fetch_timeout_kills_child() {
         let dir = init_repo("fetch-timeout");
         commit_file(dir.path(), "a.txt", "x\n");
-        // TEST-NET-1 (RFC 5737) — reserved, non-routable. TCP connect never
-        // completes, so the child hangs until we kill it.
+        // Bound but never accepted: connections sit in the listen backlog
+        // with no peer ever responding. Kept alive past the fetch so the
+        // pending connection is not reset by the listener closing.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         let repo = Repository::open(dir.path()).unwrap();
-        repo.remote("origin", "https://192.0.2.1/repo.git").unwrap();
+        repo.remote("origin", &format!("http://127.0.0.1:{port}/repo.git"))
+            .unwrap();
 
         let start = Instant::now();
         let err = fetch_with_timeout(
@@ -295,7 +303,7 @@ mod tests {
             None,
             Duration::from_millis(500),
         )
-        .expect_err("fetch must time out against a non-routable remote");
+        .expect_err("fetch must time out against an unresponsive remote");
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(10),

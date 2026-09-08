@@ -353,6 +353,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -687,7 +688,7 @@ async fn question_tail_promotes_and_dismiss_retires_over_wss() {
         }
     }
 
-    // Hold prerequisite over the wire: the transcript's LAST message is the
+    // Pending-questions prerequisite over the wire: the transcript's LAST message is the
     // assistant row whose trailing block is the question resource.
     let conv = wss_rpc(
         &mut rpc,
@@ -767,7 +768,7 @@ async fn question_tail_promotes_and_dismiss_retires_over_wss() {
         "pendingness survives an untagged user message and the agent's turn"
     );
 
-    // ---- Retire: agent.dismissQuestions clears the question hold ----
+    // ---- Retire: agent.dismissQuestions clears the pending questions ----
     let dismissed = wss_rpc(
         &mut rpc,
         "agent.dismissQuestions",
@@ -952,7 +953,7 @@ async fn delegated_blocker_never_promotes_needs_attention_over_wss() {
 /// derived `displayStatus` over the real WSS router. A question tail raises
 /// `needs_attention` (as in scenario 3); then `agent.appendMessage` with the
 /// ANSWER row (tagged `question_answers` for that message) resolves the
-/// question hold and the op's own recompute emits the retire transition; then
+/// pending set and the op's own recompute emits the retire transition; then
 /// `agent.replaceMessages` swapping back to an unanswered question-bearing
 /// transcript raises it again.
 #[tokio::test]
@@ -1006,7 +1007,7 @@ async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
         "subscribed: {sub_resp}"
     );
 
-    // ---- Seed the hold: the marker turn ends on a question tail ----
+    // ---- Seed the pending set: the marker turn ends on a question tail ----
     let agent_id = create_agent(&mut rpc, &ws_id, "mutator").await;
     let sent = wss_rpc(
         &mut rpc,
@@ -1044,7 +1045,7 @@ async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     // Capture the question row's blocks so replaceMessages can rebuild the
-    // tail below — and pin the hold prerequisite while at it.
+    // tail below — and pin the pending-questions prerequisite while at it.
     let conv = wss_rpc(
         &mut rpc,
         "agent.getConversation",

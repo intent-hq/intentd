@@ -782,7 +782,9 @@ pub(super) fn build_unsloth_rows(
 
 /// Whether a JSON-RPC error from an adapter signals "authentication
 /// required" (parity with the FE droid probe's `isAuthRequiredError`).
-pub(super) fn is_auth_required_error(code: i64, message: &str) -> bool {
+/// `pub(crate)` because the agent-session runtime seams reuse it to map
+/// auth-required spawn/prompt failures to the actionable login error.
+pub(crate) fn is_auth_required_error(code: i64, message: &str) -> bool {
     if code == 401 {
         return true;
     }

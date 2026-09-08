@@ -24,11 +24,10 @@ use intent_core::events::{
     WORKSPACE_SETUP_COMPLETED, WORKSPACE_SETUP_STARTED, WORKSPACE_TOKEN_USAGE_CHANGED,
     WORKSPACE_UPDATED,
 };
-use intent_core::AgentReverseDispatch;
 use intent_core::{
     chief_workspace, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso, ActorType,
-    AgentDelegateInput, AgentId, AgentLite, AgentSession, AuthorType, BoxFuture, ClientId, Comment,
-    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
+    AgentDelegateInput, AgentId, AgentLite, AgentSession, AuthorType, BoxFuture, ClientHostInfo,
+    ClientId, Comment, CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
     CommentWire, ContentType, ContextItem, CreatedTaskEntry, Draft, Event, EventQueryParams,
@@ -48,6 +47,7 @@ use intent_core::{
     WorkspaceGitRootId, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
     WorkspaceUpdate,
 };
+use intent_core::{AgentReverseDispatch, ReverseDispatchError, ReverseLiveClient};
 use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
@@ -58,10 +58,14 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+pub mod antigravity;
+pub mod antigravity_install;
+pub mod antigravity_setup;
 mod attachment_upload;
 mod auggie_cli;
 mod auto_commit;
 pub mod browser_ops;
+mod browser_tabs;
 mod clone_ops;
 mod complete_ops;
 #[cfg(test)]
@@ -98,7 +102,7 @@ mod line_attribution;
 mod linear_ops;
 mod model_catalog;
 mod nested_repos;
-mod note_ops;
+pub mod note_ops;
 mod one_shot_acp;
 pub mod pagination;
 pub mod pi_cli;
@@ -108,8 +112,10 @@ mod primitive_ops;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_models;
+pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
+pub mod retention;
 mod rtk;
 mod sandbox_ops;
 mod script_ops;
@@ -127,8 +133,10 @@ mod transfer_export;
 pub mod transfer_git;
 mod transfer_import;
 pub(crate) mod transfer_materialize;
+mod transfer_remotes;
 #[cfg(test)]
 mod transfer_roundtrip;
+mod transfer_submodules;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
@@ -145,14 +153,19 @@ mod v1_1_goldens;
 mod v1_goldens;
 #[cfg(test)]
 mod v2_1_goldens;
+#[cfg(test)]
+mod v2_2_goldens;
+#[cfg(test)]
+mod v2_3_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
-    agent_memory_budget_bytes, cleanup_retired_settings, import_legacy_settings,
-    max_concurrent_adapters, max_concurrent_agents, migrate_default_vocabulary,
-    migrate_quick_action_settings, report_to_parent_debounce_seconds, InMemorySecretStore,
+    agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
+    import_legacy_settings, max_concurrent_adapters, max_concurrent_agents,
+    migrate_active_provider_setting, migrate_default_vocabulary, migrate_quick_action_settings,
+    report_to_parent_debounce_seconds, tool_payload_retention_days, InMemorySecretStore,
     SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry};
@@ -218,6 +231,56 @@ pub(crate) struct CompletionClassifyPark {
     pub(crate) release: tokio::sync::Notify,
 }
 
+/// Live state of the completion delivery passes over one child
+/// (intent-hq/intent#4367); see [`Services::claim_watch_delivery`]. Evicted
+/// when the last pass exits and no watch claim remains.
+#[derive(Default)]
+struct ChildCompletionPasses {
+    /// Passes currently inside `deliver_completion_to_watches_inner`.
+    passes: usize,
+    /// Ungrouped watch ids whose terminal wake is in flight on some pass.
+    claimed_watches: HashSet<String>,
+    /// The child's flipped-completion triggers, consumed from the store by
+    /// exactly one pass and shared by every pass overlapping it. The store
+    /// take is destructive, so without this a split snapshot (pass 1 claims
+    /// watch A, pass 2 claims watch B) would stamp the flips on one
+    /// parent's terminal wake and lose them on the other's. The cell
+    /// serializes the take itself: a second pass arriving before the first
+    /// take completes awaits it instead of taking an empty set.
+    taken_flip_triggers: Arc<tokio::sync::OnceCell<Vec<(String, String)>>>,
+}
+
+/// Registration of one in-flight delivery pass over `child`; dropping it
+/// exits the pass and evicts the child's shared state once nothing else
+/// holds it.
+struct CompletionPassGuard<'a> {
+    services: &'a Services,
+    child: AgentId,
+}
+
+impl Drop for CompletionPassGuard<'_> {
+    fn drop(&mut self) {
+        self.services.exit_completion_pass(&self.child);
+    }
+}
+
+/// Ownership of one ungrouped watch's in-flight terminal delivery
+/// (intent-hq/intent#4367); see [`Services::claim_watch_delivery`]. Dropping
+/// the guard releases the claim on every exit of the delivering pass —
+/// delivered, retried, or unwound.
+struct WatchDeliveryClaim<'a> {
+    services: &'a Services,
+    child: AgentId,
+    watch_id: String,
+}
+
+impl Drop for WatchDeliveryClaim<'_> {
+    fn drop(&mut self) {
+        self.services
+            .release_watch_delivery(&self.child, &self.watch_id);
+    }
+}
+
 /// Test park for one pending-question marker mutation before it acquires the
 /// per-agent ordering lock. The target is `"set"` or `"clear"`; only the
 /// first matching call parks.
@@ -258,6 +321,23 @@ pub(crate) struct DeferredAttention {
     pub(crate) attention_data: serde_json::Value,
 }
 
+/// Store-backed aggregates for one complete list-shaped workspace snapshot.
+/// Each component is loaded with one bulk statement and joined to workspace
+/// rows in memory. Batch projection failures fall back to the existing
+/// per-workspace reads; a missing map entry then retains the existing
+/// best-effort omission behavior for only that workspace.
+struct WorkspaceAggregateSnapshot {
+    max_note_updated_at: HashMap<WorkspaceId, String>,
+    task_stats: Option<HashMap<WorkspaceId, WorkspaceTaskStats>>,
+    sessions: Option<HashMap<WorkspaceId, Vec<AgentSession>>>,
+    unread: Option<HashSet<WorkspaceId>>,
+    active_hooks: HashSet<WorkspaceId>,
+    active_pr_monitors: HashSet<WorkspaceId>,
+    monitor_pr_signals: HashMap<WorkspaceId, workspace_status::MonitorPrSignals>,
+    legacy_question_holds: HashSet<AgentId>,
+    cow_supported: Option<bool>,
+}
+
 /// Aggregate service handle wired by the binary composition root. It implements
 /// `WorkspaceApi` so it can be handed to `intent-acp` as `Arc<dyn WorkspaceApi>`
 /// (§6.8) and dispatched to by the transport router.
@@ -288,6 +368,17 @@ pub struct Services {
     /// the `agent_queue` table always reflects the newest in-memory state — an
     /// older snapshot can never overwrite a newer one out of mutation order.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes `workspace.setBrowserClient` write + `workspace:updated`
+    /// publish so concurrent setters never emit deltas out of order relative
+    /// to the durable pin; the delta is read back from the committed row.
+    browser_client_pin_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes each browser tab registry mutation (`browser.upsertTab` /
+    /// `removeTab` / `syncTabs`) together with the publication of its
+    /// `browser:tab-*` events. The store transaction alone orders the rows;
+    /// without this gate a `removeTab` could commit and publish `tab-closed`
+    /// between a `syncTabs` commit and that sync's per-row `tab-opened`,
+    /// leaving subscribers with a ghost tab the database no longer has.
+    browser_tab_gate: Arc<tokio::sync::Mutex<()>>,
     /// Per-entry debounce-hold release timers, keyed by queue-entry id: each
     /// held [`agent_ops::QueuedMessage`] gets a spawned sleeper that flushes
     /// the hold marker at `holdUntil` and kicks delivery. Release/retract
@@ -348,6 +439,13 @@ pub struct Services {
     /// the `after_all` group fan-in (AS-4) consume it later. Shared across
     /// clones like the other in-memory registries.
     agent_subscriptions: Arc<Mutex<agent_subscriptions::SubscriptionRegistry>>,
+    /// Sender side of the delegation-group persistence lane: every write to
+    /// the `delegation_group` table is enqueued here (under the registry
+    /// lock) and executed by ONE worker task in enqueue order, so a
+    /// best-effort upsert spawned at group create/enroll can never land after
+    /// a later sweep/settlement delete and resurrect the row
+    /// (intent-hq/intent#4460). Lazily spawned on first use.
+    group_persist_lane: Arc<OnceLock<agent_subscriptions::GroupPersistSender>>,
     /// Serializes strict completion-only ask registration so a watch is
     /// durably persisted before it becomes visible to completion delivery.
     completion_watch_registration_gate: Arc<tokio::sync::Mutex<()>>,
@@ -432,6 +530,35 @@ pub struct Services {
     /// any re-mark that does not re-qualify. In-memory only, like the
     /// parent set.
     advisory_pending_interim_skips: Arc<Mutex<HashSet<AgentId>>>,
+    /// Ungrouped completion watches whose terminal wake is being delivered
+    /// RIGHT NOW by some delivery pass (intent-hq/intent#4367). Two passes
+    /// can settle the same child concurrently — the completion-delivery
+    /// loop handling the live `agent:idle`, and the worker-exit
+    /// `redeliver_completion_after_queue_mutation` synthesizing the same
+    /// completion off a stale interim-skip marker — and each reads the
+    /// watch as still armed before either retires it. The stable wake id
+    /// does not close that window (a direct-send wake is not in the queue
+    /// and not yet persisted while its turn starts), so the parent received
+    /// two terminal wakes. The claim is taken before the "watch still
+    /// armed" check and released when the pass is done with the watch
+    /// (delivered + retired, or handed to the retry task); a pass that
+    /// finds the watch claimed skips it. The same entry shares the child's
+    /// consumed flipped-completion triggers between overlapping passes, so
+    /// a split snapshot never loses them (see [`ChildCompletionPasses`]).
+    /// In-memory only, like the other live delivery state.
+    completion_deliveries_in_flight: Arc<Mutex<HashMap<AgentId, ChildCompletionPasses>>>,
+    /// Process-local mirror of the persisted `advisory_wake_delivery`
+    /// once-per-period markers: `(parent, child)` pairs whose monitoring-idle
+    /// advisory was delivered this waiting period (PR #1686 review). The
+    /// persisted marker is written best-effort AFTER the durable wake, so a
+    /// sustained store write failure would otherwise let every fresh idle
+    /// re-advise (fail-open, unbounded wakes); this set is consulted
+    /// alongside the marker and set BEFORE the write, bounding that failure
+    /// to at most one advisory per period per process lifetime. Cleared at
+    /// the same period boundaries as the marker (genuine settlement, turn
+    /// start). In-memory only: after a restart only the persisted marker
+    /// guards, so the accepted one-duplicate residual window remains.
+    advisory_wake_periods: Arc<Mutex<HashSet<(AgentId, AgentId)>>>,
     /// Message ids whose questions-dismissed notice has already been claimed
     /// per agent (`agent.dismissQuestions`, PROTOCOL §5.5). The persisted
     /// dismissal marker is single-slot (most recent id only), so this set is
@@ -543,6 +670,20 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_completion_classify_park`.
     completion_classify_park: Option<Arc<CompletionClassifyPark>>,
+    /// Test park seam (intent-hq/intent#4367) for the completion-delivery
+    /// claim→send window: parks the ungrouped terminal delivery right after
+    /// it claims the watch and before the durable send, so a concurrent
+    /// delivery pass for the same child landing inside that window is
+    /// deterministic. `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_completion_claim_park`.
+    completion_claim_park: Option<Arc<CompletionClassifyPark>>,
+    /// Test park seam (intent-hq/intent#4367) for the flipped-completion
+    /// take→publish window: parks the pass that consumed the child's flips
+    /// from the store before it publishes them to the overlapping passes,
+    /// so a concurrent pass reaching the take inside that window is
+    /// deterministic. `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_completion_flip_take_park`.
+    completion_flip_take_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (monorepo#1481) for the attention mutation race window
     /// — parks `raise_attention` / `mark_seen` / `dismiss_attention`
     /// immediately before their scoped attention write (the site of the
@@ -695,6 +836,10 @@ pub struct Services {
     /// To prevent race conditions where an old task removes a newer handle, each
     /// entry stores a generation counter alongside the abort handle. Tasks only
     /// remove their own entry if the generation still matches.
+    ///
+    /// Lock order when nested with `agent_activity`: `agent_activity` →
+    /// `idle_debouncers` (`workspace_activity`, `agent_activity_end`). Never
+    /// take `agent_activity` while holding this lock.
     idle_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
     /// Generation counter for idle debounce tasks (incremented on each schedule).
     idle_debounce_gen: Arc<Mutex<u64>>,
@@ -978,6 +1123,8 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
+            browser_tab_gate: Arc::new(tokio::sync::Mutex::new(())),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
             pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks::default(),
             pending_marker_mutation_park: None,
@@ -990,6 +1137,7 @@ impl Services {
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
+            group_persist_lane: Arc::new(OnceLock::new()),
             completion_watch_registration_gate: Arc::new(tokio::sync::Mutex::new(())),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
@@ -997,8 +1145,10 @@ impl Services {
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
             interim_skipped_idles: Arc::new(Mutex::new(HashSet::new())),
+            advisory_wake_periods: Arc::new(Mutex::new(HashSet::new())),
             stale_report_interim_skips: Arc::new(Mutex::new(HashSet::new())),
             advisory_pending_interim_skips: Arc::new(Mutex::new(HashSet::new())),
+            completion_deliveries_in_flight: Arc::new(Mutex::new(HashMap::new())),
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
@@ -1018,6 +1168,8 @@ impl Services {
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
+            completion_claim_park: None,
+            completion_flip_take_park: None,
             attention_write_park: None,
             wake_archived_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
@@ -1396,8 +1548,8 @@ impl Services {
     /// resolves (mirroring [`agent_ops::resolve_delegate_provider`], the
     /// provider `agent.delegate` itself spawns on) — not a single
     /// settings-derived provider shared across every specialist, so a
-    /// specialist pinned to another provider (frontmatter `codingAgent` or a
-    /// compound `model` prefix) still shows the default it actually pins.
+    /// specialist pinned to another provider (frontmatter `codingAgent`)
+    /// still shows the default it actually pins.
     /// Specialists without options (the default) are omitted; resolution
     /// failure yields an empty list — spawning never fails on this.
     pub(crate) fn specialist_model_options(
@@ -1422,6 +1574,11 @@ impl Services {
                     .iter()
                     .filter_map(|o| {
                         Some(intent_acp::SpecialistModelOption {
+                            provider: o
+                                .get("provider")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
                             model: o.get("model").and_then(Value::as_str)?.to_string(),
                             hint: o
                                 .get("hint")
@@ -1469,7 +1626,13 @@ impl Services {
             .await
             .ok()
             .and_then(|w| crate::git_ops::worktree_path(&w));
-        self.specialist_model_options(wp.as_deref())
+        // The options walk lists the full specialist catalog — blocking pool
+        // (monorepo#4148); a JoinError degrades to no options, matching the
+        // "spawning never fails on this" doctrine above.
+        let services = self.clone();
+        tokio::task::spawn_blocking(move || services.specialist_model_options(wp.as_deref()))
+            .await
+            .unwrap_or_default()
     }
 
     /// Non-empty trimmed string at `key` in a session's raw metadata JSON —
@@ -1677,6 +1840,31 @@ impl Services {
         park: Arc<CompletionClassifyPark>,
     ) -> Self {
         self.completion_classify_park = Some(park);
+        self
+    }
+
+    /// Test seam (intent-hq/intent#4367): park the ungrouped terminal
+    /// delivery in its claim→send window (after the watch is claimed,
+    /// before the durable wake is sent) so a concurrent delivery pass for
+    /// the same child inside that window is deterministic. Production
+    /// wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_completion_claim_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.completion_claim_park = Some(park);
+        self
+    }
+
+    /// Test seam (intent-hq/intent#4367): park the delivery pass that
+    /// consumed the child's flipped-completion triggers from the store
+    /// between its take and the publish to the overlapping passes, so a
+    /// concurrent pass reaching the take inside that window is
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_completion_flip_take_park(
+        mut self,
+        park: Arc<CompletionClassifyPark>,
+    ) -> Self {
+        self.completion_flip_take_park = Some(park);
         self
     }
 
@@ -2225,6 +2413,7 @@ impl Services {
         ws: &mut Workspace,
         unread: Option<bool>,
     ) {
+        let cow_supported = self.compute_cow_supported().await;
         let mut activity_max = latest_activity_candidate(&[
             ws.last_activity.as_deref(),
             Some(ws.updated_at.as_str()),
@@ -2266,7 +2455,7 @@ impl Services {
         }
         // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
-        ws.cow_supported = self.compute_cow_supported().await;
+        ws.cow_supported = cow_supported;
         // diskUsage is deliberately NOT populated here: list/get/subscription
         // re-reads never touch the DiskUsageCache or arm walks (rung 3 of the
         // derived-field ladder). Clients fetch it on demand via the dedicated
@@ -2276,6 +2465,225 @@ impl Services {
         // [`Services::enrich_display_status`] (workspace_status module).
         self.enrich_display_status(ws, sessions.as_deref(), unread)
             .await;
+    }
+
+    /// Load every store-backed list aggregate in a constant number of
+    /// statements, then pre-fold the PR and legacy-question projections.
+    async fn workspace_aggregate_snapshot(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> WorkspaceAggregateSnapshot {
+        let (max_note_updated_at, task_stats, sessions, unread, cow_supported) = tokio::join!(
+            self.store.max_note_updated_at_by_workspace(workspace_ids),
+            self.store.count_task_stats_by_workspace(workspace_ids),
+            self.store
+                .list_agent_session_summaries_by_workspace(workspace_ids),
+            self.store
+                .workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids),
+            self.compute_cow_supported(),
+        );
+        let (active_hooks, monitors, legacy_question_tails) = tokio::join!(
+            self.store.workspaces_with_active_hooks(workspace_ids),
+            self.store
+                .list_display_status_pr_monitors_by_workspaces(workspace_ids),
+            self.store
+                .list_legacy_question_tail_candidates_by_workspace(workspace_ids),
+        );
+
+        let task_stats = match task_stats {
+            Ok(stats) => Some(stats),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "batch task stats projection failed; falling back to per-workspace reads"
+                );
+                let mut stats = HashMap::new();
+                for workspace_id in workspace_ids {
+                    match self.cheap_task_stats(workspace_id).await {
+                        Ok(workspace_stats) => {
+                            stats.insert(workspace_id.clone(), workspace_stats);
+                        }
+                        Err(error) => tracing::debug!(
+                            %error,
+                            %workspace_id,
+                            "per-workspace task stats projection failed"
+                        ),
+                    }
+                }
+                Some(stats)
+            }
+        };
+        let sessions = match sessions {
+            Ok(mut sessions) => {
+                for workspace_id in workspace_ids {
+                    sessions.entry(workspace_id.clone()).or_default();
+                }
+                Some(sessions)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "batch session projection failed; falling back to per-workspace reads"
+                );
+                let mut sessions = HashMap::new();
+                for workspace_id in workspace_ids {
+                    match self.store.list_agent_session_summaries(workspace_id).await {
+                        Ok(workspace_sessions) => {
+                            sessions.insert(workspace_id.clone(), workspace_sessions);
+                        }
+                        Err(error) => tracing::debug!(
+                            %error,
+                            %workspace_id,
+                            "per-workspace session projection failed"
+                        ),
+                    }
+                }
+                Some(sessions)
+            }
+        };
+        let mut active_pr_monitors = HashSet::new();
+        let mut monitor_rows: HashMap<WorkspaceId, Vec<intent_core::PrMonitor>> = HashMap::new();
+        if let Ok(monitors) = monitors {
+            for monitor in monitors {
+                if monitor.state == intent_core::PrMonitorState::Active {
+                    active_pr_monitors.insert(monitor.workspace_id.clone());
+                }
+                monitor_rows
+                    .entry(monitor.workspace_id.clone())
+                    .or_default()
+                    .push(monitor);
+            }
+        }
+        let monitor_pr_signals = monitor_rows
+            .into_iter()
+            .map(|(id, monitors)| (id, pr_monitor::fold_monitor_pr_signals(&monitors)))
+            .collect();
+
+        let sessions_by_agent: HashMap<&AgentId, &AgentSession> = sessions
+            .iter()
+            .flat_map(|by_workspace| by_workspace.values().flatten())
+            .map(|session| (&session.id, session))
+            .collect();
+        let legacy_question_holds = match legacy_question_tails {
+            Ok(tails) => tails
+                .into_iter()
+                .filter_map(|(agent_id, message_id, role, content)| {
+                    let session = sessions_by_agent.get(&agent_id)?;
+                    (role == "assistant"
+                        && agent_ops::has_question_blocks(&content)
+                        && session.dismissed_questions_message_id() != Some(message_id.as_str()))
+                    .then_some(agent_id)
+                })
+                .collect(),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "batch legacy question tail read failed; falling back to per-session probes"
+                );
+                let legacy_agent_ids: Vec<_> = sessions_by_agent
+                    .values()
+                    .filter(|session| {
+                        session.parent_agent_id.is_none()
+                            && !session.is_background
+                            && session.status != intent_core::AgentStatus::Deleted
+                            && !session.pending_questions_marker_written()
+                    })
+                    .map(|session| session.id.clone())
+                    .collect();
+                let mut holds = HashSet::new();
+                for agent_id in legacy_agent_ids {
+                    if self.questions_pending(&agent_id).await {
+                        holds.insert(agent_id);
+                    }
+                }
+                holds
+            }
+        };
+
+        WorkspaceAggregateSnapshot {
+            max_note_updated_at: max_note_updated_at.unwrap_or_default(),
+            task_stats,
+            sessions,
+            unread: unread.ok(),
+            active_hooks: active_hooks.unwrap_or_default(),
+            active_pr_monitors,
+            monitor_pr_signals,
+            legacy_question_holds,
+            cow_supported,
+        }
+    }
+
+    /// Join one workspace row with a pre-fetched aggregate snapshot. The full
+    /// list retains agent summaries and session-derived activity; the lite
+    /// subscription snapshot intentionally omits the summary payload.
+    async fn enrich_workspace_from_snapshot(
+        &self,
+        ws: &mut Workspace,
+        snapshot: &WorkspaceAggregateSnapshot,
+        include_agent_summary: bool,
+    ) {
+        ws.activity = self.workspace_activity(&ws.id);
+        ws.pending_delete_at = self.pending_workspace_deletes.deadline(ws.id.as_str());
+        let mut activity_max = if include_agent_summary {
+            latest_activity_candidate(&[
+                ws.last_activity.as_deref(),
+                Some(ws.updated_at.as_str()),
+                Some(ws.created_at.as_str()),
+                snapshot.max_note_updated_at.get(&ws.id).map(String::as_str),
+            ])
+        } else {
+            None
+        };
+        ws.task_stats = snapshot
+            .task_stats
+            .as_ref()
+            .and_then(|stats| stats.get(&ws.id).cloned());
+        let sessions = snapshot
+            .sessions
+            .as_ref()
+            .and_then(|by_workspace| by_workspace.get(&ws.id).map(Vec::as_slice));
+        if let Some(sessions) = sessions {
+            for session in sessions {
+                if include_agent_summary {
+                    activity_max = latest_activity_candidate(&[
+                        activity_max.as_deref(),
+                        Some(session.updated_at.as_str()),
+                    ]);
+                }
+            }
+            if include_agent_summary {
+                ws.agent_summary = Some(build_agent_summary(sessions));
+            }
+        }
+        if !include_agent_summary {
+            ws.agent_summary = None;
+        }
+        ws.diff_summary = None;
+        if let Some(activity_max) = activity_max {
+            ws.last_activity = Some(activity_max);
+        }
+        ws.cow_supported = snapshot.cow_supported;
+        let unread = snapshot.unread.as_ref().map(|ids| ids.contains(&ws.id));
+        let waiting = snapshot.active_hooks.contains(&ws.id)
+            || snapshot.active_pr_monitors.contains(&ws.id)
+            || sessions.is_some_and(|sessions| {
+                self.workspace_has_waiting_agent_subscriptions_in_sessions(&ws.id, sessions)
+            });
+        self.enrich_display_status_with_snapshot(
+            ws,
+            sessions,
+            unread,
+            Some(workspace_status::WorkspaceStatusSnapshot {
+                waiting,
+                monitor_pr_signals: snapshot
+                    .monitor_pr_signals
+                    .get(&ws.id)
+                    .copied()
+                    .unwrap_or_default(),
+                legacy_question_holds: &snapshot.legacy_question_holds,
+            }),
+        )
+        .await;
     }
 
     /// Cheap per-workspace `taskStats` read for lite/list paths: delegates to
@@ -2463,6 +2871,20 @@ impl Services {
         None
     }
 
+    /// Start the one-time repository owner/name backfill after daemon listeners
+    /// are live. The daemon invokes this from a detached readiness task, so the
+    /// candidate read and every git/filesystem probe stay off startup and RPC
+    /// critical paths.
+    pub async fn prewarm_repository_metadata(&self) {
+        match self.store.list_workspaces(false).await {
+            Ok(workspaces) => self.spawn_repository_owner_backfill(&workspaces),
+            Err(error) => tracing::warn!(
+                %error,
+                "repository metadata startup prewarm skipped; workspace read failed"
+            ),
+        }
+    }
+
     /// Spawn a background task to backfill `repository_owner` / `repository_name`
     /// for active workspaces with a local `repositoryPath` and missing owner/name.
     /// Non-blocking for the caller; each workspace is probed at most once per
@@ -2480,21 +2902,24 @@ impl Services {
 
             let mut candidates = Vec::new();
             for ws in workspaces {
-                if ws.archived || backfilled.contains(ws.id.as_str()) {
+                let Some(repository_path) = ws.repository_path.as_deref().filter(|p| !p.is_empty())
+                else {
+                    continue;
+                };
+                let dedupe_key = format!("{}\0{repository_path}", ws.id.as_str());
+                if ws.archived || backfilled.contains(&dedupe_key) {
                     continue;
                 }
                 let missing_owner = ws.repository_owner.is_none()
                     || ws.repository_owner.as_deref().is_some_and(str::is_empty);
                 let missing_name = ws.repository_name.is_none()
                     || ws.repository_name.as_deref().is_some_and(str::is_empty);
-                if (missing_owner || missing_name)
-                    && ws.repository_path.as_deref().is_some_and(|p| !p.is_empty())
-                {
+                if missing_owner || missing_name {
                     candidates.push(BackfillCandidate {
                         workspace_id: ws.id.clone(),
-                        repository_path: ws.repository_path.clone().unwrap(),
+                        repository_path: repository_path.to_string(),
                     });
-                    backfilled.insert(ws.id.0.clone());
+                    backfilled.insert(dedupe_key);
                 }
             }
             candidates
@@ -2522,24 +2947,42 @@ impl Services {
     /// and emit `workspace:updated` with the changed fields. Non-github remotes
     /// are skipped silently.
     async fn backfill_one_workspace(&self, candidate: BackfillCandidate) -> Result<()> {
-        let repo_path = std::path::PathBuf::from(&candidate.repository_path);
-        if !repo_path.join(".git").exists() {
-            return Ok(());
-        }
-
-        let origin_url = intent_git::remote::origin_url(&repo_path).ok().flatten();
-
-        let Some(origin_url) = origin_url else {
-            return Ok(());
-        };
-
-        let Some((owner, name)) = Self::parse_github_owner_repo(&origin_url) else {
+        let repository_path = candidate.repository_path.clone();
+        let metadata = tokio::task::spawn_blocking(move || {
+            let repo_path = std::path::PathBuf::from(&repository_path);
+            #[cfg(test)]
+            record_repository_backfill_probe(&repo_path);
+            if !repo_path.join(".git").exists() {
+                return None;
+            }
+            intent_git::remote::origin_url(&repo_path)
+                .ok()
+                .flatten()
+                .and_then(|url| Self::parse_github_owner_repo(&url))
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("repository metadata probe failed: {error}")))?;
+        let Some((owner, name)) = metadata else {
             return Ok(());
         };
 
         // Re-read the workspace to avoid overwriting fields populated after the
         // candidate was built (backfill race guard).
         let mut ws = self.store.get_workspace(&candidate.workspace_id).await?;
+        let current_repository_path = ws
+            .repository_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        if current_repository_path != Some(candidate.repository_path.as_str()) {
+            tracing::debug!(
+                workspace_id = %ws.id.as_str(),
+                candidate_repository_path = %candidate.repository_path,
+                current_repository_path = current_repository_path.unwrap_or(""),
+                "repository owner backfill skipped; workspace repository path changed"
+            );
+            return Ok(());
+        }
         let mut changes = serde_json::Map::new();
 
         // Only fill fields that are still missing in the currently persisted state.
@@ -2580,26 +3023,38 @@ impl Services {
         Ok(())
     }
 
-    /// Compute whether `CoW` isolation is supported on this machine. Probes the
-    /// workspaces root's filesystem (root→root) — a machine capability,
-    /// independent of any workspace or checkout mode (the FE uses it to gate
-    /// the `CoW` opt-in toggle, which affects newly created workspaces).
+    /// Read whether `CoW` isolation is supported on this machine from the
+    /// lifetime cache, awaiting the budgeted single-flight probe on a miss.
     /// Resolves the root like every other consumer — the injected
     /// `workspaces_root`, else [`default_workspaces_root`]
     /// (`$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces`) — so
     /// production daemons, which never inject a root, still report the
-    /// capability. Returns Some(true) if the `CoW` probe reports Supported;
-    /// Some(false) on an unsupported filesystem; None if the probe cannot
-    /// run. The live probe is offloaded to the blocking pool and cached per
-    /// workspaces root by the shared aggregate cache.
+    /// capability. Returns Some(true) if the `CoW` probe reports Supported,
+    /// Some(false) on an unsupported filesystem, and None when it cannot run or
+    /// exceeds the request budget. Over-budget probes continue in the
+    /// background and populate the cache for the next request.
     async fn compute_cow_supported(&self) -> Option<bool> {
         let workspaces_root = self
             .workspaces_root
             .clone()
-            .unwrap_or_else(default_workspaces_root);
+            .or_else(try_default_workspaces_root)?;
         self.workspace_aggregates
             .cow_supported(workspaces_root)
             .await
+    }
+
+    /// Prewarm the machine-level `CoW` capability off the RPC read path.
+    /// Idempotent and single-flight per resolved workspaces root.
+    pub fn prewarm_cow_supported(&self) {
+        let Some(workspaces_root) = self
+            .workspaces_root
+            .clone()
+            .or_else(try_default_workspaces_root)
+        else {
+            return;
+        };
+        self.workspace_aggregates
+            .prewarm_cow_supported(workspaces_root);
     }
 
     /// The daemon-managed directory whose footprint `workspace.diskUsage`
@@ -2663,6 +3118,84 @@ impl Services {
         Ok(result)
     }
 
+    /// `workspace.localChanges` (§5.1): the local git work archiving or
+    /// deleting the workspace would lose — one row per evaluated root, the
+    /// primary worktree first, then every registered secondary root in
+    /// `gitRoot.list` order. The primary row is skipped when the workspace is
+    /// remote (no daemon-provisioned checkout), when it skipped worktree
+    /// provisioning (`worktree_path` then falls back to the user's own
+    /// `repository_path`, which archive/delete never removes), or when its
+    /// worktree has no `.git` entry (the same gate as `git.status`); any other
+    /// failure to read it surfaces as an `error` row like a secondary root's.
+    /// Secondary roots are always evaluated because registration only accepts
+    /// host-local repository roots. Roots are scanned concurrently, one
+    /// blocking-pool task each (git I/O never runs on the RPC task), and
+    /// merged back in order; a root that cannot be read — or whose task
+    /// panics — yields an `error` row with zero counts rather than failing
+    /// the call. An unknown id is `NotFound`.
+    pub(crate) async fn workspace_local_changes_op(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<serde_json::Value> {
+        let ws = self.store.get_workspace(&id).await?;
+        let secondary = self.store.list_workspace_git_roots(&id).await?;
+
+        // (kind, gitRootId, path, whether a missing `.git` skips the row).
+        let mut targets: Vec<(&'static str, Option<String>, PathBuf, bool)> =
+            Vec::with_capacity(secondary.len() + 1);
+        if !ws.is_remote && !ws.skip_worktree {
+            if let Some(primary) = git_ops::worktree_path(&ws) {
+                targets.push(("primary", None, primary, true));
+            }
+        }
+        for root in secondary {
+            targets.push((
+                "secondary",
+                Some(root.id.as_str().to_string()),
+                PathBuf::from(&root.path),
+                false,
+            ));
+        }
+
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|(kind, git_root_id, path, skip_without_git_dir)| {
+                let kind = *kind;
+                let git_root_id = git_root_id.clone();
+                let path = path.clone();
+                let skip_without_git_dir = *skip_without_git_dir;
+                tokio::task::spawn_blocking(move || {
+                    if skip_without_git_dir && !path.join(".git").exists() {
+                        return None;
+                    }
+                    Some(LocalChangesRow::compute(kind, git_root_id, &path))
+                })
+            })
+            .collect();
+
+        let mut roots: Vec<LocalChangesRow> = Vec::with_capacity(handles.len());
+        for ((kind, git_root_id, path, _), handle) in targets.into_iter().zip(handles) {
+            match handle.await {
+                Ok(Some(row)) => roots.push(row),
+                Ok(None) => {}
+                Err(e) => roots.push(LocalChangesRow::failed(
+                    kind,
+                    git_root_id,
+                    &path,
+                    format!("workspace.localChanges task failed: {e}"),
+                )),
+            }
+        }
+
+        let has_unpushed_commits = roots.iter().any(|r| r.changes.unpushed_count > 0);
+        let has_uncommitted_changes = roots.iter().any(|r| r.changes.uncommitted_count > 0);
+        Ok(serde_json::json!({
+            "roots": roots,
+            "hasUnpushedCommits": has_unpushed_commits,
+            "hasUncommittedChanges": has_uncommitted_changes,
+        }))
+    }
+
     /// The currently configured `workspace.worktreesLocation` directory for
     /// teardown sweeps: `None` when the setting is empty or the startup pin
     /// (`INTENTD_WORKSPACES_DIR`) keeps precedence, or when the expanded path
@@ -2724,21 +3257,28 @@ impl Services {
     /// window (~3s default, env-overridable for tests). A new `agent_activity_begin`
     /// within the window cancels the idle flip. A decrement with no tracked session
     /// is a no-op.
+    ///
+    /// The `agent_activity` lock is held across the debouncer registration
+    /// (intent#4283): [`Self::workspace_activity`] reads the count and then
+    /// the `idle_debouncers` map, so releasing the count before the debouncer
+    /// is inserted opened a window where a reader saw count `0` with no
+    /// pending debouncer and derived a transient `Idle` inside the grace
+    /// window — `workspace.get` serving `idle` while the immediately following
+    /// `workspace.list` served `agent_running` / `in_progress`. Lock order
+    /// `agent_activity → idle_debouncers` matches `workspace_activity`.
     pub(crate) fn agent_activity_end(&self, workspace_id: &WorkspaceId) {
-        let transitioned = {
-            let mut map = self.agent_activity.lock().unwrap();
-            match map.get_mut(workspace_id) {
-                Some(count) if *count > 0 => {
-                    *count -= 1;
-                    if *count == 0 {
-                        map.remove(workspace_id);
-                        true
-                    } else {
-                        false
-                    }
+        let mut map = self.agent_activity.lock().unwrap();
+        let transitioned = match map.get_mut(workspace_id) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                if *count == 0 {
+                    map.remove(workspace_id);
+                    true
+                } else {
+                    false
                 }
-                _ => false,
             }
+            _ => false,
         };
         if transitioned {
             self.schedule_idle_debounce(workspace_id.clone());
@@ -2749,6 +3289,11 @@ impl Services {
     /// for the workspace. The event is emitted only after the workspace stays idle
     /// for the full debounce window (~3s default, env-overridable for tests). A new
     /// `agent_activity_begin` within the window cancels the pending flip.
+    ///
+    /// Called with the `agent_activity` guard held (intent#4283): must stay
+    /// synchronous, must not lock `agent_activity` (non-reentrant `std::sync::Mutex`),
+    /// and may only take `idle_debounce_gen` / `idle_debouncers` (lock order
+    /// `agent_activity → idle_debouncers`).
     fn schedule_idle_debounce(&self, workspace_id: WorkspaceId) {
         // Increment generation counter and cancel any existing debouncer.
         let gen = if let Ok(mut gen_lock) = self.idle_debounce_gen.lock() {
@@ -3379,6 +3924,41 @@ impl Services {
     pub fn with_reverse_dispatch(mut self, dispatch: Arc<dyn AgentReverseDispatch>) -> Self {
         self.reverse_dispatch = Some(dispatch);
         self
+    }
+
+    /// The `workspace.getBrowserClient` payload for `id`: the persisted pin
+    /// (`clientId` + `source: "workspace"`, else `source: "default"`) and
+    /// `resolved` — the driving client an agent `browser.exec` would reach
+    /// right now ([`Self::driving_client_target`]: pin → host of the
+    /// workspace's claimed tabs → first-connected eligible client), `null`
+    /// when that client is offline or no eligible client is connected. Chief
+    /// has no row and always reports the default.
+    async fn browser_client_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
+        let pinned = if id.is_chief() {
+            None
+        } else {
+            self.store.workspace_browser_client(id).await?
+        };
+        let target = self.driving_client_target(id).await?;
+        let resolved = self
+            .reverse_dispatch
+            .as_ref()
+            .and_then(|d| d.resolve(&target).ok())
+            .map_or(serde_json::Value::Null, |r| {
+                serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
+            });
+        let mut out = serde_json::Map::new();
+        match pinned {
+            Some(client_id) => {
+                out.insert("clientId".into(), client_id.as_str().into());
+                out.insert("source".into(), "workspace".into());
+            }
+            None => {
+                out.insert("source".into(), "default".into());
+            }
+        }
+        out.insert("resolved".into(), resolved);
+        Ok(serde_json::Value::Object(out))
     }
 
     /// Attach the runtime [`ServerControl`] so `settings.update` can start/stop
@@ -4844,6 +5424,46 @@ impl Services {
             .remove(&(parent_id.clone(), child_id.clone()));
     }
 
+    /// Whether the process-local advisory period set already records a
+    /// delivered advisory for this pair (see [`Self::advisory_wake_periods`]).
+    fn advisory_wake_period_marked_in_memory(
+        &self,
+        parent_id: &AgentId,
+        child_id: &AgentId,
+    ) -> bool {
+        self.advisory_wake_periods
+            .lock()
+            .expect("advisory wake period registry poisoned")
+            .contains(&(parent_id.clone(), child_id.clone()))
+    }
+
+    /// Record a delivered advisory for this pair in the process-local period
+    /// set — called BEFORE the best-effort persisted marker write so a
+    /// failing store cannot re-open the period.
+    fn mark_advisory_wake_period_in_memory(&self, parent_id: &AgentId, child_id: &AgentId) {
+        self.advisory_wake_periods
+            .lock()
+            .expect("advisory wake period registry poisoned")
+            .insert((parent_id.clone(), child_id.clone()));
+    }
+
+    /// Period boundary for ONE pair (mirrors `clear_advisory_wake_delivery`).
+    fn clear_advisory_wake_period_in_memory(&self, parent_id: &AgentId, child_id: &AgentId) {
+        self.advisory_wake_periods
+            .lock()
+            .expect("advisory wake period registry poisoned")
+            .remove(&(parent_id.clone(), child_id.clone()));
+    }
+
+    /// Period boundary for EVERY parent advised about `child_id` (mirrors
+    /// `clear_advisory_wake_deliveries_for_child`).
+    pub(crate) fn clear_advisory_wake_periods_in_memory_for_child(&self, child_id: &AgentId) {
+        self.advisory_wake_periods
+            .lock()
+            .expect("advisory wake period registry poisoned")
+            .retain(|(_, child)| child != child_id);
+    }
+
     /// Record that an `agent:idle` for `child_id` was classified as interim
     /// (monorepo#1280) — recorded up front, whether or not any ungrouped
     /// watch matched (monorepo#1281), and whether the classification came
@@ -4964,6 +5584,111 @@ impl Services {
             .lock()
             .expect("interim skipped idle registry poisoned")
             .remove(child_id)
+    }
+
+    /// Register one delivery pass over `child_id` in the in-flight registry
+    /// (intent-hq/intent#4367) so the child's consumed flip triggers are
+    /// shared with every pass that overlaps this one. The returned guard
+    /// exits the pass on drop.
+    fn enter_completion_pass(&self, child_id: &AgentId) -> CompletionPassGuard<'_> {
+        self.completion_deliveries_in_flight
+            .lock()
+            .expect("completion delivery claim registry poisoned")
+            .entry(child_id.clone())
+            .or_default()
+            .passes += 1;
+        CompletionPassGuard {
+            services: self,
+            child: child_id.clone(),
+        }
+    }
+
+    fn exit_completion_pass(&self, child_id: &AgentId) {
+        let mut registry = self
+            .completion_deliveries_in_flight
+            .lock()
+            .expect("completion delivery claim registry poisoned");
+        if let Some(entry) = registry.get_mut(child_id) {
+            entry.passes = entry.passes.saturating_sub(1);
+            if entry.passes == 0 && entry.claimed_watches.is_empty() {
+                registry.remove(child_id);
+            }
+        }
+    }
+
+    /// Claim the ungrouped watch `watch_id` of `child_id` for terminal
+    /// delivery (intent-hq/intent#4367). `None` when another delivery pass
+    /// already holds it — the caller skips the watch: the owning pass
+    /// either delivers + retires it or hands it to the stable-id retry
+    /// task, so a skipped concurrent pass never strands the watch. The
+    /// returned guard releases the claim on drop.
+    fn claim_watch_delivery(
+        &self,
+        child_id: &AgentId,
+        watch_id: &str,
+    ) -> Option<WatchDeliveryClaim<'_>> {
+        self.completion_deliveries_in_flight
+            .lock()
+            .expect("completion delivery claim registry poisoned")
+            .entry(child_id.clone())
+            .or_default()
+            .claimed_watches
+            .insert(watch_id.to_string())
+            .then(|| WatchDeliveryClaim {
+                services: self,
+                child: child_id.clone(),
+                watch_id: watch_id.to_string(),
+            })
+    }
+
+    fn release_watch_delivery(&self, child_id: &AgentId, watch_id: &str) {
+        let mut registry = self
+            .completion_deliveries_in_flight
+            .lock()
+            .expect("completion delivery claim registry poisoned");
+        if let Some(entry) = registry.get_mut(child_id) {
+            entry.claimed_watches.remove(watch_id);
+            if entry.passes == 0 && entry.claimed_watches.is_empty() {
+                registry.remove(child_id);
+            }
+        }
+    }
+
+    /// The flipped-completion triggers of `child_id` for the calling
+    /// delivery pass: the store take is destructive, so exactly one pass
+    /// takes them and publishes the set in the child's in-flight entry,
+    /// and every overlapping pass awaits and reads that same set
+    /// (intent-hq/intent#4367 review: two ungrouped parents settled by two
+    /// concurrent passes must both stamp the flips). The cell serializes
+    /// the take: a pass arriving while the take is in flight awaits its
+    /// result instead of taking an empty set from the store. The cell is
+    /// cloned out under the registry lock and awaited outside it.
+    async fn shared_flipped_completion_triggers(
+        &self,
+        child_id: &AgentId,
+    ) -> Vec<(String, String)> {
+        let cell = self
+            .completion_deliveries_in_flight
+            .lock()
+            .expect("completion delivery claim registry poisoned")
+            .get(child_id)
+            .map(|entry| entry.taken_flip_triggers.clone())
+            .unwrap_or_default();
+        cell.get_or_init(|| async {
+            let taken = self.take_flipped_completion_triggers(child_id).await;
+            // Test seam: park the consuming pass between its take and the
+            // publish so a concurrent pass reaching the take inside that
+            // window is deterministic.
+            if let Some(park) = &self.completion_flip_take_park {
+                if !taken.is_empty() {
+                    park.entered.notify_one();
+                    park.release.notified().await;
+                }
+            }
+            taken
+        })
+        .await
+        .clone()
     }
 
     /// Whether `agent_id` is currently idle-but-waiting on OTHER agents: it
@@ -5329,6 +6054,112 @@ impl Services {
         }
     }
 
+    /// Permanent-failure probe for a failed parent wake (monorepo#4183): a
+    /// RETIRED watcher can never consume a wake (the soft-retire inertness
+    /// gate rejects every delivery until `agent.restore`), and an
+    /// UNKNOWN/DELETED watcher — no session row at all — can never consume
+    /// one either. Both make retrying a permanent-failure loop, not
+    /// recovery. Returns the terminal reason, or `None` when the parent is
+    /// live or the probe hit a transient store error (fail open: the normal
+    /// retry path runs).
+    async fn wake_target_permanently_gone(&self, parent: &AgentId) -> Option<&'static str> {
+        match self.store.get_agent_session_retired_at(parent).await {
+            Ok(Some(_)) => Some("retired"),
+            Err(intent_store::Error::NotFound(_)) => Some("unknown/deleted"),
+            Ok(None) | Err(_) => None,
+        }
+    }
+
+    /// Wholesale sweep of a permanently gone parent's subscription state
+    /// (monorepo#4183): every outgoing completion watch
+    /// (`remove_all_for_parent`) and every delegation group
+    /// (`remove_groups_for_parent`), memory + persisted rows, mirroring the
+    /// `retire_one_session` sweep this backstop exists to backstop. Sweeping
+    /// wholesale — instead of dropping only the watch whose delivery failed
+    /// — keeps one consistent contract (gone parent ⇒ no outgoing watches,
+    /// no groups): a grouped watch dropped alone would leave its child in
+    /// the group's `expected_agent_ids` and strand the group forever, and
+    /// sibling watches would each have to fail-and-drop individually. Ends
+    /// with a `waiting` recompute since watches feed
+    /// `workspace_has_waiting_agent_subscriptions`.
+    async fn sweep_gone_parent_subscriptions(
+        &self,
+        parent: &AgentId,
+        parent_ws: &WorkspaceId,
+        reason: &'static str,
+    ) {
+        let watches = self.remove_all_for_parent(parent);
+        let groups = self.remove_groups_for_parent(parent);
+        tracing::warn!(
+            parent = %parent.0,
+            watches,
+            groups,
+            reason,
+            "swept watches + delegation groups — parent can never consume a wake; no retry"
+        );
+        self.maybe_emit_waiting_changed(parent_ws).await;
+    }
+
+    /// Terminal-failure classification for a failed parent wake
+    /// (monorepo#4183): when the failed delivery's target is permanently
+    /// gone (retired or unknown/deleted), sweep ALL of the parent's watches
+    /// and groups (see [`Services::sweep_gone_parent_subscriptions`]) and
+    /// return `true` so the caller skips the retry scheduling; a restored
+    /// agent re-arms with `ws.agent.watch` if it still cares. Fails open: a
+    /// store read error (or a live parent) returns `false` and the normal
+    /// retry path runs. This is a backstop — `agent.retire` drops the
+    /// retiree's own watches up front — covering watches that raced the
+    /// retire sweep or predate the fix in persisted form.
+    async fn drop_watch_if_parent_gone(
+        &self,
+        watch: &agent_subscriptions::CompletionWatch,
+        child_id: &AgentId,
+    ) -> bool {
+        let Some(reason) = self
+            .wake_target_permanently_gone(&watch.parent_agent_id)
+            .await
+        else {
+            return false;
+        };
+        tracing::warn!(
+            parent = %watch.parent_agent_id.0,
+            child = %child_id.0,
+            watch = %watch.id,
+            reason,
+            "failed wake target is permanently gone; dropping its subscriptions"
+        );
+        self.sweep_gone_parent_subscriptions(
+            &watch.parent_agent_id,
+            &watch.parent_workspace_id,
+            reason,
+        )
+        .await;
+        true
+    }
+
+    /// Grouped mirror of [`Services::drop_watch_if_parent_gone`] for the
+    /// aggregated `after_all` wake path (monorepo#4183): a failed group wake
+    /// whose parent is permanently gone (retired or unknown/deleted — e.g. a
+    /// deleted agent whose delegation group survived in the DB and
+    /// rehydrated after restart) is terminal. The parent's groups and
+    /// watches are swept from memory AND their persisted rows deleted, so
+    /// neither the live retry task nor a future restart can resume the
+    /// permanent-failure loop. Fails open on store read errors.
+    async fn drop_group_if_parent_gone(
+        &self,
+        group: &agent_subscriptions::DelegationGroup,
+    ) -> bool {
+        let Some(reason) = self
+            .wake_target_permanently_gone(&group.parent_agent_id)
+            .await
+        else {
+            return false;
+        };
+        self.sweep_gone_parent_subscriptions(&group.parent_agent_id, &group.workspace_id, reason)
+            .await;
+        true
+    }
+
     /// Retry failed durable terminal wakes for `child_id` until its
     /// ungrouped watches retire or a pass completes without a delivery
     /// failure. Retry ownership is coalesced per child
@@ -5357,7 +6188,10 @@ impl Services {
 
         let services = self.clone();
         tokio::spawn(async move {
-            let mut backoff = std::time::Duration::from_millis(100);
+            // 500ms initial (monorepo#4183): the old 100ms start burst three
+            // attempts inside the first second on every transient failure;
+            // wakes are not latency-critical enough to justify that.
+            let mut backoff = std::time::Duration::from_millis(500);
             let max_backoff = std::time::Duration::from_secs(5);
             loop {
                 tokio::time::sleep(backoff).await;
@@ -5411,7 +6245,10 @@ impl Services {
 
         let services = self.clone();
         tokio::spawn(async move {
-            let mut backoff = std::time::Duration::from_millis(100);
+            // 500ms initial backoff, aligned with the per-child retry task
+            // (monorepo#4183): wakes are not latency-critical enough to
+            // justify bursting attempts inside the first second.
+            let mut backoff = std::time::Duration::from_millis(500);
             let max_backoff = std::time::Duration::from_secs(5);
             loop {
                 tokio::time::sleep(backoff).await;
@@ -5532,7 +6369,23 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, true)
+        self.deliver_completion_to_watches_inner(child_id, event, true, true)
+            .await
+    }
+
+    /// [`Services::deliver_completion_to_watches`] for a child whose
+    /// advisory-wake period markers the caller has ALREADY cleared in one
+    /// batched statement (`clear_advisory_wake_deliveries_for_children`):
+    /// the workspace-delete sweep settles every session of the workspace in
+    /// one pass, and the per-child clear inside the delivery would cost one
+    /// statement per agent (intent-hq/monorepo#4130). Delivery semantics are
+    /// otherwise identical.
+    pub(crate) async fn deliver_completion_to_watches_markers_precleared(
+        &self,
+        child_id: &AgentId,
+        event: &Event,
+    ) -> CompletionIdleClassification {
+        self.deliver_completion_to_watches_inner(child_id, event, true, false)
             .await
     }
 
@@ -5549,7 +6402,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, false)
+        self.deliver_completion_to_watches_inner(child_id, event, false, true)
             .await
     }
 
@@ -5558,6 +6411,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
         advisory_allowed: bool,
+        clear_advisory_markers: bool,
     ) -> CompletionIdleClassification {
         // Queue- and busy-aware completion: an `agent:idle` for a child whose
         // pending message queue still holds ready-to-send entries, OR whose
@@ -5707,23 +6561,29 @@ impl Services {
             // (completion/failure/deletion/retirement) ends its
             // monitoring-idle waiting period for EVERY advised parent —
             // clear the once-per-period advisory markers BY CHILD, not per
-            // delivered watch: a parent that never re-armed after the
-            // advisory consumed its one-shot watch has no watch for a
-            // per-watch clear to run through, and the leaked marker would
-            // suppress the NEXT period's advisory for the pair (the
-            // turn-start clear in `AgentManager` is the other period
-            // boundary). Best-effort: a failed clear only suppresses one
-            // future advisory, never a real wake.
-            if let Err(e) = self
-                .store
-                .clear_advisory_wake_deliveries_for_child(child_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    child = %child_id.0,
-                    "failed to clear advisory-wake period markers at settlement"
-                );
+            // delivered watch: a parent that unwatched after hearing the
+            // advisory has no watch for a per-watch clear to run through,
+            // and the leaked marker would suppress the NEXT period's
+            // advisory for the pair (the turn-start clear in `AgentManager`
+            // is the other period boundary). Best-effort: a failed clear
+            // only suppresses one future advisory, never a real wake. The
+            // durable clear is skipped when the caller batch-cleared the
+            // markers up front (the workspace-delete sweep —
+            // `deliver_completion_to_watches_markers_precleared`); the
+            // in-memory clear is free and always runs.
+            self.clear_advisory_wake_periods_in_memory_for_child(child_id);
+            if clear_advisory_markers {
+                if let Err(e) = self
+                    .store
+                    .clear_advisory_wake_deliveries_for_child(child_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        child = %child_id.0,
+                        "failed to clear advisory-wake period markers at settlement"
+                    );
+                }
             }
         }
         let failure_error_text = (event.event_type == AGENT_FAILED).then(|| {
@@ -5926,8 +6786,12 @@ impl Services {
         // needs them — never up front — so a pass that skips every delivery
         // (deferral, report_delivered retirement, replay dedup) leaves the
         // rows for the wake that actually stamps them; one take is shared by
-        // every watch in this pass so multiple watchers stamp the same set.
-        let mut taken_flip_triggers: Option<Vec<(String, String)>> = None;
+        // every watch in this pass AND by every concurrent pass over the
+        // same child (`shared_flipped_completion_triggers`), so multiple
+        // watchers stamp the same set even when two passes split the
+        // watch snapshot between them. The pass guard keeps the shared set
+        // alive until the last overlapping pass exits.
+        let _pass = self.enter_completion_pass(child_id);
         // intent-hq/intent#3728: set on any ungrouped wake/retirement
         // failure below so the returned classification tells the per-child
         // retry task whether this pass genuinely needs another attempt.
@@ -6029,14 +6893,7 @@ impl Services {
                             triggers.push((s.workspace_id.0.clone(), n.0.clone()));
                         }
                     }
-                    let flips = if let Some(f) = &taken_flip_triggers {
-                        f.clone()
-                    } else {
-                        let f = self.take_flipped_completion_triggers(child_id).await;
-                        taken_flip_triggers = Some(f.clone());
-                        f
-                    };
-                    for pair in flips {
+                    for pair in self.shared_flipped_completion_triggers(child_id).await {
                         if !triggers.contains(&pair) {
                             triggers.push(pair);
                         }
@@ -6073,6 +6930,7 @@ impl Services {
                 // once-per-period advisory marker so a FUTURE waiting period
                 // may advise again. Best-effort, like that clear.
                 if newly_recorded {
+                    self.clear_advisory_wake_period_in_memory(&watch.parent_agent_id, child_id);
                     if let Err(e) = self
                         .store
                         .clear_advisory_wake_delivery(&watch.parent_agent_id, child_id)
@@ -6150,19 +7008,18 @@ impl Services {
             // parent: PR monitors have no TTL, so a child merely monitoring
             // a PR awaiting human review parks the watcher indefinitely.
             // Deliver ONE advisory wake per (parent, child) waiting period
-            // instead: it names the child's active hooks/monitors, consumes
-            // the one-shot watch (retired via the standard durable path,
-            // recording NO completion identity so a later genuine completion
-            // still delivers to a re-armed watch), and tells the parent to
-            // re-arm `agent.watch` for the genuine completion. A persisted
+            // instead (intent-hq/intent#4254): it names the child's active
+            // hooks/monitors and LEAVES THE WATCH ARMED — only genuine
+            // terminal settlement (completion/failure/deletion/retirement)
+            // consumes a watch. A persisted
             // once-per-period marker (`advisory_wake_delivery`) keeps
             // subsequent monitoring idles in the SAME continuous waiting
             // period silently deferring exactly as before — cleared when a
             // genuine completion/failure/deletion wake delivers below OR
             // when the child starts a real turn (the `AgentManager`
             // turn-start clear), each of which ends the waiting period so
-            // the next one may advise again. Only a LIVE `agent:idle` may
-            // fire it
+            // the next one may advise the SAME still-armed watch again.
+            // Only a LIVE `agent:idle` may fire it
             // (`advisory_allowed`): registration-time reconciliation and the
             // synthetic mutation-path redelivery keep today's silent skip —
             // except the redelivery's advisory-pending heal (monorepo#1297),
@@ -6257,6 +7114,22 @@ impl Services {
                     continue;
                 }
             }
+            // intent-hq/intent#4367: the live `agent:idle` pass and the
+            // worker-exit synthesized redelivery can settle the same child
+            // concurrently; without a claim both read the watch as armed
+            // below (retirement only lands after the durable send) and the
+            // parent gets two terminal wakes. Claim BEFORE the armed check
+            // so the loser skips; the guard releases on every exit of this
+            // iteration (delivered, retried, or unwound).
+            let Some(_claim) = self.claim_watch_delivery(child_id, &watch.id) else {
+                tracing::debug!(
+                    child = %child_id.0,
+                    parent = %watch.parent_agent_id.0,
+                    watch = %watch.id,
+                    "terminal delivery already in flight on a concurrent pass, skipping"
+                );
+                continue;
+            };
             if !self
                 .find_watches_for_child(child_id)
                 .iter()
@@ -6268,6 +7141,13 @@ impl Services {
                     "watch already removed, skipping terminal delivery"
                 );
                 continue;
+            }
+            // Test seam: park in the claim→send window so a test can run a
+            // concurrent delivery pass for the same child while this one
+            // holds the claim.
+            if let Some(park) = &self.completion_claim_park {
+                park.entered.notify_one();
+                park.release.notified().await;
             }
             let mut metadata = build_event_notification_metadata(&[event]);
             metadata["watchStillArmed"] = serde_json::json!(false);
@@ -6347,14 +7227,7 @@ impl Services {
                 }
             }
             if event.event_type == AGENT_IDLE && !interim_idle {
-                let flips = if let Some(f) = &taken_flip_triggers {
-                    f.clone()
-                } else {
-                    let f = self.take_flipped_completion_triggers(child_id).await;
-                    taken_flip_triggers = Some(f.clone());
-                    f
-                };
-                for pair in flips {
+                for pair in self.shared_flipped_completion_triggers(child_id).await {
                     if !stamped_triggers.contains(&pair) {
                         stamped_triggers.push(pair);
                     }
@@ -6376,6 +7249,25 @@ impl Services {
                 )
                 .await
             {
+                // Permanently gone watcher (retired or unknown/deleted) =
+                // terminal (monorepo#4183): drop the watch instead of
+                // scheduling a retry that would fail forever. The retracted
+                // report entries ARE restored first — retirement keeps the
+                // queue for a later `agent.restore` ("restore may drain it
+                // later"), so consuming them here would silently lose the
+                // reports; for an unknown/deleted parent the restore is a
+                // no-op against a queue nobody will ever drain.
+                if self.drop_watch_if_parent_gone(&watch, child_id).await {
+                    if let Some(held) = retracted_held {
+                        self.restore_held_message(&watch.parent_agent_id, held)
+                            .await;
+                    }
+                    for entry in retracted_flushed {
+                        self.restore_flushed_report_message(&watch.parent_agent_id, entry)
+                            .await;
+                    }
+                    continue;
+                }
                 tracing::warn!(
                     error = %e,
                     parent = %watch.parent_agent_id.0,
@@ -6428,6 +7320,7 @@ impl Services {
             // clear the once-per-period advisory marker: a FUTURE waiting
             // period may advise again. Best-effort: a failed clear only
             // suppresses one future advisory, never a real wake.
+            self.clear_advisory_wake_period_in_memory(&watch.parent_agent_id, child_id);
             if let Err(e) = self
                 .store
                 .clear_advisory_wake_delivery(&watch.parent_agent_id, child_id)
@@ -6506,44 +7399,42 @@ impl Services {
 
     /// Deliver the ONE advisory wake for a watch whose child went idle while
     /// only externally monitoring (active hooks / PR monitors — see the
-    /// callers in `deliver_completion_to_watches_inner`). Consults the
-    /// persisted once-per-waiting-period marker first: a standing marker
+    /// callers in `deliver_completion_to_watches_inner`). Ask-only watches
+    /// (`completion_only`) skip silently first, without consulting or
+    /// writing the once-per-period marker: they wait strictly for terminal
+    /// settlement and never earn (or suppress) an advisory. Consults the
+    /// persisted once-per-waiting-period marker next: a standing marker
     /// means the parent already heard the advisory for this continuous
-    /// waiting period, so the deferred idle skips silently (the watch —
-    /// typically a re-armed one — stays armed for the genuine completion).
-    /// The marker clears when the period ends — genuine settlement OR a real
-    /// turn start (the `AgentManager` turn-start clear) — so a LATER
-    /// monitoring-idle period advises re-armed watchers again. For an
-    /// ungrouped watch (`grouped: false`) the delivery retires the watch via
-    /// the standard durable path with NO completion identity recorded (a
-    /// later genuine completion must still deliver to a re-armed watch);
-    /// failures set `ungrouped_delivery_failed` AND schedule the per-child
-    /// completion retry task (PR #1578 review) — the advisory is the one
-    /// event meant to break the parent's unbounded silent wait (a PR monitor
-    /// has no TTL), so waiting for the child's next idle could park the
-    /// parent indefinitely. The retry replays the advisory-allowed delivery
-    /// pass; the stable message id keeps every attempt idempotent. The
-    /// ungrouped marker write and watch retirement commit in ONE transaction
-    /// (`retire_advisory_watch_after_delivery`, PR #1578 review): a crash
-    /// between them could otherwise retire the watch without its marker,
-    /// and the parent's re-armed watch — carrying a NEW id, hence a new
-    /// stable message id — would fire a second advisory in the same
-    /// waiting period. A crash or failure BEFORE the transaction leaves the
-    /// old watch (same id) as the recovery record, so the replayed send is
-    /// deduped, never lost. For a grouped `after_all` watch
-    /// (`grouped: true`, STAB-160 shape) the watch stays armed and the
-    /// group stays open (`watchStillArmed: true`, no re-arm instruction,
-    /// no retirement, no `ungrouped_delivery_failed`); only the shared
-    /// period marker is recorded. Because the armed grouped watch keeps its
-    /// id ACROSS waiting periods, its stable message id carries the
-    /// triggering idle event's id as a per-period discriminator — a bare
+    /// waiting period, so the deferred idle skips silently (the watch
+    /// stays armed for the genuine completion). The marker clears when the
+    /// period ends — genuine settlement OR a real turn start (the
+    /// `AgentManager` turn-start clear) — so a LATER monitoring-idle period
+    /// advises the SAME still-armed watch again. The advisory never
+    /// consumes the watch (intent-hq/intent#4254): grouped and ungrouped
+    /// watches alike stay armed (`watchStillArmed: true`) until genuine
+    /// settlement, and only the shared period marker is recorded once the
+    /// wake is durable. Because the armed watch keeps its id ACROSS
+    /// waiting periods, the stable message id carries the triggering idle
+    /// event's id as a per-period discriminator
+    /// (`advisory-wake:{watch.id}:{event.id}`) — a bare
     /// `advisory-wake:{watch.id}` would be dedup-suppressed in every period
     /// after the first. Within one period a replay of the SAME event
     /// (delivery retry) still dedups on the identical id, and a fresh idle
-    /// is marker-suppressed before the id matters; the one residual window
-    /// is a crash after the wake persists but before the best-effort marker
-    /// write, where the next idle's fresh event id re-sends one duplicate
-    /// advisory — accepted, matching the "at worst one duplicate" contract.
+    /// is marker-suppressed before the id matters — by the persisted marker
+    /// or by the process-local period set (`advisory_wake_periods`), which
+    /// is set before the best-effort marker write so a sustained store
+    /// failure cannot re-advise every idle; the one residual window is a
+    /// crash after the wake persists but before the marker write, where the
+    /// next idle's fresh event id re-sends one duplicate advisory —
+    /// accepted, matching the "at worst one duplicate" contract. An
+    /// ungrouped delivery FAILURE still sets
+    /// `ungrouped_delivery_failed` AND schedules the per-child completion
+    /// retry task (PR #1578 review) — the advisory is the one event meant
+    /// to break the parent's unbounded silent wait (a PR monitor has no
+    /// TTL), so waiting for the child's next idle could park the parent
+    /// indefinitely; the retry replays the advisory-allowed delivery pass
+    /// and the stable message id keeps every attempt idempotent. `grouped`
+    /// (STAB-160 shape when `true`) only picks the wake's trailer wording.
     #[allow(clippy::too_many_arguments)]
     async fn deliver_monitoring_idle_advisory(
         &self,
@@ -6557,22 +7448,45 @@ impl Services {
         child_of_recipient: bool,
         ungrouped_delivery_failed: &mut bool,
     ) -> bool {
+        // Ask-only watches wait strictly for terminal settlement: no
+        // advisory, and no period marker read or written on their behalf.
+        if watch.completion_only {
+            tracing::debug!(
+                child = %child_id.0,
+                parent = %watch.parent_agent_id.0,
+                "skipping monitoring-idle advisory — completion-only watch defers silently"
+            );
+            return false;
+        }
         // Marker read fails CLOSED (skip, watch stays armed): the advisory is
         // a courtesy; a missed one only restores the pre-advisory silent
         // deferral, while a duplicate would spam the parent every idle.
+        // The marker read below and the marker write after the durable send
+        // are NOT atomic and there is no per-child delivery lock: the
+        // once-per-period guarantee assumes the turn lifecycle serializes
+        // idle emits per child (one in-flight delivery at a time). Two
+        // distinct same-period idle events processed concurrently would both
+        // pass the read and both deliver under different event ids — an
+        // accepted low-risk duplicate; a change that parallelizes delivery
+        // must add a real mutex, the marker alone is not one. The
+        // process-local period set is consulted first: it is set before the
+        // persisted marker write, so a sustained store write failure still
+        // degrades to one advisory per period for this process lifetime.
         let already_advised = self
-            .store
-            .has_advisory_wake_delivery(&watch.parent_agent_id, child_id)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    child = %child_id.0,
-                    parent = %watch.parent_agent_id.0,
-                    error = %e,
-                    "advisory-wake marker read failed; deferring silently"
-                );
-                true
-            });
+            .advisory_wake_period_marked_in_memory(&watch.parent_agent_id, child_id)
+            || self
+                .store
+                .has_advisory_wake_delivery(&watch.parent_agent_id, child_id)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        child = %child_id.0,
+                        parent = %watch.parent_agent_id.0,
+                        error = %e,
+                        "advisory-wake marker read failed; deferring silently"
+                    );
+                    true
+                });
         if already_advised {
             tracing::debug!(
                 child = %child_id.0,
@@ -6586,11 +7500,11 @@ impl Services {
             event,
             active_hooks,
             active_pr_monitors,
-            !grouped,
+            grouped,
             child_of_recipient,
         );
         let mut metadata = build_event_notification_metadata(&[event]);
-        metadata["watchStillArmed"] = serde_json::json!(grouped);
+        metadata["watchStillArmed"] = serde_json::json!(true);
         metadata["childExternallyWaiting"] = serde_json::json!(true);
         if !active_hooks.is_empty() {
             metadata["waitingOnHooks"] = serde_json::Value::Array(active_hooks.to_vec());
@@ -6598,16 +7512,11 @@ impl Services {
         if !active_pr_monitors.is_empty() {
             metadata["waitingOnPrMonitors"] = serde_json::Value::Array(active_pr_monitors.to_vec());
         }
-        // Stable message id: a crash between delivery and retirement (or the
-        // marker write) replays this pass; the durable-wake dedup makes the
-        // re-send idempotent. Ungrouped ids are per-watch (retirement mints a
-        // new watch id each period); grouped ids append the triggering event
-        // id since the grouped watch id repeats across waiting periods.
-        let message_id = if grouped {
-            format!("advisory-wake:{}:{}", watch.id, event.id)
-        } else {
-            format!("advisory-wake:{}", watch.id)
-        };
+        // Stable message id: the armed watch keeps its id across waiting
+        // periods, so the triggering idle event's id is appended as a
+        // per-period discriminator. A delivery retry replays the SAME event
+        // and the durable-wake dedup makes the re-send idempotent.
+        let message_id = format!("advisory-wake:{}:{}", watch.id, event.id);
         if let Err(e) = self
             .deliver_parent_wake_durable(
                 parent_ws,
@@ -6618,6 +7527,14 @@ impl Services {
             )
             .await
         {
+            // Permanently gone watcher (retired or unknown/deleted) =
+            // terminal (monorepo#4183): drop the watch instead of scheduling
+            // the retry loop that would fail forever. Applies to grouped
+            // watches too — group settlement toward a gone parent is equally
+            // undeliverable, so the group is dropped with the watch.
+            if self.drop_watch_if_parent_gone(watch, child_id).await {
+                return false;
+            }
             tracing::warn!(
                 error = %e,
                 parent = %watch.parent_agent_id.0,
@@ -6630,59 +7547,26 @@ impl Services {
             }
             return false;
         }
-        let delivered_at = now_iso();
-        if grouped {
-            // Grouped watches never retire here — group settlement owns
-            // them. Only the shared period marker is recorded; a failure
-            // here means the next idle in this period replays the send
-            // under a fresh event id (see the per-period discriminator
-            // above), so the parent may hear one duplicate advisory —
-            // accepted worst case.
-            if let Err(e) = self
-                .store
-                .record_advisory_wake_delivery(&watch.parent_agent_id, child_id, &delivered_at)
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    parent = %watch.parent_agent_id.0,
-                    child = %child_id.0,
-                    "failed to record advisory-wake period marker"
-                );
-            }
-        } else {
-            // Retire the watch and write the period marker in ONE
-            // transaction (with NO completion identity: the advisory is not
-            // the child's completion, so nothing may be recorded as
-            // "delivered" for the genuine completion a re-armed watch waits
-            // for). Atomicity closes the crash window where the watch is
-            // retired without its marker — the re-armed watch's NEW id
-            // would defeat the stable-id dedup and a second advisory would
-            // fire this waiting period. A failed transaction leaves the old
-            // watch (same id) armed for the deduped retry.
-            if let Err(e) = self
-                .store
-                .retire_advisory_watch_after_delivery(
-                    &watch.id,
-                    &watch.parent_agent_id,
-                    child_id,
-                    &delivered_at,
-                )
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    parent = %watch.parent_agent_id.0,
-                    watch = %watch.id,
-                    "advisory wake is durable but watch retirement failed; stable-id retry remains armed"
-                );
-                *ungrouped_delivery_failed = true;
-                self.schedule_completion_delivery_retry(child_id.clone(), event.clone());
-                return false;
-            }
-            self.remove_watch_after_delivery_commit(&watch.id);
-            self.publish_subscriptions_changed(parent_ws, &watch.parent_agent_id)
-                .await;
+        // The watch stays armed — advisories never consume watches
+        // (intent-hq/intent#4254); genuine settlement owns retirement.
+        // Only the shared period marker is recorded: the process-local set
+        // first (so a failing store cannot re-open the period while this
+        // process lives), then the persisted marker. A persisted write
+        // failure therefore only matters across a restart, where the next
+        // idle's fresh event id (see the per-period discriminator above)
+        // replays the send once — the accepted one-duplicate worst case.
+        self.mark_advisory_wake_period_in_memory(&watch.parent_agent_id, child_id);
+        if let Err(e) = self
+            .store
+            .record_advisory_wake_delivery(&watch.parent_agent_id, child_id, &now_iso())
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                parent = %watch.parent_agent_id.0,
+                child = %child_id.0,
+                "failed to record advisory-wake period marker"
+            );
         }
         true
     }
@@ -6784,6 +7668,27 @@ impl Services {
             )
             .await
         {
+            // Permanently gone parent (retired or unknown/deleted) =
+            // terminal (monorepo#4183): drop the group + grouped watches
+            // (memory + persisted rows) instead of scheduling the retry
+            // loop — covers persisted groups that rehydrate after a daemon
+            // restart with a parent that no longer exists. The retracted
+            // holds ARE restored first — retirement keeps the queue for a
+            // later `agent.restore`, so consuming them here would lose the
+            // reports; for an unknown/deleted parent the restore is a no-op
+            // against a queue nobody will drain.
+            if self.drop_group_if_parent_gone(&group).await {
+                for held in retracted_holds {
+                    self.restore_held_message(&group.parent_agent_id, held)
+                        .await;
+                }
+                for entry in retracted_flushed {
+                    self.restore_flushed_report_message(&group.parent_agent_id, entry)
+                        .await;
+                }
+                self.release_group_delivery(group_id);
+                return;
+            }
             tracing::warn!(
                 error = %e,
                 parent = %group.parent_agent_id.0,
@@ -6807,8 +7712,7 @@ impl Services {
             return;
         }
         if let Err(e) = self
-            .store
-            .settle_delegation_group_after_delivery(group_id, &failed_children)
+            .settle_delegation_group_persisted(group_id, &failed_children)
             .await
         {
             tracing::warn!(
@@ -7594,37 +8498,6 @@ impl Services {
                 )
                 .await
         } else {
-            // Question hold (PROTOCOL §5.5): parent wakes are automatic —
-            // an active hold parks the wake in the queue instead of
-            // appending a user row that would bury the pending Q&A
-            // (mirrors the manager path's `send_message` gate).
-            if self.question_hold_active(&parent_agent_id).await {
-                let (queued, position) = self.enqueue_message_with_id_and_origin(
-                    &parent_agent_id,
-                    message_id,
-                    content,
-                    None,
-                    None,
-                    message_metadata,
-                    None,
-                    false,
-                    false,
-                );
-                let result = serde_json::json!({
-                    "success": true,
-                    "queued": true,
-                    "heldForQuestions": true,
-                    "queuedMessage": queued.to_value(position),
-                });
-                self.publish_queue_updated(&parent_agent_id).await;
-                // Race close (hold-check → enqueue vs a concurrent
-                // `dismissQuestions`/answer): this branch is only taken
-                // when no `AgentManager` is attached (see the `match`
-                // above), so there is no drain to kick here — a manager
-                // attaching later re-derives the hold on its own next
-                // trigger.
-                return Ok(result);
-            }
             // Delivery-time unblocked hints (monorepo#2044): the
             // store-only persist IS this path's delivery, so the section
             // is resolved here — matching the manager path's direct-send
@@ -8145,6 +9018,125 @@ impl Services {
         }
     }
 
+    /// Write a task note's metadata status — the single implementation behind
+    /// `task.updateNoteStatus` and the checkbox-level writes (`task.updateStatus`
+    /// / `task.update`) redirected from a linked line (intent-hq/intent#4255).
+    /// On an actual transition it emits `task:status-changed`, recomputes the
+    /// ready-task set, re-announces dependents across the complete boundary
+    /// and probes the displayStatus rollup; either way it then materializes
+    /// the status char onto every line linking the task.
+    pub(crate) async fn set_task_note_status(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        new_status: TaskStatus,
+        expected_version: Option<i64>,
+        caller_agent_id: Option<AgentId>,
+    ) -> Result<TaskUpdateNoteStatusResult> {
+        let store = &self.store;
+        let bus = self.event_bus.as_ref();
+        let mut note = fetch_note(store, workspace_id, note_id).await?;
+        let Some(mut task) = note.metadata.task.clone() else {
+            return Err(Error::Internal(
+                "Note is not a task. Use markAsTask() first.".to_string(),
+            ));
+        };
+        let previous_status = task.status;
+        let now = now_iso();
+        apply_status_transition(&mut task, new_status, &now);
+        note.metadata.task = Some(task);
+        note.updated_at = now.clone();
+        store.update_note_versioned(&note, expected_version).await?;
+        // Mirror `notes.service.ts`: emit only when the status actually changed.
+        let all = if previous_status == new_status {
+            None
+        } else {
+            // A complete-boundary crossing records/removes the caller's
+            // flipped-completion pair (later stamped as a wake trigger).
+            track_flipped_completion_boundary(
+                store,
+                caller_agent_id.as_ref(),
+                &note.workspace_id,
+                &note.id,
+                previous_status == TaskStatus::Complete,
+                new_status == TaskStatus::Complete,
+                &now,
+            )
+            .await;
+            // LC-1: agent-attributed changes carry provenance — resolve the
+            // caller's display name best-effort for the agent actor.
+            let agent = match &caller_agent_id {
+                Some(agent_id) => Some((
+                    agent_id.0.clone(),
+                    store.get_agent_session(agent_id).await.ok().map(|s| s.name),
+                )),
+                None => None,
+            };
+            publish_event(
+                bus,
+                task_status_changed_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    previous_status,
+                    new_status,
+                    &now,
+                    agent,
+                ),
+            )
+            .await;
+            // Then recompute + broadcast the ready-task set, mirroring the
+            // `emitReadyTasksChanged` call that follows `task:status-changed`.
+            let all = store.list_notes(&note.workspace_id).await?;
+            let ready_task_ids = compute_ready_task_ids(&all);
+            publish_event(
+                bus,
+                ready_tasks_changed_event(
+                    &note.workspace_id,
+                    &ready_task_ids,
+                    &note.id,
+                    previous_status,
+                    new_status,
+                    &now_iso(),
+                ),
+            )
+            .await;
+            // Re-announce dependents only when the transition crosses the
+            // complete boundary — that is the only move that changes their
+            // computed `unmetDependsOn` (monorepo#1979).
+            if (previous_status == TaskStatus::Complete) != (new_status == TaskStatus::Complete) {
+                publish_dependent_note_updates(bus, &note.workspace_id, &note.id, &all).await;
+            }
+            // A task-status transition can move the derived displayStatus
+            // rollup (§6.5): recompute-and-compare, emitting only on an
+            // actual transition.
+            self.maybe_emit_display_status_changed(&note.workspace_id)
+                .await;
+            Some(all)
+        };
+        // Materialize the status char onto the lines linking this task
+        // (parents refetch via their own `note:updated`, after the task's
+        // own emissions above). A transition already listed the workspace
+        // for the ready-task recompute; reuse that list instead of a second
+        // fetch.
+        match all {
+            Some(all) => {
+                self.materialize_linked_checkboxes_in(&note.workspace_id, &note.id, all)
+                    .await;
+            }
+            None => {
+                self.materialize_linked_checkboxes(&note.workspace_id, &note.id)
+                    .await;
+            }
+        }
+        Ok(TaskUpdateNoteStatusResult {
+            ok: true,
+            note_id: note.id.clone(),
+            status: new_status,
+            note,
+        })
+    }
+
     /// Drop any cached CRDT session for `(workspace, note)` after a surgical
     /// content mutation (`note.add` / `note.edit` / `note.editLines`,
     /// `task.updateStatus` / `task.update`, `note.restoreVersion`,
@@ -8172,10 +9164,8 @@ async fn ensure_spec_note(
     workspace_id: &WorkspaceId,
 ) -> Result<()> {
     let spec_id = NoteId::from("spec");
-    match fetch_note(store, workspace_id, &spec_id).await {
-        Ok(_) => return Ok(()),
-        Err(Error::NotFound(_)) => {}
-        Err(e) => return Err(e),
+    if store.note_exists(workspace_id, &spec_id).await? {
+        return Ok(());
     }
     // The reseed writes target `note.workspace_id → workspace(id)` (migration
     // 0030), so a deleted/nonexistent workspace has no FK target: verify the
@@ -8267,9 +9257,9 @@ async fn fetch_note_peer(
 }
 
 /// Resolve a sibling workspace for the `crossWorkspace.*` reads, enforcing that
-/// the caller and target share the same `repositoryPath`. Mirrors the TS
-/// `getSiblingWorkspaceOrThrow` messages; all failures surface as
-/// [`Error::Internal`] (→ `-32603`) to match the TS handler.
+/// the caller and target share a repository per [`workspaces_share_repository`].
+/// Mirrors the TS `getSiblingWorkspaceOrThrow` messages; all failures surface
+/// as [`Error::Internal`] (→ `-32603`) to match the TS handler.
 async fn sibling_workspace_or_throw(
     store: &Store,
     current_workspace_id: &WorkspaceId,
@@ -8282,14 +9272,11 @@ async fn sibling_workspace_or_throw(
         }
         Err(e) => return Err(e),
     };
-    let repo_path = match current.repository_path.as_deref() {
-        Some(p) if !p.is_empty() => p.to_string(),
-        _ => {
-            return Err(Error::Internal(
-                "Current workspace is not associated with a repository".to_string(),
-            ));
-        }
-    };
+    if !has_repository_identity(&current) {
+        return Err(Error::Internal(
+            "Current workspace is not associated with a repository".to_string(),
+        ));
+    }
     let target = match store.get_workspace(target_workspace_id).await {
         Ok(w) => w,
         Err(Error::NotFound(_)) => {
@@ -8299,12 +9286,57 @@ async fn sibling_workspace_or_throw(
         }
         Err(e) => return Err(e),
     };
-    if target.repository_path.as_deref() != Some(repo_path.as_str()) {
+    if !workspaces_share_repository(&current, &target) {
         return Err(Error::Internal(
             "Access denied: Can only access workspaces in the same repository".to_string(),
         ));
     }
     Ok(target)
+}
+
+/// Normalized GitHub `(owner, name)` for sibling matching: both parts
+/// non-empty, lowercased (GitHub owner/repo names are case-insensitive), with a
+/// trailing `.git` stripped from the lowercased name so `INTENT.GIT` matches
+/// `intent`. `None` when the workspace has no complete GitHub identity
+/// (local-only repo, or not yet backfilled).
+fn github_repository_identity(ws: &Workspace) -> Option<(String, String)> {
+    let owner = ws.repository_owner.as_deref()?.trim().to_ascii_lowercase();
+    let name = ws.repository_name.as_deref()?.trim().to_ascii_lowercase();
+    let name = name.strip_suffix(".git").unwrap_or(&name);
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((owner, name.to_string()))
+}
+
+fn nonempty_repository_path(ws: &Workspace) -> Option<&str> {
+    ws.repository_path.as_deref().filter(|p| !p.is_empty())
+}
+
+/// Caller precondition for `crossWorkspace.*`: the workspace can be placed in
+/// a repository by either its GitHub owner/name or its local source path.
+fn has_repository_identity(ws: &Workspace) -> bool {
+    github_repository_identity(ws).is_some() || nonempty_repository_path(ws).is_some()
+}
+
+/// The single sibling predicate shared by `crossWorkspace.listSiblings` and
+/// the `readNote` / `listNotes` access gate, so the two cannot drift. Two
+/// workspaces share a repository when either their GitHub owner/name match
+/// (case-insensitive, `.git` tolerated) — which links checkouts of the same
+/// repo at different local paths — or their non-empty source
+/// `repository_path`s are equal (local-only repos, and rows the owner/name
+/// backfill has not reached yet). Identity of the two rows is not checked;
+/// callers filter self out.
+fn workspaces_share_repository(a: &Workspace, b: &Workspace) -> bool {
+    if let (Some(ia), Some(ib)) = (github_repository_identity(a), github_repository_identity(b)) {
+        if ia == ib {
+            return true;
+        }
+    }
+    matches!(
+        (nonempty_repository_path(a), nonempty_repository_path(b)),
+        (Some(pa), Some(pb)) if pa == pb
+    )
 }
 
 /// Prefix each line with a right-aligned 1-based line number (`"   1 | text"`),
@@ -8348,10 +9380,9 @@ pub(crate) fn reject_compound_model(param: &str, value: &str) -> Result<()> {
 /// Resolve the specialist preview provider context (`specialist.get`/`.list`
 /// optional `provider` param): a supplied id must be a registered provider
 /// (unknown → `-32602` via `InvalidParams`); absent/empty defaults to the
-/// settings-derived default provider (provider of `model.default`, else
-/// `providers.active`). `None` when neither is set (monorepo#3044: no
-/// positional last resort) — the preview decoration is skipped and clients
-/// render "Provider default".
+/// settings-derived default provider (`model.defaultProvider`). `None` when
+/// neither is set (monorepo#3044: no positional last resort) — the preview
+/// decoration is skipped and clients render "Provider default".
 fn specialist_preview_provider(
     services: &Services,
     provider: Option<String>,
@@ -8375,7 +9406,11 @@ fn specialist_preview_provider(
 /// steps 2–5 — a preview has no client-picked model, so step 1 never applies)
 /// so the preview matches what a no-model create would actually pin. Both
 /// fields are omitted when resolution yields the provider CLI default
-/// (clients render "Provider default").
+/// (clients render "Provider default"). A decorated def additionally carries
+/// `resolvedReasoningEffort` when the specialist rungs of the delegate effort
+/// resolution decide one for the resolved pair — the `modelOptions` entry
+/// matching `{ provider, model }`, else the `reasoningEffort` frontmatter
+/// scalar — i.e. the effort a no-`reasoningEffort` delegate would apply.
 ///
 /// `provider` is the caller/settings context from
 /// [`specialist_preview_provider`]; `None` (no `provider` param, no
@@ -8414,9 +9449,16 @@ fn decorate_specialist_resolved(
     else {
         return;
     };
+    let specialists_svc = services.specialists_service();
+    let effort = specialists_svc
+        .resolve_model_option_effort(&id, workspace_path, Some(provider), &model)
+        .or_else(|| specialists_svc.resolve_reasoning_effort(&id, workspace_path));
     if let Some(obj) = def.as_object_mut() {
         obj.insert("resolvedModel".into(), serde_json::json!(model));
         obj.insert("resolvedProvider".into(), serde_json::json!(provider));
+        if let Some(effort) = effort {
+            obj.insert("resolvedReasoningEffort".into(), serde_json::json!(effort));
+        }
     }
 }
 
@@ -8798,9 +9840,12 @@ fn note_to_workspace_task(
 /// liveness). `agentIds` lists the same agents (forward-compat TS parity).
 /// `parentAgentId` (v2.9) carries the session's delegation parent (the value
 /// surfaced as `metadata.createdByAgentId` on full agent loads), omitted for
-/// root agents. Soft-deleted sessions (`AgentStatus::Deleted`) are excluded
-/// from `count`/`agents`/`agentIds` so clients never render deleted rows
-/// (mirrors the `workspace_attention_signals` filter).
+/// root agents. `isBackground` (monorepo#3789) carries the session's persisted
+/// `is_background` flag (the value surfaced as `metadata.isBackground` on
+/// full agent loads), omitted for foreground agents. Soft-deleted sessions
+/// (`AgentStatus::Deleted`) are excluded from `count`/`agents`/`agentIds` so
+/// clients never render deleted rows (mirrors the
+/// `workspace_attention_signals` filter).
 fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
     let live: Vec<&AgentSession> = sessions
         .iter()
@@ -8817,6 +9862,7 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
             is_streaming: false,
             is_responding: false,
             parent_agent_id: s.parent_agent_id.clone(),
+            is_background: s.is_background,
         })
         .collect();
     let agent_ids: Vec<_> = live.iter().map(|s| s.id.clone()).collect();
@@ -9311,6 +10357,28 @@ pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
 struct BackfillCandidate {
     workspace_id: WorkspaceId,
     repository_path: String,
+}
+
+#[cfg(test)]
+fn repository_backfill_probe_counts() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static COUNTS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_repository_backfill_probe(path: &Path) {
+    let mut counts = repository_backfill_probe_counts().lock().unwrap();
+    *counts.entry(path.to_path_buf()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn repository_backfill_probe_count(path: &Path) -> u64 {
+    repository_backfill_probe_counts()
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or_default()
 }
 
 /// Recursively scan `dir` for git repositories (a directory that contains a
@@ -10104,6 +11172,158 @@ async fn publish_dependent_note_updates(
             .await;
         }
     }
+}
+
+impl Services {
+    /// Materialize a task note's current status onto every note in the
+    /// workspace whose checkbox lines link it
+    /// (`[label](intent://local/task/{id})`): `complete` → `[x]`,
+    /// `in_progress` → `[/]`, else `[ ]`. Notes whose linked lines already
+    /// carry the marker are left untouched (no write, no event); each
+    /// rewritten note takes a `note:updated` and — like every other surgical
+    /// content mutation — drops its cached CRDT session and schedules its
+    /// line-attribution recompute. Every parent write is versioned against a
+    /// fresh read (retried on conflict), so a concurrent status write on a
+    /// sibling task or an editor save landing in the window is never reverted.
+    /// The marker is derived from the task note re-read on each attempt — not
+    /// from a status the caller captured — so two transitions of the same task
+    /// racing always leave the last one's projection. Best-effort: store
+    /// failures are logged, never surfaced to the status write that already
+    /// succeeded.
+    async fn materialize_linked_checkboxes(&self, workspace_id: &WorkspaceId, task_id: &NoteId) {
+        let notes = match self.store.list_notes(workspace_id).await {
+            Ok(notes) => notes,
+            Err(e) => {
+                tracing::warn!(note = %task_id.0, error = %e, "materialize linked checkboxes: list notes failed");
+                return;
+            }
+        };
+        self.materialize_linked_checkboxes_in(workspace_id, task_id, notes)
+            .await;
+    }
+
+    /// [`Self::materialize_linked_checkboxes`] over an already-fetched
+    /// workspace note list (callers that just listed the workspace for the
+    /// ready-task recompute pass it through instead of listing twice). The
+    /// list only selects candidate parents by link marker; the write itself
+    /// goes through [`Self::materialize_linked_checkbox_in_note`].
+    async fn materialize_linked_checkboxes_in(
+        &self,
+        workspace_id: &WorkspaceId,
+        task_id: &NoteId,
+        notes: Vec<Note>,
+    ) {
+        let needle = format!("(intent://local/task/{})", task_id.as_str());
+        for note in notes {
+            if !note.content.contains(&needle) {
+                continue;
+            }
+            self.materialize_linked_checkbox_in_note(workspace_id, task_id, &note.id)
+                .await;
+        }
+    }
+
+    /// Rewrite the lines linking `task_id` in one candidate parent: read the
+    /// note fresh, then the task note (its status at this moment is the
+    /// marker), patch the marker, write it back versioned against the parent
+    /// rev just read, and re-read both on `Conflict` (bounded) so a write
+    /// racing with this one — including a later transition of the same task
+    /// — is merged into rather than overwritten. A parent that already carries
+    /// the marker (or lost its link) after the fresh read is left untouched,
+    /// as is one whose task note is gone or no longer a task.
+    async fn materialize_linked_checkbox_in_note(
+        &self,
+        workspace_id: &WorkspaceId,
+        task_id: &NoteId,
+        note_id: &NoteId,
+    ) {
+        const MAX_ATTEMPTS: usize = 3;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let mut note = match self.store.get_note(workspace_id, note_id).await {
+                Ok(note) => note,
+                Err(e) => {
+                    tracing::warn!(note = %note_id.0, task = %task_id.0, error = %e, "materialize linked checkboxes: read failed");
+                    return;
+                }
+            };
+            let status = match self.store.get_note(workspace_id, task_id).await {
+                Ok(task) => match task.metadata.task.as_ref() {
+                    Some(task) => task.status,
+                    None => return,
+                },
+                Err(Error::NotFound(_)) => return,
+                Err(e) => {
+                    tracing::warn!(note = %note_id.0, task = %task_id.0, error = %e, "materialize linked checkboxes: task read failed");
+                    return;
+                }
+            };
+            let checkbox = note_ops::checkbox_for_task_status(status);
+            let Some(content) =
+                note_ops::set_linked_checkbox(&note.content, task_id.as_str(), checkbox)
+            else {
+                return;
+            };
+            note.content = content;
+            note.updated_at = now_iso();
+            match self
+                .store
+                .update_note_versioned(&note, Some(note.rev))
+                .await
+            {
+                Ok(()) => {}
+                Err(Error::Conflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                Err(e) => {
+                    tracing::warn!(note = %note.id.0, task = %task_id.0, attempt, error = %e, "materialize linked checkboxes: update failed");
+                    return;
+                }
+            }
+            self.invalidate_crdt_note(workspace_id, &note.id);
+            self.schedule_line_attribution_recompute(workspace_id, &note.id);
+            publish_event(
+                self.event_bus.as_ref(),
+                note_change_event(workspace_id, &note.id, &note.title, NOTE_UPDATED, "update"),
+            )
+            .await;
+            return;
+        }
+    }
+}
+
+/// Resolve the task note a checkbox line links to: `Some((id, status))` when
+/// `task_id` names a task note in `workspace_id`. Dangling links and links to
+/// non-task notes yield `None`, keeping the raw checkbox write.
+async fn resolve_linked_task(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    task_id: &str,
+) -> Option<(NoteId, TaskStatus)> {
+    let id = NoteId::from(task_id);
+    let note = store.get_note(workspace_id, &id).await.ok()?;
+    let status = note.metadata.task.as_ref()?.status;
+    Some((id, status))
+}
+
+/// Task-note status a checkbox word (`todo` / `in-progress` / `done`) written
+/// on a linked line redirects to, or `None` when the task already projects
+/// that word: `done` → `complete`, `in-progress` → `in_progress`, and `todo`
+/// reopens `complete` / `in_progress` to `not_started` while leaving the
+/// detailed statuses that already render as `[ ]` (`blocked`, `waiting`, …)
+/// untouched.
+fn redirected_task_status(word: &str, current: TaskStatus) -> Option<TaskStatus> {
+    let next = match word {
+        "done" => TaskStatus::Complete,
+        "in-progress" => TaskStatus::InProgress,
+        "todo" => match current {
+            TaskStatus::Complete | TaskStatus::InProgress => TaskStatus::NotStarted,
+            _ => return None,
+        },
+        // Callers validate the word via `checkbox_for` before resolving.
+        _ => {
+            debug_assert!(false, "unvalidated checkbox word {word:?}");
+            return None;
+        }
+    };
+    (next != current).then_some(next)
 }
 
 /// Build a `task:created` event with the payload
@@ -10981,6 +12201,53 @@ pub(crate) fn git_root_wire_rows(
         .collect()
 }
 
+/// One `workspace.localChanges` root row (§5.1): the identity fields the
+/// service owns plus the flattened per-repository signals from
+/// [`intent_git::local_changes`]. On a read failure the signals are zeroed and
+/// `error` carries the message, so a single unreadable root never fails the
+/// aggregate.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalChangesRow {
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_root_id: Option<String>,
+    path: String,
+    #[serde(flatten)]
+    changes: intent_git::LocalChanges,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl LocalChangesRow {
+    /// Compute the row for the repository at `path`. Blocking git I/O —
+    /// callers run this on the blocking pool.
+    fn compute(kind: &'static str, git_root_id: Option<String>, path: &Path) -> Self {
+        match intent_git::local_changes(path) {
+            Ok(changes) => Self {
+                kind,
+                git_root_id,
+                path: path.to_string_lossy().into_owned(),
+                changes,
+                error: None,
+            },
+            Err(e) => Self::failed(kind, git_root_id, path, e.to_string()),
+        }
+    }
+
+    /// The fail-soft row for a root that could not be evaluated: zeroed
+    /// signals plus `error`.
+    fn failed(kind: &'static str, git_root_id: Option<String>, path: &Path, error: String) -> Self {
+        Self {
+            kind,
+            git_root_id,
+            path: path.to_string_lossy().into_owned(),
+            changes: intent_git::LocalChanges::default(),
+            error: Some(error),
+        }
+    }
+}
+
 /// Build a `gitRoot:unregistered` event (§6.5, monorepo#2053). Carries the
 /// removed root's id and path so clients drop the row without a re-list.
 pub(crate) fn git_root_unregistered_event(
@@ -11792,12 +13059,12 @@ pub(crate) fn format_completion_wake(
 /// The advisory wake for a hook-/PR-monitor-deferred idle: the child is idle
 /// but still externally monitoring, so this is NOT its completion — the text
 /// names the active hooks (name + expiry) and PR monitors (repo#pr + title).
-/// `watch_retired` picks the trailer (same contract as
-/// [`format_completion_wake`]): `true` on the ungrouped path states the
-/// one-shot watch was consumed and instructs re-arming via `ws.agent.watch`
-/// to hear the genuine completion; `false` on the grouped `after_all` path
-/// says the grouped watch stays armed and the group still waits for the
-/// child's genuine settlement (no re-arm instruction).
+/// The watch stays armed either way (advisories never consume watches —
+/// intent-hq/intent#4254), so no trailer instructs re-arming; `grouped`
+/// only picks the trailer wording: `true` on the `after_all` path says the
+/// delegation group still waits for the child's genuine settlement, `false`
+/// on the ungrouped path says the watch fires at the genuine settlement and
+/// names `ws.agent.unwatch` as the opt-out.
 /// `child_of_recipient` picks the relationship label, same contract as
 /// [`format_completion_wake`] (intent-hq/monorepo#3906).
 pub(crate) fn format_monitoring_idle_advisory_wake(
@@ -11805,7 +13072,7 @@ pub(crate) fn format_monitoring_idle_advisory_wake(
     event: &Event,
     active_hooks: &[serde_json::Value],
     active_pr_monitors: &[serde_json::Value],
-    watch_retired: bool,
+    grouped: bool,
     child_of_recipient: bool,
 ) -> String {
     use std::fmt::Write as _;
@@ -11856,15 +13123,15 @@ pub(crate) fn format_monitoring_idle_advisory_wake(
             }
         }
     }
-    if watch_retired {
-        let _ = write!(
-            msg,
-            "\nThis advisory consumed your one-shot watch on it. If you want to be woken at its genuine completion, re-arm with ws.agent.watch(\"{}\").",
-            child_id.0
-        );
-    } else {
+    if grouped {
         msg.push_str(
             "\nYour grouped watch on it stays armed — its delegation group still waits for its genuine settlement; no re-arm needed.",
+        );
+    } else {
+        let _ = write!(
+            msg,
+            "\nYour watch on it stays armed and fires at its genuine settlement — no re-arm needed. If you no longer want that wake, cancel with ws.agent.unwatch(\"{}\").",
+            child_id.0
         );
     }
     msg
@@ -12998,15 +14265,24 @@ impl Services {
     /// provider is derivable from settings
     /// ([`agent_session::derived_default_provider`] returns `None`) and
     /// discovery reported at least one installed registered provider,
-    /// persist the first one (registry order) as `providers.active`, plus —
-    /// when its cached model catalog names a default (or any) model — that
-    /// model as a compound `model.default`. Per-key no-overwrite guard: a
+    /// persist the first one (registry order) as `model.defaultProvider`,
+    /// plus — when its cached model catalog names a default (or any) model —
+    /// that model as a bare `model.default`. Per-key no-overwrite guard: a
     /// key with ANY existing raw value (even an unregistered one) is never
     /// written; with a derivable default the whole heal is a no-op, making
-    /// it idempotent across restarts and repeated discovery calls. Writes go
+    /// it idempotent across restarts and repeated discovery calls. The model
+    /// rung additionally runs only when the provider key is healed in the
+    /// same sweep — an unset `model.default` behind a nonblank-but-
+    /// unregistered `model.defaultProvider` stays unset rather than taking
+    /// the discovered provider's model while that provider is not the
+    /// effective one. Writes go
     /// through the same `settings.update` path clients use, so
     /// `settings:changed` is emitted and every store/hook rule applies. The
     /// model rung is cache-only ([`ModelCatalogCache`]) — never a probe.
+    ///
+    /// Legacy `providers.active` needs no rung here: the boot migration
+    /// ([`settings::migrate_active_provider_setting`]) carries it into
+    /// `model.defaultProvider` before discovery ever runs this heal.
     ///
     /// # Errors
     ///
@@ -13028,41 +14304,50 @@ impl Services {
             return Ok(serde_json::json!({ "healed": false, "reason": "no-installed-provider" }));
         };
         let mut changes = Vec::new();
-        if settings
-            .providers
-            .active
+        let provider_key_healed = settings
+            .model
+            .default_provider
             .as_deref()
-            .is_none_or(|v| v.trim().is_empty())
-        {
-            changes.push(serde_json::json!({ "path": "providers.active", "value": provider }));
+            .is_none_or(|v| v.trim().is_empty());
+        if provider_key_healed {
+            changes.push(serde_json::json!({ "path": "model.defaultProvider", "value": provider }));
         }
         let mut healed_model = None;
-        if settings
-            .model
-            .default
-            .as_deref()
-            .is_none_or(|v| v.trim().is_empty())
+        // The model rung only runs when THIS heal is also setting the
+        // provider key: with a nonblank-but-unregistered
+        // `model.defaultProvider` (e.g. a typo) the discovered provider is
+        // not going to be the effective one, so persisting its catalog model
+        // would strand a foreign `model.default` behind the user's
+        // eventual correction.
+        if provider_key_healed
+            && settings
+                .model
+                .default
+                .as_deref()
+                .is_none_or(|v| v.trim().is_empty())
         {
-            if let Some(m) = self.models_catalog.cached_default_or_first_model(provider) {
-                // Catalog row ids may already be compound (`provider:model`),
-                // but only a prefix naming the owning provider is trusted — a
+            if let Some(m) = self.cached_models().cached_default_or_first_model(provider) {
+                // Legacy catalog row ids may be compound (`provider:model`);
+                // only a prefix naming the owning provider is trusted — a
                 // foreign-prefixed row is not an ownership claim
-                // (monorepo#607) and persisting it would let its prefix
-                // override the just-healed `providers.active`.
-                let compound = match m.split_once(':') {
-                    Some((prefix, _)) if prefix == provider => Some(m),
+                // (monorepo#607). The persisted value is always the BARE id
+                // (`session.model`/settings never carry compound ids).
+                let bare = match m.split_once(':') {
+                    Some((prefix, bare)) if prefix == provider => Some(bare.to_string()),
                     Some(_) => None,
-                    None => Some(format!("{provider}:{m}")),
+                    None => Some(m),
                 };
-                if let Some(compound) = compound {
-                    changes.push(serde_json::json!({ "path": "model.default", "value": compound }));
-                    healed_model = Some(compound);
+                if let Some(bare) = bare.filter(|m| !m.is_empty()) {
+                    changes.push(serde_json::json!({ "path": "model.default", "value": bare }));
+                    healed_model = Some(bare);
                 }
             }
         }
         if changes.is_empty() {
-            // Both keys hold raw values that just don't resolve to a
-            // registered provider — never overwrite them (no-overwrite rule).
+            // The provider key holds a raw value that just doesn't resolve
+            // to a registered provider — never overwrite it (no-overwrite
+            // rule), and never persist a model for a provider that isn't
+            // going to be the effective one.
             return Ok(serde_json::json!({ "healed": false, "reason": "values-already-set" }));
         }
         self.settings_update(serde_json::Value::Array(changes))
@@ -13081,17 +14366,17 @@ impl Services {
 
     /// Default-model re-resolution on a default-provider switch
     /// (monorepo#3177). When a `settings.update` batch writes
-    /// `providers.active` to a registered provider that differs from the
-    /// currently derived default provider
+    /// `model.defaultProvider` to a registered provider that differs from
+    /// the currently derived default provider
     /// ([`agent_session::derived_default_provider`]) — an actual switch, not
     /// a first-time set-up rewrite of the same provider — the stored
-    /// `model.default` would otherwise go stale: its compound prefix takes
-    /// precedence over `providers.active`, so the old provider's model keeps
-    /// shadowing the switch entirely. Append a re-resolved `model.default`
+    /// `model.default` would otherwise go stale: it names the OLD provider's
+    /// model, so every default-model resolution would feed the new provider
+    /// a foreign model id. Append a re-resolved `model.default`
     /// to the batch so it applies atomically with the provider change:
     /// the new provider's cached catalog default-or-first model
-    /// ([`ModelCatalogCache::cached_default_or_first_model`], cache-only —
-    /// never a probe) as a compound id, else — when a model is currently
+    /// ([`model_catalog::ModelCatalogReader::cached_default_or_first_model`], cache-only —
+    /// never a probe) as a bare id, else — when a model is currently
     /// stored — a blank value clearing it (the next call that needs a
     /// default then fails loudly, monorepo#3044, instead of silently
     /// running on a foreign model). An explicit `model.default` entry
@@ -13121,14 +14406,14 @@ impl Services {
             return;
         }
         // Last write wins within a batch, mirroring apply order: the LAST
-        // `providers.active` entry is taken unconditionally — a non-string
-        // value there means no side effect (the batch will fail schema
-        // validation downstream anyway), never a fall-back to an earlier
-        // entry.
+        // `model.defaultProvider` entry is taken unconditionally — a
+        // non-string value there means no side effect (the batch will fail
+        // schema validation downstream anyway), never a fall-back to an
+        // earlier entry.
         let Some(provider) = entries
             .iter()
             .rev()
-            .find(|e| path_of(e) == "providers.active")
+            .find(|e| path_of(e) == "model.defaultProvider")
             .and_then(|e| e.get("value").and_then(|v| v.as_str()))
             .map(str::trim)
             .filter(|id| intent_providers::find_provider(id).is_some())
@@ -13139,38 +14424,39 @@ impl Services {
         let settings = self.effective_settings();
         // Only an actual switch qualifies: no derivable provider means
         // first-time setup (e.g. the heal path), and the provider that
-        // already rules (via a self-prefixed `model.default` or
-        // `providers.active`) makes the batch a same-provider rewrite —
-        // neither may disturb a configured model.
+        // already rules (via `model.defaultProvider`) makes the batch a
+        // same-provider rewrite — neither may disturb a configured model.
         match agent_session::derived_default_provider(&settings) {
             None => return,
             Some(current) if current == provider => return,
             Some(_) => {}
         }
         let resolved = self
-            .models_catalog
+            .cached_models()
             .cached_default_or_first_model(&provider)
             .and_then(|m| match m.split_once(':') {
-                // Catalog row ids may already be compound, but only a prefix
+                // Legacy catalog row ids may be compound, but only a prefix
                 // naming the owning provider is trusted — a foreign-prefixed
-                // row is not an ownership claim (monorepo#607).
-                Some((prefix, _)) if prefix == provider => Some(m),
+                // row is not an ownership claim (monorepo#607). The persisted
+                // value is always the BARE id.
+                Some((prefix, bare)) if prefix == provider => Some(bare.to_string()),
                 Some(_) => None,
-                None => Some(format!("{provider}:{m}")),
-            });
+                None => Some(m),
+            })
+            .filter(|m| !m.is_empty());
         let model_currently_set = settings
             .model
             .default
             .as_deref()
             .is_some_and(|v| !v.trim().is_empty());
         match resolved {
-            Some(compound) => {
+            Some(bare) => {
                 tracing::info!(
                     provider,
-                    model = compound,
+                    model = bare,
                     "default-provider switch: re-resolved model.default from the cached catalog"
                 );
-                entries.push(serde_json::json!({ "path": "model.default", "value": compound }));
+                entries.push(serde_json::json!({ "path": "model.default", "value": bare }));
             }
             None if model_currently_set => {
                 tracing::info!(
@@ -13648,19 +14934,28 @@ impl WorkspaceApi for Services {
         workspace_path: Option<String>,
         provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Catalog assembly walks every specialist tier on disk and the
+        // per-row decoration re-resolves through the same tiers, so the
+        // whole read runs on the blocking pool — never inline on the async
+        // runtime (monorepo#4148).
+        let services = self.clone();
         Box::pin(async move {
-            let provider = specialist_preview_provider(self, provider)?;
-            let ws_path = workspace_path.as_deref().map(Path::new);
-            let mut result = self.specialists_service().list(ws_path)?;
-            if let Some(specs) = result
-                .get_mut("specialists")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                for def in specs {
-                    decorate_specialist_resolved(self, def, ws_path, provider.as_deref());
+            tokio::task::spawn_blocking(move || {
+                let provider = specialist_preview_provider(&services, provider)?;
+                let ws_path = workspace_path.as_deref().map(Path::new);
+                let mut result = services.specialists_service().list(ws_path)?;
+                if let Some(specs) = result
+                    .get_mut("specialists")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for def in specs {
+                        decorate_specialist_resolved(&services, def, ws_path, provider.as_deref());
+                    }
                 }
-            }
-            Ok(result)
+                Ok(result)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("specialist.list task failed: {e}")))?
         })
     }
 
@@ -13668,23 +14963,29 @@ impl WorkspaceApi for Services {
         &self,
         workspace_path: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Same tier walk as `specialist_list` — blocking pool (monorepo#4148).
+        let services = self.clone();
         Box::pin(async move {
-            let ws_path = workspace_path.as_deref().map(Path::new);
-            let mut result = self.specialists_service().list(ws_path)?;
-            if let Some(specs) = result
-                .get_mut("specialists")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                for def in specs {
-                    // No caller/settings provider context: `provider: None`
-                    // makes the decoration resolve each row through
-                    // `resolve_delegate_provider_preview` — the specialist's
-                    // own pin first, else the settings-derived default —
-                    // exactly what a no-model `agent.delegate` would spawn on.
-                    decorate_specialist_resolved(self, def, ws_path, None);
+            tokio::task::spawn_blocking(move || {
+                let ws_path = workspace_path.as_deref().map(Path::new);
+                let mut result = services.specialists_service().list(ws_path)?;
+                if let Some(specs) = result
+                    .get_mut("specialists")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for def in specs {
+                        // No caller/settings provider context: `provider: None`
+                        // makes the decoration resolve each row through
+                        // `resolve_delegate_provider_preview` — the specialist's
+                        // own pin first, else the settings-derived default —
+                        // exactly what a no-model `agent.delegate` would spawn on.
+                        decorate_specialist_resolved(&services, def, ws_path, None);
+                    }
                 }
-            }
-            Ok(result)
+                Ok(result)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("specialist.listDispatch task failed: {e}")))?
         })
     }
 
@@ -13694,14 +14995,21 @@ impl WorkspaceApi for Services {
         workspace_path: Option<String>,
         provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Single-id resolve still walks the tier directories — blocking pool
+        // (monorepo#4148).
+        let services = self.clone();
         Box::pin(async move {
-            let provider = specialist_preview_provider(self, provider)?;
-            let ws_path = workspace_path.as_deref().map(Path::new);
-            let mut result = self.specialists_service().get(&id, ws_path)?;
-            if let Some(def) = result.get_mut("specialist") {
-                decorate_specialist_resolved(self, def, ws_path, provider.as_deref());
-            }
-            Ok(result)
+            tokio::task::spawn_blocking(move || {
+                let provider = specialist_preview_provider(&services, provider)?;
+                let ws_path = workspace_path.as_deref().map(Path::new);
+                let mut result = services.specialists_service().get(&id, ws_path)?;
+                if let Some(def) = result.get_mut("specialist") {
+                    decorate_specialist_resolved(&services, def, ws_path, provider.as_deref());
+                }
+                Ok(result)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("specialist.get task failed: {e}")))?
         })
     }
 
@@ -13738,13 +15046,20 @@ impl WorkspaceApi for Services {
         scope: Option<String>,
         workspace_path: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Write ops validate against the full on-disk catalog — blocking pool
+        // (monorepo#4148).
+        let service = self.specialists_service();
         Box::pin(async move {
-            self.specialists_service().create(
-                &id,
-                &spec,
-                scope.as_deref(),
-                workspace_path.as_deref().map(Path::new),
-            )
+            tokio::task::spawn_blocking(move || {
+                service.create(
+                    &id,
+                    &spec,
+                    scope.as_deref(),
+                    workspace_path.as_deref().map(Path::new),
+                )
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("specialist.create task failed: {e}")))?
         })
     }
 
@@ -13755,13 +15070,13 @@ impl WorkspaceApi for Services {
         scope: String,
         workspace_path: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let service = self.specialists_service();
         Box::pin(async move {
-            self.specialists_service().edit(
-                &id,
-                &spec,
-                &scope,
-                workspace_path.as_deref().map(Path::new),
-            )
+            tokio::task::spawn_blocking(move || {
+                service.edit(&id, &spec, &scope, workspace_path.as_deref().map(Path::new))
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("specialist.edit task failed: {e}")))?
         })
     }
 
@@ -13771,9 +15086,13 @@ impl WorkspaceApi for Services {
         scope: String,
         workspace_path: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let service = self.specialists_service();
         Box::pin(async move {
-            self.specialists_service()
-                .delete(&id, &scope, workspace_path.as_deref().map(Path::new))
+            tokio::task::spawn_blocking(move || {
+                service.delete(&id, &scope, workspace_path.as_deref().map(Path::new))
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("specialist.delete task failed: {e}")))?
         })
     }
 
@@ -14354,7 +15673,16 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
-            file_ops::list(&root, &path)
+            // Containment checks and directory enumeration both touch the
+            // filesystem, so keep the complete synchronous operation off the
+            // async runtime. RPC dispatch tasks are detached from their client
+            // connection, so a disconnect lets this finish and the closed
+            // outbound channel discards its response. If this future is
+            // otherwise dropped, dropping the JoinHandle detaches the already
+            // running blocking task; neither case pins a runtime worker.
+            tokio::task::spawn_blocking(move || file_ops::list(&root, &path))
+                .await
+                .map_err(|e| Error::Internal(format!("file.list task failed: {e}")))?
         })
     }
 
@@ -14486,7 +15814,9 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             let root = file_ops::resolve_root(&store, &workspace_id, None).await;
-            file_ops::tree(&root, &path)
+            tokio::task::spawn_blocking(move || file_ops::tree(&root, &path))
+                .await
+                .map_err(|e| Error::Internal(format!("file.tree task failed: {e}")))?
         })
     }
 
@@ -14876,20 +16206,15 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            let repo_path = match current.repository_path.as_deref() {
-                Some(p) if !p.is_empty() => p.to_string(),
-                _ => {
-                    return Err(Error::Internal(
-                        "Current workspace is not associated with a repository".to_string(),
-                    ));
-                }
-            };
+            if !has_repository_identity(&current) {
+                return Err(Error::Internal(
+                    "Current workspace is not associated with a repository".to_string(),
+                ));
+            }
             let all = store.list_workspaces(true).await?;
             let siblings: Vec<serde_json::Value> = all
                 .into_iter()
-                .filter(|w| {
-                    w.id != workspace_id && w.repository_path.as_deref() == Some(repo_path.as_str())
-                })
+                .filter(|w| w.id != workspace_id && workspaces_share_repository(&current, w))
                 .map(|w| {
                     serde_json::json!({
                         "id": w.id,
@@ -15063,63 +16388,15 @@ impl WorkspaceApi for Services {
             let mut list = store.list_workspaces(include_archived).await?;
             // `activity` is derived from live agent state, never persisted (§9.9);
             // the card aggregates are computed fresh on the emit path (§9.1).
-            // Enrichment fans out per workspace (bounded by a semaphore so a
-            // large workspace count doesn't burst-issue unbounded store reads):
-            // store reads stay on the async pool while the git/FS rollups are
-            // offloaded, bounded, and cached inside `enrich_workspace_aggregates`,
-            // so list latency is bounded by the per-aggregate budget instead of
-            // O(workspaces × workdir diff).
+            // Every store-backed aggregate is fetched once for the requested ids
+            // and joined below in store order; no per-workspace store futures.
             let started = std::time::Instant::now();
             let count = list.len();
-            // Batch unread derivation (§5.1): ONE indexed statement for the
-            // whole list instead of a per-row EXISTS probe, so the hot RPC's
-            // statement count stays independent of the workspace count
-            // (AGENTS.md RPC cost contract). A batch failure degrades to
-            // `None` per row — enrichment falls back to its bounded
-            // per-workspace probe rather than serving the stale stored flag.
-            let unread_set = store
-                .workspaces_with_unread_top_level_sessions()
-                .await
-                .ok()
-                .map(Arc::new);
-            let enrich_gate = Arc::new(tokio::sync::Semaphore::new(
-                workspace_aggregates::MAX_CONCURRENT_ENRICHMENTS,
-            ));
-            let mut join = tokio::task::JoinSet::new();
-            for (idx, ws) in list.iter().enumerate() {
-                let mut ws = ws.clone();
-                let this = this.clone();
-                let enrich_gate = Arc::clone(&enrich_gate);
-                let unread_set = unread_set.clone();
-                join.spawn(async move {
-                    // The semaphore is never closed, so acquisition can only
-                    // fail on a bug; fail loudly rather than dropping the bound.
-                    let _permit = enrich_gate
-                        .acquire_owned()
-                        .await
-                        .expect("enrichment semaphore closed");
-                    ws.activity = this.workspace_activity(&ws.id);
-                    // Delete grace window (§5.1): surface the in-memory
-                    // pending-deletion deadline; O(1) map read, never persisted.
-                    ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
-                    let unread = unread_set.as_ref().map(|set| set.contains(ws.id.as_str()));
-                    this.enrich_workspace_aggregates_with_unread(&mut ws, unread)
-                        .await;
-                    (idx, ws)
-                });
-            }
-            // Merge back into store order (ORDER BY created_at) by index. If an
-            // enrichment task panics, degrade to the un-enriched base row —
-            // aggregates are advisory and optional on the wire, so one bad
-            // worktree must not fail the whole list call.
-            while let Some(res) = join.join_next().await {
-                match res {
-                    Ok((idx, ws)) => list[idx] = ws,
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "workspace.list: enrichment task failed; serving base row"
-                    ),
-                }
+            let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
+            let snapshot = this.workspace_aggregate_snapshot(&workspace_ids).await;
+            for ws in &mut list {
+                this.enrich_workspace_from_snapshot(ws, &snapshot, true)
+                    .await;
             }
             // List-frame slimming (monorepo#3041), following the v4.2
             // `diskUsage` precedent — optional fields simply never present on
@@ -15152,10 +16429,6 @@ impl WorkspaceApi for Services {
             // derivation still sees only the persisted workspace PRs).
             this.merge_external_pull_requests(&mut list, include_archived)
                 .await;
-            // Background backfill: active workspaces with repository_path but missing
-            // repository_owner/repository_name get derived from origin remote (STAB-64
-            // backfill). Spawned non-blocking so list latency stays green.
-            this.spawn_repository_owner_backfill(&list);
             Ok(list)
         })
     }
@@ -15177,32 +16450,14 @@ impl WorkspaceApi for Services {
             // `displayStatus` (same derivation as the enriched path), and
             // `cowSupported` (lifetime-cached probe, effectively free).
             let mut list = store.list_workspaces(include_archived).await?;
-            let cow_supported = this.compute_cow_supported().await;
-            // Batch unread derivation, same as the full list path: ONE
-            // statement for the whole snapshot; a batch failure degrades to
-            // the per-workspace probe inside `enrich_display_status`.
-            let unread_set = store.workspaces_with_unread_top_level_sessions().await.ok();
+            let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
+            let snapshot = this.workspace_aggregate_snapshot(&workspace_ids).await;
             for ws in &mut list {
-                ws.activity = this.workspace_activity(&ws.id);
-                // Delete grace window (§5.1): surface the in-memory
-                // pending-deletion deadline; O(1) map read, never persisted.
-                ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
-                ws.agent_summary = None;
-                ws.diff_summary = None;
+                this.enrich_workspace_from_snapshot(ws, &snapshot, false)
+                    .await;
                 // Detail-only on the wire (monorepo#3041): list rows never
                 // carry `tokenUsage` — same rationale as the full list path.
                 ws.token_usage = None;
-                ws.cow_supported = cow_supported;
-                // Keep PR fields if already on the row (cheap, already stored);
-                // do not fetch/refresh them here.
-                // A stats-read failure degrades to absent taskStats +
-                // displayStatus (clients fall back to local derivation on a
-                // missing field), mirroring `enrich_workspace_aggregates`.
-                // Same derivation + baseline seeding as the enriched path
-                // (see [`Services::enrich_display_status`]).
-                ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
-                let unread = unread_set.as_ref().map(|set| set.contains(ws.id.as_str()));
-                this.enrich_display_status(ws, None, unread).await;
             }
             // Emit-path PR merge, same as the full list path: the seq-0
             // snapshot must carry the same `pullRequests` a later
@@ -15241,6 +16496,10 @@ impl WorkspaceApi for Services {
 
     fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.workspace_disk_usage_op(id).await })
+    }
+
+    fn workspace_local_changes(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_local_changes_op(id).await })
     }
 
     fn workspace_transfer_plan(
@@ -15715,11 +16974,20 @@ impl WorkspaceApi for Services {
                                     )
                                     .await;
                                 }
-                                if input.repository_owner.is_none() {
-                                    input.repository_owner = Some(owner);
-                                }
-                                if input.repository_name.is_none() {
-                                    input.repository_name = Some(name.clone());
+                                // Persisted owner/name carry GitHub identity
+                                // (the `crossWorkspace.*` sibling predicate
+                                // trusts them), so only a strict `github.com`
+                                // URL seeds them; the host-agnostic pair above
+                                // keys the cache slot only.
+                                if let Some((gh_owner, gh_name)) =
+                                    Self::parse_github_owner_repo(url)
+                                {
+                                    if input.repository_owner.is_none() {
+                                        input.repository_owner = Some(gh_owner);
+                                    }
+                                    if input.repository_name.is_none() {
+                                        input.repository_name = Some(gh_name);
+                                    }
                                 }
                                 // The workspace checkout IS the repository
                                 // (self-contained; the cache can be deleted
@@ -15805,7 +17073,10 @@ impl WorkspaceApi for Services {
                             })?;
                             input.repository_path =
                                 Some(target.to_string_lossy().to_string());
-                            if let Some((owner, name)) = clone_ops::parse_owner_repo(url) {
+                            // Strict `github.com` host only: persisted owner/name
+                            // are trusted as GitHub identity by the
+                            // `crossWorkspace.*` sibling predicate.
+                            if let Some((owner, name)) = Self::parse_github_owner_repo(url) {
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
                                 }
@@ -16171,6 +17442,7 @@ impl WorkspaceApi for Services {
                         diff_summary: None,
                         token_usage: None,
                         cow_supported: None,
+                        browser_client_id: None,
                         display_status: None,
                         waiting: false,
                         checkout_mode: None,
@@ -17437,6 +18709,7 @@ impl WorkspaceApi for Services {
                 || update.active_pull_request.is_some()
                 || update.pull_requests.is_some();
             let attention_changed = update.attention.is_some();
+            let repository_path_changed = update.repository_path.is_some();
             let mut ws = if id.is_chief() {
                 chief_workspace()
             } else {
@@ -17566,6 +18839,9 @@ impl WorkspaceApi for Services {
                 // response carries `agent_running` when agents are in-flight,
                 // not the stale default `idle` from the persisted row.
                 ws.activity = this.workspace_activity(&ws.id);
+                if repository_path_changed {
+                    this.spawn_repository_owner_backfill(std::slice::from_ref(&ws));
+                }
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
@@ -17632,12 +18908,17 @@ impl WorkspaceApi for Services {
             // sessions, drop each session's runtime state, then emit
             // `agent:deleted` per session so subscribers see the tear-down
             // before the terminal `workspace:deleted`.
-            // Fail fast on a transient `list_agent_sessions` error: skipping
-            // the sweep here but still deleting the workspace row leaves ghost
+            // Fail fast on a transient session-list error: skipping the
+            // sweep here but still deleting the workspace row leaves ghost
             // workers, live-turn slots, queued messages, and completion
             // watches with no owning workspace — a client can retry the
             // delete, but silent partial success cannot recover.
-            let sessions = store.list_agent_sessions(&id).await?;
+            // Summaries only (intent-hq/monorepo#4130): the sweep reads just
+            // `id` + `name`, and the full `list_agent_sessions` hydrated
+            // every session's transcript (2 statements per agent) for rows
+            // the cascade below is about to drop.
+            let sessions = store.list_agent_session_summaries(&id).await?;
+            let session_ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
             // Cascade interaction (§5.5): the workspace delete — immediate
             // or committed-from-pending — supersedes any pending agent
             // deletions inside it. Abort their timers without per-agent
@@ -17658,10 +18939,7 @@ impl WorkspaceApi for Services {
             // replacement child during the shared grace wait and leave it
             // running as a ghost process after the rows are gone.
             let _teardown_fence = match manager.as_ref() {
-                Some(manager) => {
-                    let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
-                    Some(manager.stop_many(&ids).await)
-                }
+                Some(manager) => Some(manager.stop_many(&session_ids).await),
                 None => None,
             };
             for session in &sessions {
@@ -17744,6 +19022,21 @@ impl WorkspaceApi for Services {
             // `deliver_completion_to_watches` makes the bus loop's later
             // processing of the published event a no-op — no duplicate wake —
             // and `record_group_child_completion` is idempotent.
+            // The settlement clear of each child's advisory-wake period
+            // markers runs ONCE for the whole sweep (one `IN`-list statement)
+            // instead of inside every delivery (intent-hq/monorepo#4130);
+            // best-effort on the same terms as the per-child clear — the
+            // cascade below drops the rows regardless.
+            if let Err(e) = store
+                .clear_advisory_wake_deliveries_for_children(&session_ids)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    workspace = %id.as_str(),
+                    "failed to clear advisory-wake period markers for deleted workspace"
+                );
+            }
             for session in &sessions {
                 let event = Event {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -17761,7 +19054,7 @@ impl WorkspaceApi for Services {
                     }),
                 };
                 services
-                    .deliver_completion_to_watches(&session.id, &event)
+                    .deliver_completion_to_watches_markers_precleared(&session.id, &event)
                     .await;
             }
             // Backstop sweep: grouped watches survive delivery (group
@@ -18498,6 +19791,7 @@ impl WorkspaceApi for Services {
                 diff_summary: None,
                 token_usage: None,
                 cow_supported: None,
+                browser_client_id: None,
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
@@ -19331,6 +20625,85 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn client_list(&self) -> BoxFuture<'_, Result<Vec<ReverseLiveClient>>> {
+        let clients = self
+            .reverse_dispatch
+            .as_ref()
+            .map(|d| d.live_clients())
+            .unwrap_or_default();
+        Box::pin(async move { Ok(clients) })
+    }
+
+    fn get_workspace_browser_client(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.browser_client_state(&id).await })
+    }
+
+    fn set_workspace_browser_client(
+        &self,
+        id: WorkspaceId,
+        client_id: Option<ClientId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            // Chief is virtual: no row to pin and no agent browser work runs
+            // there.
+            if id.is_chief() {
+                return Err(Error::InvalidParams(
+                    "cannot set browserClient on chief workspace".to_string(),
+                ));
+            }
+            if let Some(client_id) = &client_id {
+                // Only a client that has completed `client.hello` at least
+                // once can be pinned — an offline-but-known client is fine
+                // (it surfaces as "pinned but not connected"), but a row
+                // minted only to key an anonymous connection's drafts is
+                // not: it can never resolve to a reverse connection.
+                let hello_seen = store
+                    .get_client(client_id)
+                    .await?
+                    .is_some_and(|c| c.last_hello_at.is_some());
+                if !hello_seen {
+                    return Err(Error::InvalidParams(format!(
+                        "unknown clientId {}: the client has never connected",
+                        client_id.as_str()
+                    )));
+                }
+            }
+            // Write, announce and read back under one gate: two racing
+            // setters would otherwise publish deltas in the opposite order of
+            // their commits, or echo the other's pin in their own reply. The
+            // delta carries the read-back committed value, not the requested
+            // one, and the reply is built from the same committed state.
+            let _gate = self.browser_client_pin_gate.lock().await;
+            store
+                .set_workspace_browser_client(&id, client_id.as_ref())
+                .await?;
+            let committed = store.workspace_browser_client(&id).await?;
+            // Self-sufficient `workspace:updated` delta (§6.5); `null`
+            // spells a cleared pin so clients can drop their copy.
+            let change = committed
+                .as_ref()
+                .map_or(serde_json::Value::Null, |c| c.as_str().into());
+            publish_event(
+                bus.as_ref(),
+                workspace_updated_event(&id, &serde_json::json!({ "browserClientId": change })),
+            )
+            .await;
+            // Driving-client switch (REV-2 Model 10): every claimed tab of the
+            // workspace follows the new pin; one `browser:tab-updated` per
+            // moved tab. Clearing the pin moves nothing — the driving client
+            // then falls back to the host of those same claimed tabs.
+            if let Some(new_host) = &committed {
+                self.browser_tabs_migrate_claimed(&id, new_host).await?;
+            }
+            self.browser_client_state(&id).await
+        })
+    }
+
     fn get_setup_script(&self, id: WorkspaceId) -> BoxFuture<'_, Result<SetupScript>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -19684,6 +21057,9 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            if let Some(content) = input.content.as_deref() {
+                note_ops::reject_numbered_read_presentation(content)?;
+            }
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
             with_idempotency(
@@ -19765,6 +21141,9 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            if let Some(content) = input.content.as_deref() {
+                note_ops::reject_numbered_read_presentation(content)?;
+            }
             let expected_version = input.expected_version;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.
@@ -19855,6 +21234,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            note_ops::reject_numbered_read_presentation(&input.content)?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
             let (new_content, position) = note_ops::apply_add(
@@ -19936,6 +21316,7 @@ impl WorkspaceApi for Services {
                     "old is required and cannot be empty".to_string(),
                 ));
             }
+            note_ops::reject_numbered_read_presentation(&input.new)?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
             let (new_content, match_position, was_empty) =
@@ -20011,6 +21392,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            note_ops::reject_numbered_read_presentation(&input.content)?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
             let new_content =
@@ -20087,6 +21469,9 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            // Guard before the CRDT merge so a rejected write never seeds the
+            // yrs doc with content that is not persisted.
+            note_ops::reject_numbered_read_presentation(&content)?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
             let previous_title = note.title.clone();
@@ -20422,6 +21807,11 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<SaveAssetResult>> {
         let assets_root = self.assets_root.clone();
         Box::pin(async move {
+            if intent_core::asset_extension_from_mime(&mime_type).is_none() {
+                return Err(Error::InvalidParams(format!(
+                    "unsupported asset MIME type: {mime_type}"
+                )));
+            }
             let root = assets_root
                 .ok_or_else(|| Error::Internal("asset storage is not configured".to_string()))?;
             let base64_data = note_ops::strip_data_url_prefix(&data);
@@ -20572,6 +21962,7 @@ impl WorkspaceApi for Services {
         note_id: NoteId,
         task_text: String,
         status: String,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateStatusResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -20587,6 +21978,43 @@ impl WorkspaceApi for Services {
             })?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let normalized = task_text.trim().to_string();
+            let linked = match note_ops::linked_task_for_text(&note.content, &normalized) {
+                Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
+                None => None,
+            };
+            if let Some((task_id, current)) = linked {
+                // The line links a task note: the task's metadata status is
+                // the source of truth and the char is its projection, so the
+                // write goes to the task (events, ready-task recompute) and
+                // the char follows via materialization — which also heals a
+                // line that had drifted from the task's status.
+                // Materialization invalidates the CRDT session and schedules
+                // the attribution recompute of every parent it rewrites.
+                match redirected_task_status(&status, current) {
+                    Some(next) => {
+                        services
+                            .set_task_note_status(
+                                &note.workspace_id,
+                                &task_id,
+                                next,
+                                None,
+                                caller_agent_id,
+                            )
+                            .await?;
+                    }
+                    None => {
+                        services
+                            .materialize_linked_checkboxes(&note.workspace_id, &task_id)
+                            .await;
+                    }
+                }
+                return Ok(TaskUpdateStatusResult {
+                    ok: true,
+                    note_id: note.id,
+                    task_text: normalized,
+                    status,
+                });
+            }
             let updated = note_ops::apply_task_status(&note.content, &normalized, checkbox)?;
             note.content = updated;
             note.updated_at = now_iso();
@@ -20622,104 +22050,20 @@ impl WorkspaceApi for Services {
         expected_version: Option<i64>,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
-        let services = self.clone();
         Box::pin(async move {
             let new_status = parse_task_status_strict(&status)?;
-            let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
-            let Some(mut task) = note.metadata.task.clone() else {
-                return Err(Error::Internal(
-                    "Note is not a task. Use markAsTask() first.".to_string(),
-                ));
-            };
-            let previous_status = task.status;
-            let now = now_iso();
-            apply_status_transition(&mut task, new_status, &now);
-            note.metadata.task = Some(task);
-            note.updated_at = now.clone();
-            store.update_note_versioned(&note, expected_version).await?;
-            // Mirror `notes.service.ts`: emit only when the status actually changed.
-            if previous_status != new_status {
-                // A complete-boundary crossing records/removes the caller's
-                // flipped-completion pair (later stamped as a wake trigger).
-                track_flipped_completion_boundary(
-                    &store,
-                    caller_agent_id.as_ref(),
-                    &note.workspace_id,
-                    &note.id,
-                    previous_status == TaskStatus::Complete,
-                    new_status == TaskStatus::Complete,
-                    &now,
-                )
-                .await;
-                // LC-1: agent-attributed changes carry provenance — resolve the
-                // caller's display name best-effort for the agent actor.
-                let agent = match &caller_agent_id {
-                    Some(agent_id) => Some((
-                        agent_id.0.clone(),
-                        store.get_agent_session(agent_id).await.ok().map(|s| s.name),
-                    )),
-                    None => None,
-                };
-                publish_event(
-                    bus.as_ref(),
-                    task_status_changed_event(
-                        &note.workspace_id,
-                        &note.id,
-                        &note.title,
-                        previous_status,
-                        new_status,
-                        &now,
-                        agent,
-                    ),
-                )
-                .await;
-                // Then recompute + broadcast the ready-task set, mirroring the
-                // `emitReadyTasksChanged` call that follows `task:status-changed`.
-                let all = store.list_notes(&note.workspace_id).await?;
-                let ready_task_ids = compute_ready_task_ids(&all);
-                publish_event(
-                    bus.as_ref(),
-                    ready_tasks_changed_event(
-                        &note.workspace_id,
-                        &ready_task_ids,
-                        &note.id,
-                        previous_status,
-                        new_status,
-                        &now_iso(),
-                    ),
-                )
-                .await;
-                // Re-announce dependents only when the transition crosses the
-                // complete boundary — that is the only move that changes their
-                // computed `unmetDependsOn` (monorepo#1979).
-                if (previous_status == TaskStatus::Complete) != (new_status == TaskStatus::Complete)
-                {
-                    publish_dependent_note_updates(
-                        bus.as_ref(),
-                        &note.workspace_id,
-                        &note.id,
-                        &all,
-                    )
-                    .await;
-                }
-                // A task-status transition can move the derived displayStatus
-                // rollup (§6.5): recompute-and-compare, emitting only on an
-                // actual transition.
-                services
-                    .maybe_emit_display_status_changed(&note.workspace_id)
-                    .await;
-            }
-            Ok(TaskUpdateNoteStatusResult {
-                ok: true,
-                note_id: note.id.clone(),
-                status: new_status,
-                note,
-            })
+            self.set_task_note_status(
+                &workspace_id,
+                &note_id,
+                new_status,
+                expected_version,
+                caller_agent_id,
+            )
+            .await
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         workspace_id: WorkspaceId,
@@ -20728,6 +22072,7 @@ impl WorkspaceApi for Services {
         text: Option<String>,
         status: Option<String>,
         expected: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -20751,35 +22096,86 @@ impl WorkspaceApi for Services {
                 }
             }
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            // The link is resolved from the POST-edit line: `text` may retarget
+            // it (A → B), and it is the task the line links after this write
+            // whose status the char projects.
+            let post_edit = note_ops::apply_task_line_update(
+                &note.content,
+                line,
+                text.as_deref(),
+                None,
+                expected.as_deref(),
+            )?;
+            let linked = match note_ops::linked_task_at_line(&post_edit.content, line) {
+                Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
+                None => None,
+            };
+            // On a linked line the char is a projection of the task note's
+            // status: the status write is redirected to the task and the line
+            // edit carries the word that status projects to — with no status
+            // word, the task's current one (a text-only retarget renders the
+            // new target's marker).
+            let redirect = linked.map(|(task_id, current)| {
+                let next = status
+                    .as_deref()
+                    .and_then(|word| redirected_task_status(word, current));
+                (task_id, next, current)
+            });
+            let line_status = match &redirect {
+                Some((_, next, current)) => Some(note_ops::status_word_for_task_status(
+                    next.unwrap_or(*current),
+                )),
+                None => status.as_deref(),
+            };
             let update = note_ops::apply_task_line_update(
                 &note.content,
                 line,
                 text.as_deref(),
-                status.as_deref(),
+                line_status,
                 expected.as_deref(),
             )?;
-            note.content = update.content;
-            note.updated_at = now_iso();
-            store.update_note(&note).await?;
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
-            services
-                .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            publish_event(
-                bus.as_ref(),
-                note_change_event(
-                    &note.workspace_id,
-                    &note.id,
-                    &note.title,
-                    NOTE_UPDATED,
-                    "update",
-                ),
-            )
-            .await;
-            // A spec checkbox-line rewrite can add/remove task links and
-            // move taskStats; non-spec notes skip the probe (§6.5).
-            services
-                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+            // A redirected pure-status write leaves the char to materialization
+            // so the parent's `note:updated` follows the task's own emissions;
+            // a text edit (or a drifted char with nothing to write on the task)
+            // lands in one direct parent write instead.
+            let write_parent = match &redirect {
+                None => true,
+                Some((_, next, _)) => {
+                    text.is_some() || (next.is_none() && update.content != note.content)
+                }
+            };
+            if write_parent {
+                note.content = update.content;
+                note.updated_at = now_iso();
+                store.update_note(&note).await?;
+                publish_event(
+                    bus.as_ref(),
+                    note_change_event(
+                        &note.workspace_id,
+                        &note.id,
+                        &note.title,
+                        NOTE_UPDATED,
+                        "update",
+                    ),
+                )
                 .await;
+                // A spec checkbox-line rewrite can add/remove task links and
+                // move taskStats; non-spec notes skip the probe (§6.5).
+                services
+                    .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                    .await;
+            }
+            if let Some((task_id, Some(next), _)) = redirect {
+                services
+                    .set_task_note_status(&note.workspace_id, &task_id, next, None, caller_agent_id)
+                    .await?;
+            }
+            // A parent materialization rewrites already invalidates and
+            // schedules; only the direct write here needs it.
+            if write_parent {
+                services.invalidate_crdt_note(&note.workspace_id, &note.id);
+                services.schedule_line_attribution_recompute(&note.workspace_id, &note.id);
+            }
             Ok(TaskUpdateResult {
                 ok: true,
                 note_id: note.id,
@@ -21026,6 +22422,9 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            services
+                .materialize_linked_checkboxes(&note.workspace_id, &note.id)
+                .await;
             match previous_status {
                 // Only a note that was not already a task is "created" as one.
                 None => {
@@ -21249,6 +22648,9 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskCreatePrerequisiteResult>> {
         let services = self.clone();
         Box::pin(async move {
+            if let Some(content) = content.as_deref() {
+                note_ops::reject_numbered_read_presentation(content)?;
+            }
             let store = &services.store;
             // Verify the dependent note exists in this workspace.
             match store.get_note(&workspace_id, &dependent_note_id).await {
@@ -21388,6 +22790,9 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            services
+                .materialize_linked_checkboxes(&note.workspace_id, &note.id)
+                .await;
             if should_update_status {
                 publish_event(
                     bus.as_ref(),
@@ -24620,46 +26025,6 @@ impl WorkspaceApi for Services {
                         .await
                 }
             } else {
-                // Question hold (PROTOCOL §5.5): the store-only fallback
-                // must honor the automatic-delivery gate too — the row it
-                // persists would bury the pending Q&A. User-originated
-                // sends pass through (never held; only an answer-tagged
-                // row or `agent.dismissQuestions` releases the hold).
-                if !origin.is_user() && self.question_hold_active(&agent_id).await {
-                    self.require_agent_session(&agent_id).await?;
-                    // A2A sender header (intent-hq/intent#3721, monorepo#1015): this hold-park
-                    // bypasses `agent_send_message_op`'s prepend, so the
-                    // queued entry is annotated here — the drain persist
-                    // then inherits it.
-                    let mut content = content;
-                    crate::agent_ops::annotate_sender_attribution(
-                        &mut content,
-                        message_metadata.as_ref(),
-                    );
-                    let (queued, position) = self.enqueue_message(
-                        &agent_id,
-                        content,
-                        image_blocks,
-                        file_blocks,
-                        message_metadata,
-                        None,
-                        crate::agent_ops::is_interrupt_priority(priority.as_deref()),
-                    );
-                    let result = serde_json::json!({
-                        "success": true,
-                        "queued": true,
-                        "heldForQuestions": true,
-                        "queuedMessage": queued.to_value(position),
-                        "turnId": queued.turn_id,
-                    });
-                    self.publish_queue_updated(&agent_id).await;
-                    // Race close (hold-check → enqueue vs a concurrent
-                    // `dismissQuestions`/answer): this `None` arm only
-                    // runs with no `AgentManager` attached, so there is
-                    // no drain to kick here — same as the other
-                    // store-only fallbacks.
-                    return Ok(result);
-                }
                 // Read-only fallback (no `agent_manager` wired): plumb
                 // `messageMetadata` through the store-only append so the
                 // persisted row matches the production
@@ -26042,6 +27407,26 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn github_issues_get(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let issue = sc
+                .get_issue(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({
+                "issue": github_ops::issue_to_json(&issue, &repo_ref.owner, &repo_ref.name)
+            }))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn github_issues_list(
         &self,
@@ -27406,9 +28791,18 @@ impl WorkspaceApi for Services {
         client_id: ClientId,
         name: Option<String>,
         capabilities: Option<serde_json::Value>,
+        host: ClientHostInfo,
     ) -> BoxFuture<'_, Result<()>> {
         let svc = self.clone();
-        Box::pin(async move { svc.client_hello_upsert(client_id, name, capabilities).await })
+        Box::pin(async move {
+            svc.client_hello_upsert(client_id, name, capabilities, host)
+                .await
+        })
+    }
+
+    fn ensure_client(&self, client_id: ClientId) -> BoxFuture<'_, Result<()>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.client_ensure(client_id).await })
     }
 
     fn draft_get(
@@ -27446,13 +28840,58 @@ impl WorkspaceApi for Services {
         Box::pin(async move { svc.drafts_clear(workspace_id, agent_id, client_id).await })
     }
 
-    /// `browser.exec` — agent-initiated CDP forward (REV-1, PROTOCOL §5.14/§12.4).
+    fn browser_list_tabs(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<intent_core::BrowserTab>>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.browser_tabs_list(workspace_id).await })
+    }
+
+    fn browser_upsert_tab(
+        &self,
+        host: ClientId,
+        tab: intent_core::BrowserTabInput,
+    ) -> BoxFuture<'_, Result<intent_core::BrowserTab>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.browser_tab_upsert(host, tab).await })
+    }
+
+    fn browser_remove_tab(&self, host: ClientId, tab_id: String) -> BoxFuture<'_, Result<()>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.browser_tab_remove(host, tab_id).await })
+    }
+
+    fn browser_sync_tabs(
+        &self,
+        host: ClientId,
+        tabs: Vec<intent_core::BrowserTabInput>,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.browser_tabs_sync(host, tabs).await })
+    }
+
+    /// `browser.exec` — agent-initiated CDP forward (REV-2, PROTOCOL §5.14/§12.4).
     ///
     /// When an agent triggers this via the MCP `ws.browser.exec` binding
     /// there is no per-connection reverse channel to use (the caller is the
     /// daemon-hosted MCP server, not a client connection), so we route the
-    /// batch to the first-registered live client via the injected
-    /// [`AgentReverseDispatch`]. Attribution fields (`workspaceId`, `agentId`,
+    /// batch through the injected [`AgentReverseDispatch`]. The target is
+    /// the workspace's **driving client** ([`Self::driving_client_target`],
+    /// REV-2 Model 5 & 10: pin → host of the workspace's claimed tabs →
+    /// first-connected eligible client); a driving client that is offline is
+    /// a hard `-32603` ("browser client … for this workspace is not
+    /// connected"), never a silent fallback. Two rules run before dispatch:
+    /// every `tabId` the batch names (envelope or per action) must be an
+    /// open registry tab of this workspace (`-32602` "tab not found"), and
+    /// `listTabs` is answered by the daemon from the registry — all hosts
+    /// aggregated, no reverse call — so a `listTabs` batch never mixes with
+    /// FE-executed actions (`-32602`). After a successful dispatch, a
+    /// `claimTab` that succeeded re-homes the row to the driving client as
+    /// re-resolved at commit time (`browser:tab-updated { changes: {
+    /// hostClientId, ownerAgentId } }`, see
+    /// [`Self::browser_tab_claim_migrate`]).
+    /// Attribution fields (`workspaceId`, `agentId`,
     /// `tabId`) are threaded into the forwarded params so the FE sees the
     /// same envelope shape the client-triggered path already emits. Result
     /// shaping stays in [`browser_ops`], via the agent-surface variant
@@ -27481,10 +28920,83 @@ impl WorkspaceApi for Services {
                     "browser.exec: actions must be a non-empty array".to_string(),
                 ));
             }
+            // Every tab the batch names must be an open registry tab of this
+            // workspace — before anything is answered or dispatched; the
+            // driving client is the one host, so no per-tab host lookup is
+            // involved (Model 5).
+            let mut named_tabs: Vec<&str> = actions
+                .iter()
+                .filter_map(|a| a["tabId"].as_str())
+                .chain(tab_id.as_deref())
+                .filter(|id| !id.is_empty())
+                .collect();
+            named_tabs.sort_unstable();
+            named_tabs.dedup();
+            for id in &named_tabs {
+                let known = self
+                    .store
+                    .get_browser_tab(id)
+                    .await?
+                    .is_some_and(|tab| tab.workspace_id == workspace_id);
+                if !known {
+                    return Err(Error::InvalidParams(format!(
+                        "browser.exec: tab not found: {id}"
+                    )));
+                }
+            }
+            let list_tabs_count = actions
+                .iter()
+                .filter(|a| a["action"] == browser_tabs::LIST_TABS_ACTION)
+                .count();
+            if list_tabs_count > 0 {
+                if list_tabs_count != actions.len() {
+                    return Err(Error::InvalidParams(
+                        "browser.exec: listTabs is answered by the daemon and cannot be batched \
+                         with other actions"
+                            .to_string(),
+                    ));
+                }
+                let mut results = Vec::with_capacity(actions.len());
+                for action in &actions {
+                    let scope = match &action["scope"] {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(scope) => Some(scope.as_str()),
+                        other => {
+                            return Err(Error::InvalidParams(format!(
+                                "browser.exec: listTabs scope must be \"mine\", \"unclaimed\" or \
+                                 \"all\", got {other}"
+                            )))
+                        }
+                    };
+                    results.push(
+                        self.browser_tabs_list_for_agent(&workspace_id, scope, agent_id.as_ref())
+                            .await?,
+                    );
+                }
+                return Ok(if results.len() == 1 {
+                    results.remove(0)
+                } else {
+                    serde_json::json!({ "results": results })
+                });
+            }
             let Some(dispatch) = self.reverse_dispatch.clone() else {
                 return Err(Error::Internal(
                     "browser.exec: no client connected".to_string(),
                 ));
+            };
+            let target = self.driving_client_target(&workspace_id).await?;
+            // Claims re-home their tab after the dispatch; record which
+            // client executed them (the commit re-validates the host).
+            let claims: Vec<String> = actions
+                .iter()
+                .filter(|a| a["action"] == "claimTab")
+                .filter_map(|a| a["tabId"].as_str().or(tab_id.as_deref()))
+                .map(str::to_string)
+                .collect();
+            let executed_on = if claims.is_empty() {
+                None
+            } else {
+                dispatch.resolve(&target).ok().map(|r| r.client_id)
             };
             // Shape by *request* arity: the FE aborts a batch on the first
             // failing action, so the reply's results count can be shorter
@@ -27493,24 +29005,97 @@ impl WorkspaceApi for Services {
             let args = browser_ops::BrowserExecArgs {
                 actions,
                 tab_id,
-                agent_id: agent_id.map(|a| a.as_str().to_string()),
+                agent_id: agent_id.as_ref().map(|a| a.as_str().to_string()),
                 workspace_id: Some(workspace_id.as_str().to_string()),
             };
             let forwarded = browser_ops::build_forward_params(&args);
-            let response =
-                dispatch
-                    .dispatch("browser.exec", forwarded)
-                    .await
-                    .map_err(|e| match e {
-                        intent_core::ReverseDispatchError::NoClient => {
-                            Error::Internal("browser.exec: no client connected".to_string())
-                        }
-                        intent_core::ReverseDispatchError::Transport { message, .. } => {
-                            Error::Internal(format!("browser.exec: {message}"))
-                        }
-                    })?;
+            let response = match dispatch.dispatch("browser.exec", forwarded, target).await {
+                Ok(response) => response,
+                Err(ReverseDispatchError::NoClient) => {
+                    return Err(Error::Internal(
+                        "browser.exec: no client connected".to_string(),
+                    ));
+                }
+                Err(err) => {
+                    let message = self.browser_dispatch_error_message(err).await;
+                    return Err(Error::Internal(format!("browser.exec: {message}")));
+                }
+            };
+            if let Some(executed_on) = executed_on {
+                for tab_id in browser_ops::successful_claims(&response, &claims) {
+                    self.browser_tab_claim_migrate(&tab_id, &executed_on, agent_id.as_ref())
+                        .await?;
+                }
+            }
             browser_ops::shape_agent_result(&response, requested_actions)
                 .map_err(|e| Error::Internal(e.message))
+        })
+    }
+
+    /// `browser.navigateTab { tabId, url }` (REV-2 Model 4): route a
+    /// navigation request to the client that renders the live tab — the
+    /// workspace's driving client for a claimed tab, the physical host for
+    /// an unclaimed one — as a reverse `browser.exec { action: "navigate"
+    /// }` and echo that action's result envelope. The host then reports the
+    /// resulting navigation through `browser.upsertTab` and every client
+    /// follows the canonical row.
+    fn browser_navigate_tab(
+        &self,
+        tab_id: String,
+        url: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let tab = self
+                .browser_tab_required("browser.navigateTab", &tab_id)
+                .await?;
+            let response = self
+                .browser_tab_dispatch(
+                    "browser.navigateTab",
+                    &tab,
+                    serde_json::json!({ "action": "navigate", "tabId": tab_id, "url": url }),
+                )
+                .await?;
+            browser_ops::shape_result(&response).map_err(|e| Error::Internal(e.message))
+        })
+    }
+
+    /// `browser.closeTab { tabId, force? }` (REV-2 Model 6): route the close
+    /// to the tab's routing target (as `browser_navigate_tab`) so the host's
+    /// own `browser.removeTab` deletes the row. With `force` the row is
+    /// tombstoned daemon-side regardless (after a best-effort routed close
+    /// when the target is reachable); a target that is offline without
+    /// `force` is `Error::Internal`. Unknown tab ⇒ `Error::InvalidParams`.
+    fn browser_close_tab(
+        &self,
+        tab_id: String,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let tab = self
+                .browser_tab_required("browser.closeTab", &tab_id)
+                .await?;
+            let action = serde_json::json!({ "action": "closeTab", "tabId": tab_id });
+            if force {
+                let target = self.browser_tab_route_target(&tab).await?;
+                let reachable = self
+                    .reverse_dispatch
+                    .as_ref()
+                    .is_some_and(|d| d.resolve(&target).is_ok());
+                if reachable {
+                    // The host is told directly; failures fall through to
+                    // the tombstone, which its next sync reconciles.
+                    let _ = self
+                        .browser_tab_dispatch("browser.closeTab", &tab, action)
+                        .await;
+                }
+                self.browser_tab_force_close(&tab_id).await?;
+                return Ok(serde_json::json!({ "ok": true }));
+            }
+            let response = self
+                .browser_tab_dispatch("browser.closeTab", &tab, action)
+                .await?;
+            browser_ops::shape_result(&response).map_err(|e| Error::Internal(e.message))?;
+            Ok(serde_json::json!({ "ok": true }))
         })
     }
 

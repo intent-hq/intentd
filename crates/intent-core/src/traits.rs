@@ -9,21 +9,21 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
 use crate::model::{
-    AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
-    CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
-    ContextItem, Draft, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
-    GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts,
-    GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData, MessageOrigin,
-    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
-    RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
-    TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
-    WorkspaceTask, WorkspaceUpdate,
+    AgentDelegateInput, AgentLite, AgentSession, BrowserTab, BrowserTabInput, ClientHostInfo,
+    CommentAddResult, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
+    CommentResolveThreadResult, CommentRespondResult, ContextItem, Draft, EventQueryParams,
+    EventSubscribeResult, EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus,
+    GitBranches, GitCommitResult, GitMergeConflicts, GitPullResult, GitStatus,
+    LineAttributionComputeResult, LineAttributionData, MessageOrigin, Note, NoteAddInput,
+    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
+    NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
+    ScriptCreateParams, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
+    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
+    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -89,6 +89,27 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::workspace_disk_usage not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.localChanges`: local git work that archiving or deleting
+    /// the workspace would lose or orphan (PROTOCOL §5.1) —
+    /// `{ roots: [...], hasUnpushedCommits, hasUncommittedChanges }`. One
+    /// row per evaluated root: the primary worktree first (skipped when the
+    /// workspace is remote or the worktree is not a git repository), then
+    /// every registered secondary git root in `gitRoot.list` order (always
+    /// evaluated — registered paths are host-local by construction). Each
+    /// row carries `kind`, `gitRootId` (secondary only), `path`, and the
+    /// per-repository signals (`branch?`, `hasRemoteRefs`, `unpushedCount`,
+    /// `uncommittedCount`); a root that cannot be read yields an `error` row
+    /// with zero counts instead of failing the call. `NotFound` only if the
+    /// workspace is absent.
+    fn workspace_local_changes(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_local_changes not implemented".to_string(),
             ))
         })
     }
@@ -420,6 +441,56 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::set_workspace_auto_commit not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `client.list` (REV-2, global): live hello'd connections grouped by
+    /// `clientId` — `[{ clientId, name?, capabilities, connections,
+    /// transports, connectedAt }]`, ordered by each client's first
+    /// connection. Empty when no reverse dispatcher is wired.
+    fn client_list(&self) -> BoxFuture<'_, Result<Vec<ReverseLiveClient>>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::client_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.getBrowserClient` (REV-2): the effective browser client for
+    /// agent-initiated `browser.exec` in `id` — `{ clientId?, source:
+    /// "workspace" | "default", resolved: { clientId, name? } | null }`.
+    /// `clientId` is the persisted pin (omitted when unpinned); `resolved`
+    /// is the client a dispatch would reach right now (`null` when the pin
+    /// is offline or, unpinned, no eligible client is connected). `NotFound`
+    /// if the workspace is absent (router maps it to `-32602`).
+    fn get_workspace_browser_client(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::get_workspace_browser_client not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.setBrowserClient` (REV-2): persist (`Some`) or clear
+    /// (`None`) the per-workspace browser-client pin, emit
+    /// `workspace:updated { changes: { browserClientId } }`, and echo the
+    /// `get_workspace_browser_client` shape. `InvalidParams` for the Chief
+    /// workspace or a `clientId` that never completed `client.hello`;
+    /// `NotFound` if the workspace is absent.
+    fn set_workspace_browser_client(
+        &self,
+        id: WorkspaceId,
+        client_id: Option<ClientId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, client_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::set_workspace_browser_client not implemented".to_string(),
             ))
         })
     }
@@ -1054,14 +1125,17 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.updateStatus`: flip a checkbox by exact task text (PROTOCOL §5.4).
+    /// `caller_agent_id` attributes a write redirected to a linked task note
+    /// (its `task:status-changed` / flipped-completion) to the calling agent.
     fn task_update_status(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         task_text: String,
         status: String,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateStatusResult>> {
-        let _ = (workspace_id, note_id, task_text, status);
+        let _ = (workspace_id, note_id, task_text, status, caller_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::task_update_status not implemented".to_string(),
@@ -1098,6 +1172,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.update`: atomic single-line edit with `expected` conflict check (§5.4).
+    /// `caller_agent_id` attributes a write redirected to a linked task note
+    /// (its `task:status-changed` / flipped-completion) to the calling agent.
+    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         workspace_id: WorkspaceId,
@@ -1106,8 +1183,17 @@ pub trait WorkspaceApi: Send + Sync {
         text: Option<String>,
         status: Option<String>,
         expected: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
-        let _ = (workspace_id, note_id, line, text, status, expected);
+        let _ = (
+            workspace_id,
+            note_id,
+            line,
+            text,
+            status,
+            expected,
+            caller_agent_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::task_update not implemented".to_string(),
@@ -1721,11 +1807,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// through to the prompt builder for downstream note-image /
     /// context-reference resolution.
     ///
-    /// `origin` marks who originated the delivery (question hold, PROTOCOL
-    /// §5.5): the FE RPC front door passes [`MessageOrigin::User`] (never
-    /// held); the MCP front door and every internal wake/continuation path
-    /// pass [`MessageOrigin::Automatic`], which enqueues instead of starting
-    /// a turn while the target agent's question hold is active.
+    /// `origin` marks who originated the delivery (PROTOCOL §5.5): the FE
+    /// RPC front door passes [`MessageOrigin::User`]; the MCP front door and
+    /// every internal wake/continuation path pass
+    /// [`MessageOrigin::Automatic`], which enqueues instead of starting a
+    /// turn while the target's workspace is archived. Pending questions gate
+    /// neither origin.
     #[allow(clippy::too_many_arguments)]
     fn agent_send_message(
         &self,
@@ -1786,7 +1873,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// `agent.dismissQuestions`: persist the question-dismissal marker
     /// (`message_id` — the assistant message whose trailing question resource
     /// blocks the user dismissed) on the agent session, emit `agent:updated`,
-    /// and kick the queue drain so messages held by the question hold resume
+    /// deliver the questions-dismissed system notice, and kick the queue
+    /// drain so entries parked for other reasons (busy race) resume
     /// (PROTOCOL §5.5). Idempotent: re-dismissing the same message succeeds.
     fn agent_dismiss_questions(
         &self,
@@ -2005,11 +2093,12 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.setModel`: change an agent's model (PROTOCOL §5.5).
-    /// `provider_id` optionally names the intended provider explicitly
-    /// (additive param): absent keeps the historical behavior; present it
-    /// must be a registered provider, must agree with a compound
-    /// `model_id`'s prefix, and owns the validation of a bare `model_id`
-    /// (session.provider is reconciled to it on success).
+    /// `model_id` is a bare model id (compound `provider:model` ids reject
+    /// `-32602` at the wire boundary). `provider_id` optionally names the
+    /// intended provider explicitly (additive param): absent keeps the
+    /// historical behavior; present it must be a registered provider and
+    /// owns the validation of the model id (session.provider is reconciled
+    /// to it on success).
     fn agent_set_model(
         &self,
         workspace_id: WorkspaceId,
@@ -3930,6 +4019,21 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.issues.get`: `GET /repos/{owner}/{repo}/issues/{number}` → `{ issue }`.
+    fn github_issues_get(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_issues_get not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `github.issues.list`: `GET /repos/{owner}/{repo}/issues` (PRs filtered
     /// out) → `{ issues, nextToken }`.
     #[allow(clippy::too_many_arguments)]
@@ -4653,8 +4757,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// the providers discovery reported as installed. When no default
     /// provider is derivable from settings and at least one installed
     /// provider exists, the implementation persists the first installed
-    /// provider as `providers.active` (and, when a cached model catalog
-    /// exists for it, its default model as a compound `model.default`).
+    /// provider as `model.defaultProvider` (and, when a cached model catalog
+    /// exists for it, its default model as a bare `model.default`).
     /// Idempotent, and never overwrites an existing settings value. Returns
     /// `{ healed: boolean, ... }`. Default: no-op (read-only wirings).
     fn settings_heal_default_provider(
@@ -4837,7 +4941,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `resolvedModel`/`resolvedProvider` preview fields are computed
     /// per-specialist — each row against the provider a no-`model`
     /// `agent.delegate` of that specialist would actually spawn on (its own
-    /// frontmatter `codingAgent`/compound-`model` pin first, else the
+    /// frontmatter `codingAgent` pin first, else the
     /// settings-derived default) — instead of one shared caller/settings
     /// provider context. Matches the session-start specialist hints.
     fn specialist_list_dispatch(
@@ -5677,18 +5781,34 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `client.hello` persistence: upsert the logical `client` row, setting
     /// `first_seen` once and touching `last_seen`, and persisting `name` /
-    /// `capabilities` (a JSON bag). The connection→client binding and the
-    /// `server` capability block are transport concerns (§16) (PROTOCOL §5.17).
+    /// `capabilities` (a JSON bag) / the client's [`ClientHostInfo`]. The
+    /// connection→client binding and the `server` capability block are
+    /// transport concerns (§16) (PROTOCOL §5.17).
     fn upsert_client(
         &self,
         client_id: ClientId,
         name: Option<String>,
         capabilities: Option<serde_json::Value>,
+        host: ClientHostInfo,
     ) -> BoxFuture<'_, Result<()>> {
-        let _ = (client_id, name, capabilities);
+        let _ = (client_id, name, capabilities, host);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::upsert_client not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Anonymous-connection draft placeholder: ensure a `client` row exists for
+    /// a connection-scoped `client_id` minted on its first draft write, so the
+    /// draft FK is satisfied. Unlike [`Self::upsert_client`] this records no
+    /// hello — the row is never eligible as a `workspace.setBrowserClient` pin
+    /// — and is a no-op on an existing row (PROTOCOL §5.16).
+    fn ensure_client(&self, client_id: ClientId) -> BoxFuture<'_, Result<()>> {
+        let _ = client_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::ensure_client not implemented".to_string(),
             ))
         })
     }
@@ -5744,6 +5864,115 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::draft_clear not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
+    // browser.listTabs / upsertTab / removeTab / syncTabs — the daemon-owned
+    // browser tab registry (REV-2 Model 2 & 6). Like `drafts.*`, the write
+    // methods consume the connection's `client_id` binding (the reporting
+    // host) and are transport-level interceptors that reach persistence
+    // through this trait.
+    // ------------------------------------------------------------------------
+
+    /// `browser.listTabs`: every open tab of `workspace_id`, oldest first,
+    /// without host presence decoration (the transport adds `hostName` /
+    /// `hostConnected` from the live reverse registry).
+    fn browser_list_tabs(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<BrowserTab>>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_list_tabs not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `browser.upsertTab` (host only): `host` becomes / stays the tab's
+    /// host; a tab hosted by another client is `Error::InvalidParams`. Emits
+    /// `browser:tab-opened` for a new row or `browser:tab-updated { changes }`
+    /// when a field changed — nothing when the report matched the stored
+    /// state. Returns the persisted row.
+    fn browser_upsert_tab(
+        &self,
+        host: ClientId,
+        tab: BrowserTabInput,
+    ) -> BoxFuture<'_, Result<BrowserTab>> {
+        let _ = (host, tab);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_upsert_tab not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `browser.removeTab` (host only): delete the tab and emit
+    /// `browser:tab-closed`. Unknown ids are an idempotent no-op; a tab hosted
+    /// by another client is `Error::InvalidParams`.
+    fn browser_remove_tab(&self, host: ClientId, tab_id: String) -> BoxFuture<'_, Result<()>> {
+        let _ = (host, tab_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_remove_tab not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `browser.syncTabs` (host only): reconcile `host`'s full tab snapshot
+    /// per REV-2 Model 6, emitting the matching `browser:tab-*` events, and
+    /// return the tab ids the host must drop.
+    fn browser_sync_tabs(
+        &self,
+        host: ClientId,
+        tabs: Vec<BrowserTabInput>,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        let _ = (host, tabs);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_sync_tabs not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `browser.navigateTab { tabId, url }` (any client, REV-2 Model 4):
+    /// route a navigation request to the client that must perform it — the
+    /// workspace's driving client for a claimed tab, the physical host for an
+    /// unclaimed one — as a reverse `browser.exec { action: "navigate" }`,
+    /// and echo that action's result envelope. Unknown tab ⇒
+    /// `Error::InvalidParams`; target offline ⇒ `Error::Internal`.
+    fn browser_navigate_tab(
+        &self,
+        tab_id: String,
+        url: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (tab_id, url);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_navigate_tab not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `browser.closeTab { tabId, force? }` (any client, REV-2 Model 6):
+    /// route the close to the tab's routing target (as
+    /// `browser_navigate_tab`); the host's own report then removes the row.
+    /// With `force`, or when the target is offline, the row is tombstoned
+    /// daemon-side and `browser:tab-closed` published (the host is told to
+    /// drop it on its next `browser.syncTabs`). Unknown tab ⇒
+    /// `Error::InvalidParams`; target offline without `force` ⇒
+    /// `Error::Internal`. Returns `{ ok: true }`.
+    fn browser_close_tab(
+        &self,
+        tab_id: String,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (tab_id, force);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_close_tab not implemented".to_string(),
             ))
         })
     }
@@ -6544,14 +6773,48 @@ pub trait ContextEngine: Send + Sync {
     ) -> std::result::Result<RetrieveResult, ContextError>;
 }
 
-/// Why an agent-initiated reverse RPC could not be delivered (REV-1). Kept as a
-/// small named enum so the service layer can distinguish "no client connected"
-/// from a transport-level failure without inspecting error strings.
+/// Which client an agent-initiated reverse RPC should be delivered to (REV-2).
+///
+/// Resolution is performed by the [`AgentReverseDispatch`] implementation
+/// against its live, capability-eligible connections (a connection is
+/// eligible for `browser.exec` only when its `client.hello` advertised
+/// `capabilities.browserExec === true`, PROTOCOL §5.17):
+///
+/// - [`Client`](Self::Client) / [`Pinned`](Self::Pinned): the named logical
+///   client's **newest** eligible connection; no such connection ⇒
+///   [`ReverseDispatchError::ClientOffline`] (with `pinned` set for `Pinned`).
+///   `Client` is what tab-host routing uses, `Pinned` what the per-workspace
+///   browser-client pin uses — same lookup, distinct error wording.
+/// - [`Default`](Self::Default): the **first-connected** eligible connection;
+///   none ⇒ [`ReverseDispatchError::NoClient`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReverseTarget {
+    /// A specific logical client (e.g. the host of a browser tab).
+    Client(ClientId),
+    /// The workspace's pinned browser client.
+    Pinned(ClientId),
+    /// The first-connected eligible client.
+    Default,
+}
+
+/// Why an agent-initiated reverse RPC could not be delivered (REV-1/REV-2).
+/// Kept as a small named enum so the service layer can distinguish "no client
+/// connected" from a transport-level failure without inspecting error strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReverseDispatchError {
-    /// No client is currently registered as the sticky reverse target — no
-    /// live connection to route the request to.
+    /// No eligible client is currently connected — nothing to route a
+    /// [`ReverseTarget::Default`] request to.
     NoClient,
+    /// The requested [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`]
+    /// client has no live eligible connection. `name` is the client's display
+    /// name when the dispatcher knows it (it may not for a client that is
+    /// fully offline); `pinned` mirrors the target variant so callers can
+    /// word the failure as a pin miss.
+    ClientOffline {
+        client_id: ClientId,
+        name: Option<String>,
+        pinned: bool,
+    },
     /// The reverse RPC could not be completed successfully — covers delivery
     /// failures (e.g. the outbound queue was closed before the request left
     /// the daemon), transport-level failures (timeout waiting for the
@@ -6567,6 +6830,25 @@ impl std::fmt::Display for ReverseDispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReverseDispatchError::NoClient => f.write_str("no client connected"),
+            ReverseDispatchError::ClientOffline {
+                client_id,
+                name,
+                pinned,
+            } => {
+                let kind = if *pinned {
+                    "pinned browser client"
+                } else {
+                    "browser client"
+                };
+                match name {
+                    Some(name) => write!(
+                        f,
+                        "{kind} \"{name}\" ({}) is not connected",
+                        client_id.as_str()
+                    ),
+                    None => write!(f, "{kind} {} is not connected", client_id.as_str()),
+                }
+            }
             ReverseDispatchError::Transport { message, .. } => f.write_str(message),
         }
     }
@@ -6574,30 +6856,100 @@ impl std::fmt::Display for ReverseDispatchError {
 
 impl std::error::Error for ReverseDispatchError {}
 
-/// Agent-initiated daemon→client reverse-RPC seam (REV-1, PROTOCOL §5.14/§12.4).
+/// The client a [`ReverseTarget`] resolved to without dispatching
+/// ([`AgentReverseDispatch::resolve`]) — the `resolved` half of
+/// `workspace.getBrowserClient` (REV-2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedClient {
+    pub client_id: ClientId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// One logical client as reported by `client.list` (REV-2): every live
+/// hello'd connection sharing a `clientId`, grouped. `name` comes from the
+/// newest connection's hello; `capabilities` is the newest hello's bag with
+/// `browserExec` replaced by the per-client aggregate — a client is
+/// `browserExec`-eligible when **any** of its live connections advertises it,
+/// so a later auxiliary socket without the capability never masks an earlier
+/// eligible connection (#1756 review). `host` (flattened: `hostname` /
+/// `prettyHostname` / `deviceKind`, each presence-detected) is the newest
+/// hello's device identification. `transports` carries the wire spelling
+/// (`"uds"` / `"wss"`) of each live connection, oldest first; `connected_at`
+/// is the ISO-8601 registration time of the oldest live connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReverseLiveClient {
+    pub client_id: ClientId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub capabilities: serde_json::Value,
+    #[serde(flatten)]
+    pub host: ClientHostInfo,
+    pub connections: usize,
+    pub transports: Vec<String>,
+    pub connected_at: String,
+}
+
+/// Agent-initiated daemon→client reverse-RPC seam (REV-1/REV-2, PROTOCOL
+/// §5.14/§12.4).
 ///
-/// Provides the sticky "first client wins" routing decision the service layer
-/// needs when an agent (not a per-connection client) triggers a reverse intent
-/// (currently `browser.exec`). The concrete implementation lives in
-/// `intent-transport` (a shared registry of live `ReverseChannel`s ordered by
-/// arrival); `intent-services` holds it as `Arc<dyn AgentReverseDispatch>` so
-/// the crate graph stays acyclic (§3.2).
+/// Provides the target-selection decision the service layer needs when an
+/// agent (not a per-connection client) triggers a reverse intent (currently
+/// `browser.exec`). The concrete implementation lives in `intent-transport`
+/// (a shared registry of live `ReverseChannel`s that learns each connection's
+/// logical `clientId` and `capabilities` from `client.hello`);
+/// `intent-services` holds it as `Arc<dyn AgentReverseDispatch>` so the crate
+/// graph stays acyclic (§3.2).
 ///
-/// Semantics: `dispatch` returns the same JSON `Value` the connected client
-/// echoed back verbatim, or a [`ReverseDispatchError`] describing why the
-/// request could not be delivered. `is_connected` is a cheap synchronous probe
-/// that lets the service surface a friendlier error before it composes the
-/// forward params.
+/// Semantics: `dispatch` resolves `target` (see [`ReverseTarget`]) and returns
+/// the same JSON `Value` the connected client echoed back verbatim, or a
+/// [`ReverseDispatchError`] describing why the request could not be
+/// delivered. `is_connected` is a cheap synchronous probe that lets the
+/// service surface a friendlier error before it composes the forward params.
 pub trait AgentReverseDispatch: Send + Sync {
-    /// Whether at least one client is currently registered as a reverse target.
+    /// Whether at least one eligible client is currently connected (i.e. a
+    /// [`ReverseTarget::Default`] dispatch would find a target).
     fn is_connected(&self) -> bool;
 
-    /// Dispatch a reverse JSON-RPC request to the sticky primary client and
-    /// await its response.
+    /// Resolve `target` without dispatching — the probe behind
+    /// `workspace.getBrowserClient`. Same rules and errors as `dispatch`.
+    /// The default reports nothing connected.
+    ///
+    /// # Errors
+    ///
+    /// `NoClient` when `Default` finds no eligible connection; `ClientOffline`
+    /// when the named client has no live eligible connection.
+    fn resolve(
+        &self,
+        target: &ReverseTarget,
+    ) -> std::result::Result<ResolvedClient, ReverseDispatchError> {
+        match target {
+            ReverseTarget::Default => Err(ReverseDispatchError::NoClient),
+            ReverseTarget::Client(client_id) | ReverseTarget::Pinned(client_id) => {
+                Err(ReverseDispatchError::ClientOffline {
+                    client_id: client_id.clone(),
+                    name: None,
+                    pinned: matches!(target, ReverseTarget::Pinned(_)),
+                })
+            }
+        }
+    }
+
+    /// Live hello'd connections grouped by `clientId` (the `client.list`
+    /// projection). The default reports no clients.
+    fn live_clients(&self) -> Vec<ReverseLiveClient> {
+        Vec::new()
+    }
+
+    /// Dispatch a reverse JSON-RPC request to the client `target` resolves to
+    /// and await its response.
     fn dispatch<'a>(
         &'a self,
         method: &'a str,
         params: serde_json::Value,
+        target: ReverseTarget,
     ) -> BoxFuture<'a, std::result::Result<serde_json::Value, ReverseDispatchError>>;
 }
 

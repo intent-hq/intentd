@@ -121,16 +121,25 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Resolve pinned Rust channel
-        id: toolchain
+      # Provision the toolchain with bare rustup instead of a toolchain
+      # action, mirroring v-release.yml's "Provision Rust toolchain and
+      # matrix targets" step (green on the same runner pool). On the
+      # GitHub-hosted gh-linux-16x images the preinstalled Rust collides
+      # with the channel sync that rust-toolchain.toml triggers to add its
+      # declared rustfmt/clippy components ("failed to install component:
+      # 'rustfmt-preview-...', detected conflict: 'bin/cargo-fmt'" —
+      # sitter-v0.1.8 run 33700707269, x86_64-musl leg; same mechanism as
+      # v0.2.16 Release run 30706345522). --profile minimal skips the
+      # components and the RUSTUP_TOOLCHAIN pin keeps later cargo
+      # invocations from re-entering the toml sync; the components aren't
+      # needed for release builds.
+      - name: Provision Rust toolchain and target
         shell: bash
         run: |
           channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-          targets: ${{ matrix.target }}
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          rustup target add --toolchain "$channel" "$TARGET"
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
       # No rust-cache step: nothing saves under a key this tag-push-only
       # workflow could restore (ci.yml's build job uses gh-build-<target>),
       # so a restore-only cache here was dead weight — and enabling saves

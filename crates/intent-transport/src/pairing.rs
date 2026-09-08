@@ -142,20 +142,36 @@ pub(crate) async fn handle(
 /// Build the `pairing.getInfo` result JSON: `{ uri, hosts, port, fingerprint,
 /// token, version }`. Errors clearly when the TCP listener is not running —
 /// there is no port to embed in the payload, so pairing is impossible
-/// ([`Error::ListenerDown`], surfaced with `error.data.code = "listener-down"`).
+/// ([`Error::ListenerDown`], surfaced with `error.data.code = "listener-down"`)
+/// — and when there is no dialable route at all (no non-loopback host and no
+/// tunnel): a payload without a route would report pairing as successful while
+/// no other device can connect through it.
 async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let snapshot = provider.pairing_snapshot().await;
     let port = snapshot.port.ok_or(Error::ListenerDown)?;
     let token = crate::get_or_create_token(provider.token_store()).await?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
-    // Bind-aware hosts: a specific bind (loopback included) advertises exactly
-    // that address; only an unspecified/unknown bind enumerates local IPs.
+    // Bind-aware hosts: a specific bind advertises exactly its non-loopback
+    // addresses (loopback is never dialable from another device, so it is
+    // filtered even when bound); only an unspecified/unknown bind enumerates
+    // local IPs. Pairing needs at least one dialable route — a direct host or
+    // the tunnel — so an empty set with no tunnel errors instead of minting a
+    // payload no other device can connect through. With the tunnel up, an
+    // empty host list still pairs: the tc= route carries it.
     let hosts = pairing_hosts(&snapshot);
-    if hosts.is_empty() {
-        return Err(Error::Unsupported(
+    if hosts.is_empty() && snapshot.tc_address.is_none() {
+        let enumerated = snapshot
+            .bind_addresses
+            .as_deref()
+            .is_none_or(|a| a.is_empty() || a.iter().any(std::net::IpAddr::is_unspecified));
+        let msg = if enumerated {
             "no non-loopback IPv4 address found — connect this machine to a network before pairing"
-                .to_string(),
-        ));
+        } else {
+            "listener is bound to loopback only and no tunnel is active — set \
+             server.bindAddress to a LAN address or enable the tunnel \
+             (server.tunnel.enabled) before pairing"
+        };
+        return Err(Error::Unsupported(msg.to_string()));
     }
     let uri = build_pairing_uri(
         &hosts,

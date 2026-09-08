@@ -100,6 +100,7 @@ fn workspace_with_repo(id: &WorkspaceId, repo: &GitRepo) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -287,9 +288,9 @@ fn last_commit_trailers(dir: &std::path::Path) -> (Option<String>, Option<String
     (head.agent_id, head.linked_note_id, head.message)
 }
 
-/// Registry with `providers.active = "auggie"` so the completeOnce provider
-/// gate is open: unset settings resolve the gate CLOSED, so generation tests
-/// that expect the CLI to be reached must opt in explicitly.
+/// Registry with `model.defaultProvider = "auggie"` so the completeOnce
+/// provider gate is open: unset settings resolve the gate CLOSED, so
+/// generation tests that expect the CLI to be reached must opt in explicitly.
 #[cfg(unix)]
 fn auggie_active_registry() -> (tempfile::TempDir, std::sync::Arc<crate::SettingsRegistry>) {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -298,8 +299,8 @@ fn auggie_active_registry() -> (tempfile::TempDir, std::sync::Arc<crate::Setting
             .expect("load registry"),
     );
     registry
-        .apply(&[("providers.active".to_string(), json!("auggie"))])
-        .expect("set providers.active");
+        .apply(&[("model.defaultProvider".to_string(), json!("auggie"))])
+        .expect("set model.defaultProvider");
     (config_dir, registry)
 }
 

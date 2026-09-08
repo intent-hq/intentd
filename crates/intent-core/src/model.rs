@@ -145,12 +145,14 @@ pub enum NoteVisibility {
 /// in `error`) > `Blocked` (a top-level pending `blocker` attention
 /// request) > `NeedsAttention` (discussion requests, pending structured
 /// questions, or the `review_required` attention flag) > `InProgress`
-/// (running agent) > the PR/task rollup. The dismissible `unread` attention
-/// flag (`Workspace.attention`, §9.9) never feeds the derivation — unread
-/// is the flag's own contract, not a display status. Without a running
-/// agent, a task-stage rollup (`InProgress`/`NotStarted`) demotes to `Idle`
-/// — so `NotStarted` and the task-derived `InProgress` never reach the wire
-/// on their own.
+/// (running agent) > the PR/task rollup. Within the open-PR rung,
+/// `PrQueued` (the PR sits in the forge's merge queue) outranks `PrReady`
+/// (mergeable, action needed), which outranks `PrOpen`. The dismissible
+/// `unread` attention flag (`Workspace.attention`, §9.9) never feeds the
+/// derivation — unread is the flag's own contract, not a display status.
+/// Without a running agent, a task-stage rollup (`InProgress`/`NotStarted`)
+/// demotes to `Idle` — so `NotStarted` and the task-derived `InProgress`
+/// never reach the wire on their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDisplayStatus {
@@ -161,6 +163,7 @@ pub enum WorkspaceDisplayStatus {
     Blocked,
     Idle,
     Complete,
+    PrQueued,
     PrReady,
     PrOpen,
     PrMerged,
@@ -295,6 +298,12 @@ pub struct Workspace {
     /// `worktreePath`, non-git repo paths, pre-existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_mode: Option<CheckoutMode>,
+    /// Per-workspace browser-client pin (REV-2): the logical `clientId`
+    /// agent-initiated `browser.exec` requests for this workspace are routed
+    /// to (`workspace.setBrowserClient`). Omitted (not `null`) when unpinned
+    /// — the first-connected eligible client then serves the workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_client_id: Option<ClientId>,
     /// Disk footprint of the daemon-managed workspace directory
     /// (`<workspaces_root>/<workspaceId>`: repo checkout, tool-outputs, agent
     /// sandboxes, everything). Never populated on `workspace.list` /
@@ -430,6 +439,7 @@ pub fn chief_workspace() -> Workspace {
         waiting: false,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -805,6 +815,12 @@ pub struct WorkspaceAgentInfo {
     pub is_responding: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_agent_id: Option<AgentId>,
+    /// The session's persisted `is_background` flag (the same value served
+    /// as `metadata.isBackground` on `agent.list`/`agent.get`, §5.5), so
+    /// clients can gate background agents from the summary alone. Additive
+    /// (monorepo#3789): omitted when `false`, never `false` on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_background: bool,
 }
 
 /// `Workspace.agentSummary` card aggregate. The iOS coverflow reads the richer
@@ -1562,6 +1578,30 @@ pub struct ReadAssetResult {
     pub mime_type: String,
     pub data: String,
     pub size_kb: i64,
+}
+
+/// MIME types accepted by `note.saveAsset`, paired with their persisted file
+/// extensions. Callers must reject values absent from this table so a later
+/// `note.readAsset` call can recover the correct MIME type from the asset ID.
+pub const SUPPORTED_ASSET_MIME_TYPES: &[(&str, &str)] = &[
+    ("image/png", ".png"),
+    ("image/jpeg", ".jpg"),
+    ("image/jpg", ".jpg"),
+    ("image/gif", ".gif"),
+    ("image/webp", ".webp"),
+    ("image/svg+xml", ".svg"),
+    ("image/bmp", ".bmp"),
+    ("image/tiff", ".tiff"),
+    ("video/mp4", ".mp4"),
+    ("video/webm", ".webm"),
+];
+
+/// Return the persisted extension for a supported asset MIME type.
+#[must_use]
+pub fn asset_extension_from_mime(mime_type: &str) -> Option<&'static str> {
+    SUPPORTED_ASSET_MIME_TYPES
+        .iter()
+        .find_map(|(supported, extension)| (*supported == mime_type).then_some(*extension))
 }
 
 /// Result of `note.saveAsset` (PROTOCOL §5.2 — additive asset write). `path`
@@ -2647,7 +2687,7 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
 /// defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "2.1";
+pub const CURRENT_HARNESS_VERSION: &str = "2.3";
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching
@@ -2659,7 +2699,7 @@ fn default_harness_version() -> String {
 }
 
 /// Metadata key under which the question-dismissal marker is persisted on the
-/// `agent_session.metadata` JSON (PROTOCOL §5.5, question hold): the id of the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5, pending questions): the id of the
 /// assistant message whose trailing question resource blocks the user
 /// dismissed via `agent.dismissQuestions`. No schema migration — the marker
 /// rides the existing free-form `metadata` column and survives daemon
@@ -2667,16 +2707,17 @@ fn default_harness_version() -> String {
 pub const DISMISSED_QUESTIONS_MESSAGE_ID_KEY: &str = "dismissedQuestionsMessageId";
 
 /// Metadata key under which the pending-questions marker is persisted on the
-/// `agent_session.metadata` JSON (PROTOCOL §5.5, question hold): the id of the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5, pending questions): the id of the
 /// assistant message whose trailing question resource blocks are still
 /// awaiting an answer. Written at turn end when the persisted assistant tail
 /// bears question blocks (a newer question-bearing turn overwrites it —
 /// single-slot), and cleared (written as the empty string, which reads back as
 /// absent) when the answer for that exact message id persists or the
 /// transcript is truncated by `agent.editAndRegenerate`. Stored-on-write so
-/// the hold derivation stays a bounded metadata read and pendingness survives
-/// later user messages, agent turns, and daemon restarts. No schema migration
-/// — the marker rides the existing free-form `metadata` column. Read back by
+/// the pending-questions derivation stays a bounded metadata read and
+/// pendingness survives later user messages, agent turns, and daemon
+/// restarts. No schema migration — the marker rides the existing free-form
+/// `metadata` column. Read back by
 /// [`AgentSession::pending_questions_message_id`] /
 /// [`AgentSession::pending_questions_marker_written`].
 pub const PENDING_QUESTIONS_MESSAGE_ID_KEY: &str = "pendingQuestionsMessageId";
@@ -2741,23 +2782,23 @@ pub(crate) const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
 /// [`AgentSession::sponsor_agent_id`].
 pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
 
-/// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
-/// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY
-/// user-originated entry point — which always delivers immediately; it
-/// bypasses the hold but does NOT release it (only an answer-tagged row or
-/// `agent.dismissQuestions` does). Everything else (MCP front-door sends,
-/// reportToParent / completion-watch / event-subscription wakes,
-/// `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations) is
-/// `Automatic` and is held in the queue while the target agent's question
-/// hold is active. `Automatic` is the `Default` so unmarked internal paths
-/// fail closed (held) rather than burying a pending Q&A.
+/// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5).
+/// `User` marks the FE `agent.sendMessage` RPC — the ONLY user-originated
+/// entry point — which is an explicit user action: it revives an archived
+/// workspace and retires a pending attention request. Everything else (MCP
+/// front-door sends, reportToParent / completion-watch / event-subscription
+/// wakes, `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations)
+/// is `Automatic`: parked in the queue while the target's workspace is
+/// archived (intent-hq/monorepo#2732) and never treated as user attention.
+/// Pending questions gate NEITHER origin — a pending Q&A is resolved only by
+/// an answer-tagged row, `agent.dismissQuestions`, or a newer question turn,
+/// never by delivery order. `Automatic` is the `Default` so unmarked internal
+/// paths fail closed (never mistaken for a user action).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageOrigin {
-    /// FE-originated `agent.sendMessage` (typed message or wizard answers):
-    /// never held by the question hold.
+    /// FE-originated `agent.sendMessage` (typed message or wizard answers).
     User,
-    /// System/agent-originated delivery: held while the question hold is
-    /// active.
+    /// System/agent-originated delivery.
     #[default]
     Automatic,
 }
@@ -2990,9 +3031,9 @@ impl AgentSession {
     /// The question-dismissal marker persisted under
     /// [`DISMISSED_QUESTIONS_MESSAGE_ID_KEY`] in the session's free-form
     /// `metadata`: `Some` only when the metadata is an object carrying a
-    /// non-empty string under that key. The question-hold derivation compares
-    /// this against the last assistant message id — a match means the user
-    /// dismissed that message's questions and automatic deliveries resume.
+    /// non-empty string under that key. The pending-questions derivation
+    /// compares this against the pending marker — a match means the user
+    /// dismissed that message's questions and nothing is pending.
     pub fn dismissed_questions_message_id(&self) -> Option<&str> {
         self.metadata
             .as_ref()
@@ -3004,8 +3045,8 @@ impl AgentSession {
     /// The pending-questions marker persisted under
     /// [`PENDING_QUESTIONS_MESSAGE_ID_KEY`] in the session's free-form
     /// `metadata`: `Some` only when the metadata is an object carrying a
-    /// non-empty string under that key. The question-hold derivation reads it
-    /// directly (no transcript walk) — a set marker that differs from
+    /// non-empty string under that key. The pending-questions derivation reads
+    /// it directly (no transcript walk) — a set marker that differs from
     /// [`AgentSession::dismissed_questions_message_id`] means questions are
     /// still pending. Cleared markers are written as the empty string, which
     /// reads back as `None` here while
@@ -3022,8 +3063,8 @@ impl AgentSession {
     /// session's metadata at all (set or cleared-to-empty). Distinguishes a
     /// session the marker-based derivation has already written (an empty
     /// marker authoritatively means "nothing pending") from a pre-upgrade
-    /// session that never saw a marker write, where the hold derivation must
-    /// fall back to the transcript tail walk so a live hold is not lost
+    /// session that never saw a marker write, where the derivation must fall
+    /// back to the transcript tail walk so a live pending set is not lost
     /// across the upgrade.
     pub fn pending_questions_marker_written(&self) -> bool {
         self.metadata
@@ -3183,7 +3224,7 @@ pub struct AgentMetadata {
     /// Sandbox branch name when this agent runs in a sandbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_branch: Option<String>,
-    /// Question-dismissal marker (PROTOCOL §5.5, question hold): the id of the
+    /// Question-dismissal marker (PROTOCOL §5.5, pending questions): the id of the
     /// assistant message whose trailing question resource blocks the user
     /// dismissed via `agent.dismissQuestions`. Clients gate the Q&A wizard on
     /// it so a dismissed question set never re-surfaces (including after
@@ -4315,10 +4356,32 @@ pub struct WorkspaceGitRoot {
     pub updated_at: String,
 }
 
+/// Host identification a client supplies about *its own* device in
+/// `client.hello` (§5.17) — the mirror image of the `hostname` /
+/// `prettyHostname` / `deviceKind` triple the daemon reports about itself in
+/// `host.status` / `server.pairingInfo`, with the same semantics: `hostname`
+/// is the OS hostname, `pretty_hostname` the user-facing device name (macOS
+/// Computer Name) falling back to the hostname, `device_kind` the detected
+/// device category. All optional: clients pre-dating the fields send none.
+/// Persisted on the `client` row and refreshed on every hello.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientHostInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pretty_hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_kind: Option<String>,
+}
+
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that
 /// survives reconnects; persisted to the `client` table with `name`,
-/// `capabilities`, `first_seen`, and `last_seen`. The ephemeral per-connection
-/// id is transport-only and never stored here.
+/// `capabilities`, the [`ClientHostInfo`] triple, `first_seen`, and
+/// `last_seen`. `last_hello_at` is `None` for a row minted only to key an
+/// anonymous connection's drafts (§5.16) — such a client never completed
+/// `client.hello`. The ephemeral per-connection id is transport-only and
+/// never stored here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Client {
@@ -4326,8 +4389,12 @@ pub struct Client {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub capabilities: serde_json::Value,
+    #[serde(flatten)]
+    pub host: ClientHostInfo,
     pub first_seen: String,
     pub last_seen: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hello_at: Option<String>,
 }
 
 /// Per-client chat draft (§9.10, §15), keyed by `(workspaceId, agentId,
@@ -4346,6 +4413,221 @@ pub struct Draft {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<serde_json::Value>,
     pub updated_at: String,
+}
+
+/// Visibility of a daemon-owned browser tab (REV-2). `hidden` is an
+/// agent-owned-tab state only; user tabs are always `visible`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserTabVisibility {
+    #[default]
+    Visible,
+    Hidden,
+}
+
+impl BrowserTabVisibility {
+    /// Stored / wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BrowserTabVisibility::Visible => "visible",
+            BrowserTabVisibility::Hidden => "hidden",
+        }
+    }
+
+    /// Parse the stored spelling; unknown values fall back to `Visible`.
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "hidden" => BrowserTabVisibility::Hidden,
+            _ => BrowserTabVisibility::Visible,
+        }
+    }
+}
+
+/// Emulated viewport of a browser tab (`{ width, height }`, CSS pixels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTabSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Daemon-owned logical browser tab (REV-2 Model 2). Persisted to the
+/// `browser_tab` table; the daemon is the shared source of truth for every
+/// connected client. `host_client_id` is the logical client whose process owns
+/// the live webview — CDP-backed actions run there and it reports canonical
+/// `url` / `title`; every other client is a viewer. `tab_id` is minted by the
+/// host and unique per daemon. Panel geometry is client-local and never
+/// stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTab {
+    pub tab_id: String,
+    pub workspace_id: WorkspaceId,
+    pub host_client_id: ClientId,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_name: Option<String>,
+    #[serde(default)]
+    pub visibility: BrowserTabVisibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emulated_size: Option<BrowserTabSize>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl BrowserTab {
+    /// Field-wise diff against a host report: every wire field whose value
+    /// differs from the stored row, keyed by wire name and carrying the
+    /// reported value (`null` when cleared). Empty when the report matches —
+    /// the "nothing changed ⇒ no event" test.
+    #[must_use]
+    pub fn changes_from(
+        &self,
+        input: &BrowserTabInput,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut changes = serde_json::Map::new();
+        if self.workspace_id != input.workspace_id {
+            changes.insert(
+                "workspaceId".to_string(),
+                serde_json::Value::String(input.workspace_id.0.clone()),
+            );
+        }
+        if self.url != input.url {
+            changes.insert(
+                "url".to_string(),
+                serde_json::Value::String(input.url.clone()),
+            );
+        }
+        if self.requested_url != input.requested_url {
+            changes.insert(
+                "requestedUrl".to_string(),
+                serde_json::json!(input.requested_url),
+            );
+        }
+        if self.title != input.title {
+            changes.insert("title".to_string(), serde_json::json!(input.title));
+        }
+        if self.owner_agent_id != input.owner_agent_id {
+            changes.insert(
+                "ownerAgentId".to_string(),
+                serde_json::json!(input.owner_agent_id),
+            );
+        }
+        if self.owner_agent_name != input.owner_agent_name {
+            changes.insert(
+                "ownerAgentName".to_string(),
+                serde_json::json!(input.owner_agent_name),
+            );
+        }
+        if self.visibility != input.visibility {
+            changes.insert(
+                "visibility".to_string(),
+                serde_json::json!(input.visibility),
+            );
+        }
+        if self.emulated_size != input.emulated_size {
+            changes.insert(
+                "emulatedSize".to_string(),
+                serde_json::json!(input.emulated_size),
+            );
+        }
+        changes
+    }
+
+    /// Overwrite the host-reported fields from `input`, leaving the
+    /// daemon-owned host / timestamps untouched.
+    pub fn apply_input(&mut self, input: BrowserTabInput) {
+        let BrowserTabInput {
+            tab_id: _,
+            workspace_id,
+            url,
+            requested_url,
+            title,
+            owner_agent_id,
+            owner_agent_name,
+            visibility,
+            emulated_size,
+        } = input;
+        self.workspace_id = workspace_id;
+        self.url = url;
+        self.requested_url = requested_url;
+        self.title = title;
+        self.owner_agent_id = owner_agent_id;
+        self.owner_agent_name = owner_agent_name;
+        self.visibility = visibility;
+        self.emulated_size = emulated_size;
+    }
+}
+
+/// Host-reported tab state: a [`BrowserTab`] minus the daemon-owned fields
+/// (host and timestamps). The `tab` param of `browser.upsertTab` (with
+/// `workspaceId` taken from the envelope) and each entry of the
+/// `browser.syncTabs` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTabInput {
+    pub tab_id: String,
+    pub workspace_id: WorkspaceId,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_name: Option<String>,
+    #[serde(default)]
+    pub visibility: BrowserTabVisibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emulated_size: Option<BrowserTabSize>,
+}
+
+/// Outcome of a host-reported `browser.upsertTab`: the persisted row plus
+/// how it changed, so the caller can emit `browser:tab-opened` (new row) or
+/// `browser:tab-updated { changes }` (field-wise diff of the wire fields) — or
+/// nothing when the report matched the stored state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserTabUpsertOutcome {
+    Opened(BrowserTab),
+    Updated {
+        tab: BrowserTab,
+        changes: serde_json::Value,
+    },
+    Unchanged(BrowserTab),
+}
+
+impl BrowserTabUpsertOutcome {
+    /// The persisted row regardless of outcome.
+    #[must_use]
+    pub fn tab(&self) -> &BrowserTab {
+        match self {
+            BrowserTabUpsertOutcome::Opened(tab)
+            | BrowserTabUpsertOutcome::Updated { tab, .. }
+            | BrowserTabUpsertOutcome::Unchanged(tab) => tab,
+        }
+    }
+}
+
+/// Result of a host's `browser.syncTabs` reconciliation (REV-2 Model 6).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BrowserTabSyncResult {
+    /// Tab ids the host must drop: closed daemon-side while it was offline,
+    /// or hosted by another client.
+    pub drop: Vec<String>,
+    /// Rows created by the snapshot (⇒ `browser:tab-opened`).
+    pub opened: Vec<BrowserTab>,
+    /// Rows whose wire fields changed (⇒ `browser:tab-updated`).
+    pub updated: Vec<(BrowserTab, serde_json::Value)>,
+    /// Rows of this host absent from the snapshot (⇒ `browser:tab-closed`).
+    pub closed: Vec<BrowserTab>,
 }
 
 /// A persistently-registered repository (parity with the TS `KnownRepo`). Backs
@@ -5078,6 +5360,7 @@ mod tests {
             waiting: false,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -5130,6 +5413,7 @@ mod tests {
             is_streaming: false,
             is_responding: false,
             parent_agent_id: Some(AgentId::from("agent-root")),
+            is_background: true,
         };
         let summary = WorkspaceAgentSummary {
             count: 1,
@@ -5165,6 +5449,9 @@ mod tests {
         assert_eq!(v["agents"][0]["isResponding"], false);
         // `parentAgentId` (v2.9): the delegating agent, camelCased on the wire.
         assert_eq!(v["agents"][0]["parentAgentId"], "agent-root");
+        // `isBackground` (monorepo#3789): present only when the session is
+        // background, camelCased on the wire.
+        assert_eq!(v["agents"][0]["isBackground"], true);
         // `agentIds` is emitted alongside `agents` (forward-compat TS parity).
         assert_eq!(v["agentIds"][0], "agent-1");
         assert_eq!(v["agentIds"].as_array().unwrap().len(), 1);
@@ -5579,8 +5866,10 @@ mod tests {
     }
 
     /// `WorkspaceAgentInfo` omits the optional `specialist`/`lastActivity`/
-    /// `parentAgentId` keys when absent (not `null`), while the non-optional
-    /// flags stay present.
+    /// `parentAgentId` keys when absent (not `null`) and the additive
+    /// `isBackground` flag when `false` (monorepo#3789), while the
+    /// non-optional flags stay present; a pre-#3789 payload without the key
+    /// deserializes as foreground.
     #[test]
     fn workspace_agent_info_optionals_absent() {
         let agent = WorkspaceAgentInfo {
@@ -5592,14 +5881,18 @@ mod tests {
             is_streaming: false,
             is_responding: false,
             parent_agent_id: None,
+            is_background: false,
         };
         let v = serde_json::to_value(&agent).unwrap();
         assert!(v.get("specialist").is_none());
         assert!(v.get("lastActivity").is_none());
         assert!(v.get("parentAgentId").is_none());
+        assert!(v.get("isBackground").is_none());
         assert_eq!(v["status"], "pending");
         assert_eq!(v["isStreaming"], false);
         assert_eq!(v["isResponding"], false);
+        let back: WorkspaceAgentInfo = serde_json::from_value(v).unwrap();
+        assert!(!back.is_background);
     }
 
     /// `AgentLite` carries the nested `metadata` object (`isBackground`/

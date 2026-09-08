@@ -40,9 +40,18 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
             .expect("load registry"),
     );
     // monorepo#3044: creation requires a resolvable provider (no positional
-    // fallback) — seed the effective default provider explicitly.
+    // fallback) — seed the effective default provider explicitly. The
+    // `providers.paths` override points auggie at a deterministic executable
+    // so the delegate path's availability check passes without the real
+    // binary on the test host (CI has none).
     registry
-        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .apply(&[
+            ("model.defaultProvider".into(), serde_json::json!("auggie")),
+            (
+                "providers.paths".into(),
+                serde_json::json!({ "auggie": "/bin/sh" }),
+            ),
+        ])
         .expect("seed default provider");
     let services = Services::new(store)
         .with_settings_registry(registry)
@@ -65,9 +74,11 @@ fn set(svc: &Services, path: &str, value: serde_json::Value) {
 ///
 /// Both `auggie` and `mock` are seeded: the create-path tests never spawn, so
 /// they can name `auggie`, while the delegate-path tests resolve a *provider*
-/// and must use `mock` — its availability is gated purely on
-/// `MOCK_AGENT_SCRIPT_PATH` ([`EnvGuard`]), so they do not depend on a real
-/// ACP provider binary being installed on the test host (CI has none).
+/// and pass its availability check — `mock` is gated purely on
+/// `MOCK_AGENT_SCRIPT_PATH` ([`EnvGuard`]), and delegate tests that resolve
+/// the settings default `auggie` rely on the `providers.paths` override in
+/// [`setup`], so neither depends on a real ACP provider binary being
+/// installed on the test host (CI has none).
 fn seed_catalog(svc: &Services) {
     for provider in ["auggie", "mock"] {
         let version_key = crate::model_catalog::source_for(provider)
@@ -133,12 +144,12 @@ async fn effort_of(svc: &Services, id: AgentId) -> Option<String> {
 async fn settings_default_effort_applies_to_a_settings_resolved_model() {
     let (_t, svc, ws, _spec, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.default", json!("fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("high"));
 
     let id = create(&svc, &ws, None, None, AgentCreateExtra::default()).await;
     let session = svc.agent_get_session_op(id).await.expect("get session");
-    assert_eq!(session.model.as_deref(), Some("auggie:fable-5"));
+    assert_eq!(session.model.as_deref(), Some("fable-5"));
     assert_eq!(session.reasoning_effort.as_deref(), Some("high"));
 }
 
@@ -148,13 +159,13 @@ async fn settings_default_effort_applies_to_a_settings_resolved_model() {
 async fn explicit_model_suppresses_the_settings_default_effort() {
     let (_t, svc, ws, _spec, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.default", json!("fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("high"));
 
     let id = create(
         &svc,
         &ws,
-        Some("auggie:fable-5"),
+        Some("fable-5"),
         None,
         AgentCreateExtra::default(),
     )
@@ -168,13 +179,13 @@ async fn explicit_model_suppresses_the_settings_default_effort() {
 async fn specialist_model_pin_suppresses_the_settings_default_effort() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:sonnet5"));
+    set(&svc, "model.default", json!("sonnet5"));
     set(&svc, "model.defaultReasoningEffort", json!("high"));
-    write_specialist(spec_dir.path(), "pinned", "model: \"auggie:fable-5\"\n");
+    write_specialist(spec_dir.path(), "pinned", "model: \"fable-5\"\n");
 
     let id = create(&svc, &ws, None, Some("pinned"), AgentCreateExtra::default()).await;
     let session = svc.agent_get_session_op(id).await.expect("get session");
-    assert_eq!(session.model.as_deref(), Some("auggie:fable-5"));
+    assert_eq!(session.model.as_deref(), Some("fable-5"));
     assert_eq!(session.reasoning_effort, None);
 }
 
@@ -198,7 +209,7 @@ async fn cli_default_model_suppresses_the_settings_default_effort() {
 async fn explicit_effort_param_and_explicit_clear_outrank_the_setting() {
     let (_t, svc, ws, _spec, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.default", json!("fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("high"));
 
     let id = create(
@@ -239,14 +250,14 @@ async fn explicit_effort_param_and_explicit_clear_outrank_the_setting() {
 async fn specialist_efforts_outrank_the_settings_default() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("mock:fable-5"));
+    set(&svc, "model.default", json!("fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("high"));
     let _env = mock_provider_env();
     write_specialist(spec_dir.path(), "fm", "reasoningEffort: \"low\"\n");
     write_specialist(
         spec_dir.path(),
         "opt",
-        "model: \"mock:fable-5\"\nmodelOptions:\n  - model: \"mock:fable-5\"\n    reasoningEffort: \"low\"\n",
+        "model: \"fable-5\"\nmodelOptions:\n  - model: \"fable-5\"\n    reasoningEffort: \"low\"\n",
     );
 
     for spec in ["fm", "opt"] {
@@ -279,13 +290,13 @@ async fn specialist_efforts_outrank_the_settings_default() {
 async fn model_option_keyed_on_the_settings_default_model_is_selected() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("mock:fable-5"));
+    set(&svc, "model.default", json!("fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("high"));
     let _env = mock_provider_env();
     write_specialist(
         spec_dir.path(),
         "unpinned",
-        "modelOptions:\n  - model: \"mock:fable-5\"\n    reasoningEffort: \"low\"\n",
+        "modelOptions:\n  - model: \"fable-5\"\n    reasoningEffort: \"low\"\n",
     );
 
     let resp = svc
@@ -317,19 +328,19 @@ async fn model_option_keyed_on_the_settings_default_model_is_selected() {
 async fn direct_create_specialist_efforts_outrank_the_settings_default() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.default", json!("fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("high"));
     write_specialist(spec_dir.path(), "fm", "reasoningEffort: \"low\"\n");
     write_specialist(
         spec_dir.path(),
         "opt",
-        "modelOptions:\n  - model: \"auggie:fable-5\"\n    reasoningEffort: \"low\"\n",
+        "modelOptions:\n  - model: \"fable-5\"\n    reasoningEffort: \"low\"\n",
     );
 
     for spec in ["fm", "opt"] {
         let id = create(&svc, &ws, None, Some(spec), AgentCreateExtra::default()).await;
         let session = svc.agent_get_session_op(id).await.expect("get session");
-        assert_eq!(session.model.as_deref(), Some("auggie:fable-5"));
+        assert_eq!(session.model.as_deref(), Some("fable-5"));
         assert_eq!(
             session.reasoning_effort.as_deref(),
             Some("low"),
@@ -345,7 +356,7 @@ async fn direct_create_specialist_efforts_outrank_the_settings_default() {
 async fn direct_create_specialist_without_effort_falls_through_to_the_setting() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.default", json!("fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("high"));
     write_specialist(spec_dir.path(), "plain", "");
 
@@ -360,7 +371,7 @@ async fn direct_create_specialist_without_effort_falls_through_to_the_setting() 
 async fn direct_create_unsupported_specialist_effort_is_rejected() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.default", json!("fable-5"));
     write_specialist(spec_dir.path(), "bad", "reasoningEffort: \"xhigh\"\n");
 
     let err = svc
@@ -388,12 +399,12 @@ async fn direct_create_unsupported_specialist_effort_is_rejected() {
 async fn unsupported_settings_default_effort_is_dropped_not_rejected() {
     let (_t, svc, ws, _spec, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.default", json!("fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("xhigh"));
 
     let id = create(&svc, &ws, None, None, AgentCreateExtra::default()).await;
     let session = svc.agent_get_session_op(id).await.expect("get session");
-    assert_eq!(session.model.as_deref(), Some("auggie:fable-5"));
+    assert_eq!(session.model.as_deref(), Some("fable-5"));
     assert_eq!(
         session.reasoning_effort, None,
         "an unsupported settings level is dropped with a warn, never a -32602"
@@ -406,7 +417,7 @@ async fn unsupported_settings_default_effort_is_dropped_not_rejected() {
 async fn settings_default_effort_passes_through_without_catalog_evidence() {
     let (_t, svc, ws, _spec, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:sonnet5"));
+    set(&svc, "model.default", json!("sonnet5"));
     set(&svc, "model.defaultReasoningEffort", json!("xhigh"));
 
     let id = create(&svc, &ws, None, None, AgentCreateExtra::default()).await;
@@ -418,11 +429,89 @@ async fn settings_default_effort_passes_through_without_catalog_evidence() {
 async fn blank_settings_default_effort_leaves_the_session_unset() {
     let (_t, svc, ws, _spec, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.default", json!("fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("   "));
 
     let id = create(&svc, &ws, None, None, AgentCreateExtra::default()).await;
     assert_eq!(effort_of(&svc, id).await, None);
+}
+
+/// The model-option effort rung matches on the effective `{ provider, model }`
+/// pair: two options sharing a bare model id under different providers apply
+/// their own efforts, keyed by the provider the delegate actually resolves.
+#[tokio::test]
+async fn delegate_model_option_effort_matches_the_effective_provider() {
+    let (_t, svc, ws, spec_dir, _cfg) = setup().await;
+    seed_catalog(&svc);
+    set(&svc, "model.default", json!("fable-5"));
+    let _env = mock_provider_env();
+    write_specialist(
+        spec_dir.path(),
+        "paired",
+        "modelOptions: [{\"provider\":\"other\",\"model\":\"fable-5\",\"reasoningEffort\":\"high\"},\
+         {\"provider\":\"mock\",\"model\":\"fable-5\",\"reasoningEffort\":\"low\"}]\n",
+    );
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                specialist: Some("paired".into()),
+                provider: Some("mock".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let id = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    assert_eq!(
+        effort_of(&svc, id).await.as_deref(),
+        Some("low"),
+        "the option pinned to the effective provider wins over one sharing the bare model id"
+    );
+}
+
+/// Explicit `model` + no `provider` (spawn doctrine corner): the child spawns
+/// on the settings-derived default — the specialist's `codingAgent` never
+/// participates in that spawn chain — so the pair match must key on the
+/// settings default too, not on `codingAgent`.
+#[tokio::test]
+async fn delegate_explicit_model_pair_match_ignores_the_specialist_coding_agent() {
+    let (_t, svc, ws, spec_dir, _cfg) = setup().await;
+    seed_catalog(&svc);
+    let _env = mock_provider_env();
+    // Settings default provider is `auggie` (seeded in setup); the specialist
+    // pins `codingAgent: mock` and carries one option per provider.
+    write_specialist(
+        spec_dir.path(),
+        "pinned",
+        "codingAgent: \"mock\"\n\
+         modelOptions: [{\"provider\":\"mock\",\"model\":\"fable-5\",\"reasoningEffort\":\"high\"},\
+         {\"provider\":\"auggie\",\"model\":\"fable-5\",\"reasoningEffort\":\"low\"}]\n",
+    );
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                specialist: Some("pinned".into()),
+                model: Some("fable-5".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let id = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    assert_eq!(
+        effort_of(&svc, id).await.as_deref(),
+        Some("low"),
+        "the pair match keys on the settings-derived default the child actually spawns on, \
+         not the specialist's codingAgent"
+    );
 }
 
 /// The settings rung also applies through `agent.delegate` (which routes into
@@ -431,7 +520,7 @@ async fn blank_settings_default_effort_leaves_the_session_unset() {
 async fn delegate_applies_the_settings_default_effort() {
     let (_t, svc, ws, _spec, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("mock:fable-5"));
+    set(&svc, "model.default", json!("fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("high"));
     let _env = mock_provider_env();
 

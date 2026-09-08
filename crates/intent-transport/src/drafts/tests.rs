@@ -22,12 +22,7 @@ struct MemApi {
 }
 
 impl WorkspaceApi for MemApi {
-    fn upsert_client(
-        &self,
-        client_id: ClientId,
-        _name: Option<String>,
-        _capabilities: Option<Value>,
-    ) -> BoxFuture<'_, Result<()>> {
+    fn ensure_client(&self, client_id: ClientId) -> BoxFuture<'_, Result<()>> {
         self.minted.lock().unwrap().push(client_id.0);
         Box::pin(async { Ok(()) })
     }

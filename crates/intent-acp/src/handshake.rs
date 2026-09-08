@@ -150,11 +150,11 @@ pub async fn authenticate(conn: &Connection, provider: &ProviderConfig) -> AcpRe
 
 /// Set the agent's mode for a session (§6.4.3). Session-scoped; call after a
 /// session exists (M3.4).
-pub(crate) async fn set_session_mode(
-    conn: &Connection,
-    session_id: &str,
-    mode_id: &str,
-) -> AcpResult<()> {
+///
+/// # Errors
+///
+/// Propagates serialization, transport, or RPC errors if the request fails.
+pub async fn set_session_mode(conn: &Connection, session_id: &str, mode_id: &str) -> AcpResult<()> {
     let request = SetSessionModeRequest::new(session_id.to_string(), mode_id.to_string());
     let params = serde_json::to_value(&request)?;
     conn.request("session/set_mode", params).await?;

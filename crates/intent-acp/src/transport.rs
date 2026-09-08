@@ -39,6 +39,14 @@ const WRITER_CHANNEL_CAPACITY: usize = 256;
 
 type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, JsonRpcError>>>>>;
 
+fn authentication_required() -> JsonRpcError {
+    JsonRpcError {
+        code: -32000,
+        message: "Authentication required; run intentd provider login antigravity".into(),
+        data: None,
+    }
+}
+
 /// Removes a request's pending-map entry when the request future completes or
 /// is dropped, making [`Connection::request_timeout`] cancel-safe with respect
 /// to the correlation map: a caller that abandons the future mid-flight (e.g.
@@ -83,6 +91,9 @@ pub struct IncomingNotification {
 /// stderr drain matches against.
 #[derive(Default)]
 pub struct ConnectionHooks {
+    /// Exact out-of-band stdout signal from a configured browser guard.
+    /// Disabled by default. A match fails requests without exposing a URL.
+    pub auth_required_stdout_marker: Option<&'static str>,
     /// Sink for agent→client requests (client-served handlers).
     pub requests: Option<mpsc::UnboundedSender<IncomingRequest>>,
     /// Sink for agent notifications (streaming router).
@@ -345,6 +356,7 @@ pub struct Connection {
     auth_error: Arc<AtomicBool>,
     stderr_settled: watch::Receiver<bool>,
     stderr_captured: Arc<AtomicBool>,
+    auth_required: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -370,6 +382,7 @@ impl Connection {
         let client_request_seq = Arc::new(AtomicU64::new(0));
         let stderr_buf = Arc::new(Mutex::new(StderrBuffer::default()));
         let auth_error = Arc::new(AtomicBool::new(false));
+        let auth_required = Arc::new(AtomicBool::new(false));
         let mut tasks = Vec::new();
 
         // Writer task: drain whole lines to stdin, one at a time.
@@ -393,10 +406,26 @@ impl Connection {
         let client_req_seq_reader = Arc::clone(&client_request_seq);
         let requests = hooks.requests;
         let notifications = hooks.notifications;
+        let auth_marker = hooks.auth_required_stdout_marker;
+        let auth_required_reader = Arc::clone(&auth_required);
+        let auth_error_reader = Arc::clone(&auth_error);
         tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.trim().is_empty() {
+                    continue;
+                }
+                if auth_marker.is_some_and(|marker| line.trim() == marker) {
+                    auth_required_reader.store(true, Ordering::SeqCst);
+                    auth_error_reader.store(true, Ordering::SeqCst);
+                    for (_, sender) in pending_reader.lock().unwrap().drain() {
+                        let _ = sender.send(Err(authentication_required()));
+                    }
+                    // Continue draining stdout, but never parse OAuth banners
+                    // printed after the browser guard. The caller reaps the child.
+                    continue;
+                }
+                if auth_required_reader.load(Ordering::SeqCst) {
                     continue;
                 }
                 match serde_json::from_str::<Value>(&line) {
@@ -501,6 +530,7 @@ impl Connection {
             auth_error,
             stderr_settled,
             stderr_captured,
+            auth_required,
             tasks,
         }
     }
@@ -540,6 +570,12 @@ impl Connection {
             pending: Arc::clone(&self.pending),
             id,
         };
+
+        // Check after insertion so a signal racing this request either drains
+        // its sender or is observed here. No request can miss the auth failure.
+        if self.auth_required.load(Ordering::SeqCst) {
+            return Err(AcpError::Rpc(authentication_required()));
+        }
 
         let line = encode_message(Some(id), method, &params)?;
         if self.writer_tx.send(line).await.is_err() {

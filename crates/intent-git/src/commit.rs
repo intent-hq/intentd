@@ -23,6 +23,31 @@ use crate::submodule::reject_submodule_internal_paths;
 /// (nothing to commit). Public so auto-commit can recognize this benign skip condition.
 pub const CLEAN_TREE_ERROR: &str = "nothing to commit, working tree clean";
 
+/// Error message returned when a pathspec-scoped commit is attempted while a
+/// merge is pending (`MERGE_HEAD` present), mirroring `git commit -- <paths>`'s
+/// "cannot do a partial commit during a merge" (monorepo#4223): a subset tree
+/// cannot represent the merge, and committing it single-parent would silently
+/// discard the incoming parent.
+pub const PARTIAL_MERGE_COMMIT_ERROR: &str = "cannot do a partial commit during a merge: \
+     run a user-requested commit without an explicit `files` list (staged-only \
+     checkpoint) to complete the merge with all staged changes, or abort it with \
+     `git merge --abort`";
+
+/// The commits named by `MERGE_HEAD` when a merge is pending — the extra
+/// parents `git commit` would record. Empty when no merge is in progress.
+fn pending_merge_heads(repo: &mut Repository) -> Result<Vec<git2::Oid>> {
+    let mut heads = Vec::new();
+    match repo.mergehead_foreach(|oid| {
+        heads.push(*oid);
+        true
+    }) {
+        Ok(()) => {}
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {}
+        Err(e) => return Err(map_git_err(e)),
+    }
+    Ok(heads)
+}
+
 /// The outcome of creating a commit: the new commit SHA and the files it changed.
 #[derive(Debug, Clone)]
 pub struct CommitOutcome {
@@ -33,11 +58,19 @@ pub struct CommitOutcome {
 /// Create a commit from the current index (already-staged changes), mirroring
 /// `git commit -m <message>`. Errors when there is nothing staged to commit.
 ///
+/// When a merge is pending (`MERGE_HEAD` present), the merge is completed like
+/// `git commit`: every `MERGE_HEAD` commit is recorded as an additional parent
+/// and the merge state is cleaned up afterwards (monorepo#4223). A merge whose
+/// resolution leaves the tree identical to the first parent's (an "ours"
+/// resolution) is still a valid merge commit, so the clean-tree rejection is
+/// skipped in that case.
+///
 /// # Errors
 ///
 /// Returns `Error::Internal` if there is nothing staged to commit or another libgit2 operation fails.
 pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
-    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let mut repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let merge_heads = pending_merge_heads(&mut repo)?;
     let mut index = repo.index().map_err(map_git_err)?;
     let tree_oid = index.write_tree().map_err(map_git_err)?;
     let tree = repo.find_tree(tree_oid).map_err(map_git_err)?;
@@ -47,19 +80,36 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
         .ok()
         .and_then(|h| h.target())
         .and_then(|oid| repo.find_commit(oid).ok());
+    let mut merge_parents = Vec::new();
+    for head in merge_heads {
+        merge_parents.push(repo.find_commit(head).map_err(map_git_err)?);
+    }
 
-    // Reject an empty commit, mirroring the TS "nothing to commit" failure.
-    if let Some(parent) = &parent {
-        if parent.tree_id() == tree_oid {
-            return Err(Error::Internal(CLEAN_TREE_ERROR.to_string()));
+    // Reject an empty commit, mirroring the TS "nothing to commit" failure —
+    // unless this commit completes a pending merge.
+    if merge_parents.is_empty() {
+        if let Some(parent) = &parent {
+            if parent.tree_id() == tree_oid {
+                return Err(Error::Internal(CLEAN_TREE_ERROR.to_string()));
+            }
         }
     }
 
     let sig = repo.signature().map_err(map_git_err)?;
-    let parents: Vec<&Commit> = parent.iter().collect();
+    let parents: Vec<&Commit> = parent.iter().chain(merge_parents.iter()).collect();
     let oid = repo
         .commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
         .map_err(map_git_err)?;
+    if !merge_parents.is_empty() {
+        // Drop MERGE_HEAD/MERGE_MSG etc. so the repo leaves the merging
+        // state, exactly like `git commit` finishing a merge. The merge
+        // commit is already written and HEAD advanced at this point, so a
+        // cleanup failure must not fail the call — log and return the
+        // outcome instead.
+        if let Err(e) = repo.cleanup_state() {
+            tracing::warn!(error = %e, "merge state cleanup failed after merge commit");
+        }
+    }
 
     let files = changed_files(&repo, parent.as_ref(), &tree)?;
     Ok(CommitOutcome {
@@ -96,7 +146,7 @@ pub fn commit_with_trailers(
 ///
 /// # Errors
 ///
-/// Returns `Error::Internal` if a path is inside a registered submodule, a pathspec matches no files, or another libgit2 operation fails.
+/// Returns `Error::Internal` if a merge is pending (`MERGE_HEAD` present), a path is inside a registered submodule, a pathspec matches no files, or another libgit2 operation fails.
 pub fn commit_paths_with_trailers(
     worktree_path: &Path,
     message: &str,
@@ -105,7 +155,15 @@ pub fn commit_paths_with_trailers(
     paths: &[String],
 ) -> Result<CommitOutcome> {
     let body = build_commit_message(message, agent_id, linked_note_id);
-    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let mut repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    // Refuse a pathspec-scoped commit while a merge is pending, BEFORE any
+    // index mutation (monorepo#4223): the subset tree cannot represent the
+    // merge, and writing it single-parent silently discards MERGE_HEAD.
+    // Mirrors `git commit -- <paths>`'s partial-commit rejection; HEAD, the
+    // merge state, and the staged incoming changes are left intact.
+    if !pending_merge_heads(&mut repo)?.is_empty() {
+        return Err(Error::Internal(PARTIAL_MERGE_COMMIT_ERROR.to_string()));
+    }
     // Refuse any path strictly inside a registered submodule BEFORE any index
     // mutation (monorepo#1714): a rejected batch leaves the in-memory tree
     // build below untouched, and since the post-commit index refresh loop
@@ -691,5 +749,147 @@ mod tests {
         commit_file(dir.path(), "tracked.txt", "one\n");
         write_file(dir.path(), "tracked.txt", "two\n");
         assert!(staged_paths(dir.path()).unwrap().is_empty());
+    }
+
+    /// Put the repo into a pending-merge state (`MERGE_HEAD` present): HEAD has
+    /// `ours.txt`, the incoming commit adds `theirs.txt`, and `repo.merge` has
+    /// staged the incoming changes without committing — the
+    /// `git merge --no-commit` shape from monorepo#4223. Returns
+    /// `(head_before, incoming)`.
+    fn setup_pending_merge(dir: &Path) -> (git2::Oid, git2::Oid) {
+        commit_file(dir, "seed.txt", "seed\n");
+        let repo = Repository::open(dir).unwrap();
+        let seed = repo.head().unwrap().target().unwrap();
+        commit_file(dir, "ours.txt", "ours\n");
+        let head_before = repo.head().unwrap().target().unwrap();
+
+        // Build the incoming commit (seed + theirs.txt) on a side ref without
+        // touching HEAD or the worktree.
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let seed_commit = repo.find_commit(seed).unwrap();
+        let blob = repo.blob(b"theirs\n").unwrap();
+        let mut tb = repo
+            .treebuilder(Some(&seed_commit.tree().unwrap()))
+            .unwrap();
+        tb.insert("theirs.txt", blob, 0o100_644).unwrap();
+        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+        let incoming = repo
+            .commit(
+                Some("refs/heads/incoming"),
+                &sig,
+                &sig,
+                "incoming",
+                &tree,
+                &[&seed_commit],
+            )
+            .unwrap();
+
+        let annotated = repo.find_annotated_commit(incoming).unwrap();
+        repo.merge(&[&annotated], None, None).unwrap();
+        assert_eq!(repo.state(), git2::RepositoryState::Merge);
+        (head_before, incoming)
+    }
+
+    /// Regression (monorepo#4223): an explicit-`files` commit during a pending
+    /// merge used to write a single-parent commit, silently discarding the
+    /// incoming `MERGE_HEAD` parent. It must be refused before any index
+    /// mutation, mirroring `git commit -- <paths>`'s "cannot do a partial
+    /// commit during a merge", leaving HEAD, the merge state, and the staged
+    /// incoming changes intact.
+    #[test]
+    fn commit_paths_rejects_partial_commit_during_pending_merge() {
+        let dir = init_repo("commit-paths-merge");
+        let (head_before, _incoming) = setup_pending_merge(dir.path());
+        // The resolved-file analog: a worktree edit committed via an explicit list.
+        write_file(dir.path(), "ours.txt", "resolved\n");
+
+        let err = commit_paths_with_trailers(
+            dir.path(),
+            "scoped during merge",
+            Some("agent-1"),
+            None,
+            &["ours.txt".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("partial commit during a merge"),
+            "unexpected error: {err}"
+        );
+
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(
+            repo.head().unwrap().target().unwrap(),
+            head_before,
+            "HEAD must not advance"
+        );
+        assert_eq!(
+            repo.state(),
+            git2::RepositoryState::Merge,
+            "merge state must be preserved"
+        );
+        let st = crate::status::status(dir.path()).unwrap();
+        assert!(
+            st.files.iter().any(|f| f.path == "theirs.txt" && f.staged),
+            "incoming staged change must remain staged: {st:?}"
+        );
+    }
+
+    /// Regression (monorepo#4223): a full-index commit during a pending merge
+    /// must complete the merge — both parents recorded, staged incoming
+    /// changes included, merge state cleaned up — like `git commit`.
+    #[test]
+    fn commit_completes_pending_merge_with_both_parents() {
+        let dir = init_repo("commit-merge-complete");
+        let (head_before, incoming) = setup_pending_merge(dir.path());
+
+        let out = commit(dir.path(), "merge incoming").unwrap();
+        assert!(
+            out.files.contains(&"theirs.txt".to_string()),
+            "incoming change part of the commit delta: {:?}",
+            out.files
+        );
+
+        let repo = Repository::open(dir.path()).unwrap();
+        let c = repo
+            .find_commit(git2::Oid::from_str(&out.hash).unwrap())
+            .unwrap();
+        assert_eq!(c.parent_count(), 2, "merge commit must have two parents");
+        assert_eq!(c.parent_id(0).unwrap(), head_before);
+        assert_eq!(c.parent_id(1).unwrap(), incoming);
+        assert!(
+            c.tree().unwrap().get_name("theirs.txt").is_some(),
+            "staged incoming change committed"
+        );
+        assert_eq!(
+            repo.state(),
+            git2::RepositoryState::Clean,
+            "merge state (MERGE_HEAD etc.) must be cleaned up"
+        );
+    }
+
+    /// An "ours" resolution (merge tree identical to the first parent's tree)
+    /// is a valid merge commit, so the clean-tree rejection must not fire
+    /// while a merge is pending.
+    #[test]
+    fn commit_allows_ours_resolution_merge_with_unchanged_tree() {
+        let dir = init_repo("commit-merge-ours");
+        let (head_before, incoming) = setup_pending_merge(dir.path());
+        // Resolve to "ours": reset the index to HEAD's tree, discarding the
+        // staged incoming changes.
+        let repo = Repository::open(dir.path()).unwrap();
+        let head_tree = repo.find_commit(head_before).unwrap().tree().unwrap();
+        let mut index = repo.index().unwrap();
+        index.read_tree(&head_tree).unwrap();
+        index.write().unwrap();
+
+        let out = commit(dir.path(), "merge incoming (ours)").unwrap();
+        let c = repo
+            .find_commit(git2::Oid::from_str(&out.hash).unwrap())
+            .unwrap();
+        assert_eq!(c.parent_count(), 2, "merge commit must have two parents");
+        assert_eq!(c.parent_id(0).unwrap(), head_before);
+        assert_eq!(c.parent_id(1).unwrap(), incoming);
+        assert_eq!(c.tree_id(), head_tree.id(), "tree unchanged (ours)");
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
     }
 }

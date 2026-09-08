@@ -1,14 +1,15 @@
 //! Unit tests: open a temp `SQLite` DB, run migrations, and round-trip
 //! workspaces and notes including the `include_archived` filter.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use intent_core::{
-    events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientId, Comment,
-    CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, Error, EventActor,
-    Hook, HookId, HookState, Note, NoteId, NoteMetadata, NoteVersionAuthor, NoteVisibility,
-    TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientHostInfo,
+    ClientId, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType,
+    Error, EventActor, Hook, HookId, HookState, Note, NoteId, NoteMetadata, NoteVersionAuthor,
+    NoteVisibility, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+    WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -80,6 +81,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -102,7 +104,7 @@ async fn migration_status_reports_current_after_open() {
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112
+            110, 111, 112, 113, 114, 115, 116, 117
         ]
     );
     assert_eq!(
@@ -113,7 +115,7 @@ async fn migration_status_reports_current_after_open() {
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112
+            110, 111, 112, 113, 114, 115, 116, 117
         ]
     );
 }
@@ -843,6 +845,128 @@ async fn note_round_trip() {
 
     let fetched = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(fetched.id, note.id);
+}
+
+/// `count_tasks_by_status`: one GROUP BY aggregate over
+/// `json_extract(task_json, '$.status')` keyed by the wire status string —
+/// every task note in the workspace regardless of parent/archive state
+/// except the spec itself (`task.list` population parity), non-task notes
+/// ignored, absent statuses absent, an unknown stored status folded into
+/// `not_started`, and scoped per workspace.
+#[tokio::test]
+async fn count_tasks_by_status_groups_by_wire_status() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let ts = now_iso();
+    let mk_note = |id: &str, status: Option<TaskStatus>, archived: bool| Note {
+        id: NoteId::from(id),
+        workspace_id: ws_id.clone(),
+        title: id.to_string(),
+        content: "body".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: archived,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata {
+            task: status.map(|status| TaskMetadata {
+                status,
+                ..Default::default()
+            }),
+        },
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts.clone(),
+    };
+    for (id, status, archived) in [
+        ("t-review", Some(TaskStatus::ReviewRequired), false),
+        ("t-prog-1", Some(TaskStatus::InProgress), false),
+        ("t-prog-2", Some(TaskStatus::InProgress), true),
+        ("t-done", Some(TaskStatus::Complete), false),
+        ("t-cancel", Some(TaskStatus::Cancelled), false),
+        ("n-plain", None, false),
+        // A spec carrying task metadata is excluded, like `task.list`.
+        ("spec", Some(TaskStatus::Blocked), false),
+    ] {
+        store
+            .insert_note(&mk_note(id, status, archived))
+            .await
+            .expect("insert");
+    }
+    // An unrecognised stored status folds into `not_started`.
+    sqlx::query("UPDATE note SET task_json = '{\"status\":\"bogus\"}' WHERE id = 't-done'")
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt status");
+
+    let counts = store.count_tasks_by_status(&ws_id).await.expect("counts");
+    let expected: BTreeMap<String, u64> = [
+        ("cancelled".to_string(), 1),
+        ("in_progress".to_string(), 2),
+        ("not_started".to_string(), 1),
+        ("review_required".to_string(), 1),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(counts, expected);
+    assert!(
+        !counts.contains_key("blocked"),
+        "spec row with task metadata must not be counted: {counts:?}"
+    );
+
+    // Scoped per workspace: another workspace reads empty.
+    let other = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&other, "Other", false))
+        .await
+        .expect("insert other ws");
+    assert!(store
+        .count_tasks_by_status(&other)
+        .await
+        .expect("other counts")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn note_exists_is_workspace_scoped() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_a = WorkspaceId::new();
+    let ws_b = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_a, "A", false))
+        .await
+        .expect("insert A");
+    store
+        .insert_workspace(&sample_workspace(&ws_b, "B", false))
+        .await
+        .expect("insert B");
+
+    let mut note = stray_note(&ws_a, "spec", "Spec");
+    note.content = "large body".repeat(10_000);
+    store.insert_note(&note).await.expect("insert note");
+
+    assert!(store
+        .note_exists(&ws_a, &NoteId::from("spec"))
+        .await
+        .expect("existing note"));
+    assert!(!store
+        .note_exists(&ws_a, &NoteId::from("missing"))
+        .await
+        .expect("missing note"));
+    assert!(!store
+        .note_exists(&ws_b, &NoteId::from("spec"))
+        .await
+        .expect("same id in other workspace"));
 }
 
 /// `max_note_updated_at` (monorepo#3058): the newest note `updated_at` per
@@ -3867,9 +3991,10 @@ async fn agent_session_status_only_lookup() {
 }
 
 /// `set_agent_session_resolved_model` (D13/D14) guard: the write lands only
-/// while `model` still equals `expected_model` (`None` matches NULL) — a
-/// mismatch (concurrent `agent.setModel`) returns `false` and leaves
-/// `resolved_model` untouched.
+/// while the NORMALIZED `model` still equals `expected_model` (`None`
+/// matches NULL) — callers hold the model surfaced by reads, which the 0113
+/// backstop always splits — and a mismatch (concurrent `agent.setModel`)
+/// returns `false` and leaves `resolved_model` untouched.
 /// `clear_agent_session_resolved_model` is idempotent (already-NULL column
 /// and absent row are both no-ops).
 #[tokio::test]
@@ -3891,12 +4016,7 @@ async fn agent_session_resolved_model_guard_and_clear() {
 
     // Guard failure: expected_model no longer matches → false, no write.
     let landed = store
-        .set_agent_session_resolved_model(
-            &ws,
-            &agent_id,
-            Some("claude-code:sonnet"),
-            Some("Sonnet 5"),
-        )
+        .set_agent_session_resolved_model(&ws, &agent_id, Some("sonnet"), Some("Sonnet 5"))
         .await
         .expect("guarded write");
     assert!(!landed, "mismatched expected_model must not land");
@@ -3913,12 +4033,13 @@ async fn agent_session_resolved_model_guard_and_clear() {
         .expect("guarded write");
     assert!(!landed, "None expected_model must not match a set model");
 
-    // Guard success: matching expected_model lands the resolution.
+    // Guard success: the split model (what a read of this legacy compound
+    // row surfaces) lands the resolution.
     let landed = store
         .set_agent_session_resolved_model(
             &ws,
             &agent_id,
-            Some("claude-code:claude-fable-5[1m]"),
+            Some("claude-fable-5[1m]"),
             Some("Fable 5"),
         )
         .await
@@ -3932,12 +4053,7 @@ async fn agent_session_resolved_model_guard_and_clear() {
 
     // A None resolution overwrites (clears) via the same guarded write.
     let landed = store
-        .set_agent_session_resolved_model(
-            &ws,
-            &agent_id,
-            Some("claude-code:claude-fable-5[1m]"),
-            None,
-        )
+        .set_agent_session_resolved_model(&ws, &agent_id, Some("claude-fable-5[1m]"), None)
         .await
         .expect("guarded clear");
     assert!(landed);
@@ -4614,22 +4730,44 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let id = ClientId::from_string("cli-abc");
 
+    let host = ClientHostInfo {
+        hostname: Some("mbp.local".to_string()),
+        pretty_hostname: Some("Clement's MacBook Pro".to_string()),
+        device_kind: Some("laptop".to_string()),
+    };
     store
-        .upsert_client(&id, Some("Laptop"), Some(&json!({ "forward": true })))
+        .upsert_client(
+            &id,
+            Some("Laptop"),
+            Some(&json!({ "forward": true })),
+            &host,
+        )
         .await
         .expect("insert client");
     let first = store.get_client(&id).await.expect("get").expect("present");
     assert_eq!(first.name, Some("Laptop".to_string()));
     assert_eq!(first.capabilities, json!({ "forward": true }));
+    assert_eq!(first.host, host, "host identification round-trips");
+    assert!(
+        first.last_hello_at.is_some(),
+        "a hello stamps last_hello_at"
+    );
 
-    // Re-hello updates name/capabilities and touches last_seen; first_seen stays.
+    // Re-hello updates name/capabilities/host and touches last_seen;
+    // first_seen stays. A hello that omits the host triple clears it.
     store
-        .upsert_client(&id, Some("Desktop"), Some(&json!({ "forward": false })))
+        .upsert_client(
+            &id,
+            Some("Desktop"),
+            Some(&json!({ "forward": false })),
+            &ClientHostInfo::default(),
+        )
         .await
         .expect("re-upsert");
     let again = store.get_client(&id).await.expect("get").expect("present");
     assert_eq!(again.name, Some("Desktop".to_string()));
     assert_eq!(again.capabilities, json!({ "forward": false }));
+    assert_eq!(again.host, ClientHostInfo::default());
     assert_eq!(
         again.first_seen, first.first_seen,
         "first_seen is preserved"
@@ -4639,6 +4777,138 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
         .await
         .unwrap()
         .is_none());
+
+    // A draft-only placeholder exists but never hello'd; ensuring an
+    // already-hello'd id is a no-op that keeps its identity and hello stamp.
+    let anon = ClientId::from_string("anon-draft");
+    store.ensure_client(&anon).await.expect("ensure");
+    let placeholder = store.get_client(&anon).await.unwrap().expect("present");
+    assert_eq!(placeholder.name, None);
+    assert_eq!(placeholder.capabilities, json!({}));
+    assert_eq!(placeholder.last_hello_at, None, "no hello recorded");
+    store.ensure_client(&id).await.expect("ensure existing");
+    let kept = store.get_client(&id).await.unwrap().expect("present");
+    assert_eq!(kept, again, "ensure never clobbers a hello'd row");
+
+    // The 0117 upgrade backfill uses `name` as the hello-provenance proxy: a
+    // pre-upgrade *named* row (shaped here by nulling the stamp on a hello'd
+    // row) is stamped from `last_seen`; a pre-upgrade *nameless* row (the
+    // placeholder above) stays unstamped; an already-stamped row is left
+    // alone. Re-run just the backfill statement — the ALTERs in the same
+    // file cannot run twice.
+    let legacy = ClientId::from_string("legacy-named");
+    store
+        .upsert_client(
+            &legacy,
+            Some("Old Laptop"),
+            None,
+            &ClientHostInfo::default(),
+        )
+        .await
+        .expect("insert legacy");
+    sqlx::query("UPDATE client SET last_hello_at = NULL WHERE id = ?")
+        .bind(legacy.as_str())
+        .execute(store.write_pool())
+        .await
+        .expect("shape pre-upgrade row");
+    assert_eq!(
+        store
+            .get_client(&legacy)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_hello_at,
+        None
+    );
+    let backfill = include_str!("../migrations/0117_client_host_identity.sql")
+        .lines()
+        .find(|l| l.starts_with("UPDATE client SET last_hello_at"))
+        .expect("0117 backfill statement");
+    sqlx::raw_sql(backfill)
+        .execute(store.write_pool())
+        .await
+        .expect("re-run backfill");
+    let legacy_row = store.get_client(&legacy).await.unwrap().expect("present");
+    assert_eq!(
+        legacy_row.last_hello_at,
+        Some(legacy_row.last_seen.clone()),
+        "a pre-upgrade named row counts as hello'd at its last touch"
+    );
+    let placeholder = store.get_client(&anon).await.unwrap().expect("present");
+    assert_eq!(
+        placeholder.last_hello_at, None,
+        "a pre-upgrade nameless row fails closed"
+    );
+    let kept = store.get_client(&id).await.unwrap().expect("present");
+    assert_eq!(kept, again, "an already-stamped row keeps its own stamp");
+}
+
+/// REV-2 per-workspace browser-client pin: NULL (unpinned) by default, a
+/// scoped set/clear round-trips, the column rides `Workspace` reads, and an
+/// unknown workspace is `NotFound`. The scoped setter is the column's only
+/// writer after insert: a full-row `update_workspace` from a snapshot read
+/// before the pin must not revert it.
+#[tokio::test]
+async fn workspace_browser_client_pin_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    let ws = sample_workspace(&ws_id, "Pinned", false);
+    store.insert_workspace(&ws).await.expect("insert");
+
+    assert_eq!(store.workspace_browser_client(&ws_id).await.unwrap(), None);
+    let stale = store.get_workspace(&ws_id).await.unwrap();
+    assert_eq!(stale.browser_client_id, None);
+
+    let desktop = ClientId::from_string("desktop-b");
+    store
+        .set_workspace_browser_client(&ws_id, Some(&desktop))
+        .await
+        .expect("pin");
+    assert_eq!(
+        store.workspace_browser_client(&ws_id).await.unwrap(),
+        Some(desktop.clone())
+    );
+    let loaded = store.get_workspace(&ws_id).await.unwrap();
+    assert_eq!(loaded.browser_client_id, Some(desktop.clone()));
+    let json = serde_json::to_value(&loaded).unwrap();
+    assert_eq!(json["browserClientId"], "desktop-b");
+
+    // A general update from a snapshot taken before the pin (a concurrent
+    // `workspace.update` that read early and committed late) leaves the
+    // pin alone; so does one from a fresh snapshot.
+    store.update_workspace(&stale).await.expect("stale update");
+    assert_eq!(
+        store.workspace_browser_client(&ws_id).await.unwrap(),
+        Some(desktop.clone()),
+        "full-row update must not revert the scoped pin"
+    );
+    store.update_workspace(&loaded).await.expect("update");
+    assert_eq!(
+        store.workspace_browser_client(&ws_id).await.unwrap(),
+        Some(desktop)
+    );
+
+    store
+        .set_workspace_browser_client(&ws_id, None)
+        .await
+        .expect("clear");
+    assert_eq!(store.workspace_browser_client(&ws_id).await.unwrap(), None);
+    let json = serde_json::to_value(store.get_workspace(&ws_id).await.unwrap()).unwrap();
+    assert!(
+        json.get("browserClientId").is_none(),
+        "unpinned workspaces omit browserClientId: {json}"
+    );
+
+    let missing = WorkspaceId::new();
+    assert!(matches!(
+        store.workspace_browser_client(&missing).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        store.set_workspace_browser_client(&missing, None).await,
+        Err(Error::NotFound(_))
+    ));
 }
 
 #[tokio::test]
@@ -4652,7 +4922,7 @@ async fn draft_round_trip_upsert_get_delete() {
         .expect("insert ws");
     let client = ClientId::from_string("cli-1");
     store
-        .upsert_client(&client, None, None)
+        .upsert_client(&client, None, None, &ClientHostInfo::default())
         .await
         .expect("client");
     let agent = AgentId::from_string("agent-1");
@@ -4736,7 +5006,7 @@ async fn draft_round_trip_for_workspace_id_without_row() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let client = ClientId::from_string("cli-1");
     store
-        .upsert_client(&client, None, None)
+        .upsert_client(&client, None, None, &ClientHostInfo::default())
         .await
         .expect("client");
     let ws = WorkspaceId::from("__new-workspace__");
@@ -4781,7 +5051,10 @@ async fn draft_fk_drop_migration_preserves_existing_rows() {
         .await
         .expect("insert ws");
     let client = ClientId::from_string("cli-1");
-    store.upsert_client(&client, None, None).await.unwrap();
+    store
+        .upsert_client(&client, None, None, &ClientHostInfo::default())
+        .await
+        .unwrap();
 
     // Restore the pre-0050 shape: 0007 columns + workspace FK, with the 0048
     // `attachments` column appended.
@@ -4861,8 +5134,9 @@ async fn drafts_are_isolated_by_client_and_removed_on_workspace_delete() {
     let agent = AgentId::from_string("agent-1");
     let a = ClientId::from_string("cli-a");
     let b = ClientId::from_string("cli-b");
-    store.upsert_client(&a, None, None).await.unwrap();
-    store.upsert_client(&b, None, None).await.unwrap();
+    let no_host = ClientHostInfo::default();
+    store.upsert_client(&a, None, None, &no_host).await.unwrap();
+    store.upsert_client(&b, None, None, &no_host).await.unwrap();
 
     store
         .upsert_draft(&ws, &agent, &a, "from-a", None)
@@ -5335,6 +5609,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     diff_summary: None,
                     token_usage: None,
                     cow_supported: None,
+                    browser_client_id: None,
                     display_status: None,
                     waiting: false,
                     checkout_mode: None,
@@ -6582,4 +6857,130 @@ async fn agent_flipped_completion_record_dedup_cap_remove_and_reopen() {
             .expect("list a after cascade"),
         vec![(ws.clone(), NoteId::from("task-keep"))]
     );
+}
+
+/// Batched `clear_stop_redeliveries` (intent-hq/monorepo#4130): one
+/// statement deletes exactly the listed agents' payloads, an unlisted
+/// agent's row survives, and an empty list is a no-op.
+#[tokio::test]
+async fn clear_stop_redeliveries_deletes_only_listed_agents() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let ids: Vec<AgentId> = (0..3)
+        .map(|i| AgentId::from(format!("agent-4130-stop-{i}")))
+        .collect();
+    for id in &ids {
+        store
+            .insert_agent_session(&sample_agent_session(id, &ws))
+            .await
+            .expect("insert session");
+        store
+            .set_stop_redelivery(id, &json!({ "content": id.0 }), "2026-01-01T00:00:00Z")
+            .await
+            .expect("arm payload");
+    }
+    let armed = |rows: Vec<crate::stop_redelivery_repo::StopRedeliveryRow>| {
+        rows.into_iter().map(|r| r.agent_id).collect::<Vec<_>>()
+    };
+
+    store
+        .clear_stop_redeliveries(&[])
+        .await
+        .expect("empty clear");
+    assert_eq!(
+        armed(store.load_all_stop_redeliveries().await.expect("load")),
+        ids,
+        "empty list is a no-op"
+    );
+
+    store
+        .clear_stop_redeliveries(&ids[..2])
+        .await
+        .expect("batched clear");
+    assert_eq!(
+        armed(store.load_all_stop_redeliveries().await.expect("load")),
+        vec![ids[2].clone()],
+        "only the listed agents' payloads are deleted"
+    );
+
+    // Re-clearing an already-cleared id alongside the survivor is fine.
+    store
+        .clear_stop_redeliveries(&[ids[0].clone(), ids[2].clone()])
+        .await
+        .expect("mixed clear");
+    assert!(store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load")
+        .is_empty());
+}
+
+/// Batched `clear_advisory_wake_deliveries_for_children`
+/// (intent-hq/monorepo#4130): one statement clears every marker whose CHILD
+/// is a listed agent — a marker where a listed agent appears only as the
+/// PARENT survives (it belongs to that parent's watch on some other child),
+/// as does any pair not touching the list, and an empty list is a no-op.
+#[tokio::test]
+async fn clear_advisory_wake_deliveries_for_children_matches_child_side_only() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let parent = AgentId::from("agent-4130-adv-parent");
+    let child_a = AgentId::from("agent-4130-adv-child-a");
+    let child_b = AgentId::from("agent-4130-adv-child-b");
+    let other = AgentId::from("agent-4130-adv-other");
+    for id in [&parent, &child_a, &child_b, &other] {
+        store
+            .insert_agent_session(&sample_agent_session(id, &ws))
+            .await
+            .expect("insert session");
+    }
+    let pairs = [
+        (&parent, &child_a),
+        (&parent, &child_b),
+        // child_a as PARENT of `other`: must survive a clear listing child_a.
+        (&child_a, &other),
+        // Untouched by the list.
+        (&other, &parent),
+    ];
+    for (p, c) in pairs {
+        store
+            .record_advisory_wake_delivery(p, c, "2026-01-01T00:00:00Z")
+            .await
+            .expect("record marker");
+    }
+    let has = |p: &AgentId, c: &AgentId| {
+        let (p, c) = (p.clone(), c.clone());
+        let store = &store;
+        async move { store.has_advisory_wake_delivery(&p, &c).await.expect("has") }
+    };
+
+    store
+        .clear_advisory_wake_deliveries_for_children(&[])
+        .await
+        .expect("empty clear");
+    for (p, c) in pairs {
+        assert!(has(p, c).await, "empty list is a no-op: ({p:?}, {c:?})");
+    }
+
+    store
+        .clear_advisory_wake_deliveries_for_children(&[child_a.clone(), child_b.clone()])
+        .await
+        .expect("batched clear");
+    assert!(!has(&parent, &child_a).await, "child_a marker cleared");
+    assert!(!has(&parent, &child_b).await, "child_b marker cleared");
+    assert!(
+        has(&child_a, &other).await,
+        "a marker where the listed id is only the parent survives"
+    );
+    assert!(has(&other, &parent).await, "unrelated pair survives");
 }

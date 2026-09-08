@@ -121,13 +121,56 @@ pub(crate) fn session_message_projections_sql(retired_filter: &str) -> String {
 /// (`metadata.lastSeenMessageId`, v4.5) has not caught up with. Shared by the
 /// single-workspace EXISTS probe, the batch list-path derivation, and the
 /// guarded workspace-attention clear so the three can never drift.
+///
+/// The seen marker is read with `->>` (NOT `json_extract()`) and the three
+/// consumers force [`UNREAD_TOP_LEVEL_SESSION_INDEX`] via `INDEXED BY`, so
+/// each statement is answered entirely from the 0114 partial covering index
+/// instead of fetching every candidate row's metadata JSON from the main
+/// table B-tree — on a ~1GB dogfood DB that difference is ~5.6MB of
+/// scattered page reads vs ~86KB, and cold-cache it pushed the
+/// `workspace.list` dispatch past its 1s budget (intent-hq/monorepo#4190).
+/// `json_extract()` would silently break the covering property: it carries
+/// the `SQLITE_RESULT_SUBTYPE` property, which makes `SQLite` refuse
+/// index-expression substitution (values here are plain strings/NULL, so
+/// `->>` is semantically identical). A plan-shape test guards this.
 pub(crate) const UNREAD_TOP_LEVEL_SESSION_PREDICATE: &str = "parent_agent_id IS NULL \
     AND is_background = 0 \
     AND status <> 'deleted' \
     AND last_message_id IS NOT NULL \
     AND last_message_role = 'assistant' \
-    AND (json_extract(metadata, '$.lastSeenMessageId') IS NULL \
-         OR json_extract(metadata, '$.lastSeenMessageId') <> last_message_id)";
+    AND (metadata ->> '$.lastSeenMessageId' IS NULL \
+         OR metadata ->> '$.lastSeenMessageId' <> last_message_id)";
+
+/// The 0114 partial covering index answering
+/// [`UNREAD_TOP_LEVEL_SESSION_PREDICATE`] statements. Named explicitly (via
+/// `INDEXED BY`) by all three consumers because the planner's stat1
+/// estimates otherwise prefer `idx_agent_parent` (`parent_agent_id IS NULL`
+/// is costed like a ~4-row equality match) — same precedent as the
+/// `idx_agent_parent` `INDEXED BY` uses below. `INDEXED BY` fails loudly if
+/// the index is dropped or the predicate stops matching its WHERE clause.
+pub(crate) const UNREAD_TOP_LEVEL_SESSION_INDEX: &str = "idx_agent_session_unread_top_level";
+
+/// SQL behind [`Store::workspace_has_unread_top_level_session`], extracted so
+/// the monorepo#4190 plan-shape guard runs `EXPLAIN` on the exact production
+/// statement (see [`SESSION_MESSAGE_STATS_SQL`] for the precedent).
+pub(crate) fn unread_workspace_probe_sql() -> String {
+    format!(
+        "SELECT EXISTS(\
+            SELECT 1 FROM agent_session INDEXED BY {UNREAD_TOP_LEVEL_SESSION_INDEX} \
+            WHERE workspace_id = ? AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}\
+        ) AS unread"
+    )
+}
+
+/// SQL behind [`Store::workspaces_with_unread_top_level_sessions`], extracted
+/// for the same monorepo#4190 plan-shape guard.
+pub(crate) fn unread_workspaces_batch_sql() -> String {
+    format!(
+        "SELECT DISTINCT workspace_id \
+         FROM agent_session INDEXED BY {UNREAD_TOP_LEVEL_SESSION_INDEX} \
+         WHERE {UNREAD_TOP_LEVEL_SESSION_PREDICATE}"
+    )
+}
 
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_usage)`.
@@ -220,7 +263,9 @@ pub(crate) async fn fetch_agent_usage_rows(
     let mut result = Vec::new();
     for session_row in session_rows {
         let agent_id: String = session_row.get("id");
-        let model: Option<String> = session_row.get("model");
+        // Read backstop (0113): never leak a legacy compound id into the
+        // usage rollup's model key.
+        let (model, _) = normalize_compound_model(session_row.get("model"), None);
         // Best-effort decode (mirrors the content parse below): a malformed
         // snapshot degrades to None so the tally falls back to message sums.
         let snapshot: Option<TokenUsageTotals> = session_row
@@ -280,6 +325,26 @@ pub struct InterruptedAgent {
     /// daemon-restart / heal paths). The wake-resume orchestrator resumes ONLY
     /// `system_suspend` rows.
     pub reason: Option<String>,
+}
+
+/// The heavy field of a `tool_use` / `tool_result` content block whose full
+/// body the retention sweep has compacted away. Returned by
+/// [`Store::get_agent_message_by_id_with_pruned`]; the side-table `kind` strings behind it
+/// stay inside this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PrunedToolField {
+    /// `tool_use.input`.
+    ToolUseInput,
+    /// `tool_result.output`.
+    ToolResultOutput,
+}
+
+/// One retention-pruned heavy body of a message: the content-array index of
+/// the owning block plus which field was pruned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrunedToolPayload {
+    pub block_ordinal: i64,
+    pub field: PrunedToolField,
 }
 
 /// Per-session message inputs for the `AgentLite` projection (monorepo#958):
@@ -981,6 +1046,42 @@ impl Store {
         rows.iter().map(map_session_summary_row).collect()
     }
 
+    /// Message-free session summaries for all requested workspaces in one
+    /// statement, grouped by workspace while preserving per-workspace creation
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the batch query or row projection fails.
+    pub async fn list_agent_session_summaries_by_workspace(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<std::collections::HashMap<WorkspaceId, Vec<AgentSession>>> {
+        if workspace_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let sql = format!(
+            "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
+             WHERE workspace_id IN ({placeholders}) ORDER BY workspace_id, created_at"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+            Error::Internal(format!("batch list agent session summaries failed: {e}"))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in &rows {
+            let session = map_session_summary_row(row)?;
+            out.entry(session.workspace_id.clone())
+                .or_insert_with(Vec::new)
+                .push(session);
+        }
+        Ok(out)
+    }
+
     /// [`Store::list_agent_session_summaries`] restricted to ACTIVE (not
     /// soft-retired) sessions — the default `agent.list` read. The filter
     /// runs in SQL (`retired_at IS NULL`), keeping the handler cost
@@ -1268,12 +1369,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<bool> {
-        let sql = format!(
-            "SELECT EXISTS(\
-                SELECT 1 FROM agent_session \
-                WHERE workspace_id = ? AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}\
-            ) AS unread"
-        );
+        let sql = unread_workspace_probe_sql();
         let row = sqlx::query(&sql)
             .bind(&workspace_id.0)
             .fetch_one(self.read_pool())
@@ -1297,16 +1393,99 @@ impl Store {
     pub async fn workspaces_with_unread_top_level_sessions(
         &self,
     ) -> Result<std::collections::HashSet<String>> {
-        let sql = format!(
-            "SELECT DISTINCT workspace_id FROM agent_session \
-             WHERE {UNREAD_TOP_LEVEL_SESSION_PREDICATE}"
-        );
+        let sql = unread_workspaces_batch_sql();
         let rows = sqlx::query(&sql)
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("batch workspace unread probe failed: {e}")))?;
         rows.iter()
             .map(|r| col::<String>(r, "workspace_id"))
+            .collect()
+    }
+
+    /// The requested workspace ids that currently have an unread top-level
+    /// session. This scoped batch form keeps list-shaped callers from scanning
+    /// unrelated workspaces while retaining one statement for the full batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the batch query or row projection fails.
+    pub async fn workspaces_with_unread_top_level_sessions_by_workspace(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<std::collections::HashSet<WorkspaceId>> {
+        if workspace_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let sql = format!(
+            "SELECT DISTINCT workspace_id \
+             FROM agent_session INDEXED BY {UNREAD_TOP_LEVEL_SESSION_INDEX} \
+             WHERE workspace_id IN ({placeholders}) AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+            Error::Internal(format!("scoped batch workspace unread probe failed: {e}"))
+        })?;
+        rows.iter()
+            .map(|row| Ok(WorkspaceId(col(row, "workspace_id")?)))
+            .collect()
+    }
+
+    /// Legacy top-level sessions whose pending-question marker was never
+    /// written, paired with their newest non-system message. List enrichment
+    /// uses this one-statement projection to preserve the pre-upgrade question
+    /// hold fallback without issuing a tail query per session.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the query or JSON projection fails.
+    pub async fn list_legacy_question_tail_candidates_by_workspace(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<Vec<(AgentId, String, String, serde_json::Value)>> {
+        if workspace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let sql = format!(
+            "SELECT s.id AS agent_id, m.id AS message_id, m.role, m.content \
+             FROM agent_session s \
+             JOIN agent_message m ON m.id = (\
+                 SELECT tail.id FROM agent_message tail \
+                 WHERE tail.agent_id = s.id AND tail.role != 'system' \
+                 ORDER BY tail.seq DESC LIMIT 1\
+             ) \
+             WHERE s.workspace_id IN ({placeholders}) \
+               AND s.parent_agent_id IS NULL AND s.is_background = 0 \
+               AND s.status != 'deleted' \
+               AND (json_type(s.metadata, '$.pendingQuestionsMessageId') IS NULL \
+                    OR json_type(s.metadata, '$.pendingQuestionsMessageId') != 'text')"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("batch legacy question tail read failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                let raw: String = col(row, "content")?;
+                let content = serde_json::from_str(&raw).map_err(|e| {
+                    Error::Internal(format!("decode legacy question tail content failed: {e}"))
+                })?;
+                Ok((
+                    AgentId(col(row, "agent_id")?),
+                    col(row, "message_id")?,
+                    col(row, "role")?,
+                    content,
+                ))
+            })
             .collect()
     }
 
@@ -1325,6 +1504,12 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<(String, String)>> {
+        // Deliberately NOT `UNREAD_TOP_LEVEL_SESSION_PREDICATE` / the partial
+        // covering index: this query drops the `last_message_role =
+        // 'assistant'` term (markSeen must advance user-last sessions too),
+        // so `idx_agent_session_unread_top_level`'s WHERE does not cover its
+        // rows — an `INDEXED BY` here would fail to plan. Per-workspace and
+        // rare (markSeen), so the plain `json_extract` spelling is fine.
         let sql = "SELECT id, last_message_id FROM agent_session \
             WHERE workspace_id = ? \
               AND parent_agent_id IS NULL \
@@ -1409,12 +1594,21 @@ impl Store {
         expected_model: Option<&str>,
         resolved: Option<&str>,
     ) -> Result<bool> {
+        // The CAS compares against the NORMALIZED stored model (0113 read
+        // backstop, same split rule as `normalize_compound_model`): callers
+        // hold the model surfaced by reads — always split — so a legacy
+        // compound row must still match. Colon-free ids are untouched by the
+        // expression (`ltrim(x, ':')` only strips LEADING colons).
+        const NORMALIZED_MODEL_SQL: &str = "CASE \
+             WHEN instr(ltrim(model, ':'), ':') > 0 \
+             THEN nullif(substr(ltrim(model, ':'), instr(ltrim(model, ':'), ':') + 1), '') \
+             ELSE nullif(ltrim(model, ':'), '') END";
         let res = match expected_model {
             Some(expected) => {
-                sqlx::query(
+                sqlx::query(&format!(
                     "UPDATE agent_session SET resolved_model=? \
-                     WHERE id=? AND workspace_id=? AND model=?",
-                )
+                     WHERE id=? AND workspace_id=? AND {NORMALIZED_MODEL_SQL} = ?"
+                ))
                 .bind(resolved)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
@@ -1423,10 +1617,10 @@ impl Store {
                 .await
             }
             None => {
-                sqlx::query(
+                sqlx::query(&format!(
                     "UPDATE agent_session SET resolved_model=? \
-                     WHERE id=? AND workspace_id=? AND model IS NULL",
-                )
+                     WHERE id=? AND workspace_id=? AND {NORMALIZED_MODEL_SQL} IS NULL"
+                ))
                 .bind(resolved)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
@@ -1491,10 +1685,11 @@ impl Store {
         let Some(row) = row else {
             return Err(Error::NotFound(format!("agent session {id}")));
         };
-        Ok((
+        let (model, provider) = normalize_compound_model(
             row.get::<Option<String>, _>("last_turn_model"),
             row.get::<Option<String>, _>("last_turn_provider"),
-        ))
+        );
+        Ok((model, provider))
     }
 
     /// Persist the model/provider identity the CURRENT turn runs under
@@ -1569,9 +1764,14 @@ impl Store {
         let Some(row) = row else {
             return Err(Error::NotFound(format!("agent session {id}")));
         };
-        let model = row.get::<Option<String>, _>("model");
+        // Read backstop (0113): a legacy compound model id must not select
+        // the stale provider's token-accounting semantics or leak into the
+        // stats model key. `resolved_model` is a display label, untouched.
+        let (model, provider) = normalize_compound_model(
+            row.get::<Option<String>, _>("model"),
+            row.get::<Option<String>, _>("provider"),
+        );
         let resolved_model = row.get::<Option<String>, _>("resolved_model");
-        let provider = row.get::<Option<String>, _>("provider");
         let snapshot = row
             .get::<Option<String>, _>("token_usage")
             .map(|json| {
@@ -1649,11 +1849,12 @@ impl Store {
         workspace_id: &WorkspaceId,
         s: &AgentSession,
     ) -> Result<()> {
-        // Lightweight invariant check: read only workspace_id, provider,
-        // acp_session_id (finding F3: no message fetch). Workspace mismatch →
-        // NotFound, provider immutable, acp_session_id write-once (§9.5).
+        // Lightweight invariant check: read only workspace_id, model,
+        // provider, acp_session_id (finding F3: no message fetch). Workspace
+        // mismatch → NotFound, provider immutable, acp_session_id write-once
+        // (§9.5).
         let row = sqlx::query(
-            "SELECT workspace_id, provider, acp_session_id FROM agent_session WHERE id = ?",
+            "SELECT workspace_id, model, provider, acp_session_id FROM agent_session WHERE id = ?",
         )
         .bind(&s.id.0)
         .fetch_optional(self.read_pool())
@@ -1665,7 +1866,14 @@ impl Store {
         if current_workspace_id != *workspace_id {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
-        let current_provider = row.get::<Option<String>, _>("provider");
+        // Compare against the NORMALIZED stored identity (0113 read
+        // backstop): a caller that read-modify-updates a legacy compound row
+        // holds the split provider, and that round trip must not trip the
+        // immutability guard.
+        let (_, current_provider) = normalize_compound_model(
+            row.get::<Option<String>, _>("model"),
+            row.get::<Option<String>, _>("provider"),
+        );
         let current_acp_session_id = row.get::<Option<String>, _>("acp_session_id");
         // Provider is immutable only after first real use (once acp_session_id
         // is set). This allows cross-provider model switches before the first
@@ -1751,7 +1959,7 @@ impl Store {
     /// Persist a model switch (`agent.setModel`): a narrow write of `model`,
     /// `provider`, and `updated_at` only. This is the ONE writer allowed to
     /// change `provider` after first real use — an intentional cross-provider
-    /// model switch must reconcile `provider` to the compound id's prefix so
+    /// model switch must reconcile `provider` to the explicit providerId so
     /// the next spawn tears down the old child and runs the new provider's
     /// binary (monorepo#882). Accidental provider drift from every other
     /// writer is still rejected by [`Store::update_agent_session`]'s
@@ -2783,6 +2991,7 @@ fn map_session_row_with_heavy_cols(
         ),
         _ => None,
     };
+    let (model, provider) = normalize_compound_model(col(row, "model")?, col(row, "provider")?);
     Ok(AgentSession {
         id: AgentId(col(row, "id")?),
         workspace_id: WorkspaceId(col(row, "workspace_id")?),
@@ -2791,10 +3000,10 @@ fn map_session_row_with_heavy_cols(
         acp_session_id: col(row, "acp_session_id")?,
         name: col(row, "name")?,
         name_explicitly_set: col::<i64>(row, "name_explicitly_set")? != 0,
-        model: col(row, "model")?,
+        model,
         reasoning_effort: col(row, "reasoning_effort")?,
         effort_levels: effort_levels_from_db(col(row, "effort_levels")?)?,
-        provider: col(row, "provider")?,
+        provider,
         specialist: col(row, "specialist")?,
         status: enum_from_db::<AgentStatus>(&col::<String>(row, "status")?)?,
         is_active: col::<i64>(row, "is_active")? != 0,
@@ -2833,6 +3042,42 @@ fn map_session_row_with_heavy_cols(
         sandbox_path: col(row, "sandbox_path")?,
         sandbox_branch: col(row, "sandbox_branch")?,
     })
+}
+
+/// Lenient read-time backstop for legacy compound `provider:model` ids
+/// (migration 0113's split, applied on read so a row the migration has not
+/// touched — e.g. one written by an older daemon after this build's
+/// migrations ran — still never surfaces a compound id). Split on the FIRST
+/// ':' with the old prefix-wins precedence: a non-empty prefix overwrites
+/// `provider`, the remainder becomes the model. Malformed leading colons
+/// carry no provider information and are stripped; an empty remainder
+/// normalizes to `None`. Colon-free ids (incl. effort-lookalikes such as
+/// `opus[1m]`) pass through untouched. Read-only: nothing is written back.
+///
+/// Non-idempotence caveat: a theoretical MULTI-colon id (`a:b:c`) is not a
+/// fixed point of this split — migration 0113 stores it as
+/// (provider `a`, model `b:c`), and this backstop then re-splits the stored
+/// model to (provider `b`, model `c`), discarding the migrated provider. No
+/// real model id contains a ':' (the wire rejects compound ids), so this is
+/// accepted rather than special-cased.
+fn normalize_compound_model(
+    model: Option<String>,
+    provider: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let Some(raw) = model else {
+        return (None, provider);
+    };
+    if !raw.contains(':') {
+        return (Some(raw), provider);
+    }
+    let trimmed = raw.trim_start_matches(':');
+    if let Some((prefix, rest)) = trimmed.split_once(':') {
+        let model = (!rest.is_empty()).then(|| rest.to_string());
+        (model, Some(prefix.to_string()))
+    } else {
+        let model = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        (model, provider)
+    }
 }
 
 /// Encode `agent_session.metadata` for persistence: `None` → SQL `NULL`,
@@ -2962,6 +3207,18 @@ const PAYLOAD_UPSERT_SQL: &str = "INSERT INTO agent_message_payload \
      VALUES (?,?,?,?,?,?) \
      ON CONFLICT(message_id, block_ordinal, kind) \
      DO UPDATE SET encoding = excluded.encoding, body = excluded.body";
+
+/// One full-body side row prepared by [`Store::compact_tool_payloads_before`]:
+/// the key of the row to delete plus the `*_replay` row replacing it.
+struct CompactedPayloadRow {
+    message_id: String,
+    agent_id: String,
+    block_ordinal: i64,
+    kind: String,
+    replay_kind: &'static str,
+    replay_encoding: &'static str,
+    replay_body: Vec<u8>,
+}
 
 /// Insert (upsert, see [`PAYLOAD_UPSERT_SQL`]) one message's prepared
 /// `agent_message_payload` rows inside the caller's write transaction.
@@ -3653,7 +3910,10 @@ impl Store {
     /// read. Takes the caller's read transaction: message SELECT and payload
     /// SELECT must share one WAL snapshot ([`Store::begin_read_snapshot`]),
     /// or a concurrent replace/delete between them would strand the old
-    /// message rows without their side rows.
+    /// message rows without their side rows. Only the two FULL-body kinds
+    /// are selected: `*_replay` rows (retention-pruned bodies, see
+    /// [`Store::compact_tool_payloads_before`]) are ignored, so a pruned
+    /// block keeps serving its inline slim preview + `*Truncated` flags.
     async fn hydrate_message_payloads(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         messages: &mut [AgentMessage],
@@ -3674,8 +3934,9 @@ impl Store {
             let sql = format!(
                 "SELECT message_id, block_ordinal, kind, encoding, body \
                  FROM agent_message_payload \
-                 WHERE kind != '{}' AND message_id IN ({placeholders})",
-                crate::message_payload::KIND_THUMBNAILS
+                 WHERE kind IN ('{}', '{}') AND message_id IN ({placeholders})",
+                crate::message_payload::KIND_TOOL_USE_INPUT,
+                crate::message_payload::KIND_TOOL_RESULT_OUTPUT
             );
             let mut query = sqlx::query(&sql);
             for id in chunk {
@@ -3719,8 +3980,318 @@ impl Store {
         Ok(())
     }
 
+    /// Read an agent's whole log shaped for recovery replay (`history_xml`):
+    /// every externalized heavy body — full row or retention-pruned
+    /// `*_replay` row alike — is spliced in as the replay-preview block
+    /// contract (`intent_core::replay_preview`: the heavy field becomes the
+    /// middle-truncated preview string at `replay_chars`, plus the additive
+    /// `inputReplayOriginalChars` / `outputReplayOriginalChars` count), so a
+    /// block renders byte-identically whether or not the sweep has already
+    /// compacted it. Legacy inline-body blocks are returned as stored.
+    ///
+    /// Message SELECT and payload SELECT share one read snapshot like
+    /// [`Store::hydrate_message_payloads`]. Side rows are paged by rowid in
+    /// small batches and each full body is decoded → stringified → truncated
+    /// as soon as it is read, so at most one page of full bodies is ever
+    /// materialized at once — never the whole transcript's. Rows whose
+    /// message is missing from the log (0109 staged rows) are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_agent_messages_for_replay(
+        &self,
+        agent_id: &AgentId,
+        replay_chars: usize,
+    ) -> Result<Vec<AgentMessage>> {
+        const ROWS_PER_PAGE: i64 = 64;
+        let sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? ORDER BY seq ASC"
+        );
+        let mut tx = self.begin_read_snapshot().await?;
+        let rows = sqlx::query(&sql)
+            .bind(&agent_id.0)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("get agent messages for replay failed: {e}")))?;
+        let mut messages: Vec<AgentMessage> =
+            rows.iter().map(map_message_row).collect::<Result<_>>()?;
+        if messages.is_empty() {
+            return Ok(messages);
+        }
+        let index_by_id: std::collections::HashMap<String, usize> = messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.id.clone(), i))
+            .collect();
+        let page_sql = format!(
+            "SELECT rowid AS rid, message_id, block_ordinal, kind, encoding, body \
+             FROM agent_message_payload \
+             WHERE agent_id = ? AND rowid > ? AND kind IN ('{}', '{}', '{}', '{}') \
+             ORDER BY rowid ASC LIMIT ?",
+            crate::message_payload::KIND_TOOL_USE_INPUT,
+            crate::message_payload::KIND_TOOL_RESULT_OUTPUT,
+            crate::message_payload::KIND_TOOL_USE_INPUT_REPLAY,
+            crate::message_payload::KIND_TOOL_RESULT_OUTPUT_REPLAY,
+        );
+        let mut after_rowid: i64 = 0;
+        loop {
+            let rows = sqlx::query(&page_sql)
+                .bind(&agent_id.0)
+                .bind(after_rowid)
+                .bind(ROWS_PER_PAGE)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("get replay payloads failed: {e}")))?;
+            let page_len = rows.len();
+            for row in &rows {
+                after_rowid = col(row, "rid")?;
+                let message_id: String = col(row, "message_id")?;
+                let Some(&idx) = index_by_id.get(&message_id) else {
+                    continue;
+                };
+                let block_ordinal: i64 = col(row, "block_ordinal")?;
+                let kind: String = col(row, "kind")?;
+                let encoding: String = col(row, "encoding")?;
+                let body: Vec<u8> = col(row, "body")?;
+                let preview = crate::message_payload::decode_body(&encoding, &body).and_then(|v| {
+                    if crate::message_payload::is_replay_kind(&kind) {
+                        crate::message_payload::ReplayPreview::from_row_body(v)
+                    } else {
+                        Ok(crate::message_payload::ReplayPreview::from_body(
+                            &v,
+                            replay_chars,
+                        ))
+                    }
+                });
+                match preview {
+                    Ok(preview) => crate::message_payload::splice_replay_preview(
+                        &mut messages[idx].content,
+                        block_ordinal,
+                        &kind,
+                        &preview,
+                        replay_chars,
+                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            message = %message_id,
+                            block_ordinal,
+                            kind,
+                            error = %e,
+                            "decode replay payload failed; serving stored preview"
+                        );
+                    }
+                }
+            }
+            if i64::try_from(page_len).unwrap_or(i64::MAX) < ROWS_PER_PAGE {
+                break;
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Tool-payload retention sweep (`agents.toolPayloadRetentionDays`):
+    /// compact every FULL-body side row (`tool_use_input` /
+    /// `tool_result_output`) whose owning `agent_message.created_at` sorts
+    /// before `cutoff_iso` (RFC 3339 UTC, lexicographic compare like every
+    /// other `created_at` cutoff) into its `*_replay` row — body decoded,
+    /// stringified and middle-truncated to `replay_chars` with the shared
+    /// `intent_core::replay_preview` helpers — and delete the full row.
+    /// The replay row body is the JSON object
+    /// `{"text": <preview>, "originalChars": <N>}`
+    /// ([`crate::message_payload::ReplayPreview`]), `encoding` none|zlib like
+    /// every other row; bodies already under the cap are converted too, so
+    /// every pruned block has the same shape. Returns the number of rows
+    /// compacted.
+    ///
+    /// Work is chunked (≤ 500 rows per scan + one write transaction per
+    /// chunk) so the sweep never holds the write lock for long; the CPU-bound
+    /// decode/truncate of a chunk runs on a blocking thread BEFORE its
+    /// transaction opens. The join on `agent_message` means 0109 staged rows
+    /// (no message row yet) and thumbnails rows are never touched. Delete +
+    /// insert inside one transaction keep the 0108/0109 `conversation_bytes`
+    /// triggers balanced, and a re-run finds nothing left to convert
+    /// (idempotent). A row whose message vanished between scan and write
+    /// (concurrent replace/delete) is skipped, never re-created.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn compact_tool_payloads_before(
+        &self,
+        cutoff_iso: &str,
+        replay_chars: usize,
+    ) -> Result<u64> {
+        const CHUNK: i64 = 500;
+        let pool = self.write_pool();
+        let scan_sql = format!(
+            "SELECT p.rowid AS rid, p.message_id, p.agent_id, p.block_ordinal, p.kind, \
+                    p.encoding, p.body \
+             FROM agent_message_payload p \
+             JOIN agent_message m ON m.id = p.message_id \
+             WHERE p.rowid > ? AND p.kind IN ('{}', '{}') AND m.created_at < ? \
+             ORDER BY p.rowid ASC LIMIT ?",
+            crate::message_payload::KIND_TOOL_USE_INPUT,
+            crate::message_payload::KIND_TOOL_RESULT_OUTPUT,
+        );
+        let mut total: u64 = 0;
+        let mut after_rowid: i64 = 0;
+        loop {
+            let rows = sqlx::query(&scan_sql)
+                .bind(after_rowid)
+                .bind(cutoff_iso)
+                .bind(CHUNK)
+                .fetch_all(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("scan tool payloads failed: {e}")))?;
+            if rows.is_empty() {
+                break;
+            }
+            let page_len = rows.len();
+            let mut scanned = Vec::with_capacity(page_len);
+            for row in &rows {
+                after_rowid = col(row, "rid")?;
+                let message_id: String = col(row, "message_id")?;
+                let agent_id: String = col(row, "agent_id")?;
+                let block_ordinal: i64 = col(row, "block_ordinal")?;
+                let kind: String = col(row, "kind")?;
+                let encoding: String = col(row, "encoding")?;
+                let body: Vec<u8> = col(row, "body")?;
+                scanned.push((message_id, agent_id, block_ordinal, kind, encoding, body));
+            }
+            drop(rows);
+            let converted = tokio::task::spawn_blocking(move || {
+                let mut out: Vec<CompactedPayloadRow> = Vec::with_capacity(scanned.len());
+                for (message_id, agent_id, block_ordinal, kind, encoding, body) in scanned {
+                    let Some(replay_kind) = crate::message_payload::replay_kind_for(&kind) else {
+                        continue;
+                    };
+                    let encoded = crate::message_payload::decode_body(&encoding, &body)
+                        .map(|v| crate::message_payload::ReplayPreview::from_body(&v, replay_chars))
+                        .and_then(|p| p.encode());
+                    match encoded {
+                        Ok((replay_encoding, replay_body)) => out.push(CompactedPayloadRow {
+                            message_id,
+                            agent_id,
+                            block_ordinal,
+                            kind,
+                            replay_kind,
+                            replay_encoding,
+                            replay_body,
+                        }),
+                        Err(e) => {
+                            tracing::warn!(
+                                message = %message_id,
+                                block_ordinal,
+                                kind,
+                                error = %e,
+                                "decode tool payload failed; leaving full row in place"
+                            );
+                        }
+                    }
+                }
+                out
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("payload compaction task failed: {e}")))?;
+
+            let compacted = crate::with_write_txn_retry(|| async {
+                let mut tx = pool.begin().await.map_err(|e| {
+                    Error::Internal(format!("compact tool payloads begin failed: {e}"))
+                })?;
+                let mut n: u64 = 0;
+                for row in &converted {
+                    let deleted = sqlx::query(
+                        "DELETE FROM agent_message_payload \
+                         WHERE message_id = ? AND block_ordinal = ? AND kind = ?",
+                    )
+                    .bind(&row.message_id)
+                    .bind(row.block_ordinal)
+                    .bind(&row.kind)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("compact tool payloads delete failed: {e}"))
+                    })?
+                    .rows_affected();
+                    if deleted == 0 {
+                        continue;
+                    }
+                    sqlx::query(PAYLOAD_UPSERT_SQL)
+                        .bind(&row.message_id)
+                        .bind(&row.agent_id)
+                        .bind(row.block_ordinal)
+                        .bind(row.replay_kind)
+                        .bind(row.replay_encoding)
+                        .bind(&row.replay_body)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("compact tool payloads insert failed: {e}"))
+                        })?;
+                    n += 1;
+                }
+                tx.commit().await.map_err(|e| {
+                    Error::Internal(format!("compact tool payloads commit failed: {e}"))
+                })?;
+                Ok(n)
+            })
+            .await?;
+            total += compacted;
+            if i64::try_from(page_len).unwrap_or(i64::MAX) < CHUNK {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// The heavy tool bodies of one message that the retention sweep has
+    /// compacted ([`Store::compact_tool_payloads_before`]): every content
+    /// block whose side table holds a `*_replay` row and NO full-body row of
+    /// the same field. This is the store-side evidence `agent.getMessageBlock`
+    /// uses to flag a pruned block — a block that merely still carries its
+    /// slim `*Truncated` flags after hydration is NOT evidence (a corrupt or
+    /// undecodable full row, or a body that arrived pre-flagged and was never
+    /// extracted, looks the same yet was never pruned). Takes the caller's
+    /// read transaction: it must share the WAL snapshot the message was
+    /// hydrated from ([`Store::get_agent_message_by_id_with_pruned`]), or a
+    /// sweep landing between the two reads would stamp a still-full body as
+    /// pruned. One statement over the `(message_id, block_ordinal, kind)`
+    /// primary key; the replay kind strings never leave this crate. Legacy
+    /// messages (no side rows) yield an empty list.
+    async fn pruned_tool_payloads_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        message_id: &str,
+    ) -> Result<Vec<PrunedToolPayload>> {
+        let rows = sqlx::query(
+            "SELECT block_ordinal, kind FROM agent_message_payload \
+             WHERE message_id = ? AND block_ordinal >= 0",
+        )
+        .bind(message_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| Error::Internal(format!("list tool payload kinds failed: {e}")))?;
+        let present: Vec<(i64, String)> = rows
+            .iter()
+            .map(|r| (r.get::<i64, _>("block_ordinal"), r.get::<String, _>("kind")))
+            .collect();
+        let mut pruned: Vec<PrunedToolPayload> = present
+            .iter()
+            .filter_map(|(ordinal, kind)| {
+                let (field, full_kind) = crate::message_payload::pruned_field_for(kind)?;
+                let full_retained = present.iter().any(|(o, k)| o == ordinal && k == full_kind);
+                (!full_retained).then_some(PrunedToolPayload {
+                    block_ordinal: *ordinal,
+                    field,
+                })
+            })
+            .collect();
+        pruned.sort_by_key(|p| (p.block_ordinal, p.field));
+        Ok(pruned)
+    }
+
     /// The newest non-`system` message of an agent's log, hydrated as a
-    /// single row — the question-hold tail anchor (PROTOCOL §5.5). Trailing
+    /// single row — the pending-questions tail anchor (PROTOCOL §5.5). Trailing
     /// `system` rows are skipped inside SQL (a backwards walk over the
     /// `UNIQUE(agent_id, seq)` index), so per-call cost is one statement and
     /// at most ONE decoded message regardless of transcript size — the
@@ -3770,19 +4341,57 @@ impl Store {
         agent_id: &AgentId,
         message_id: &str,
     ) -> Result<Option<AgentMessage>> {
+        let mut tx = self.begin_read_snapshot().await?;
+        Self::get_agent_message_by_id_in(&mut tx, agent_id, message_id).await
+    }
+
+    /// [`Store::get_agent_message_by_id`] plus the message's retention-pruned
+    /// heavy fields, both read from ONE WAL snapshot — the `agent.getMessageBlock`
+    /// read. The pairing matters: a sweep committing between a hydrated read
+    /// and a separate pruned-metadata read would report a `*_replay` row for a
+    /// block whose full body was just served (stamping a full body "pruned",
+    /// flags gone), and a side-row replacement between the reads could apply
+    /// the metadata to another content generation. Three indexed reads inside
+    /// the snapshot — the message row by primary key, the full-payload
+    /// hydration by `message_id`, and the pruned-kind metadata by `message_id`
+    /// (the last two only when the message exists) — at most ONE decoded
+    /// message. `None` when the id is unknown or belongs to a different agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_agent_message_by_id_with_pruned(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<(AgentMessage, Vec<PrunedToolPayload>)>> {
+        let mut tx = self.begin_read_snapshot().await?;
+        match Self::get_agent_message_by_id_in(&mut tx, agent_id, message_id).await? {
+            Some(msg) => {
+                let pruned = Self::pruned_tool_payloads_in(&mut tx, message_id).await?;
+                Ok(Some((msg, pruned)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_agent_message_by_id_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<AgentMessage>> {
         let sql =
             format!("SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? AND id = ?");
-        let mut tx = self.begin_read_snapshot().await?;
         let row = sqlx::query(&sql)
             .bind(&agent_id.0)
             .bind(message_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(|e| Error::Internal(format!("get agent message by id failed: {e}")))?;
         match row.as_ref().map(map_message_row).transpose()? {
             Some(msg) => {
                 let mut messages = [msg];
-                Self::hydrate_message_payloads(&mut tx, &mut messages).await?;
+                Self::hydrate_message_payloads(tx, &mut messages).await?;
                 let [msg] = messages;
                 Ok(Some(msg))
             }
@@ -4257,6 +4866,105 @@ impl Store {
         .await
     }
 
+    /// Atomically drop every message of `agent_id` with `seq >= first_dropped_seq`
+    /// and leave the rest UNTOUCHED — ids, `seq`, and every
+    /// `agent_message_payload` side row (full-body, retention-pruned
+    /// `*_replay`, thumbnails) of the kept rows survive as stored. Used by the
+    /// `agent.editAndRegenerate` truncation, which keeps a prefix the store
+    /// already holds: reminting it through [`Store::replace_agent_messages`]
+    /// would re-extract the kept content from its hydrated form, and a block
+    /// the sweep has already compacted hydrates to its slim placeholder (the
+    /// `*_replay` row is not a full body), so re-extraction skipped it and the
+    /// cascade dropped the replay preview for good — the next recovery replay
+    /// then rendered the 2 KiB head instead of the marked middle-truncated
+    /// body, and `agent.getMessageBlock` lost its `*Pruned` evidence.
+    /// Returns the number of rows deleted. The dropped rows' side rows go with
+    /// them through the 0109 cascade trigger (`conversation_bytes` stays
+    /// balanced through the stats triggers), and the `agent_session`
+    /// last-message preview columns are recomputed from the surviving newest
+    /// user / assistant rows inside the same transaction (NULL when none is
+    /// left of that role). Callers are expected to reject busy sessions before
+    /// invoking this, like `replace_agent_messages`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn truncate_agent_messages_from(
+        &self,
+        agent_id: &AgentId,
+        first_dropped_seq: i64,
+    ) -> Result<usize> {
+        let pool = self.write_pool();
+        let newest_of_role_sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM agent_message \
+             WHERE agent_id = ? AND role = ? ORDER BY seq DESC LIMIT 1"
+        );
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool.begin().await.map_err(|e| {
+                Error::Internal(format!("truncate agent messages begin failed: {e}"))
+            })?;
+            let deleted = sqlx::query("DELETE FROM agent_message WHERE agent_id = ? AND seq >= ?")
+                .bind(&agent_id.0)
+                .bind(first_dropped_seq)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("truncate agent messages failed: {e}")))?
+                .rows_affected();
+            // The preview columns derive only from text blocks and the
+            // slim-projected `tool_use.input`, so the stored (slim) content
+            // yields the same values the append path computed from the full
+            // body — no payload hydration needed here.
+            let mut newest: Vec<AgentMessage> = Vec::with_capacity(2);
+            for role in ["assistant", "user"] {
+                let row = sqlx::query(&newest_of_role_sql)
+                    .bind(&agent_id.0)
+                    .bind(role)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("read newest {role} message failed: {e}"))
+                    })?;
+                if let Some(row) = row {
+                    newest.push(map_message_row(&row)?);
+                }
+            }
+            newest.sort_by_key(|m| m.seq);
+            let batch: Vec<OwnedBatchMessage> = newest
+                .iter()
+                .map(|m| {
+                    (
+                        m.role.clone(),
+                        m.content.clone(),
+                        m.metadata.clone(),
+                        m.created_at.clone(),
+                    )
+                })
+                .collect();
+            let (assistant_preview, user_preview, last_message_role, last_tool_use) =
+                batch_preview_col_values(&batch)?;
+            let last_message_id = newest.last().map(|m| m.id.as_str());
+            sqlx::query(
+                "UPDATE agent_session SET last_assistant_preview = ?, last_user_preview = ?, \
+                 last_message_role = ?, last_message_id = ?, last_tool_use_preview = ? \
+                 WHERE id = ?",
+            )
+            .bind(assistant_preview.as_deref())
+            .bind(user_preview.as_deref())
+            .bind(last_message_role.as_deref())
+            .bind(last_message_id)
+            .bind(last_tool_use.as_deref())
+            .bind(&agent_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("update session message previews failed: {e}")))?;
+            tx.commit().await.map_err(|e| {
+                Error::Internal(format!("truncate agent messages commit failed: {e}"))
+            })?;
+            Ok(usize::try_from(deleted).unwrap_or(usize::MAX))
+        })
+        .await
+    }
+
     /// Record an interrupted in-flight agent. Upserts: if a pending row exists
     /// (daemon restarted before resumption), updates to the latest state. Returns
     /// `true` if inserted/updated.
@@ -4571,6 +5279,94 @@ mod tests {
         }
     }
 
+    /// The three unread-derivation statements (single-workspace EXISTS
+    /// probe, workspace.list batch derivation, guarded settle-clear) must be
+    /// answered entirely from the 0114 partial covering index
+    /// `idx_agent_session_unread_top_level` (intent-hq/monorepo#4190
+    /// regression guard): the plan must name the index, and the bytecode
+    /// must contain no `Function` opcode — a JSON function call in the
+    /// program means `SQLite` declined index-expression substitution (e.g.
+    /// someone reverted `->>` to `json_extract()`, whose `RESULT_SUBTYPE`
+    /// property blocks substitution) and every candidate row's metadata is
+    /// being fetched from the main table B-tree again.
+    #[tokio::test]
+    async fn unread_derivation_uses_partial_covering_index() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        for (label, sql, bind) in [
+            ("probe", unread_workspace_probe_sql(), true),
+            ("batch", unread_workspaces_batch_sql(), false),
+            (
+                "settle-clear",
+                crate::workspace_repo::clear_workspace_unread_if_all_seen_sql(),
+                true,
+            ),
+        ] {
+            let plan_sql = format!("EXPLAIN QUERY PLAN {sql}");
+            let bytecode_sql = format!("EXPLAIN {sql}");
+            let mut plan = sqlx::query(&plan_sql);
+            let mut bytecode = sqlx::query(&bytecode_sql);
+            if bind {
+                plan = plan.bind("ws-plan");
+                bytecode = bytecode.bind("ws-plan");
+            }
+            let details: Vec<String> = plan
+                .fetch_all(store.read_pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                details
+                    .iter()
+                    .any(|d| d.contains("INDEX idx_agent_session_unread_top_level")),
+                "{label} must use the partial unread index, plan: {details:?}"
+            );
+            let opcodes: Vec<String> = bytecode
+                .fetch_all(store.read_pool())
+                .await
+                .expect("explain bytecode")
+                .iter()
+                .map(|row| row.get::<String, _>("opcode"))
+                .collect();
+            assert!(
+                !opcodes.iter().any(|o| o == "Function"),
+                "{label} must read the seen marker from the index expression, \
+                 not recompute it per row (covering property lost), opcodes: {opcodes:?}"
+            );
+        }
+
+        // Positive control: the no-`Function` assertion above is the
+        // load-bearing half of this guard (a `json_extract` revert still
+        // satisfies the partial index's WHERE, so EXPLAIN QUERY PLAN keeps
+        // naming the index), but EXPLAIN opcode names are not a stable
+        // interface. Prove the opcode check can still fail: the same batch
+        // statement with the seen marker spelled `json_extract()` MUST emit
+        // a `Function` opcode (RESULT_SUBTYPE blocks index-expression
+        // substitution). If a bundled-SQLite bump ever renames the opcode,
+        // this control fails loudly instead of the guard going vacuous.
+        let control_sql = unread_workspaces_batch_sql()
+            .replace("metadata ->> ", "json_extract(metadata, ")
+            .replace("'$.lastSeenMessageId'", "'$.lastSeenMessageId')");
+        assert_ne!(control_sql, unread_workspaces_batch_sql());
+        let control_bytecode_sql = format!("EXPLAIN {control_sql}");
+        let opcodes: Vec<String> = sqlx::query(&control_bytecode_sql)
+            .fetch_all(store.read_pool())
+            .await
+            .expect("explain control bytecode")
+            .iter()
+            .map(|row| row.get::<String, _>("opcode"))
+            .collect();
+        assert!(
+            opcodes.iter().any(|o| o == "Function"),
+            "positive control lost: a json_extract-spelled statement no longer \
+             emits a `Function` opcode, so the no-Function guard above is \
+             vacuous — re-verify the opcode name for this SQLite version, \
+             opcodes: {opcodes:?}"
+        );
+    }
+
     /// A UNIQUE violation on the session id maps to `Internal` naming the
     /// colliding id. Agent ids are server-minted (`agent-{uuid}`), so a
     /// duplicate insert is a server-side anomaly — never a client params
@@ -4624,6 +5420,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -4745,6 +5542,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -4904,6 +5702,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -5330,6 +6129,786 @@ mod tests {
                 .await
                 .expect("remaining side rows");
         assert_eq!(remaining, 0, "session delete cascades side rows");
+    }
+
+    /// `(kind, encoding, body)` of every side row of `message_id`, kind-sorted.
+    async fn payload_rows(store: &Store, message_id: &str) -> Vec<(String, String, Vec<u8>)> {
+        sqlx::query_as::<_, (String, String, Vec<u8>)>(
+            "SELECT kind, encoding, body FROM agent_message_payload \
+             WHERE message_id = ? ORDER BY kind",
+        )
+        .bind(message_id)
+        .fetch_all(store.read_pool())
+        .await
+        .expect("payload rows")
+    }
+
+    async fn conversation_bytes_recount(store: &Store, agent: &AgentId) -> i64 {
+        sqlx::query_scalar(
+            "SELECT (SELECT COALESCE(SUM(OCTET_LENGTH(content)), 0) FROM agent_message \
+                     WHERE agent_id = ?1) \
+                  + (SELECT COALESCE(SUM(OCTET_LENGTH(body)), 0) FROM agent_message_payload \
+                     WHERE agent_id = ?1)",
+        )
+        .bind(&agent.0)
+        .fetch_one(store.read_pool())
+        .await
+        .expect("recount")
+    }
+
+    async fn conversation_bytes_counter(store: &Store, agent: &AgentId) -> i64 {
+        sqlx::query_scalar("SELECT conversation_bytes FROM agent_session WHERE id = ?")
+            .bind(&agent.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("counter")
+    }
+
+    /// The retention sweep compacts only full-body rows whose message sorts
+    /// before the cutoff: the replay row carries the shared-helper preview
+    /// (`{"text", "originalChars"}`), the full row is gone, thumbnails /
+    /// newer / 0109-staged rows are untouched, `conversation_bytes` stays
+    /// balanced, a re-run converts nothing, and normal hydration ignores the
+    /// replay row (the pruned block serves its inline slim preview + flags).
+    #[tokio::test]
+    async fn compact_tool_payloads_before_converts_only_old_full_rows() {
+        use intent_core::replay_preview::{safe_stringify, truncate_marked};
+
+        let tmp = TempDb::new("test-payload-compact");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let old_ts = "2026-01-01T00:00:00Z";
+        let new_ts = "2026-06-01T00:00:00Z";
+        let cutoff = "2026-03-01T00:00:00Z";
+        let ws_id = WorkspaceId("ws-payload-compact".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, old_ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-payload-compact".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, old_ts, None))
+            .await
+            .expect("insert session");
+
+        let old_input = serde_json::json!({ "blob": "w".repeat(12 * 1024) });
+        let old_output = "q".repeat(10 * 1024);
+        let old_content = serde_json::json!([
+            { "type": "tool_use", "id": "m:0", "name": "view", "input": old_input,
+              "toolCallId": "t1" },
+            { "type": "tool_result", "toolCallId": "t1", "output": old_output },
+        ]);
+        let old = store
+            .append_agent_message(&agent_id, "assistant", &old_content, old_ts)
+            .await
+            .expect("append old");
+        sqlx::query(
+            "INSERT INTO agent_message_payload \
+             (message_id, agent_id, block_ordinal, kind, encoding, body) \
+             VALUES (?, ?, -1, 'thumbnails', 'none', X'7B7D')",
+        )
+        .bind(&old.id)
+        .bind(&agent_id.0)
+        .execute(store.write_pool())
+        .await
+        .expect("seed thumbnails row");
+        let new_content = serde_json::json!([
+            { "type": "tool_result", "toolCallId": "t2", "output": "n".repeat(10 * 1024) },
+        ]);
+        let new = store
+            .append_agent_message(&agent_id, "assistant", &new_content, new_ts)
+            .await
+            .expect("append new");
+        let staged_block = serde_json::json!(
+            { "type": "tool_result", "toolCallId": "t3", "output": "s".repeat(10 * 1024) }
+        );
+        store
+            .prestage_agent_message_payload(&agent_id, "staged-1", 0, &staged_block)
+            .await
+            .expect("prestage")
+            .expect("staged block is heavy");
+        let staged_before = payload_rows(&store, "staged-1").await;
+        let new_before = payload_rows(&store, &new.id).await;
+        assert_eq!(new_before.len(), 1);
+        assert_eq!(payload_rows(&store, &old.id).await.len(), 3);
+        assert_eq!(
+            conversation_bytes_counter(&store, &agent_id).await,
+            conversation_bytes_recount(&store, &agent_id).await
+        );
+
+        let replay_chars = 2_000;
+        let compacted = store
+            .compact_tool_payloads_before(cutoff, replay_chars)
+            .await
+            .expect("compact");
+        assert_eq!(compacted, 2, "both old full rows compact; nothing else");
+
+        let old_rows = payload_rows(&store, &old.id).await;
+        let kinds: Vec<&str> = old_rows.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "thumbnails",
+                "tool_result_output_replay",
+                "tool_use_input_replay"
+            ],
+            "full rows replaced by replay rows; thumbnails untouched"
+        );
+        for (kind, encoding, body) in &old_rows {
+            if kind == "thumbnails" {
+                continue;
+            }
+            let decoded =
+                crate::message_payload::decode_body(encoding, body).expect("decode replay body");
+            let obj = decoded.as_object().expect("replay body is an object");
+            assert_eq!(
+                obj.len(),
+                2,
+                "replay body is exactly {{text, originalChars}}"
+            );
+            let full = if kind == "tool_use_input_replay" {
+                safe_stringify(&old_content[0]["input"])
+            } else {
+                safe_stringify(&old_content[1]["output"])
+            };
+            let (text, original) = truncate_marked(&full, replay_chars);
+            assert_eq!(obj["text"], serde_json::json!(text));
+            assert_eq!(
+                obj["originalChars"],
+                serde_json::json!(original.expect("over cap"))
+            );
+        }
+        assert_eq!(
+            payload_rows(&store, &new.id).await,
+            new_before,
+            "newer row untouched"
+        );
+        assert_eq!(
+            payload_rows(&store, "staged-1").await,
+            staged_before,
+            "staged row (no message) untouched"
+        );
+        assert_eq!(
+            conversation_bytes_counter(&store, &agent_id).await,
+            conversation_bytes_recount(&store, &agent_id).await,
+            "delete + insert triggers keep the counter balanced"
+        );
+
+        let again = store
+            .compact_tool_payloads_before(cutoff, replay_chars)
+            .await
+            .expect("compact again");
+        assert_eq!(again, 0, "idempotent");
+        assert_eq!(payload_rows(&store, &old.id).await, old_rows);
+
+        let hydrated = store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .expect("hydrate");
+        let stored: String = sqlx::query_scalar("SELECT content FROM agent_message WHERE id = ?")
+            .bind(&old.id)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("stored content");
+        let stored: serde_json::Value = serde_json::from_str(&stored).expect("stored json");
+        assert_eq!(
+            hydrated[0].content, stored,
+            "hydration ignores replay rows: pruned block serves the stored slim preview"
+        );
+        assert_eq!(hydrated[0].content[1]["outputTruncated"], true);
+        assert!(hydrated[0].content[1]
+            .get("outputReplayOriginalChars")
+            .is_none());
+        assert_eq!(
+            hydrated[1].content, new_content,
+            "newer message still hydrates"
+        );
+    }
+
+    /// `get_agent_message_by_id_with_pruned` reports, alongside the hydrated
+    /// body, exactly the heavy fields the sweep compacted (a `*_replay` row
+    /// with no full row of the same field) and nothing else — and the two
+    /// agree: a compacted block is served as its stored preview + flags AND
+    /// listed; a retained full row is served in full and NOT listed; a
+    /// still-truncated block whose full row is corrupt (the sweep leaves it in
+    /// place, hydration serves the stored preview + flags) is NOT listed;
+    /// thumbnails rows and legacy messages yield an empty list; an unknown id
+    /// or wrong agent yields `None`.
+    #[tokio::test]
+    async fn pruned_tool_payloads_reports_only_compacted_fields() {
+        let tmp = TempDb::new("test-payload-pruned");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let old_ts = "2026-01-01T00:00:00Z";
+        let new_ts = "2026-06-01T00:00:00Z";
+        let cutoff = "2026-03-01T00:00:00Z";
+        let ws_id = WorkspaceId("ws-payload-pruned".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, old_ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-payload-pruned".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, old_ts, None))
+            .await
+            .expect("insert session");
+
+        let heavy_result = |call: &str, ch: char| {
+            serde_json::json!(
+                { "type": "tool_result", "toolCallId": call, "output": ch.to_string().repeat(10 * 1024) }
+            )
+        };
+        let old_content = serde_json::json!([
+            { "type": "text", "text": "hello" },
+            { "type": "tool_use", "id": "m:1", "name": "view", "toolCallId": "t1",
+              "input": { "blob": "w".repeat(12 * 1024) } },
+            heavy_result("t1", 'q'),
+        ]);
+        let old = store
+            .append_agent_message(&agent_id, "assistant", &old_content, old_ts)
+            .await
+            .expect("append old");
+        sqlx::query(
+            "INSERT INTO agent_message_payload \
+             (message_id, agent_id, block_ordinal, kind, encoding, body) \
+             VALUES (?, ?, -1, 'thumbnails', 'none', X'7B7D')",
+        )
+        .bind(&old.id)
+        .bind(&agent_id.0)
+        .execute(store.write_pool())
+        .await
+        .expect("seed thumbnails row");
+        let corrupt_content = serde_json::json!([heavy_result("t2", 'c')]);
+        let corrupt = store
+            .append_agent_message(&agent_id, "assistant", &corrupt_content, old_ts)
+            .await
+            .expect("append corrupt");
+        sqlx::query(
+            "UPDATE agent_message_payload SET encoding = 'zlib', body = X'DEADBEEF' \
+             WHERE message_id = ?",
+        )
+        .bind(&corrupt.id)
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt full row");
+        let retained_content = serde_json::json!([heavy_result("t3", 'n')]);
+        let retained = store
+            .append_agent_message(&agent_id, "assistant", &retained_content, new_ts)
+            .await
+            .expect("append retained");
+        let legacy_content = serde_json::json!([{ "type": "text", "text": "no side rows" }]);
+        let legacy = store
+            .append_agent_message(&agent_id, "assistant", &legacy_content, old_ts)
+            .await
+            .expect("append legacy");
+
+        let read = |id: &str| {
+            let store = &store;
+            let agent_id = &agent_id;
+            let id = id.to_string();
+            async move {
+                store
+                    .get_agent_message_by_id_with_pruned(agent_id, &id)
+                    .await
+                    .expect("combined read")
+            }
+        };
+
+        let (before_old, before_pruned) = read(&old.id).await.expect("old exists");
+        assert_eq!(
+            before_old.content, old_content,
+            "before the sweep the combined read hydrates the full body"
+        );
+        assert!(
+            before_pruned.is_empty(),
+            "nothing is pruned before the sweep"
+        );
+        for id in [&corrupt.id, &retained.id, &legacy.id] {
+            let (_, pruned) = read(id).await.expect("message exists");
+            assert!(pruned.is_empty(), "nothing is pruned before the sweep");
+        }
+
+        let compacted = store
+            .compact_tool_payloads_before(cutoff, 2_000)
+            .await
+            .expect("compact");
+        assert_eq!(compacted, 2, "the two decodable old full rows compact");
+
+        let (old_msg, old_pruned) = read(&old.id).await.expect("old exists");
+        assert_eq!(
+            old_pruned,
+            vec![
+                PrunedToolPayload {
+                    block_ordinal: 1,
+                    field: PrunedToolField::ToolUseInput,
+                },
+                PrunedToolPayload {
+                    block_ordinal: 2,
+                    field: PrunedToolField::ToolResultOutput,
+                },
+            ],
+            "compacted fields, by stored ordinal; the thumbnails row is ignored"
+        );
+        assert_eq!(old_msg.content[0], old_content[0], "text block untouched");
+        assert_eq!(
+            old_msg.content[1]["inputTruncated"], true,
+            "the compacted input is served as the stored slim preview + flags"
+        );
+        assert!(old_msg.content[1]["inputBytes"].is_number());
+        assert_ne!(old_msg.content[1]["input"], old_content[1]["input"]);
+        assert_eq!(
+            old_msg.content[2]["outputTruncated"], true,
+            "the compacted output is served as the stored slim preview + flags"
+        );
+        assert!(old_msg.content[2]["outputBytes"].is_number());
+        assert_ne!(old_msg.content[2]["output"], old_content[2]["output"]);
+
+        let corrupt_rows = payload_rows(&store, &corrupt.id).await;
+        assert_eq!(
+            corrupt_rows.len(),
+            1,
+            "the undecodable full row is left in place"
+        );
+        assert_eq!(
+            corrupt_rows[0].0,
+            crate::message_payload::KIND_TOOL_RESULT_OUTPUT
+        );
+        let (corrupt_msg, corrupt_pruned) = read(&corrupt.id).await.expect("corrupt exists");
+        assert!(
+            corrupt_pruned.is_empty(),
+            "a corrupt full row is not evidence of a prune"
+        );
+        assert_eq!(
+            corrupt_msg.content[0]["outputTruncated"], true,
+            "hydration of the corrupt row serves the stored preview + slim flags"
+        );
+
+        let (retained_msg, retained_pruned) = read(&retained.id).await.expect("retained exists");
+        assert!(
+            retained_pruned.is_empty(),
+            "a retained full row is not pruned"
+        );
+        assert_eq!(
+            retained_msg.content, retained_content,
+            "a retained full row hydrates in full, no flags"
+        );
+
+        let (legacy_msg, legacy_pruned) = read(&legacy.id).await.expect("legacy exists");
+        assert!(legacy_pruned.is_empty());
+        assert_eq!(legacy_msg.content, legacy_content);
+
+        assert!(read("no-such-message").await.is_none());
+        assert!(
+            store
+                .get_agent_message_by_id_with_pruned(&AgentId("someone-else".to_string()), &old.id)
+                .await
+                .expect("wrong agent read")
+                .is_none(),
+            "the agent id scopes the lookup"
+        );
+    }
+
+    /// The replay read emits the replay-preview block contract and is
+    /// byte-identical whether a body is still a full row or already a
+    /// compacted replay row; a smaller cap re-truncates a stored preview to
+    /// exactly what the full body would give; under-cap bodies pass whole.
+    #[tokio::test]
+    async fn replay_read_is_identical_before_and_after_compaction() {
+        use intent_core::replay_preview::{safe_stringify, truncate_marked};
+
+        let tmp = TempDb::new("test-payload-replay-read");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = "2026-01-01T00:00:00Z";
+        let ws_id = WorkspaceId("ws-payload-replay".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-payload-replay".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, ts, None))
+            .await
+            .expect("insert session");
+
+        let input = serde_json::json!({ "path": "a.rs", "blob": "w".repeat(12 * 1024) });
+        let output = format!("{}é{}", "q".repeat(5 * 1024), "z".repeat(5 * 1024));
+        let content = serde_json::json!([
+            { "type": "text", "text": "small text" },
+            { "type": "tool_use", "id": "m:1", "name": "view", "input": input,
+              "toolCallId": "t1" },
+            { "type": "tool_result", "toolCallId": "t1", "output": output },
+            { "type": "tool_result", "toolCallId": "t0", "output": "tiny inline output" },
+        ]);
+        store
+            .append_agent_message(&agent_id, "assistant", &content, ts)
+            .await
+            .expect("append");
+        store
+            .append_agent_message(&agent_id, "user", &serde_json::json!("hi"), ts)
+            .await
+            .expect("append user");
+
+        let cap = 2_000;
+        let before = store
+            .get_agent_messages_for_replay(&agent_id, cap)
+            .await
+            .expect("replay read before");
+        assert_eq!(before.len(), 2);
+        let blocks = before[0].content.as_array().expect("blocks");
+        assert_eq!(blocks[0], content[0], "non-heavy block untouched");
+        assert_eq!(blocks[3], content[3], "inline heavy-field block untouched");
+        let input_full = safe_stringify(&content[1]["input"]);
+        let (input_text, input_original) = truncate_marked(&input_full, cap);
+        assert_eq!(blocks[1]["input"], serde_json::json!(input_text));
+        assert_eq!(
+            blocks[1]["inputReplayOriginalChars"],
+            serde_json::json!(input_original.expect("over cap"))
+        );
+        assert!(blocks[1].get("inputTruncated").is_none());
+        assert!(blocks[1].get("inputBytes").is_none());
+        assert_eq!(blocks[1]["name"], "view");
+        let output_full = safe_stringify(&content[2]["output"]);
+        let (output_text, output_original) = truncate_marked(&output_full, cap);
+        assert_eq!(blocks[2]["output"], serde_json::json!(output_text));
+        assert_eq!(
+            blocks[2]["outputReplayOriginalChars"],
+            serde_json::json!(output_original.expect("over cap"))
+        );
+        assert!(blocks[2].get("outputTruncated").is_none());
+        assert_eq!(before[1].content, serde_json::json!("hi"));
+
+        let whole = store
+            .get_agent_messages_for_replay(&agent_id, 100_000)
+            .await
+            .expect("replay read under cap");
+        let whole_blocks = whole[0].content.as_array().expect("blocks");
+        assert_eq!(whole_blocks[1]["input"], serde_json::json!(input_full));
+        assert_eq!(
+            whole_blocks[1]["inputReplayOriginalChars"],
+            serde_json::json!(input_full.chars().count()),
+            "under-cap body: marker is its own char count"
+        );
+
+        let compacted = store
+            .compact_tool_payloads_before("2026-02-01T00:00:00Z", cap)
+            .await
+            .expect("compact");
+        assert_eq!(compacted, 2);
+
+        let after = store
+            .get_agent_messages_for_replay(&agent_id, cap)
+            .await
+            .expect("replay read after");
+        assert_eq!(
+            after, before,
+            "replay read is byte-identical across compaction"
+        );
+
+        let smaller = store
+            .get_agent_messages_for_replay(&agent_id, 500)
+            .await
+            .expect("replay read smaller cap");
+        let (small_text, small_original) = truncate_marked(&output_full, 500);
+        assert_eq!(
+            smaller[0].content[2]["output"],
+            serde_json::json!(small_text)
+        );
+        assert_eq!(
+            smaller[0].content[2]["outputReplayOriginalChars"],
+            serde_json::json!(small_original.expect("over cap"))
+        );
+        let larger = store
+            .get_agent_messages_for_replay(&agent_id, 100_000)
+            .await
+            .expect("replay read larger cap");
+        assert_eq!(
+            larger[0].content[2]["output"],
+            serde_json::json!(output_text),
+            "a stored preview is never expanded"
+        );
+        assert_eq!(
+            larger[0].content[2]["outputReplayOriginalChars"],
+            serde_json::json!(output_original.expect("over cap"))
+        );
+    }
+
+    /// `truncate_agent_messages_from` (the `agent.editAndRegenerate`
+    /// truncation) drops only the suffix: the kept rows keep their ids and
+    /// every side row — a retention-compacted `*_replay` preview AND a still
+    /// full body alike — so the replay read of a kept message is
+    /// byte-identical before and after the edit, the combined
+    /// `getMessageBlock` read still reports the prune, the dropped rows'
+    /// side rows are cascaded, `conversation_bytes` stays balanced, and the
+    /// session preview columns follow the surviving newest rows.
+    #[tokio::test]
+    async fn truncate_from_keeps_prefix_side_rows_across_compaction() {
+        async fn recount(store: &Store, agent: &AgentId) -> i64 {
+            let content_bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(OCTET_LENGTH(content)), 0) FROM agent_message \
+                 WHERE agent_id = ?",
+            )
+            .bind(&agent.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("recount content");
+            let payload_bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(OCTET_LENGTH(body)), 0) FROM agent_message_payload \
+                 WHERE agent_id = ?",
+            )
+            .bind(&agent.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("recount payload");
+            content_bytes + payload_bytes
+        }
+        async fn counter(store: &Store, agent: &AgentId) -> i64 {
+            sqlx::query_scalar("SELECT conversation_bytes FROM agent_session WHERE id = ?")
+                .bind(&agent.0)
+                .fetch_one(store.read_pool())
+                .await
+                .expect("counter")
+        }
+        async fn kinds(store: &Store, message_id: &str) -> Vec<String> {
+            sqlx::query_scalar(
+                "SELECT kind FROM agent_message_payload WHERE message_id = ? ORDER BY kind",
+            )
+            .bind(message_id)
+            .fetch_all(store.read_pool())
+            .await
+            .expect("kinds")
+        }
+
+        let tmp = TempDb::new("test-payload-truncate-from");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_id = WorkspaceId("ws-payload-truncate".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, "2026-01-01T00:00:00Z"))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-payload-truncate".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(
+                &agent_id,
+                &ws_id,
+                "2026-01-01T00:00:00Z",
+                None,
+            ))
+            .await
+            .expect("insert session");
+
+        let heavy = |tag: &str| {
+            serde_json::json!([
+                { "type": "text", "text": format!("{tag} text") },
+                { "type": "tool_use", "id": format!("{tag}:1"), "name": "bash",
+                  "input": { "cmd": format!("{tag}-{}", "i".repeat(12 * 1024)) },
+                  "toolCallId": tag },
+                { "type": "tool_result", "toolCallId": tag,
+                  "output": format!("{tag}-{}", "o".repeat(20 * 1024)) },
+            ])
+        };
+        // [u0, old(assistant, back-dated), u1, fresh(assistant), u2, a2]:
+        // the edit targets u2, so `old` (compacted) and `fresh` (still full)
+        // are both kept; u2 + a2 (heavy, full rows) are dropped.
+        let u0 = store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "u0" }]),
+                "2026-01-01T00:00:00Z",
+            )
+            .await
+            .expect("append u0");
+        let old = store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &heavy("old"),
+                "2026-01-01T00:00:01Z",
+            )
+            .await
+            .expect("append old");
+        let u1 = store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "u1" }]),
+                "2026-03-01T00:00:00Z",
+            )
+            .await
+            .expect("append u1");
+        let fresh = store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &heavy("fresh"),
+                "2026-03-01T00:00:01Z",
+            )
+            .await
+            .expect("append fresh");
+        let u2 = store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "u2" }]),
+                "2026-03-01T00:00:02Z",
+            )
+            .await
+            .expect("append u2");
+        let a2 = store
+            .append_agent_message(&agent_id, "assistant", &heavy("a2"), "2026-03-01T00:00:03Z")
+            .await
+            .expect("append a2");
+
+        let cap = 2_000;
+        assert_eq!(
+            store
+                .compact_tool_payloads_before("2026-02-01T00:00:00Z", cap)
+                .await
+                .expect("compact"),
+            2,
+            "only the back-dated message is compacted"
+        );
+        assert_eq!(
+            kinds(&store, &old.id).await,
+            vec!["tool_result_output_replay", "tool_use_input_replay"]
+        );
+        assert_eq!(
+            kinds(&store, &fresh.id).await,
+            vec!["tool_result_output", "tool_use_input"]
+        );
+        let replay_before = store
+            .get_agent_messages_for_replay(&agent_id, cap)
+            .await
+            .expect("replay before");
+        assert_eq!(replay_before.len(), 6);
+        let (_, pruned_before) = store
+            .get_agent_message_by_id_with_pruned(&agent_id, &old.id)
+            .await
+            .expect("read old")
+            .expect("old exists");
+        assert_eq!(pruned_before.len(), 2);
+        assert_eq!(
+            counter(&store, &agent_id).await,
+            recount(&store, &agent_id).await
+        );
+
+        // The edit: drop u2 and everything after it.
+        let dropped = store
+            .truncate_agent_messages_from(&agent_id, u2.seq)
+            .await
+            .expect("truncate");
+        assert_eq!(dropped, 2);
+
+        let after = store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .expect("messages after");
+        assert_eq!(
+            after.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![
+                u0.id.as_str(),
+                old.id.as_str(),
+                u1.id.as_str(),
+                fresh.id.as_str()
+            ],
+            "kept rows keep their ids"
+        );
+        assert_eq!(
+            after.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![u0.seq, old.seq, u1.seq, fresh.seq],
+            "kept rows keep their seq"
+        );
+        assert_eq!(
+            kinds(&store, &old.id).await,
+            vec!["tool_result_output_replay", "tool_use_input_replay"],
+            "compacted message keeps its replay previews"
+        );
+        assert_eq!(
+            kinds(&store, &fresh.id).await,
+            vec!["tool_result_output", "tool_use_input"],
+            "retained message keeps its full rows"
+        );
+        assert!(kinds(&store, &u2.id).await.is_empty());
+        assert!(
+            kinds(&store, &a2.id).await.is_empty(),
+            "dropped message's side rows are cascaded"
+        );
+        assert_eq!(
+            after[3].content,
+            heavy("fresh"),
+            "retained message still hydrates its full body"
+        );
+        assert_eq!(
+            counter(&store, &agent_id).await,
+            recount(&store, &agent_id).await,
+            "conversation_bytes stays balanced across the truncation"
+        );
+
+        let replay_after = store
+            .get_agent_messages_for_replay(&agent_id, cap)
+            .await
+            .expect("replay after");
+        assert_eq!(
+            replay_after,
+            replay_before[..4].to_vec(),
+            "replay of the kept prefix is byte-identical to the pre-edit replay"
+        );
+        let (old_after, pruned_after) = store
+            .get_agent_message_by_id_with_pruned(&agent_id, &old.id)
+            .await
+            .expect("read old after")
+            .expect("old still exists");
+        assert_eq!(pruned_after, pruned_before, "prune evidence survives");
+        assert_eq!(
+            old_after.content[2]["outputTruncated"],
+            serde_json::json!(true)
+        );
+
+        // Session preview columns follow the surviving newest rows.
+        let projection = store
+            .get_agent_session_message_projection(&agent_id)
+            .await
+            .expect("projection");
+        assert_eq!(projection.message_count, 4);
+        assert_eq!(
+            projection.last_message_id.as_deref(),
+            Some(fresh.id.as_str())
+        );
+        assert_eq!(projection.last_message_role.as_deref(), Some("assistant"));
+        assert_eq!(
+            projection.last_user_text_blocks,
+            Some(vec!["u1".to_string()]),
+            "last user preview follows the kept newest user row"
+        );
+        assert_eq!(
+            projection.last_assistant_text_blocks,
+            Some(vec!["fresh text".to_string()])
+        );
+        assert_eq!(
+            projection
+                .last_tool_use
+                .as_ref()
+                .and_then(|p| p["name"].as_str()),
+            Some("bash")
+        );
+
+        // Truncating to empty clears the previews outright.
+        assert_eq!(
+            store
+                .truncate_agent_messages_from(&agent_id, u0.seq)
+                .await
+                .expect("truncate to empty"),
+            4
+        );
+        assert!(store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .expect("messages empty")
+            .is_empty());
+        assert_eq!(counter(&store, &agent_id).await, 0);
+        let projection = store
+            .get_agent_session_message_projection(&agent_id)
+            .await
+            .expect("projection");
+        assert_eq!(projection, SessionMessageProjection::default());
     }
 
     /// Seed `count` small `agent_message` rows for `agent_id` in one
@@ -6749,12 +8328,13 @@ mod tests {
         assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
     }
 
-    /// Migration 0080 splits legacy codex `{base}/{effort}` compound model
-    /// ids into base model + `reasoning_effort`, guarded on codex evidence
-    /// (provider column, `codex:` prefix, or known effort-variant base) AND a
-    /// known effort suffix — slash-bearing non-codex ids stay untouched.
+    /// Migration 0080 splits legacy codex `{base}/{effort}` effort-suffixed
+    /// model ids into base model + `reasoning_effort`, guarded on codex
+    /// evidence (provider column, legacy `codex:` prefix, or known
+    /// effort-variant base) AND a known effort suffix — slash-bearing
+    /// non-codex ids stay untouched.
     #[tokio::test]
-    async fn migration_0080_splits_codex_compound_model_ids() {
+    async fn migration_0080_splits_codex_effort_suffixed_model_ids() {
         use intent_core::now_iso;
 
         use uuid::Uuid;
@@ -6771,11 +8351,13 @@ mod tests {
                 "gpt-5.3-codex",
                 Some("high"),
             ),
-            // codex compound prefix evidence → split.
+            // codex compound prefix evidence → split. 0080 leaves the raw
+            // column at `codex:gpt-5.3-codex`; the 0113 read backstop then
+            // strips the compound prefix on read.
             (
                 "codex:gpt-5.3-codex/xhigh",
                 None,
-                "codex:gpt-5.3-codex",
+                "gpt-5.3-codex",
                 Some("xhigh"),
             ),
             // known effort-variant base evidence → split.
@@ -6837,6 +8419,413 @@ mod tests {
                 "reasoning_effort after 0080 for legacy {model}"
             );
         }
+    }
+
+    /// [`normalize_compound_model`] splits on the first ':' with prefix-wins
+    /// precedence, strips malformed leading colons without touching the
+    /// provider, normalizes empty remainders to `None`, and passes colon-free
+    /// ids through untouched.
+    #[test]
+    fn normalize_compound_model_splits_leniently() {
+        // (model, provider) → (expected model, expected provider)
+        type Case<'a> = (
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+        );
+        let cases: Vec<Case> = vec![
+            (None, Some("anthropic"), None, Some("anthropic")),
+            (Some("claude-opus-4"), None, Some("claude-opus-4"), None),
+            // Effort-lookalike bare id: no colon → untouched.
+            (
+                Some("opus[1m]"),
+                Some("claude-code"),
+                Some("opus[1m]"),
+                Some("claude-code"),
+            ),
+            // Compound: prefix overwrites the provider.
+            (
+                Some("codex:gpt-5.3-codex"),
+                Some("stale"),
+                Some("gpt-5.3-codex"),
+                Some("codex"),
+            ),
+            (
+                Some("anthropic:claude-opus-4"),
+                None,
+                Some("claude-opus-4"),
+                Some("anthropic"),
+            ),
+            // First-colon split: the remainder keeps its colons.
+            (Some("a:b:c"), None, Some("b:c"), Some("a")),
+            // Malformed leading colon(s): no provider information.
+            (
+                Some(":claude-opus-4"),
+                Some("anthropic"),
+                Some("claude-opus-4"),
+                Some("anthropic"),
+            ),
+            (Some("::"), Some("anthropic"), None, Some("anthropic")),
+            // Empty remainder → None.
+            (Some("anthropic:"), None, None, Some("anthropic")),
+        ];
+        for (model, provider, expected_model, expected_provider) in cases {
+            let (got_model, got_provider) =
+                normalize_compound_model(model.map(str::to_string), provider.map(str::to_string));
+            assert_eq!(
+                (got_model.as_deref(), got_provider.as_deref()),
+                (expected_model, expected_provider),
+                "normalize({model:?}, {provider:?})"
+            );
+        }
+    }
+
+    /// Migration 0113 splits compound `provider:model` ids in `model` (and
+    /// the `last_turn_model` pair) on the first ':' — prefix overwrites the
+    /// provider, remainder becomes the model — strips malformed leading-colon
+    /// ids without touching the provider, and leaves `reasoning_effort`,
+    /// `resolved_model`, and colon-free ids untouched. Asserted against the
+    /// raw columns so the read backstop cannot mask the migration.
+    #[tokio::test]
+    async fn migration_0113_splits_compound_session_model_ids() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        // (model, provider) → (expected model, expected provider) raw columns.
+        type Case<'a> = (&'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+        let tmp = TempDb::new("test-agent-repo");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-0113".to_string());
+        let mk_id = || AgentId(format!("agent-{}", Uuid::new_v4()));
+        let cases: Vec<Case> = vec![
+            // Compound, no stored provider → prefix fills it.
+            (
+                "anthropic:claude-opus-4",
+                None,
+                Some("claude-opus-4"),
+                Some("anthropic"),
+            ),
+            // Compound with a stale provider → prefix wins.
+            (
+                "codex:gpt-5.3-codex",
+                Some("stale"),
+                Some("gpt-5.3-codex"),
+                Some("codex"),
+            ),
+            // Malformed leading colon: stripped, provider untouched.
+            (
+                ":claude-opus-4",
+                Some("anthropic"),
+                Some("claude-opus-4"),
+                Some("anthropic"),
+            ),
+            // Empty remainder → NULL model.
+            ("anthropic:", None, None, Some("anthropic")),
+            // Effort-lookalike bare id: no colon → untouched.
+            (
+                "opus[1m]",
+                Some("claude-code"),
+                Some("opus[1m]"),
+                Some("claude-code"),
+            ),
+            // Bare id → untouched.
+            (
+                "claude-opus-4",
+                Some("anthropic"),
+                Some("claude-opus-4"),
+                Some("anthropic"),
+            ),
+        ];
+        let ids: Vec<AgentId> = cases.iter().map(|_| mk_id()).collect();
+        {
+            let store = Store::open(&tmp).await.expect("create test store");
+            store
+                .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+                .await
+                .expect("insert workspace");
+            for (id, (model, provider, _, _)) in ids.iter().zip(&cases) {
+                let mut session = baseline_test_session(id, &ws_id, &ts, None);
+                session.model = Some(model.to_string());
+                session.provider = provider.map(str::to_string);
+                store.insert_agent_session(&session).await.expect("insert");
+            }
+            // Seed the columns insert doesn't cover on the first row: a
+            // compound last-turn pair (split), an effort (untouched — 0113
+            // never writes reasoning_effort), and a colon-bearing display
+            // identity (untouched — resolved_model is excluded).
+            sqlx::query(
+                "UPDATE agent_session SET last_turn_model = 'codex:gpt-5.3-codex', \
+                 last_turn_provider = 'stale', reasoning_effort = 'high', \
+                 resolved_model = 'Display: Opus' WHERE id = ?",
+            )
+            .bind(&ids[0].0)
+            .execute(store.write_pool())
+            .await
+            .expect("seed aux columns");
+            // Rewind the ledger so the reopen re-runs 0113 against these
+            // rows (same pattern as the 0080 test; 0113 is pure UPDATE, so
+            // there is no DDL to rewind).
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 113")
+                .execute(store.write_pool())
+                .await
+                .expect("forget 0113");
+            store.close().await;
+        }
+
+        let store = Store::open(&tmp).await.expect("reopen applies 0113");
+        for (id, (model, _, expected_model, expected_provider)) in ids.iter().zip(&cases) {
+            let row = sqlx::query("SELECT model, provider FROM agent_session WHERE id = ?")
+                .bind(&id.0)
+                .fetch_one(store.write_pool())
+                .await
+                .expect("raw row");
+            assert_eq!(
+                row.get::<Option<String>, _>("model").as_deref(),
+                *expected_model,
+                "raw model after 0113 for legacy {model}"
+            );
+            assert_eq!(
+                row.get::<Option<String>, _>("provider").as_deref(),
+                *expected_provider,
+                "raw provider after 0113 for legacy {model}"
+            );
+        }
+        let row = sqlx::query(
+            "SELECT last_turn_model, last_turn_provider, reasoning_effort, resolved_model \
+             FROM agent_session WHERE id = ?",
+        )
+        .bind(&ids[0].0)
+        .fetch_one(store.write_pool())
+        .await
+        .expect("raw aux row");
+        assert_eq!(
+            row.get::<Option<String>, _>("last_turn_model").as_deref(),
+            Some("gpt-5.3-codex"),
+            "last_turn_model split by 0113"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("last_turn_provider")
+                .as_deref(),
+            Some("codex"),
+            "last_turn_provider overwritten by the prefix"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("reasoning_effort").as_deref(),
+            Some("high"),
+            "0113 must not touch reasoning_effort"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("resolved_model").as_deref(),
+            Some("Display: Opus"),
+            "0113 must not touch resolved_model"
+        );
+    }
+
+    /// The read backstop splits a compound id a row the migration never saw
+    /// (e.g. written by an older daemon after this build's migrations ran):
+    /// session hydration and the last-turn getter never return a compound id.
+    #[tokio::test]
+    async fn read_backstop_normalizes_compound_model_ids() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-backstop".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.model = Some("anthropic:claude-opus-4".to_string());
+        session.provider = Some("stale".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        // Full-row hydration (0113 already ran on the empty table, so only
+        // the backstop can split this row).
+        let read = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(read.model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(read.provider.as_deref(), Some("anthropic"));
+
+        // Summary hydration goes through the same mapping.
+        let listed = store
+            .list_agent_sessions(&ws_id)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|s| s.id == agent_id)
+            .expect("listed session");
+        assert_eq!(listed.model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(listed.provider.as_deref(), Some("anthropic"));
+
+        // The last-turn getter applies the same backstop.
+        store
+            .set_agent_session_last_turn_model(
+                &ws_id,
+                &agent_id,
+                Some("codex:gpt-5.3-codex"),
+                "stale",
+            )
+            .await
+            .expect("seed last turn");
+        let (last_model, last_provider) = store
+            .get_agent_session_last_turn_model(&ws_id, &agent_id)
+            .await
+            .expect("get last turn");
+        assert_eq!(last_model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(last_provider.as_deref(), Some("codex"));
+    }
+
+    /// The 0113 read backstop also covers the token-usage reads: neither
+    /// `get_agent_session_token_usage` nor the workspace usage rollup
+    /// (`get_workspace_agent_usage_data`) surfaces a compound id — the stats
+    /// model/provider keys are computed from the split pair.
+    #[tokio::test]
+    async fn read_backstop_normalizes_usage_reads() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-usage-backstop".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.model = Some("anthropic:claude-opus-4".to_string());
+        session.provider = Some("stale".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let (model, _resolved, provider, _snapshot) = store
+            .get_agent_session_token_usage(&ws_id, &agent_id)
+            .await
+            .expect("token usage read");
+        assert_eq!(model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(provider.as_deref(), Some("anthropic"));
+
+        let rows = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("usage rollup");
+        let (_, rollup_model, _, _, _) = rows
+            .into_iter()
+            .find(|(id, _, _, _, _)| *id == agent_id.0)
+            .expect("rollup row");
+        assert_eq!(rollup_model.as_deref(), Some("claude-opus-4"));
+    }
+
+    /// `update_agent_session`'s provider-immutability guard compares against
+    /// the NORMALIZED stored identity: a read-modify-update round trip on a
+    /// legacy compound row (whose reads surface the split provider) must not
+    /// trip "provider is immutable", while an actual provider change still
+    /// does.
+    #[tokio::test]
+    async fn update_session_immutability_guard_normalizes_compound_rows() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-guard-backstop".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-1"));
+        session.model = Some("anthropic:claude-opus-4".to_string());
+        session.provider = Some("stale".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        // Round trip: reads surface the split identity; persisting it back
+        // must pass the guard even though the raw row is still compound.
+        let mut read = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(read.provider.as_deref(), Some("anthropic"));
+        read.name = "Renamed".to_string();
+        store
+            .update_agent_session(&ws_id, &read)
+            .await
+            .expect("round-trip update must not trip the immutability guard");
+
+        // An actual provider change is still rejected.
+        read.provider = Some("codex".to_string());
+        let err = store
+            .update_agent_session(&ws_id, &read)
+            .await
+            .expect_err("provider change past first use");
+        assert!(matches!(err, Error::Internal(_)));
+    }
+
+    /// The `set_agent_session_resolved_model` CAS matches the NORMALIZED
+    /// stored model: a caller that read a legacy compound row holds the split
+    /// model, and its guarded write must land; a genuine mismatch still
+    /// fails.
+    #[tokio::test]
+    async fn resolved_model_cas_normalizes_compound_rows() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-cas-backstop".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.model = Some("anthropic:claude-opus-4".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        // Mismatch still fails (and the raw compound form is NOT a valid
+        // expected_model — callers only ever hold split reads).
+        let landed = store
+            .set_agent_session_resolved_model(&ws_id, &agent_id, Some("sonnet"), Some("Sonnet"))
+            .await
+            .expect("guarded write");
+        assert!(!landed, "mismatched expected_model must not land");
+
+        // The split model read back from the row matches the compound column.
+        let landed = store
+            .set_agent_session_resolved_model(
+                &ws_id,
+                &agent_id,
+                Some("claude-opus-4"),
+                Some("Opus 4"),
+            )
+            .await
+            .expect("guarded write");
+        assert!(landed, "normalized expected_model must match compound row");
+        let (_, resolved, _, _) = store
+            .get_agent_session_token_usage(&ws_id, &agent_id)
+            .await
+            .expect("read");
+        assert_eq!(resolved.as_deref(), Some("Opus 4"));
+
+        // A compound id that normalizes to an empty model matches None.
+        let null_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut null_session = baseline_test_session(&null_id, &ws_id, &ts, None);
+        null_session.model = Some("anthropic:".to_string());
+        store
+            .insert_agent_session(&null_session)
+            .await
+            .expect("insert");
+        let landed = store
+            .set_agent_session_resolved_model(&ws_id, &null_id, None, Some("Opus 4.8"))
+            .await
+            .expect("guarded write on empty-remainder model");
+        assert!(
+            landed,
+            "empty remainder normalizes to NULL and matches None"
+        );
     }
 
     /// Hydration-skip matrix (monorepo#738): `get_workspace_agent_usage_data`
@@ -7225,6 +9214,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -7356,6 +9346,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -7439,6 +9430,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -7635,6 +9627,7 @@ mod tests {
                 diff_summary: None,
                 token_usage: None,
                 cow_supported: None,
+                browser_client_id: None,
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
@@ -7778,8 +9771,9 @@ mod tests {
             .await
             .expect_err("cross-workspace write must not mutate");
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+        // The read backstop splits the seeded compound id on read.
         let unchanged = store.get_agent_session(&agent_id).await.expect("get");
-        assert_eq!(unchanged.model.as_deref(), Some("mock:default"));
+        assert_eq!(unchanged.model.as_deref(), Some("default"));
         assert_eq!(unchanged.provider.as_deref(), Some("mock"));
 
         // Cross-provider switch AFTER first real use (acp_session_id set).
@@ -7795,7 +9789,7 @@ mod tests {
             .await
             .expect("intentional cross-provider switch");
         let after = store.get_agent_session(&agent_id).await.expect("get after");
-        assert_eq!(after.model.as_deref(), Some("grok:grok-4-fast"));
+        assert_eq!(after.model.as_deref(), Some("grok-4-fast"));
         assert_eq!(after.provider.as_deref(), Some("grok"));
         assert_eq!(after.updated_at, updated_at);
         assert_eq!(
@@ -7864,12 +9858,14 @@ mod tests {
             .expect("persist system prompt");
         let after = store.get_agent_session(&agent_id).await.expect("get after");
         assert_eq!(after.system_prompt.as_deref(), Some("assembled prompt"));
+        // The read backstop splits the compound id; the prefix wins over the
+        // stored provider column.
         assert_eq!(
             after.model.as_deref(),
-            Some("auggie:haiku"),
+            Some("haiku"),
             "concurrent setModel must not be reverted by the prompt persist"
         );
-        assert_eq!(after.provider.as_deref(), Some("mock"));
+        assert_eq!(after.provider.as_deref(), Some("auggie"));
         assert_eq!(after.updated_at, switched_at, "updated_at untouched");
         assert_eq!(after.acp_session_id.as_deref(), Some("acp-live"));
     }
@@ -7925,6 +9921,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -10208,8 +12205,14 @@ mod tests {
         raw_insert(&system_only, 0, "system").await;
 
         // Raw inserts bypass write-time maintenance: still NULL. Recreate
-        // the pre-0070 shape and re-run the migration file verbatim.
+        // the pre-0070 shape and re-run the migration file verbatim (the
+        // 0114 unread index references the column, so drop the index first
+        // and re-run its migration after).
         assert_eq!(read_role_column(&store, &user_newest).await, None);
+        sqlx::query("DROP INDEX idx_agent_session_unread_top_level")
+            .execute(store.write_pool())
+            .await
+            .expect("drop 0114 index");
         sqlx::query("ALTER TABLE agent_session DROP COLUMN last_message_role")
             .execute(store.write_pool())
             .await
@@ -10220,6 +12223,12 @@ mod tests {
         .execute(store.write_pool())
         .await
         .expect("re-run 0070 migration");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0114_agent_session_unread_covering_index.sql"
+        ))
+        .execute(store.write_pool())
+        .await
+        .expect("re-run 0114 migration");
 
         assert_eq!(
             read_role_column(&store, &user_newest).await,
@@ -10521,6 +12530,12 @@ mod tests {
 
         // Recreate the pre-0088 shape and re-run the migration file
         // verbatim: the backfill stamps from the newest user/assistant row.
+        // (The 0114 unread index references the column, so drop the index
+        // first and re-run its migration after.)
+        sqlx::query("DROP INDEX idx_agent_session_unread_top_level")
+            .execute(store.write_pool())
+            .await
+            .expect("drop 0114 index");
         sqlx::query("ALTER TABLE agent_session DROP COLUMN last_message_id")
             .execute(store.write_pool())
             .await
@@ -10531,6 +12546,12 @@ mod tests {
         .execute(store.write_pool())
         .await
         .expect("re-run 0088 migration");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0114_agent_session_unread_covering_index.sql"
+        ))
+        .execute(store.write_pool())
+        .await
+        .expect("re-run 0114 migration");
 
         assert_eq!(
             read_id_column(&store, &user_newest).await,
@@ -12112,6 +14133,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,

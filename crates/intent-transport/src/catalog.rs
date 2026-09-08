@@ -11,7 +11,7 @@ mod tests;
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 297 canonical methods routed through the main dispatch match in
+/// These are the 303 canonical methods routed through the main dispatch match in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
@@ -64,6 +64,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "agent.unsubscribe",
     "agent.update",
     "agent.wakeOrCreate",
+    "client.list",
     "comment.add",
     "comment.delete",
     "comment.getThread",
@@ -129,6 +130,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "github.connect",
     "github.getReviewThreads",
     "github.getUser",
+    "github.issues.get",
     "github.issues.list",
     "github.issues.search",
     "github.listReviewComments",
@@ -297,6 +299,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.generateSetupScript",
     "workspace.get",
     "workspace.getAutoCommit",
+    "workspace.getBrowserClient",
     "workspace.getContext",
     "workspace.getSetupScript",
     "workspace.getTokenUsage",
@@ -307,10 +310,12 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.import.commit",
     "workspace.initializeRepository",
     "workspace.list",
+    "workspace.localChanges",
     "workspace.markSeen",
     "workspace.restore",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
+    "workspace.setBrowserClient",
     "workspace.transfer.plan",
     "workspace.unarchive",
     "workspace.update",
@@ -329,15 +334,21 @@ pub(crate) const METHOD_ALIASES: &[(&str, &str)] =
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 37 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 49 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
 /// `pairing.rs`, `server.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
 /// performance or to access per-connection state (e.g., `client_id` binding for
-/// drafts).
+/// drafts and the host-only `browser.*Tab*` registry reports).
 #[cfg(test)]
 pub(crate) const FASTPATH_METHODS: &[&str] = &[
+    "browser.closeTab",
     "browser.exec",
+    "browser.listTabs",
+    "browser.navigateTab",
+    "browser.removeTab",
+    "browser.syncTabs",
+    "browser.upsertTab",
     "client.hello",
     "drafts.clear",
     "drafts.get",
@@ -365,9 +376,14 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "host.openInEditor",
     "host.providerAuthStatus",
     "host.providerDiscovery",
+    "host.providerTestPrompt",
     "host.status",
     "host.toolAvailability",
     "pairing.getInfo",
+    "providers.setup.cancel",
+    "providers.setup.login",
+    "providers.setup.start",
+    "providers.setup.status",
     "server.pairingInfo",
     "server.rotateToken",
     "system.gitCredential",
@@ -396,4 +412,5 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
     "host.openExternal",
     "host.openInEditor",
     "host.pickApplication",
+    "providers.setup.openLogin",
 ];

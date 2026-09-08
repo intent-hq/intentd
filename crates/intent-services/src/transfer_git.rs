@@ -2,7 +2,9 @@
 //! decision 1): snapshot dirty state as sentinel-marked WIP commits (the
 //! workspace worktree AND every sandbox), then build one `git bundle`
 //! carrying the workspace branch, the base ref, and all `sb/<agentId>`
-//! sandbox branches. The inverse helper ([`unwind_wip`]) removes a WIP
+//! sandbox branches — plus one self-contained bundle per tracked submodule
+//! whose checked-out commit is unpublished (monorepo#4219), so the target
+//! can hydrate it without a network. The inverse helper ([`unwind_wip`]) removes a WIP
 //! snapshot commit and restores the exact staged/unstaged/untracked split —
 //! reused by the import side after materialization and by the source-side
 //! failure/cleanup paths. No wire code lives here.
@@ -15,6 +17,7 @@ use intent_store::Sandbox;
 use serde::{Deserialize, Serialize};
 
 use crate::nested_repos::{is_dirty, stage_all_skipping_nested};
+use crate::transfer_submodules::{find_unpublished_submodules, UnpublishedSubmodule};
 
 /// First line of every transfer WIP snapshot commit message. The import side
 /// identifies snapshot commits by this sentinel and unwinds them via
@@ -43,6 +46,34 @@ pub(crate) fn base_bundle_ref(workspace_id: &str) -> String {
 /// (workspace-namespaced like [`base_bundle_ref`]).
 pub(crate) fn sandbox_bundle_ref(workspace_id: &str, agent_id: &str) -> String {
     format!("{TRANSFER_REF_NS}/{workspace_id}/sandbox/{agent_id}")
+}
+
+/// Temp ref anchoring the `index`-th unpublished submodule commit inside ITS
+/// OWN repository for the duration of its `git bundle create` (the name
+/// survives in that bundle's header, workspace-namespaced like the others).
+pub(crate) fn submodule_bundle_ref(workspace_id: &str, index: usize) -> String {
+    format!("{TRANSFER_REF_NS}/{workspace_id}/submodule/{index}")
+}
+
+/// Archive entry name of the `index`-th submodule bundle
+/// (`git/submodules/<n>.bundle`). Index-based so submodule paths never need
+/// encoding into zip entry names.
+pub(crate) fn submodule_bundle_entry(index: usize) -> String {
+    format!("git/submodules/{index}.bundle")
+}
+
+/// Output of [`create_transfer_bundle`]: the loose bundle files in the
+/// staging dir plus the ref inventory that becomes `git/refs.json`.
+#[derive(Debug)]
+pub struct TransferBundle {
+    /// The superproject bundle (`<staging>/<wsId>.bundle`), written to the
+    /// archive as `git/repo.bundle`.
+    pub bundle_path: PathBuf,
+    /// One `(loose file, archive entry)` pair per bundled unpublished
+    /// submodule, in `refs.submodules` order; the entry is
+    /// [`SubmoduleBundleRef::bundle_entry`].
+    pub submodule_bundles: Vec<(PathBuf, String)>,
+    pub refs: TransferRefsManifest,
 }
 
 /// Ref inventory of a transfer bundle: what each bundle ref is and how it
@@ -74,6 +105,114 @@ pub struct TransferRefsManifest {
     pub base_sha: Option<String>,
     /// One entry per sandbox whose branch made it into the bundle.
     pub sandboxes: Vec<SandboxBundleRef>,
+    /// One entry per tracked worktree submodule whose checked-out commit is
+    /// unpublished (unreachable from any of its remote-tracking refs) and
+    /// therefore rides the archive as its own bundle — plus every published
+    /// ancestor such a nested submodule needs checked out first
+    /// (`published: true`). Ordered by path, so a parent submodule always
+    /// precedes its nested children. Absent/empty in archives from older
+    /// daemons and when every submodule is published.
+    #[serde(default)]
+    pub submodules: Vec<SubmoduleBundleRef>,
+    /// The root repository's portable remotes with their remote-tracking
+    /// tips as of export (see `transfer_remotes`); the tips' objects ride
+    /// the bundle. Absent/empty in archives from older daemons and when the
+    /// source had no transferable remote — the import then lands without
+    /// remotes, as before.
+    #[serde(default)]
+    pub remotes: Vec<RemoteBundleRef>,
+    /// `branch.<workspace_branch>.remote/merge` on the source, when it named
+    /// one of `remotes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_upstream: Option<BranchUpstream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_push_remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_push_default: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_default: Option<String>,
+}
+
+/// One root-repository remote as recorded in the manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteBundleRef {
+    /// The `remote.<name>` key.
+    pub name: String,
+    /// Sanitized fetch URL (credential-free, portable form only).
+    pub url: String,
+    /// Sanitized `remote.<name>.pushurl`, when configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_url: Option<String>,
+    /// Further URL values in their original order, after the first URL above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_push_urls: Vec<String>,
+    /// None means a legacy manifest; Some(empty) means explicitly no mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_refspecs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub push_refspecs: Vec<String>,
+    /// Direct refs under `refs/remotes/<name>/` and their tips at export.
+    #[serde(default)]
+    pub tracking_refs: Vec<TrackingRef>,
+}
+
+/// One remote-tracking ref: full name and the commit it pointed at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackingRef {
+    pub ref_name: String,
+    pub sha: String,
+    /// Transfer-owned snapshot anchor; absent in legacy remote manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_ref: Option<String>,
+}
+
+/// The workspace branch's upstream: `branch.<b>.remote` + `branch.<b>.merge`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchUpstream {
+    pub remote: String,
+    /// Full ref on the remote (`refs/heads/<branch>`).
+    pub merge_ref: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_merge_refs: Vec<String>,
+}
+
+/// One submodule as bundled into the archive: unpublished, or the published
+/// parent of a nested unpublished one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmoduleBundleRef {
+    /// The `submodule.<name>` key in ITS superproject (raw, not composed).
+    pub name: String,
+    /// Path relative to the workspace worktree root, forward slashes; nested
+    /// submodules compose their parents' paths (`sub/inner`), so the
+    /// containing repository is the entry whose path is this path's parent
+    /// (or the worktree itself).
+    pub path: String,
+    /// The bundled commit — the submodule checkout's HEAD, which is the
+    /// gitlink recorded by the (possibly WIP-snapshotted) superproject tip.
+    pub commit_sha: String,
+    /// Branch the submodule checkout had HEAD on, when attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The checkout's `remote.origin.url`, when configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_url: Option<String>,
+    /// Archive entry carrying the bundle (`git/submodules/<n>.bundle`).
+    pub bundle_entry: String,
+    /// Ref inside that bundle anchoring `commit_sha`
+    /// ([`submodule_bundle_ref`]); the bundle also carries `HEAD` at the same
+    /// commit so a plain clone from it checks out.
+    pub bundle_ref: String,
+    /// `true` when `commit_sha` is reachable from a remote and the entry is
+    /// bundled only so a nested unpublished submodule below it can be
+    /// checked out. Absent (false) in archives from older daemons.
+    #[serde(default)]
+    pub published: bool,
 }
 
 /// One sandbox branch as recorded in the bundle.
@@ -246,14 +385,17 @@ pub(crate) fn unwind_wip(repo_path: &Path) -> Result<bool> {
 /// Build the transfer bundle for a workspace: WIP-snapshot the worktree and
 /// every sandbox, anchor the base commit and each sandbox branch under
 /// temporary `refs/intent/transfer/*` refs in the worktree repo, and run
-/// `git bundle create` + `verify`. Returns the bundle path and the ref
-/// inventory.
+/// `git bundle create` + `verify`. Every tracked worktree submodule whose
+/// checked-out commit is unpublished — and every published ancestor a
+/// nested one needs — additionally gets its own self-contained bundle
+/// (`<staging>/submodules/<n>.bundle`). Returns the bundle paths and the
+/// ref inventory.
 ///
 /// On success the WIP snapshot commits are left in place (they are what the
 /// bundle refs point at); the caller unwinds them via [`unwind_wip`] once the
 /// export settles. On failure every created WIP commit is unwound, temporary
-/// refs are deleted, and any partial bundle file is removed — the source is
-/// restored exactly as found.
+/// refs are deleted, and any partial bundle file (submodule bundles included)
+/// is removed — the source is restored exactly as found.
 ///
 /// This is blocking work (git2 I/O plus `git` child processes); async callers
 /// must run it via `spawn_blocking`, like the plan op does for
@@ -266,23 +408,27 @@ pub fn create_transfer_bundle(
     ws: &Workspace,
     sandboxes: &[Sandbox],
     staging_dir: &Path,
-) -> Result<(PathBuf, TransferRefsManifest)> {
+) -> Result<TransferBundle> {
     let worktree = crate::git_ops::worktree_path(ws).ok_or_else(|| {
         Error::Internal("workspace has no worktree or repository path".to_string())
     })?;
     std::fs::create_dir_all(staging_dir)
         .map_err(|e| Error::Internal(format!("create staging dir failed: {e}")))?;
     let bundle_path = staging_dir.join(format!("{}.bundle", ws.id.0));
+    let submodules_dir = staging_dir.join("submodules");
 
     let mut snapshotted: Vec<PathBuf> = Vec::new();
     let mut temp_refs: Vec<String> = Vec::new();
+    let mut submodule_bundles: Vec<(PathBuf, String)> = Vec::new();
     let result = build_bundle(
         ws,
         sandboxes,
         &worktree,
         &bundle_path,
+        &submodules_dir,
         &mut snapshotted,
         &mut temp_refs,
+        &mut submodule_bundles,
     );
 
     // The temp refs only anchor the bundle build; drop them regardless of
@@ -302,18 +448,33 @@ pub fn create_transfer_bundle(
         if bundle_path.exists() {
             let _ = std::fs::remove_file(&bundle_path);
         }
+        for (path, _) in &submodule_bundles {
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        if submodules_dir.is_dir() {
+            let _ = std::fs::remove_dir(&submodules_dir);
+        }
     }
 
-    result.map(|manifest| (bundle_path, manifest))
+    result.map(|refs| TransferBundle {
+        bundle_path,
+        submodule_bundles,
+        refs,
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_bundle(
     ws: &Workspace,
     sandboxes: &[Sandbox],
     worktree: &Path,
     bundle_path: &Path,
+    submodules_dir: &Path,
     snapshotted: &mut Vec<PathBuf>,
     temp_refs: &mut Vec<String>,
+    submodule_bundles: &mut Vec<(PathBuf, String)>,
 ) -> Result<TransferRefsManifest> {
     let repo = git2::Repository::open(worktree)
         .map_err(|e| Error::Internal(format!("open workspace repo failed: {e}")))?;
@@ -440,6 +601,39 @@ fn build_bundle(
         });
     }
 
+    // 4b. Record the portable remotes and their remote-tracking tips; the
+    //     tips are bundled too so the target can restore them offline and
+    //     the workspace branch's published prefix stays reachable from
+    //     `refs/remotes/*` (intent-hq/intent#4438).
+    let (mut remotes, workspace_upstream) =
+        crate::transfer_remotes::capture_remotes(&repo, &workspace_branch)?;
+    let (workspace_push_remote, remote_push_default, push_default) =
+        crate::transfer_remotes::capture_push_selection(&repo, &workspace_branch, &remotes)?;
+
+    // Bundle immutable OIDs, not mutable refs that a concurrent fetch/prune
+    // can advance or delete. Register each anchor immediately for cleanup,
+    // and never overwrite an existing ref (including another transfer's).
+    let snapshot_id = uuid::Uuid::new_v4();
+    for (index, tracking) in remotes
+        .iter_mut()
+        .flat_map(|r| &mut r.tracking_refs)
+        .enumerate()
+    {
+        let anchor = format!(
+            "{TRANSFER_REF_NS}/{}/remotes/{snapshot_id}/{index}",
+            ws.id.0
+        );
+        let oid = git2::Oid::from_str(&tracking.sha)
+            .map_err(|_| Error::Internal("invalid remote snapshot OID".into()))?;
+        repo.reference(&anchor, oid, false, "transfer remote snapshot")
+            .map_err(|_| Error::Internal("could not anchor remote snapshot".into()))?;
+        temp_refs.push(anchor.clone());
+        tracking.bundle_ref = Some(anchor);
+    }
+
+    #[cfg(test)]
+    tests::after_remote_capture();
+
     // 5. Create and verify the bundle (full history — self-contained, no
     //    prerequisites, so the target can clone/fetch with no other remote).
     let mut ref_args = vec![workspace_bundle_ref.clone()];
@@ -447,6 +641,11 @@ fn build_bundle(
         ref_args.push(r.clone());
     }
     ref_args.extend(sandbox_refs.iter().map(|s| s.bundle_ref.clone()));
+    ref_args.extend(
+        remotes
+            .iter()
+            .flat_map(|r| r.tracking_refs.iter().filter_map(|t| t.bundle_ref.clone())),
+    );
     run_git(worktree, |cmd| {
         cmd.arg("bundle").arg("create").arg(bundle_path);
         cmd.args(&ref_args);
@@ -457,6 +656,43 @@ fn build_bundle(
     })
     .map_err(|e| Error::Internal(format!("git bundle verify failed: {e}")))?;
 
+    // 6. Bundle every unpublished worktree submodule on its own, along with
+    //    the published parents a nested one needs. Runs after the WIP
+    //    snapshot so the gitlinks that travel are final; detection order (by
+    //    path) puts a parent before its nested children.
+    let unpublished = find_unpublished_submodules(worktree)?;
+    let mut submodule_refs = Vec::with_capacity(unpublished.len());
+    for (index, sub) in unpublished.iter().enumerate() {
+        if index == 0 {
+            std::fs::create_dir_all(submodules_dir).map_err(|e| {
+                Error::Internal(format!("create submodule bundle staging dir failed: {e}"))
+            })?;
+        }
+        let out_path = submodules_dir.join(format!("{index}.bundle"));
+        let bundle_entry = submodule_bundle_entry(index);
+        // Register before creating so a partial file is cleaned up on failure.
+        submodule_bundles.push((out_path.clone(), bundle_entry.clone()));
+        let bundle_ref = submodule_bundle_ref(&ws.id.0, index);
+        bundle_submodule(sub, &bundle_ref, &out_path)?;
+        tracing::info!(
+            path = %sub.path,
+            commit = %sub.commit_sha,
+            entry = %bundle_entry,
+            published = sub.published,
+            "transfer bundle: bundled submodule commit"
+        );
+        submodule_refs.push(SubmoduleBundleRef {
+            name: sub.name.clone(),
+            path: sub.path.clone(),
+            commit_sha: sub.commit_sha.clone(),
+            branch: sub.branch.clone(),
+            origin_url: sub.origin_url.clone(),
+            bundle_entry,
+            bundle_ref,
+            published: sub.published,
+        });
+    }
+
     Ok(TransferRefsManifest {
         workspace_branch,
         workspace_bundle_ref,
@@ -466,7 +702,59 @@ fn build_bundle(
         base_bundle_ref,
         base_sha,
         sandboxes: sandbox_refs,
+        submodules: submodule_refs,
+        remotes,
+        workspace_upstream,
+        workspace_push_remote,
+        remote_push_default,
+        push_default,
     })
+}
+
+/// Write one submodule's self-contained bundle: anchor `commit_sha` under
+/// `bundle_ref` in the submodule's own repository, `git bundle create` it
+/// together with `HEAD` (so a plain clone from the bundle has something to
+/// check out), `verify`, and delete the temp ref again — success or failure.
+fn bundle_submodule(sub: &UnpublishedSubmodule, bundle_ref: &str, out_path: &Path) -> Result<()> {
+    let repo = git2::Repository::open(&sub.repo_dir)
+        .map_err(|e| Error::Internal(format!("open submodule {} failed: {e}", sub.path)))?;
+    let oid = git2::Oid::from_str(&sub.commit_sha)
+        .map_err(|e| Error::Internal(format!("submodule {} commit sha: {e}", sub.path)))?;
+    repo.reference(bundle_ref, oid, true, "transfer submodule anchor")
+        .map_err(|e| {
+            Error::Internal(format!(
+                "create submodule transfer ref for {} failed: {e}",
+                sub.path
+            ))
+        })?;
+    let result = run_git(&sub.repo_dir, |cmd| {
+        cmd.arg("bundle")
+            .arg("create")
+            .arg(out_path)
+            .arg(bundle_ref)
+            .arg("HEAD");
+    })
+    .map_err(|e| {
+        Error::Internal(format!(
+            "git bundle create for submodule {} failed: {e}",
+            sub.path
+        ))
+    })
+    .and_then(|()| {
+        run_git(&sub.repo_dir, |cmd| {
+            cmd.arg("bundle").arg("verify").arg(out_path);
+        })
+        .map_err(|e| {
+            Error::Internal(format!(
+                "git bundle verify for submodule {} failed: {e}",
+                sub.path
+            ))
+        })
+    });
+    if let Ok(mut r) = repo.find_reference(bundle_ref) {
+        let _ = r.delete();
+    }
+    result
 }
 
 /// Resolve the workspace base commit locally: the remote-tracking ref for
@@ -584,6 +872,143 @@ mod tests {
     use intent_core::{AgentId, WorkspaceId, WorkspaceStatus};
     use intent_store::SandboxStatus;
     use std::fs;
+
+    thread_local! {
+        static AFTER_REMOTE_CAPTURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_remote_capture() {
+        AFTER_REMOTE_CAPTURE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+
+    fn remote_snapshot_survives_change(delete: bool) {
+        let (dir, path) = temp_repo("remote-race");
+        let repo = git2::Repository::open(&path).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Test", "test@example.invalid").unwrap();
+        let captured = repo
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "remote-only snapshot",
+                &head.tree().unwrap(),
+                &[&head],
+            )
+            .unwrap();
+        let advanced = repo
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "later remote tip",
+                &head.tree().unwrap(),
+                &[&head],
+            )
+            .unwrap();
+        repo.remote("origin", "https://example.invalid/repo")
+            .unwrap();
+        let tracking = "refs/remotes/origin/main";
+        repo.reference(tracking, captured, false, "fixture")
+            .unwrap();
+        let change_path = path.clone();
+        AFTER_REMOTE_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let repo = git2::Repository::open(change_path).unwrap();
+                if delete {
+                    repo.find_reference(tracking).unwrap().delete().unwrap();
+                } else {
+                    repo.reference(tracking, advanced, true, "concurrent fetch fixture")
+                        .unwrap();
+                }
+            }));
+        });
+        let ws = workspace_for_repo(&path);
+        let bundle = create_transfer_bundle(&ws, &[], &dir.path().join("staging")).unwrap();
+        assert_eq!(head_sha(&path), head.id().to_string(), "HEAD unchanged");
+        assert!(repo_ref_names(&path)
+            .iter()
+            .all(|r| !r.starts_with(TRANSFER_REF_NS)));
+        let out = crate::transfer_materialize::materialize_workspace_git_blocking(
+            &bundle.bundle_path,
+            &bundle.refs,
+            &ws,
+            &[],
+            &dir.path().join("target"),
+        )
+        .unwrap();
+        let dst = git2::Repository::open(&out.checkout_dir).unwrap();
+        assert_eq!(
+            dst.find_reference(tracking).unwrap().target(),
+            Some(captured)
+        );
+        assert_eq!(
+            intent_git::local_changes(&out.checkout_dir)
+                .unwrap()
+                .unpushed_count,
+            0
+        );
+        assert!(repo_ref_names(&out.checkout_dir)
+            .iter()
+            .all(|r| !r.starts_with(TRANSFER_REF_NS)));
+        assert_eq!(
+            repo.find_reference(tracking).ok().and_then(|r| r.target()),
+            if delete { None } else { Some(advanced) }
+        );
+    }
+
+    #[test]
+    fn review_r4_remote_advance_preserves_captured_snapshot() {
+        remote_snapshot_survives_change(false);
+    }
+
+    #[test]
+    fn review_r4_remote_deletion_preserves_captured_snapshot() {
+        remote_snapshot_survives_change(true);
+    }
+
+    #[test]
+    fn review_r4_bundle_failure_cleans_remote_anchors_and_unwinds_wip() {
+        let (dir, path) = temp_repo("remote-failure");
+        let repo = git2::Repository::open(&path).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.remote("origin", "https://example.invalid/repo")
+            .unwrap();
+        repo.reference("refs/remotes/origin/main", head, false, "fixture")
+            .unwrap();
+        fs::write(path.join("dirty.txt"), "local work").unwrap();
+        let before = status_fingerprint(&path);
+        let ws = workspace_for_repo(&path);
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let lock = staging.join(format!("{}.bundle.lock", ws.id.0));
+        let inspect_path = path.clone();
+        AFTER_REMOTE_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(repo_ref_names(&inspect_path)
+                    .iter()
+                    .any(|r| r.contains("/remotes/") && r.starts_with(TRANSFER_REF_NS)));
+                fs::write(lock, "force bundle lock failure").unwrap();
+            }));
+        });
+        assert!(create_transfer_bundle(&ws, &[], &staging).is_err());
+        assert_eq!(head_sha(&path), head.to_string());
+        assert_eq!(status_fingerprint(&path), before);
+        assert!(repo_ref_names(&path)
+            .iter()
+            .all(|r| !r.starts_with(TRANSFER_REF_NS)));
+        assert_eq!(
+            repo.find_reference("refs/remotes/origin/main")
+                .unwrap()
+                .target(),
+            Some(head)
+        );
+        assert!(!staging.join(format!("{}.bundle", ws.id.0)).exists());
+    }
 
     fn now_iso() -> String {
         intent_core::now_iso()
@@ -708,6 +1133,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -862,8 +1288,14 @@ mod tests {
         let ws = workspace_for_repo(&repo);
         let staging = dir.path().join("staging");
 
-        let (bundle_path, manifest) = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        let TransferBundle {
+            bundle_path,
+            submodule_bundles,
+            refs: manifest,
+        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
         assert!(bundle_path.exists());
+        assert!(submodule_bundles.is_empty());
+        assert!(manifest.submodules.is_empty());
         assert_eq!(manifest.workspace_branch, "main");
         assert_eq!(manifest.workspace_bundle_ref, "refs/heads/main");
         assert_eq!(manifest.workspace_head_sha, head_sha(&repo));
@@ -911,8 +1343,11 @@ mod tests {
         let before = status_fingerprint(&repo);
 
         let ws = workspace_for_repo(&repo);
-        let (bundle_path, manifest) =
-            create_transfer_bundle(&ws, &[], &dir.path().join("staging")).unwrap();
+        let TransferBundle {
+            bundle_path,
+            refs: manifest,
+            ..
+        } = create_transfer_bundle(&ws, &[], &dir.path().join("staging")).unwrap();
         let wip = manifest
             .workspace_wip_commit_sha
             .clone()
@@ -945,8 +1380,11 @@ mod tests {
         fs::write(sb_path.join("sb-wip.txt"), "sandbox wip\n").unwrap();
         let sb = sandbox_row(&ws, &agent, &sb_path, &branch);
 
-        let (bundle_path, manifest) =
-            create_transfer_bundle(&ws, &[sb], &dir.path().join("staging")).unwrap();
+        let TransferBundle {
+            bundle_path,
+            refs: manifest,
+            ..
+        } = create_transfer_bundle(&ws, &[sb], &dir.path().join("staging")).unwrap();
 
         assert_eq!(manifest.base_ref.as_deref(), Some("main"));
         assert_eq!(
@@ -1074,7 +1512,7 @@ mod tests {
         let mut missing = sb.clone();
         missing.path = dir.path().join("gone").to_string_lossy().to_string();
 
-        let (_bundle, manifest) =
+        let TransferBundle { refs: manifest, .. } =
             create_transfer_bundle(&ws, &[missing], &dir.path().join("staging")).unwrap();
         assert!(manifest.sandboxes.is_empty(), "missing sandbox skipped");
     }
@@ -1094,7 +1532,7 @@ mod tests {
         let mut sb = sandbox_row(&ws, &agent, &sb_path, &format!("sb/{}", agent.0));
         sb.branch = "sb/does-not-exist".to_string();
 
-        let (_bundle, manifest) =
+        let TransferBundle { refs: manifest, .. } =
             create_transfer_bundle(&ws, &[sb], &dir.path().join("staging")).unwrap();
         assert!(manifest.sandboxes.is_empty(), "unbundlable sandbox skipped");
         // The skipped sandbox was not touched: no WIP commit, dirty state intact.
@@ -1127,7 +1565,7 @@ mod tests {
         let before = status_fingerprint(&sb_path);
         let sb = sandbox_row(&ws, &agent, &sb_path, &branch);
 
-        let (_bundle, manifest) =
+        let TransferBundle { refs: manifest, .. } =
             create_transfer_bundle(&ws, &[sb], &dir.path().join("staging")).unwrap();
         assert_eq!(manifest.sandboxes.len(), 1);
         let entry = &manifest.sandboxes[0];
@@ -1511,8 +1949,11 @@ mod tests {
         let before = status_fingerprint(&repo);
 
         let ws = workspace_for_repo(&repo);
-        let (bundle_path, manifest) =
-            create_transfer_bundle(&ws, &[], &dir.path().join("staging")).unwrap();
+        let TransferBundle {
+            bundle_path,
+            refs: manifest,
+            ..
+        } = create_transfer_bundle(&ws, &[], &dir.path().join("staging")).unwrap();
         assert!(bundle_path.exists());
         let wip = manifest
             .workspace_wip_commit_sha
@@ -1572,5 +2013,297 @@ mod tests {
                 .all(|r| !r.starts_with(TRANSFER_REF_NS)),
             "temp refs cleaned up"
         );
+    }
+
+    /// A tracked submodule with a local-only commit gets its own
+    /// self-contained bundle (listed in `refs.submodules`, cloneable at the
+    /// recorded sha) and leaves no temp ref behind in the submodule repo; a
+    /// published submodule produces no bundle at all.
+    #[test]
+    fn bundle_includes_unpublished_submodules() {
+        use crate::transfer_submodules::test_fixture::{
+            git, local_commit, superproject_with_submodule,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let (sup, origin) = superproject_with_submodule(dir.path());
+        let sub = sup.join("sub");
+        git(&sub, &["checkout", "-q", "main"]);
+        let sha = local_commit(&sub, "wip.txt");
+        let ws = workspace_for_repo(&sup);
+        let staging = dir.path().join("staging");
+
+        let bundle = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        assert_eq!(bundle.submodule_bundles.len(), 1, "{bundle:?}");
+        let (sub_bundle, entry) = &bundle.submodule_bundles[0];
+        assert_eq!(entry, "git/submodules/0.bundle");
+        assert_eq!(sub_bundle, &staging.join("submodules/0.bundle"));
+        assert!(sub_bundle.exists());
+        assert_eq!(bundle.refs.submodules.len(), 1);
+        let s = &bundle.refs.submodules[0];
+        assert_eq!(s.name, "sub");
+        assert_eq!(s.path, "sub");
+        assert_eq!(s.commit_sha, sha);
+        assert_eq!(s.branch.as_deref(), Some("main"));
+        assert_eq!(
+            s.origin_url.as_deref().map(|u| u.trim_end_matches('/')),
+            Some(origin.to_str().unwrap())
+        );
+        assert_eq!(s.bundle_entry, *entry);
+        assert_eq!(s.bundle_ref, submodule_bundle_ref(&ws.id.0, 0));
+        assert!(!s.published);
+
+        // The bundle carries the anchor ref and is cloneable at the sha.
+        let refs = bundle_refs(&sub, sub_bundle);
+        assert!(refs.contains(&s.bundle_ref), "{refs:?}");
+        let clone_dst = dir.path().join("sub-from-bundle");
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                sub_bundle.to_str().unwrap(),
+                clone_dst.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(git(&clone_dst, &["rev-parse", "HEAD"]), sha);
+        assert!(clone_dst.join("wip.txt").exists());
+
+        // No temp refs left in the submodule or superproject repos.
+        assert!(
+            repo_ref_names(&sub)
+                .iter()
+                .chain(repo_ref_names(&sup).iter())
+                .all(|r| !r.starts_with(TRANSFER_REF_NS)),
+            "temp refs cleaned up"
+        );
+
+        // Once pushed, the submodule is published: nothing to bundle.
+        git(&sub, &["push", "-q", "origin", "main"]);
+        let staging2 = dir.path().join("staging2");
+        let bundle = create_transfer_bundle(&ws, &[], &staging2).unwrap();
+        assert!(bundle.submodule_bundles.is_empty());
+        assert!(bundle.refs.submodules.is_empty());
+        assert!(!staging2.join("submodules").exists());
+    }
+
+    /// A nested unpublished submodule (`sub/inner`) is bundled after its
+    /// parent (`sub`), each in its own cloneable bundle with index-based
+    /// entry names, and `refs.submodules` lists them parent-first.
+    #[test]
+    fn bundle_orders_nested_submodules_parent_first() {
+        use crate::transfer_submodules::test_fixture::{
+            git, init_repo, local_commit, superproject_with_submodule,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let inner_src = dir.path().join("inner-src");
+        init_repo(&inner_src);
+        git(
+            dir.path(),
+            &["clone", "-q", "--bare", "inner-src", "inner.git"],
+        );
+        let (sup, _origin) = superproject_with_submodule(dir.path());
+        let sub = sup.join("sub");
+        git(&sub, &["checkout", "-q", "main"]);
+        let inner_origin = dir.path().join("inner.git");
+        git(
+            &sub,
+            &[
+                "submodule",
+                "add",
+                "-q",
+                inner_origin.to_str().unwrap(),
+                "inner",
+            ],
+        );
+        git(&sub, &["commit", "-q", "-m", "add inner"]);
+        let inner = sub.join("inner");
+        git(&inner, &["checkout", "-q", "-b", "feat/x"]);
+        let inner_sha = local_commit(&inner, "deep.txt");
+        // `sub` records the new inner gitlink in a commit that is never
+        // pushed — only a gitlink its HEAD records can be hydrated on import.
+        git(&sub, &["add", "inner"]);
+        git(&sub, &["commit", "-q", "-m", "bump inner"]);
+        let sub_sha = git(&sub, &["rev-parse", "HEAD"]);
+        let ws = workspace_for_repo(&sup);
+        let staging = dir.path().join("staging");
+
+        let bundle = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        assert_eq!(bundle.submodule_bundles.len(), 2, "{bundle:?}");
+        assert_eq!(bundle.refs.submodules.len(), 2);
+        let parent = &bundle.refs.submodules[0];
+        let child = &bundle.refs.submodules[1];
+        assert_eq!(parent.path, "sub");
+        assert_eq!(parent.name, "sub");
+        assert_eq!(parent.commit_sha, sub_sha);
+        assert_eq!(parent.bundle_entry, "git/submodules/0.bundle");
+        assert_eq!(child.path, "sub/inner");
+        assert_eq!(child.name, "inner");
+        assert_eq!(child.commit_sha, inner_sha);
+        assert_eq!(child.branch.as_deref(), Some("feat/x"));
+        assert_eq!(child.bundle_entry, "git/submodules/1.bundle");
+        assert!(!parent.published && !child.published);
+        assert_eq!(bundle.submodule_bundles[0].1, parent.bundle_entry);
+        assert_eq!(bundle.submodule_bundles[1].1, child.bundle_entry);
+
+        for (i, (path, _)) in bundle.submodule_bundles.iter().enumerate() {
+            assert_eq!(path, &staging.join(format!("submodules/{i}.bundle")));
+            let dst = dir.path().join(format!("clone-{i}"));
+            git(
+                dir.path(),
+                &["clone", "-q", path.to_str().unwrap(), dst.to_str().unwrap()],
+            );
+            let expected = if i == 0 { &sub_sha } else { &inner_sha };
+            assert_eq!(&git(&dst, &["rev-parse", "HEAD"]), expected);
+        }
+
+        assert!(
+            [&sup, &sub, &inner]
+                .iter()
+                .flat_map(|p| repo_ref_names(p))
+                .all(|r| !r.starts_with(TRANSFER_REF_NS)),
+            "temp refs cleaned up in every repo"
+        );
+    }
+
+    /// A nested unpublished submodule under a PUBLISHED parent: the parent
+    /// is bundled too (`published: true`, parent-first, cloneable at its
+    /// pushed commit) so the import can check the child out; the archive
+    /// layout is the same as for two unpublished submodules.
+    #[test]
+    fn bundle_carries_published_parent_of_nested_unpublished_submodule() {
+        use crate::transfer_submodules::test_fixture::{
+            git, nested_unpublished_under_published_parent, NestedFixture,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let NestedFixture {
+            sup,
+            sub_origin,
+            inner_origin,
+            sub_sha,
+            inner_sha,
+        } = nested_unpublished_under_published_parent(dir.path());
+        let ws = workspace_for_repo(&sup);
+        let staging = dir.path().join("staging");
+
+        let bundle = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        assert_eq!(bundle.submodule_bundles.len(), 2, "{bundle:?}");
+        assert_eq!(bundle.refs.submodules.len(), 2);
+        let parent = &bundle.refs.submodules[0];
+        let child = &bundle.refs.submodules[1];
+        assert_eq!(parent.path, "sub");
+        assert_eq!(parent.commit_sha, sub_sha);
+        assert_eq!(parent.branch.as_deref(), Some("main"));
+        assert_eq!(
+            parent
+                .origin_url
+                .as_deref()
+                .map(|u| u.trim_end_matches('/')),
+            Some(sub_origin.to_str().unwrap())
+        );
+        assert_eq!(parent.bundle_entry, "git/submodules/0.bundle");
+        assert!(parent.published, "{parent:?}");
+        assert_eq!(child.path, "sub/inner");
+        assert_eq!(child.commit_sha, inner_sha);
+        assert_eq!(
+            child.origin_url.as_deref().map(|u| u.trim_end_matches('/')),
+            Some(inner_origin.to_str().unwrap())
+        );
+        assert_eq!(child.bundle_entry, "git/submodules/1.bundle");
+        assert!(!child.published, "{child:?}");
+
+        for (i, (path, _)) in bundle.submodule_bundles.iter().enumerate() {
+            let dst = dir.path().join(format!("clone-{i}"));
+            git(
+                dir.path(),
+                &["clone", "-q", path.to_str().unwrap(), dst.to_str().unwrap()],
+            );
+            let expected = if i == 0 { &sub_sha } else { &inner_sha };
+            assert_eq!(&git(&dst, &["rev-parse", "HEAD"]), expected);
+        }
+
+        // `published` is additive on the wire: absent reads as false.
+        let json = serde_json::to_value(&bundle.refs).unwrap();
+        assert_eq!(json["submodules"][0]["published"], true);
+        assert_eq!(json["submodules"][1]["published"], false);
+        let mut legacy = json.clone();
+        legacy["submodules"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("published");
+        let back: TransferRefsManifest = serde_json::from_value(legacy).unwrap();
+        assert!(!back.submodules[0].published);
+    }
+
+    /// A submodule bundle that cannot be written (its output path is a
+    /// directory) fails the whole build: the superproject bundle is removed,
+    /// the WIP snapshot is unwound, and no temp ref survives in either repo.
+    #[test]
+    fn submodule_bundle_failure_unwinds_wip_and_leaves_no_files() {
+        use crate::transfer_submodules::test_fixture::{
+            git, local_commit, superproject_with_submodule,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let (sup, _origin) = superproject_with_submodule(dir.path());
+        let sub = sup.join("sub");
+        git(&sub, &["checkout", "-q", "main"]);
+        local_commit(&sub, "wip.txt");
+        fs::write(sup.join("dirty.txt"), "uncommitted\n").unwrap();
+        let head_before = git(&sup, &["rev-parse", "HEAD"]);
+        let sub_head_before = git(&sub, &["rev-parse", "HEAD"]);
+        let before = status_fingerprint(&sup);
+        let ws = workspace_for_repo(&sup);
+        let staging = dir.path().join("staging");
+        // `git bundle create` cannot replace a directory with the bundle.
+        fs::create_dir_all(staging.join("submodules/0.bundle")).unwrap();
+
+        let err = create_transfer_bundle(&ws, &[], &staging).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("git bundle create for submodule sub failed"),
+            "error names the submodule: {err}"
+        );
+
+        assert!(!staging.join(format!("{}.bundle", ws.id.0)).exists());
+        let leftover: Vec<_> = fs::read_dir(staging.join("submodules"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no submodule bundle files: {leftover:?}"
+        );
+
+        assert_eq!(
+            git(&sup, &["rev-parse", "HEAD"]),
+            head_before,
+            "WIP unwound"
+        );
+        assert_eq!(git(&sup, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert_eq!(status_fingerprint(&sup), before);
+        assert_eq!(git(&sub, &["rev-parse", "HEAD"]), sub_head_before);
+        assert_eq!(git(&sub, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert!(
+            repo_ref_names(&sup)
+                .iter()
+                .chain(repo_ref_names(&sub).iter())
+                .all(|r| !r.starts_with(TRANSFER_REF_NS)),
+            "temp refs cleaned up"
+        );
+    }
+
+    /// A `refs.json` written before `submodules` existed still decodes.
+    #[test]
+    fn refs_manifest_without_submodules_field_decodes() {
+        let legacy = r#"{
+            "workspaceBranch": "main",
+            "workspaceBundleRef": "refs/heads/main",
+            "workspaceHeadSha": "0123456789abcdef0123456789abcdef01234567",
+            "sandboxes": []
+        }"#;
+        let refs: TransferRefsManifest = serde_json::from_str(legacy).unwrap();
+        assert!(refs.submodules.is_empty());
+        assert!(refs.sandboxes.is_empty());
+        assert!(refs.workspace_wip_commit_sha.is_none());
     }
 }

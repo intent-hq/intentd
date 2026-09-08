@@ -6,7 +6,7 @@
 //! already covers the resolution order at the service-layer seam; this file
 //! locks the same behavior through the router + a real WSS connection:
 //! - no explicit `model`, no specialist → the configured default
-//!   (`providers.active`) is resolved onto the created session, never left
+//!   (`model.defaultProvider`) is resolved onto the created session, never left
 //!   to fall through to the hardcoded default provider (Auggie).
 //! - an unavailable configured default fails the RPC with a clear error
 //!   naming the configured provider, never silently substituting Auggie.
@@ -234,7 +234,7 @@ fn gate() -> Option<String> {
 }
 
 /// D2 step 2: no explicit `model`, no specialist — `agent.delegate` resolves
-/// the configured default (`providers.active`) onto the created session,
+/// the configured default (`model.defaultProvider`) onto the created session,
 /// instead of leaving `provider` unset and falling through to the spawn
 /// path's hardcoded default (Auggie).
 #[tokio::test]
@@ -282,7 +282,7 @@ async fn delegate_resolves_configured_default_provider_over_wss() {
         &mut ws,
         20,
         "settings.update",
-        json!({ "changes": [{ "path": "providers.active", "value": "mock" }] }),
+        json!({ "changes": [{ "path": "model.defaultProvider", "value": "mock" }] }),
     )
     .await;
 
@@ -317,7 +317,7 @@ async fn delegate_resolves_configured_default_provider_over_wss() {
     );
 }
 
-/// D2 step 3 (error path): the configured default (`providers.active`) is
+/// D2 step 3 (error path): the configured default (`model.defaultProvider`) is
 /// unavailable — `agent.delegate` fails the RPC with a clear error naming the
 /// configured provider, never silently substituting/spawning the hardcoded
 /// default provider (Auggie).
@@ -357,7 +357,7 @@ async fn delegate_errors_not_auggie_when_configured_default_unavailable_over_wss
         &mut ws,
         20,
         "settings.update",
-        json!({ "changes": [{ "path": "providers.active", "value": "mock" }] }),
+        json!({ "changes": [{ "path": "model.defaultProvider", "value": "mock" }] }),
     )
     .await;
 
@@ -387,7 +387,7 @@ async fn delegate_errors_not_auggie_when_configured_default_unavailable_over_wss
     );
 }
 
-/// monorepo#3044: nothing configured at all (`providers.active` unset, no
+/// monorepo#3044: nothing configured at all (`model.defaultProvider` unset, no
 /// compound `model.default`) — `agent.delegate` without an explicit
 /// provider/model fails the RPC with `-32602` and a clear "no default
 /// provider/model is configured" message, never silently spawning the former
@@ -505,7 +505,7 @@ async fn delegate_explicit_provider_param_over_wss() {
         &mut ws,
         20,
         "settings.update",
-        json!({ "changes": [{ "path": "providers.active", "value": "codex" }] }),
+        json!({ "changes": [{ "path": "model.defaultProvider", "value": "codex" }] }),
     )
     .await;
 
@@ -688,7 +688,7 @@ async fn create_and_delegate_reject_hard_false_auth_verdict_over_wss() {
         &mut ws,
         30,
         "settings.update",
-        json!({ "changes": [{ "path": "providers.active", "value": "opencode" }] }),
+        json!({ "changes": [{ "path": "model.defaultProvider", "value": "opencode" }] }),
     )
     .await;
 

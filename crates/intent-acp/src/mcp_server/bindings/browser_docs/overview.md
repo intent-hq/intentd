@@ -81,31 +81,52 @@ Agent-opened tabs start hidden: `openTab` without `visible: true` creates the ta
 hidden — alive, owned by you, emulated (the sizing invariant above is unchanged),
 returned by `listTabs` with `visibility: "hidden"`, and rendering offscreen — with no
 panel mount and no focus or active-tab change. Pass `visible: true` to open directly
-into the user's panel layout. Per-agent `openTab` dedupe matches regardless of
+into the user's panel layout: the tab is mounted AND made its panel's active tab
+without stealing panel/keyboard focus, on every `position` (`adjacent`, `same`, or a
+`replace` that falls back to a new tab). The `openTab` result carries an **optional**
+`displayed` (see below): present when the layout confirmed the tab's display state,
+absent when that state is unknown (the layout could not be read, or the tab was not
+in the fresh tab list) — absence means unknown, NOT `false`; re-check with
+`listTabs`. Only `visible: true` requests carry it (a dedupe reuse under `visible: true`
+reports the reused tab's real display state); default hidden opens and reuses without
+`visible: true` omit it. Per-agent `openTab` dedupe matches regardless of
 visibility — a same-URL reopen reuses your tab whether it is hidden or visible — and a
 dedupe hit never changes the reused tab's visibility: a hidden tab stays hidden even
 when the `openTab` carried `visible: true` (and a visible tab stays visible).
 Revealing an existing tab is `showTab`-only.
 
-- `{ action: "showTab", tabId, focus? }` - Reveal a hidden tab by activating it in a
-  visible panel. Owner-only: on a tab you do not own it returns the structured
+- `{ action: "showTab", tabId, focus? }` - Activate an owned tab in a visible panel:
+  reveals a hidden tab, or brings a visible-but-inactive tab to the front of its
+  panel. Owner-only: on a tab you do not own it returns the structured
   `not-owner` error. `focus` defaults to false: the tab is activated in a visible
   panel without moving panel/keyboard focus and without displacing the
-  currently-viewed conversation; `focus: true` reveals AND focuses — the tab becomes
+  currently-viewed conversation; `focus: true` activates AND focuses — the tab becomes
   its panel's active tab and the panel takes focus. The reveal is persisted: a
-  revealed tab stays visible across app restarts. Idempotent on an already-visible
-  tab: with `focus: false` it is a no-op success; with `focus: true` it still
-  activates the tab and focuses its panel. An unknown `tabId` fails as an
-  action-result error naming the unknown id.
-- `listTabs` results carry `visibility: "visible" | "hidden"` on every tab.
+  revealed tab stays visible across app restarts. Idempotent on an already-displayed
+  tab (a no-op success with `focus: false`; `focus: true` still focuses its panel).
+  An unknown `tabId` fails as an action-result error naming the unknown id.
+- `listTabs` results carry `visibility: "visible" | "hidden"` on every tab, plus an
+  unconditional `displayed: boolean` — a fact about the saved layout, not a paint
+  guarantee: true when the tab is visible AND its panel's active tab (derived from the
+  panel that holds the tab). `visibility: "visible"` alone
+  does not mean the tab can paint: a visible tab that is not its panel's active tab
+  is mounted but renders nothing, so `visibility: "visible", displayed: false` is the
+  "sits behind another tab" state — `showTab` it (default `focus: false`) to bring it
+  to the front. Hidden tabs are always `displayed: false`. A `displayed: true` tab
+  actually paints only while its workspace is in view in the app and its panel is
+  not hidden (e.g. by another panel being zoomed/expanded); `displayed` does not
+  track either condition.
 - `focusTab` is unchanged for visible tabs (activate + focus the panel). On a hidden
   tab it fails with an action-result error directing you to `showTab` — there is no
   focusTab overload that reveals a hidden tab.
 
 Hidden tabs are fully usable for background work — screenshots, evaluation, and
-navigation are deterministic offscreen thanks to viewport emulation. Reveal a tab
-only when the user should see it, and prefer the default `focus: false` so you never
-steal focus.
+navigation are deterministic offscreen thanks to viewport emulation. A **visible**
+tab, by contrast, paints only while it is on screen: a screenshot of a
+`visibility: "visible", displayed: false` tab fails with a not-painting error that
+points at `showTab`, and even a `displayed: true` tab fails the same way while its
+workspace is not in view or its panel is hidden by zoom. Reveal a tab only when the
+user should see it, and prefer the default `focus: false` so you never steal focus.
 
 Tab operations do not require the workspace to be currently open/visible in the app:
 every action (`openTab` hidden or visible, `closeTab`, `showTab`, `evaluate`,
@@ -121,7 +142,7 @@ carries an additive `warning` string stating that the workspace is not visible s
 UI focus was attempted (the field is absent when the workspace is visible).
 
 ## Basic Actions
-- `{ action: "listTabs", scope? }` - List browser tabs (`scope: "mine" | "unclaimed" | "all"`, default `all`) with ownership, sizing, and visibility info
+- `{ action: "listTabs", scope? }` - List browser tabs (`scope: "mine" | "unclaimed" | "all"`, default `all`) with ownership, sizing, visibility, and `displayed` (visible AND its panel's active tab) info
 - `{ action: "getAccessibilityTree", tabId? }` - Get page structure as YAML
 - `{ action: "screenshot", tabId? }` - Take a screenshot
 - `{ action: "evaluate", expression, tabId? }` - Run JavaScript in the page
@@ -142,10 +163,10 @@ UI focus was attempted (the field is absent when the workspace is visible).
 
 ## UI Control
 - `{ action: "openTab", url, position?, visible?, width?, height? }` - Open a new browser tab, owned by you; hidden by default (see Tab Visibility)
-  - visible: true opens directly into the UI; omitted/false creates the tab hidden
+  - visible: true opens directly into the UI, activated in its panel without stealing focus on any position; the result carries `displayed` when the layout confirmed it and omits it when unknown (absent ≠ false); omitted/false creates the tab hidden
   - position: 'adjacent' (default), 'replace', or 'same'
   - width/height: emulated viewport size in CSS px; omitted width defaults to 1280, omitted height to 800
-- `{ action: "showTab", tabId, focus? }` - Reveal a hidden owned tab; focus: true also activates it (see Tab Visibility)
+- `{ action: "showTab", tabId, focus? }` - Activate an owned tab in a visible panel without stealing focus (reveals a hidden tab, or brings a visible-but-inactive one to the front); focus: true also focuses it (see Tab Visibility)
 - `{ action: "claimTab", tabId, width, height? }` - Claim an unowned (user) tab (see Tab Ownership & Sizing)
 - `{ action: "resizeTab", tabId, width, height? }` - Change an owned tab's emulated size
 - `{ action: "closeTab", tabId }` - Close a browser tab

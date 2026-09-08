@@ -354,11 +354,11 @@ fn gate(test: &str) -> Option<String> {
 const MARKER: &str = "MCP_TOOL_MARKER_wss_e2e";
 
 /// Full agent lifecycle over WSS (steps 1–9 of the task note): events.subscribe
-/// + client.hello → agent.create → agent.sendMessage → assert ≥1 chunk + one
-/// terminal stream:end + ≥1 note:updated → note.get sees the MCP-mutated body →
-/// agent.list reports an assistant message persisted.
+/// + client.hello → agent.create → agent.sendMessage → the mock agent calls
+/// `ws.note.saveAsset` and `ws.note.add` through MCP → note.readAsset proves the
+/// returned URL is readable → agent.list reports an assistant message persisted.
 #[tokio::test]
-async fn mock_agent_full_turn_over_wss() {
+async fn mock_agent_full_turn_saves_readable_asset_over_wss() {
     let Some(script) = gate("WSS full-turn E2E") else {
         return;
     };
@@ -368,10 +368,12 @@ async fn mock_agent_full_turn_over_wss() {
     // process starts so it gets a clean handle. Mirrors the UDS analogue.
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
-    // Post-WSAPI-8: agent-supplied JS via `workspace_api` replaces the
-    // discrete `add_to_note` tool.
+    // The agent saves generated media, then embeds the returned URL in a note.
+    // Both calls run through the production workspace_api MCP bridge.
     let js = format!(
-        "return await ws.note.add({}, {{ content: {} }});",
+        "const asset = await ws.note.saveAsset({{ data: 'AAAA', mimeType: 'video/webm', originalName: 'clip.webm' }}); \
+         await ws.note.add({}, {{ content: {} + '\\n![clip](' + asset.url + ')' }}); \
+         return asset;",
         json!(note_id),
         json!(MARKER),
     );
@@ -381,7 +383,7 @@ async fn mock_agent_full_turn_over_wss() {
     let behavior = json!({
         "toolCall": {
             "name": "workspace_api",
-            "arguments": { "code": js, "summary": "WSS E2E ws.note.add" },
+            "arguments": { "code": js, "summary": "WSS E2E ws.note.saveAsset" },
         },
         "response": "first line done\nadded via mcp over wss",
     })
@@ -604,9 +606,28 @@ async fn mock_agent_full_turn_over_wss() {
                 .contains(MARKER),
         "note mutated by the daemon-spawned MCP tool call over WSS: {note}"
     );
+    let content = note["note"]["content"]
+        .as_str()
+        .or_else(|| note["content"].as_str())
+        .expect("note content");
+    let asset_url = content
+        .split_once("![clip](")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(url, _)| url)
+        .expect("agent embedded the returned asset URL");
+    let asset = wss_rpc(
+        &mut rpc,
+        14,
+        "note.readAsset",
+        json!({ "workspaceId": ws_id, "asset": asset_url }),
+    )
+    .await;
+    assert_eq!(asset["assetId"].as_str(), asset_url.rsplit('/').next());
+    assert_eq!(asset["mimeType"], "video/webm");
+    assert_eq!(asset["data"], "AAAA");
 
     // Assistant message persisted (AgentLite messageCount ≥ 1).
-    let list = wss_rpc(&mut rpc, 14, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let list = wss_rpc(&mut rpc, 15, "agent.list", json!({ "workspaceId": ws_id })).await;
     let agents = list["agents"].as_array().expect("agents array");
     let listed = agents
         .iter()
@@ -5316,6 +5337,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -5871,10 +5893,39 @@ async fn terminal_create_env_over_wss() {
     .await;
     assert_eq!(buffer["terminalId"], json!(terminal_id));
     assert!(buffer["data"].is_string(), "retained scrollback: {buffer}");
+    let full = base64::engine::general_purpose::STANDARD
+        .decode(buffer["data"].as_str().unwrap())
+        .expect("full buffer is base64");
+
+    let bounded = wss_rpc(
+        &mut rpc,
+        5,
+        "terminal.getBuffer",
+        json!({ "terminalId": terminal_id, "maxBytes": 4 }),
+    )
+    .await;
+    let tail = base64::engine::general_purpose::STANDARD
+        .decode(bounded["data"].as_str().unwrap())
+        .expect("bounded buffer is base64");
+    assert_eq!(tail, full[full.len().saturating_sub(4)..]);
+
+    let formatted = wss_rpc(
+        &mut rpc,
+        6,
+        "terminal.readOutput",
+        json!({ "workspaceId": ws_id, "terminalId": terminal_id, "maxLines": 100 }),
+    )
+    .await;
+    assert!(
+        formatted
+            .as_str()
+            .is_some_and(|text| text.contains("MY_TEST_VAR=PROT_MARKER_env_wss")),
+        "post-exit readOutput retains formatted scrollback: {formatted}"
+    );
 
     let released = wss_rpc(
         &mut rpc,
-        5,
+        7,
         "terminal.kill",
         json!({ "terminalId": terminal_id }),
     )
@@ -12807,6 +12858,12 @@ async fn edit_and_regenerate_rejects_bad_message_ids_over_wss() {
 /// Before the fix, the abort dropped the live-turn slot unflushed: the
 /// persisted transcript had no assistant row, so the reconcile emitted the
 /// streamed block id in `removedIds` and the FE erased the partial output.
+///
+/// Also covers intent#4409 over the real wire: every terminal entity carries
+/// the persisted row's `metadata` verbatim (byte-identical to the row
+/// `agent.getConversation` serves), while the live pre-terminal entity carried
+/// none — so a subscribe-only client renders the interrupted state without a
+/// refetch.
 #[tokio::test]
 async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
     let Some(script) = gate("WSS interrupt partial-flush E2E") else {
@@ -12923,6 +12980,12 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
                         .is_some_and(|t| t.contains("streaming-before-cancel"))
                 })
             {
+                // Live (pre-terminal) entities carry no row metadata — there
+                // is no persisted row yet to lift it from.
+                assert!(
+                    entity.get("metadata").is_none(),
+                    "live chunk entity carries no row metadata: {entity}"
+                );
                 return entity["block"]["id"].as_str().map(String::from);
             }
         }
@@ -13001,6 +13064,33 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
             .contains("streaming-before-cancel"),
         "the streamed-so-far text persisted: {assistant}"
     );
+
+    // intent#4409: the terminal `subscription.push` entities lift the persisted
+    // row's `metadata` verbatim — byte-identical to what `agent.getConversation`
+    // serves — so the reduced subscribe-only state matches a fresh snapshot.
+    assert_eq!(
+        assistant["metadata"]["interruptReason"],
+        json!("user_stop"),
+        "assistant row carries the machine-readable reason: {assistant}"
+    );
+    let terminal_entities: Vec<&Value> = ["added", "updated"]
+        .iter()
+        .flat_map(|key| terminal[*key].as_array().into_iter().flatten())
+        .collect();
+    assert!(
+        !terminal_entities.is_empty(),
+        "terminal frame carries entities: {terminal}"
+    );
+    for entity in terminal_entities {
+        assert_eq!(
+            entity["messageId"], assistant["id"],
+            "terminal entity points at the persisted row: {entity}"
+        );
+        assert_eq!(
+            entity["metadata"], assistant["metadata"],
+            "terminal entity lifts the persisted row metadata verbatim: {entity}"
+        );
+    }
 }
 
 /// §7.1: a tool completing with a proposal-MIME resource item in its output

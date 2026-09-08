@@ -18,6 +18,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 use crate::browser;
 use crate::client;
@@ -28,8 +29,10 @@ use crate::events::{self, FastPath};
 use crate::forward::{self, ForwardRegistry};
 use crate::host;
 use crate::panic_guard;
-use crate::reverse::ReverseChannel;
-use crate::router::{check_envelope, handle_message, EnvelopeCheck};
+use crate::reverse::{PrimaryReverseGuard, ReverseChannel};
+use crate::router::{
+    check_envelope, handle_message, EnvelopeCheck, RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET,
+};
 use crate::rpc_limit::{Overloaded, RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
 use crate::subscriptions::{self, Channel, SubFastPath};
 
@@ -205,6 +208,7 @@ impl Drop for ConnSub {
 #[derive(Default)]
 pub(crate) struct ConnSubs {
     subs: HashMap<String, ConnSub>,
+    setup: crate::provider_setup::Connection,
 }
 
 impl ConnSubs {
@@ -254,7 +258,10 @@ impl ConnSubs {
 ///
 /// The fast-paths that mutate per-connection state (`reverse.route_response`,
 /// `system.*`, `forward.*`, `client.hello`, `drafts.*`, `events.`/subscription
-/// fast-paths) run inline on the read loop and stay serialized. The two
+/// fast-paths) run inline on the read loop and stay serialized. A successful
+/// `client.hello` also binds the connection's logical identity onto its
+/// `reverse_guard` registry entry (REV-2 target selection) and publishes the
+/// global `client:connected` event when the logical client came online. The two
 /// stateless slow paths — `host::handle` and the [`handle_message`] JSON-RPC
 /// dispatcher — are spawned onto detached tokio tasks that write their response
 /// frame through a cloned outbound sender, so a long-running request (e.g.
@@ -286,6 +293,7 @@ pub(crate) async fn process_frame(
     subs: &mut ConnSubs,
     forwards: &mut ForwardRegistry,
     reverse: &ReverseChannel,
+    reverse_guard: &PrimaryReverseGuard,
     control: Option<&Arc<dyn SystemControl>>,
     server_pairing_info: Option<&Arc<dyn crate::server::ServerPairingInfo>>,
     client_id: &mut Option<ClientId>,
@@ -370,7 +378,22 @@ pub(crate) async fn process_frame(
                 };
             }
         }
+        if let Some(req) = crate::provider_setup::classify(value) {
+            let frame = panic_guard::guard_frame(
+                &method,
+                rpc_id.clone(),
+                subs.setup.handle(req, api.as_ref(), reverse),
+            )
+            .await;
+            return match frame {
+                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                None => true,
+            };
+        }
         if let Some(req) = host::classify(value) {
+            let host_environment = control
+                .map(|control| control.host_environment())
+                .or_else(|| server_pairing_info.map(|info| info.host_environment()));
             // Slow path: spawn so `host.exec` and friends can't block the read
             // loop (UDS HOL fix). `openInEditor` in particular awaits an
             // FE-served reverse RPC on this same connection (§5.14) — running
@@ -400,7 +423,14 @@ pub(crate) async fn process_frame(
                         panic_guard::guard_frame(
                             &method,
                             rpc_id,
-                            host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse),
+                            host::handle_with_host_environment(
+                                req,
+                                api.as_ref(),
+                                Some(&bus),
+                                host_environment,
+                                is_local,
+                                &reverse,
+                            ),
                         ),
                         slot,
                     )
@@ -414,7 +444,14 @@ pub(crate) async fn process_frame(
             // Slow path: `browser.exec` awaits an FE-served reverse RPC on this
             // same connection (§12.4), so run it off the read loop for the same
             // reason as `host::classify` — inline would block frame reads until
-            // the reverse timeout.
+            // the reverse timeout. The registry methods share the path (they
+            // hit SQLite) and take the connection's hello'd identity as the
+            // reporting host plus the reverse registry for presence. The host
+            // is the identity `client.hello` bound onto the registry entry —
+            // not the `client_id` slot, which `drafts.*` mints lazily without
+            // a handshake and must not qualify a connection to host tabs. Only
+            // the host reports resolve it (an O(1) index lookup); `listTabs` /
+            // `exec` do not use it and skip the lock entirely.
             let Ok(slot) = out_tx.reserve_priority().await else {
                 return false;
             };
@@ -426,13 +463,29 @@ pub(crate) async fn process_frame(
                 }
             };
             let reverse = reverse.clone();
+            let api = Arc::clone(api);
+            let host_client_id = req
+                .method
+                .reports_as_host()
+                .then(|| reverse_guard.bound_client_id())
+                .flatten();
+            let registry = reverse_guard.registry();
             let is_tcp = crate::context::is_tcp_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
                 crate::context::with_connection_context(is_tcp, async {
+                    let tabs = browser::TabContext {
+                        api: api.as_ref(),
+                        client_id: host_client_id.as_ref(),
+                        registry: registry.as_ref(),
+                    };
                     finish_slow_path_rpc(
                         permit,
-                        panic_guard::guard_frame(&method, rpc_id, browser::handle(req, &reverse)),
+                        panic_guard::guard_frame(
+                            &method,
+                            rpc_id,
+                            browser::handle(req, &reverse, tabs),
+                        ),
                         slot,
                     )
                     .await;
@@ -454,12 +507,33 @@ pub(crate) async fn process_frame(
             };
         }
         if let Some(req) = client::classify(value) {
-            let frame = panic_guard::guard_frame(
-                &method,
-                rpc_id.clone(),
-                client::handle(req, api.as_ref(), client_id, is_local),
-            )
+            let setup_requested = req.id_present
+                && req
+                    .capabilities
+                    .as_ref()
+                    .and_then(|v| v.get("antigravitySetup"))
+                    .and_then(Value::as_u64)
+                    == Some(1);
+            // A new hello revokes the previous connection-local operation.
+            subs.setup = crate::provider_setup::Connection::default();
+            let mut bound = None;
+            let frame = panic_guard::guard_frame(&method, rpc_id.clone(), async {
+                let outcome = client::handle(req, api.as_ref(), client_id, is_local).await;
+                bound = outcome.bound;
+                outcome.frame
+            })
             .await;
+            // REV-2: bind the hello'd identity onto the registry entry; the
+            // registry queues and publishes any `client:*` transition.
+            if let Some(identity) = bound {
+                reverse_guard.bind(identity);
+            }
+            subs.setup.authorized = setup_requested
+                && !crate::context::is_tcp_connection()
+                && frame
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .is_some_and(|v| v.get("result").is_some());
             return match frame {
                 Some(frame) => out_tx.send_priority(frame).await.is_ok(),
                 None => true,
@@ -1432,6 +1506,24 @@ async fn forward_channel_subscription(
         let (snapshot, links) = subscriptions::task_snapshot(api.as_ref(), &workspace_id).await;
         spec_links = links;
         snapshot
+    } else if channel == Channel::Workspace {
+        // The workspace subscribe fast-path bypasses router::dispatch, but its
+        // seq-0 aggregate read has the same bounded-statement contract as
+        // workspace.list. Give that read the canonical profiling span so the
+        // runtime guardrail and real-daemon integration tests can attribute
+        // sqlx statements to `workspace.subscribe`.
+        let span = tracing::info_span!(
+            target: RPC_DISPATCH_SPAN_TARGET,
+            RPC_DISPATCH_SPAN_NAME,
+            method = "workspace.subscribe",
+            response_bytes = tracing::field::Empty,
+            encode_elapsed_ms = tracing::field::Empty,
+            oversized_replacement = tracing::field::Empty,
+            encode_failed = tracing::field::Empty,
+        );
+        subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
+            .instrument(span)
+            .await
     } else {
         subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
             .await

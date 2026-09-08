@@ -10,7 +10,7 @@
 /// one-line code change here.
 macro_rules! claude_agent_acp_version {
     () => {
-        "0.66.0"
+        "0.73.0"
     };
 }
 
@@ -34,7 +34,7 @@ pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
 /// Pinned npx package spec for the codex ACP fallback. intentd is the only
 /// pin site (cloudlands-fe no longer pins a managed codex-acp version);
 /// bumping the version is a deliberate code change.
-pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.6.2";
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.9.0";
 
 /// Pinned npx package spec the pi provider is ALWAYS spawned with (via
 /// `npx -y`). Mirrors the FE pin (`PI_ACP_NPX_PACKAGE` in `pi-resolver.ts`);
@@ -208,11 +208,26 @@ pub struct ProviderConfig {
     /// package via `npx -y <package>`. Only set for providers shipped as npm
     /// packages (e.g. codex's `@agentclientprotocol/codex-acp`).
     pub fallback_npx_package: Option<&'static str>,
-    /// When set, the provider is ALWAYS spawned via `npx -y <package>` with a
-    /// version pinned by us — local binary discovery (settings path, managed
-    /// bin, PATH scan) is skipped entirely, so the adapter version is under our
-    /// release cadence (claude-code's [`CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
+    /// When set, the provider is spawned via `npx -y <package>` with a
+    /// version pinned by us — auto-discovery (managed bin, PATH scan) is
+    /// skipped entirely, so the adapter version is under our release cadence
+    /// (claude-code's [`CLAUDE_AGENT_ACP_NPX_PACKAGE`]). The one exception is
+    /// an explicit `providers.paths[id]` override for providers that opt in
+    /// via [`Self::npx_only_honors_path_override`].
     pub npx_only_package: Option<&'static str>,
+    /// For npx-only providers ([`Self::npx_only_package`]): whether a valid
+    /// (absolute, executable) `providers.paths[id]` override is exec'd
+    /// directly in place of the pinned npx spawn — on every surface (ACP
+    /// session spawn, discovery `installed`, one-shot / test-prompt launches,
+    /// the ACP auth fallback probe) — so users can track the adapter
+    /// themselves (intent-hq/monorepo#4352). An invalid override contributes
+    /// nothing and the pinned spawn applies. Opt-in per provider: claude-code
+    /// (a self-contained adapter). pi stays pinned-npx-only — its adapter
+    /// additionally routes through the version-gated real `pi` CLI and the
+    /// extension wrapper, and its auth probe runs the pinned package, so an
+    /// override there would advertise `installed` for a spawn that still
+    /// fails the `pi` CLI gate.
+    pub npx_only_honors_path_override: bool,
     /// When set, discovery (`discover_providers`) only reports this provider
     /// as `installed` when BOTH `command` AND this secondary CLI resolve.
     /// Unsloth rides the `opencode` binary as its ACP runtime (`command`) but
@@ -244,6 +259,13 @@ pub struct ProviderConfig {
     /// next `agent.sendMessage` respawns the child and resumes the session
     /// via the normal `session/load` ladder.
     pub kills_child_on_interrupt: bool,
+    /// Whether the provider supports the live test-prompt probe
+    /// (`host.providerTestPrompt`): an ephemeral end-to-end ACP prompt used
+    /// by onboarding to verify the provider actually answers. `false` for
+    /// unsloth — its first prompt can trigger a very long model
+    /// download/load cycle, so a bounded probe would time out spuriously.
+    /// Antigravity also opts out because it requires a private guarded profile.
+    pub supports_test_prompt: bool,
 }
 
 impl ProviderConfig {
@@ -287,10 +309,12 @@ impl ProviderConfig {
             login_docs_url: None,
             fallback_npx_package: None,
             npx_only_package: None,
+            npx_only_honors_path_override: false,
             requires_secondary_binary: None,
             terminal_requires_shell: false,
             truncates_tool_descriptions: false,
             kills_child_on_interrupt: false,
+            supports_test_prompt: true,
         }
     }
 
@@ -380,6 +404,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             "https://code.claude.com/docs/en/quickstart#step-2-log-in-to-your-account",
         ),
         npx_only_package: Some(CLAUDE_AGENT_ACP_NPX_PACKAGE),
+        npx_only_honors_path_override: true,
         short_name: "Claude Code",
         // Claude Code silently truncates MCP tool descriptions at ~2k chars
         // (anthropics/claude-code#53933): serve the compact `workspace_api`
@@ -394,9 +419,9 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // time and DOES get the NODE_OPTIONS heap cap
         // (`build_provider_env_for_spawn`, intent-hq/monorepo#1661).
         can_be_disabled: true,
-        // The pinned @agentclientprotocol/codex-acp adapter (1.6.2) ignores
+        // The pinned @agentclientprotocol/codex-acp adapter (1.9.0) ignores
         // `_meta.developerInstructions` (verified empirically, #479; still
-        // true at 1.6.2 — the adapter never reads that key from session
+        // true at 1.9.0 — the adapter never reads that key from session
         // params), so the system prompt is delivered via the first-turn
         // `<system>` prepend instead of SessionMeta.
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
@@ -481,6 +506,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // `unsloth start opencode` directly, independent of the ACP spawn.
         requires_secondary_binary: Some("unsloth"),
         short_name: "Unsloth",
+        // The first prompt can trigger a very long model download/load
+        // cycle, so the bounded `host.providerTestPrompt` probe would time
+        // out spuriously.
+        supports_test_prompt: false,
         ..ProviderConfig::empty("unsloth", "Unsloth", "opencode")
     },
     ProviderConfig {
@@ -581,6 +610,21 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("grok", "Grok Build", "grok")
     },
     ProviderConfig {
+        short_name: "Antigravity",
+        can_be_disabled: true,
+        // Generic one-shot probes bypass the private Antigravity profile.
+        supports_test_prompt: false,
+        supports_config_option_model: true,
+        supports_session_mcp_servers: true,
+        injection_mechanism: InjectionMechanism::FirstTurnPrepend,
+        auth_error_patterns: Some(&["authentication required", "intent_acp_auth_required"]),
+        login_command_hint: Some("intentd provider login antigravity"),
+        login_docs_url: Some("https://antigravity.google/docs/ide/extensions"),
+        // Saved personal OAuth is reused by session/new. Do not send the
+        // generic authenticate method "none", or map AllowAll to yolo.
+        ..ProviderConfig::empty("antigravity", "Google Antigravity", "antigravity-acp")
+    },
+    ProviderConfig {
         runtime: ProviderRuntime::Node,
         supports_authenticate: true,
         can_be_disabled: true,
@@ -598,9 +642,8 @@ pub fn find_provider(provider_id: &str) -> Option<&'static ProviderConfig> {
 }
 
 /// The first registered provider — a neutral positional last resort used
-/// ONLY when no settings-derived default (provider of `model.default`, else
-/// `providers.active`) is reachable. No provider carries a privileged
-/// default designation.
+/// ONLY when no settings-derived default (`model.defaultProvider`) is
+/// reachable. No provider carries a privileged default designation.
 pub(crate) fn first_provider_config() -> &'static ProviderConfig {
     ACP_PROVIDERS
         .first()

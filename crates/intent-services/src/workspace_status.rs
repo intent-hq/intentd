@@ -16,13 +16,13 @@
 //! cache internals are private to this module, so nothing outside it can
 //! emit `workspace:displayStatus-changed` or touch the baseline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use intent_core::events::{WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_WAITING_CHANGED};
 use intent_core::{
-    now_iso, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceDisplayStatus, WorkspaceId, WorkspaceTaskStats,
+    now_iso, AgentId, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity,
+    WorkspaceAttention, WorkspaceDisplayStatus, WorkspaceId, WorkspaceTaskStats,
 };
 use intent_store::NewEvent;
 
@@ -185,6 +185,20 @@ impl Services {
         sessions: Option<&[intent_core::AgentSession]>,
         unread: Option<bool>,
     ) {
+        self.enrich_display_status_with_snapshot(ws, sessions, unread, None)
+            .await;
+    }
+
+    /// List-shaped variant of [`Self::enrich_display_status`]. All store-backed
+    /// signals are supplied by one bulk snapshot, so this method performs only
+    /// in-memory enrichment and cache seeding for each row.
+    pub(crate) async fn enrich_display_status_with_snapshot(
+        &self,
+        ws: &mut Workspace,
+        sessions: Option<&[intent_core::AgentSession]>,
+        unread: Option<bool>,
+        snapshot: Option<WorkspaceStatusSnapshot<'_>>,
+    ) {
         // Served `attention` is DERIVED on this same emit path (§5.1):
         // `unread` = any top-level (non-background, non-deleted) session
         // whose newest user/assistant message is an unseen assistant message
@@ -235,7 +249,10 @@ impl Services {
             // eviction racing the probe must not have this seed
             // resurrect the baseline.
             let waiting_generation = self.last_waiting_statuses.generation();
-            let waiting = self.workspace_is_waiting(&ws.id).await;
+            let waiting = match snapshot {
+                Some(snapshot) => snapshot.waiting,
+                None => self.workspace_is_waiting(&ws.id).await,
+            };
             self.last_waiting_statuses
                 .seed(&ws.id, waiting, waiting_generation);
             waiting
@@ -254,13 +271,21 @@ impl Services {
         // agent-monitored PRs DO feed the PR rungs: an active monitor on an
         // open PR (including cross-repo) reads as an open-PR signal.
         let display_status = compute_display_status(
-            self.workspace_attention_signals(&ws.id, ws.attention, sessions)
-                .await,
+            self.workspace_attention_signals_with_legacy_holds(
+                &ws.id,
+                ws.attention,
+                sessions,
+                snapshot.map(|snapshot| snapshot.legacy_question_holds),
+            )
+            .await,
             ws.activity == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
-            self.workspace_monitor_pr_signals(&ws.id).await,
+            match snapshot {
+                Some(snapshot) => snapshot.monitor_pr_signals,
+                None => self.workspace_monitor_pr_signals(&ws.id).await,
+            },
             ws.task_stats.as_ref(),
         );
         self.last_display_statuses
@@ -435,7 +460,7 @@ impl Services {
     /// - `blocked` — a top-level pending `blocker` attention request.
     /// - `needs_attention` — a top-level pending non-blocker attention
     ///   request (`discussion`), pending structured questions
-    ///   ([`Services::question_hold_active`] — pending until answered or
+    ///   ([`Services::questions_pending`] — pending until answered or
     ///   dismissed, so a question the user walked away from keeps the
     ///   workspace flagged across the agent's later turns and daemon
     ///   restarts), or the workspace `attention` flag at `review_required`.
@@ -448,10 +473,10 @@ impl Services {
     /// deferred-attention registry does not count either: the workspace
     /// stays `in_progress` until the raising agent's turn-end flush
     /// surfaces the request. The cheap metadata
-    /// checks run over every candidate first, so the per-session hold reads
+    /// checks run over every candidate first, so the per-session pending reads
     /// only happen when `needs_attention` is still undecided. Best-effort: a
     /// store read failure fails open — session-derived signals read `false`
-    /// (and `question_hold_active` fails open itself) so list/get emission
+    /// (and `questions_pending` fails open itself) so list/get emission
     /// is never wedged; the flag-derived signal needs no store read.
     ///
     /// `sessions` — the workspace's session summaries when the caller already
@@ -463,6 +488,17 @@ impl Services {
         workspace_id: &WorkspaceId,
         attention: WorkspaceAttention,
         sessions: Option<&[intent_core::AgentSession]>,
+    ) -> AttentionSignals {
+        self.workspace_attention_signals_with_legacy_holds(workspace_id, attention, sessions, None)
+            .await
+    }
+
+    async fn workspace_attention_signals_with_legacy_holds(
+        &self,
+        workspace_id: &WorkspaceId,
+        attention: WorkspaceAttention,
+        sessions: Option<&[intent_core::AgentSession]>,
+        legacy_question_holds: Option<&HashSet<AgentId>>,
     ) -> AttentionSignals {
         let mut signals = AttentionSignals {
             needs_attention: attention == WorkspaceAttention::ReviewRequired,
@@ -511,18 +547,20 @@ impl Services {
                 // The summaries already carry the session `metadata`, so a
                 // written pending-questions marker is decided right here with
                 // no extra store read (monorepo#3058) — same derivation as
-                // [`Services::question_hold_active`]. Only pre-upgrade
+                // [`Services::questions_pending`]. Only pre-upgrade
                 // sessions (marker key never written) fall back to the full
                 // per-session probe, which also materializes the marker.
-                let hold = if session.pending_questions_marker_written() {
+                let pending = if session.pending_questions_marker_written() {
                     match session.pending_questions_message_id() {
                         Some(pending) => session.dismissed_questions_message_id() != Some(pending),
                         None => false,
                     }
+                } else if let Some(holds) = legacy_question_holds {
+                    holds.contains(&session.id)
                 } else {
-                    self.question_hold_active(&session.id).await
+                    self.questions_pending(&session.id).await
                 };
-                if hold {
+                if pending {
                     signals.needs_attention = true;
                     break;
                 }
@@ -530,6 +568,14 @@ impl Services {
         }
         signals
     }
+}
+
+/// Store-backed status inputs already fetched for a complete list snapshot.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkspaceStatusSnapshot<'a> {
+    pub(crate) waiting: bool,
+    pub(crate) monitor_pr_signals: MonitorPrSignals,
+    pub(crate) legacy_question_holds: &'a HashSet<AgentId>,
 }
 
 /// Attention-axis inputs to [`compute_display_status`], probed by
@@ -555,7 +601,13 @@ pub(crate) struct AttentionSignals {
 /// [`compute_display_status`]. Derived purely from persisted
 /// `state`/`last_snapshot` columns: no forge calls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct MonitorPrSignals {
+    /// An ACTIVE monitor's last snapshot shows an open (non-draft) PR that
+    /// sits in the forge's merge queue (`requirements.isInMergeQueue`) — the
+    /// `pr_queued` mapping; outranks `ready` (a queued PR is being handled
+    /// by the queue, no action needed).
+    pub(crate) queued: bool,
     /// An ACTIVE monitor's last snapshot shows an open (non-draft) PR whose
     /// full merge-requirements checklist is clear — truly mergeable, not
     /// merely conflict-free (see
@@ -587,13 +639,16 @@ pub(crate) struct MonitorPrSignals {
 ///    ([`Services::workspace_is_waiting`]).
 /// 4. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
-///    `pr_ready` only when truly mergeable (`mergeable == Some(true)` AND
-///    `mergeable_state == "clean"`, not draft), else `pr_open`. GitHub's
-///    `mergeable` flag alone only means "no merge conflicts" — a PR blocked
-///    by required checks or reviews still reports `mergeable: true` — so a
-///    missing/unknown `mergeable_state` conservatively reads `pr_open`.
+///    `pr_queued` when the PR sits in the forge's merge queue
+///    (`mergeable_state == "queued"`, not draft), `pr_ready` only when truly
+///    mergeable (`mergeable == Some(true)` AND `mergeable_state == "clean"`,
+///    not draft), else `pr_open`. GitHub's `mergeable` flag alone only means
+///    "no merge conflicts" — a PR blocked by required checks or reviews
+///    still reports `mergeable: true` — so a missing/unknown
+///    `mergeable_state` conservatively reads `pr_open`.
 ///    An ACTIVE PR monitor whose last snapshot shows an open/draft PR
-///    (`monitor_prs`) is the same rung: `pr_ready` when the snapshot's full
+///    (`monitor_prs`) is the same rung: `pr_queued` when the snapshot's PR
+///    is in the merge queue (not draft), `pr_ready` when the snapshot's full
 ///    merge-requirements checklist is clear and the PR is not draft, else
 ///    `pr_open` — so a workspace watching an open PR (including cross-repo)
 ///    never falls through to `complete`/`idle`. When none of those carries
@@ -669,21 +724,29 @@ fn compute_base_display_status(
     });
     if let Some(pr) = open_pr {
         let draft = pr.status == PullRequestStatus::Draft || pr.is_draft == Some(true);
+        // GitHub reports `mergeable_state: "queued"` for a PR sitting in
+        // the merge queue — it is beyond "ready", the queue is handling it.
+        let queued = pr.mergeable_state.as_deref() == Some("queued");
         // `mergeable` alone only rules out conflicts; only a "clean"
         // `mergeable_state` means the forge would actually accept the merge
         // (blocked/behind/dirty/unstable/unknown/absent all read `pr_open`).
         let clean = pr.mergeable == Some(true) && pr.mergeable_state.as_deref() == Some("clean");
-        return if clean && !draft {
+        return if queued && !draft {
+            WorkspaceDisplayStatus::PrQueued
+        } else if clean && !draft {
             WorkspaceDisplayStatus::PrReady
         } else {
             WorkspaceDisplayStatus::PrOpen
         };
     }
     // Agent-monitored PRs are the same rung as the linked open PR above: an
-    // ACTIVE monitor on an open PR reads `pr_ready`/`pr_open` even when the
-    // PR belongs to another repo and never enters the workspace linkage. A
-    // linked open PR wins first only because it carries richer data; the
-    // mapping is identical.
+    // ACTIVE monitor on an open PR reads `pr_queued`/`pr_ready`/`pr_open`
+    // even when the PR belongs to another repo and never enters the
+    // workspace linkage. A linked open PR wins first only because it carries
+    // richer data; the mapping is identical.
+    if monitor_prs.queued {
+        return WorkspaceDisplayStatus::PrQueued;
+    }
     if monitor_prs.ready {
         return WorkspaceDisplayStatus::PrReady;
     }
@@ -1120,6 +1183,63 @@ mod display_status {
         );
     }
 
+    /// A linked open PR sitting in the merge queue (REST
+    /// `mergeable_state: "queued"`) reads `pr_queued` — regardless of the
+    /// `mergeable` flag, and outranking the `clean` → `pr_ready` mapping —
+    /// while a draft never reads queued.
+    #[test]
+    fn open_active_pr_in_merge_queue_is_pr_queued() {
+        for mergeable in [Some(true), Some(false), None] {
+            let mut queued = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+            queued.mergeable = mergeable;
+            queued.mergeable_state = Some("queued".into());
+            assert_eq!(
+                compute_display_status(
+                    sig(false),
+                    false,
+                    Some(&queued),
+                    &[],
+                    None,
+                    Some(&stats(2, 2, 0))
+                ),
+                WorkspaceDisplayStatus::PrQueued,
+                "mergeable {mergeable:?}"
+            );
+        }
+        // Found via the `pullRequests` scan too, not just the linked PR.
+        let mut queued = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        queued.mergeable_state = Some("queued".into());
+        assert_eq!(
+            compute_display_status(sig(false), false, None, &[queued], None, None),
+            WorkspaceDisplayStatus::PrQueued
+        );
+        // Drafts never read queued.
+        let mut draft = pr(PullRequestStatus::Draft, "2026-01-02T00:00:00Z");
+        draft.mergeable_state = Some("queued".into());
+        assert_eq!(
+            compute_display_status(sig(false), false, Some(&draft), &[], None, None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        let mut flagged = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        flagged.mergeable_state = Some("queued".into());
+        flagged.is_draft = Some(true);
+        assert_eq!(
+            compute_display_status(sig(false), false, Some(&flagged), &[], None, None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        // Attention axes and a running agent still outrank a queued PR.
+        let mut queued = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        queued.mergeable_state = Some("queued".into());
+        assert_eq!(
+            compute_display_status(sig(true), false, Some(&queued), &[], None, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        assert_eq!(
+            compute_display_status(sig(false), true, Some(&queued), &[], None, None),
+            WorkspaceDisplayStatus::InProgress
+        );
+    }
+
     #[test]
     fn merged_pr_never_masks_open_tasks() {
         // Open tasks keep the rollup off pr_merged; without a running agent
@@ -1387,10 +1507,66 @@ mod display_status {
     /// Monitor-signal shorthand for the tests below.
     fn monitors(open: bool, ready: bool, merged: bool) -> MonitorPrSignals {
         MonitorPrSignals {
+            queued: false,
             ready,
             open,
             merged,
         }
+    }
+
+    /// Step 4 via monitors: an ACTIVE monitor on an open PR sitting in the
+    /// merge queue yields `pr_queued`, outranking `ready` on the same rung
+    /// (a queued PR is still checklist-blocked in practice, but a stale
+    /// `ready` never wins over `queued`) — while attention axes, a running
+    /// agent, and a linked open PR keep their precedence.
+    #[test]
+    fn active_monitor_queued_pr_is_pr_queued() {
+        let queued = MonitorPrSignals {
+            queued: true,
+            ..monitors(true, false, false)
+        };
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                false,
+                None,
+                &[],
+                None,
+                queued,
+                Some(&stats(2, 2, 0))
+            ),
+            WorkspaceDisplayStatus::PrQueued
+        );
+        let queued_and_ready = MonitorPrSignals {
+            queued: true,
+            ..monitors(true, true, true)
+        };
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                false,
+                None,
+                &[],
+                None,
+                queued_and_ready,
+                None
+            ),
+            WorkspaceDisplayStatus::PrQueued
+        );
+        assert_eq!(
+            super::compute_display_status(sig(true), false, None, &[], None, queued, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        assert_eq!(
+            super::compute_display_status(sig(false), true, None, &[], None, queued, None),
+            WorkspaceDisplayStatus::InProgress
+        );
+        // A linked open PR wins the shared rung even over a queued monitor.
+        let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            super::compute_display_status(sig(false), false, Some(&open), &[], None, queued, None),
+            WorkspaceDisplayStatus::PrOpen
+        );
     }
 
     /// Step 4 via monitors: an ACTIVE monitor on an open PR yields
@@ -1530,7 +1706,8 @@ mod display_status {
 #[cfg(test)]
 mod workspace_needs_attention {
     use intent_core::{
-        now_iso, AgentId, AgentSession, AgentStatus, WorkspaceAttention, WorkspaceId,
+        now_iso, AgentId, AgentSession, AgentStatus, WorkspaceApi, WorkspaceAttention,
+        WorkspaceDisplayStatus, WorkspaceId,
     };
     use intent_store::Store;
     use serde_json::json;
@@ -1725,6 +1902,119 @@ mod workspace_needs_attention {
     }
 
     #[tokio::test]
+    async fn question_marker_shapes_match_across_get_list_and_lite_snapshot() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store.clone());
+        let cases = [
+            ("absent", None, WorkspaceDisplayStatus::NeedsAttention),
+            (
+                "null",
+                Some(json!(null)),
+                WorkspaceDisplayStatus::NeedsAttention,
+            ),
+            (
+                "number",
+                Some(json!(42)),
+                WorkspaceDisplayStatus::NeedsAttention,
+            ),
+            ("empty", Some(json!("")), WorkspaceDisplayStatus::Idle),
+            (
+                "set",
+                Some(json!("set")),
+                WorkspaceDisplayStatus::NeedsAttention,
+            ),
+        ];
+        let mut expected = Vec::new();
+
+        for (name, marker, status) in cases {
+            let ws = WorkspaceId::from(format!("ws-marker-{name}"));
+            store.insert_workspace(&workspace(&ws)).await.expect("ws");
+            let mut session = mk_session(&ws, &format!("agent-marker-{name}"));
+            store.insert_agent_session(&session).await.expect("session");
+            let message = store
+                .append_agent_message(&session.id, "assistant", &question_content(), &now_iso())
+                .await
+                .expect("question");
+            session.metadata = marker.map(|value| {
+                json!({
+                    (intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY):
+                        if name == "set" { json!(message.id) } else { value }
+                })
+            });
+            store
+                .update_agent_session(&ws, &session)
+                .await
+                .expect("update marker");
+            expected.push((ws, status));
+        }
+
+        let listed = svc.list_workspaces(false).await.expect("workspace.list");
+        let lite = svc
+            .list_workspaces_lite(false)
+            .await
+            .expect("workspace.subscribe snapshot");
+        for (ws, status) in expected {
+            let get = svc.get_workspace(ws.clone()).await.expect("workspace.get");
+            let list = listed.iter().find(|row| row.id == ws).expect("list row");
+            let snapshot = lite.iter().find(|row| row.id == ws).expect("lite row");
+            assert_eq!(get.display_status, Some(status), "get: {ws}");
+            assert_eq!(list.display_status, get.display_status, "list: {ws}");
+            assert_eq!(
+                snapshot.display_status, get.display_status,
+                "snapshot: {ws}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_tail_failure_falls_back_without_hiding_pending_questions() {
+        let (svc, ws, _tmp) = setup().await;
+        let pending = mk_session(&ws, "agent-pending-batch-fallback");
+        svc.store.insert_agent_session(&pending).await.unwrap();
+        svc.store
+            .append_agent_message(&pending.id, "assistant", &question_content(), &now_iso())
+            .await
+            .unwrap();
+
+        let malformed = mk_session(&ws, "agent-malformed-tail");
+        svc.store.insert_agent_session(&malformed).await.unwrap();
+        let malformed_message = svc
+            .store
+            .append_agent_message(
+                &malformed.id,
+                "assistant",
+                &json!([{ "type": "text", "text": "plain" }]),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_message SET content = 'not-json' WHERE id = ?")
+            .bind(&malformed_message.id)
+            .execute(svc.store.write_pool())
+            .await
+            .expect("corrupt one legacy tail");
+        assert!(
+            svc.store
+                .list_legacy_question_tail_candidates_by_workspace(std::slice::from_ref(&ws))
+                .await
+                .is_err(),
+            "fixture must fail the batch tail read"
+        );
+
+        let listed = svc.list_workspaces(false).await.expect("workspace.list");
+        let listed_ws = listed
+            .iter()
+            .find(|workspace| workspace.id == ws)
+            .expect("workspace row");
+        assert_eq!(
+            listed_ws.display_status,
+            Some(WorkspaceDisplayStatus::NeedsAttention),
+            "valid pending question survives another row's batch decode failure"
+        );
+    }
+
+    #[tokio::test]
     async fn superseded_or_dismissed_questions_are_false() {
         let (svc, ws, _tmp) = setup().await;
 
@@ -1814,12 +2104,12 @@ mod workspace_needs_attention {
     }
 
     /// A written pending-questions marker on the summary decides the
-    /// question hold inline (monorepo#3058): no per-session store probe, so
-    /// the hold reads correctly even with the message log unavailable. Set
-    /// marker → holds; marker matching the dismissal → no hold; cleared
-    /// (empty-written) marker → no hold and NO tail-walk fallback.
+    /// pending set inline (monorepo#3058): no per-session store probe, so
+    /// pendingness reads correctly even with the message log unavailable. Set
+    /// marker → pending; marker matching the dismissal → not pending; cleared
+    /// (empty-written) marker → not pending and NO tail-walk fallback.
     #[tokio::test]
-    async fn written_markers_decide_question_hold_without_store_reads() {
+    async fn written_markers_decide_pending_questions_without_store_reads() {
         let (svc, ws, _tmp) = setup().await;
         let pending = mk_session(&ws, "agent-pending");
         let mut pending = pending;
@@ -1845,7 +2135,7 @@ mod workspace_needs_attention {
                 Some(std::slice::from_ref(&pending)),
             )
             .await;
-        assert!(holds.needs_attention, "set marker holds");
+        assert!(holds.needs_attention, "set marker is pending");
         for (name, session) in [("resolved", resolved), ("cleared", cleared)] {
             let s = svc
                 .workspace_attention_signals(
@@ -1854,7 +2144,7 @@ mod workspace_needs_attention {
                     Some(std::slice::from_ref(&session)),
                 )
                 .await;
-            assert!(!s.needs_attention, "{name} marker must not hold");
+            assert!(!s.needs_attention, "{name} marker must not be pending");
         }
     }
 }
@@ -2295,7 +2585,7 @@ mod display_status_events {
     }
 
     /// Question-resolution trigger via `agent.dismissQuestions` (§6.5 step 0):
-    /// persisting the dismissal marker retires the question hold and emits the
+    /// persisting the dismissal marker retires the pending set and emits the
     /// `needs_attention` → idle demotion.
     #[tokio::test]
     async fn question_dismiss_transition_emits() {
@@ -2480,6 +2770,7 @@ mod display_status_events {
                 NoteId::from("spec"),
                 2,
                 Some("plain text, link removed".to_string()),
+                None,
                 None,
                 None,
             )
@@ -2771,7 +3062,7 @@ mod display_status_events {
     /// `agent.sendMessage` path). A PLAIN user message leaves the Q&A pending,
     /// so the workspace stays `needs_attention` and nothing emits.
     #[tokio::test]
-    async fn user_answer_retires_question_hold_and_emits() {
+    async fn user_answer_retires_pending_questions_and_emits() {
         let h = harness().await;
         let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-q2");
         h.store
@@ -2806,7 +3097,7 @@ mod display_status_events {
             .await
             .expect("send plain message");
         assert!(
-            h.services.question_hold_active(&session.id).await,
+            h.services.questions_pending(&session.id).await,
             "a plain user message must not resolve the pending Q&A"
         );
         assert_silent(&mut sub).await;

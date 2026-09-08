@@ -22,7 +22,7 @@ use intent_acp::{
 };
 use intent_core::events::{TERMINAL_DATA, TERMINAL_EXIT};
 use intent_core::{now_iso, BoxFuture, Error, Result, WorkspaceId};
-use intent_pty::{PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
+use intent_pty::{LineSnapshot, PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -301,12 +301,13 @@ pub(crate) fn get_buffer(
     max_bytes: Option<i64>,
 ) -> Result<Value> {
     let id = resolve(terminal_id)?;
-    let mut bytes = pty.scrollback(id)?;
-    if let Some(max) = max_bytes.and_then(|n| usize::try_from(n).ok()) {
-        if bytes.len() > max {
-            bytes = bytes.split_off(bytes.len() - max);
-        }
-    }
+    // Omitted (and legacy negative) bounds retain full-history semantics. A
+    // usable bound takes the ring tail directly, without cloning its prefix.
+    let bytes = if let Some(max) = max_bytes.and_then(|n| usize::try_from(n).ok()) {
+        pty.scrollback_tail(id, max)?
+    } else {
+        pty.scrollback(id)?
+    };
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(json!({ "terminalId": terminal_id, "data": data }))
 }
@@ -376,30 +377,45 @@ pub(crate) fn read_output(
         ));
     }
 
-    let bytes = pty.scrollback(id)?;
-    let raw = String::from_utf8_lossy(&bytes);
+    // OSC payloads may contain newlines, so raw scrollback line coordinates
+    // cannot safely drive formatted or paginated visible-output boundaries.
+    // Decode the retained snapshot once, then split and page in logical lines.
+    let snapshot = pty.scrollback_lines(id, usize::MAX, None)?;
+    Ok(render_output(
+        &snapshot,
+        terminal_id,
+        info.cwd.as_deref().unwrap_or_default(),
+        max_lines,
+        paginate,
+        page_token,
+    ))
+}
 
-    // TA-2 / §5.5 opt-in pagination: when engaged, return the historical
-    // scrollback as a `{ items, nextToken }` envelope of ANSI-stripped lines
-    // ordered newest→oldest, with an opaque append-stable continuation token.
-    // Absent the opt-in, preserve the legacy bare formatted string verbatim.
+fn render_output(
+    snapshot: &LineSnapshot,
+    terminal_id: &str,
+    cwd: &str,
+    max_lines: Option<i64>,
+    paginate: bool,
+    page_token: Option<&String>,
+) -> Value {
+    let raw = String::from_utf8_lossy(&snapshot.bytes);
+    let clean = strip_ansi(&raw);
     if paginate || page_token.is_some() {
-        return Ok(crate::pagination::paginate_text_lines(
-            &strip_ansi(&raw),
+        return crate::pagination::paginate_text_lines(
+            &clean,
             max_lines,
             page_token.map(std::string::String::as_str),
-        ));
+        );
+    }
+    if !snapshot.retained_has_non_whitespace {
+        return Value::String("Terminal has no output yet.".to_string());
     }
 
-    if raw.trim().is_empty() {
-        return Ok(Value::String("Terminal has no output yet.".to_string()));
-    }
-
-    let clean = strip_ansi(&raw);
     let lines: Vec<&str> = clean.split('\n').collect();
     let max_line_count =
         usize::try_from(max_lines.unwrap_or(200).clamp(1, 10000)).expect("value fits in usize");
-    let mut output_lines: Vec<&str> = if lines.len() > max_line_count {
+    let mut output_lines = if lines.len() > max_line_count {
         lines[lines.len() - max_line_count..].to_vec()
     } else {
         lines.clone()
@@ -409,7 +425,6 @@ pub(crate) fn read_output(
     }
 
     let truncated = lines.len() > max_line_count;
-    let cwd = info.cwd.unwrap_or_default();
     let header = if truncated {
         format!(
             "Terminal {terminal_id} (cwd: {cwd}) [showing last {max_line_count} of {} lines]",
@@ -419,10 +434,10 @@ pub(crate) fn read_output(
         format!("Terminal {terminal_id} (cwd: {cwd})")
     };
     let separator = "\u{2500}".repeat(40);
-    Ok(Value::String(format!(
+    Value::String(format!(
         "{header}\n{separator}\n{}",
         output_lines.join("\n")
-    )))
+    ))
 }
 
 /// Strip ANSI escape sequences from terminal output, mirroring the TS
@@ -435,13 +450,20 @@ fn strip_ansi(input: &str) -> String {
         if bytes[i] == 0x1b {
             // ESC
             match bytes.get(i + 1) {
-                // OSC: ESC ] ... BEL(0x07)
+                // OSC: ESC ] ... BEL(0x07) or ST(ESC \\)
                 Some(b']') => {
                     i += 2;
-                    while i < bytes.len() && bytes[i] != 0x07 {
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
                         i += 1;
                     }
-                    i += 1; // consume BEL
                     continue;
                 }
                 // CSI: ESC [ (optional '?') params (0-9;) final letter
@@ -861,6 +883,118 @@ mod tests {
         needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// Count non-overlapping occurrences of a non-empty `needle` in `haystack`.
+    fn count_sub(haystack: &[u8], needle: &[u8]) -> usize {
+        assert!(!needle.is_empty(), "count_sub requires a non-empty needle");
+        let mut count = 0;
+        let mut i = 0;
+        while i + needle.len() <= haystack.len() {
+            if &haystack[i..i + needle.len()] == needle {
+                count += 1;
+                i += needle.len();
+            } else {
+                i += 1;
+            }
+        }
+        count
+    }
+
+    /// Output-complete barrier (intent#4521): poll `read` until it yields
+    /// exactly `expected` copies of `needle` AND the same bytes as the previous
+    /// read, then return that stable snapshot. `needle` must include the line
+    /// terminator when the caller expects complete lines — the PTY read loop
+    /// appends arbitrary chunks, so a bare marker can be present before its
+    /// trailing CRLF has been drained.
+    async fn settled_output(
+        mut read: impl FnMut() -> Option<Vec<u8>>,
+        needle: &[u8],
+        expected: usize,
+    ) -> Vec<u8> {
+        let mut prev: Option<Vec<u8>> = None;
+        poll_until(
+            || {
+                let bytes = read()?;
+                let settled =
+                    count_sub(&bytes, needle) == expected && prev.as_deref() == Some(&bytes[..]);
+                prev = Some(bytes.clone());
+                settled.then_some(bytes)
+            },
+            TIMEOUT,
+        )
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "output never settled with {expected} copies of {:?}; last read: {:?}",
+                String::from_utf8_lossy(needle),
+                prev.map(|b| String::from_utf8_lossy(&b).into_owned())
+            )
+        })
+    }
+
+    /// `settled_output` over a terminal's unlimited `get_buffer` read. For a
+    /// `cat` PTY the tty echo and cat's own output arrive as separate chunks,
+    /// so a snapshot taken on the first appearance of a marker can still grow.
+    async fn settled_buffer(pty: &PtyHost, id: &str, needle: &[u8], expected: usize) -> Vec<u8> {
+        settled_output(
+            || {
+                let v = get_buffer(pty, id, None).ok()?;
+                Some(decode(v["data"].as_str()?))
+            },
+            needle,
+            expected,
+        )
+        .await
+    }
+
+    /// Regression for the barrier itself: a marker whose trailing CRLF lands
+    /// in a later chunk must not satisfy the barrier just because two identical
+    /// partial reads were observed.
+    #[tokio::test]
+    async fn settled_output_waits_for_delayed_line_terminator() {
+        let partial = b"buffer-test\r\nbuffer-test".to_vec();
+        let complete = b"buffer-test\r\nbuffer-test\r\n".to_vec();
+        let reads = [
+            partial.clone(),
+            partial.clone(),
+            partial,
+            complete.clone(),
+            complete.clone(),
+        ];
+        let mut calls = 0;
+        let out = settled_output(
+            || {
+                let r = reads[calls.min(reads.len() - 1)].clone();
+                calls += 1;
+                Some(r)
+            },
+            b"buffer-test\r\n",
+            2,
+        )
+        .await;
+        assert_eq!(out, complete);
+        assert_eq!(
+            calls, 5,
+            "must settle on the second identical complete read"
+        );
+    }
+
+    #[test]
+    fn count_sub_counts_non_overlapping_matches() {
+        assert_eq!(count_sub(b"", b"ab"), 0);
+        assert_eq!(count_sub(b"abab", b"ab"), 2);
+        assert_eq!(count_sub(b"aaa", b"aa"), 1);
+        assert_eq!(
+            count_sub(b"buffer-test\r\nbuffer-test", b"buffer-test\r\n"),
+            1
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty needle")]
+    fn count_sub_rejects_empty_needle() {
+        let _ = count_sub(b"abc", b"");
+    }
+
     fn decode(data: &str) -> Vec<u8> {
         base64::engine::general_purpose::STANDARD
             .decode(data)
@@ -1023,6 +1157,113 @@ mod tests {
     fn strip_ansi_removes_sequences_and_keeps_unicode() {
         let input = "\u{1b}[31mred\u{1b}[0m \u{1b}[?25lhide \u{1b}]0;title\u{07}é✓😀";
         assert_eq!(strip_ansi(input), "red hide é✓😀");
+        assert_eq!(
+            strip_ansi("before\u{1b}]0;hidden\nhidden-tail\u{1b}\\after"),
+            "beforeafter"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_tolerates_utf8_and_ansi_split_edges() {
+        let snapshot = LineSnapshot {
+            bytes: b"\xa9prefix\x1b[31mred\x1b[0m\x1b[32".to_vec(),
+            total_lines: 1,
+            start_line: 0,
+            end_line: 1,
+            retained_has_non_whitespace: true,
+        };
+        assert_eq!(
+            strip_ansi(&String::from_utf8_lossy(&snapshot.bytes)),
+            "�prefixred"
+        );
+    }
+
+    #[test]
+    fn multiline_osc_uses_visible_line_coordinates() {
+        let snapshot = LineSnapshot {
+            bytes: b"before\n\x1b]0;hidden\nhidden-tail\x07after\nlast".to_vec(),
+            total_lines: 4,
+            start_line: 0,
+            end_line: 4,
+            retained_has_non_whitespace: true,
+        };
+        let full = render_output(&snapshot, "pty-1", "/tmp", Some(50), true, None);
+        assert_eq!(
+            full,
+            json!({ "items": ["last", "after", "before"], "nextToken": null })
+        );
+
+        let first = render_output(&snapshot, "pty-1", "/tmp", Some(2), true, None);
+        assert_eq!(first["items"], json!(["last", "after"]));
+        let token = first["nextToken"]
+            .as_str()
+            .expect("continuation")
+            .to_string();
+        let second = render_output(&snapshot, "pty-1", "/tmp", Some(2), false, Some(&token));
+        assert_eq!(second, json!({ "items": ["before"], "nextToken": null }));
+
+        let legacy = render_output(&snapshot, "pty-1", "/tmp", Some(2), false, None);
+        assert!(legacy
+            .as_str()
+            .expect("formatted")
+            .contains("last 2 of 3 lines"));
+    }
+
+    #[tokio::test]
+    async fn read_output_blank_suffix_scan_work_is_linear() {
+        let pty = host();
+        let mut spec = SpawnSpec::new("ws-1", "sh");
+        spec.args = vec![
+            "-c".to_string(),
+            "i=0; while [ $i -lt 128 ]; do printf 'prefix\\n'; i=$((i+1)); done; \
+             printf 'visible\\n'; i=0; while [ $i -lt 16000 ]; do \
+             printf '\\033[31m\\033[0m\\n'; i=$((i+1)); done; \
+             printf '\\033]0;scan-complete\\007\\n'"
+                .to_string(),
+        ];
+        let id = pty.spawn(spec).expect("spawn output producer");
+        let retained = poll_until(
+            || {
+                let bytes = pty.scrollback(id).ok()?;
+                contains_sub(&bytes, b"scan-complete").then_some(bytes)
+            },
+            LONG_TIMEOUT,
+        )
+        .await
+        .expect("blank suffix reaches scrollback");
+
+        let before = pty
+            .scrollback_line_snapshot_metrics(id)
+            .expect("metrics before read");
+        let page = read_output(
+            pty.as_ref(),
+            &ws("ws-1"),
+            &id.to_string(),
+            Some(1),
+            true,
+            None,
+        )
+        .expect("paginated read");
+        let after = pty
+            .scrollback_line_snapshot_metrics(id)
+            .expect("metrics after read");
+        let calls = after.0 - before.0;
+        let scanned = after.1 - before.1;
+
+        let items = page["items"].as_array().expect("page items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].as_str().expect("visible item").trim(), "visible");
+        assert!(
+            calls <= 2,
+            "read_output issued {calls} line snapshots for one page"
+        );
+        assert!(
+            scanned <= retained.len(),
+            "read_output scanned {scanned} bytes across {calls} snapshots for {} retained bytes",
+            retained.len()
+        );
+
+        kill(pty.as_ref(), &id.to_string()).await.unwrap();
     }
 
     // ---- credential injection helpers (no spawn) ----
@@ -1096,9 +1337,18 @@ mod tests {
     /// intent-hq/intent#4142: the combined injection carries the four
     /// commit-identity `GIT_*` vars when the spawn cwd's repository resolves
     /// an identity — ungated (no settings registry needed) — and none when
-    /// the cwd is absent.
+    /// the cwd is absent. The four vars are unset for the test's lifetime:
+    /// the harness itself may inherit them (agent-spawned shells do,
+    /// post-#4142), and `commit_identity_env` correctly gap-fills nothing
+    /// then (intent-hq/monorepo#4191).
     #[test]
     fn injected_git_env_carries_commit_identity_ungated() {
+        let _env = crate::agent_manager::tests::EnvGuard::apply(&[
+            ("GIT_AUTHOR_NAME", None),
+            ("GIT_AUTHOR_EMAIL", None),
+            ("GIT_COMMITTER_NAME", None),
+            ("GIT_COMMITTER_EMAIL", None),
+        ]);
         let dir =
             std::env::temp_dir().join(format!("intentd-term-identity-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1418,6 +1668,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -1753,20 +2004,30 @@ mod tests {
         write(pty.as_ref(), &id, "!!!not base64!!!").unwrap_err();
         resize(pty.as_ref(), &id, 120, 50).unwrap();
 
-        let full = poll_until(
-            || {
-                let v = get_buffer(pty.as_ref(), &id, None).ok()?;
-                let bytes = decode(v["data"].as_str()?);
-                contains_sub(&bytes, b"buffer-test").then_some(bytes)
-            },
-            TIMEOUT,
-        )
-        .await
-        .expect("echoed output must reach the buffer");
-        assert!(contains_sub(&full, b"buffer-test"));
+        // Steady state for a `cat` PTY: the tty echo plus cat's output, both
+        // CRLF-terminated, and nothing further. Wait for both complete lines
+        // before taking the snapshot the limit cases below are compared against.
+        let full = settled_buffer(pty.as_ref(), &id, b"buffer-test\r\n", 2).await;
+        assert_eq!(full, b"buffer-test\r\nbuffer-test\r\n");
 
         let capped = get_buffer(pty.as_ref(), &id, Some(4)).unwrap();
-        assert!(decode(capped["data"].as_str().unwrap()).len() <= 4);
+        assert_eq!(
+            decode(capped["data"].as_str().unwrap()),
+            full[full.len() - 4..]
+        );
+        let zero = get_buffer(pty.as_ref(), &id, Some(0)).unwrap();
+        assert!(decode(zero["data"].as_str().unwrap()).is_empty());
+        let exact = get_buffer(
+            pty.as_ref(),
+            &id,
+            Some(i64::try_from(full.len()).expect("test buffer length fits in i64")),
+        )
+        .unwrap();
+        assert_eq!(decode(exact["data"].as_str().unwrap()), full);
+        let oversized = get_buffer(pty.as_ref(), &id, Some(i64::MAX)).unwrap();
+        assert_eq!(decode(oversized["data"].as_str().unwrap()), full);
+        let legacy_negative = get_buffer(pty.as_ref(), &id, Some(-1)).unwrap();
+        assert_eq!(decode(legacy_negative["data"].as_str().unwrap()), full);
 
         kill(pty.as_ref(), &id).await.unwrap();
     }
@@ -1931,6 +2192,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_output_reports_exact_line_total_after_exit() {
+        let pty = host();
+        let mut spec = SpawnSpec::new("ws-1", "sh");
+        spec.args = vec![
+            "-c".to_string(),
+            "printf '\x1b[31mone\x1b[0m\\ntwo\\nthree'".to_string(),
+        ];
+        let id = pty.spawn(spec).unwrap();
+        pty.wait(id).await.unwrap();
+
+        let text = poll_until(
+            || {
+                let value = read_output(
+                    pty.as_ref(),
+                    &ws("ws-1"),
+                    &id.to_string(),
+                    Some(2),
+                    false,
+                    None,
+                )
+                .ok()?;
+                let text = value.as_str()?.to_string();
+                text.contains("three").then_some(text)
+            },
+            TIMEOUT,
+        )
+        .await
+        .expect("post-exit output drains into scrollback");
+        assert!(text.contains("[showing last 2 of 3 lines]"), "{text}");
+        assert!(text.ends_with("two\r\nthree") || text.ends_with("two\nthree"));
+        assert!(!text.contains('\u{1b}'));
+
+        kill(pty.as_ref(), &id.to_string()).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn read_output_paginates_with_token() {
         let pty = host();
         let res = create(
@@ -1967,24 +2264,83 @@ mod tests {
         .expect("first page with continuation token");
 
         let token = page1["nextToken"].as_str().unwrap().to_string();
+        write(
+            pty.as_ref(),
+            &id,
+            &base64::engine::general_purpose::STANDARD.encode(b"new-tail\n"),
+        )
+        .unwrap();
+        poll_until(
+            || {
+                let bytes = pty.scrollback(PtyId::parse(&id)?).ok()?;
+                contains_sub(&bytes, b"new-tail").then_some(())
+            },
+            TIMEOUT,
+        )
+        .await
+        .expect("concurrent append reaches scrollback");
         let page2 =
             read_output(pty.as_ref(), &ws("ws-1"), &id, Some(2), false, Some(&token)).unwrap();
         assert!(!page2["items"].as_array().unwrap().is_empty());
+        assert!(page2["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| !item.as_str().unwrap_or_default().contains("new-tail")));
 
         kill(pty.as_ref(), &id).await.unwrap();
     }
 
     // ---- ACP `PtyTerminalHost` adapter ----
 
-    /// ACP terminal create → output → `wait_for_exit` happy path.
+    /// Load-independent exit barrier for ACP terminal tests (monorepo#573,
+    /// intent-hq/intent#4555). The child must print its output and then park
+    /// on `exec cat`: this polls `output` until `marker` is present, sends
+    /// canonical-mode EOF (`^D`) so `cat` — and thus the child — exits 0
+    /// naturally, awaits that exit under a generous bounded deadline, and
+    /// returns the observed output.
     ///
-    /// Load-independent (monorepo#573): the child prints the marker and then
-    /// stays alive (`exec cat`) until the test has *observed* the output, so
-    /// the host's reader thread can never lose the race where a fast-exiting
-    /// child closes the PTY slave before the first `read()` and macOS discards
-    /// the buffered output. Only then does the test send canonical-mode EOF
-    /// (`^D`) so `cat` — and thus the child — exits 0 naturally, awaited with
-    /// a generous bounded deadline.
+    /// Exit reaping and the PTY reader thread are independent, so a
+    /// `wait_for_exit` that resolves does not imply the child's final chunk
+    /// has reached the buffer — reading right after it races the reader under
+    /// CPU contention. A fast-exiting child can also close the PTY slave
+    /// before the first `read()`, and macOS then discards the buffered output
+    /// entirely. Observing the marker *before* letting the child exit closes
+    /// both windows.
+    async fn acp_observe_then_exit(
+        pty: &PtyHost,
+        adapter: &PtyTerminalHost,
+        id: &str,
+        marker: &str,
+    ) -> String {
+        let pty_id = PtyId::parse(id).expect("wire id parses");
+        let deadline = Instant::now() + LONG_TIMEOUT;
+        let output = loop {
+            let info = adapter.output(id.to_string()).await.unwrap();
+            if info.output.contains(marker) {
+                break info.output;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ACP output must surface {marker:?}; got: {:?}",
+                info.output
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        pty.write(pty_id, b"\x04").unwrap();
+
+        let exit = tokio::time::timeout(LONG_TIMEOUT, adapter.wait_for_exit(id.to_string()))
+            .await
+            .expect("child exits within the generous deadline")
+            .unwrap();
+        assert_eq!(exit.exit_code, Some(0));
+        assert!(exit.signal.is_none());
+        output
+    }
+
+    /// ACP terminal create → output → `wait_for_exit` happy path
+    /// (load-independent via `acp_observe_then_exit`).
     #[tokio::test]
     async fn acp_create_output_and_wait_for_exit() {
         let pty = host();
@@ -2001,38 +2357,25 @@ mod tests {
             output_byte_limit: None,
         };
         let id = adapter.create(params).await.unwrap();
-        let pty_id = PtyId::parse(&id).expect("wire id parses");
-
-        let deadline = Instant::now() + LONG_TIMEOUT;
-        loop {
-            let info = adapter.output(id.clone()).await.unwrap();
-            if info.output.contains("acp-output") {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "ACP output must surface the child's stdout; got: {:?}",
-                info.output
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        pty.write(pty_id, b"\x04").unwrap();
-
-        let exit = tokio::time::timeout(LONG_TIMEOUT, adapter.wait_for_exit(id))
-            .await
-            .expect("child exits within the generous deadline")
-            .unwrap();
-        assert_eq!(exit.exit_code, Some(0));
-        assert!(exit.signal.is_none());
+        acp_observe_then_exit(&pty, &adapter, &id, "acp-output").await;
     }
 
     /// intent-hq/intent#4142: a `terminal/create` that omits `cwd` falls back
     /// to the agent session's cwd for both the spawn directory and the git
     /// env resolution, so the commit identity resolved from the session's
-    /// repository still reaches the child.
+    /// repository still reaches the child. The four `GIT_*` identity vars are
+    /// unset for the test's lifetime: the harness itself may inherit them
+    /// (agent-spawned shells do, post-#4142), injection is gap-filling only,
+    /// and the PTY child would print the inherited value instead
+    /// (intent-hq/monorepo#4191).
     #[tokio::test]
     async fn acp_create_without_cwd_falls_back_to_session_cwd_with_identity() {
+        let _env = crate::agent_manager::tests::EnvGuard::apply(&[
+            ("GIT_AUTHOR_NAME", None),
+            ("GIT_AUTHOR_EMAIL", None),
+            ("GIT_COMMITTER_NAME", None),
+            ("GIT_COMMITTER_EMAIL", None),
+        ]);
         let dir =
             std::env::temp_dir().join(format!("intentd-acp-session-cwd-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2050,28 +2393,24 @@ mod tests {
             command: "sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                "printf 'cwd=%s email=%s\\n' \"$(pwd)\" \"$GIT_AUTHOR_EMAIL\"".to_string(),
+                // Trailing sentinel line: once it is observed, the data line
+                // before it is complete in the buffer.
+                "printf 'cwd=%s email=%s\\nacp-cwd-done\\n' \"$(pwd)\" \"$GIT_AUTHOR_EMAIL\"; exec cat"
+                    .to_string(),
             ],
             env: Vec::new(),
             cwd: None,
             output_byte_limit: None,
         };
         let id = adapter.create(params).await.unwrap();
-        let exit = tokio::time::timeout(LONG_TIMEOUT, adapter.wait_for_exit(id.clone()))
-            .await
-            .expect("child exits within the deadline")
-            .unwrap();
-        assert_eq!(exit.exit_code, Some(0));
-        let out = adapter.output(id).await.unwrap();
+        let out = acp_observe_then_exit(&pty, &adapter, &id, "acp-cwd-done").await;
         assert!(
-            out.output.contains(&format!("cwd={}", dir.display())),
-            "spawn falls back to the session cwd; got {:?}",
-            out.output
+            out.contains(&format!("cwd={}", dir.display())),
+            "spawn falls back to the session cwd; got {out:?}"
         );
         assert!(
-            out.output.contains("email=session@example.com"),
-            "identity resolved from the session cwd's repo; got {:?}",
-            out.output
+            out.contains("email=session@example.com"),
+            "identity resolved from the session cwd's repo; got {out:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2128,21 +2467,14 @@ mod tests {
             // Grok-style packed shell line (would ENOENT under argv-only
             // spawn). `/bin/sh` rather than a hard-coded `/bin/bash` so the
             // test is portable to hosts without bash.
-            command: "/bin/sh -c 'printf shell-mode-ok\\n'".to_string(),
+            command: "/bin/sh -c 'printf shell-mode-ok\\n; exec cat'".to_string(),
             args: Vec::new(),
             env: Vec::new(),
             cwd: None,
             output_byte_limit: None,
         };
         let id = adapter.create(params).await.unwrap();
-        let exit = adapter.wait_for_exit(id.clone()).await.unwrap();
-        assert_eq!(exit.exit_code, Some(0));
-        let out = adapter.output(id).await.unwrap();
-        assert!(
-            out.output.contains("shell-mode-ok"),
-            "expected shell-mode-ok in output, got {:?}",
-            out.output
-        );
+        acp_observe_then_exit(&pty, &adapter, &id, "shell-mode-ok").await;
     }
 
     #[tokio::test]

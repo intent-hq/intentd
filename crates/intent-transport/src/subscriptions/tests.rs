@@ -3735,4 +3735,134 @@ mod chat_terminal_reconcile_failure {
             assert_eq!(snapshot["messages"][0]["id"], "msg-1");
         }
     }
+
+    /// intent#4409 — the terminal reconcile lifts the persisted assistant
+    /// row's `metadata` onto every entity it emits (mirroring the
+    /// `agent:message` re-read), so a chat.subscribe-only client renders
+    /// interrupted / finish-reason state identically to
+    /// `agent.getConversation`. Rows without metadata keep the lean shape,
+    /// and the best-effort fallback frame — built with no persisted row —
+    /// carries none.
+    mod chat_terminal_metadata {
+        use super::*;
+
+        fn serving(conversation: Value) -> FailingConvApi {
+            FailingConvApi {
+                calls: AtomicUsize::new(0),
+                fail_first: 0,
+                conversation,
+            }
+        }
+
+        fn conversation_with_metadata(metadata: Value) -> Value {
+            let mut conv = conversation();
+            conv["messages"][0]["metadata"] = metadata;
+            conv["messages"][0]["contentBlocks"] = json!([
+                { "type": "text", "id": "msg-1:0", "text": "Hello, world" },
+                { "type": "text", "id": "msg-1:1", "text": "Interrupted" }
+            ]);
+            conv
+        }
+
+        #[tokio::test]
+        async fn terminal_entities_carry_the_persisted_row_metadata() {
+            // An interrupted turn persists the assistant row with
+            // `metadata.interrupted/stopReason/interruptReason`. Both the block
+            // the client already saw live (`updated`) and the one it never saw
+            // (`added`) must carry that metadata verbatim.
+            let metadata = json!({
+                "interrupted": true,
+                "stopReason": "interrupted",
+                "interruptReason": "user_stop",
+            });
+            let api = serving(conversation_with_metadata(metadata.clone()));
+            let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+            s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
+                .expect("first chunk");
+            let d = s
+                .delta(&api, &end_event("msg-1"))
+                .await
+                .expect("terminal reconcile");
+            let updated = d["updated"].as_array().unwrap();
+            let added = d["added"].as_array().unwrap();
+            assert_eq!(updated.len(), 1, "the live block returns as an update: {d}");
+            assert_eq!(added.len(), 1, "msg-1:1 is new: {d}");
+            for e in updated.iter().chain(added.iter()) {
+                assert_eq!(
+                    e["metadata"], metadata,
+                    "every terminal entity carries the persisted row metadata: {d}"
+                );
+                assert_eq!(e["messageSeq"], 8);
+                assert_eq!(e["streamingComplete"], true);
+            }
+            assert_eq!(d["removedIds"], json!([]));
+        }
+
+        #[tokio::test]
+        async fn a_fallback_id_reconcile_carries_the_persisted_row_metadata() {
+            // monorepo#2105 path: nothing was learned live, the id comes from
+            // the terminal event — the recovered entities still carry metadata.
+            let metadata = json!({ "interrupted": true, "interruptReason": "user_stop" });
+            let api = serving(conversation_with_metadata(metadata.clone()));
+            let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+            let d = s
+                .delta(&api, &end_event("msg-1"))
+                .await
+                .expect("terminal reconcile");
+            let added = d["added"].as_array().unwrap();
+            assert_eq!(added.len(), 2, "every persisted block is delivered: {d}");
+            for e in added {
+                assert_eq!(e["metadata"], metadata, "{d}");
+            }
+        }
+
+        #[tokio::test]
+        async fn rows_without_metadata_keep_the_lean_entity_shape() {
+            for conv in [conversation(), conversation_with_metadata(Value::Null)] {
+                let api = serving(conv);
+                let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+                s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
+                    .expect("first chunk");
+                let d = s
+                    .delta(&api, &end_event("msg-1"))
+                    .await
+                    .expect("terminal reconcile");
+                let entities = d["updated"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .chain(d["added"].as_array().unwrap());
+                let mut count = 0;
+                for e in entities {
+                    count += 1;
+                    assert!(
+                        e.get("metadata").is_none(),
+                        "absent/null row metadata keeps the lean entity shape: {e}"
+                    );
+                }
+                assert!(count > 0, "the frame carries entities: {d}");
+            }
+        }
+
+        #[tokio::test]
+        async fn the_best_effort_frame_carries_no_metadata() {
+            // The degraded frame is built from accumulated live state with no
+            // persisted row to read metadata from, so it stays metadata-less.
+            let api = FailingConvApi::new();
+            let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+            s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
+                .expect("first chunk");
+            let d = s
+                .delta(&api, &end_event("msg-1"))
+                .await
+                .expect("best-effort terminal frame");
+            let updated = d["updated"].as_array().unwrap();
+            assert_eq!(updated.len(), 1, "{d}");
+            assert!(
+                updated[0].get("metadata").is_none(),
+                "no persisted row → no metadata on the fallback frame: {d}"
+            );
+            assert_eq!(updated[0]["streamingComplete"], true);
+        }
+    }
 }

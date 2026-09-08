@@ -347,6 +347,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -535,6 +536,13 @@ async fn resume_via_session_load_replays_interrupted_tail() {
     assert!(
         text.contains("did NOT complete"),
         "continuation prompt must disclose the cut-off explicitly; got: {text}"
+    );
+    // The replayed segments are far under the per-segment cap and nothing was
+    // elided, so the truncation hint (intent#3696) must NOT ride the recap —
+    // it is reserved for recaps that actually cut something.
+    assert!(
+        !text.contains("cut by this recap") && !text.contains("truncated=\""),
+        "an untruncated recap must not carry the truncation hint; got: {text}"
     );
 
     // The tail must have been delivered on the session/load branch — prove

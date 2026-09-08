@@ -49,10 +49,34 @@ pub struct TransferAttachment {
     pub exists: bool,
 }
 
+/// One tracked submodule whose checked-out commit is not reachable from any
+/// remote-tracking ref of that submodule repo (monorepo#4219). `path` is
+/// superproject-relative with forward slashes (nested submodules compose,
+/// e.g. `sub/inner`); `branch` is the submodule's attached HEAD branch when
+/// there is one. `carried: true` means the objects ride in the archive as a
+/// submodule bundle (a workspace-worktree finding); `carried: false` marks a
+/// sandbox-only finding that is reported but not bundled. `published: true`
+/// marks a commit that IS on a remote but is listed (and bundled) anyway
+/// because a nested submodule below it is unpublished and cannot be checked
+/// out without its containing repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferSubmoduleSummary {
+    pub name: String,
+    pub path: String,
+    pub commit_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub carried: bool,
+    #[serde(default)]
+    pub published: bool,
+}
+
 /// Git state summary for the manifest: the checked-out branch, dirty paths
-/// (snapshotted as WIP commits at export time), and the sandbox branches that
-/// ride in the bundle. `has_repository: false` means the workspace has no
-/// local git repository and the archive will carry no bundle.
+/// (snapshotted as WIP commits at export time), the sandbox branches that
+/// ride in the bundle, and the submodules whose commits exist only locally.
+/// `has_repository: false` means the workspace has no local git repository
+/// and the archive will carry no bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferGitSummary {
@@ -61,6 +85,11 @@ pub struct TransferGitSummary {
     pub branch: Option<String>,
     pub dirty_files: Vec<String>,
     pub sandbox_branches: Vec<String>,
+    /// Submodules pointing at unpublished commits, plus the published
+    /// ancestors bundled for a nested one (additive to format v1; exact
+    /// intentd version gating makes `default` tolerance sufficient).
+    #[serde(default)]
+    pub submodules: Vec<TransferSubmoduleSummary>,
 }
 
 /// The versioned transfer manifest embedded in every export archive.

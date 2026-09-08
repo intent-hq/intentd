@@ -581,10 +581,12 @@ impl Services {
     }
 
     /// Materialize the imported git payload (`git/repo.bundle` +
-    /// `git/refs.json` under `extracted_dir`) via
+    /// `git/refs.json`, plus any `git/submodules/<n>.bundle` the refs list,
+    /// under `extracted_dir`) via
     /// [`crate::transfer_materialize::materialize_workspace_git`]: clone the
-    /// bundle into `<workspaces_root>/<wsId>/<repo-slug>`, fetch the base
-    /// ref, re-provision sandboxes, and unwind WIP snapshots. The checkout
+    /// bundle into `<workspaces_root>/<wsId>/<repo-slug>`, hydrate the
+    /// bundled submodules, fetch the base ref, re-provision sandboxes, and
+    /// unwind WIP snapshots. The checkout
     /// is workspace-owned storage and is NOT registered in `known_repo`
     /// (intent-hq/monorepo#2227). Runs BEFORE the store insert with the
     /// transformed rows passed mutably: the [`MaterializedGit::apply`] row
@@ -1102,6 +1104,7 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -1214,7 +1217,9 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 ///
 /// - **workspace**: `worktree_path`, `repository_path`, and `path` are
 ///   rewritten under `<target_root>/<workspaceId>/`; PR linkage columns are
-///   kept (monitors re-poll).
+///   kept (monitors re-poll); `browser_client_id` is nulled — it names a
+///   client of the source daemon (the `client` table never transfers), so
+///   the imported workspace starts unpinned.
 /// - **`agent_session`**: `acp_session_id` / `backend_session_id` nulled (no
 ///   stale resume, ACP sessions are process-local), `is_active` forced 0;
 ///   in-flight statuses (`active`/`Processing`/`Waiting`) become `idle` with
@@ -1259,6 +1264,9 @@ fn transform_rows(
                         if Path::new(value.as_str()).is_absolute() {
                             *value = ws_dir.to_string_lossy().to_string();
                         }
+                    }
+                    if map.contains_key("browser_client_id") {
+                        map.insert("browser_client_id".into(), serde_json::Value::Null);
                     }
                 }
             }
@@ -1449,6 +1457,23 @@ mod tests {
         assert_eq!(row["worktree_path"], "/target/workspaces/ws-import/repo");
         assert_eq!(row["repository_path"], "/target/workspaces/ws-import/repo");
         assert_eq!(row["path"], "/target/workspaces/ws-import");
+    }
+
+    /// The browser-client pin names a source-daemon client (the `client`
+    /// table never transfers), so the imported workspace starts unpinned;
+    /// archives predating the column import untouched.
+    #[test]
+    fn transform_nulls_workspace_browser_client_pin() {
+        let outcome = transform_one(
+            "workspace",
+            serde_json::json!({ "id": "ws-import", "browser_client_id": "desktop-a" }),
+        );
+        let row = &find(&outcome, "workspace")[0];
+        assert_eq!(row["browser_client_id"], serde_json::Value::Null);
+
+        let outcome = transform_one("workspace", serde_json::json!({ "id": "ws-import" }));
+        let row = &find(&outcome, "workspace")[0];
+        assert!(row.get("browser_client_id").is_none());
     }
 
     /// Relative / null path values are left untouched by the rewrite.
@@ -1835,6 +1860,7 @@ mod tests {
                 branch: None,
                 dirty_files: vec![],
                 sandbox_branches: vec![],
+                submodules: vec![],
             },
         }
     }
@@ -2290,7 +2316,9 @@ mod tests {
             updated_at: t.to_string(),
         };
         let staging = src.0.join("staging");
-        let (bundle_path, refs) = crate::transfer_git::create_transfer_bundle(
+        let crate::transfer_git::TransferBundle {
+            bundle_path, refs, ..
+        } = crate::transfer_git::create_transfer_bundle(
             &src_ws,
             std::slice::from_ref(&src_sb),
             &staging,
@@ -2474,8 +2502,9 @@ mod tests {
             w
         };
         let staging = src.0.join("staging");
-        let (bundle_path, refs) =
-            crate::transfer_git::create_transfer_bundle(&src_ws, &[], &staging).expect("bundle");
+        let crate::transfer_git::TransferBundle {
+            bundle_path, refs, ..
+        } = crate::transfer_git::create_transfer_bundle(&src_ws, &[], &staging).expect("bundle");
 
         let m = manifest(&ws);
         let rows: Vec<(&str, Vec<serde_json::Value>)> =

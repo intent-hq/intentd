@@ -7,12 +7,13 @@
 //! fast-paths, every listener intercepts it before the JSON-RPC dispatcher and
 //! threads the resolved id through the per-connection `client_id` binding.
 
-use intent_core::{ClientId, WorkspaceApi};
+use intent_core::{ClientHostInfo, ClientId, WorkspaceApi};
 use serde_json::{json, Value};
 
 use crate::events::{error_frame, success_frame};
 use crate::host_env::detect_has_display;
 use crate::protocol::PROTOCOL_VERSION;
+use crate::reverse::ReverseClientIdentity;
 
 /// A classified `client.hello` request awaiting handling by the connection task.
 pub(crate) struct ClientRequest {
@@ -22,6 +23,10 @@ pub(crate) struct ClientRequest {
     pub client_id_invalid: bool,
     pub name: Option<String>,
     pub capabilities: Option<Value>,
+    /// The client's own `hostname` / `prettyHostname` / `deviceKind` — the
+    /// same triple the daemon reports in `host.status` / `server.pairingInfo`,
+    /// each taken only when a string (anything else reads as omitted).
+    pub host: ClientHostInfo,
     pub id_present: bool,
     pub id_echo: Value,
 }
@@ -51,16 +56,25 @@ pub(crate) fn classify(value: &Value) -> Option<ClientRequest> {
         Some(Value::String(s)) => (Some(s.clone()), false),
         Some(_) => (None, true),
     };
-    let name = params
-        .and_then(|p| p.get("name"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let string_param = |key: &str| {
+        params
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let name = string_param("name");
     let capabilities = params.and_then(|p| p.get("capabilities")).cloned();
+    let host = ClientHostInfo {
+        hostname: string_param("hostname"),
+        pretty_hostname: string_param("prettyHostname"),
+        device_kind: string_param("deviceKind"),
+    };
     Some(ClientRequest {
         client_id,
         client_id_invalid,
         name,
         capabilities,
+        host,
         id_present: id_member.is_some(),
         id_echo: id_member.cloned().unwrap_or(Value::Null),
     })
@@ -86,7 +100,7 @@ pub(crate) fn server_json(
         "osArch": format!("{os}/{arch}"),
         "version": version,
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": { "liveState": true },
+        "capabilities": { "liveState": true, "antigravitySetup": 1 },
     });
     if let Some(build_commit) = build_commit {
         server
@@ -97,32 +111,52 @@ pub(crate) fn server_json(
     server
 }
 
+/// Result of [`handle`]: the response frame (`None` for a notification) and,
+/// on success, the identity the connection now carries — what the connection
+/// task binds onto its reverse-registry entry (REV-2).
+pub(crate) struct HelloOutcome {
+    pub frame: Option<String>,
+    pub bound: Option<ReverseClientIdentity>,
+}
+
 /// Handle a classified `client.hello`: resolve (or mint) the `clientId`, persist
 /// the logical `client` row, set the connection's `client_id` binding, and reply
 /// with `{ clientId, protocolVersion, server }`. The top-level `protocolVersion`
 /// is an explicit copy of `server.protocolVersion` so clients can version-check
 /// without digging into the `server` block. A non-string `clientId` is `-32602`;
 /// a persistence failure is `-32603`. Idempotent: re-sending updates name /
-/// capabilities and re-returns the same `server` block (PROTOCOL §5.17).
+/// capabilities / host identification and re-returns the same `server` block
+/// (PROTOCOL §5.17).
 pub(crate) async fn handle(
     req: ClientRequest,
     api: &dyn WorkspaceApi,
     client_id: &mut Option<ClientId>,
     is_local: bool,
-) -> Option<String> {
+) -> HelloOutcome {
     if req.client_id_invalid {
-        return frame(
-            req.id_present,
-            &req.id_echo,
-            Err((-32602, "clientId must be a string".to_string())),
-        );
+        return HelloOutcome {
+            frame: frame(
+                req.id_present,
+                &req.id_echo,
+                Err((-32602, "clientId must be a string".to_string())),
+            ),
+            bound: None,
+        };
     }
     let resolved = req.client_id.map(ClientId::from_string).unwrap_or_default();
     if let Err(e) = api
-        .upsert_client(resolved.clone(), req.name, req.capabilities)
+        .upsert_client(
+            resolved.clone(),
+            req.name.clone(),
+            req.capabilities.clone(),
+            req.host.clone(),
+        )
         .await
     {
-        return frame(req.id_present, &req.id_echo, Err((-32603, e.to_string())));
+        return HelloOutcome {
+            frame: frame(req.id_present, &req.id_echo, Err((-32603, e.to_string()))),
+            bound: None,
+        };
     }
     *client_id = Some(resolved.clone());
     let server = server_json(
@@ -133,15 +167,23 @@ pub(crate) async fn handle(
         crate::BUILD_COMMIT,
         is_local,
     );
-    frame(
-        req.id_present,
-        &req.id_echo,
-        Ok(json!({
-            "clientId": resolved.as_str(),
-            "protocolVersion": PROTOCOL_VERSION,
-            "server": server,
-        })),
-    )
+    HelloOutcome {
+        frame: frame(
+            req.id_present,
+            &req.id_echo,
+            Ok(json!({
+                "clientId": resolved.as_str(),
+                "protocolVersion": PROTOCOL_VERSION,
+                "server": server,
+            })),
+        ),
+        bound: Some(ReverseClientIdentity {
+            client_id: resolved,
+            name: req.name,
+            capabilities: req.capabilities.unwrap_or_else(|| json!({})),
+            host: req.host,
+        }),
+    }
 }
 
 /// Build the response frame for a `client.hello` result, or `None` for a

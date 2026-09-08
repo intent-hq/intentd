@@ -9,7 +9,8 @@
 //!
 //! 1. download the archive to `sitter/tmp/…`, hashing while streaming
 //! 2. verify sha256 against the manifest, extract next to the download
-//! 3. stage `versions/.staging-…/intentd[.exe]` (exec perms, fsync)
+//! 3. stage `versions/.staging-…/intentd[.exe]` (exec perms, fsync) plus the
+//!    archive's sibling payload (e.g. `libexec/tailcat`), preserving layout
 //! 4. atomically rename the staging dir to `versions/<version>/`
 //! 5. write `state.json` (`current_version`) via temp file + rename
 //! 6. prune: keep the new and previous versions, delete the rest best-effort
@@ -435,7 +436,8 @@ impl Updater {
     }
 
     /// Stage the binary under `versions/` with exec permissions, fsync it,
-    /// then atomically rename the staging dir to `versions/<version>/`.
+    /// stage the archive's sibling payload (e.g. `libexec/tailcat`) next to
+    /// it, then atomically rename the staging dir to `versions/<version>/`.
     fn install_version(&self, version: &str, src_bin: &Path) -> Result<(), UpdateError> {
         fs::create_dir_all(&self.paths.versions_dir)?;
         let staging =
@@ -453,6 +455,13 @@ impl Updater {
             fs::set_permissions(&staged_bin, fs::Permissions::from_mode(0o755))?;
         }
         fs::File::open(&staged_bin)?.sync_all()?;
+
+        if let Some(src_dir) = src_bin.parent() {
+            stage_sibling_payload(src_dir, &staging)?;
+        }
+        // Sync the staging dir's own entries (binary + payload) so the whole
+        // tree is durable before the rename makes it selectable.
+        sync_dir(&staging)?;
 
         let final_dir = self.paths.versions_dir.join(version);
         if final_dir.exists() {
@@ -577,9 +586,121 @@ fn find_daemon_binary(root: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Copy the daemon's sibling payload — everything the archive shipped next
+/// to the binary (e.g. `libexec/tailcat` and its LICENSE) — from the
+/// extracted directory into the staging dir, preserving layout. `fs::copy`
+/// carries permission bits, so exec bits survive; every copied file is
+/// fsync'd like the binary, and every created directory is fsync'd after it
+/// is fully populated so its entries are durable before the staging dir is
+/// renamed into place. Archives without any sibling payload (older releases)
+/// copy nothing — never an error.
+fn stage_sibling_payload(src_dir: &Path, staging: &Path) -> io::Result<()> {
+    let mut created_dirs = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        for entry in fs::read_dir(src_dir.join(&rel))? {
+            let entry = entry?;
+            if rel.as_os_str().is_empty() && entry.file_name() == DAEMON_BIN_NAME {
+                // The binary itself is staged separately (forced 0o755).
+                continue;
+            }
+            let rel_child = rel.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                let dest = staging.join(&rel_child);
+                fs::create_dir_all(&dest)?;
+                created_dirs.push(dest);
+                stack.push(rel_child);
+            } else {
+                let dest = staging.join(&rel_child);
+                fs::copy(entry.path(), &dest)?;
+                fs::File::open(&dest)?.sync_all()?;
+            }
+        }
+    }
+    // Sync deepest-first so every child's entries are durable before its
+    // parent's entry for it is.
+    for dir in created_dirs.iter().rev() {
+        sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// Fsync a directory so its entries survive a power loss. On non-Unix
+/// platforms directories cannot be opened for syncing; a failure to open is
+/// ignored there while sync errors on an opened handle still propagate.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    match fs::File::open(dir) {
+        Ok(handle) => handle.sync_all(),
+        #[cfg(unix)]
+        Err(err) => Err(err),
+        #[cfg(not(unix))]
+        Err(_) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sibling_payload_copied_preserving_layout_and_exec_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("extracted");
+        let libexec = src.join("libexec");
+        fs::create_dir_all(&libexec).unwrap();
+        fs::write(src.join(DAEMON_BIN_NAME), b"daemon").unwrap();
+        fs::write(libexec.join("tailcat"), b"tailcat").unwrap();
+        fs::write(libexec.join("tailcat.LICENSE"), b"license").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(libexec.join("tailcat"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        stage_sibling_payload(&src, &staging).unwrap();
+
+        assert!(
+            !staging.join(DAEMON_BIN_NAME).exists(),
+            "the binary is staged separately, not by the payload copy"
+        );
+        assert_eq!(
+            fs::read(staging.join("libexec").join("tailcat")).unwrap(),
+            b"tailcat"
+        );
+        assert_eq!(
+            fs::read(staging.join("libexec").join("tailcat.LICENSE")).unwrap(),
+            b"license"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(staging.join("libexec").join("tailcat"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0, "exec bits must survive the copy: {mode:o}");
+        }
+    }
+
+    #[test]
+    fn missing_sibling_payload_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("extracted");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join(DAEMON_BIN_NAME), b"daemon").unwrap();
+
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        stage_sibling_payload(&src, &staging).unwrap();
+        assert_eq!(
+            fs::read_dir(&staging).unwrap().count(),
+            0,
+            "a binary-only archive stages no sibling payload"
+        );
+    }
 
     #[test]
     fn newer_older_equal_versions() {

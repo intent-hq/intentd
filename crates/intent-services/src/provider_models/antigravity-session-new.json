@@ -1,0 +1,173 @@
+{
+  "modes": {
+    "currentModeId": "default",
+    "availableModes": [
+      {
+        "id": "default",
+        "name": "Default",
+        "description": "Default permission prompt flow"
+      },
+      {
+        "id": "auto_edit",
+        "name": "Auto Edit",
+        "description": "Auto-approve file edit tools"
+      },
+      {
+        "id": "yolo",
+        "name": "YOLO",
+        "description": "Auto-approve all tools"
+      }
+    ]
+  },
+  "models": {
+    "availableModels": [
+      {
+        "modelId": "gemini-3.8-flash-high",
+        "name": "Gemini 3.8 Flash (High)",
+        "description": "gemini-3.8-flash-high"
+      },
+      {
+        "modelId": "gemini-3.8-flash-medium",
+        "name": "Gemini 3.8 Flash (Medium)",
+        "description": "gemini-3.8-flash-medium"
+      },
+      {
+        "modelId": "gemini-3.8-flash-low",
+        "name": "Gemini 3.8 Flash (Low)",
+        "description": "gemini-3.8-flash-low"
+      },
+      {
+        "modelId": "gemini-3.7-flash-high",
+        "name": "Gemini 3.7 Flash (High)",
+        "description": "gemini-3.7-flash-high"
+      },
+      {
+        "modelId": "gemini-3.7-flash-medium",
+        "name": "Gemini 3.7 Flash (Medium)",
+        "description": "gemini-3.7-flash-medium"
+      },
+      {
+        "modelId": "gemini-3.7-flash-low",
+        "name": "Gemini 3.7 Flash (Low)",
+        "description": "gemini-3.7-flash-low"
+      },
+      {
+        "modelId": "gemini-3.6-flash-high",
+        "name": "Gemini 3.6 Flash (High)",
+        "description": "gemini-3.6-flash-high"
+      },
+      {
+        "modelId": "gemini-3.6-flash-medium",
+        "name": "Gemini 3.6 Flash (Medium)",
+        "description": "gemini-3.6-flash-medium"
+      },
+      {
+        "modelId": "gemini-3.6-flash-low",
+        "name": "Gemini 3.6 Flash (Low)",
+        "description": "gemini-3.6-flash-low"
+      },
+      {
+        "modelId": "gemini-pro-agent",
+        "name": "Gemini 3.1 Pro (High)",
+        "description": "gemini-pro-agent"
+      },
+      {
+        "modelId": "gemini-3.1-pro-low",
+        "name": "Gemini 3.1 Pro (Low)",
+        "description": "gemini-3.1-pro-low"
+      }
+    ],
+    "currentModelId": "gemini-3.7-flash-high"
+  },
+  "configOptions": [
+    {
+      "currentValue": "gemini-3.7-flash-high",
+      "options": [
+        {
+          "value": "gemini-3.8-flash-high",
+          "name": "Gemini 3.8 Flash (High)",
+          "description": "gemini-3.8-flash-high"
+        },
+        {
+          "value": "gemini-3.8-flash-medium",
+          "name": "Gemini 3.8 Flash (Medium)",
+          "description": "gemini-3.8-flash-medium"
+        },
+        {
+          "value": "gemini-3.8-flash-low",
+          "name": "Gemini 3.8 Flash (Low)",
+          "description": "gemini-3.8-flash-low"
+        },
+        {
+          "value": "gemini-3.7-flash-high",
+          "name": "Gemini 3.7 Flash (High)",
+          "description": "gemini-3.7-flash-high"
+        },
+        {
+          "value": "gemini-3.7-flash-medium",
+          "name": "Gemini 3.7 Flash (Medium)",
+          "description": "gemini-3.7-flash-medium"
+        },
+        {
+          "value": "gemini-3.7-flash-low",
+          "name": "Gemini 3.7 Flash (Low)",
+          "description": "gemini-3.7-flash-low"
+        },
+        {
+          "value": "gemini-3.6-flash-high",
+          "name": "Gemini 3.6 Flash (High)",
+          "description": "gemini-3.6-flash-high"
+        },
+        {
+          "value": "gemini-3.6-flash-medium",
+          "name": "Gemini 3.6 Flash (Medium)",
+          "description": "gemini-3.6-flash-medium"
+        },
+        {
+          "value": "gemini-3.6-flash-low",
+          "name": "Gemini 3.6 Flash (Low)",
+          "description": "gemini-3.6-flash-low"
+        },
+        {
+          "value": "gemini-pro-agent",
+          "name": "Gemini 3.1 Pro (High)",
+          "description": "gemini-pro-agent"
+        },
+        {
+          "value": "gemini-3.1-pro-low",
+          "name": "Gemini 3.1 Pro (Low)",
+          "description": "gemini-3.1-pro-low"
+        }
+      ],
+      "id": "model",
+      "name": "Model",
+      "category": "model",
+      "type": "select"
+    },
+    {
+      "currentValue": "default",
+      "options": [
+        {
+          "value": "default",
+          "name": "Default",
+          "description": "Default permission prompt flow"
+        },
+        {
+          "value": "auto_edit",
+          "name": "Auto Edit",
+          "description": "Auto-approve file edit tools"
+        },
+        {
+          "value": "yolo",
+          "name": "YOLO",
+          "description": "Auto-approve all tools"
+        }
+      ],
+      "id": "mode",
+      "name": "Session Mode",
+      "category": "mode",
+      "type": "select"
+    }
+  ],
+  "sessionId": "antigravity-fixture-session"
+}

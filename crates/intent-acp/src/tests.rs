@@ -89,6 +89,45 @@ async fn handshake_completes() {
 }
 
 #[tokio::test]
+async fn antigravity_auth_marker_fails_pending_and_future_requests_without_url() {
+    let (client_write, mut agent_read) = tokio::io::duplex(4096);
+    let (mut agent_write, client_read) = tokio::io::duplex(4096);
+    let conn = Connection::new(
+        client_write,
+        client_read,
+        None,
+        ConnectionHooks {
+            auth_required_stdout_marker: Some("INTENT_ACP_AUTH_REQUIRED"),
+            ..Default::default()
+        },
+    );
+    let server = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buffer = [0u8; 4096];
+        assert!(agent_read.read(&mut buffer).await.unwrap() > 0);
+        agent_write
+            .write_all(b"INTENT_ACP_AUTH_REQUIRED\nhttps://accounts.google.com/secret-oauth-url\n")
+            .await
+            .unwrap();
+    });
+    let result = conn
+        .request("session/new", json!({}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(result.contains("Authentication required"));
+    assert!(!result.contains("secret-oauth-url"));
+    server.await.unwrap();
+    assert!(conn
+        .request("session/new", json!({}))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Authentication required"));
+    assert_eq!(conn.pending_len(), 0);
+}
+
+#[tokio::test]
 async fn concurrent_writes_do_not_interleave() {
     let (conn, responder, _stderr) = connect_mock(ConnectionHooks::default());
     let conn = std::sync::Arc::new(conn);
@@ -124,6 +163,7 @@ async fn routes_requests_and_notifications() {
         notifications: Some(note_tx),
         auth_error_patterns: Vec::new(),
         stderr_log_dir: None,
+        auth_required_stdout_marker: None,
     };
 
     let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
@@ -985,6 +1025,66 @@ mod session_tests {
     }
 
     #[test]
+    fn antigravity_captured_tool_frames_keep_native_names_and_generic_mcp_mapping() {
+        let frame = json!({"sessionUpdate":"tool_call","toolCallId":"mcp-1","title":"workspace-mcp_workspace_api","kind":"other","status":"pending","rawInput":{"arguments":{"code":"return await ws.workspace.getDetails();"}},"_meta":{"is_mcp_tool_call":true,"mcp":{"tool":"workspace_api","server":"workspace-mcp"}}});
+        let update: SessionUpdate = serde_json::from_value(frame.clone()).unwrap();
+        let Some(MappedUpdate::ToolCall(call)) = session::map_session_update(&update) else {
+            panic!("tool call expected")
+        };
+        assert_eq!(call.tool_name, "workspace_api");
+        assert_eq!(
+            call.input["code"],
+            "return await ws.workspace.getDetails();"
+        );
+        let mut unrelated = frame;
+        unrelated.as_object_mut().unwrap().remove("_meta");
+        let Some(MappedUpdate::ToolCall(call)) =
+            session::map_session_update(&serde_json::from_value(unrelated).unwrap())
+        else {
+            panic!("tool call expected")
+        };
+        assert!(
+            call.input.get("arguments").is_some(),
+            "other provider inputs remain unchanged"
+        );
+        for (title, input, name) in [
+            (
+                "Running client_view_file",
+                json!({"absolute_path":"/workspace/seed.txt"}),
+                "client_view_file",
+            ),
+            (
+                "Run client_create_file?",
+                json!({"target_file":"/workspace/created.txt","code_content":"ACP_FILE_OK"}),
+                "client_create_file",
+            ),
+            (
+                "printf ACP_DENIED > denied.txt",
+                json!({"CommandLine":"printf ACP_DENIED > denied.txt","Cwd":"/workspace","WaitMsBeforeAsync":10000}),
+                "run_command",
+            ),
+            (
+                "workspace-mcp_intent_echo",
+                json!({"arguments":{}}),
+                "intent_echo",
+            ),
+        ] {
+            assert_eq!(session::derive_tool_name(title, Some(&input)), name);
+        }
+        assert_eq!(
+            session::derive_tool_name("Running client_view_file", Some(&json!({}))),
+            "Running client_view_file"
+        );
+        assert_eq!(
+            session::derive_tool_name(
+                "Some other tool",
+                Some(&json!({"target_file":"a","code_content":"b"}))
+            ),
+            "Some other tool"
+        );
+    }
+
+    #[test]
     fn derive_tool_name_splits_prefix_and_strips_server_suffix() {
         // `<name>: <description>` titles yield the bare tool name; the registry
         // names are bare and the ACP provider (auggie) appends `_workspace-mcp`
@@ -1078,6 +1178,91 @@ mod session_tests {
                 Some(&json!({ "input": "*** Begin Patch\n*** End Patch" })),
             ),
             "apply_patch"
+        );
+    }
+
+    #[test]
+    fn derive_tool_name_recognizes_workspace_api_input_shape() {
+        // intent-hq/intent#4491: auggie titles a `workspace_api` call with the
+        // model-authored `summary` (prose, no `name`, `kind: other`), so only
+        // the `{ code, summary }` input identifies the tool.
+        let input = json!({
+            "code": "return await ws.workspace.proposeSibling({ title: 't', initialPrompt: 'p' })",
+            "summary": "Propose the follow-up settings change",
+        });
+        assert_eq!(
+            session::derive_tool_name("Propose the follow-up settings change", Some(&input)),
+            "workspace_api"
+        );
+        // A prose summary that happens to look like `<name>: <description>`
+        // must not be split into a bogus tool name.
+        assert_eq!(
+            session::derive_tool_name("Note: append the plan to the spec", Some(&input)),
+            "workspace_api"
+        );
+        // Providers that do title the call with the tool name agree.
+        for title in [
+            "workspace_api",
+            "workspace_api_workspace-mcp",
+            "workspace-mcp_workspace_api",
+            "mcp.workspace-mcp.workspace_api",
+            "mcp__workspace-mcp__workspace_api",
+        ] {
+            assert_eq!(
+                session::derive_tool_name(title, Some(&input)),
+                "workspace_api",
+                "title={title}"
+            );
+        }
+        // A daemon-stamped `_acpTitle` echo on the input is tolerated.
+        assert_eq!(
+            session::derive_tool_name(
+                "Propose",
+                Some(&json!({ "code": "return 1", "summary": "Propose", "_acpTitle": "Propose" }))
+            ),
+            "workspace_api"
+        );
+        // Explicitly namespaced foreign MCP titles are authoritative: a
+        // foreign tool whose arguments happen to be `{ code, summary }` keeps
+        // its own name and must never be mistaken for the daemon's tool.
+        for (title, name) in [
+            ("mcp.python.execute", "python_execute"),
+            ("mcp__python__execute", "python_execute"),
+        ] {
+            assert_eq!(
+                session::derive_tool_name(title, Some(&input)),
+                name,
+                "title={title}"
+            );
+        }
+        // Extra keys mean another tool's arguments, not the workspace_api
+        // schema.
+        assert_eq!(
+            session::derive_tool_name(
+                "Run Python",
+                Some(&json!({ "code": "print(1)", "summary": "Run Python", "language": "python" }))
+            ),
+            "Run Python"
+        );
+        // Both keys are required, as strings; `code` must be non-empty.
+        assert_eq!(
+            session::derive_tool_name("Run some code", Some(&json!({ "code": "return 1" }))),
+            "Run some code"
+        );
+        assert_eq!(
+            session::derive_tool_name("Summarize", Some(&json!({ "summary": "x" }))),
+            "Summarize"
+        );
+        assert_eq!(
+            session::derive_tool_name("Run", Some(&json!({ "code": "", "summary": "empty code" }))),
+            "Run"
+        );
+        assert_eq!(
+            session::derive_tool_name(
+                "Run",
+                Some(&json!({ "code": ["not", "a", "string"], "summary": "x" }))
+            ),
+            "Run"
         );
     }
 
@@ -1562,6 +1747,123 @@ mod session_tests {
         assert_eq!(tc.tool_name, "github_list_issues");
         assert_eq!(tc.input["repo"], json!("intent-hq/monorepo"));
         assert_eq!(tc.input["_acpTitle"], json!("List issues"));
+    }
+
+    #[test]
+    fn foreign_mcp_tool_with_code_summary_arguments_never_claims_pending_attachments() {
+        // intent-hq/intent#4491 negative control across the mapper and the
+        // §7.1 registry: a non-workspace_api tool completing while a batch is
+        // pending must not claim it, even when its arguments are shaped
+        // `{ code, summary }`. Codex `server`/`tool` metadata and namespaced
+        // titles are authoritative over the input-shape rule — in the mapper
+        // AND at the registry's input-shape claim gate, which the transcript
+        // writer feeds only for calls the mapper did NOT identify
+        // authoritatively (`name_authoritative`). The titles here equal the
+        // model-authored `summary` on purpose: nothing constrains a summary
+        // from matching the title, and the codex unwrap strips `server`/`tool`
+        // from the recorded input, so the input alone cannot tell these
+        // frames from auggie's.
+        use intent_core::turn_attachments::{
+            AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry,
+        };
+        use intent_core::AgentId;
+
+        // What the transcript writer hands the claim gate.
+        let gate_input = |tc: &session::MappedToolCall| {
+            (!tc.name_authoritative).then(|| {
+                let mut input = tc.input.clone();
+                input["_acpTitle"] = json!(tc.title);
+                input
+            })
+        };
+        let reg = TurnAttachmentRegistry::new();
+        let agent = AgentId::from_string("agent-4491");
+        let pending = || TurnAttachment {
+            id: "tar-4491".to_string(),
+            policy: AttachmentPolicy::AtToolResult,
+            mime_type: "application/vnd.intent.proposal+json".to_string(),
+            uri: "intent-proposal://workspace-create/x".to_string(),
+            name: "Create workspace".to_string(),
+            text: "{}".to_string(),
+        };
+        let args = |summary: &str| json!({ "code": "print(1)", "summary": summary });
+        let garbled = json!({ "output": "ok" });
+
+        let codex = ToolCall::new("t1", "Run Python")
+            .kind(ToolKind::Execute)
+            .raw_input(json!({
+                "arguments": args("Run Python"),
+                "server": "python",
+                "tool": "execute",
+            }));
+        let claude = ToolCall::new("t2", "mcp__python__execute")
+            .kind(ToolKind::Execute)
+            .raw_input(args("mcp__python__execute"));
+        let codex_title = ToolCall::new("t3", "mcp.python.execute")
+            .kind(ToolKind::Execute)
+            .raw_input(args("mcp.python.execute"));
+        for call in [codex, claude, codex_title] {
+            let title = call.title.clone();
+            let MappedUpdate::ToolCall(tc) =
+                session::map_session_update(&SessionUpdate::ToolCall(call)).unwrap()
+            else {
+                panic!("expected tool call");
+            };
+            assert_eq!(tc.tool_name, "python_execute", "title={title}");
+            assert!(tc.name_authoritative, "title={title}");
+            assert!(
+                intent_core::is_workspace_api_input(&tc.input),
+                "the unwrapped input is indistinguishable from auggie's: title={title}"
+            );
+            let input = gate_input(&tc);
+            assert!(input.is_none(), "title={title}");
+            reg.register(&agent, pending());
+            assert!(
+                reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name, input.as_ref())
+                    .is_empty(),
+                "foreign tool {title} must not claim the pending batch"
+            );
+            // The batch is still there for the daemon's own tool.
+            assert_eq!(
+                reg.claim_at_tool_result(&agent, Some(&garbled), "workspace_api", None)
+                    .len(),
+                1,
+                "title={title}"
+            );
+        }
+
+        // Positive control on the same registry: the auggie-shaped frame
+        // (prose title, `{ code, summary }` input) resolves to workspace_api
+        // and does claim.
+        let auggie = ToolCall::new("t4", "Propose the follow-up")
+            .kind(ToolKind::Other)
+            .raw_input(json!({
+                "code": "return { ok: true }",
+                "summary": "Propose the follow-up",
+            }));
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(auggie)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "workspace_api");
+        assert!(!tc.name_authoritative);
+        let input = gate_input(&tc);
+        assert!(input.is_some());
+        reg.register(&agent, pending());
+        assert_eq!(
+            reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name, input.as_ref())
+                .len(),
+            1
+        );
+        // Second line of defense: were the name ever recorded as the prose
+        // title again, the same identifier-less input still opens the gate.
+        reg.register(&agent, pending());
+        assert_eq!(
+            reg.claim_at_tool_result(&agent, Some(&garbled), &tc.title, input.as_ref())
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -5699,6 +6001,7 @@ mod workspace_api_tool_tests {
                 diff_summary: None,
                 token_usage: None,
                 cow_supported: None,
+                browser_client_id: None,
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
@@ -5739,6 +6042,11 @@ mod workspace_api_tool_tests {
     fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
+        // Pin the unborn HEAD to `main` explicitly so the initial commit
+        // creates the branch itself: force-creating `main` after the commit
+        // fails on hosts whose `init.defaultBranch = main` already made it
+        // the current HEAD (intent-hq/monorepo#4218).
+        repo.set_head("refs/heads/main").unwrap();
         std::fs::write(dir.path().join("README.md"), "test\n").unwrap();
         let mut index = repo.index().unwrap();
         index.add_path(std::path::Path::new("README.md")).unwrap();
@@ -5749,7 +6057,6 @@ mod workspace_api_tool_tests {
             .commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
             .unwrap();
         let commit = repo.find_commit(commit_id).unwrap();
-        repo.branch("main", &commit, true).unwrap();
         repo.branch("feature/ready", &commit, false).unwrap();
         repo.reference_symbolic(
             "refs/remotes/origin/HEAD",
@@ -6264,9 +6571,10 @@ mod workspace_api_tool_tests {
             .with_agent_features(no_hooks_features())
             .with_specialist_model_options(vec![SpecialistModelOptions {
                 specialist: "implementor".to_string(),
-                default_model: Some("auggie:claude-opus-5".to_string()),
+                default_model: Some("claude-opus-5".to_string()),
                 options: vec![SpecialistModelOption {
-                    model: "opencode:kimi-k3".to_string(),
+                    provider: "opencode".to_string(),
+                    model: "kimi-k3".to_string(),
                     hint: "cheap".to_string(),
                     reasoning_effort: String::new(),
                 }],
@@ -6277,9 +6585,7 @@ mod workspace_api_tool_tests {
             .unwrap();
         let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
         assert!(
-            desc.contains(
-                "implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"
-            ),
+            desc.contains("implementor: default `claude-opus-5`, `kimi-k3` on opencode (cheap)"),
             "delegate docs must list the specialist's default model and options"
         );
         assert!(
@@ -6642,7 +6948,7 @@ mod wsapi3_bindings_tests {
         CommentType, CommentWire, Error, Note, NoteAddInput, NoteAddResult, NoteCreate,
         NoteCreateResult, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
         NoteEditResult, NoteId, NoteMetadata, NoteSetContentResult, NoteTaskRow,
-        NoteUpdateMetadataResult, ReadAssetResult, Result, TaskAssignAgentResult,
+        NoteUpdateMetadataResult, ReadAssetResult, Result, SaveAssetResult, TaskAssignAgentResult,
         TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
         TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskUpdateNoteStatusResult,
         TaskUpdateResult, TaskUpdateStatusResult, WorkspaceApi, WorkspaceId,
@@ -6676,6 +6982,7 @@ mod wsapi3_bindings_tests {
         create_note_calls: Mutex<Vec<CreateNoteCall>>,
         list_note_tasks_calls: Mutex<Vec<String>>,
         read_asset_calls: Mutex<Vec<String>>,
+        save_asset_calls: Mutex<Vec<(String, String, Option<String>)>>,
         set_content_calls: Mutex<Vec<(String, String, bool)>>,
         add_calls: Mutex<Vec<AddCall>>,
         edit_calls: Mutex<Vec<(String, String, String)>>,
@@ -6882,6 +7189,26 @@ mod wsapi3_bindings_tests {
             })
         }
 
+        fn save_asset(
+            &self,
+            _ws: WorkspaceId,
+            data: String,
+            mime_type: String,
+            original_name: Option<String>,
+        ) -> BoxFuture<'_, Result<SaveAssetResult>> {
+            self.save_asset_calls
+                .lock()
+                .unwrap()
+                .push((data, mime_type, original_name));
+            Box::pin(async {
+                Ok(SaveAssetResult {
+                    asset_id: "asset-1.webm".to_string(),
+                    path: "/tmp/assets/asset-1.webm".to_string(),
+                    url: "workspace-asset://amber-forest/asset-1.webm".to_string(),
+                })
+            })
+        }
+
         fn set_note_content(
             &self,
             _ws: WorkspaceId,
@@ -7057,6 +7384,7 @@ mod wsapi3_bindings_tests {
             note_id: NoteId,
             task_text: String,
             status: String,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<TaskUpdateStatusResult>> {
             self.task_update_status_calls.lock().unwrap().push((
                 note_id.as_str().to_string(),
@@ -7098,6 +7426,7 @@ mod wsapi3_bindings_tests {
             })
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn task_update(
             &self,
             _ws: WorkspaceId,
@@ -7106,6 +7435,7 @@ mod wsapi3_bindings_tests {
             text: Option<String>,
             status: Option<String>,
             expected: Option<String>,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
             self.task_update_calls.lock().unwrap().push((
                 note_id.as_str().to_string(),
@@ -7568,6 +7898,31 @@ mod wsapi3_bindings_tests {
     }
 
     #[tokio::test]
+    async fn note_read_numbered_content_is_what_the_write_guard_rejects() {
+        // Keeps the binding's `{:>4} | ` rendering and the service-side
+        // write guard in lock-step (monorepo#4208): the `content` field of a
+        // real `note.read` — plain and task-note shapes — must be recognised
+        // as the numbered presentation, while `rawContent` must not, so the
+        // documented remediation (write `rawContent` back) keeps working.
+        let (srv, _api) = server();
+        for id in ["n-1", "task-1"] {
+            let resp = call(&srv, &format!("return await ws.note.read('{id}');")).await;
+            assert_eq!(resp["result"]["isError"], json!(false));
+            let v = body(&resp);
+            let content = v["content"].as_str().unwrap();
+            let raw = v["rawContent"].as_str().unwrap();
+            assert!(
+                intent_services::note_ops::is_numbered_read_presentation(content),
+                "{id}: read content must be detected as numbered: {content}"
+            );
+            assert!(
+                !intent_services::note_ops::is_numbered_read_presentation(raw),
+                "{id}: rawContent must pass the guard: {raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn note_read_missing_id_surfaces_js_error() {
         let (srv, _api) = server();
         let resp = call(&srv, "return await ws.note.read();").await;
@@ -7711,6 +8066,54 @@ mod wsapi3_bindings_tests {
         assert_eq!(
             api.read_asset_calls.lock().unwrap()[0],
             "workspace-asset://amber-forest/img-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_save_asset_accepts_media_and_forwards_fields_to_daemon() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.note.saveAsset({ data: 'AAAA', mimeType: 'video/webm', originalName: 'clip.webm' });",
+        )
+        .await;
+        let v = body(&resp);
+        assert_eq!(v["assetId"], json!("asset-1.webm"));
+        assert_eq!(
+            v["url"],
+            json!("workspace-asset://amber-forest/asset-1.webm")
+        );
+        assert_eq!(
+            api.save_asset_calls.lock().unwrap()[0],
+            (
+                "AAAA".to_string(),
+                "video/webm".to_string(),
+                Some("clip.webm".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn note_save_asset_rejects_unsupported_and_parameterized_mime_types() {
+        let (srv, api) = server();
+        for mime_type in ["video/quicktime", "video/mp4; codecs=avc1"] {
+            let resp = call(
+                &srv,
+                &format!(
+                    "return await ws.note.saveAsset({{ data: 'AAAA', mimeType: '{mime_type}' }});"
+                ),
+            )
+            .await;
+            assert_eq!(resp["result"]["isError"], json!(true));
+            assert!(
+                text(&resp).contains("mimeType must be one of"),
+                "unexpected error for {mime_type}: {}",
+                text(&resp)
+            );
+        }
+        assert!(
+            api.save_asset_calls.lock().unwrap().is_empty(),
+            "invalid MIME types must be rejected before persistence"
         );
     }
 
@@ -8630,6 +9033,78 @@ mod wsapi6_bindings_tests {
         assert_eq!(resp["result"]["isError"], json!(true));
         assert!(text(&resp).contains("actions array cannot be empty"));
         assert!(api.browser_exec_calls.lock().unwrap().is_empty());
+    }
+
+    // `ws.browser.listTabs(scope?)` (REV-2 Model 5): a one-action `listTabs`
+    // batch through the seam, with the caller attributed and the envelope
+    // unwrapped to the bare tab array.
+    #[tokio::test]
+    async fn browser_list_tabs_unwraps_the_registry_envelope() {
+        let (srv, api) = server_with_caller("agent-77");
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": true,
+            "results": [{
+                "action": "listTabs",
+                "success": true,
+                "result": [
+                    { "tabId": "t-1", "ownerAgentId": null, "hostClientId": "desktop-a", "hostConnected": true },
+                    { "tabId": "t-2", "ownerAgentId": "agent-77", "hostClientId": "desktop-b", "hostConnected": false }
+                ]
+            }]
+        }));
+        let resp = call(&srv, "return await ws.browser.listTabs('mine');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        let tabs = v.as_array().expect("bare tab array");
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[1]["tabId"], json!("t-2"));
+        assert_eq!(tabs[1]["hostClientId"], json!("desktop-b"));
+
+        let calls = api.browser_exec_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (actions, tab_id, agent_id) = &calls[0];
+        assert_eq!(
+            actions,
+            &vec![json!({ "action": "listTabs", "scope": "mine" })]
+        );
+        assert_eq!(tab_id.as_deref(), None);
+        assert_eq!(agent_id.as_deref(), Some("agent-77"));
+    }
+
+    #[tokio::test]
+    async fn browser_list_tabs_omits_scope_when_not_given() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.browser.listTabs();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.browser_exec_calls.lock().unwrap();
+        assert_eq!(calls[0].0, vec![json!({ "action": "listTabs" })]);
+        assert_eq!(calls[0].2, None);
+    }
+
+    #[tokio::test]
+    async fn browser_list_tabs_rejects_non_string_scope_without_calling_trait() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.browser.listTabs(42);").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("scope must be"));
+        assert!(api.browser_exec_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn browser_list_tabs_surfaces_the_action_error_as_a_throw() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "listTabs scope \"mine\" requires an agent caller",
+            "results": [{
+                "action": "listTabs",
+                "success": false,
+                "error": "listTabs scope \"mine\" requires an agent caller"
+            }]
+        }));
+        let resp = call(&srv, "return await ws.browser.listTabs('mine');").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("requires an agent caller"));
     }
 
     #[tokio::test]
@@ -9554,24 +10029,6 @@ mod wsapi4_bindings_tests {
         assert_eq!(v["delivery"], json!("queued"));
     }
 
-    /// Self-describing success: a held-for-questions park reports
-    /// `delivery: "held"`.
-    #[tokio::test]
-    async fn agent_send_held_shape_carries_delivery_field() {
-        let (srv, api) = server();
-        *api.agent_send_result.lock().unwrap() = Some(json!({
-            "success": true,
-            "queued": true,
-            "heldForQuestions": true,
-            "queuedMessage": { "id": "qmsg-1" },
-        }));
-        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let v = body(&resp);
-        assert_eq!(v["ok"], json!(true));
-        assert_eq!(v["delivery"], json!("held"));
-    }
-
     /// `sendToTask` classifies the nested `result` envelope the op returns.
     #[tokio::test]
     async fn agent_send_to_task_delivery_field_reads_nested_result() {
@@ -9584,12 +10041,12 @@ mod wsapi4_bindings_tests {
         *api.agent_send_to_task_result.lock().unwrap() = Some(json!({
             "ok": true,
             "agentId": "agent-assignee",
-            "result": { "success": true, "queued": true, "heldForQuestions": true },
+            "result": { "success": true, "queued": true, "queuedMessage": { "id": "qmsg-1" } },
         }));
         let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let v = body(&resp);
-        assert_eq!(v["delivery"], json!("held"));
+        assert_eq!(v["delivery"], json!("queued"));
     }
 
     /// A non-success `sendToTask` result (e.g. no assignee) gains no
@@ -11065,6 +11522,7 @@ mod workspace_api_output_limit_tests {
                     diff_summary: None,
                     token_usage: None,
                     cow_supported: None,
+                    browser_client_id: None,
                     display_status: None,
                     waiting: false,
                     checkout_mode: None,

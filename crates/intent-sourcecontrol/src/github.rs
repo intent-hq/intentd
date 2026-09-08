@@ -235,7 +235,25 @@ pub(crate) fn map_issue(value: Value) -> Result<Issue> {
         body: i.body,
         state: i.state.unwrap_or_default(),
         url: i.html_url.unwrap_or_default(),
+        author: login_of(i.user.as_ref()),
+        created_at: i.created_at.unwrap_or_default(),
+        updated_at: i.updated_at.unwrap_or_default(),
     })
+}
+
+/// [`map_issue`] for `get_issue`'s single-item fetch: GitHub's
+/// `/issues/{number}` endpoint returns a PR's issue-shaped payload when
+/// `number` names a pull request (the REST API models every PR as an issue,
+/// tagged with a `pull_request` key). Reject that case as not-found instead
+/// of mapping it, so `github.issues.get` never leaks a PR as an issue --
+/// callers get the same not-found treatment as a number that doesn't exist.
+pub(crate) fn map_issue_at_number(value: Value, number: u64) -> Result<Issue> {
+    if value.get("pull_request").is_some() {
+        return Err(Error::NotFound(format!(
+            "#{number} is a pull request, not an issue"
+        )));
+    }
+    map_issue(value)
 }
 
 pub(crate) fn map_repo(value: Value) -> Result<Repo> {
@@ -644,6 +662,9 @@ mod dto {
         pub body: Option<String>,
         pub state: Option<String>,
         pub html_url: Option<String>,
+        pub user: Option<User>,
+        pub created_at: Option<String>,
+        pub updated_at: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -1616,7 +1637,7 @@ impl SourceControl for GitHubSourceControl {
     async fn get_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue> {
         let route = Self::repo_path(repo, &format!("/issues/{number}"));
         let v: Value = self.client.get(&route, None::<&()>).await?;
-        map_issue(v)
+        map_issue_at_number(v, number)
     }
 
     async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Page<Issue>> {
@@ -2180,11 +2201,23 @@ mod tests {
     fn maps_issue_and_comment() {
         let issue = map_issue(json!({
             "number": 7, "title": "bug", "body": "broken", "state": "open",
-            "html_url": "https://github.com/o/r/issues/7"
+            "html_url": "https://github.com/o/r/issues/7",
+            "user": { "login": "octocat" },
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z"
         }))
         .unwrap();
         assert_eq!(issue.number, 7);
         assert_eq!(issue.state, "open");
+        assert_eq!(issue.author, "octocat");
+        assert_eq!(issue.created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(issue.updated_at, "2026-01-02T00:00:00Z");
+
+        // Missing author/timestamps default like the other REST mappers.
+        let bare = map_issue(json!({ "number": 8 })).unwrap();
+        assert_eq!(bare.author, "unknown");
+        assert_eq!(bare.created_at, "");
+        assert_eq!(bare.updated_at, "");
 
         let c = map_issue_comment(json!({
             "id": 99, "user": { "login": "u" }, "body": "hello",
@@ -2194,6 +2227,29 @@ mod tests {
         assert_eq!(c.id, "99");
         assert_eq!(c.author, "u");
         assert!(c.path.is_none());
+    }
+
+    #[test]
+    fn get_issue_rejects_pull_request_shaped_payload() {
+        // `/issues/{number}` on a PR number comes back issue-shaped but
+        // carries a `pull_request` key -- must be rejected as not-found,
+        // never mapped as an issue.
+        let err = map_issue_at_number(
+            json!({
+                "number": 42,
+                "title": "Add thing",
+                "pull_request": { "url": "https://api.github.com/repos/o/r/pulls/42" }
+            }),
+            42,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(msg) if msg.contains("#42") && msg.contains("pull request"))
+        );
+
+        // A genuine issue payload (no `pull_request` key) still maps normally.
+        let issue = map_issue_at_number(json!({ "number": 7, "title": "bug" }), 7).unwrap();
+        assert_eq!(issue.number, 7);
     }
 
     #[test]

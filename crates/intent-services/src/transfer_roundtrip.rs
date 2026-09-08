@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 
 use intent_core::transfer::TransferManifest;
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, ClientId, Error, Hook, HookId, HookState, Note,
-    NoteId, PrMonitor, PrMonitorId, PrMonitorState, Script, ScriptMode, WorkspaceId,
-    WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, ClientHostInfo, ClientId, Error, Hook, HookId,
+    HookState, Note, NoteId, PrMonitor, PrMonitorId, PrMonitorState, Script, ScriptMode,
+    WorkspaceId, WorkspaceStatus,
 };
 use intent_store::{AgentQueueRow, PersistedEventSubscription, Sandbox, SandboxStatus, Store};
 
@@ -423,7 +423,7 @@ async fn seed_source(
     // Draft (FKs onto client; dropped by the import transform).
     let client = ClientId::from("client-rt");
     svc.store
-        .upsert_client(&client, None, None)
+        .upsert_client(&client, None, None, &ClientHostInfo::default())
         .await
         .expect("client");
     svc.store

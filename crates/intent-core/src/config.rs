@@ -40,6 +40,22 @@ pub const MAX_CONCURRENT_ADAPTERS_LIMIT: u32 = 64;
 /// unlimited value.
 pub const DEFAULT_MAX_TOP_LEVEL_AGENTS: u32 = 20;
 
+/// Default V8 `--max-old-space-size` cap in MB (`agents.acpNodeMaxOldSpaceMb`)
+/// injected via `NODE_OPTIONS` into Node/Electron ACP provider processes.
+/// V8's own default (~1.7 GB) is too small for long-lived coordinator
+/// sessions, which V8-OOM mid-turn with no error surfaced (STAB-50); 8 GB
+/// gives ample headroom. The `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` env var
+/// overrides the setting. Applies to newly started agent processes only.
+pub const DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB: u32 = 8192;
+
+/// Lower bound accepted for `agents.acpNodeMaxOldSpaceMb`: below 1 GB the
+/// cap is smaller than V8's own default and would only make the STAB-50
+/// OOM more likely.
+pub const ACP_NODE_MAX_OLD_SPACE_MB_MIN: u32 = 1024;
+
+/// Upper bound accepted for `agents.acpNodeMaxOldSpaceMb` (64 GB).
+pub const ACP_NODE_MAX_OLD_SPACE_MB_MAX: u32 = 65_536;
+
 /// Default grace window in seconds (`agents.reportToParentDebounceSeconds`)
 /// before an ungrouped child's `reportToParent` wake is delivered to the
 /// parent, giving the child time to finish its turn so the parent receives
@@ -47,6 +63,30 @@ pub const DEFAULT_MAX_TOP_LEVEL_AGENTS: u32 = 20;
 /// immediate wake). Read live from the settings snapshot at each call — no
 /// restart required.
 pub const DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS: u32 = 30;
+
+/// Default per-block character cap (`agents.historyReplayToolContentChars`)
+/// applied to each `tool_use` input and `tool_result` output in the recovery
+/// replay that rebuilds a lost ACP session; longer bodies are middle-truncated.
+/// Read live at replay time — no restart required.
+pub const DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS: u32 = 4000;
+
+/// Lower bound accepted for `agents.historyReplayToolContentChars`: below
+/// 500 characters a replayed tool block carries too little of the original
+/// call to orient the resumed agent.
+pub const HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN: u32 = 500;
+
+/// Upper bound accepted for `agents.historyReplayToolContentChars` (100k
+/// characters per block).
+pub const HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX: u32 = 100_000;
+
+/// Default retention window in days (`agents.toolPayloadRetentionDays`) after
+/// which stored tool payloads are shrunk to the replay-shaped preview; `0`
+/// (the default) disables the sweep and keeps full bodies forever. Read live
+/// at each sweep tick — no restart required.
+pub const DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS: u32 = 0;
+
+/// Upper bound accepted for `agents.toolPayloadRetentionDays` (ten years).
+pub const TOOL_PAYLOAD_RETENTION_DAYS_MAX: u32 = 3650;
 
 /// Default ephemeral-event retention TTL in hours (`events.streamRetentionHours`,
 /// §10.2); `0` disables the retention/compaction sweep entirely. Defaults to 72h

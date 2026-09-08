@@ -32,12 +32,15 @@ async fn create_agent(
         .agent_create_op(
             ws.clone(),
             Some(name.to_string()),
-            Some("auggie:sonnet4.5".into()),
+            Some("sonnet4.5".into()),
             None,
             parent.cloned(),
             None,
             false,
-            intent_core::AgentCreateExtra::default(),
+            intent_core::AgentCreateExtra {
+                provider: Some("auggie".into()),
+                ..Default::default()
+            },
         )
         .await
         .expect("create");

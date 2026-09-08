@@ -322,13 +322,116 @@
 //! unknown/foreign id → `-32602` "Unknown git root: <id>"), and the
 //! resulting `git:commit` / `changes:git-status` events carry an additive
 //! `gitRootId` field. No method-catalog change — 298 router methods, 338
+//! total. Version 9.3 adds the `host.providerTestPrompt` fast-path method
+//! (additive; §5.14): one live end-to-end ACP prompt ("say hello") against a
+//! provider's adapter — the only conclusive auth check for providers that
+//! serve local probes uncredentialed and fail only at `session/prompt`
+//! (claude-code). Success `{ ok: true }` promotes the cached
+//! `host.providerAuthStatus` verdict to a hard `true`; failures are
+//! structured `{ ok: false, reason, message }` (`reason` ∈ `unsupported |
+//! not-installed | spawn-failed | auth-required | busy | timeout | error`,
+//! never a
+//! wire error — only an unknown `providerId` is `-32602`), and an
+//! auth-required failure demotes the verdict like the runtime spawn seam.
+//! `providers.catalog` rows gain the always-present `supportsTestPrompt`
+//! boolean (`false` only for unsloth, whose first prompt can trigger a very
+//! long model download). Method catalog grows by one fast-path method —
+//! 298 router methods, 39 fast-path, 339 total. Version 9.4 adds provider
+//! auth identity metadata (additive; §5.14): `host.providerAuthStatus`
+//! entries gain the optional `identity: { email?, orgName?,
+//! subscriptionType? }` object, captured from claude-code's logged-in
+//! `claude auth status` JSON report, riding the cached verdict (demotion
+//! clears it, test-prompt promotion preserves it) and absent for providers
+//! without identity. No method-catalog change — 298 router methods,
+//! 39 fast-path, 339 total. Version 9.5 retires the question-hold delivery
+//! gate (§5.5): pending questions no longer park automatic deliveries —
+//! agent-to-agent sends, `agent.sendToTask`, parent/subscription wakes and
+//! the queue drain all proceed while `pendingQuestionsMessageId` is set, so
+//! the `heldForQuestions: true` result flag (and the MCP `ws.agent.send` /
+//! `ws.agent.sendToTask` `delivery: "held"` outcome) is never produced and
+//! is removed from the wire. The pending-question marker lifecycle
+//! (set/clear, `agent.dismissQuestions` + its system notice, the
+//! `needs_attention` derivation and `agent:updated` projections) is
+//! unchanged. No method-catalog change — 298 router methods, 39 fast-path,
+//! 339 total. Version 9.6 adds the single-issue read `github.issues.get`
+//! (`{ owner, repo, number }` → `{ issue: GithubIssue }`; §5.27) and enriches
+//! the `GithubIssue` DTO: `user.login`, `createdAt` and `updatedAt` are now
+//! populated from the forge payload (additive — the keys already existed as
+//! placeholders) on `github.issues.get` / `.list` / `.search`. Method
+//! catalog grows by one router method — 299 router methods, 39 fast-path,
+//! 340 total. Version 9.7 is an additive minor bump over 9.6 that adds the
+//! `workspace.localChanges` method (§5.1): the local git work archiving or
+//! deleting a workspace would lose —
+//! `{ roots: [...], hasUnpushedCommits, hasUncommittedChanges }`
+//! with one row per evaluated root (the primary worktree first, skipped when
+//! the workspace is remote or not a git repository; then every registered
+//! secondary root in `gitRoot.list` order, always evaluated), each carrying
+//! `kind`, `gitRootId` (secondary only), `path`, `branch?`, `hasRemoteRefs`,
+//! `unpushedCount` (commits no `refs/remotes/*` ref reaches, saturating at
+//! 1000 — exact for never-pushed branches, unlike the upstream-relative
+//! `git.status.ahead`), `uncommittedCount` (distinct paths in the
+//! `git.status.files` entry set), and `error` only when the root could not
+//! be read (counts then 0). Unknown workspace → `-32602`. Method catalog
+//! grows by one router method — 300 router methods, 39 fast-path, 341
 //! total.
+//!
+//! Version 9.8 adds guided Antigravity setup (§5.44). The four local-app
+//! methods are `providers.setup.status`, `providers.setup.start`,
+//! `providers.setup.login`, and `providers.setup.cancel`. The reverse request
+//! `providers.setup.openLogin` asks the owning app to open the sign-in URL
+//! after explicit user consent. The catalog contains 300 router methods,
+//! 43 fast-path methods, and two aliases: 345 client-callable names.
+//! The five reverse methods are counted separately.
+//!
+//! Version 9.9 adds the REV-2 per-workspace browser-client pin. `client.list`
+//! (global) reports live hello'd connections grouped by `clientId`, a client
+//! counting as `browserExec`-capable when ANY of its live connections
+//! advertises it; `workspace.getBrowserClient` / `workspace.setBrowserClient`
+//! read and persist the pin (`Workspace.browserClientId`, omitted when
+//! unset; `-32602` for Chief / unknown workspace / never-hello'd clientId;
+//! `workspace:updated { changes: { browserClientId } }`). Agent-initiated
+//! `browser.exec` dispatches to the pinned client when set — pinned but
+//! offline is `-32603`, never a silent fallback. The catalog grows by three
+//! router methods — 303 router methods, 43 fast-path, two aliases: 348
+//! client-callable names.
+//!
+//! Version 9.10 adds the daemon-owned browser tab registry (REV-2 Model 2 & 6).
+//! Four additive fast-path methods: `browser.listTabs` (any client; entries
+//! decorated with `hostName` / `hostConnected` from the live reverse
+//! registry) and the host-only reports `browser.upsertTab`,
+//! `browser.removeTab`, and `browser.syncTabs`, which are keyed by the
+//! connection's `client.hello` identity (never a wire parameter) and answer
+//! `-32602` on an un-hello'd connection or when a report would move a known
+//! `tabId` to another workspace. Three additive workspace events:
+//! `browser:tab-opened`, `browser:tab-updated`, `browser:tab-closed`. The
+//! catalog contains 303 router methods, 47 fast-path methods, and two
+//! aliases: 352 client-callable names. The five reverse methods are
+//! counted separately.
+//!
+//! Version 9.11 routes agent browser traffic through the registry (REV-2
+//! Model 3–6 & 10). Agent-initiated `browser.exec` dispatches to the
+//! workspace's **driving client** — the pin, else the host of the
+//! workspace's claimed tabs, else the first-connected eligible client — and
+//! answers `listTabs` itself from the registry (all hosts aggregated,
+//! `hostClientId` / `hostName` / `hostConnected` per entry); a `claimTab`
+//! executed on the driving client re-homes the tab's row there
+//! (`browser:tab-updated { changes: { hostClientId, ownerAgentId } }`), and
+//! `workspace.setBrowserClient` moves every claimed tab to the new pin. Two
+//! additive fast-path methods (any client): `browser.navigateTab { tabId,
+//! url }` routes a navigation to the tab's driving client / host and echoes
+//! the action envelope; `browser.closeTab { tabId, force? }` routes the
+//! close, or with `force` (or an offline target) tombstones the row
+//! daemon-side and publishes `browser:tab-closed`. Unknown `tabId` is
+//! `-32602`; an offline target is `-32603` ("browser client … for this
+//! workspace is not connected"). The catalog contains 303 router methods,
+//! 49 fast-path methods, and two aliases: 354 client-callable names. The
+//! five reverse methods are counted separately.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.2";
+pub const PROTOCOL_VERSION: &str = "9.11";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

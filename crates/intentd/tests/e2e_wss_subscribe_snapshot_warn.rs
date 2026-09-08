@@ -206,7 +206,11 @@ async fn boot(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, u16, Arc<ClientCo
 
 /// Send a `*.subscribe` over WSS and wait for both the response envelope
 /// (`subscriptionId`) and the seq-0 `subscription.push` snapshot.
-async fn subscribe_and_await_snapshot<S>(ws: &mut WebSocketStream<S>, method: &str, params: Value)
+async fn subscribe_and_await_snapshot<S>(
+    ws: &mut WebSocketStream<S>,
+    method: &str,
+    params: Value,
+) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -215,9 +219,9 @@ where
         .await
         .expect("send subscribe frame");
     let mut got_response = false;
-    let mut got_snapshot = false;
+    let mut snapshot = None;
     let deadline = tokio::time::Instant::now() + common::rpc_read_timeout();
-    while !(got_response && got_snapshot) {
+    while !(got_response && snapshot.is_some()) {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(
             !remaining.is_zero(),
@@ -239,7 +243,7 @@ where
                     && v["params"]["kind"] == json!("snapshot")
                 {
                     assert_eq!(v["params"]["seq"], 0, "seq-0 snapshot: {v}");
-                    got_snapshot = true;
+                    snapshot = Some(v["params"]["snapshot"].clone());
                 }
             }
             Some(Ok(Message::Ping(p))) => {
@@ -249,6 +253,7 @@ where
             other => panic!("expected text frame, got {other:?}"),
         }
     }
+    snapshot.expect("seq-0 snapshot")
 }
 
 /// Strip ANSI escape sequences (the stderr fmt layer colors its output even
@@ -276,6 +281,193 @@ fn count_lines(log: &str, needles: &[&str]) -> usize {
         .lines()
         .filter(|line| needles.iter().all(|n| line.contains(n)))
         .count()
+}
+
+fn statement_counts(log: &str, method: &str) -> Vec<u64> {
+    strip_ansi(log)
+        .lines()
+        .filter(|line| {
+            line.contains("rpc dispatch exceeded SQL statement budget")
+                && line.contains(&format!("method={method}"))
+        })
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("statements="))
+                .and_then(|value| value.parse().ok())
+        })
+        .collect()
+}
+
+/// Poll `daemon.log` from byte `offset` until the tail holds a statement-budget
+/// row for every method in `methods`, and return that tail.
+async fn await_profile_rows(log_path: &Path, offset: usize, methods: &[&str]) -> String {
+    let deadline = tokio::time::Instant::now() + common::rpc_read_timeout();
+    loop {
+        let log = std::fs::read_to_string(log_path).expect("read daemon log");
+        let segment = &log[offset..];
+        if methods
+            .iter()
+            .all(|method| !statement_counts(segment, method).is_empty())
+        {
+            return segment.to_string();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for profile rows; log:\n{log}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Statements `method`'s single profile row in `segment` attributes to the
+/// aggregate plan itself. The read pool grows lazily (min 0, max 32), so an
+/// aggregate fan-out may open new connections mid-dispatch; how many depends on
+/// scheduling, and each one runs sqlx's connection-setup PRAGMA statement
+/// inside the dispatch span. Those setup rows are subtracted so the budget
+/// measures the plan, not pool growth.
+fn plan_statements(segment: &str, method: &str) -> u64 {
+    let rows = statement_counts(segment, method);
+    assert_eq!(
+        rows.len(),
+        1,
+        "one {method} profile row; segment:\n{segment}"
+    );
+    let span = format!("rpc_dispatch{{method=\"{method}\"}}");
+    let connection_setup = strip_ansi(segment)
+        .lines()
+        .filter(|line| {
+            line.contains(&span)
+                && line.contains("sqlx::query")
+                && line.contains("summary=\"PRAGMA journal_mode = WAL;")
+        })
+        .count();
+    rows[0] - u64::try_from(connection_setup).unwrap()
+}
+
+async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    ws.send(Message::Text(
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send rpc");
+    loop {
+        match timeout(common::rpc_read_timeout(), ws.next())
+            .await
+            .expect("rpc frame timed out")
+        {
+            Some(Ok(Message::Text(text))) => {
+                let value: Value = serde_json::from_str(&text).expect("json frame");
+                if value["id"] == json!(id) {
+                    return value;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// The real WSS list and workspace-subscribe seq-0 paths execute a fixed
+/// aggregate plan. Growing the returned set from 1 to 10 to 100 rows must not
+/// grow SQL statement count.
+#[tokio::test]
+async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
+    const MAX_STATEMENTS: u64 = 11;
+    let (daemon, port, cfg, socket) = boot(
+        "itd-wscost",
+        &[
+            ("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "0"),
+            // Surface every `sqlx::query` row so [`plan_statements`] can
+            // tell read-pool connection setup apart from the aggregate plan.
+            ("RUST_LOG", "info,sqlx::query=debug"),
+        ],
+    )
+    .await;
+    let log_path = daemon.data_dir.join("daemon.log");
+    let mut seeded = 0;
+    let mut observed = Vec::new();
+
+    for target in [1, 10, 100] {
+        while seeded < target {
+            seeded += 1;
+            let created = uds_rpc(
+                &socket,
+                i64::from(seeded),
+                "workspace.create",
+                json!({
+                    "title": format!("Cost {seeded:03}"),
+                    "branch": "main",
+                    "skipWorktree": true,
+                }),
+            )
+            .await;
+            assert!(
+                created["result"]["workspace"]["id"].is_string(),
+                "{created}"
+            );
+        }
+
+        // Everything the measured RPCs log lands after this offset, so the
+        // profile rows below are theirs and nobody else's.
+        let log_offset = std::fs::read_to_string(&log_path)
+            .expect("read daemon log")
+            .len();
+
+        let mut list_ws = connect_ws(port, cfg.clone()).await;
+        let listed = wss_rpc(
+            &mut list_ws,
+            10_000 + i64::from(target),
+            "workspace.list",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            listed["result"]["workspaces"]
+                .as_array()
+                .expect("workspace.list rows")
+                .len(),
+            usize::try_from(target).unwrap()
+        );
+
+        let mut sub_ws = connect_ws(port, cfg.clone()).await;
+        let snapshot =
+            subscribe_and_await_snapshot(&mut sub_ws, "workspace.subscribe", json!({})).await;
+        assert_eq!(
+            snapshot.as_array().expect("workspace snapshot rows").len(),
+            usize::try_from(target).unwrap()
+        );
+
+        let segment = await_profile_rows(
+            &log_path,
+            log_offset,
+            &["workspace.list", "workspace.subscribe"],
+        )
+        .await;
+        let list_count = plan_statements(&segment, "workspace.list");
+        let subscribe_count = plan_statements(&segment, "workspace.subscribe");
+        assert!(
+            list_count <= MAX_STATEMENTS,
+            "{target} rows: {list_count}; log segment:\n{segment}"
+        );
+        assert!(
+            subscribe_count <= MAX_STATEMENTS,
+            "{target} rows: {subscribe_count}; log segment:\n{segment}"
+        );
+        observed.push((target, list_count, subscribe_count));
+    }
+
+    assert_eq!(
+        observed.iter().map(|row| row.0).collect::<Vec<_>>(),
+        [1, 10, 100]
+    );
 }
 
 /// End-to-end: with the threshold lowered to 0, a real `note.subscribe` over

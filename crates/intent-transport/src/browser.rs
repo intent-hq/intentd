@@ -14,21 +14,74 @@
 //! multi-action batch. `-32602` on missing / empty / non-array `actions`;
 //! `-32603` when the FE reverse RPC fails, times out, no client is connected,
 //! or the FE surfaces its own error.
+//!
+//! The daemon-owned **browser tab registry** (REV-2 Model 2 & 6) shares the
+//! namespace: `browser.listTabs` (any client) reads the persisted tabs of a
+//! workspace decorated with host presence from the reverse registry
+//! (`hostName` / `hostConnected`); `browser.upsertTab` / `browser.removeTab`
+//! / `browser.syncTabs` are **host-only** reports keyed by the connection's
+//! logical `clientId` from `client.hello` (§5.17) — never a wire parameter —
+//! which is why they are transport interceptors like `drafts.*`. A connection
+//! that never said hello cannot host tabs (`-32602`).
+//!
+//! REV-2 routing (Model 3–6, protocol 9.11) adds the tab-addressed
+//! `browser.navigateTab { tabId, url }` and `browser.closeTab { tabId,
+//! force? }` (any client): the daemon looks the tab up in the registry
+//! (`-32602` when unknown) and routes the request to the client that must
+//! perform it — the workspace's driving client for a claimed tab, the
+//! physical host for an unclaimed one — as a reverse `browser.exec`; an
+//! offline target is `-32603` unless `force` tombstones the row daemon-side.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use intent_core::{BrowserTab, BrowserTabInput, ClientId, WorkspaceApi, WorkspaceId};
 use intent_services::browser_ops;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::events::{error_frame, success_frame};
-use crate::reverse::{request_timeout, ReverseChannel};
+use crate::reverse::{request_timeout, ClientPresence, PrimaryReverseRegistry, ReverseChannel};
 
 /// The `browser.*` methods, once classified. Kept as an enum for parity with
-/// `host::HostMethod` and to leave room for future additions without changing
-/// the classify/handle signature.
+/// `host::HostMethod`.
 pub(crate) enum BrowserMethod {
     /// `browser.exec` client-callable trigger → FE-served reverse RPC.
     Exec,
+    /// `browser.listTabs` — daemon-answered registry read (any client).
+    ListTabs,
+    /// `browser.upsertTab` — host-only tab report.
+    UpsertTab,
+    /// `browser.removeTab` — host-only close report.
+    RemoveTab,
+    /// `browser.syncTabs` — host-only full-snapshot reconciliation.
+    SyncTabs,
+    /// `browser.navigateTab` — routed navigation of one registered tab.
+    NavigateTab,
+    /// `browser.closeTab` — routed (or forced daemon-side) close of one tab.
+    CloseTab,
+}
+
+impl BrowserMethod {
+    /// Whether the method reports as a tab host and therefore needs the
+    /// connection's hello-bound identity. Only these three resolve it: the
+    /// lookup is an indexed read under the reverse registry lock, and
+    /// `browser.listTabs` / `browser.exec` never consume the identity, so
+    /// they skip it entirely and the list fast path stays free of it.
+    pub(crate) fn reports_as_host(&self) -> bool {
+        matches!(self, Self::UpsertTab | Self::RemoveTab | Self::SyncTabs)
+    }
+}
+
+/// What the registry methods need from the connection task: the service
+/// surface, the connection's hello'd identity (the reporting host), and the
+/// live reverse registry for presence decoration. `client_id` is the identity
+/// `client.hello` bound onto the reverse-registry entry
+/// (`PrimaryReverseGuard::bound_client_id`), never the lazily minted
+/// `drafts.*` binding — a connection that only touched drafts is not a host.
+pub(crate) struct TabContext<'a> {
+    pub api: &'a dyn WorkspaceApi,
+    pub client_id: Option<&'a ClientId>,
+    pub registry: Option<&'a PrimaryReverseRegistry>,
 }
 
 /// A classified `browser.*` request awaiting handling by the connection task.
@@ -57,6 +110,12 @@ pub(crate) fn classify(value: &Value) -> Option<BrowserRequest> {
     }
     let method = match method {
         "browser.exec" => BrowserMethod::Exec,
+        "browser.listTabs" => BrowserMethod::ListTabs,
+        "browser.upsertTab" => BrowserMethod::UpsertTab,
+        "browser.removeTab" => BrowserMethod::RemoveTab,
+        "browser.syncTabs" => BrowserMethod::SyncTabs,
+        "browser.navigateTab" => BrowserMethod::NavigateTab,
+        "browser.closeTab" => BrowserMethod::CloseTab,
         _ => return None,
     };
     let params = obj
@@ -72,10 +131,16 @@ pub(crate) fn classify(value: &Value) -> Option<BrowserRequest> {
     })
 }
 
-/// Handle a classified `browser.*` request: validate the envelope, forward
-/// via the reverse channel, and shape the FE's reply. Returns `None` for a
-/// notification (no `id`), which gets no response.
-pub(crate) async fn handle(req: BrowserRequest, reverse: &ReverseChannel) -> Option<String> {
+/// Handle a classified `browser.*` request. `browser.exec` validates the
+/// envelope, forwards via the reverse channel, and shapes the FE's reply; the
+/// registry methods run against `tabs` (persistence + the connection's host
+/// identity). Returns `None` for a notification (no `id`), which gets no
+/// response.
+pub(crate) async fn handle(
+    req: BrowserRequest,
+    reverse: &ReverseChannel,
+    tabs: TabContext<'_>,
+) -> Option<String> {
     let BrowserRequest {
         method,
         id_present,
@@ -87,11 +152,211 @@ pub(crate) async fn handle(req: BrowserRequest, reverse: &ReverseChannel) -> Opt
             Ok(v) => success_frame(&id_echo, &v),
             Err(e) => error_frame(&id_echo, e.code(), &e.to_string()),
         },
+        BrowserMethod::ListTabs => frame_result(&id_echo, list_tabs(&params, &tabs).await),
+        BrowserMethod::UpsertTab => frame_result(&id_echo, upsert_tab(&params, &tabs).await),
+        BrowserMethod::RemoveTab => frame_result(&id_echo, remove_tab(&params, &tabs).await),
+        BrowserMethod::SyncTabs => frame_result(&id_echo, sync_tabs(&params, &tabs).await),
+        BrowserMethod::NavigateTab => frame_result(&id_echo, navigate_tab(&params, &tabs).await),
+        BrowserMethod::CloseTab => frame_result(&id_echo, close_tab(&params, &tabs).await),
     };
     if !id_present {
         return None;
     }
     Some(frame)
+}
+
+fn frame_result(id_echo: &Value, result: Result<Value, (i32, String)>) -> String {
+    match result {
+        Ok(v) => success_frame(id_echo, &v),
+        Err((code, message)) => error_frame(id_echo, code, &message),
+    }
+}
+
+fn invalid(message: impl Into<String>) -> (i32, String) {
+    (browser_ops::INVALID_PARAMS, message.into())
+}
+
+fn domain_err(e: &intent_core::Error) -> (i32, String) {
+    (e.code(), e.to_string())
+}
+
+fn required_str<'a>(params: &'a Map<String, Value>, name: &str) -> Result<&'a str, (i32, String)> {
+    params
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid(format!("Invalid parameter: {name} is required")))
+}
+
+/// The host-only methods require a hello'd connection: the reporting host is
+/// the connection's logical `clientId`, never a wire parameter.
+fn require_host(method: &str, tabs: &TabContext<'_>) -> Result<ClientId, (i32, String)> {
+    tabs.client_id.cloned().ok_or_else(|| {
+        invalid(format!(
+            "{method}: client.hello is required before hosting tabs"
+        ))
+    })
+}
+
+/// Parse one host-reported tab. `workspace_id` (when given) overrides the
+/// object's own `workspaceId` — `browser.upsertTab` carries it on the
+/// envelope, `browser.syncTabs` per entry.
+fn parse_tab_input(
+    value: &Value,
+    workspace_id: Option<&str>,
+    what: &str,
+) -> Result<BrowserTabInput, (i32, String)> {
+    let Some(obj) = value.as_object() else {
+        return Err(invalid(format!(
+            "Invalid parameter: {what} must be an object"
+        )));
+    };
+    let mut obj = obj.clone();
+    if let Some(ws) = workspace_id {
+        obj.insert("workspaceId".to_string(), Value::String(ws.to_string()));
+    }
+    let input: BrowserTabInput = serde_json::from_value(Value::Object(obj))
+        .map_err(|e| invalid(format!("Invalid parameter: {what}: {e}")))?;
+    if input.tab_id.is_empty() {
+        return Err(invalid(format!(
+            "Invalid parameter: {what}.tabId is required"
+        )));
+    }
+    if input.workspace_id.0.is_empty() {
+        return Err(invalid(format!(
+            "Invalid parameter: {what}.workspaceId is required"
+        )));
+    }
+    Ok(input)
+}
+
+/// `browser.listTabs { workspaceId }` → `{ tabs: [Tab & { hostName?,
+/// hostConnected }] }`. Presence comes from the reverse registry's
+/// mutation-maintained presence index
+/// ([`crate::reverse::PrimaryReverseRegistry::host_presence`]): a host with
+/// any live hello'd connection is `hostConnected` and carries its hello
+/// `name`; an offline host has no name to report. Cost is one ordered index
+/// scan for the rows plus one O(1) lookup per distinct host — O(rows
+/// returned), never O(rows × connections).
+async fn list_tabs(
+    params: &Map<String, Value>,
+    tabs: &TabContext<'_>,
+) -> Result<Value, (i32, String)> {
+    let workspace_id = required_str(params, "workspaceId")?;
+    let rows = tabs
+        .api
+        .browser_list_tabs(WorkspaceId(workspace_id.to_string()))
+        .await
+        .map_err(|e| domain_err(&e))?;
+    let hosts: HashSet<&ClientId> = rows.iter().map(|tab| &tab.host_client_id).collect();
+    let presence = tabs
+        .registry
+        .map(|registry| registry.host_presence(&hosts))
+        .unwrap_or_default();
+    let decorated: Vec<Value> = rows
+        .iter()
+        .map(|tab| decorate_tab(tab, &presence))
+        .collect();
+    Ok(json!({ "tabs": decorated }))
+}
+
+fn decorate_tab(tab: &BrowserTab, presence: &HashMap<ClientId, ClientPresence>) -> Value {
+    let mut value = json!(tab);
+    let host = presence.get(&tab.host_client_id);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("hostConnected".to_string(), Value::Bool(host.is_some()));
+        if let Some(name) = host.and_then(|c| c.name.clone()) {
+            obj.insert("hostName".to_string(), Value::String(name));
+        }
+    }
+    value
+}
+
+/// `browser.upsertTab { workspaceId, tab }` (host only) → `{ tab }`.
+async fn upsert_tab(
+    params: &Map<String, Value>,
+    tabs: &TabContext<'_>,
+) -> Result<Value, (i32, String)> {
+    let host = require_host("browser.upsertTab", tabs)?;
+    let workspace_id = required_str(params, "workspaceId")?;
+    let tab = params
+        .get("tab")
+        .ok_or_else(|| invalid("Invalid parameter: tab is required"))?;
+    let input = parse_tab_input(tab, Some(workspace_id), "tab")?;
+    let tab = tabs
+        .api
+        .browser_upsert_tab(host, input)
+        .await
+        .map_err(|e| domain_err(&e))?;
+    Ok(json!({ "tab": tab }))
+}
+
+/// `browser.removeTab { tabId }` (host only) → `{ ok: true }`.
+async fn remove_tab(
+    params: &Map<String, Value>,
+    tabs: &TabContext<'_>,
+) -> Result<Value, (i32, String)> {
+    let host = require_host("browser.removeTab", tabs)?;
+    let tab_id = required_str(params, "tabId")?;
+    tabs.api
+        .browser_remove_tab(host, tab_id.to_string())
+        .await
+        .map_err(|e| domain_err(&e))?;
+    Ok(json!({ "ok": true }))
+}
+
+/// `browser.syncTabs { tabs }` (host only) → `{ drop: tabId[] }`.
+async fn sync_tabs(
+    params: &Map<String, Value>,
+    tabs: &TabContext<'_>,
+) -> Result<Value, (i32, String)> {
+    let host = require_host("browser.syncTabs", tabs)?;
+    let snapshot = params
+        .get("tabs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("Invalid parameter: tabs must be an array"))?;
+    let inputs = snapshot
+        .iter()
+        .enumerate()
+        .map(|(i, v)| parse_tab_input(v, None, &format!("tabs[{i}]")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let drop = tabs
+        .api
+        .browser_sync_tabs(host, inputs)
+        .await
+        .map_err(|e| domain_err(&e))?;
+    Ok(json!({ "drop": drop }))
+}
+
+/// `browser.navigateTab { tabId, url }` (any client) → the routed
+/// `navigate` action's result envelope.
+async fn navigate_tab(
+    params: &Map<String, Value>,
+    tabs: &TabContext<'_>,
+) -> Result<Value, (i32, String)> {
+    let tab_id = required_str(params, "tabId")?;
+    let url = required_str(params, "url")?;
+    tabs.api
+        .browser_navigate_tab(tab_id.to_string(), url.to_string())
+        .await
+        .map_err(|e| domain_err(&e))
+}
+
+/// `browser.closeTab { tabId, force? }` (any client) → `{ ok: true }`.
+async fn close_tab(
+    params: &Map<String, Value>,
+    tabs: &TabContext<'_>,
+) -> Result<Value, (i32, String)> {
+    let tab_id = required_str(params, "tabId")?;
+    let force = match params.get("force") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(invalid("Invalid parameter: force must be a boolean")),
+    };
+    tabs.api
+        .browser_close_tab(tab_id.to_string(), force)
+        .await
+        .map_err(|e| domain_err(&e))
 }
 
 /// Why a [`exec`] call could not be satisfied. `code()` maps each to a

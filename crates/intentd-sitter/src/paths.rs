@@ -12,6 +12,7 @@
 //! ```text
 //! sitter/
 //! ├── versions/<version>/intentd[.exe]   # installed daemon binaries
+//! ├── versions/<version>/libexec/…       # sidecar payload from the archive (tailcat + LICENSE)
 //! ├── tmp/                               # in-flight downloads/extractions
 //! ├── config.toml                        # user-editable channel pin
 //! ├── state.json                         # persisted sitter state

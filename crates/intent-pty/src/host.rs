@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 
 use intent_core::{Error, Result};
 
-use crate::scrollback::{Scrollback, DEFAULT_SCROLLBACK_BYTES};
+use crate::scrollback::{LineSnapshot, Scrollback, DEFAULT_SCROLLBACK_BYTES};
 
 /// Broadcast backlog of output chunks buffered per subscriber before lagging.
 const FANOUT_CAPACITY: usize = 2048;
@@ -429,6 +429,61 @@ impl PtyHost {
         let session = self.get(id)?;
         let guard = session.fanout.lock().unwrap();
         Ok(guard.scrollback.snapshot())
+    }
+
+    /// Snapshot at most the trailing `max_bytes` of retained scrollback without
+    /// first cloning the retained prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned.
+    pub fn scrollback_tail(&self, id: PtyId, max_bytes: usize) -> Result<Vec<u8>> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok(guard.scrollback.snapshot_tail(max_bytes))
+    }
+
+    /// Snapshot an oldest-indexed line window from retained scrollback. The
+    /// total line count and bytes come from one lock acquisition, so concurrent
+    /// appends cannot make the header/cursor disagree with the copied range.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned.
+    pub fn scrollback_lines(
+        &self,
+        id: PtyId,
+        max_lines: usize,
+        end_line: Option<usize>,
+    ) -> Result<LineSnapshot> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok(guard.scrollback.snapshot_lines(max_lines, end_line))
+    }
+
+    /// Cumulative line-snapshot call and backward-scan counts for regression
+    /// tests that exercise scrollback through the service surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the session fanout mutex is poisoned.
+    #[doc(hidden)]
+    pub fn scrollback_line_snapshot_metrics(&self, id: PtyId) -> Result<(usize, usize)> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok(guard.scrollback.line_snapshot_metrics())
     }
 
     /// The PTY child's process id, if the platform reported one at spawn.

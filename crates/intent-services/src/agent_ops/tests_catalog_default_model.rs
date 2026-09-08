@@ -39,7 +39,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
     // fallback) — seed the effective default provider explicitly; the tests
     // here exercise the MODEL rungs, which sit below it.
     registry
-        .apply(&[("providers.active".into(), json!("auggie"))])
+        .apply(&[("model.defaultProvider".into(), json!("auggie"))])
         .expect("seed default provider");
     let services = Services::new(store)
         .with_settings_registry(registry)
@@ -147,11 +147,11 @@ async fn catalog_without_default_row_falls_through() {
 async fn settings_chain_outranks_catalog_default() {
     let (_t, svc, ws, _spec, _cfg) = setup().await;
     seed_catalog_with_default(&svc);
-    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.default", json!("fable-5"));
 
     let id = create(&svc, &ws, None, None, AgentCreateExtra::default()).await;
     let got = svc.agent_get_op(id, None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:fable-5"));
+    assert_eq!(got.model.as_deref(), Some("fable-5"));
 }
 
 /// A specialist frontmatter pin outranks the catalog default.
@@ -159,11 +159,11 @@ async fn settings_chain_outranks_catalog_default() {
 async fn specialist_pin_outranks_catalog_default() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog_with_default(&svc);
-    write_specialist(spec_dir.path(), "pinned", "model: \"auggie:fable-5\"\n");
+    write_specialist(spec_dir.path(), "pinned", "model: \"fable-5\"\n");
 
     let id = create(&svc, &ws, None, Some("pinned"), AgentCreateExtra::default()).await;
     let got = svc.agent_get_op(id, None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:fable-5"));
+    assert_eq!(got.model.as_deref(), Some("fable-5"));
 }
 
 /// An explicit client model outranks everything.

@@ -226,12 +226,17 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     let specialists_dir = data_dir.join(".intent").join("specialists");
     std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
     let specialist_content =
-        "---\nmodel: auggie:opus\n---\n# Test Specialist\nTest behavior prompt.";
+        "---\ncodingAgent: auggie\nmodel: opus\n---\n# Test Specialist\nTest behavior prompt.";
     std::fs::write(
         specialists_dir.join("test-specialist.md"),
         specialist_content,
     )
     .expect("write specialist file");
+
+    // Seed a configured default provider: since monorepo#3044 `agent.create`
+    // fails loudly when neither an explicit provider nor a settings-derived
+    // default resolves (the frontmatter model no longer carries a provider).
+    common::seed_default_provider(&data_dir);
 
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -277,7 +282,7 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
 
     // Assert the session's model IS the frontmatter model (make the test fail if resolution is skipped)
     assert_eq!(
-        get_res["agent"]["model"], "auggie:opus",
+        get_res["agent"]["model"], "opus",
         "specialist frontmatter model not resolved"
     );
 
@@ -733,13 +738,19 @@ async fn specialist_config_scalars_inherit_over_wss() {
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 
-    // get — omitted scalars inherit the bundled values; roleReminder does not.
+    // get — omitted scalars inherit the bundled values; roleReminder does
+    // not. The bundled compound `model` scalar reads as the bare model plus
+    // `codingAgent` set to the prefix (lenient legacy normalization).
     let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "zeta" })).await;
     let def = &got["specialist"];
     assert_eq!(def["source"], "user", "user tier wins the merge");
     assert_eq!(
-        def["model"], "auggie:opus",
-        "omitted model inherits the bundled value on specialist.get over WSS"
+        def["model"], "opus",
+        "omitted model inherits the bundled value (split to the bare id) on specialist.get over WSS"
+    );
+    assert_eq!(
+        def["codingAgent"], "auggie",
+        "the legacy compound's prefix lands on codingAgent over WSS"
     );
     assert_eq!(
         def["agentType"], "zeta-type",
@@ -765,8 +776,8 @@ async fn specialist_config_scalars_inherit_over_wss() {
         .find(|s| s["id"] == "zeta")
         .expect("zeta listed");
     assert_eq!(
-        zeta["model"], "auggie:opus",
-        "omitted model inherits in specialist.list over WSS"
+        zeta["model"], "opus",
+        "omitted model inherits (split to the bare id) in specialist.list over WSS"
     );
     assert_eq!(
         zeta["agentType"], "zeta-type",
@@ -878,7 +889,9 @@ async fn specialist_model_options_round_trip_over_wss() {
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 
-    let expected = json!([{ "model": "auggie:opus", "hint": "smart" }]);
+    // The bundled legacy compound entry reads as the provider+model triple
+    // (lenient legacy normalization).
+    let expected = json!([{ "provider": "auggie", "model": "opus", "hint": "smart" }]);
 
     // get — an omitted key inherits the bundled tier's list.
     let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "zeta" })).await;
@@ -1158,6 +1171,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,

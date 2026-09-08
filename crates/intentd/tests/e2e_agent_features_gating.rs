@@ -1026,9 +1026,9 @@ async fn specialist_model_options_surface_in_bridge_description() {
     );
     assert!(
         desc.contains(
-            "chooser: default: provider default, `opencode:kimi-k3` (cheap), `auggie:opus`"
+            "chooser: default: provider default, `kimi-k3` on opencode (cheap), `opus` on auggie"
         ),
-        "options line must name the resolved default then compound ids + hints in order: {desc}"
+        "options line must name the resolved default then bare ids on providers + hints in order: {desc}"
     );
     assert!(
         !desc.contains("plain:"),

@@ -265,8 +265,8 @@ impl Services {
     /// prompt, run the one-shot auggie CLI, clean the transcript, and parse
     /// the mode-specific result. `mode` is pre-validated by the router
     /// (`"enhance"` or `"layout"`). Gated on auggie being the effective
-    /// provider per spec Decision 5 — the settings-derived default (provider
-    /// of `model.default`, else `providers.active`) must be auggie.
+    /// provider per spec Decision 5 — the settings-derived default
+    /// (`model.defaultProvider`) must be auggie.
     /// Unset/undecidable settings resolve the gate CLOSED (unavailable):
     /// falling through to the first registered provider would always be
     /// auggie and functionally reinstate the removed hardcoded default
@@ -424,7 +424,7 @@ mod tests {
         }
     }
 
-    /// Services with a fake CLI and `providers.active = "auggie"` so the
+    /// Services with a fake CLI and `model.defaultProvider = "auggie"` so the
     /// provider gate is open: unset settings resolve the gate CLOSED
     /// (see `enhance_op_unavailable_when_settings_unset`), so op-level
     /// tests must opt in to an auggie-active registry to reach the CLI.
@@ -436,8 +436,11 @@ mod tests {
                 .expect("load registry"),
         );
         registry
-            .apply(&[("providers.active".to_string(), serde_json::json!("auggie"))])
-            .expect("set providers.active");
+            .apply(&[(
+                "model.defaultProvider".to_string(),
+                serde_json::json!("auggie"),
+            )])
+            .expect("set model.defaultProvider");
         let services = Services::new(store)
             .with_auggie_bin(bin)
             .with_settings_registry(registry);
@@ -474,7 +477,7 @@ mod tests {
         // functionally reinstate the removed hardcoded default (coordinator
         // ruling; matches FE #759 where unset resolves disabled). No registry
         // wired → schema defaults → both `model.default` and
-        // `providers.active` unset.
+        // `model.defaultProvider` unset.
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let services =

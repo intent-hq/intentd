@@ -33,12 +33,80 @@
 
 use std::sync::Arc;
 
-use intent_store::{PersistedCompletionWatch, PersistedDelegationGroup};
+use intent_store::{PersistedCompletionWatch, PersistedDelegationGroup, Store};
 
 use intent_core::{now_iso, AgentId, Error, Event, Result, WorkspaceId};
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::Services;
+
+/// One write to the `delegation_group` table. Every such write is enqueued on
+/// the group persistence lane and executed by its single worker in enqueue
+/// order (intent-hq/intent#4460): a spawned best-effort upsert can therefore
+/// never land after a later delete for the same group and resurrect the row.
+pub(crate) enum GroupPersistOp {
+    /// Write-through snapshot of an in-memory group (serialized by the
+    /// worker, off the registry lock).
+    Upsert(DelegationGroup),
+    /// Drop the group row (cancel / gone-parent sweep / emptied group).
+    Delete(String),
+    /// Transactional post-delivery settlement
+    /// ([`Store::settle_delegation_group_after_delivery`]).
+    Settle {
+        group_id: String,
+        retain_children: Vec<AgentId>,
+    },
+}
+
+/// Outcome channel for a lane op whose caller awaits durability.
+type GroupPersistAck = oneshot::Sender<Result<()>>;
+
+/// Sender half of the group persistence lane (see [`GroupPersistOp`]).
+pub(crate) type GroupPersistSender =
+    mpsc::UnboundedSender<(GroupPersistOp, Option<GroupPersistAck>)>;
+
+/// The lane worker: drains ops strictly in enqueue order, one at a time.
+/// Exits when the last [`Services`] clone drops its sender.
+async fn run_group_persist_lane(
+    store: Store,
+    mut rx: mpsc::UnboundedReceiver<(GroupPersistOp, Option<GroupPersistAck>)>,
+) {
+    while let Some((op, ack)) = rx.recv().await {
+        let (group_id, result) = match op {
+            GroupPersistOp::Upsert(group) => {
+                let result = match delegation_group_to_persisted(&group) {
+                    Ok(persisted) => store.upsert_delegation_group(&persisted).await,
+                    Err(e) => Err(e),
+                };
+                (group.group_id, result)
+            }
+            GroupPersistOp::Delete(group_id) => {
+                let result = store.delete_delegation_group(&group_id).await;
+                (group_id, result)
+            }
+            GroupPersistOp::Settle {
+                group_id,
+                retain_children,
+            } => {
+                let result = store
+                    .settle_delegation_group_after_delivery(&group_id, &retain_children)
+                    .await;
+                (group_id, result)
+            }
+        };
+        match ack {
+            Some(ack) => {
+                let _ = ack.send(result);
+            }
+            None => {
+                if let Err(e) = result {
+                    tracing::warn!("delegation_group persist failed {group_id}: {e}");
+                }
+            }
+        }
+    }
+}
 
 /// One parent→child completion-watch record. An ungrouped watch is removed
 /// once the child's completion has been delivered to the parent (AS-3).
@@ -74,8 +142,18 @@ pub(crate) struct CompletionWatch {
     /// of an explicit registration.
     pub wake_on_attention: bool,
     /// Ask-only watches wait strictly for terminal completion. Attention
-    /// requests do not consume or wake this watch, and it may coexist with an
-    /// unrelated grouped watch for the same parent/child pair.
+    /// requests do not consume or wake this watch, and monitoring-idle
+    /// advisories (child idle while only hooks / PR monitors are active) are
+    /// skipped for it too — the parent hears nothing until settlement, even
+    /// if the child parks on a TTL-less PR monitor (intent-hq/intent#4254
+    /// design). It may coexist with an unrelated grouped watch for the same
+    /// parent/child pair. The flag is set only on watches the ask path
+    /// CREATES: `register_completion_watch_strict_durable` reuses an
+    /// existing non-strict ungrouped watch as-is, and any later non-ask
+    /// registration adopting an ask-only watch CLEARS the flag (upgrade to
+    /// a full watch — the explicit watcher expects advisories; see
+    /// `insert_watch_in_memory`). The skip therefore holds exactly while the
+    /// ask registration is the pair's only ungrouped interest.
     pub completion_only: bool,
     /// Identity (`completion_report.timestamp`) of the child report whose
     /// report-time wake was SENT toward this parent (monorepo#4026): stamped
@@ -234,6 +312,7 @@ impl Services {
         if let Err(e) = self.store.upsert_completion_watch(&persisted).await {
             tracing::warn!("completion_watch upsert failed {id}: {e}");
         }
+        self.delete_watch_row_if_swept(&id).await;
         Ok(id)
     }
 
@@ -298,8 +377,8 @@ impl Services {
     /// regardless of the `wake_on_attention` flag (monorepo#3443); the flag
     /// is kept as the persisted record of an explicit registration.
     /// Adoption strengthens an existing watch for the pair
-    /// (`wake_on_attention` set) — grouped watches keep their group but gain
-    /// the flag.
+    /// (`wake_on_attention` set, `completion_only` cleared) — grouped watches
+    /// keep their group but gain the flag.
     pub(crate) async fn register_agent_watch_durable(
         &self,
         parent_workspace_id: &WorkspaceId,
@@ -322,7 +401,37 @@ impl Services {
         if let Err(e) = self.store.upsert_completion_watch(&persisted).await {
             tracing::warn!("completion_watch upsert failed {id}: {e}");
         }
+        self.delete_watch_row_if_swept(&id).await;
         Ok(id)
+    }
+
+    /// Close the write-through registration race (monorepo#4183): the two
+    /// insert-then-upsert variants above make the watch memory-visible
+    /// BEFORE the persisted row lands, so a concurrent parent sweep
+    /// (retire/delete cascade) can remove the in-memory watch and its rows
+    /// between the insert and the upsert — the late upsert then resurrects
+    /// an orphan row that rehydrates on restart. After the upsert commits,
+    /// re-check membership and best-effort delete the row when the watch is
+    /// already gone. (The strict variant persists before memory-visibility
+    /// and does not need this.)
+    async fn delete_watch_row_if_swept(&self, watch_id: &str) {
+        let still_present = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .iter()
+            .any(|s| s.id == watch_id);
+        if still_present {
+            return;
+        }
+        tracing::info!(
+            watch = %watch_id,
+            "watch swept during registration upsert; deleting resurrected row"
+        );
+        if let Err(e) = self.store.delete_completion_watch(watch_id).await {
+            tracing::warn!("completion_watch post-sweep delete failed {watch_id}: {e}");
+        }
     }
 
     /// Shared body of the two registration variants: run the scope gate,
@@ -341,6 +450,11 @@ impl Services {
     /// - `wake_on_attention` is strengthen-only: an explicit `agent.watch`
     ///   sets it on the adopted watch; a later auto registration never
     ///   clears it.
+    /// - `completion_only` is cleared: every registration through this path
+    ///   is a full (non-ask) watch, so adopting an ask-only watch upgrades it
+    ///   to hear monitoring-idle advisories (PR #1686 review). The ask path
+    ///   (`register_completion_watch_strict_durable`) never adopts through
+    ///   here, so it cannot re-narrow a full watch.
     #[allow(clippy::too_many_arguments)]
     fn insert_watch_in_memory(
         &self,
@@ -365,6 +479,7 @@ impl Services {
                     existing.group_id = Some(gid);
                 }
                 existing.wake_on_attention = existing.wake_on_attention || wake_on_attention;
+                existing.completion_only = false;
                 // monorepo#2532: adoption expresses fresh interest in the
                 // child's NEXT completion — clear the report-time disarm so
                 // a re-armed watch fires on the next `agent:idle` (mirrors
@@ -613,7 +728,36 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> bool {
-        let parents: Vec<AgentId> = {
+        let parents = self.waiting_subscription_parent_ids(workspace_id);
+        if parents.is_empty() {
+            return false;
+        }
+        match self.store.list_agent_session_summaries(workspace_id).await {
+            Ok(sessions) => Self::sessions_include_waiting_parent(&sessions, &parents),
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "waiting-subscriptions displayStatus lookup failed; reads as none"
+                );
+                false
+            }
+        }
+    }
+
+    /// In-memory half of the waiting-subscription derivation, shared by the
+    /// single-workspace probe and batched list enrichment.
+    pub(crate) fn workspace_has_waiting_agent_subscriptions_in_sessions(
+        &self,
+        workspace_id: &WorkspaceId,
+        sessions: &[intent_core::AgentSession],
+    ) -> bool {
+        let parents = self.waiting_subscription_parent_ids(workspace_id);
+        Self::sessions_include_waiting_parent(sessions, &parents)
+    }
+
+    fn waiting_subscription_parent_ids(&self, workspace_id: &WorkspaceId) -> Vec<AgentId> {
+        {
             let guard = self
                 .agent_subscriptions
                 .lock()
@@ -624,26 +768,20 @@ impl Services {
                 .filter(|s| &s.parent_workspace_id == workspace_id && !s.report_delivered)
                 .map(|s| s.parent_agent_id.clone())
                 .collect()
-        };
-        if parents.is_empty() {
-            return false;
         }
-        match self.store.list_agent_session_summaries(workspace_id).await {
-            Ok(sessions) => sessions.iter().any(|s| {
+    }
+
+    fn sessions_include_waiting_parent(
+        sessions: &[intent_core::AgentSession],
+        parents: &[AgentId],
+    ) -> bool {
+        !parents.is_empty()
+            && sessions.iter().any(|s| {
                 s.parent_agent_id.is_none()
                     && !s.is_background
                     && s.status != intent_core::AgentStatus::Deleted
                     && parents.contains(&s.id)
-            }),
-            Err(e) => {
-                tracing::warn!(
-                    workspace = %workspace_id.0,
-                    error = %e,
-                    "waiting-subscriptions displayStatus lookup failed; reads as none"
-                );
-                false
-            }
-        }
+            })
     }
 
     /// Remove a single watch by subscription id; returns whether one was found.
@@ -816,9 +954,10 @@ impl Services {
             raw_events: Vec::new(),
         };
         guard.delegation_groups.push(group.clone());
+        // Write-through persist (best-effort), enqueued under the lock so the
+        // lane order matches the registry order.
+        self.persist_delegation_group(group);
         drop(guard);
-        // Write-through persist (best-effort).
-        self.persist_delegation_group(&group);
         group_id
     }
 
@@ -859,11 +998,11 @@ impl Services {
         } else {
             None
         };
-        drop(guard);
-        // Write-through persist (best-effort).
+        // Write-through persist (best-effort), enqueued under the lock.
         if let Some(g) = group_clone {
-            self.persist_delegation_group(&g);
+            self.persist_delegation_group(g);
         }
+        drop(guard);
     }
 
     /// Seal the parent's open group (its delegating turn ended, so the expected
@@ -873,7 +1012,7 @@ impl Services {
     /// before the caller proceeds (fixes race where daemon kill between seal and
     /// spawned persist loses the sealed state across restart).
     pub(crate) async fn seal_group_for_parent(&self, parent_id: &AgentId) -> Option<String> {
-        let (group_id, group_clone) = {
+        let (group_id, ack) = {
             let mut guard = self
                 .agent_subscriptions
                 .lock()
@@ -884,19 +1023,12 @@ impl Services {
                 .find(|g| &g.parent_agent_id == parent_id && !g.sealed && !g.delivered)?;
             g.sealed = true;
             let group_id = g.group_id.clone();
-            let group_clone = g.clone();
-            (group_id, group_clone)
+            let ack = self.enqueue_group_persist_acked(GroupPersistOp::Upsert(g.clone()));
+            (group_id, ack)
         }; // guard is dropped here automatically
-           // Durable write-through persist: await the write so the sealed flag is
+           // Durable write-through persist: await the lane so the sealed flag is
            // persisted before the caller continues.
-        let persisted = match delegation_group_to_persisted(&group_clone) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("skip delegation_group persist {}: {e}", group_id);
-                return Some(group_id);
-            }
-        };
-        if let Err(e) = self.store.upsert_delegation_group(&persisted).await {
+        if let Err(e) = Self::await_group_persist(ack).await {
             tracing::warn!("delegation_group upsert failed {}: {e}", group_id);
         }
         Some(group_id)
@@ -949,7 +1081,7 @@ impl Services {
         summary: String,
         event: Event,
     ) -> bool {
-        let group_clone = {
+        let ack = {
             let mut guard = self
                 .agent_subscriptions
                 .lock()
@@ -974,22 +1106,15 @@ impl Services {
                 }
                 g.event_summaries.push(summary);
                 g.raw_events.push(Arc::new(event));
-                Some(g.clone())
+                Some(self.enqueue_group_persist_acked(GroupPersistOp::Upsert(g.clone())))
             } else {
                 None
             }
         }; // guard is dropped here automatically
-           // Durable write-through persist: await the write so the completion is
+           // Durable write-through persist: await the lane so the completion is
            // persisted before the caller continues / before the event is observable.
-        if let Some(g) = group_clone {
-            let persisted = match delegation_group_to_persisted(&g) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("skip delegation_group persist {group_id}: {e}");
-                    return true;
-                }
-            };
-            if let Err(e) = self.store.upsert_delegation_group(&persisted).await {
+        if let Some(ack) = ack {
+            if let Err(e) = Self::await_group_persist(ack).await {
                 tracing::warn!("delegation_group upsert failed {group_id}: {e}");
             }
             true
@@ -1143,37 +1268,25 @@ impl Services {
     /// Drop every delegation group parented by `parent_id`; returns the count
     /// removed (the group side of `agent.cancelSubscriptions`).
     pub(crate) fn remove_groups_for_parent(&self, parent_id: &AgentId) -> usize {
-        let removed_ids: Vec<String> = {
-            let mut guard = self
-                .agent_subscriptions
-                .lock()
-                .expect("agent subscription registry poisoned");
-            let mut ids = Vec::new();
-            guard.delegation_groups.retain(|g| {
-                if &g.parent_agent_id == parent_id {
-                    ids.push(g.group_id.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            ids
-        };
-        let removed = removed_ids.len();
-        if removed > 0 {
-            // Best-effort DB sweep (mirrors `remove_all_for_parent`): drop the
-            // persisted rows so cancelled groups don't rehydrate on restart. A
-            // failed delete self-heals — cancel is idempotent, so a repeat
-            // cancel (or group delivery) clears any resurrected group.
-            let store = self.store.clone();
-            tokio::spawn(async move {
-                for gid in removed_ids {
-                    if let Err(e) = store.delete_delegation_group(&gid).await {
-                        tracing::warn!("delegation_group parent sweep failed {gid}: {e}");
-                    }
-                }
-            });
-        }
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let mut removed = 0usize;
+        guard.delegation_groups.retain(|g| {
+            if &g.parent_agent_id == parent_id {
+                // Best-effort DB sweep (mirrors `remove_all_for_parent`): drop
+                // the persisted row so cancelled groups don't rehydrate on
+                // restart. Enqueued on the lane under the lock, so it lands
+                // after every earlier upsert of the same group.
+                self.enqueue_group_persist(GroupPersistOp::Delete(g.group_id.clone()));
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        drop(guard);
         removed
     }
 
@@ -1183,15 +1296,20 @@ impl Services {
     /// as an orphan pointing at a deleted group. Only removes a group
     /// parented by `parent_id`; returns the removed snapshot or `None` when
     /// no such group exists. The persisted watch rows are swept best-effort
-    /// (spawned, like every other watch-delete path); the caller owns the
-    /// persisted GROUP row delete (durable-before-observable in the scoped
-    /// `agent.cancelSubscriptions` path).
+    /// (spawned, like every other watch-delete path); the persisted GROUP row
+    /// delete is enqueued on the lane under the lock and its ack returned:
+    /// the scoped `agent.cancelSubscriptions` path already committed one
+    /// delete durable-before-observable, but the group stayed live in the
+    /// registry until this call, so an enroll/completion upsert may have been
+    /// enqueued after that delete. This trailing delete is ordered after any
+    /// such upsert; awaiting its ack before publishing success is what makes
+    /// the cancel fully durable-before-observable.
     pub(crate) fn remove_group_with_watches(
         &self,
         parent_id: &AgentId,
         group_id: &str,
-    ) -> Option<DelegationGroup> {
-        let (group, watch_ids) = {
+    ) -> Option<(DelegationGroup, oneshot::Receiver<Result<()>>)> {
+        let (group, ack, watch_ids) = {
             let mut guard = self
                 .agent_subscriptions
                 .lock()
@@ -1201,6 +1319,8 @@ impl Services {
                 .iter()
                 .position(|g| g.group_id == group_id && &g.parent_agent_id == parent_id)?;
             let group = guard.delegation_groups.remove(idx);
+            let ack =
+                self.enqueue_group_persist_acked(GroupPersistOp::Delete(group.group_id.clone()));
             let mut watch_ids = Vec::new();
             guard.subscriptions.retain(|s| {
                 if s.group_id.as_deref() == Some(group_id) {
@@ -1210,7 +1330,7 @@ impl Services {
                     true
                 }
             });
-            (group, watch_ids)
+            (group, ack, watch_ids)
         };
         if !watch_ids.is_empty() {
             let store = self.store.clone();
@@ -1222,7 +1342,7 @@ impl Services {
                 }
             });
         }
-        Some(group)
+        Some((group, ack))
     }
 
     /// Drop `child_id` from a group's expected/completed/deleted sets (the
@@ -1237,43 +1357,36 @@ impl Services {
     /// afterwards — the caller should `try_fire_group` it, since the shrunk
     /// group may now be sealed AND complete.
     pub(crate) fn remove_child_from_group(&self, group_id: &str, child_id: &AgentId) -> bool {
-        let (shrunk, emptied) = {
-            let mut guard = self
-                .agent_subscriptions
-                .lock()
-                .expect("agent subscription registry poisoned");
-            let Some(idx) = guard
-                .delegation_groups
-                .iter()
-                .position(|g| g.group_id == group_id)
-            else {
-                return false;
-            };
-            let g = &mut guard.delegation_groups[idx];
-            g.expected_agent_ids.retain(|id| id != child_id);
-            g.completed_agent_ids.retain(|id| id != child_id);
-            g.deleted_agent_ids.retain(|id| id != child_id);
-            if g.expected_agent_ids.is_empty() {
-                guard.delegation_groups.remove(idx);
-                (None, true)
-            } else {
-                (Some(g.clone()), false)
-            }
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let Some(idx) = guard
+            .delegation_groups
+            .iter()
+            .position(|g| g.group_id == group_id)
+        else {
+            return false;
         };
-        if let Some(g) = shrunk {
-            self.persist_delegation_group(&g);
-            return true;
-        }
-        if emptied {
-            let store = self.store.clone();
-            let gid = group_id.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = store.delete_delegation_group(&gid).await {
-                    tracing::warn!("delegation_group delete failed {gid}: {e}");
-                }
-            });
-        }
-        false
+        let g = &mut guard.delegation_groups[idx];
+        g.expected_agent_ids.retain(|id| id != child_id);
+        g.completed_agent_ids.retain(|id| id != child_id);
+        g.deleted_agent_ids.retain(|id| id != child_id);
+        let survives = if g.expected_agent_ids.is_empty() {
+            guard.delegation_groups.remove(idx);
+            self.enqueue_group_persist(GroupPersistOp::Delete(group_id.to_string()));
+            false
+        } else {
+            // A group claimed for delivery (`take_group_if_ready`) is owned by
+            // settlement: its row is deleted by the queued `Settle`, and a
+            // shrink snapshot enqueued behind it would re-create the row.
+            if !g.delivered {
+                self.persist_delegation_group(g.clone());
+            }
+            true
+        };
+        drop(guard);
+        survives
     }
 
     /// Test-only snapshot of a parent's delegation group, if one exists.
@@ -1293,27 +1406,76 @@ impl Services {
 
     /// Best-effort write-through persist of a delegation group (AS-2 persistence).
     ///
-    /// Spawns async persist task, **not** durable-before-observable. A crash between
-    /// group creation and commit loses the persisted row, preventing restoration on
-    /// the next startup. This is acceptable: the crash window is milliseconds, and
-    /// the parent agent can re-delegate if needed. Consistency requirement applies
-    /// to **agent completions** (must persist before `agent:idle` event), not group
-    /// creation.
-    fn persist_delegation_group(&self, group: &DelegationGroup) {
-        let store = self.store.clone();
-        let group_id = group.group_id.clone();
-        let persisted = match delegation_group_to_persisted(group) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("skip delegation_group persist {group_id}: {e}");
-                return;
-            }
-        };
-        tokio::spawn(async move {
-            if let Err(e) = store.upsert_delegation_group(&persisted).await {
-                tracing::warn!("delegation_group upsert failed {group_id}: {e}");
-            }
+    /// Enqueues the upsert on the group persistence lane, **not**
+    /// durable-before-observable. A crash between group creation and commit
+    /// loses the persisted row, preventing restoration on the next startup.
+    /// This is acceptable: the crash window is milliseconds, and the parent
+    /// agent can re-delegate if needed. Consistency requirement applies to
+    /// **agent completions** (must persist before `agent:idle` event), not
+    /// group creation. Call it while holding the registry lock so the lane
+    /// order matches the registry order (intent-hq/intent#4460).
+    fn persist_delegation_group(&self, group: DelegationGroup) {
+        self.enqueue_group_persist(GroupPersistOp::Upsert(group));
+    }
+
+    /// The group persistence lane sender, spawning the single worker on first
+    /// use (see [`GroupPersistOp`]).
+    fn group_persist_sender(&self) -> &GroupPersistSender {
+        self.group_persist_lane.get_or_init(|| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tokio::spawn(run_group_persist_lane(self.store.clone(), rx));
+            tx
+        })
+    }
+
+    /// Fire-and-forget lane enqueue; a closed lane (worker gone) is logged.
+    fn enqueue_group_persist(&self, op: GroupPersistOp) {
+        if self.group_persist_sender().send((op, None)).is_err() {
+            tracing::warn!("delegation_group persistence lane closed; write dropped");
+        }
+    }
+
+    /// Lane enqueue whose outcome the caller awaits via
+    /// [`Services::await_group_persist`] — AFTER releasing the registry lock.
+    pub(crate) fn enqueue_group_persist_acked(
+        &self,
+        op: GroupPersistOp,
+    ) -> oneshot::Receiver<Result<()>> {
+        let (tx, rx) = oneshot::channel();
+        if self.group_persist_sender().send((op, Some(tx))).is_err() {
+            tracing::warn!("delegation_group persistence lane closed; write dropped");
+        }
+        rx
+    }
+
+    pub(crate) async fn await_group_persist(ack: oneshot::Receiver<Result<()>>) -> Result<()> {
+        ack.await.unwrap_or_else(|_| {
+            Err(Error::Internal(
+                "delegation_group persistence lane closed".to_string(),
+            ))
+        })
+    }
+
+    /// Delete a persisted `delegation_group` row through the lane and await
+    /// the outcome (durable-before-observable callers).
+    pub(crate) async fn delete_delegation_group_persisted(&self, group_id: &str) -> Result<()> {
+        let ack = self.enqueue_group_persist_acked(GroupPersistOp::Delete(group_id.to_string()));
+        Self::await_group_persist(ack).await
+    }
+
+    /// Run [`Store::settle_delegation_group_after_delivery`] through the lane
+    /// and await the outcome, so a shrunk-group upsert queued earlier (scoped
+    /// watch cancel) cannot land after the settlement delete.
+    pub(crate) async fn settle_delegation_group_persisted(
+        &self,
+        group_id: &str,
+        retain_children: &[AgentId],
+    ) -> Result<()> {
+        let ack = self.enqueue_group_persist_acked(GroupPersistOp::Settle {
+            group_id: group_id.to_string(),
+            retain_children: retain_children.to_vec(),
         });
+        Self::await_group_persist(ack).await
     }
 
     /// Best-effort write-through persist of a completion watch (restart
@@ -1390,12 +1552,22 @@ impl Services {
             // Prune when either endpoint is gone: no wake could fire (child
             // deleted watches are handled by reconciliation below instead,
             // since a deleted child IS a completion signal for the parent).
-            let parent_alive = self.agent_is_live(&p.parent_agent_id).await;
+            // A RETIRED parent is equally gone (monorepo#4183): the
+            // soft-retire inertness gate rejects every wake, so rehydrating
+            // its watch only feeds the delivery-retry loop; `agent.restore`
+            // does not resurrect watches, matching the retire sweep.
+            let parent_alive = self.agent_is_live(&p.parent_agent_id).await
+                && !matches!(
+                    self.store
+                        .get_agent_session_retired_at(&p.parent_agent_id)
+                        .await,
+                    Ok(Some(_))
+                );
             if !parent_alive {
                 tracing::info!(
                     watch = %p.id,
                     parent = %p.parent_agent_id.0,
-                    "pruning persisted completion watch — parent agent gone"
+                    "pruning persisted completion watch — parent agent gone or retired"
                 );
                 let _ = self.store.delete_completion_watch(&p.id).await;
                 continue;
@@ -1717,6 +1889,38 @@ impl Services {
         workspace_id: &WorkspaceId,
     ) -> Result<usize> {
         let persisted = self.store.list_undelivered_groups(workspace_id).await?;
+        // Prune groups whose parent is permanently gone (deleted/missing or
+        // retired) BEFORE loading them (monorepo#4183): an aggregated wake
+        // toward such a parent can never be delivered, so rehydrating the
+        // group only feeds the delivery-retry loop from persisted state
+        // after every restart. Delete the row so it stays pruned — through
+        // the persistence lane, since rehydration also runs on resume/retry
+        // and transfer import while live group writes may be queued. The
+        // liveness probe fails open — a transient store error keeps the
+        // group (the delivery-path backstop catches it later).
+        let mut survivors = Vec::with_capacity(persisted.len());
+        for p in persisted {
+            let parent_gone = !self.agent_is_live(&p.parent_agent_id).await
+                || matches!(
+                    self.store
+                        .get_agent_session_retired_at(&p.parent_agent_id)
+                        .await,
+                    Ok(Some(_)) | Err(intent_store::Error::NotFound(_))
+                );
+            if parent_gone {
+                tracing::info!(
+                    group = %p.group_id,
+                    parent = %p.parent_agent_id.0,
+                    "pruning persisted delegation group — parent agent gone or retired"
+                );
+                if let Err(e) = self.delete_delegation_group_persisted(&p.group_id).await {
+                    tracing::warn!("delegation_group delete failed {}: {e}", p.group_id);
+                }
+                continue;
+            }
+            survivors.push(p);
+        }
+        let persisted = survivors;
         let (loaded, groups_to_reconcile) = {
             let mut guard = self
                 .agent_subscriptions
@@ -2416,6 +2620,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,

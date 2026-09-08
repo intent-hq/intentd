@@ -74,6 +74,10 @@ pub struct SystemStatus {
     /// hostname when unavailable (same source as `server.pairingInfo` /
     /// `host.status`).
     pub pretty_hostname: String,
+    /// Detected device category, omitted from the host block when unknown.
+    pub device_kind: Option<String>,
+    /// Raw hardware product/model name, omitted from the host block when unknown.
+    pub hardware_model: Option<String>,
     /// CPU usage of the daemon process, raw `sysinfo` convention: 100 = one
     /// full core, so values may exceed 100 on multi-core hosts. The first
     /// sample after startup may legitimately read 0.
@@ -136,6 +140,14 @@ pub struct SystemStatus {
     /// down), so the whole `fileWatch` object is presence-detected on the
     /// wire — absent when `None`, never null.
     pub file_watch: Option<FileWatchStatus>,
+    /// Open file descriptors held by the daemon process, from the background
+    /// own-process sampler (intent-hq/intent#4390). `None` until the first
+    /// sample lands or where the count is unavailable (non-Linux/macOS).
+    /// Presence-detected on the wire — omitted when `None`, never null.
+    pub fd_count: Option<u64>,
+    /// Soft `RLIMIT_NOFILE` in effect after the startup raise. `None` where
+    /// the limit could not be read (non-Unix). Presence-detected on the wire.
+    pub fd_limit: Option<u64>,
     /// Whether `system.requestUpdate` can currently succeed
     /// (intent-hq/intent#3875): true exactly when the daemon is
     /// sitter-supervised, per the same pidfile + parent/name verification
@@ -171,6 +183,8 @@ pub type GitCredential = (String, String);
 pub trait SystemControl: Send + Sync {
     /// Snapshot the current daemon state.
     fn status(&self) -> SystemStatus;
+    /// Cached host identity, refreshed by the composition root off the RPC path.
+    fn host_environment(&self) -> crate::host_env::HostEnvironment;
     /// Request a graceful shutdown (idempotent). Returns immediately; the daemon
     /// tears the listeners down asynchronously.
     fn request_shutdown(&self);
@@ -326,6 +340,16 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         },
     });
     let obj = v.as_object_mut().expect("status_json literal is an object");
+    let host = obj
+        .get_mut("host")
+        .and_then(Value::as_object_mut)
+        .expect("status_json host literal is an object");
+    if let Some(device_kind) = &status.device_kind {
+        host.insert("deviceKind".into(), device_kind.clone().into());
+    }
+    if let Some(hardware_model) = &status.hardware_model {
+        host.insert("hardwareModel".into(), hardware_model.clone().into());
+    }
     if let Some(tc) = &status.tc_address {
         obj.insert("tcAddress".into(), tc.clone().into());
     }
@@ -356,6 +380,12 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
                 "failedRoots": fw.failed_roots,
             }),
         );
+    }
+    if let Some(count) = status.fd_count {
+        obj.insert("fdCount".into(), count.into());
+    }
+    if let Some(limit) = status.fd_limit {
+        obj.insert("fdLimit".into(), limit.into());
     }
     v
 }
