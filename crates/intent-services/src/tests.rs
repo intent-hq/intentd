@@ -367,6 +367,64 @@ async fn semantic_map_structural_fallback_is_single_flight_and_cached() {
 }
 
 #[tokio::test]
+async fn semantic_map_structural_cache_invalidates_on_transient_file_create() {
+    let root = test_tempdir("intentd-semantic-map-live-invalidation-");
+    std::fs::create_dir_all(root.path().join("src")).expect("mkdir src");
+    std::fs::write(root.path().join("src/lib.rs"), "pub fn mapped() {}\n").expect("write src");
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let mut workspace = workspace(&ws);
+    workspace.worktree_path = Some(root.path().to_string_lossy().into_owned());
+    store.insert_workspace(&workspace).await.expect("ws");
+    let bus = crate::events::EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let mut map_events = bus.subscribe(crate::events::SubscriptionFilter {
+        event_types: vec![intent_core::events::MAP_ACTIVITY.to_string()],
+        ..Default::default()
+    });
+    crate::semantic_map::structural::reset_structural_scan_count(root.path());
+
+    let initial = services.map_get(ws.clone()).await.expect("initial map");
+    assert_eq!(initial["coverage"]["total"], 1);
+    std::fs::create_dir_all(root.path().join("tests")).expect("mkdir tests");
+    std::fs::write(root.path().join("tests/map.rs"), "#[test] fn mapped() {}\n")
+        .expect("write test");
+    bus.publish(&intent_store::NewEvent {
+        workspace_id: ws.clone(),
+        timestamp: "2030-01-01T00:00:00Z".to_string(),
+        event_type: intent_core::events::FILE_CREATED.to_string(),
+        actor: intent_core::EventActor {
+            actor_type: intent_core::ActorType::System,
+            ..Default::default()
+        },
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({"action":"create","relativePath":"tests/map.rs"}),
+    })
+    .await
+    .expect("publish transient file create");
+    tokio::time::timeout(std::time::Duration::from_secs(2), map_events.recv())
+        .await
+        .expect("map projector timeout")
+        .expect("map projector closed");
+
+    let refreshed = services.map_get(ws).await.expect("refreshed map");
+    assert_eq!(refreshed["coverage"]["total"], 2);
+    assert!(refreshed["manifest"]["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|region| region["id"] == "tests"));
+    assert_eq!(
+        crate::semantic_map::structural::structural_scan_count(root.path()),
+        2
+    );
+}
+
+#[tokio::test]
 async fn semantic_map_manifest_delete_and_tag_removal_reveal_structural_fallback() {
     let root = test_tempdir("intentd-semantic-map-lifecycle-");
     std::fs::write(root.path().join("README.md"), "# mapped\n").expect("write readme");

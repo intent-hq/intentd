@@ -98,14 +98,20 @@ pub fn project_with_classifier(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let input = event.data.get("input");
-            let path = input.and_then(find_path).and_then(|path| {
-                workspace_paths
-                    .normalize(
-                        &path,
-                        event_git_root_id(event).or_else(|| input.and_then(find_git_root_id)),
-                    )
-                    .ok()
-            });
+            let path = event
+                .data
+                .get("semanticMapPath")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| input.and_then(find_path))
+                .and_then(|path| {
+                    workspace_paths
+                        .normalize(
+                            &path,
+                            event_git_root_id(event).or_else(|| input.and_then(find_git_root_id)),
+                        )
+                        .ok()
+                });
             let is_read = path.is_some() && is_read_tool(tool_name, tool_kind);
             let region_id = path
                 .as_deref()
@@ -143,7 +149,11 @@ pub fn project_with_classifier(
 }
 
 fn event_git_root_id(event: &Event) -> Option<&str> {
-    event.data.get("gitRootId").and_then(Value::as_str)
+    event
+        .data
+        .get("gitRootId")
+        .or_else(|| event.data.get("semanticMapGitRootId"))
+        .and_then(Value::as_str)
 }
 
 fn file_kind(event: &Event) -> Option<MapActivityKind> {
@@ -360,6 +370,49 @@ mod tests {
             activity.path.as_deref(),
             Some("packages/intentd/crates/intent-transport/src/router.rs")
         );
+    }
+
+    #[test]
+    fn sibling_root_activity_retains_the_trusted_relative_path() {
+        let paths = WorkspacePaths::with_prefix("intentd-root", "../intentd");
+        let activity = project_with_paths(
+            &manifest(),
+            &paths,
+            &event(
+                FILE_CHANGED,
+                json!({
+                    "relativePath": "crates/intent-core/src/lib.rs",
+                    "gitRootId": "intentd-root",
+                    "action": "modify"
+                }),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            activity.path.as_deref(),
+            Some("../intentd/crates/intent-core/src/lib.rs")
+        );
+        assert_eq!(activity.region_id.as_deref(), Some("unsorted"));
+    }
+
+    #[test]
+    fn truncated_tool_input_path_hint_projects_identically_to_live_input() {
+        let live = event(
+            AGENT_TOOL_CALL,
+            json!({
+                "toolName":"view", "toolKind":"file",
+                "input":{"path":"src/lib.rs","blob":"x".repeat(64 * 1024)}
+            }),
+        );
+        let mut replay = live.clone();
+        replay.data = json!({
+            "toolName":"view", "toolKind":"file",
+            "semanticMapPath":"src/lib.rs",
+            "input":{"truncated":true,"originalBytes":65536,"preview":"..."}
+        });
+
+        assert_eq!(project(&manifest(), &live), project(&manifest(), &replay));
     }
 
     #[test]

@@ -270,6 +270,7 @@ API:
   ws.map.get() → { manifest, source, coverage }  // Load the curated semantic map or a structural fallback.
   ws.map.setManifest(json) → { ok, noteId }  // Validate and upsert the workspace's `semantic-map` note.
   ws.map.classify(paths) → [{ regionId, confidence }]  // Classify workspace-relative paths against the active map.
+  ws.map.activity({ sinceTs?, minutesAgo?, agentId?, kinds?, limit? }?) → MapActivity[]  // Replay bounded semantic-map activity from persisted source events.
   ws.map.route({ agentId? | taskNoteId?, sinceTs? }) → { visits, transitions }  // Derive one agent or task assignee's route through map regions.
 
   ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
@@ -524,6 +525,7 @@ API:
   ws.map.get() → { manifest, source, coverage }  // Load the curated semantic map or a structural fallback.
   ws.map.setManifest(json) → { ok, noteId }  // Validate and upsert the workspace's `semantic-map` note.
   ws.map.classify(paths) → [{ regionId, confidence }]  // Classify workspace-relative paths against the active map.
+  ws.map.activity({ sinceTs?, minutesAgo?, agentId?, kinds?, limit? }?) → MapActivity[]  // Replay bounded semantic-map activity from persisted source events.
   ws.map.route({ agentId? | taskNoteId?, sinceTs? }) → { visits, transitions }  // Derive one agent or task assignee's route through map regions.
 
   ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.

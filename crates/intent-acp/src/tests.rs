@@ -9691,6 +9691,26 @@ mod wsapi4_bindings_tests {
             Box::pin(async move { Ok(json!({ "paths": paths })) })
         }
 
+        fn map_activity(
+            &self,
+            _workspace_id: WorkspaceId,
+            since_ts: Option<String>,
+            minutes_ago: Option<i64>,
+            agent_id: Option<String>,
+            kinds: Vec<String>,
+            limit: Option<i64>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({
+                    "sinceTs": since_ts,
+                    "minutesAgo": minutes_ago,
+                    "agentId": agent_id,
+                    "kinds": kinds,
+                    "limit": limit,
+                }))
+            })
+        }
+
         fn map_route(
             &self,
             _workspace_id: WorkspaceId,
@@ -11450,6 +11470,11 @@ mod wsapi4_bindings_tests {
                 "root-1",
             ),
             (
+                "return await ws.map.activity({ sinceTs: 't0', minutesAgo: 5, agentId: 'a-1', kinds: ['read'], limit: 25 });",
+                "kinds.0",
+                "read",
+            ),
+            (
                 "return await ws.map.route({ agentId: 'a-1', sinceTs: 't0' });",
                 "agentId",
                 "a-1",
@@ -11490,6 +11515,7 @@ mod wsapi4_bindings_tests {
         assert!(docs.contains("ws.map.get()"));
         assert!(docs.contains("ws.map.setManifest(json)"));
         assert!(docs.contains("ws.map.classify(paths)"));
+        assert!(docs.contains("ws.map.activity("));
         assert!(docs.contains("ws.map.route("));
     }
 

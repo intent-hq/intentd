@@ -641,6 +641,33 @@ async fn small_tool_call_payload_persists_verbatim() {
 }
 
 #[tokio::test]
+async fn oversized_tool_call_input_persists_bounded_semantic_map_path_hints() {
+    let (_tmp, bus) = bus().await;
+    let mut ev = tool_call_event(&json!("done"));
+    ev.data["toolName"] = json!("view");
+    ev.data["input"] = json!({
+        "path": "src/lib.rs",
+        "gitRootId": "intentd-root",
+        "blob": "x".repeat(64 * 1024),
+    });
+    bus.publish(&ev).await.expect("publish");
+
+    let rows = bus
+        .store()
+        .query_events(&EventQuery {
+            workspace_id: Some(WorkspaceId::from("ws-1")),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    let data = &rows[0].data;
+    assert_eq!(data["input"]["truncated"], json!(true));
+    assert_eq!(data["semanticMapPath"], json!("src/lib.rs"));
+    assert_eq!(data["semanticMapGitRootId"], json!("intentd-root"));
+    assert!(serde_json::to_string(data).unwrap().len() <= 16 * 1024);
+}
+
+#[tokio::test]
 async fn oversized_non_tool_call_event_is_not_truncated() {
     let (_tmp, bus) = bus().await;
     let mut ev = new_event("note:created", Some("agent-1"), ActorType::Agent);

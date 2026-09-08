@@ -5,7 +5,7 @@ use std::sync::Arc;
 use intent_core::{NoteId, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
-use super::{map_err, opt_str};
+use super::{map_err, opt_str, opt_vec_str};
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
@@ -13,6 +13,7 @@ pub(crate) const PRELUDE: &str = r"
         get: () => host({ method: 'map.get', args: {} }),
         setManifest: (json) => host({ method: 'map.setManifest', args: { json } }),
         classify: (paths) => host({ method: 'map.classify', args: { paths } }),
+        activity: (options) => host({ method: 'map.activity', args: { ...(options || {}) } }),
         route: (options) => host({ method: 'map.route', args: { ...(options || {}) } }),
     };
 ";
@@ -43,6 +44,17 @@ pub(crate) async fn dispatch(
                 .ok_or_else(|| "paths must be an array".to_string())?;
             api.map_classify(ws.clone(), paths).await.map_err(map_err)
         }
+        "activity" => api
+            .map_activity(
+                ws.clone(),
+                opt_str(args, "sinceTs"),
+                args.get("minutesAgo").and_then(Value::as_i64),
+                opt_str(args, "agentId"),
+                opt_vec_str(args, "kinds").unwrap_or_default(),
+                args.get("limit").and_then(Value::as_i64),
+            )
+            .await
+            .map_err(map_err),
         "route" => {
             let agent_id = opt_str(args, "agentId").filter(|value| !value.trim().is_empty());
             let task_note_id = opt_str(args, "taskNoteId")

@@ -357,6 +357,8 @@ pub struct Services {
     store: Store,
     /// Parsed semantic-map manifests, shared by every clone and map operation.
     semantic_map_manifest_loader: semantic_map::ManifestLoader,
+    /// Per-workspace live file-event generations folded into structural cache keys.
+    semantic_map_file_versions: Arc<Mutex<HashMap<WorkspaceId, u64>>>,
     /// One post-persistence projector shared by every clone of this service.
     map_activity_projection_task: Option<Arc<MapActivityProjectionTask>>,
     /// Root directory for note assets, laid out as `<root>/<workspaceId>/<assetId>`.
@@ -1134,6 +1136,7 @@ impl Services {
         Self {
             store,
             semantic_map_manifest_loader: semantic_map::ManifestLoader::default(),
+            semantic_map_file_versions: Arc::new(Mutex::new(HashMap::new())),
             map_activity_projection_task: None,
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
@@ -3933,10 +3936,18 @@ impl Services {
         });
         let store = self.store.clone();
         let loader = self.semantic_map_manifest_loader.clone();
+        let file_versions = Arc::clone(&self.semantic_map_file_versions);
         let projection_bus = bus.clone();
         let handle = tokio::spawn(async move {
             while let Some(events) = source_events.recv().await {
                 for event in events {
+                    if event.event_type.starts_with("file:") {
+                        let mut versions = file_versions
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let version = versions.entry(event.workspace_id.clone()).or_default();
+                        *version = version.saturating_add(1);
+                    }
                     publish_live_map_activity(&store, &loader, &projection_bus, &event).await;
                 }
             }
@@ -12754,13 +12765,15 @@ async fn semantic_map_paths(
 async fn active_semantic_map(
     store: &Store,
     loader: &semantic_map::ManifestLoader,
+    file_versions: &Mutex<HashMap<WorkspaceId, u64>>,
     workspace_id: &WorkspaceId,
 ) -> Result<(
     semantic_map::Manifest,
     Arc<semantic_map::Classifier>,
     Option<(usize, usize)>,
 )> {
-    let mut worktree_version = semantic_map_worktree_version(store, workspace_id).await?;
+    let mut worktree_version =
+        semantic_map_worktree_version(store, file_versions, workspace_id).await?;
     loader.invalidate_structural_if_stale(workspace_id, worktree_version.as_deref());
     if let Some((manifest, classifier)) = load_semantic_map(loader, store, workspace_id).await? {
         let coverage = (manifest.source == semantic_map::ManifestSource::Structural)
@@ -12770,7 +12783,7 @@ async fn active_semantic_map(
     }
 
     let _guard = loader.structural_guard(workspace_id).await;
-    worktree_version = semantic_map_worktree_version(store, workspace_id).await?;
+    worktree_version = semantic_map_worktree_version(store, file_versions, workspace_id).await?;
     loader.invalidate_structural_if_stale(workspace_id, worktree_version.as_deref());
     if let Some((manifest, classifier)) = load_semantic_map(loader, store, workspace_id).await? {
         let coverage = (manifest.source == semantic_map::ManifestSource::Structural)
@@ -12820,9 +12833,10 @@ async fn load_semantic_map(
 
 async fn semantic_map_worktree_version(
     store: &Store,
+    file_versions: &Mutex<HashMap<WorkspaceId, u64>>,
     workspace_id: &WorkspaceId,
 ) -> Result<Option<String>> {
-    Ok(store
+    let persisted = store
         .query_events(&EventQuery {
             workspace_id: Some(workspace_id.clone()),
             event_types: vec![
@@ -12840,7 +12854,21 @@ async fn semantic_map_worktree_version(
         .await?
         .into_iter()
         .next()
-        .map(|event| event.id))
+        .map(|event| event.id);
+    let live = file_versions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(workspace_id)
+        .copied()
+        .unwrap_or_default();
+    Ok(if live == 0 {
+        persisted
+    } else {
+        Some(format!(
+            "{}:live:{live}",
+            persisted.as_deref().unwrap_or("none")
+        ))
+    })
 }
 
 fn project_map_events(
@@ -23863,13 +23891,15 @@ impl WorkspaceApi for Services {
     fn map_get(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let loader = self.semantic_map_manifest_loader.clone();
+        let file_versions = Arc::clone(&self.semantic_map_file_versions);
         Box::pin(async move {
             let (manifest, classifier, structural_coverage) =
-                active_semantic_map(&store, &loader, &workspace_id).await?;
+                active_semantic_map(&store, &loader, &file_versions, &workspace_id).await?;
             let (matched, total) = if let Some(coverage) = structural_coverage {
                 coverage
             } else {
-                let worktree_version = semantic_map_worktree_version(&store, &workspace_id).await?;
+                let worktree_version =
+                    semantic_map_worktree_version(&store, &file_versions, &workspace_id).await?;
                 if let Some(coverage) = loader.coverage(&workspace_id, worktree_version.as_deref())
                 {
                     coverage
@@ -23973,6 +24003,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let loader = self.semantic_map_manifest_loader.clone();
+        let file_versions = Arc::clone(&self.semantic_map_file_versions);
         Box::pin(async move {
             let paths: Vec<semantic_map::ClassifyPath> =
                 serde_json::from_value(serde_json::Value::Array(paths)).map_err(|error| {
@@ -23994,7 +24025,8 @@ impl WorkspaceApi for Services {
                     semantic_map::MAX_CLASSIFY_BYTES
                 )));
             }
-            let (_, classifier, _) = active_semantic_map(&store, &loader, &workspace_id).await?;
+            let (_, classifier, _) =
+                active_semantic_map(&store, &loader, &file_versions, &workspace_id).await?;
             let workspace_paths = semantic_map::workspace_paths(&store, &workspace_id).await?;
             let assignments = paths
                 .iter()
@@ -24021,8 +24053,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let loader = self.semantic_map_manifest_loader.clone();
+        let file_versions = Arc::clone(&self.semantic_map_file_versions);
         Box::pin(async move {
-            let (_, classifier, _) = active_semantic_map(&store, &loader, &workspace_id).await?;
+            let (_, classifier, _) =
+                active_semantic_map(&store, &loader, &file_versions, &workspace_id).await?;
             let workspace_paths = semantic_map::workspace_paths(&store, &workspace_id).await?;
             let kinds = kinds
                 .into_iter()
@@ -24060,9 +24094,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let loader = self.semantic_map_manifest_loader.clone();
+        let file_versions = Arc::clone(&self.semantic_map_file_versions);
         Box::pin(async move {
             let (manifest, classifier, _) =
-                active_semantic_map(&store, &loader, &workspace_id).await?;
+                active_semantic_map(&store, &loader, &file_versions, &workspace_id).await?;
             let workspace_paths = semantic_map::workspace_paths(&store, &workspace_id).await?;
             let mut agent_ids = if let Some(agent_id) = agent_id {
                 vec![agent_id]

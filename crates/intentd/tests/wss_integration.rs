@@ -7947,7 +7947,8 @@ async fn wss_semantic_map_projects_fresh_source_events_once() {
             parent_event_id: None,
             metadata: None,
             data: serde_json::json!({
-                "toolName":"view", "toolKind":"file", "input":{"path":"src/lib.rs"}
+                "toolName":"view", "toolKind":"file",
+                "input":{"path":"src/lib.rs","blob":"x".repeat(64 * 1024)}
             }),
         })
         .await
@@ -8030,6 +8031,17 @@ async fn wss_semantic_map_projects_fresh_source_events_once() {
         .collect::<std::collections::HashSet<_>>();
     assert!(replay_ids.contains(changed.id.as_str()), "{replay}");
     assert!(replay_ids.contains(tool_call.id.as_str()), "{replay}");
+    let replay_tool = replay["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|activity| activity["id"] == tool_call.id)
+        .expect("replayed oversized tool call");
+    assert_eq!(
+        replay_tool,
+        by_id[tool_call.id.as_str()],
+        "oversized read must project identically live and on replay"
+    );
 
     srv.ws.stop().await;
 }

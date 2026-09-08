@@ -77,14 +77,17 @@ const INSERT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_mill
 /// is ~3 KiB (so >96% of events persist untouched) while the ~3% of rows above
 /// 16 KiB carried ~33% of all tool-call bytes — the cap bounds those outliers
 /// (historically multi-MB tool outputs) without losing signal for any reader.
-/// No consumer reads persisted `input`/`output` back: conversation replay uses
-/// `agent_message` rows, `event.agentActivity`/`event.workspaceSummary` read
-/// only `data.filesModified`, and the FE synthesizes live tool blocks from the
-/// broadcast, which keeps the FULL payload — only the durable row is capped.
+/// Conversation replay uses `agent_message` rows, while semantic-map replay
+/// reads bounded path hints retained beside a truncated `input`. The FE
+/// synthesizes live tool blocks from the broadcast, which keeps the FULL
+/// payload — only the durable row is capped.
 pub(crate) const TOOL_CALL_PERSIST_CAP_BYTES: usize = 16 * 1024;
 
 /// Serialized-JSON prefix retained as `preview` on each truncated field.
 const TOOL_CALL_FIELD_PREVIEW_BYTES: usize = 2 * 1024;
+
+const TOOL_CALL_PATH_HINT_BYTES: usize = 4 * 1024;
+const TOOL_CALL_GIT_ROOT_HINT_BYTES: usize = 512;
 
 /// Request sent to the writer task: the event to persist and a oneshot to
 /// return the result (or error).
@@ -589,7 +592,26 @@ fn truncate_tool_call_for_persist(ev: &NewEvent) -> Option<NewEvent> {
         return None;
     }
     let mut data = ev.data.clone();
+    let path_hint = ev.data.get("input").and_then(|input| {
+        find_bounded_tool_input_string(
+            input,
+            &["path", "filePath", "relativePath"],
+            TOOL_CALL_PATH_HINT_BYTES,
+        )
+    });
+    let git_root_hint = ev.data.get("input").and_then(|input| {
+        find_bounded_tool_input_string(input, &["gitRootId"], TOOL_CALL_GIT_ROOT_HINT_BYTES)
+    });
     if let Some(obj) = data.as_object_mut() {
+        if let Some(path) = path_hint {
+            obj.insert("semanticMapPath".to_string(), Value::String(path));
+        }
+        if let Some(git_root_id) = git_root_hint {
+            obj.insert(
+                "semanticMapGitRootId".to_string(),
+                Value::String(git_root_id),
+            );
+        }
         for field in ["output", "input", "registeredAttachments"] {
             if let Some(v) = obj.get(field) {
                 let serialized = v.to_string();
@@ -619,6 +641,8 @@ fn truncate_tool_call_for_persist(ev: &NewEvent) -> Option<NewEvent> {
                 "agentId",
                 "toolKind",
                 "filesModified",
+                "semanticMapPath",
+                "semanticMapGitRootId",
             ];
             obj.retain(|k, _| keep.contains(&k.as_str()));
             obj.insert("truncated".to_string(), Value::Bool(true));
@@ -635,6 +659,32 @@ fn truncate_tool_call_for_persist(ev: &NewEvent) -> Option<NewEvent> {
         metadata: ev.metadata.clone(),
         data,
     })
+}
+
+fn find_bounded_tool_input_string(
+    value: &Value,
+    keys: &[&str],
+    max_bytes: usize,
+) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            for key in keys {
+                if let Some(value) = object.get(*key) {
+                    return value
+                        .as_str()
+                        .filter(|value| !value.is_empty() && value.len() <= max_bytes)
+                        .map(str::to_string);
+                }
+            }
+            object
+                .values()
+                .find_map(|value| find_bounded_tool_input_string(value, keys, max_bytes))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_bounded_tool_input_string(value, keys, max_bytes)),
+        _ => None,
+    }
 }
 
 /// Byte length of a value's serialized JSON (what `insert_events` writes).

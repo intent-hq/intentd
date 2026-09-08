@@ -92,7 +92,7 @@ impl WorkspacePaths {
     ///
     /// # Errors
     ///
-    /// Returns an error when `path` or the combined workspace path is unsafe.
+    /// Returns an error when the caller-supplied `path` is unsafe.
     pub fn normalize(
         &self,
         path: &str,
@@ -105,7 +105,7 @@ impl WorkspacePaths {
         if prefix.is_empty() {
             return Ok(path);
         }
-        normalize_workspace_relative_path(&format!("{prefix}/{path}"))
+        Ok(format!("{prefix}/{path}"))
     }
 
     #[cfg(test)]
@@ -267,5 +267,20 @@ mod tests {
             relative_path(Path::new("/work/repo"), Path::new("/work/intentd")),
             Path::new("../intentd")
         );
+    }
+
+    #[test]
+    fn normalizes_paths_under_trusted_sibling_root_prefixes() {
+        let paths = WorkspacePaths::with_prefix("intentd-root", "../intentd");
+
+        assert_eq!(
+            paths
+                .normalize("./crates/intent-core/src/lib.rs", Some("intentd-root"))
+                .unwrap(),
+            "../intentd/crates/intent-core/src/lib.rs"
+        );
+        assert!(paths
+            .normalize("../outside.rs", Some("intentd-root"))
+            .is_err());
     }
 }
