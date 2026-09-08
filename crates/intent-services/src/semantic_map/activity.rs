@@ -103,12 +103,13 @@ pub fn project_with_classifier(
                 .get("semanticMapPath")
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .or_else(|| input.and_then(find_path))
+                .or_else(|| input.and_then(find_tool_input_path))
                 .and_then(|path| {
                     workspace_paths
                         .normalize(
                             &path,
-                            event_git_root_id(event).or_else(|| input.and_then(find_git_root_id)),
+                            event_git_root_id(event)
+                                .or_else(|| input.and_then(find_tool_input_git_root_id)),
                         )
                         .ok()
                 });
@@ -205,7 +206,7 @@ fn is_read_tool(name: &str, kind: &str) -> bool {
         .any(|verb| name.contains(verb))
 }
 
-fn find_path(value: &Value) -> Option<String> {
+pub(crate) fn find_tool_input_path(value: &Value) -> Option<String> {
     match value {
         Value::Object(object) => {
             for key in ["path", "filePath", "relativePath"] {
@@ -217,20 +218,20 @@ fn find_path(value: &Value) -> Option<String> {
                     return Some(path.to_string());
                 }
             }
-            object.values().find_map(find_path)
+            object.values().find_map(find_tool_input_path)
         }
-        Value::Array(values) => values.iter().find_map(find_path),
+        Value::Array(values) => values.iter().find_map(find_tool_input_path),
         _ => None,
     }
 }
 
-fn find_git_root_id(value: &Value) -> Option<&str> {
+pub(crate) fn find_tool_input_git_root_id(value: &Value) -> Option<&str> {
     match value {
         Value::Object(object) => object
             .get("gitRootId")
             .and_then(Value::as_str)
-            .or_else(|| object.values().find_map(find_git_root_id)),
-        Value::Array(values) => values.iter().find_map(find_git_root_id),
+            .or_else(|| object.values().find_map(find_tool_input_git_root_id)),
+        Value::Array(values) => values.iter().find_map(find_tool_input_git_root_id),
         _ => None,
     }
 }

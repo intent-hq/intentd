@@ -592,16 +592,20 @@ fn truncate_tool_call_for_persist(ev: &NewEvent) -> Option<NewEvent> {
         return None;
     }
     let mut data = ev.data.clone();
-    let path_hint = ev.data.get("input").and_then(|input| {
-        find_bounded_tool_input_string(
-            input,
-            &["path", "filePath", "relativePath"],
-            TOOL_CALL_PATH_HINT_BYTES,
-        )
-    });
-    let git_root_hint = ev.data.get("input").and_then(|input| {
-        find_bounded_tool_input_string(input, &["gitRootId"], TOOL_CALL_GIT_ROOT_HINT_BYTES)
-    });
+    // Select exactly what live semantic-map projection selects, then bound that
+    // result. If the selected value exceeds the cap, replay degrades for this
+    // event rather than silently choosing a different alias or nested value.
+    let path_hint = ev
+        .data
+        .get("input")
+        .and_then(crate::semantic_map::activity::find_tool_input_path)
+        .filter(|path| path.len() <= TOOL_CALL_PATH_HINT_BYTES);
+    let git_root_hint = ev
+        .data
+        .get("input")
+        .and_then(crate::semantic_map::activity::find_tool_input_git_root_id)
+        .filter(|git_root_id| git_root_id.len() <= TOOL_CALL_GIT_ROOT_HINT_BYTES)
+        .map(str::to_string);
     if let Some(obj) = data.as_object_mut() {
         if let Some(path) = path_hint {
             obj.insert("semanticMapPath".to_string(), Value::String(path));
@@ -659,32 +663,6 @@ fn truncate_tool_call_for_persist(ev: &NewEvent) -> Option<NewEvent> {
         metadata: ev.metadata.clone(),
         data,
     })
-}
-
-fn find_bounded_tool_input_string(
-    value: &Value,
-    keys: &[&str],
-    max_bytes: usize,
-) -> Option<String> {
-    match value {
-        Value::Object(object) => {
-            for key in keys {
-                if let Some(value) = object.get(*key) {
-                    return value
-                        .as_str()
-                        .filter(|value| !value.is_empty() && value.len() <= max_bytes)
-                        .map(str::to_string);
-                }
-            }
-            object
-                .values()
-                .find_map(|value| find_bounded_tool_input_string(value, keys, max_bytes))
-        }
-        Value::Array(values) => values
-            .iter()
-            .find_map(|value| find_bounded_tool_input_string(value, keys, max_bytes)),
-        _ => None,
-    }
 }
 
 /// Byte length of a value's serialized JSON (what `insert_events` writes).

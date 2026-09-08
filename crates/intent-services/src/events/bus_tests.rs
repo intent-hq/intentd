@@ -668,6 +668,65 @@ async fn oversized_tool_call_input_persists_bounded_semantic_map_path_hints() {
 }
 
 #[tokio::test]
+async fn oversized_tool_call_path_hints_follow_live_alias_and_nesting_selection() {
+    let (_tmp, bus) = bus().await;
+    let cases = [
+        (
+            "empty-primary",
+            json!({
+                "path": "",
+                "filePath": "src/empty-primary.rs",
+                "blob": "x".repeat(64 * 1024),
+            }),
+            "src/empty-primary.rs",
+        ),
+        (
+            "non-string-primary",
+            json!({
+                "path": 42,
+                "relativePath": "src/non-string-primary.rs",
+                "blob": "x".repeat(64 * 1024),
+            }),
+            "src/non-string-primary.rs",
+        ),
+        (
+            "nested-primary",
+            json!({
+                "arguments": {"items": [{"path": "src/nested-primary.rs"}]},
+                "blob": "x".repeat(64 * 1024),
+            }),
+            "src/nested-primary.rs",
+        ),
+    ];
+
+    for (label, input, expected_path) in cases {
+        let mut event = tool_call_event(&json!("done"));
+        event.data["toolCallId"] = json!(label);
+        event.data["toolName"] = json!("view");
+        event.data["input"] = input;
+        let live = bus.publish(&event).await.expect("publish");
+        let replay = bus
+            .store()
+            .query_events(&EventQuery {
+                workspace_id: Some(WorkspaceId::from("ws-1")),
+                ..Default::default()
+            })
+            .await
+            .expect("query")
+            .into_iter()
+            .find(|stored| stored.id == live.id)
+            .expect("persisted tool call");
+
+        assert_eq!(
+            replay.data["semanticMapPath"],
+            json!(expected_path),
+            "{label}"
+        );
+        assert_eq!(replay.data["input"]["truncated"], json!(true), "{label}");
+    }
+}
+
+#[tokio::test]
 async fn oversized_non_tool_call_event_is_not_truncated() {
     let (_tmp, bus) = bus().await;
     let mut ev = new_event("note:created", Some("agent-1"), ActorType::Agent);

@@ -425,6 +425,104 @@ async fn semantic_map_structural_cache_invalidates_on_transient_file_create() {
 }
 
 #[tokio::test]
+async fn semantic_map_oversized_tool_call_replay_matches_live_path_selection() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = crate::events::EventBus::new(store);
+    let manifest = crate::semantic_map::Manifest {
+        version: 1,
+        source: crate::semantic_map::ManifestSource::Curated,
+        regions: vec![crate::semantic_map::Region {
+            id: "code".into(),
+            label: "Code".into(),
+            responsibility: "Code".into(),
+            parent: None,
+            anchor: [0.5, 0.5],
+            paths: vec!["src/**".into()],
+            color: None,
+        }],
+        crossings: vec![],
+    };
+    let cases = [
+        (
+            "empty-primary",
+            serde_json::json!({
+                "path": "",
+                "filePath": "src/empty-primary.rs",
+                "blob": "x".repeat(64 * 1024),
+            }),
+            "src/empty-primary.rs",
+        ),
+        (
+            "non-string-primary",
+            serde_json::json!({
+                "path": false,
+                "relativePath": "src/non-string-primary.rs",
+                "blob": "x".repeat(64 * 1024),
+            }),
+            "src/non-string-primary.rs",
+        ),
+        (
+            "nested-primary",
+            serde_json::json!({
+                "arguments": {"items": [{"path": "src/nested-primary.rs"}]},
+                "blob": "x".repeat(64 * 1024),
+            }),
+            "src/nested-primary.rs",
+        ),
+    ];
+
+    for (label, input, expected_path) in cases {
+        let live = bus
+            .publish(&intent_store::NewEvent {
+                workspace_id: WorkspaceId::from("ws-map-path-parity"),
+                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                event_type: intent_core::events::AGENT_TOOL_CALL.to_string(),
+                actor: intent_core::EventActor {
+                    actor_type: intent_core::ActorType::Agent,
+                    id: Some("agent-1".to_string()),
+                    ..Default::default()
+                },
+                session_id: None,
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data: serde_json::json!({
+                    "toolCallId": label,
+                    "toolName": "view",
+                    "toolKind": "file",
+                    "input": input,
+                }),
+            })
+            .await
+            .expect("publish tool call");
+        let replay = bus
+            .store()
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(WorkspaceId::from("ws-map-path-parity")),
+                ..Default::default()
+            })
+            .await
+            .expect("query persisted tool call")
+            .into_iter()
+            .find(|stored| stored.id == live.id)
+            .expect("persisted tool call");
+        let live_activity = crate::semantic_map::project(&manifest, &live).expect("live activity");
+        let replay_activity =
+            crate::semantic_map::project(&manifest, &replay).expect("replay activity");
+
+        assert_eq!(live_activity, replay_activity, "{label}");
+        assert_eq!(live_activity.id, live.id, "{label}");
+        assert_eq!(
+            live_activity.path.as_deref(),
+            Some(expected_path),
+            "{label}"
+        );
+        assert_eq!(live_activity.region_id.as_deref(), Some("code"), "{label}");
+    }
+}
+
+#[tokio::test]
 async fn semantic_map_manifest_delete_and_tag_removal_reveal_structural_fallback() {
     let root = test_tempdir("intentd-semantic-map-lifecycle-");
     std::fs::write(root.path().join("README.md"), "# mapped\n").expect("write readme");
