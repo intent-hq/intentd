@@ -2793,6 +2793,51 @@ async fn wait_for_persisted_groups(svc: &Services, ws: &WorkspaceId, expected: u
     }
 }
 
+/// A delegation group is not a useful restart-recovery record until its first
+/// expected child is enrolled. Persisting the empty creation snapshot first
+/// can leave a sealed, permanently incomplete group after a crash and lose the
+/// aggregated parent wake.
+#[tokio::test]
+async fn delegation_group_first_persisted_snapshot_contains_enrolled_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    let before_enrollment = svc.enqueue_group_persist_acked(GroupPersistOp::Delete(format!(
+        "barrier-{}",
+        uuid::Uuid::new_v4()
+    )));
+    Services::await_group_persist(before_enrollment)
+        .await
+        .expect("creation lane barrier");
+    assert!(
+        svc.store()
+            .list_undelivered_groups(&ws)
+            .await
+            .expect("groups before enrollment")
+            .is_empty(),
+        "empty group creation snapshot must not become a recovery record"
+    );
+
+    svc.enroll_child_in_group(&gid, &child);
+    let after_enrollment = svc.enqueue_group_persist_acked(GroupPersistOp::Delete(format!(
+        "barrier-{}",
+        uuid::Uuid::new_v4()
+    )));
+    Services::await_group_persist(after_enrollment)
+        .await
+        .expect("enrollment lane barrier");
+    let groups = svc
+        .store()
+        .list_undelivered_groups(&ws)
+        .await
+        .expect("groups after enrollment");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].group_id, gid);
+    assert_eq!(groups[0].expected_agent_ids, vec![child]);
+}
+
 /// intent#4460 product-side probe: a scoped group cancel issued right after
 /// the group is created (its create/enroll upserts spawned but not yet
 /// landed) must not leave a resurrected `delegation_group` row behind — a
