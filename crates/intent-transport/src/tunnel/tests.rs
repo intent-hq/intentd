@@ -1,8 +1,84 @@
-//! Pure unit tests for the `/tunnel` frame codec: encode/decode round-trips
-//! and malformed-frame rejection. Relay/lifecycle behavior is covered by the
+//! Unit tests for the `/tunnel` frame codec and bounded queue admission.
+//! TCP relay/lifecycle behavior is covered by the
 //! `wss_tunnel` integration suite in the `intentd` crate.
 
 use super::*;
+
+/// Queue saturation is isolated even when the next frame is a half-close.
+/// Use an unpolled receiver to make saturation deterministic, without relying
+/// on kernel TCP buffer sizes or timing a slow consumer.
+#[tokio::test]
+async fn full_stream_queue_closes_only_that_stream() {
+    for message in [StreamMsg::Data(vec![2]), StreamMsg::Eof] {
+        let (server_io, client_io) = tokio::io::duplex(1024);
+        let server = WebSocketStream::from_raw_socket(
+            server_io,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let mut client = WebSocketStream::from_raw_socket(
+            client_io,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let (mut sink, _) = server.split();
+        let (blocked_tx, _blocked_rx) = mpsc::channel(1);
+        assert!(blocked_tx.try_send(StreamMsg::Data(vec![1])).is_ok());
+        let (healthy_tx, mut healthy_rx) = mpsc::channel(2);
+        let blocked = tokio::spawn(std::future::pending::<()>());
+        let healthy = tokio::spawn(std::future::pending::<()>());
+        let mut streams = HashMap::from([
+            (
+                1,
+                StreamHandle {
+                    msg_tx: blocked_tx,
+                    abort: blocked.abort_handle(),
+                },
+            ),
+            (
+                2,
+                StreamHandle {
+                    msg_tx: healthy_tx,
+                    abort: healthy.abort_handle(),
+                },
+            ),
+        ]);
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            forward_to_stream(&mut sink, &mut streams, 1, message),
+        )
+        .await
+        .expect("queue admission must not wait for the consumer"));
+        assert!(!streams.contains_key(&1));
+        assert!(streams.contains_key(&2));
+        assert!(blocked
+            .await
+            .expect_err("blocked relay aborted")
+            .is_cancelled());
+        let Message::Binary(bytes) = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("stream CLOSE must arrive promptly")
+            .expect("stream CLOSE message")
+            .expect("read stream CLOSE")
+        else {
+            panic!("expected stream CLOSE");
+        };
+        assert_eq!(
+            Frame::decode(&bytes).unwrap(),
+            Frame::Close { stream_id: 1 }
+        );
+        assert!(forward_to_stream(&mut sink, &mut streams, 2, StreamMsg::Data(vec![3])).await);
+        assert!(forward_to_stream(&mut sink, &mut streams, 2, StreamMsg::Eof).await);
+        assert!(
+            matches!(healthy_rx.recv().await, Some(StreamMsg::Data(bytes)) if bytes == vec![3])
+        );
+        assert!(matches!(healthy_rx.recv().await, Some(StreamMsg::Eof)));
+        healthy.abort();
+        assert!(healthy.await.expect_err("cleanup").is_cancelled());
+    }
+}
 
 /// Every frame variant survives an encode → decode round-trip unchanged.
 #[test]

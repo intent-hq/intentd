@@ -27,14 +27,11 @@
 //! teardown can race a client `CLOSE`, so frames for unknown stream ids are
 //! ignored (a duplicate `CLOSE` is harmless).
 //!
-//! Flow control is per-connection, not per-stream, so one stream with a
-//! stalled consumer can briefly head-of-line-block its siblings' inbound
-//! frames. The wedge is bounded on every axis: client `CLOSE` is handled
-//! out-of-band (never queued behind `DATA`), a blocked TCP write or idle
-//! stream is torn down after [`TunnelLimits::idle_timeout`], and a stream
-//! whose full queue parks the connection loop longer than
-//! [`TunnelLimits::forward_timeout`] is killed so the mux resumes servicing
-//! pings well inside the heartbeat window. Inbound messages are capped at
+//! Stream queues are bounded and admission never waits on a TCP consumer:
+//! a full queue closes only that stream, leaving sibling frames and pings
+//! readable. Client `CLOSE` is handled out-of-band (never queued behind
+//! `DATA`), and a blocked TCP write or idle stream is torn down after
+//! [`TunnelLimits::idle_timeout`]. Inbound messages are capped at
 //! [`MAX_TUNNEL_MESSAGE_BYTES`] (1009 close on violation) and concurrent
 //! streams are capped per connection.
 
@@ -90,12 +87,6 @@ pub const MAX_TUNNEL_MESSAGE_BYTES: usize = HEADER_LEN + MAX_DATA_PAYLOAD_BYTES;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A stream with no data in either direction for this long is closed.
 const IDLE_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
-/// Longest the connection loop will park on one stream's full queue before
-/// killing that stream. Kept well inside the 60s heartbeat window: while
-/// parked the WebSocket read half is unpolled (pongs go unprocessed), so an
-/// unbounded park would let one wedged stream get the whole connection
-/// reaped as heartbeat-dead.
-const FORWARD_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound of the shared daemon→client frame queue (backpressure on TCP reads).
 const OUTBOUND_QUEUE_FRAMES: usize = 64;
 /// Bound of each stream's client→daemon message queue (backpressure on the
@@ -114,9 +105,6 @@ pub struct TunnelLimits {
     /// Idle-stream (no data either way) teardown deadline; also bounds a
     /// single blocked TCP write.
     pub idle_timeout: Duration,
-    /// Longest one stream's full queue may park the connection loop before
-    /// that stream is killed to unwedge the mux.
-    pub forward_timeout: Duration,
 }
 
 impl Default for TunnelLimits {
@@ -125,7 +113,6 @@ impl Default for TunnelLimits {
             max_streams: MAX_STREAMS_PER_CONNECTION,
             connect_timeout: CONNECT_TIMEOUT,
             idle_timeout: IDLE_STREAM_TIMEOUT,
-            forward_timeout: FORWARD_TIMEOUT,
         }
     }
 }
@@ -323,7 +310,6 @@ pub(crate) async fn run_tunnel_connection<S>(
                         &mut sink,
                         &mut streams,
                         &out_tx,
-                        &mut out_rx,
                         &done_tx,
                         &mut done_rx,
                         limits,
@@ -387,7 +373,6 @@ async fn handle_frame<S>(
     sink: &mut SplitSink<WebSocketStream<S>, Message>,
     streams: &mut HashMap<u32, StreamHandle>,
     out_tx: &mpsc::Sender<Frame>,
-    out_rx: &mut mpsc::Receiver<Frame>,
     done_tx: &mpsc::UnboundedSender<u32>,
     done_rx: &mut mpsc::UnboundedReceiver<u32>,
     limits: TunnelLimits,
@@ -446,18 +431,10 @@ where
                 .await;
                 return false;
             }
-            forward_to_stream(
-                sink,
-                streams,
-                out_rx,
-                stream_id,
-                StreamMsg::Data(payload),
-                limits,
-            )
-            .await
+            forward_to_stream(sink, streams, stream_id, StreamMsg::Data(payload)).await
         }
         Frame::Eof { stream_id } => {
-            forward_to_stream(sink, streams, out_rx, stream_id, StreamMsg::Eof, limits).await
+            forward_to_stream(sink, streams, stream_id, StreamMsg::Eof).await
         }
         Frame::Close { stream_id } => {
             // Out-of-band teardown: never queued behind `DATA` on a full
@@ -481,22 +458,15 @@ where
     }
 }
 
-/// Forward one message into a stream's bounded queue while continuing to
-/// drain outbound frames to the socket, so a full stream queue can never
-/// deadlock against a full outbound queue (the stream task may be blocked on
-/// `out_tx.send` at the same time). Frames for unknown stream ids are dropped
-/// — they are ordinary races with a daemon-side teardown already in flight.
-/// A stream whose queue stays full past [`TunnelLimits::forward_timeout`] is
-/// killed (abort + final `CLOSE`) so one wedged stream cannot park the whole
-/// connection past the heartbeat window. Returns `false` only when the socket
-/// is dead.
+/// Admit a message without parking the shared WebSocket reader. The wire
+/// protocol has no per-stream credit window: once the bounded queue is full,
+/// close that stream rather than blocking unrelated requests and heartbeats.
+/// Unknown/finished streams are ordinary teardown races and are ignored.
 async fn forward_to_stream<S>(
     sink: &mut SplitSink<WebSocketStream<S>, Message>,
     streams: &mut HashMap<u32, StreamHandle>,
-    out_rx: &mut mpsc::Receiver<Frame>,
     stream_id: u32,
     msg: StreamMsg,
-    limits: TunnelLimits,
 ) -> bool
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -504,28 +474,16 @@ where
     let Some(handle) = streams.get(&stream_id) else {
         return true;
     };
-    let msg_tx = handle.msg_tx.clone();
-    let send = msg_tx.send(msg);
-    tokio::pin!(send);
-    let deadline = tokio::time::sleep(limits.forward_timeout);
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            // A send error means the stream task already finished; its final
-            // `CLOSE` and done-notification are on their way. Not fatal.
-            _ = &mut send => return true,
-            Some(frame) = out_rx.recv() => {
-                if sink.send(Message::Binary(frame.encode().into())).await.is_err() {
-                    return false;
-                }
+    match handle.msg_tx.try_send(msg) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            if let Some(handle) = streams.remove(&stream_id) {
+                handle.abort.abort();
             }
-            () = &mut deadline => {
-                if let Some(handle) = streams.remove(&stream_id) {
-                    handle.abort.abort();
-                }
-                let frame = Frame::Close { stream_id };
-                return sink.send(Message::Binary(frame.encode().into())).await.is_ok();
-            }
+            tracing::warn!(stream_id, "closing tunnel stream with a full inbound queue");
+            sink.send(Message::Binary(Frame::Close { stream_id }.encode().into()))
+                .await
+                .is_ok()
         }
     }
 }
