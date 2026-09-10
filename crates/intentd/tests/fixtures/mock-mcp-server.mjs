@@ -88,6 +88,7 @@ function runStdio() {
 
 function runHttp() {
   const logAuth = process.argv.includes('--log-auth');
+  const requiredAuth = process.env.MOCK_MCP_REQUIRED_AUTH;
   const server = createServer((req, res) => {
     if (req.method === 'DELETE') {
       res.writeHead(204).end();
@@ -95,6 +96,10 @@ function runHttp() {
     }
     if (logAuth && req.method === 'POST') {
       process.stdout.write(`AUTH=${req.headers.authorization ?? 'none'}\n`);
+    }
+    if (requiredAuth && req.headers.authorization !== requiredAuth) {
+      res.writeHead(401).end();
+      return;
     }
     let body = '';
     req.on('data', (chunk) => (body += chunk));

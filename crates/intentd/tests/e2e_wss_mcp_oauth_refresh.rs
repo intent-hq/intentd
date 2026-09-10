@@ -232,10 +232,13 @@ struct Fixture {
 }
 
 /// Spawn the mock fixture with `args` and read its `PORT=<n>` announcement.
-async fn spawn_fixture(script: &str, args: &[&str]) -> Fixture {
-    let mut child = tokio::process::Command::new("node")
-        .arg(script)
-        .args(args)
+async fn spawn_fixture(script: &str, args: &[&str], required_auth: Option<&str>) -> Fixture {
+    let mut command = tokio::process::Command::new("node");
+    command.arg(script).args(args);
+    if let Some(required_auth) = required_auth {
+        command.env("MOCK_MCP_REQUIRED_AUTH", required_auth);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -350,8 +353,8 @@ async fn test_connection_refreshes_expired_bag_and_persists_it() {
     let Some(script) = fixture_script() else {
         return;
     };
-    let mut mcp = spawn_fixture(script, &["--http", "--log-auth"]).await;
-    let mut token_ep = spawn_fixture(script, &["--token"]).await;
+    let mut mcp = spawn_fixture(script, &["--http", "--log-auth"], None).await;
+    let mut token_ep = spawn_fixture(script, &["--token"], None).await;
 
     let (_daemon, mut ws) = boot_daemon().await;
     let server_id = create_server(&mut ws, 1, &mcp.base_url).await;
@@ -425,6 +428,63 @@ async fn test_connection_refreshes_expired_bag_and_persists_it() {
     assert_eq!(auth, "AUTH=Bearer refreshed-token-1", "probe #2 header");
 }
 
+/// The saved-server lifecycle path uses the same refresh-aware daemon token
+/// consumer as `mcp.testConnection`: an expired bag is refreshed before the
+/// initial remote probe, and restart performs another authenticated re-probe.
+#[tokio::test]
+async fn lifecycle_probe_refreshes_expired_bag_before_restart() {
+    let Some(script) = fixture_script() else {
+        return;
+    };
+    let mut mcp = spawn_fixture(
+        script,
+        &["--http", "--log-auth"],
+        Some("Bearer refreshed-token-1"),
+    )
+    .await;
+    let mut token_ep = spawn_fixture(script, &["--token"], None).await;
+    let (_daemon, mut ws) = boot_daemon().await;
+    let server_id = create_server(&mut ws, 1, &mcp.base_url).await;
+
+    let set = wss_rpc(
+        &mut ws,
+        2,
+        "mcp.oauth.set",
+        json!({ "serverId": server_id, "tokenBag": {
+            "access_token": STALE_TOKEN,
+            "expires_at": epoch_secs_ago(600),
+            "refresh_token": REFRESH_TOKEN,
+            "token_endpoint": format!("{}/token", token_ep.base_url),
+            "client_id": "lifecycle-client",
+        } }),
+    )
+    .await;
+    assert!(!set.to_string().contains(STALE_TOKEN));
+
+    let enabled = wss_rpc(
+        &mut ws,
+        3,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": true }),
+    )
+    .await;
+    assert_eq!(enabled["status"]["state"], json!("running"));
+    assert_eq!(enabled["status"]["toolCount"], json!(2));
+    assert!(!enabled.to_string().contains("refreshed-token-1"));
+    assert!(token_ep.next_line().await.starts_with("HIT=1 BODY="));
+    assert_eq!(mcp.next_line().await, "AUTH=Bearer refreshed-token-1");
+
+    let restarted = wss_rpc(
+        &mut ws,
+        4,
+        "mcp.servers.restart",
+        json!({ "serverId": server_id }),
+    )
+    .await;
+    assert_eq!(restarted["status"]["state"], json!("running"));
+    assert!(!restarted.to_string().contains("refreshed-token-1"));
+}
+
 /// Expired bag WITHOUT refresh metadata: no refresh attempted, no error — the
 /// stale stored token is sent as-is (fail-soft §5.22.1 contract).
 #[tokio::test]
@@ -432,7 +492,7 @@ async fn test_connection_expired_bag_without_refresh_metadata_falls_back() {
     let Some(script) = fixture_script() else {
         return;
     };
-    let mut mcp = spawn_fixture(script, &["--http", "--log-auth"]).await;
+    let mut mcp = spawn_fixture(script, &["--http", "--log-auth"], None).await;
 
     let (_daemon, mut ws) = boot_daemon().await;
     let server_id = create_server(&mut ws, 1, &mcp.base_url).await;
