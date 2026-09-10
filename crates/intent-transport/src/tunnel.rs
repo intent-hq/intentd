@@ -260,8 +260,17 @@ enum StreamMsg {
 
 /// Connection-loop handle to one live stream's relay task.
 struct StreamHandle {
+    generation: Arc<()>,
     msg_tx: mpsc::Sender<StreamMsg>,
     abort: tokio::task::AbortHandle,
+}
+
+/// A daemon→client frame tagged with the local incarnation of its stream id.
+/// The generation is not part of the wire format; it only prevents buffered
+/// output from a retired task crossing a later reuse of the same id.
+struct OutboundFrame {
+    generation: Arc<()>,
+    frame: Frame,
 }
 
 /// Drive one `/tunnel` WebSocket connection: decode inbound mux frames,
@@ -277,8 +286,7 @@ pub(crate) async fn run_tunnel_connection<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (mut sink, mut stream) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE_FRAMES);
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<u32>();
+    let (out_tx, mut out_rx) = mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_FRAMES);
     let mut streams: HashMap<u32, StreamHandle> = HashMap::new();
     loop {
         tokio::select! {
@@ -310,8 +318,6 @@ pub(crate) async fn run_tunnel_connection<S>(
                         &mut sink,
                         &mut streams,
                         &out_tx,
-                        &done_tx,
-                        &mut done_rx,
                         limits,
                     )
                     .await
@@ -333,12 +339,9 @@ pub(crate) async fn run_tunnel_connection<S>(
                 Some(Ok(Message::Frame(_))) => {}
             },
             Some(frame) = out_rx.recv() => {
-                if sink.send(Message::Binary(frame.encode().into())).await.is_err() {
+                if !send_outbound_frame(&mut sink, &mut streams, frame).await {
                     break;
                 }
-            }
-            Some(id) = done_rx.recv() => {
-                streams.remove(&id);
             }
             cmd = cmd_rx.recv() => match cmd {
                 None => break,
@@ -372,9 +375,7 @@ async fn handle_frame<S>(
     frame: Frame,
     sink: &mut SplitSink<WebSocketStream<S>, Message>,
     streams: &mut HashMap<u32, StreamHandle>,
-    out_tx: &mpsc::Sender<Frame>,
-    done_tx: &mpsc::UnboundedSender<u32>,
-    done_rx: &mut mpsc::UnboundedReceiver<u32>,
+    out_tx: &mpsc::Sender<OutboundFrame>,
     limits: TunnelLimits,
 ) -> bool
 where
@@ -382,11 +383,6 @@ where
 {
     match frame {
         Frame::Open { stream_id, port } => {
-            // Reap already-finished streams first so an id can be reused as
-            // soon as the client has seen its final `CLOSE`.
-            while let Ok(id) = done_rx.try_recv() {
-                streams.remove(&id);
-            }
             let reject = if streams.contains_key(&stream_id) {
                 Some("duplicate stream id".to_string())
             } else if streams.len() >= limits.max_streams {
@@ -404,18 +400,22 @@ where
                     .await
                     .is_ok();
             }
+            // Pointer identity is unique while any queued frame retains the
+            // old incarnation, so generations cannot wrap or alias.
+            let generation = Arc::new(());
             let (msg_tx, msg_rx) = mpsc::channel::<StreamMsg>(STREAM_QUEUE_FRAMES);
             let task = tokio::spawn(run_stream(
                 stream_id,
+                generation.clone(),
                 port,
                 msg_rx,
                 out_tx.clone(),
-                done_tx.clone(),
                 limits,
             ));
             streams.insert(
                 stream_id,
                 StreamHandle {
+                    generation,
                     msg_tx,
                     abort: task.abort_handle(),
                 },
@@ -458,6 +458,43 @@ where
     }
 }
 
+/// Send output only for the current incarnation of a stream id. Natural
+/// terminal frames release the id after reaching the socket; direct client or
+/// overload teardown removes the handle first, so any already-buffered output
+/// from the retired task is discarded here.
+async fn send_outbound_frame<S>(
+    sink: &mut SplitSink<WebSocketStream<S>, Message>,
+    streams: &mut HashMap<u32, StreamHandle>,
+    outbound: OutboundFrame,
+) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let stream_id = outbound.frame.stream_id();
+    let Some(handle) = streams.get(&stream_id) else {
+        return true;
+    };
+    if !Arc::ptr_eq(&handle.generation, &outbound.generation) {
+        return true;
+    }
+    let terminal = matches!(&outbound.frame, Frame::OpenErr { .. } | Frame::Close { .. });
+    if sink
+        .send(Message::Binary(outbound.frame.encode().into()))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    if terminal
+        && streams
+            .get(&stream_id)
+            .is_some_and(|handle| Arc::ptr_eq(&handle.generation, &outbound.generation))
+    {
+        streams.remove(&stream_id);
+    }
+    true
+}
+
 /// Admit a message without parking the shared WebSocket reader. The wire
 /// protocol has no per-stream credit window: once the bounded queue is full,
 /// close that stream rather than blocking unrelated requests and heartbeats.
@@ -490,17 +527,17 @@ where
 
 /// Relay one stream: connect to the daemon loopback, then copy bytes both
 /// ways until EOF in both directions, an idle timeout, or a socket error.
-/// An established stream always ends with a final `CLOSE` and a
-/// done-notification so the connection loop can free the stream id; a stream
-/// that never opened ends with the terminal `OPEN_ERR` instead (no `CLOSE`).
+/// An established stream always ends with a final `CLOSE`; a stream that never
+/// opened ends with the terminal `OPEN_ERR` instead (no `CLOSE`). The
+/// connection loop releases the id only after sending that terminal frame.
 /// Client `CLOSE` does not arrive here — the connection loop aborts this task
 /// directly and emits the final `CLOSE` itself.
 async fn run_stream(
     stream_id: u32,
+    generation: Arc<()>,
     port: u16,
     mut msg_rx: mpsc::Receiver<StreamMsg>,
-    out_tx: mpsc::Sender<Frame>,
-    done_tx: mpsc::UnboundedSender<u32>,
+    out_tx: mpsc::Sender<OutboundFrame>,
     limits: TunnelLimits,
 ) {
     // Connect targets are hard-limited to the daemon loopback by construction.
@@ -513,31 +550,41 @@ async fn run_stream(
         Ok(Ok(tcp)) => tcp,
         Ok(Err(e)) => {
             let _ = out_tx
-                .send(Frame::OpenErr {
-                    stream_id,
-                    message: format!("connect 127.0.0.1:{port}: {e}"),
+                .send(OutboundFrame {
+                    generation: generation.clone(),
+                    frame: Frame::OpenErr {
+                        stream_id,
+                        message: format!("connect 127.0.0.1:{port}: {e}"),
+                    },
                 })
                 .await;
-            let _ = done_tx.send(stream_id);
             return;
         }
         Err(_) => {
             let _ = out_tx
-                .send(Frame::OpenErr {
-                    stream_id,
-                    message: format!(
-                        "connect 127.0.0.1:{port}: timed out after {:?}",
-                        limits.connect_timeout
-                    ),
+                .send(OutboundFrame {
+                    generation: generation.clone(),
+                    frame: Frame::OpenErr {
+                        stream_id,
+                        message: format!(
+                            "connect 127.0.0.1:{port}: timed out after {:?}",
+                            limits.connect_timeout
+                        ),
+                    },
                 })
                 .await;
-            let _ = done_tx.send(stream_id);
             return;
         }
     };
     let _ = tcp.set_nodelay(true);
-    if out_tx.send(Frame::OpenOk { stream_id }).await.is_err() {
-        let _ = done_tx.send(stream_id);
+    if out_tx
+        .send(OutboundFrame {
+            generation: generation.clone(),
+            frame: Frame::OpenOk { stream_id },
+        })
+        .await
+        .is_err()
+    {
         return;
     }
     let (mut rd, mut wr) = tcp.into_split();
@@ -553,7 +600,14 @@ async fn run_stream(
                 // the write side keeps draining until the client is done too.
                 Ok(0) | Err(_) => {
                     read_done = true;
-                    if out_tx.send(Frame::Eof { stream_id }).await.is_err() {
+                    if out_tx
+                        .send(OutboundFrame {
+                            generation: generation.clone(),
+                            frame: Frame::Eof { stream_id },
+                        })
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     if write_done {
@@ -563,7 +617,14 @@ async fn run_stream(
                 Ok(n) => {
                     idle.as_mut().reset(Instant::now() + limits.idle_timeout);
                     let payload = buf[..n].to_vec();
-                    if out_tx.send(Frame::Data { stream_id, payload }).await.is_err() {
+                    if out_tx
+                        .send(OutboundFrame {
+                            generation: generation.clone(),
+                            frame: Frame::Data { stream_id, payload },
+                        })
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -596,8 +657,12 @@ async fn run_stream(
             () = &mut idle => break,
         }
     }
-    let _ = out_tx.send(Frame::Close { stream_id }).await;
-    let _ = done_tx.send(stream_id);
+    let _ = out_tx
+        .send(OutboundFrame {
+            generation,
+            frame: Frame::Close { stream_id },
+        })
+        .await;
 }
 
 /// Send a `1002 Protocol Error` close frame with `reason` (best effort).
