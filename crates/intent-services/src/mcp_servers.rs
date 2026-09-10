@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -300,7 +301,11 @@ enum ToolTarget {
     /// Forward over the live stdio [`Connection`].
     Stdio(Arc<Connection>),
     /// Forward over a stateless streamable-HTTP session.
-    Http { url: String, config: Value },
+    Http {
+        url: String,
+        config: Value,
+        generation: u64,
+    },
 }
 
 /// Transport-specific runtime half of a tracked server entry.
@@ -322,6 +327,7 @@ struct RunningServer {
     runtime: ServerRuntime,
     status: Value,
     failures: u32,
+    generation: u64,
 }
 
 /// Shared runtime state for the [`McpHub`].
@@ -329,6 +335,7 @@ struct HubInner {
     servers: Mutex<HashMap<String, RunningServer>>,
     bus: Mutex<Option<EventBus>>,
     oauth_store: Option<Store>,
+    next_generation: AtomicU64,
 }
 
 /// Runtime manager for external MCP servers (the `ServerManager` + `HealthMonitor`
@@ -363,8 +370,13 @@ impl McpHub {
                 servers: Mutex::new(HashMap::new()),
                 bus: Mutex::new(None),
                 oauth_store,
+                next_generation: AtomicU64::new(1),
             }),
         }
+    }
+
+    fn next_generation(&self) -> u64 {
+        self.inner.next_generation.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Wire the event bus the hub publishes `mcp.servers:status-changed` onto.
@@ -464,6 +476,7 @@ impl McpHub {
                     },
                     status: status.clone(),
                     failures: 0,
+                    generation: self.next_generation(),
                 };
                 self.inner.servers.lock().unwrap().insert(id, rs);
                 self.publish_status(&status).await;
@@ -488,6 +501,7 @@ impl McpHub {
             runtime: ServerRuntime::Remote,
             status: status.clone(),
             failures: 0,
+            generation: self.next_generation(),
         };
         self.inner.servers.lock().unwrap().insert(id, rs);
         self.publish_status(&status).await;
@@ -665,6 +679,7 @@ impl McpHub {
                 Ok(ToolTarget::Http {
                     url,
                     config: rs.config.clone(),
+                    generation: rs.generation,
                 })
             }
         }
@@ -713,7 +728,11 @@ impl McpHub {
                         other => Error::Internal(format!("mcp {method} failed: {other}")),
                     })
             }
-            ToolTarget::Http { url, config } => {
+            ToolTarget::Http {
+                url,
+                config,
+                generation,
+            } => {
                 let headers = self.remote_headers(server_id, &config).await;
                 let session = http_tool_session(&url, &headers, method, params, timeout);
                 let outcome = tokio::time::timeout(timeout, session)
@@ -721,7 +740,7 @@ impl McpHub {
                     .map_err(|_| Error::Internal(format!("mcp {method} timed out")))?;
                 if let Err(error) = &outcome {
                     if is_auth_failure(error) {
-                        self.mark_auth_required(server_id, error).await;
+                        self.mark_auth_required(server_id, generation, error).await;
                     }
                 }
                 outcome
@@ -772,14 +791,14 @@ impl McpHub {
 
     /// Move a tracked remote server to `auth_required` after a forwarded HTTP
     /// request receives 401/403. Publish only on a real state transition.
-    async fn mark_auth_required(&self, server_id: &str, error: &Error) {
+    async fn mark_auth_required(&self, server_id: &str, generation: u64, error: &Error) {
         let status = status_auth_required(server_id, &error.to_string());
         let changed = {
             let mut servers = self.inner.servers.lock().unwrap();
             let Some(server) = servers.get_mut(server_id) else {
                 return;
             };
-            if !matches!(server.runtime, ServerRuntime::Remote) {
+            if !matches!(server.runtime, ServerRuntime::Remote) || server.generation != generation {
                 return;
             }
             let changed = server.status.get("state") != status.get("state");
@@ -1097,9 +1116,16 @@ async fn probe_http_handshake(
         .map(String::from);
     let sid = session.as_deref();
     let ver = proto.as_deref();
-    // Notification (servers typically answer 202); failures are non-fatal.
+    // Notification (servers typically answer 202); only authentication
+    // failures are fatal because later requests cannot use the session.
     let inited = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-    let _ = post_rpc(client, url, headers, sid, ver, &inited).await;
+    if let Ok(resp) = post_rpc(client, url, headers, sid, ver, &inited).await {
+        if matches!(resp.status().as_u16(), 401 | 403) {
+            let error = check_http_status(resp.status()).unwrap_err();
+            delete_session(client, url, headers, sid, ver).await;
+            return Err(error);
+        }
+    }
     let tools = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} });
     let tool_count = match post_rpc(client, url, headers, sid, ver, &tools).await {
         Ok(resp) if resp.status().is_success() => {
@@ -1109,6 +1135,11 @@ async fn probe_http_handshake(
                     .and_then(Value::as_array)
                     .map(|a| a.len() as u64)
             })
+        }
+        Ok(resp) if matches!(resp.status().as_u16(), 401 | 403) => {
+            let error = check_http_status(resp.status()).unwrap_err();
+            delete_session(client, url, headers, sid, ver).await;
+            return Err(error);
         }
         _ => None,
     };
@@ -3598,6 +3629,7 @@ mod tests {
             },
             status: status_value(id, "running", None, None, None, None),
             failures: 0,
+            generation: h.next_generation(),
         };
         h.inner.servers.lock().unwrap().insert(id.to_string(), rs);
         (h, c2s_server, s2c_server)
@@ -3613,6 +3645,7 @@ mod tests {
             runtime: ServerRuntime::Remote,
             status: status_value(id, "running", None, None, None, None),
             failures: 0,
+            generation: h.next_generation(),
         };
         h.inner.servers.lock().unwrap().insert(id.to_string(), rs);
         h
@@ -3781,22 +3814,32 @@ mod tests {
     /// `tools/call` based on the request body (a `tools/call` naming the tool
     /// `boom` gets a JSON-RPC error envelope).
     async fn http_tool_stub() -> (String, tokio::task::JoinHandle<()>) {
-        http_tool_stub_with_auth(None).await
+        http_tool_stub_with_options(None, None).await
     }
 
     /// The body-aware tool stub with an optional exact bearer requirement.
     async fn http_tool_stub_with_auth(
         required_auth: Option<&str>,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        http_tool_stub_with_options(required_auth, None).await
+    }
+
+    /// The body-aware tool stub with optional auth and one denied request kind.
+    async fn http_tool_stub_with_options(
+        required_auth: Option<&str>,
+        denied_request: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let required_auth = required_auth.map(String::from);
+        let denied_request = denied_request.map(String::from);
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
                 let required_auth = required_auth.clone();
+                let denied_request = denied_request.clone();
                 tokio::spawn(async move {
                     while let Some(req) = read_http_request(&mut sock).await {
                         let authorized = required_auth.as_ref().is_none_or(|expected| {
@@ -3807,7 +3850,10 @@ mod tests {
                                 })
                             })
                         });
-                        let resp = if !authorized {
+                        let denied = denied_request
+                            .as_ref()
+                            .is_some_and(|request_kind| req.contains(request_kind));
+                        let resp = if !authorized || denied {
                             "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n".to_string()
                         } else if req.contains("\"method\":\"initialize\"") {
                             ok_json_response(
@@ -3969,6 +4015,46 @@ mod tests {
         let status = h.status("r1");
         assert_eq!(status["state"], json!("auth_required"));
         assert!(!status.to_string().contains("supersecret-token"));
+    }
+
+    #[tokio::test]
+    async fn http_probe_follow_up_auth_errors_require_authentication() {
+        for denied_request in ["notifications/initialized", "\"method\":\"tools/list\""] {
+            let (url, guard) = http_tool_stub_with_options(None, Some(denied_request)).await;
+            let h = McpHub::new();
+            let status = h.start(remote_cfg("r-follow-up", "http", &url), true).await;
+            guard.abort();
+
+            assert_eq!(status["state"], json!("auth_required"), "{denied_request}");
+            assert!(
+                status["lastError"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("HTTP 401")),
+                "{denied_request}: {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_http_auth_error_does_not_replace_restarted_status() {
+        let (url, _guard) = http_tool_stub().await;
+        let h = remote_hub("r-stale", "http", &url, json!({}));
+        let old_generation = match h.tool_target("r-stale").unwrap() {
+            ToolTarget::Http { generation, .. } => generation,
+            ToolTarget::Stdio(_) => panic!("expected HTTP target"),
+        };
+
+        let restarted = h.restart(remote_cfg("r-stale", "http", &url), true).await;
+        assert_eq!(restarted["state"], json!("running"));
+
+        let stale_error = Error::Internal(
+            "authentication failed (HTTP 401) — authenticate or check configured credentials"
+                .to_string(),
+        );
+        h.mark_auth_required("r-stale", old_generation, &stale_error)
+            .await;
+
+        assert_eq!(h.status("r-stale")["state"], json!("running"));
     }
 
     #[test]
