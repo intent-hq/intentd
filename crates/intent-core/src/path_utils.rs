@@ -229,8 +229,8 @@ fn user_db_shell() -> Option<String> {
 /// sentinels are missing, the capture still succeeds with an empty env map.
 #[cfg(unix)]
 fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCapture> {
-    use std::io::Read;
-    use std::sync::{Arc, Mutex};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
 
     // Build command with sentinel-wrapped printf for PATH, plus a second
     // sentinel pair wrapping a NUL-separated env dump in the SAME invocation.
@@ -245,48 +245,111 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCaptu
     let mut args = flags.to_vec();
     args.push(&cmd);
 
-    let mut child = Command::new(shell)
+    let mut command = Command::new(shell);
+    command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    // Drain stdout concurrently to avoid pipe-buffer deadlock when rc files print >64KB of noise
-    let stdout = child.stdout.take()?;
-    let output_buffer = Arc::new(Mutex::new(Vec::new()));
-    let output_clone = output_buffer.clone();
-    let reader_thread = std::thread::spawn(move || {
-        let mut stdout = stdout;
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        let mut out = output_clone.lock().unwrap();
-        *out = buf;
-    });
+        .stderr(Stdio::null());
+    // An interactive shell that retains the parent's controlling terminal can
+    // invoke job control while the daemon is in a background process group,
+    // stopping unrelated siblings with SIGTTIN. `setsid` is async-signal-safe
+    // and detaches only this child before exec; no process-wide signal state is
+    // changed.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().ok()?;
+    let child_pid = child.id();
 
     // Poll for completion with 5s timeout (interactive shells with nvm can take ~1.9s)
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Nonblocking reads let the same deadline bound both the child and the
+    // stdout resource. No reader thread can outlive this capture if a detached
+    // descendant inherits the pipe indefinitely.
+    let mut stdout = child.stdout.take()?;
+    let stdout_flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+    if stdout_flags == -1
+        || unsafe {
+            libc::fcntl(
+                stdout.as_raw_fd(),
+                libc::F_SETFL,
+                stdout_flags | libc::O_NONBLOCK,
+            )
+        } == -1
+    {
+        kill_capture_process_group(child_pid);
+        let _ = child.wait();
+        return None;
+    }
+    let mut output = Vec::new();
+    let mut stdout_closed = false;
     let exit_status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
+        if !stdout_closed {
+            let Ok(closed) = drain_capture_stdout(&mut stdout, &mut output, deadline) else {
+                kill_capture_process_group(child_pid);
+                let _ = child.wait();
+                break None;
+            };
+            stdout_closed = closed;
+        }
+        match capture_child_has_exited(child_pid) {
+            Ok(true) => {
+                // WNOWAIT keeps the exited leader waitable, preventing PID reuse
+                // until its process-group stragglers are retired.
+                kill_capture_process_group(child_pid);
+                break child.wait().ok();
+            }
+            Ok(false) => {
                 // Still running
                 if std::time::Instant::now() >= deadline {
-                    // Timeout - kill and return None
-                    let _ = child.kill();
+                    // Timeout - kill the detached process group so shell
+                    // descendants cannot retain the captured stdout pipe.
+                    kill_capture_process_group(child_pid);
                     let _ = child.wait();
                     break None;
                 }
                 // Sleep a bit before polling again
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(_) => break None,
+            Err(error) => match error.raw_os_error() {
+                Some(libc::EINTR) => {
+                    if std::time::Instant::now() >= deadline {
+                        kill_capture_process_group(child_pid);
+                        let _ = child.wait();
+                        break None;
+                    }
+                }
+                // Child ownership was lost, so its PID/process-group identity
+                // is no longer safe to signal.
+                Some(libc::ECHILD) => break None,
+                _ => {
+                    kill_capture_process_group(child_pid);
+                    let _ = child.wait();
+                    break None;
+                }
+            },
         }
     };
 
-    // Wait for reader thread to finish
-    let _ = reader_thread.join();
+    // A shell can exit after starting a descendant that inherited stdout.
+    // Group descendants were retired before the leader was reaped. Drain their
+    // final bytes, but keep the original deadline if a separately detached
+    // descendant still holds the pipe.
+    while !stdout_closed {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        stdout_closed = drain_capture_stdout(&mut stdout, &mut output, deadline).ok()?;
+        if !stdout_closed {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     // Check exit status
     let status = exit_status?;
@@ -295,7 +358,6 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCaptu
     }
 
     // Extract output from buffer
-    let output = output_buffer.lock().unwrap();
     let output_str = String::from_utf8_lossy(&output);
 
     // Extract PATH between sentinels (last complete pair wins if sentinels
@@ -329,6 +391,59 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCaptu
         dirs,
         credential_env,
     })
+}
+
+#[cfg(unix)]
+fn drain_capture_stdout(
+    stdout: &mut std::process::ChildStdout,
+    output: &mut Vec<u8>,
+    deadline: std::time::Instant,
+) -> std::io::Result<bool> {
+    use std::io::Read;
+
+    let mut chunk = [0_u8; 8192];
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        match stdout.read(&mut chunk) {
+            Ok(0) => return Ok(true),
+            Ok(read) => output.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn capture_child_has_exited(child_pid: u32) -> std::io::Result<bool> {
+    let child_pid = libc::pid_t::try_from(child_pid)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let wait_target = libc::id_t::try_from(child_pid)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            wait_target,
+            &raw mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+#[cfg(unix)]
+fn kill_capture_process_group(child_pid: u32) {
+    if let Ok(process_group) = libc::pid_t::try_from(child_pid) {
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
 }
 
 /// Extract the value between a sentinel pair in shell output.
@@ -630,6 +745,215 @@ mod tests {
         let _guard = lock_fake_shell();
         write_fake_shell(path, content);
         capture_login_shell_with(Some(path.to_str().unwrap()))
+    }
+
+    #[cfg(unix)]
+    const JOB_CONTROL_TEST_MODE: &str = "INTENT_JOB_CONTROL_TEST_MODE";
+    #[cfg(unix)]
+    const JOB_CONTROL_SCENARIO_PID_FILE: &str = "INTENT_JOB_CONTROL_SCENARIO_PID_FILE";
+    #[cfg(unix)]
+    const JOB_CONTROL_SIGTTIN_EXIT: i32 = 128 + libc::SIGTTIN;
+
+    #[cfg(unix)]
+    fn job_control_test_command(mode: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("capture_login_shell_isolated_from_terminal_job_control")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(JOB_CONTROL_TEST_MODE, mode);
+        command
+    }
+
+    #[cfg(unix)]
+    fn run_job_control_scenario() {
+        let mut sibling = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sibling");
+        let capture = capture_login_shell_with(Some("/bin/bash"));
+
+        let mut sibling_status = 0;
+        let sibling_pid = libc::pid_t::try_from(sibling.id()).unwrap();
+        let sibling_wait = unsafe {
+            libc::waitpid(
+                sibling_pid,
+                &raw mut sibling_status,
+                libc::WNOHANG | libc::WUNTRACED,
+            )
+        };
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+
+        assert!(!capture.dirs.is_empty(), "interactive Bash capture failed");
+        assert_eq!(sibling_wait, 0, "unrelated sibling was stopped or exited");
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::zombie_processes)] // raw waitpid observes and reaps stopped children
+    fn run_job_control_pty_harness() {
+        use std::os::unix::process::CommandExt;
+
+        let home = unique_temp_dir("job-control-home");
+        let mut scenario = job_control_test_command("scenario");
+        scenario
+            .env("HOME", home.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            scenario.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let scenario = scenario.spawn().expect("spawn background scenario");
+        let scenario_pid = libc::pid_t::try_from(scenario.id()).unwrap();
+        std::fs::write(
+            std::env::var_os(JOB_CONTROL_SCENARIO_PID_FILE).unwrap(),
+            scenario_pid.to_string(),
+        )
+        .expect("record scenario process group");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut status = 0;
+            let waited = unsafe {
+                libc::waitpid(
+                    scenario_pid,
+                    &raw mut status,
+                    libc::WNOHANG | libc::WUNTRACED,
+                )
+            };
+            if waited == scenario_pid {
+                if libc::WIFEXITED(status) {
+                    assert_eq!(libc::WEXITSTATUS(status), 0, "scenario failed");
+                    return;
+                }
+                unsafe {
+                    libc::kill(-scenario_pid, libc::SIGKILL);
+                    libc::waitpid(scenario_pid, std::ptr::null_mut(), 0);
+                }
+                if libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGTTIN {
+                    std::process::exit(JOB_CONTROL_SIGTTIN_EXIT);
+                }
+                assert!(
+                    !libc::WIFSTOPPED(status),
+                    "scenario stopped by terminal job control"
+                );
+                panic!("scenario terminated unexpectedly");
+            }
+            assert_eq!(waited, 0, "waitpid failed");
+            if std::time::Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(-scenario_pid, libc::SIGKILL);
+                    libc::waitpid(scenario_pid, std::ptr::null_mut(), 0);
+                }
+                panic!("scenario exceeded bounded timeout");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(unix)]
+    fn cleanup_job_control_test_groups(harness_pid: libc::pid_t, scenario_pid_file: &Path) {
+        if let Ok(raw_pid) = std::fs::read_to_string(scenario_pid_file) {
+            if let Ok(scenario_pid) = raw_pid.parse::<libc::pid_t>() {
+                if unsafe { libc::getsid(scenario_pid) } == harness_pid {
+                    unsafe {
+                        libc::kill(-scenario_pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        if unsafe { libc::getsid(harness_pid) } == harness_pid {
+            unsafe {
+                libc::kill(-harness_pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_isolated_from_terminal_job_control() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+
+        match std::env::var(JOB_CONTROL_TEST_MODE).as_deref() {
+            Ok("scenario") => return run_job_control_scenario(),
+            Ok("pty-harness") => return run_job_control_pty_harness(),
+            _ => {}
+        }
+        if !Path::new("/bin/bash").is_file() {
+            return;
+        }
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let openpty_result = unsafe {
+            libc::openpty(
+                &raw mut master_fd,
+                &raw mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(openpty_result, 0, "openpty failed");
+        let _master = unsafe { OwnedFd::from_raw_fd(master_fd) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+        let process_state = unique_temp_dir("job-control-state");
+        let scenario_pid_file = process_state.path().join("scenario-pgid");
+        let mut harness = job_control_test_command("pty-harness");
+        harness
+            .env(JOB_CONTROL_SCENARIO_PID_FILE, &scenario_pid_file)
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave);
+        unsafe {
+            harness.pre_exec(|| {
+                if libc::setsid() == -1
+                    || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1
+                    || libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut harness = harness.spawn().expect("spawn PTY harness");
+        let harness_pid = libc::pid_t::try_from(harness.id()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match harness.try_wait() {
+                Ok(Some(status)) if status.success() => return,
+                Ok(Some(status)) => {
+                    cleanup_job_control_test_groups(harness_pid, &scenario_pid_file);
+                    assert_ne!(
+                        status.code(),
+                        Some(JOB_CONTROL_SIGTTIN_EXIT),
+                        "background scenario stopped by SIGTTIN"
+                    );
+                    panic!("PTY harness failed");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    cleanup_job_control_test_groups(harness_pid, &scenario_pid_file);
+                    let _ = harness.wait();
+                    panic!("wait for PTY harness failed: {error}");
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                cleanup_job_control_test_groups(harness_pid, &scenario_pid_file);
+                let _ = harness.wait();
+                panic!("PTY harness exceeded bounded outer timeout");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     #[test]
@@ -1018,6 +1342,35 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "Should complete well within timeout (no deadlock), took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_bounds_stdout_holding_grandchild_cleanup() {
+        use std::fs;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_grandchild_{pid}_{nanos}.sh"));
+        let _guard = lock_fake_shell();
+        write_fake_shell(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  sleep 30 &\n  printf '__INTENT_PATH_S__/grandchild/bin__INTENT_PATH_E__'\nfi\n",
+        );
+        let start = std::time::Instant::now();
+        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        let elapsed = start.elapsed();
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(dirs, vec![PathBuf::from("/grandchild/bin")]);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stdout-holding grandchild cleanup took {elapsed:?}"
         );
     }
 
