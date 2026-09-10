@@ -1336,7 +1336,7 @@ fn check_http_status(status: reqwest::StatusCode) -> Result<()> {
     let code = status.as_u16();
     Err(match code {
         401 | 403 => Error::Internal(format!(
-            "authentication failed (HTTP {code}) — check configured headers"
+            "authentication failed (HTTP {code}) — authenticate or check configured credentials"
         )),
         500..=599 => Error::Internal(format!("server error (HTTP {code})")),
         _ => Error::Internal(format!("unexpected HTTP {code} from server")),
@@ -1529,9 +1529,9 @@ impl<'a> McpServersService<'a> {
         let normalized = merge_redacted_secrets(normalize_config(config, Some(server_id))?, stored);
         configs.insert(server_id.to_string(), normalized.clone());
         write_configs(self.secrets, &configs).await?;
-        // Apply live: any tracked server (running, or a remote in `error`)
-        // picks up the new definition on restart — an error-state remote must
-        // re-probe the updated URL/headers, not keep probing the old config.
+        // Apply live: any tracked server (running, or a remote in `error` or
+        // `auth_required`) picks up the new definition on restart. A failed
+        // remote must re-probe updated credentials, not keep the old config.
         let tracked = self.hub.status(server_id)["state"] != "stopped";
         if tracked {
             let enable = enable_user_servers(&self.effective());
@@ -3213,6 +3213,7 @@ mod tests {
         let err = status["lastError"].as_str().unwrap();
         assert!(err.contains("authentication failed"), "got: {err}");
         assert!(err.contains("401"), "got: {err}");
+        assert!(err.contains("configured credentials"), "got: {err}");
     }
 
     #[tokio::test]
