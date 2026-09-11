@@ -999,6 +999,15 @@ pub struct Services {
     /// `prMonitor.pollSeconds` live from the settings registry; values below
     /// the floor are clamped at read time.
     pr_monitor_poll_seconds: Option<u64>,
+    /// Explicit override for the PR-monitor loop's hourly forge request
+    /// budget. `None` — the production wiring — reads
+    /// `prMonitor.hourlyRequestBudget` live from the settings registry;
+    /// values below the floor are clamped at read time.
+    pr_monitor_hourly_request_budget: Option<u64>,
+    /// The last effective per-PR poll interval (seconds) the monitor loop
+    /// logged, so a cadence change is logged once — never per tick. Shared
+    /// across clones.
+    pr_monitor_logged_interval: Arc<Mutex<Option<u64>>>,
     /// Explicit override for the debounce quiet window (seconds) before a
     /// changed PR's consolidated wake is delivered. `None` — the production
     /// wiring — reads `prMonitor.debounceSeconds` live from the settings
@@ -1222,6 +1231,8 @@ impl Services {
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashSet::new())),
             pr_monitor_poll_seconds: None,
+            pr_monitor_hourly_request_budget: None,
+            pr_monitor_logged_interval: Arc::new(Mutex::new(None)),
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
@@ -1242,6 +1253,15 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
         self.pr_monitor_poll_seconds = Some(seconds);
+        self
+    }
+
+    /// Pin the PR-monitor hourly forge request budget, bypassing the live
+    /// `prMonitor.hourlyRequestBudget` setting (test wiring). Values below
+    /// the floor are clamped when read.
+    #[cfg(test)]
+    pub(crate) fn with_pr_monitor_hourly_request_budget(mut self, budget: u64) -> Self {
+        self.pr_monitor_hourly_request_budget = Some(budget);
         self
     }
 

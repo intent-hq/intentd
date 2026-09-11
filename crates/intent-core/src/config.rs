@@ -135,6 +135,20 @@ pub const DEFAULT_PR_MONITOR_POLL_SECONDS: u64 = 30;
 /// forge. Sub-minimum values (notably `0`) are clamped up at read time.
 pub const MIN_PR_MONITOR_POLL_SECONDS: u64 = 10;
 
+/// Default for `prMonitor.hourlyRequestBudget` — the forge REST calls per
+/// hour the centralized PR-monitor loop may spend across every monitored PR.
+/// Each distinct-PR poll costs `PR_MONITOR_REQUESTS_PER_POLL` (3) calls, so
+/// the loop stretches its per-PR interval above `pollSeconds` once
+/// `distinct PRs × 3 × 3600 / budget` exceeds it. 1500/h is ~30% of GitHub's
+/// 5,000/h authenticated core quota, leaving headroom for the PR-refresh
+/// sweep and agents' own `gh` use.
+pub const DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 1500;
+
+/// Floor for `prMonitor.hourlyRequestBudget` (one call per minute). Sub-floor
+/// values (notably `0`, which would divide by zero) are clamped up at read
+/// time.
+pub const MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 60;
+
 /// Default quiet window a changed PR must observe before its consolidated
 /// wake is delivered (`prMonitor.debounceSeconds`).
 pub const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;
