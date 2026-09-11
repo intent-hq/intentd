@@ -43,7 +43,9 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::agent_ops::{new_message_id, user_message_blocks, QueuedMessage, MAX_MESSAGE_ID_LEN};
+use crate::agent_ops::{
+    new_message_id, user_message_blocks, DrainingGuard, QueuedMessage, MAX_MESSAGE_ID_LEN,
+};
 use crate::agent_session::{
     agent_actor, InterruptFlushOutcome, InterruptReason, InterruptedBy, ThoughtLevelOption,
 };
@@ -6119,11 +6121,11 @@ impl AgentManager {
         // existing single-entry path unchanged.
         {
             let mode = self.services.flush_queued_messages_mode();
-            if let Some(batch) =
+            if let Some((batch, draining)) =
                 self.services
-                    .dequeue_flush_batch(&agent_id, mode, archived_drain, 2)
+                    .dequeue_flush_batch_draining(&agent_id, mode, archived_drain, 2)
             {
-                match prepare_flush_turn(&self, &agent_id, &workspace_id, batch).await {
+                match prepare_flush_turn(&self, &agent_id, &workspace_id, batch, draining).await {
                     FlushPrep::Turn { content, options } => {
                         self.spawn_worker(agent_id, workspace_id, content, *options, true);
                     }
@@ -6140,11 +6142,12 @@ impl AgentManager {
         // Under the archived-workspace exemption only a user-origin entry
         // may drain; the normal path pops the queue head as before.
         let dequeued = if archived_drain {
-            self.services.dequeue_user_origin_message(&agent_id)
+            self.services
+                .dequeue_user_origin_message_draining(&agent_id)
         } else {
-            self.services.dequeue_message(&agent_id)
+            self.services.dequeue_message_draining(&agent_id)
         };
-        let Some(mut next) = dequeued else {
+        let Some((mut next, draining)) = dequeued else {
             // Raced with another mutation (e.g. remove) that emptied the
             // ready-to-send queue between the check above and the dequeue.
             self.end_turn(&agent_id).await;
@@ -6237,6 +6240,7 @@ impl AgentManager {
             self.release_in_flight_slot(&agent_id);
             return;
         }
+        drop(draining);
         self.services
             .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
             .await;
@@ -6308,10 +6312,11 @@ impl AgentManager {
             }));
         }
         // Atomic dequeue under the queue lock: no concurrent drain can
-        // deliver the same entry twice.
-        let mut entry = self
+        // deliver the same entry twice. The entry stays listed in queue
+        // snapshots (§6.5 drain ordering) until `draining` is dropped.
+        let (mut entry, draining) = self
             .services
-            .take_queued_message(&agent_id, &message_id)
+            .take_queued_message_draining(&agent_id, &message_id)
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
@@ -6364,6 +6369,7 @@ impl AgentManager {
             entry.user_origin = true;
             let restored = entry.to_value(0);
             self.services.requeue_front(&agent_id, entry);
+            drop(draining);
             self.services.publish_queue_updated(&agent_id).await;
             return Ok(json!({
                 "success": true,
@@ -6406,6 +6412,7 @@ impl AgentManager {
                     // re-attempts the append), then surface the failure.
                     self.end_turn(&agent_id).await;
                     self.services.requeue_front(&agent_id, entry);
+                    drop(draining);
                     self.services.publish_queue_updated(&agent_id).await;
                     return Err(append_err);
                 }
@@ -6439,6 +6446,7 @@ impl AgentManager {
                     .await;
             }
         }
+        drop(draining);
         self.services
             .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
             .await;
@@ -9772,8 +9780,11 @@ async fn run_message_worker(
         // unchanged.
         {
             let mode = mgr.services.flush_queued_messages_mode();
-            if let Some(batch) = mgr.services.dequeue_flush_batch(&agent_id, mode, false, 2) {
-                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
+            if let Some((batch, draining)) = mgr
+                .services
+                .dequeue_flush_batch_draining(&agent_id, mode, false, 2)
+            {
+                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining).await {
                     FlushPrep::Turn {
                         content: c,
                         options: o,
@@ -9793,7 +9804,7 @@ async fn run_message_worker(
                 }
             }
         }
-        if let Some(mut next) = mgr.services.dequeue_message(&agent_id) {
+        if let Some((mut next, draining)) = mgr.services.dequeue_message_draining(&agent_id) {
             // Durable shrink now; the shrunk `agent:queue:updated` is
             // published only after the user row below is persisted (§6.5
             // drain ordering).
@@ -9866,6 +9877,7 @@ async fn run_message_worker(
                 mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
+            drop(draining);
             mgr.services
                 .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
                 .await;
@@ -9877,13 +9889,15 @@ async fn run_message_worker(
         // goes idle while ready-to-send messages remain — each re-claim of the
         // slot continues `'outer` and re-enters the drain at the top. The
         // popped entry travels as a batch so the slot-race failure below
-        // hands it back unchanged (`requeue_front_batch`).
+        // hands it back unchanged (`requeue_front_batch`); its draining guard
+        // (§6.5 drain ordering) rides in `raced_draining` and retires the
+        // entry from queue snapshots at every exit of this arm.
         mgr.end_turn(&agent_id).await;
-        let mut raced: Vec<QueuedMessage> = mgr
-            .services
-            .dequeue_message(&agent_id)
-            .into_iter()
-            .collect();
+        let (mut raced, mut raced_draining): (Vec<QueuedMessage>, Option<DrainingGuard>) =
+            match mgr.services.dequeue_message_draining(&agent_id) {
+                Some((next, guard)) => (vec![next], Some(guard)),
+                None => (Vec::new(), None),
+            };
         if raced.is_empty() {
             // monorepo#1297: heal a busy-misclassified terminal idle. The
             // turn's `agent:idle` is published while this worker still holds
@@ -9958,6 +9972,7 @@ async fn run_message_worker(
                 }
             }
             let mut next = raced.pop().expect("raced batch non-empty");
+            let mut draining = raced_draining.take().expect("raced batch guard");
             // Batch flush (`agents.flushQueuedMessages`): the single `next`
             // was popped before the slot re-claim, so fold any FURTHER
             // eligible entries in behind it and run them as one combined
@@ -9969,21 +9984,23 @@ async fn run_message_worker(
             // single-entry path below also runs unchanged.
             let mode = mgr.services.flush_queued_messages_mode();
             let extra_batch = match mode {
-                intent_core::FlushQueuedMessagesMode::All => {
-                    mgr.services.dequeue_ready_batch(&agent_id, false, 1)
-                }
+                intent_core::FlushQueuedMessagesMode::All => mgr
+                    .services
+                    .dequeue_ready_batch_draining(&agent_id, false, 1),
                 intent_core::FlushQueuedMessagesMode::SystemOnly => {
                     if next.user_origin {
                         None
                     } else {
-                        mgr.services.dequeue_system_only_batch(&agent_id, 1)
+                        mgr.services
+                            .dequeue_system_only_batch_draining(&agent_id, 1)
                     }
                 }
                 intent_core::FlushQueuedMessagesMode::Off => None,
             };
-            if let Some(mut batch) = extra_batch {
+            if let Some((mut batch, extra_draining)) = extra_batch {
                 batch.insert(0, next);
-                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
+                draining.merge(extra_draining);
+                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining).await {
                     FlushPrep::Turn {
                         content: c,
                         options: o,
@@ -10067,6 +10084,7 @@ async fn run_message_worker(
                 mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
+            drop(draining);
             mgr.services
                 .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
                 .await;
@@ -10076,6 +10094,7 @@ async fn run_message_worker(
         // original order and exit — that worker's own drain loop will pick
         // them up.
         mgr.services.requeue_front_batch(&agent_id, raced);
+        drop(raced_draining);
         break 'outer;
     }
     mgr.clear_worker(&agent_id);
@@ -10181,11 +10200,17 @@ enum FlushPrep {
 /// requeued around it in original order — entries whose rows already
 /// persisted carry `persisted: true` so the retry drain never
 /// double-appends. Returns [`FlushPrep::Parked`].
+///
+/// `draining` is the batch's [`DrainingGuard`] (§6.5 drain ordering): it is
+/// dropped right before the settled snapshot is published, and at scope exit
+/// on the parked paths (after the requeues, so no snapshot ever misses an
+/// entry in between).
 async fn prepare_flush_turn(
     mgr: &AgentManager,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     mut entries: Vec<QueuedMessage>,
+    draining: DrainingGuard,
 ) -> FlushPrep {
     // Durable shrink now; the ONE shrunk `agent:queue:updated` is published
     // only after every row below is persisted (§6.5 drain ordering).
@@ -10274,6 +10299,7 @@ async fn prepare_flush_turn(
             .await;
         return FlushPrep::Parked;
     }
+    drop(draining);
     mgr.services
         .publish_queue_updated_after_drain_persist(agent_id, workspace_id)
         .await;

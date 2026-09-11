@@ -11529,8 +11529,9 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
         child_agent_id: None,
     };
     let batch = vec![entry("head", true), entry("tail", false)];
+    let draining = mgr.services.mark_draining(&id, &batch);
 
-    let prep = super::prepare_flush_turn(&mgr, &id, &ws, batch).await;
+    let prep = super::prepare_flush_turn(&mgr, &id, &ws, batch, draining).await;
     assert!(
         matches!(prep, super::FlushPrep::Parked),
         "vanished-session flush parks instead of starting a turn"
@@ -15640,6 +15641,377 @@ mod queued_message_id_stamp_tests {
         msg.message_metadata = Some(json!({ "queueInfo": 7 }));
         super::super::stamp_queued_message_id(&mut msg);
         assert_eq!(msg.message_metadata, Some(json!({ "queueInfo": 7 })));
+    }
+}
+
+/// §6.5 drain-ordering barrier under concurrency (intent-hq/intentd#1783
+/// review): a drained entry stays in EVERY client-visible queue snapshot —
+/// including the `agent:queue:updated` an UNRELATED mutation publishes while
+/// the drain arm is suspended between dequeue and its user-row persist — and
+/// is retired exactly once, on both the settled and the rollback paths.
+#[cfg(test)]
+mod draining_overlay_tests {
+    use super::*;
+    use intent_core::events::{AGENT_MESSAGE, AGENT_QUEUE_UPDATED};
+
+    fn ids(snapshot: &[Value]) -> Vec<String> {
+        snapshot
+            .iter()
+            .map(|m| m["id"].as_str().expect("entry id").to_string())
+            .collect()
+    }
+
+    fn lists(queue: &Value, id: &str) -> bool {
+        queue
+            .as_array()
+            .expect("queue array")
+            .iter()
+            .any(|m| m["id"] == json!(id))
+    }
+
+    async fn drain_bus(sub: &mut crate::events::Subscription) -> Vec<intent_core::Event> {
+        let mut events = Vec::new();
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+            events.extend(batch);
+        }
+        events
+    }
+
+    /// The unrelated mutation's own publish: the write-through +
+    /// `agent:queue:updated` choke point every enqueue / edit / remove flows
+    /// through (`publish_queue_updated_for`). Called explicitly because the
+    /// hidden transcript table that parks the drain also blinds the
+    /// session-lookup variant the ops use (the session read joins it).
+    async fn publish_mutation(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+        mgr.services
+            .publish_queue_updated_for(id, ws, mgr.services.queue_snapshot(id))
+            .await;
+    }
+
+    /// Overlay semantics in isolation: the popped entry heads the snapshot
+    /// while its guard lives; unrelated enqueue / edit / remove keep it
+    /// listed; a hand-back (same id) or a failure requeue (new id, same
+    /// `turnId`) lists it ONCE; dropping the guard retires it.
+    #[tokio::test]
+    async fn draining_guard_keeps_entry_listed_until_dropped() {
+        let (_tmp, mgr) = manager().await;
+        let id = AgentId::from("a-overlay");
+        let enqueue = |text: &str| {
+            mgr.services
+                .enqueue_message(&id, text.to_string(), None, None, None, None, false)
+                .0
+        };
+        let (a, b) = (enqueue("A"), enqueue("B"));
+
+        let (popped, guard) = mgr.services.dequeue_message_draining(&id).expect("A pops");
+        assert_eq!(popped.id, a.id);
+        assert!(
+            mgr.services.take_queued_message(&id, &a.id).is_none(),
+            "the live queue no longer holds A"
+        );
+        let snap = mgr.services.queue_snapshot(&id);
+        assert_eq!(ids(&snap), vec![a.id.clone(), b.id.clone()]);
+        assert_eq!(snap[0]["position"], json!(0));
+        assert_eq!(snap[1]["position"], json!(1));
+
+        // Unrelated mutations while A drains keep A at the head.
+        let c = enqueue("C");
+        assert_eq!(
+            ids(&mgr.services.queue_snapshot(&id)),
+            vec![a.id.clone(), b.id.clone(), c.id.clone()]
+        );
+        mgr.services
+            .agent_edit_queued_message_op(id.clone(), b.id.clone(), "B edited".into(), None)
+            .await
+            .expect("edit B");
+        mgr.services
+            .agent_remove_queued_message_op(id.clone(), c.id.clone())
+            .await
+            .expect("remove C");
+        let snap = mgr.services.queue_snapshot(&id);
+        assert_eq!(ids(&snap), vec![a.id.clone(), b.id.clone()]);
+        assert_eq!(snap[1]["content"], json!("B edited"));
+
+        // Hand-back with the guard alive: listed once, from the live queue.
+        mgr.services.requeue_front(&id, popped.clone());
+        assert_eq!(
+            ids(&mgr.services.queue_snapshot(&id)),
+            vec![a.id.clone(), b.id.clone()]
+        );
+        mgr.services
+            .take_queued_message(&id, &a.id)
+            .expect("A taken back out");
+
+        // Failure requeue (new id, same turn id): listed once, no original.
+        let mut retry = popped.clone();
+        retry.id = "qm-a-retry".to_string();
+        retry.requeued_after_failure = true;
+        mgr.services.requeue_front(&id, retry);
+        assert_eq!(
+            ids(&mgr.services.queue_snapshot(&id)),
+            vec!["qm-a-retry".to_string(), b.id.clone()]
+        );
+        mgr.services
+            .take_queued_message(&id, "qm-a-retry")
+            .expect("retry entry taken back out");
+        assert_eq!(
+            ids(&mgr.services.queue_snapshot(&id)),
+            vec![a.id.clone(), b.id.clone()],
+            "overlay copy shows again once the live copy is gone"
+        );
+
+        drop(guard);
+        assert_eq!(ids(&mgr.services.queue_snapshot(&id)), vec![b.id.clone()]);
+    }
+
+    /// A merged guard (single popped entry folded into a batch flush behind
+    /// it) retires every covered entry in one drop.
+    #[tokio::test]
+    async fn merged_guard_retires_all_covered_entries() {
+        let (_tmp, mgr) = manager().await;
+        let id = AgentId::from("a-overlay-merge");
+        for text in ["A", "B", "C"] {
+            mgr.services
+                .enqueue_message(&id, text.to_string(), None, None, None, None, false);
+        }
+        let (_, mut guard) = mgr.services.dequeue_message_draining(&id).expect("A pops");
+        let (batch, extra) = mgr
+            .services
+            .dequeue_ready_batch_draining(&id, false, 1)
+            .expect("B and C pop");
+        assert_eq!(batch.len(), 2);
+        guard.merge(extra);
+        assert_eq!(
+            mgr.services.queue_snapshot(&id).len(),
+            3,
+            "all three listed"
+        );
+        drop(guard);
+        assert!(mgr.services.queue_snapshot(&id).is_empty(), "no ghosts");
+    }
+
+    /// Real drain arm, settled path: A is parked between dequeue and its row
+    /// persist (hidden transcript table, one 2s-backoff retry). Unrelated
+    /// enqueue / edit / enqueue / remove run in that window — each publishes
+    /// its own `agent:queue:updated`, every one of which still lists A at the
+    /// head. The first snapshot WITHOUT A is published only after A's user-row
+    /// `agent:message` echo.
+    #[tokio::test]
+    async fn unrelated_mutations_mid_drain_never_publish_a_snapshot_without_the_entry() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_PERSIST_RETRY_BACKOFF_MS", "2000"),
+        ]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-drain-barrier"),
+            AgentId::from("a-drain-barrier"),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set mock provider");
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let (a, _) =
+            mgr.services
+                .enqueue_message(&id, "entry A".to_string(), None, None, None, None, false);
+        sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("hide agent_message table");
+        let drain = tokio::spawn(mgr.clone().try_drain_queue(id.clone(), ws.clone()));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // A is dequeued and its first persist attempt has failed; the arm is
+        // suspended in the retry backoff. Mutate the queue around it.
+        let (b, _) =
+            mgr.services
+                .enqueue_message(&id, "entry B".to_string(), None, None, None, None, false);
+        publish_mutation(&mgr, &ws, &id).await;
+        mgr.services
+            .agent_edit_queued_message_op(id.clone(), b.id.clone(), "entry B edited".into(), None)
+            .await
+            .expect("edit B");
+        publish_mutation(&mgr, &ws, &id).await;
+        let (c, _) =
+            mgr.services
+                .enqueue_message(&id, "entry C".to_string(), None, None, None, None, false);
+        publish_mutation(&mgr, &ws, &id).await;
+        mgr.services
+            .agent_remove_queued_message_op(id.clone(), c.id.clone())
+            .await
+            .expect("remove C");
+        publish_mutation(&mgr, &ws, &id).await;
+        assert_eq!(
+            ids(&mgr.services.queue_snapshot(&id)),
+            vec![a.id.clone(), b.id.clone()],
+            "the getQueue view lists the in-flight entry at the head"
+        );
+
+        sqlx::query("ALTER TABLE agent_message_broken RENAME TO agent_message")
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("restore agent_message table");
+        drain.await.expect("drain task");
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::RuntimeIdle
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && mgr.services.queue_snapshot(&id).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both entries drain and the agent goes idle");
+
+        let events = drain_bus(&mut sub).await;
+        let row_idx = events
+            .iter()
+            .position(|e| e.event_type == AGENT_MESSAGE && e.data["queuedMessageId"] == json!(a.id))
+            .expect("A's user-row echo carries the identity link");
+        let before: Vec<&intent_core::Event> = events[..row_idx]
+            .iter()
+            .filter(|e| e.event_type == AGENT_QUEUE_UPDATED)
+            .collect();
+        assert!(
+            before.len() >= 4,
+            "enqueue B / edit B / enqueue C / remove C each published mid-drain: {}",
+            before.len()
+        );
+        for e in &before {
+            assert_eq!(
+                e.data["queue"][0]["id"],
+                json!(a.id),
+                "a mid-drain snapshot lists the draining entry at the head: {}",
+                e.data
+            );
+        }
+        let first_without_a = events
+            .iter()
+            .position(|e| e.event_type == AGENT_QUEUE_UPDATED && !lists(&e.data["queue"], &a.id))
+            .expect("the settled snapshot without A");
+        assert!(
+            first_without_a > row_idx,
+            "the first snapshot without A ({first_without_a}) follows its row echo ({row_idx})"
+        );
+        assert_eq!(
+            events[first_without_a].data["queue"][0]["content"],
+            json!("entry B edited"),
+            "the settled snapshot carries the unrelated edit, nothing lost"
+        );
+    }
+
+    /// Real drain arm, rollback path: the persist exhausts its retry while B
+    /// was enqueued mid-drain. No snapshot ever omits A (by id before the
+    /// rollback, by `turnId` after — the requeue mints a new id), the restored
+    /// queue is [A' (requeuedAfterFailure), B], and no ghost copy of the
+    /// original id survives the arm.
+    #[tokio::test]
+    async fn failed_drain_persist_rolls_back_without_flashing_or_ghosting() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_PERSIST_RETRY_BACKOFF_MS", "1500"),
+        ]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-drain-rollback"),
+            AgentId::from("a-drain-rollback"),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set mock provider");
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let (a, _) =
+            mgr.services
+                .enqueue_message(&id, "entry A".to_string(), None, None, None, None, false);
+        sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("hide agent_message table");
+        let drain = tokio::spawn(mgr.clone().try_drain_queue(id.clone(), ws.clone()));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let (b, _) =
+            mgr.services
+                .enqueue_message(&id, "entry B".to_string(), None, None, None, None, false);
+        publish_mutation(&mgr, &ws, &id).await;
+        assert_eq!(
+            ids(&mgr.services.queue_snapshot(&id)),
+            vec![a.id.clone(), b.id.clone()]
+        );
+
+        drain.await.expect("drain task");
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let status = mgr
+                    .services
+                    .store
+                    .get_agent_session_status(&id)
+                    .await
+                    .unwrap();
+                if status == AgentStatus::Error
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("drain parks the session in error");
+        sqlx::query("ALTER TABLE agent_message_broken RENAME TO agent_message")
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("restore agent_message table");
+
+        let snap = mgr.services.queue_snapshot(&id);
+        assert_eq!(snap.len(), 2, "restored queue, no ghost: {snap:?}");
+        assert_eq!(snap[0]["turnId"], json!(a.turn_id));
+        assert_eq!(snap[0]["requeuedAfterFailure"], json!(true));
+        assert_ne!(snap[0]["id"], json!(a.id), "the requeue minted a new id");
+        assert_eq!(snap[1]["id"], json!(b.id));
+
+        let events = drain_bus(&mut sub).await;
+        let queue_events: Vec<&intent_core::Event> = events
+            .iter()
+            .filter(|e| e.event_type == AGENT_QUEUE_UPDATED)
+            .collect();
+        assert!(
+            queue_events.len() >= 2,
+            "the mid-drain enqueue and the rollback each published: {}",
+            queue_events.len()
+        );
+        for e in &queue_events {
+            let queue = e.data["queue"].as_array().expect("queue array");
+            assert!(
+                queue
+                    .iter()
+                    .any(|m| m["id"] == json!(a.id) || m["turnId"] == json!(a.turn_id)),
+                "no snapshot ever omits the draining entry: {}",
+                e.data
+            );
+        }
     }
 }
 
