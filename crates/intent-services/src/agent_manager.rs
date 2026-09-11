@@ -6517,7 +6517,7 @@ impl AgentManager {
         self.stop(&agent_id).await;
         if self.services.clear_queue(&agent_id) {
             self.services
-                .publish_queue_updated_for(&agent_id, &workspace_id, Vec::new())
+                .publish_queue_updated_for(&agent_id, &workspace_id)
                 .await;
         }
         // Until the truncation actually lands, a failure must DISARM the
@@ -10297,11 +10297,7 @@ async fn prepare_flush_turn(
         // The handler's queue publish preceded the head requeue: re-publish
         // so clients see the fully-restored queue.
         mgr.services
-            .publish_queue_updated_for(
-                agent_id,
-                workspace_id,
-                mgr.services.queue_snapshot(agent_id),
-            )
+            .publish_queue_updated_for(agent_id, workspace_id)
             .await;
         return FlushPrep::Parked;
     }
@@ -11047,11 +11043,7 @@ async fn publish_error_status_and_requeue(
 
     // Publish queue updated so FE reflects the requeued message
     mgr.services
-        .publish_queue_updated_for(
-            agent_id,
-            workspace_id,
-            mgr.services.queue_snapshot(agent_id),
-        )
+        .publish_queue_updated_for(agent_id, workspace_id)
         .await;
 
     // A top-level agent parked in Error drives the `failed` displayStatus

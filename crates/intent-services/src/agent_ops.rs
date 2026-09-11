@@ -14004,19 +14004,16 @@ impl Services {
     /// is wired, the call is a quiet no-op rather than an error: the durable
     /// mutation is the source of truth and a missing event is not fatal.
     ///
-    /// The queue snapshot is taken **outside** the mutex it lives behind, but
-    /// since this method only reads (under a brief lock that is dropped before
-    /// the await) it never holds the queue lock across an `await` point. The
-    /// snapshot is taken after the session lookup so the event payload and the
-    /// write-through snapshot in [`publish_queue_updated_for`] reflect queue
-    /// state from (nearly) the same moment.
+    /// The snapshot itself is read by [`Services::publish_queue_event`] right
+    /// before the bus write, never here: capturing it ahead of the session
+    /// lookup / write-through awaits would let this publisher emit a queue
+    /// older than a mutation that completed while it was suspended.
     pub(crate) async fn publish_queue_updated(&self, agent_id: &AgentId) {
         let workspace_id = match self.store.get_agent_session(agent_id).await {
             Ok(s) => s.workspace_id,
             Err(_) => return,
         };
-        let queue = self.queue_snapshot(agent_id);
-        self.publish_queue_updated_for(agent_id, &workspace_id, queue)
+        self.publish_queue_updated_for(agent_id, &workspace_id)
             .await;
     }
 
@@ -14027,16 +14024,17 @@ impl Services {
     /// Every queue mutation flows through here (or through
     /// [`publish_queue_updated`], which delegates here), so this is also the
     /// single write-through choke point: the durable `agent_queue` snapshot is
-    /// refreshed before the event is published.
+    /// refreshed before the event is published. The published snapshot is
+    /// read AFTER the persist await (inside the publish gate), so it is never
+    /// older than the durable state and never older than any mutation that
+    /// landed while the persist was pending.
     pub(crate) async fn publish_queue_updated_for(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-        queue: Vec<Value>,
     ) {
         self.persist_queue_snapshot(agent_id).await;
-        self.publish_queue_event(agent_id, workspace_id, queue)
-            .await;
+        self.publish_queue_event(agent_id, workspace_id).await;
     }
 
     /// Drain-delivery half of [`Services::publish_queue_updated_for`] (§6.5
@@ -14052,28 +14050,37 @@ impl Services {
     /// [`DrainingGuard`], so an unrelated concurrent mutation's own
     /// `agent:queue:updated` (enqueue / edit / remove of another entry) shows
     /// it too; callers drop the guard right before this call, and the
-    /// snapshot re-read here is the first one without the entry.
+    /// snapshot read here is the first one without the entry.
     pub(crate) async fn publish_queue_updated_after_drain_persist(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) {
-        self.publish_queue_event(agent_id, workspace_id, self.queue_snapshot(agent_id))
-            .await;
+        self.publish_queue_event(agent_id, workspace_id).await;
     }
 
-    /// Publish `agent:queue:updated` WITHOUT the write-through persist — for
-    /// callers whose durable snapshot was already committed:
-    /// [`Services::migrate_queue_and_gc_poisoned_session`] (atomic store op)
-    /// and [`Services::publish_queue_updated_after_drain_persist`] (persisted
-    /// at dequeue time). Everything else goes through
-    /// [`Services::publish_queue_updated_for`].
-    async fn publish_queue_event(
-        &self,
-        agent_id: &AgentId,
-        workspace_id: &WorkspaceId,
-        queue: Vec<Value>,
-    ) {
+    /// The single `agent:queue:updated` publish choke point — every publisher
+    /// ends here. Publishes WITHOUT the write-through persist, for callers
+    /// whose durable snapshot was already committed:
+    /// [`Services::publish_queue_updated_for`] (persisted just before),
+    /// [`Services::publish_queue_updated_after_drain_persist`] (persisted at
+    /// dequeue time) and [`Services::migrate_queue_and_gc_poisoned_session`]
+    /// (atomic store op).
+    ///
+    /// Snapshot acquisition and the bus write happen together under
+    /// `agent_queue_publish_gate`: the queue is read
+    /// ([`Services::queue_snapshot`], draining overlay included) immediately
+    /// before the event is written, and no other publisher can interleave
+    /// between the two. Callers therefore never hand in a queue they captured
+    /// earlier — a `Vec` captured before an await could be older than a
+    /// mutation that completed in the meantime (a pre-enqueue snapshot
+    /// omitting an entry that is now draining, or an overlay snapshot
+    /// arriving after the settled shrink and resurrecting a drained entry).
+    /// Publication order thus equals snapshot order, so the stream of
+    /// `agent:queue:updated` payloads is monotone in queue mutation order.
+    async fn publish_queue_event(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) {
+        let _gate = self.agent_queue_publish_gate.lock().await;
+        let queue = self.queue_snapshot(agent_id);
         let event = intent_store::NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: now_iso(),
@@ -14310,9 +14317,7 @@ impl Services {
                     );
                 }
             }
-            let queue = self.queue_snapshot(target_id);
-            self.publish_queue_event(target_id, workspace_id, queue)
-                .await;
+            self.publish_queue_event(target_id, workspace_id).await;
         }
         self.agent_delete_op(poisoned_id.clone(), Some(workspace_id.clone()))
             .await?;

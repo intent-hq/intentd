@@ -15698,9 +15698,95 @@ mod draining_overlay_tests {
     /// hidden transcript table that parks the drain also blinds the
     /// session-lookup variant the ops use (the session read joins it).
     async fn publish_mutation(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
-        mgr.services
-            .publish_queue_updated_for(id, ws, mgr.services.queue_snapshot(id))
-            .await;
+        mgr.services.publish_queue_updated_for(id, ws).await;
+    }
+
+    /// Block until the drain arm has actually popped `message_id` out of the
+    /// live queue into the draining overlay — i.e. it is parked between
+    /// dequeue and its user-row persist. Synchronizing on the registry rather
+    /// than a fixed sleep matters: if the arm has not reached its dequeue yet
+    /// when the test enqueues a second entry, the batch-flush path pops BOTH
+    /// entries into one combined turn and the test's edit of the second entry
+    /// fails with "Queued message not found".
+    async fn wait_until_draining(mgr: &AgentManager, id: &AgentId, message_id: &str) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let parked = mgr
+                    .services
+                    .draining_queue_entries
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .is_some_and(|d| d.iter().any(|m| m.id == message_id));
+                if parked {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the drain arm pops the entry into the draining overlay");
+    }
+
+    /// Stale-snapshot regression (intent-hq/intentd#1783 re-review): a
+    /// publisher that captured its queue BEFORE suspending on the
+    /// write-through persist must not emit that pre-enqueue snapshot after
+    /// resuming. Interleaving: P starts publishing against [B] and parks on
+    /// the persist gate (held by the test); A is then enqueued and popped
+    /// into the draining overlay (row persist pending, guard alive); the gate
+    /// is released and P completes. P's `agent:queue:updated` must list A —
+    /// the snapshot is read at publish time, inside the publish gate, not at
+    /// call time.
+    #[tokio::test]
+    async fn publisher_suspended_across_persist_never_emits_a_pre_enqueue_snapshot() {
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-stale-publish"),
+            AgentId::from("a-stale-publish"),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let (b, _) =
+            mgr.services
+                .enqueue_message(&id, "entry B".to_string(), None, None, None, None, false);
+
+        let persist_gate = mgr.services.agent_queue_persist_gate.clone();
+        let held = persist_gate.lock().await;
+        let publisher = tokio::spawn({
+            let (mgr, ws, id) = (mgr.clone(), ws.clone(), id.clone());
+            async move { mgr.services.publish_queue_updated_for(&id, &ws).await }
+        });
+        // Let P run up to the persist gate and park there (current-thread
+        // runtime: the spawned task only progresses while this task yields).
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!publisher.is_finished(), "P is parked on the persist gate");
+
+        let (a, _) =
+            mgr.services
+                .enqueue_message(&id, "entry A".to_string(), None, None, None, None, false);
+        let (_, guard) = mgr
+            .services
+            .take_queued_message_draining(&id, &a.id)
+            .expect("A pops into the draining overlay");
+        drop(held);
+        publisher.await.expect("publisher task");
+
+        let events = drain_bus(&mut sub).await;
+        let queue_events: Vec<&intent_core::Event> = events
+            .iter()
+            .filter(|e| e.event_type == AGENT_QUEUE_UPDATED)
+            .collect();
+        assert_eq!(queue_events.len(), 1, "exactly P's publish: {events:?}");
+        let queue = &queue_events[0].data["queue"];
+        assert!(
+            lists(queue, &a.id) && lists(queue, &b.id),
+            "P's snapshot is read at publish time: it lists the entry that \
+             was enqueued and started draining while P was suspended: {queue}"
+        );
+        drop(guard);
     }
 
     /// Overlay semantics in isolation: the popped entry heads the snapshot
@@ -15842,10 +15928,10 @@ mod draining_overlay_tests {
             .await
             .expect("hide agent_message table");
         let drain = tokio::spawn(mgr.clone().try_drain_queue(id.clone(), ws.clone()));
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        wait_until_draining(&mgr, &id, &a.id).await;
 
-        // A is dequeued and its first persist attempt has failed; the arm is
-        // suspended in the retry backoff. Mutate the queue around it.
+        // A is dequeued; its persist attempt fails against the hidden table
+        // and the arm suspends in the retry backoff. Mutate the queue around it.
         let (b, _) =
             mgr.services
                 .enqueue_message(&id, "entry B".to_string(), None, None, None, None, false);
@@ -15964,7 +16050,7 @@ mod draining_overlay_tests {
             .await
             .expect("hide agent_message table");
         let drain = tokio::spawn(mgr.clone().try_drain_queue(id.clone(), ws.clone()));
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        wait_until_draining(&mgr, &id, &a.id).await;
 
         let (b, _) =
             mgr.services

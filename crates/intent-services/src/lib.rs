@@ -376,6 +376,14 @@ pub struct Services {
     /// the `agent_queue` table always reflects the newest in-memory state — an
     /// older snapshot can never overwrite a newer one out of mutation order.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes every `agent:queue:updated` publish
+    /// ([`agent_ops::Services::publish_queue_event`]): the snapshot is read
+    /// *inside* this async lock, immediately before the bus write, so a
+    /// publisher that paused (on the persist gate, on a store await) can
+    /// never emit a snapshot older than a mutation that completed before it
+    /// published — no pre-enqueue snapshot omitting a newer draining entry,
+    /// no old overlay copy arriving after the settled shrink.
+    agent_queue_publish_gate: Arc<tokio::sync::Mutex<()>>,
     /// Serializes `workspace.setBrowserClient` write + `workspace:updated`
     /// publish so concurrent setters never emit deltas out of order relative
     /// to the durable pin; the delta is read back from the committed row.
@@ -1132,6 +1140,7 @@ impl Services {
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_tab_gate: Arc::new(tokio::sync::Mutex::new(())),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
