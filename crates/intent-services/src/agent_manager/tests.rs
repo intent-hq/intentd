@@ -5545,9 +5545,13 @@ async fn context_size_requeue_replaces_oversized_entry_with_marker() {
     assert_eq!(wire["turnId"], json!("turn-413"));
 }
 
-/// A context-size failure on a SMALL entry (at/under the threshold) is the
+/// A context-size failure on an entry AT or UNDER the threshold is the
 /// accumulated context's problem, not the message's: the entry re-queues
-/// unchanged with `persisted` as given (existing behaviour).
+/// unchanged with `persisted` as given (existing behaviour). Covers a small
+/// ask, a payload of exactly `CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS` chars
+/// (the boundary is strictly greater-than), and a multibyte payload whose
+/// BYTE length exceeds the threshold while its char count does not (the
+/// threshold counts chars).
 #[tokio::test]
 async fn context_size_requeue_keeps_small_entry_unchanged() {
     let (_tmp, mgr) = manager().await;
@@ -5557,29 +5561,48 @@ async fn context_size_requeue_keeps_small_entry_unchanged() {
     );
     seed_agent(&mgr, &ws, &id).await;
 
-    let options = super::TurnOptions {
-        turn_id: Some("turn-413-small".to_string()),
-        ..super::TurnOptions::default()
-    };
-    super::persist_error_and_requeue(
-        &mgr,
-        &id,
-        &ws,
-        "small ask",
-        &options,
-        true,
-        context_size_error_text(),
-    )
-    .await;
+    let threshold = super::CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS;
+    let exact = "x".repeat(threshold);
+    assert_eq!(exact.chars().count(), threshold);
+    let multibyte = "é".repeat(threshold);
+    assert_eq!(multibyte.chars().count(), threshold);
+    assert!(
+        multibyte.len() > threshold,
+        "byte length exceeds the threshold"
+    );
 
-    let queued = mgr
-        .services
-        .dequeue_message(&id)
-        .expect("failed message requeued");
-    assert_eq!(queued.content, "small ask");
-    assert!(queued.persisted, "already-persisted row is not re-appended");
-    assert!(queued.requeued_after_failure);
-    assert_eq!(queued.turn_id, "turn-413-small");
+    for (turn, content) in [
+        ("turn-413-small", "small ask"),
+        ("turn-413-exact", exact.as_str()),
+        ("turn-413-multibyte", multibyte.as_str()),
+    ] {
+        let options = super::TurnOptions {
+            turn_id: Some(turn.to_string()),
+            ..super::TurnOptions::default()
+        };
+        super::persist_error_and_requeue(
+            &mgr,
+            &id,
+            &ws,
+            content,
+            &options,
+            true,
+            context_size_error_text(),
+        )
+        .await;
+
+        let queued = mgr
+            .services
+            .dequeue_message(&id)
+            .expect("failed message requeued");
+        assert_eq!(queued.content, content, "{turn}: content unchanged");
+        assert!(
+            queued.persisted,
+            "{turn}: already-persisted row is not re-appended"
+        );
+        assert!(queued.requeued_after_failure);
+        assert_eq!(queued.turn_id, turn);
+    }
 }
 
 /// An oversized entry whose turn failed for a NON-context-size reason
@@ -5607,9 +5630,11 @@ async fn non_context_size_failure_keeps_oversized_entry_unchanged() {
     assert!(queued.requeued_after_failure);
 }
 
-/// End-to-end (intent-hq/intent#4703): after a 413 on an oversized entry,
-/// `agent.retry` sends the MARKER to the provider — the marker lands as the
-/// retry turn's user row exactly once and the original payload is never
+/// End-to-end (intent-hq/intent#4703): after a 413 on an oversized entry
+/// whose user row was ALREADY persisted by the failed turn, `agent.retry`
+/// sends the MARKER to the provider — the marker lands as the retry turn's
+/// user row exactly once, the original row stays in the transcript exactly
+/// once (neither duplicated nor removed), and the original payload is never
 /// re-sent.
 #[tokio::test]
 async fn context_size_requeue_retry_sends_marker_to_provider() {
@@ -5642,6 +5667,18 @@ async fn context_size_requeue_retry_sends_marker_to_provider() {
     set_session_provider(&mgr, &ws, &id, "mock").await;
 
     let payload = oversized_payload();
+    // The failed turn already persisted the oversized user row (that is what
+    // `persisted = true` on the requeue asserts).
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": payload }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
     let options = super::TurnOptions {
         turn_id: Some("turn-413-retry".to_string()),
         ..super::TurnOptions::default()
@@ -5697,12 +5734,19 @@ async fn context_size_requeue_retry_sends_marker_to_provider() {
         marker_rows, 1,
         "the marker lands in the transcript exactly once: {messages:?}"
     );
-    assert!(
-        !messages.iter().any(|m| m.role == "user"
-            && serde_json::to_string(&m.content)
-                .unwrap()
-                .contains("OVERSIZED-PAYLOAD-TOKEN")),
-        "the original payload is never re-appended: {messages:?}"
+    let original_rows = messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && serde_json::to_string(&m.content)
+                    .unwrap()
+                    .contains("OVERSIZED-PAYLOAD-TOKEN")
+        })
+        .count();
+    assert_eq!(
+        original_rows, 1,
+        "the already-persisted original row stays exactly once (never re-appended, never \
+         removed): {messages:?}"
     );
     let assistant = messages
         .iter()

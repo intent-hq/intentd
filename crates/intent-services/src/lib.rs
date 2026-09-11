@@ -12910,16 +12910,28 @@ pub(crate) fn is_deterministic_prompt_rejection(stop_reason: &str) -> bool {
 /// context) exceeded what the model accepts — the HTTP 413 shape
 /// (`HTTP error: 413 Request Entity Too Large: … "Conversation context too
 /// large for model"`). Substring-anchored like its neighbours and
-/// deliberately narrow: it requires the `413` status together with one of
-/// the load-bearing phrases (`request entity too large`, `too large for
-/// model`, `context too large`), so plain 4xx/5xx errors and other texts do
-/// not classify. This is a MESSAGE problem, not a session problem — it is
-/// intentionally NOT part of [`is_session_fatal_error`] and never poisons a
-/// session on its own; `publish_error_status_and_requeue` uses it to swap an
-/// oversized queued payload for a short recovery marker.
+/// deliberately narrow: it requires the `413` status in an HTTP-status form
+/// (`HTTP error: 413`, `HTTP 413`, `status 413`, `"httpStatus":413`, or
+/// `413 Request Entity Too Large` / `413 Payload Too Large`) together with
+/// one of the load-bearing phrases (`request entity too large`, `too large
+/// for model`, `context too large`). A bare `413` inside a request id or
+/// other number never anchors, so a 400/500 whose payload happens to carry
+/// `413` and a size phrase does not classify — misclassifying would swap a
+/// queued payload for the marker destructively. This is a MESSAGE problem,
+/// not a session problem — it is intentionally NOT part of
+/// [`is_session_fatal_error`] and never poisons a session on its own;
+/// `publish_error_status_and_requeue` uses it to swap an oversized queued
+/// payload for a short recovery marker.
 pub(crate) fn is_context_size_error(error_text: &str) -> bool {
     let lower = error_text.to_ascii_lowercase();
-    lower.contains("413")
+    let status_413 = lower.contains("http error: 413")
+        || lower.contains("http 413")
+        || lower.contains("status 413")
+        || lower.contains("status: 413")
+        || lower.contains("\"httpstatus\":413")
+        || lower.contains("413 request entity too large")
+        || lower.contains("413 payload too large");
+    status_413
         && (lower.contains("request entity too large")
             || lower.contains("too large for model")
             || lower.contains("context too large"))

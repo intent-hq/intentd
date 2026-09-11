@@ -29417,9 +29417,11 @@ fn issue_4703_error() -> String {
 }
 
 /// intent-hq/intent#4703 classifier: the HTTP 413 context-size rejection
-/// classifies (with either provider phrasing); `400 Bad Request`, `500`,
-/// safety blocks, and a bare `413` without the phrase stay unclassified. A
-/// 413 is a message problem, not a session problem: it is NOT session-fatal.
+/// classifies (with either provider phrasing and any of the HTTP-status
+/// anchors); `400 Bad Request`, `500`, safety blocks, a 413 status without
+/// the phrase, and a size phrase paired with a `413` that only appears
+/// inside a request id / other number stay unclassified. A 413 is a message
+/// problem, not a session problem: it is NOT session-fatal.
 #[test]
 fn context_size_error_classifier() {
     use crate::{is_context_size_error, is_session_fatal_error};
@@ -29431,7 +29433,10 @@ fn context_size_error_classifier() {
         "HTTP 413: Conversation Context Too Large for the request"
     ));
     assert!(is_context_size_error(
-        "provider returned 413 (prompt too large for model)"
+        "provider returned status 413 (prompt too large for model)"
+    ));
+    assert!(is_context_size_error(
+        "{\"httpStatus\":413,\"message\":\"context too large\"}"
     ));
     // Plain 4xx/5xx and safety blocks do not classify.
     assert!(!is_context_size_error(&issue_940_error(
@@ -29444,9 +29449,30 @@ fn context_size_error_classifier() {
     assert!(!is_context_size_error(
         "The model provider blocked this response for safety reasons. Please start a new session"
     ));
-    // The status alone (e.g. a request id containing 413) is not enough.
+    // A 413 status WITHOUT a size phrase (e.g. a request id containing 413
+    // on a 429) is not enough.
     assert!(!is_context_size_error(
         "session/prompt failed: HTTP error: 429 Too Many Requests {\"requestId\":\"413abc\"}"
+    ));
+    assert!(!is_context_size_error(
+        "session/prompt failed: HTTP error: 413 Payload Too Large"
+    ));
+    // A size phrase paired with a `413` that only appears inside an id or
+    // another number on a NON-413 status must not classify: the swap is
+    // destructive, so an incidental digit run never anchors it.
+    assert!(!is_context_size_error(
+        "HTTP error: 500 Internal Server Error: {\"requestId\":\"413abc\",\
+         \"message\":\"context too large for model\"}"
+    ));
+    assert!(!is_context_size_error(
+        "HTTP error: 400 Bad Request: {\"requestId\":\"req-413\",\
+         \"message\":\"context too large\"}"
+    ));
+    assert!(!is_context_size_error(
+        "HTTP error: 400 Bad Request: 84130 tokens is too large for model"
+    ));
+    assert!(!is_context_size_error(
+        "session/prompt failed after 413ms: context too large"
     ));
     assert!(!is_context_size_error("payload too large for model"));
     assert!(!is_context_size_error(""));
