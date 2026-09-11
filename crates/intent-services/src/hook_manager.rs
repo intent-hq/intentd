@@ -108,8 +108,10 @@ const HOOK_STATE_MAX_BYTES: usize = 16 * 1024;
 
 /// Cap (in chars) on the `message` a dispatching run returns and on the error
 /// text an eviction wake carries. Longer text is head-kept and tail-marked
-/// before framing, so a hook cannot queue a wake larger than the owner's
-/// model can accept.
+/// before framing, so the hook-supplied part of a wake stays bounded. The
+/// framing, marker, first-turn prelude, and the owner's existing provider
+/// context are additional to this cap, so an owner low on context room can
+/// still hit a 413 — the requeue-marker path handles that case.
 const HOOK_DISPATCH_MESSAGE_MAX_CHARS: usize = 32 * 1024;
 
 /// Caps on the per-run `ws.host.exec` failure capture (monorepo#3231): at
