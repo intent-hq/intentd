@@ -4542,14 +4542,17 @@ mod tests {
     /// forge is down the marked set still rotates through the cap oldest
     /// first, a failed attempt rejoins the normal cadence instead of staying
     /// perpetually due, and the marker itself survives until a successful
-    /// poll consumes it.
+    /// poll consumes it — so the changed-state catch-up wake is still
+    /// delivered (undebounced) once the forge answers again.
     #[tokio::test]
     async fn catch_up_rotation_rate_limits_failed_attempts() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
+        // A window that would suppress the wake if debounce still applied.
         let svc = svc
             .with_pr_monitors_max_per_agent(20)
             .with_pr_monitor_poll_seconds(30)
-            .with_pr_monitor_hourly_request_budget(1500);
+            .with_pr_monitor_hourly_request_budget(1500)
+            .with_pr_monitor_debounce_seconds(3600);
         let mut ids = Vec::new();
         for pr in 1..=10_u64 {
             let (m, _) = svc
@@ -4565,7 +4568,12 @@ mod tests {
             ids.push(m.monitor_id);
         }
         forge.take_fetched_numbers();
-        forge.edit(|s| s.fail_get_pr = true);
+        // The PRs move while the daemon is "down", then the daemon boots
+        // into a failing forge.
+        forge.edit(|s| {
+            s.approvals.push("reviewer".into());
+            s.fail_get_pr = true;
+        });
         assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 10);
         let marked = || svc.pr_monitor_catch_up.lock().unwrap().len();
         assert_eq!(marked(), 10);
@@ -4591,6 +4599,10 @@ mod tests {
             "failed attempts are rate-limited"
         );
         assert_eq!(marked(), 10, "markers survive failed attempts");
+        assert!(
+            !owner_messages(&svc, &owner).await.contains("[PR monitor"),
+            "no wake while every attempt fails"
+        );
 
         // Forge back: the next due tick delivers and consumes the markers
         // of the PRs it reached.
@@ -4601,6 +4613,19 @@ mod tests {
         svc.poll_due_pr_monitors().await;
         assert_eq!(forge.take_fetched_numbers(), vec![10, 9, 8, 7, 6]);
         assert_eq!(marked(), 5, "successful polls consume their markers");
+        let text = owner_messages(&svc, &owner).await;
+        for pr in 6..=10 {
+            assert!(
+                text.contains(&format!("[PR monitor o/r#{pr}]")),
+                "the surviving marker delivers the changed-state wake undebounced for #{pr}: {text}"
+            );
+        }
+        for pr in 1..=5 {
+            assert!(
+                !text.contains(&format!("[PR monitor o/r#{pr}]")),
+                "PRs not yet reached keep their marker and have not woken: {text}"
+            );
+        }
     }
 
     /// A forge fetch failing with the quota-exhausted error pauses the
@@ -4611,8 +4636,11 @@ mod tests {
     /// the first successful post-pause poll clears the error.
     #[tokio::test]
     async fn a_rate_limited_fetch_pauses_the_gate_and_skips_the_rest_of_the_sweep() {
+        async fn row(svc: &Services, id: &PrMonitorId) -> PrMonitor {
+            svc.store().get_pr_monitor(id).await.unwrap()
+        }
         async fn last_error(svc: &Services, id: &PrMonitorId) -> Option<String> {
-            svc.store().get_pr_monitor(id).await.unwrap().last_error
+            row(svc, id).await.last_error
         }
         let (_db, _root, svc, forge, ws, owner) = setup().await;
         let svc = svc
@@ -4645,14 +4673,18 @@ mod tests {
             svc.sweep_rate_limit.paused_remaining().is_some(),
             "the global gate is paused"
         );
+        let mut paused_rows = Vec::new();
         for id in &ids[..2] {
-            let error = last_error(&svc, id).await;
+            let paused = row(&svc, id).await;
             assert!(
-                error
+                paused
+                    .last_error
                     .as_deref()
                     .is_some_and(|e| e.starts_with("rate limited; PR monitor polling paused for ~")),
-                "both monitors on the rate-limited PR record the pause: {error:?}"
+                "both monitors on the rate-limited PR record the pause: {:?}",
+                paused.last_error
             );
+            paused_rows.push(paused);
         }
         for id in &ids[2..] {
             assert_eq!(
@@ -4663,7 +4695,8 @@ mod tests {
         }
 
         // While paused, sweeps skip the forge entirely — even a due sweep
-        // over backdated rows, and even once the forge would answer again.
+        // over backdated rows, and even once the forge would answer again —
+        // and never rewrite the paused rows (no lastError / timestamp churn).
         svc.poll_due_pr_monitors().await;
         svc.poll_pr_monitors().await;
         forge.edit(|s| s.rate_limit_get_pr = false);
@@ -4672,10 +4705,13 @@ mod tests {
             forge.take_fetched_numbers().is_empty(),
             "no forge calls while the gate is paused"
         );
-        assert!(
-            last_error(&svc, &ids[0]).await.is_some(),
-            "the pause error is recorded once and stays until a poll succeeds"
-        );
+        for (id, paused) in ids[..2].iter().zip(&paused_rows) {
+            assert_eq!(
+                &row(&svc, id).await,
+                paused,
+                "the pause error is recorded once; paused sweeps leave the row untouched"
+            );
+        }
 
         // Pause window over: polling resumes and the first successful poll
         // clears the pause error.
