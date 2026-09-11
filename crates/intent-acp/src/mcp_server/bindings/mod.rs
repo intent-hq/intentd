@@ -12,6 +12,7 @@
 //! without touching the shared bootstrap.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{AgentId, TurnAttachmentRegistry, WorkspaceApi, WorkspaceId};
@@ -133,6 +134,9 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
 /// renders the same gated docs its tool description advertises;
 /// `is_sub_agent` lets the help error path attribute `app.question` pruning
 /// to the top-level-only rule instead of a settings toggle.
+/// `eval_budget` is the caller's effective `workspace_api` wall-clock budget,
+/// so bindings that wait on a process (`ws.script.run`) can refuse a wait the
+/// transport could never honor.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -141,6 +145,7 @@ pub(crate) async fn try_dispatch(
     turn_attachments: Option<&Arc<TurnAttachmentRegistry>>,
     features: &AgentFeaturesSettings,
     is_sub_agent: bool,
+    eval_budget: Duration,
     method: &str,
     args: &Value,
 ) -> Result<Option<Value>, String> {
@@ -213,7 +218,7 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("script.") {
-        return script::dispatch(api, workspace_id, rest, args)
+        return script::dispatch(api, workspace_id, eval_budget, rest, args)
             .await
             .map(Some);
     }

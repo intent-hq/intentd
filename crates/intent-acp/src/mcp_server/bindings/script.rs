@@ -8,11 +8,30 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use intent_core::{ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 use super::{map_err, opt_bool, opt_i64, opt_str, req_str};
+
+/// Seconds held back from the `workspace_api` eval budget so `script.run`
+/// can return its `timedOut` envelope before the transport aborts the call.
+const RUN_TIMEOUT_MARGIN_SECS: u64 = 2;
+
+/// The largest `timeoutSeconds` one `ws.script.run` call can honor under
+/// `budget`: `floor(budget) - 2`, never below 1 (28s on the default 30s
+/// budget). `script_run` kills the process when its timeout elapses, so a
+/// wait longer than the eval budget would be aborted by the transport while
+/// the process keeps running — the binding rejects such requests up front
+/// instead of clamping them (monorepo#4703).
+fn run_timeout_ceiling_secs(budget: Duration) -> i64 {
+    let ceiling = budget
+        .as_secs()
+        .saturating_sub(RUN_TIMEOUT_MARGIN_SECS)
+        .max(1);
+    i64::try_from(ceiling).unwrap_or(i64::MAX)
+}
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
@@ -32,9 +51,12 @@ pub(crate) const PRELUDE: &str = r"
     };
 ";
 
+/// `budget` is the caller's effective `workspace_api` eval budget; `run`
+/// derives its `timeoutSeconds` ceiling from it.
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    budget: Duration,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
@@ -47,7 +69,7 @@ pub(crate) async fn dispatch(
         "restart" => restart(api, ws, args).await,
         "output" => output(api, ws, args).await,
         "status" => status(api, ws, args).await,
-        "run" => run(api, ws, args).await,
+        "run" => run(api, ws, budget, args).await,
         other => Err(format!("host: unknown method `script.{other}`")),
     }
 }
@@ -186,11 +208,32 @@ async fn status(
         .map_err(map_err)
 }
 
-async fn run(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, args: &Value) -> Result<Value, String> {
+async fn run(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    budget: Duration,
+    args: &Value,
+) -> Result<Value, String> {
     let script_id = req_str(args, "scriptId").map_err(|_| "scriptId is required".to_string())?;
     let max_lines = opt_i64(args, "maxLines");
-    // `timeoutSeconds` with the `timeout` alias (reference parity).
-    let timeout_seconds = opt_i64(args, "timeoutSeconds").or_else(|| opt_i64(args, "timeout"));
+    let ceiling = run_timeout_ceiling_secs(budget);
+    // `timeoutSeconds` with the `timeout` alias (reference parity). An
+    // omitted timeout defaults to the ceiling rather than the service-layer
+    // 30s so the `timedOut` envelope is always reachable within the budget.
+    let timeout_seconds = match opt_i64(args, "timeoutSeconds").or_else(|| opt_i64(args, "timeout"))
+    {
+        Some(requested) if requested > ceiling => {
+            return Err(format!(
+                "ws.script.run: timeoutSeconds {requested} exceeds what one workspace_api call \
+                 can wait for (ceiling {ceiling}s, budget {}s). Start the script with \
+                 ws.script.start(scriptId) and wait with a self-checking ws.hook.schedule that \
+                 polls ws.script.status(scriptId), then read ws.script.output(scriptId).",
+                budget.as_secs()
+            ));
+        }
+        Some(requested) => Some(requested),
+        None => Some(ceiling),
+    };
     api.script_run(ws.clone(), script_id, max_lines, timeout_seconds)
         .await
         .map_err(map_err)
@@ -204,5 +247,19 @@ fn type_name(v: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_timeout_ceiling_is_budget_minus_margin_floored_at_one() {
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(30)), 28);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_millis(30_900)), 28);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(120)), 118);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(3)), 1);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_millis(250)), 1);
     }
 }
