@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Error, Note, NoteAddInput,
-    NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata, NoteUpdateInput,
-    NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus, WorkspaceUpdate,
+    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Error, MessageOrigin, Note,
+    NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata,
+    NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use intent_store::Store;
 
@@ -33975,7 +33975,7 @@ mod last_activity_events {
             .await
             .expect("insert session");
 
-        let (auto_entry, _) = h.services.enqueue_message_with_origin(
+        let (auto_entry, _) = h.services.enqueue_message(
             &agent_id,
             "wake".into(),
             None,
@@ -33983,7 +33983,7 @@ mod last_activity_events {
             None,
             None,
             false,
-            false,
+            MessageOrigin::Automatic,
         );
         h.services
             .agent_send_queued_message_now_op(agent_id.clone(), auto_entry.id)
@@ -33994,7 +33994,7 @@ mod last_activity_events {
             "automatic-origin force-send must not schedule lastActivity"
         );
 
-        let (user_entry, _) = h.services.enqueue_message_with_origin(
+        let (user_entry, _) = h.services.enqueue_message(
             &agent_id,
             "human".into(),
             None,
@@ -34002,7 +34002,7 @@ mod last_activity_events {
             None,
             None,
             false,
-            true,
+            MessageOrigin::User,
         );
         h.services
             .agent_send_queued_message_now_op(agent_id, user_entry.id)

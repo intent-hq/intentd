@@ -5663,7 +5663,7 @@ impl AgentManager {
                 stop_reason = session.stop_reason.as_deref().unwrap_or(""),
                 "session is quarantined (poisoned); parking message in queue instead of driving a turn"
             );
-            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
+            let (queued, position) = self.services.enqueue_message_with_id(
                 &agent_id,
                 Some(message_id.clone()),
                 content,
@@ -5672,7 +5672,7 @@ impl AgentManager {
                 options.message_metadata.clone(),
                 options.queued_prepend(),
                 options.interrupt_priority,
-                options.origin.is_user(),
+                options.origin,
             );
             let result = json!({
                 "success": true,
@@ -5715,7 +5715,7 @@ impl AgentManager {
         if !options.origin.is_user() && !workspace_id.is_chief() {
             match self.services.store.get_workspace(&workspace_id).await {
                 Ok(ws) if ws.archived => {
-                    let (queued, position) = self.services.enqueue_message_with_id_and_origin(
+                    let (queued, position) = self.services.enqueue_message_with_id(
                         &agent_id,
                         Some(message_id.clone()),
                         content,
@@ -5724,7 +5724,7 @@ impl AgentManager {
                         options.message_metadata.clone(),
                         options.queued_prepend(),
                         options.interrupt_priority,
-                        false,
+                        options.origin,
                     );
                     let result = json!({
                         "success": true,
@@ -5792,7 +5792,7 @@ impl AgentManager {
                 Ok(ws) if ws.archived
             )
         {
-            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
+            let (queued, position) = self.services.enqueue_message_with_id(
                 &agent_id,
                 Some(message_id.clone()),
                 content,
@@ -5801,7 +5801,7 @@ impl AgentManager {
                 options.message_metadata.clone(),
                 options.queued_prepend(),
                 options.interrupt_priority,
-                true,
+                options.origin,
             );
             let result = json!({
                 "success": true,
@@ -5816,7 +5816,7 @@ impl AgentManager {
             return Ok(result);
         }
         if !self.try_begin(&agent_id, &workspace_id).await {
-            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
+            let (queued, position) = self.services.enqueue_message_with_id(
                 &agent_id,
                 Some(message_id.clone()),
                 content,
@@ -5825,7 +5825,7 @@ impl AgentManager {
                 options.message_metadata.clone(),
                 options.queued_prepend(),
                 options.interrupt_priority,
-                options.origin.is_user(),
+                options.origin,
             );
             let result = json!({
                 "success": true,
@@ -5922,7 +5922,7 @@ impl AgentManager {
                         agent_id.0
                     )));
                 }
-                let (queued, position) = self.services.enqueue_message_with_id_and_origin(
+                let (queued, position) = self.services.enqueue_message_with_id(
                     &agent_id,
                     Some(message_id.clone()),
                     content,
@@ -5931,7 +5931,7 @@ impl AgentManager {
                     options.message_metadata.clone(),
                     options.queued_prepend(),
                     options.interrupt_priority,
-                    options.origin.is_user(),
+                    options.origin,
                 );
                 let result = json!({
                     "success": true,
@@ -12741,8 +12741,16 @@ mod role_reminder_tests {
 
     /// Make the agent's snapshot non-trivial (one pending queued message).
     fn make_snapshot_nontrivial(mgr: &AgentManager, agent_id: &AgentId) {
-        mgr.services
-            .enqueue_message(agent_id, "pending".into(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            agent_id,
+            "pending".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::Automatic,
+        );
     }
 
     /// A trivial snapshot (all counts zero, no attention) never injects:
@@ -13955,8 +13963,16 @@ mod v1_turn_envelope_goldens {
         // and make the snapshot non-trivial (one queued message).
         let mock = intent_providers::find_provider("mock").unwrap();
         mgr.arm_first_turn_prepend(&agent_id, mock);
-        mgr.services
-            .enqueue_message(&agent_id, "pending".into(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &agent_id,
+            "pending".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::Automatic,
+        );
         let options = TurnOptions {
             stdin_context: Some("repo: demo".to_string()),
             ..Default::default()
@@ -15347,6 +15363,7 @@ mod agent_retry_tests {
             None,
             None,
             false,
+            intent_core::MessageOrigin::Automatic,
         );
 
         let result = mgr
@@ -15391,6 +15408,7 @@ mod agent_retry_tests {
                     None,
                     None,
                     false,
+                    intent_core::MessageOrigin::Automatic,
                 );
                 mgr.clone()
                     .try_drain_queue(agent_id.clone(), ws.clone())
