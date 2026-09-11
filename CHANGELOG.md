@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.40] - 2026-09-11
+
+### 🐛 Bug Fixes
+
+- Isolate congested tunnel streams ([#1779](https://github.com/intent-hq/intentd/pull/1779))
+
+
 ## [0.9.39] - 2026-09-11
 
 ### ⚙️ Miscellaneous Tasks
