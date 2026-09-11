@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.42] - 2026-09-11
+
+### 🚀 Features
+
+- *(agent)* Accept messageMetadata on agent.queueMessage ([#1783](https://github.com/intent-hq/intentd/pull/1783))
+
+### 🐛 Bug Fixes
+
+- *(acp)* Derive hook-bridge ws.script.run ceiling from the hook eval budget ([#1791](https://github.com/intent-hq/intentd/pull/1791))
+- *(git)* Detect renames in git.status so a git mv is one R entry ([#1789](https://github.com/intent-hq/intentd/pull/1789))
+
+
 ## [0.9.41] - 2026-09-11
 
 ### 🐛 Bug Fixes
