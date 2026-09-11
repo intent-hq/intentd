@@ -5804,8 +5804,9 @@ async fn flush_then_fail(
     Vec<crate::agent_ops::QueuedMessage>,
     Vec<crate::agent_ops::QueuedMessage>,
 ) {
+    let draining = mgr.services.mark_draining(id, &batch);
     let super::FlushPrep::Turn { content, options } =
-        super::prepare_flush_turn(mgr, id, ws, batch).await
+        super::prepare_flush_turn(mgr, id, ws, batch, draining).await
     else {
         panic!("flush prep starts a turn");
     };
