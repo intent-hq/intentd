@@ -703,3 +703,64 @@ async fn git_status_upstream_fields_over_wss() {
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
+
+/// `git.status` rename detection (monorepo#4594): a staged `git mv` reaches
+/// the wire as one `R` entry under the new path — not a `D` + `A` pair — and
+/// the wire shape is otherwise unchanged (same `files[]` fields, no rename
+/// metadata). Editing the moved file before staging still projects as `R`.
+#[tokio::test]
+async fn git_status_rename_is_single_r_entry_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("root-status-rename");
+    let (daemon, port, cfg) = boot(&root).await;
+    let repo = make_source_repo(&daemon.scratch);
+    let mut ws = connect_ws(port, cfg).await;
+    let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git Read E2E — status rename").await;
+
+    run_git(&["mv", "tracked.txt", "moved.txt"], &wt);
+
+    let resp = wss_rpc(
+        &mut ws,
+        3,
+        "git.status",
+        json!({ "workspaceId": ws_id, "forceRefresh": true }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "status after git mv: {resp}");
+    let result = &resp["result"];
+    assert_eq!(
+        result["files"],
+        json!([{ "path": "moved.txt", "status": "R", "staged": true }]),
+        "{result:?}"
+    );
+    assert_eq!(result["hasUncommittedChanges"], json!(true));
+    assert_eq!(result["hasUntrackedFiles"], json!(false));
+
+    // A content edit staged on top of the rename (still >50% similar) keeps
+    // the `R` projection rather than degrading to `M`.
+    std::fs::write(wt.join("moved.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    run_git(&["add", "moved.txt"], &wt);
+
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "git.status",
+        json!({ "workspaceId": ws_id, "forceRefresh": true }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "status after edited rename: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["files"],
+        json!([{ "path": "moved.txt", "status": "R", "staged": true }]),
+        "{:?}",
+        resp["result"]
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}

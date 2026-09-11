@@ -215,14 +215,25 @@ pub(crate) fn collect_files(repo: &Repository) -> Result<Vec<FileStatus>> {
     collect_files_with(repo, true)
 }
 
+/// The `git.status` file list with rename detection OFF: a rename is its
+/// `D` + `A` pair, so both paths are present. For per-path bookkeeping that
+/// must see the old side too (the pathspec-limited commit set in
+/// [`crate::commit`], attribution restoration after an undone commit)
+/// rather than display.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository cannot be opened or the scan fails.
+pub fn files_without_renames(worktree_path: &Path) -> Result<Vec<FileStatus>> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    collect_files_with(&repo, false)
+}
+
 /// [`collect_files`] with rename detection switchable. `detect_renames: false`
 /// reports a rename as its `D` + `A` pair — the form the pathspec-limited
 /// commit set in [`crate::commit`] needs, so the old path's deletion lands in
 /// the commit alongside the new path.
-pub(crate) fn collect_files_with(
-    repo: &Repository,
-    detect_renames: bool,
-) -> Result<Vec<FileStatus>> {
+fn collect_files_with(repo: &Repository, detect_renames: bool) -> Result<Vec<FileStatus>> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
@@ -302,25 +313,28 @@ fn porcelain_chars(s: Status) -> (char, char) {
     if s.contains(Status::CONFLICTED) {
         return ('U', 'U');
     }
+    // A rename whose content also changed (above the similarity threshold)
+    // carries `RENAMED | MODIFIED`; porcelain prints it as `R`, so the rename
+    // bit wins over the modified bit on both sides.
     let index = if s.contains(Status::INDEX_NEW) {
         'A'
+    } else if s.contains(Status::INDEX_RENAMED) {
+        'R'
     } else if s.contains(Status::INDEX_MODIFIED) {
         'M'
     } else if s.contains(Status::INDEX_DELETED) {
         'D'
-    } else if s.contains(Status::INDEX_RENAMED) {
-        'R'
     } else if s.contains(Status::INDEX_TYPECHANGE) {
         'T'
     } else {
         ' '
     };
-    let wt = if s.contains(Status::WT_MODIFIED) {
+    let wt = if s.contains(Status::WT_RENAMED) {
+        'R'
+    } else if s.contains(Status::WT_MODIFIED) {
         'M'
     } else if s.contains(Status::WT_DELETED) {
         'D'
-    } else if s.contains(Status::WT_RENAMED) {
-        'R'
     } else if s.contains(Status::WT_TYPECHANGE) {
         'T'
     } else {
@@ -407,6 +421,7 @@ fn char_to_status(c: char) -> Option<GitFileStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stage::stage;
     use crate::testutil::{commit_file, init_repo, write_file};
 
     #[test]
@@ -485,6 +500,69 @@ mod tests {
         );
         assert!(st.has_uncommitted_changes);
         assert!(!st.has_untracked_files);
+    }
+
+    /// Forty lines that stay identical across an edited rename, keeping the
+    /// pair well above libgit2's 50% similarity threshold.
+    fn long_body() -> String {
+        (1..=40)
+            .map(|i| format!("line {i}\n"))
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    /// A rename whose content also changed (still >50% similar) is
+    /// `INDEX_RENAMED | INDEX_MODIFIED` in libgit2; porcelain prints `R`, so
+    /// the entry must be `R`, not `M`.
+    #[test]
+    fn staged_edited_rename_is_single_renamed_entry() {
+        let dir = init_repo("status-rename-staged-edited");
+        commit_file(dir.path(), "old.txt", &long_body());
+        stage_rename(dir.path(), "old.txt", "new.txt");
+        write_file(dir.path(), "new.txt", &format!("{}extra\n", long_body()));
+        stage(dir.path(), &["new.txt".to_string()]).unwrap();
+        let st = status(dir.path()).unwrap();
+        assert_eq!(
+            st.files,
+            vec![file("new.txt", GitFileStatus::Renamed, true)],
+            "expected exactly one staged R entry: {:?}",
+            st.files
+        );
+    }
+
+    /// The unstaged counterpart: `WT_RENAMED | WT_MODIFIED` is one unstaged
+    /// `R` entry under the new path.
+    #[test]
+    fn unstaged_edited_rename_is_single_renamed_entry() {
+        let dir = init_repo("status-rename-unstaged-edited");
+        commit_file(dir.path(), "old.txt", &long_body());
+        std::fs::rename(dir.path().join("old.txt"), dir.path().join("new.txt")).unwrap();
+        write_file(dir.path(), "new.txt", &format!("{}extra\n", long_body()));
+        let st = status(dir.path()).unwrap();
+        assert_eq!(
+            st.files,
+            vec![file("new.txt", GitFileStatus::Renamed, false)],
+            "expected exactly one unstaged R entry: {:?}",
+            st.files
+        );
+    }
+
+    /// The rename-unaware listing keeps both sides of a staged rename as its
+    /// `D` + `A` pair (the shape per-path bookkeeping needs).
+    #[test]
+    fn files_without_renames_reports_the_delete_add_pair() {
+        let dir = init_repo("status-rename-pair");
+        commit_file(dir.path(), "old.txt", "same content\nacross the move\n");
+        stage_rename(dir.path(), "old.txt", "new.txt");
+        let mut files = files_without_renames(dir.path()).unwrap();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            files,
+            vec![
+                file("new.txt", GitFileStatus::Added, true),
+                file("old.txt", GitFileStatus::Deleted, true),
+            ]
+        );
     }
 
     /// A staged rename whose new file was then edited in the working tree

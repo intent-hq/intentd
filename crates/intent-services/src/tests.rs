@@ -14699,6 +14699,52 @@ mod pr {
         assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
     }
 
+    /// Undoing a commit that renamed a file re-attributes BOTH sides of the
+    /// rename (monorepo#4594): the soft reset leaves a staged `R`, which the
+    /// display status collapses under the new path only, but attribution is
+    /// per path and the old path's deletion must be attributable too so the
+    /// next agent checkpoint lands it.
+    #[tokio::test]
+    async fn undo_commit_restores_attribution_for_both_sides_of_a_rename() {
+        let (_t, _w, _b, svc, ws, work) = ac_setup(StubForge::default()).await;
+        let repo = git2::Repository::open(&work).unwrap();
+        let base = repo.head().unwrap().target().unwrap().to_string();
+
+        std::fs::rename(work.join("README.md"), work.join("GUIDE.md")).unwrap();
+        commit_all(&repo, "chore: rename readme");
+
+        let res = svc
+            .accept_changes_execute(
+                ws.clone(),
+                json!({
+                    "action": "undo-commit",
+                    "upToCommitHash": base,
+                    "undoCommitsMetadata": [{
+                        "agentId": "agent-a",
+                        "files": ["README.md", "GUIDE.md"],
+                    }],
+                }),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(res["success"], true, "result: {res}");
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        let row = |p: &str| {
+            rows.iter()
+                .find(|r| r.path == p)
+                .unwrap_or_else(|| panic!("no attribution row for {p}: {rows:?}"))
+        };
+        let old = row("README.md");
+        assert_eq!(old.status, "deleted");
+        assert_eq!(old.stage, "staged");
+        assert_eq!(old.agent_id.as_deref(), Some("agent-a"));
+        let new = row("GUIDE.md");
+        assert_eq!(new.status, "added");
+        assert_eq!(new.stage, "staged");
+        assert_eq!(new.agent_id.as_deref(), Some("agent-a"));
+    }
+
     #[tokio::test]
     async fn execute_create_pr_without_remote_fails_step() {
         // A workspace with no git repo at all → push/create-pr cannot proceed.

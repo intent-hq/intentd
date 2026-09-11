@@ -305,9 +305,8 @@ fn collapse_blank_lines(s: &str) -> String {
 ///
 /// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn all_changed_paths(worktree_path: &Path) -> Result<Vec<String>> {
-    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let mut paths = Vec::new();
-    for f in crate::status::collect_files_with(&repo, false)? {
+    for f in crate::status::files_without_renames(worktree_path)? {
         if !paths.contains(&f.path) {
             paths.push(f.path);
         }
@@ -325,9 +324,8 @@ pub fn all_changed_paths(worktree_path: &Path) -> Result<Vec<String>> {
 ///
 /// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn staged_paths(worktree_path: &Path) -> Result<Vec<String>> {
-    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let mut paths = Vec::new();
-    for f in crate::status::collect_files_with(&repo, false)? {
+    for f in crate::status::files_without_renames(worktree_path)? {
         if f.staged && !paths.contains(&f.path) {
             paths.push(f.path);
         }
