@@ -123,7 +123,7 @@ async fn agent_queue_add_get_remove_lifecycle() {
 
     // Queue a message
     let queued = services
-        .agent_queue_message(agent_id.clone(), "test message".into(), None, None)
+        .agent_queue_message(agent_id.clone(), "test message".into(), None, None, None)
         .await
         .expect("queue message");
     assert_eq!(queued["success"], true);
