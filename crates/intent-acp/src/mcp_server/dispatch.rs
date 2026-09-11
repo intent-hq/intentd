@@ -626,9 +626,11 @@ fn stamp_and_collect(items: &mut [Value], known: &HashSet<String>) -> Vec<TurnAt
 ///
 /// `pub` (re-exported as `intent_acp::make_workspace_host_for_bridge`) so
 /// the background hook scheduler in `intent-services` applies the same
-/// sub-agent gate to hooks owned by background/delegated sessions. Bindings
-/// that bound a wait by the eval budget (`ws.script.run`) see the effective
-/// default budget here.
+/// sub-agent gate to hooks owned by background/delegated sessions.
+/// `eval_budget` is the wall-clock budget of the enclosing eval (the hook
+/// runner's per-run timeout); bindings that bound a wait by the eval budget
+/// (`ws.script.run`) derive their ceiling from it, so every caller must pass
+/// its real budget.
 pub fn make_workspace_host_for_bridge(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -636,6 +638,7 @@ pub fn make_workspace_host_for_bridge(
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: AgentFeaturesSettings,
     is_sub_agent: bool,
+    eval_budget: Duration,
 ) -> HostFn {
     make_workspace_host_with_pending(
         api,
@@ -644,7 +647,7 @@ pub fn make_workspace_host_for_bridge(
         turn_attachments,
         agent_features,
         is_sub_agent,
-        default_workspace_api_timeout(),
+        eval_budget,
         None,
     )
 }
