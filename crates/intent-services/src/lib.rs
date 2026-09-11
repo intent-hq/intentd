@@ -1116,6 +1116,7 @@ impl Services {
     /// Wire the services surface over a persistence handle.
     #[must_use]
     pub fn new(store: Store) -> Self {
+        let mcp_hub = Arc::new(McpHub::with_oauth_store(store.clone()));
         Self {
             store,
             assets_root: None,
@@ -1180,7 +1181,7 @@ impl Services {
             settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
-            mcp_hub: Arc::new(McpHub::new()),
+            mcp_hub,
             context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             context_usages: Arc::new(Mutex::new(HashMap::new())),

@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
 use uuid::Uuid;
 
+use crate::mcp_oauth::McpOauthService;
 use crate::settings::{AsyncSecretStore, REDACTED_PLACEHOLDER};
 use crate::settings_registry::SettingsRegistry;
 use crate::{system_actor, EventBus};
@@ -100,6 +102,19 @@ fn status_stopped(server_id: &str) -> Value {
 /// An `error` status snapshot carrying `last_error` for `server_id`.
 fn status_error(server_id: &str, last_error: &str) -> Value {
     status_value(server_id, "error", None, None, Some(last_error), None)
+}
+
+/// An `auth_required` status snapshot for a remote server whose endpoint
+/// rejected the daemon's configured or stored credentials.
+fn status_auth_required(server_id: &str, last_error: &str) -> Value {
+    status_value(
+        server_id,
+        "auth_required",
+        None,
+        None,
+        Some(last_error),
+        None,
+    )
 }
 
 /// The `id` of a config Value (empty when absent).
@@ -288,7 +303,8 @@ enum ToolTarget {
     /// Forward over a stateless streamable-HTTP session.
     Http {
         url: String,
-        headers: Vec<(String, String)>,
+        config: Value,
+        generation: u64,
     },
 }
 
@@ -311,12 +327,15 @@ struct RunningServer {
     runtime: ServerRuntime,
     status: Value,
     failures: u32,
+    generation: u64,
 }
 
 /// Shared runtime state for the [`McpHub`].
 struct HubInner {
     servers: Mutex<HashMap<String, RunningServer>>,
     bus: Mutex<Option<EventBus>>,
+    oauth_store: Option<Store>,
+    next_generation: AtomicU64,
 }
 
 /// Runtime manager for external MCP servers (the `ServerManager` + `HealthMonitor`
@@ -336,12 +355,28 @@ impl Default for McpHub {
 impl McpHub {
     /// Build an empty hub with no event bus wired yet.
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// Build an empty hub backed by the daemon store for refresh-aware OAuth
+    /// header construction on remote probes and tool calls.
+    pub(crate) fn with_oauth_store(store: Store) -> Self {
+        Self::build(Some(store))
+    }
+
+    fn build(oauth_store: Option<Store>) -> Self {
         Self {
             inner: Arc::new(HubInner {
                 servers: Mutex::new(HashMap::new()),
                 bus: Mutex::new(None),
+                oauth_store,
+                next_generation: AtomicU64::new(1),
             }),
         }
+    }
+
+    fn next_generation(&self) -> u64 {
+        self.inner.next_generation.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Wire the event bus the hub publishes `mcp.servers:status-changed` onto.
@@ -441,6 +476,7 @@ impl McpHub {
                     },
                     status: status.clone(),
                     failures: 0,
+                    generation: self.next_generation(),
                 };
                 self.inner.servers.lock().unwrap().insert(id, rs);
                 self.publish_status(&status).await;
@@ -459,12 +495,13 @@ impl McpHub {
     /// `error`) so the health sweep re-probes it — there is no process to
     /// restart, only status to flip.
     async fn start_remote(&self, id: String, config: Value) -> Value {
-        let status = remote_probe_status(&id, &config).await;
+        let status = self.remote_probe_status(&id, &config).await;
         let rs = RunningServer {
             config,
             runtime: ServerRuntime::Remote,
             status: status.clone(),
             failures: 0,
+            generation: self.next_generation(),
         };
         self.inner.servers.lock().unwrap().insert(id, rs);
         self.publish_status(&status).await;
@@ -541,7 +578,7 @@ impl McpHub {
     /// `mcp.servers:status-changed` on a state transition. `startedAt` is
     /// preserved across consecutive `running` probes.
     async fn reprobe_remote(&self, id: &str, config: &Value) {
-        let mut next = remote_probe_status(id, config).await;
+        let mut next = self.remote_probe_status(id, config).await;
         let changed = {
             let mut map = self.inner.servers.lock().unwrap();
             // The entry may have been stopped or replaced while the probe ran.
@@ -641,7 +678,8 @@ impl McpHub {
                     .to_string();
                 Ok(ToolTarget::Http {
                     url,
-                    headers: config_headers(&rs.config),
+                    config: rs.config.clone(),
+                    generation: rs.generation,
                 })
             }
         }
@@ -690,12 +728,85 @@ impl McpHub {
                         other => Error::Internal(format!("mcp {method} failed: {other}")),
                     })
             }
-            ToolTarget::Http { url, headers } => {
+            ToolTarget::Http {
+                url,
+                config,
+                generation,
+            } => {
+                let headers = self.remote_headers(server_id, &config).await;
                 let session = http_tool_session(&url, &headers, method, params, timeout);
-                tokio::time::timeout(timeout, session)
+                let outcome = tokio::time::timeout(timeout, session)
                     .await
-                    .map_err(|_| Error::Internal(format!("mcp {method} timed out")))?
+                    .map_err(|_| Error::Internal(format!("mcp {method} timed out")))?;
+                if let Err(error) = &outcome {
+                    if is_auth_failure(error) {
+                        self.mark_auth_required(server_id, generation, error).await;
+                    }
+                }
+                outcome
             }
+        }
+    }
+
+    /// Build outbound headers for a saved remote config. An explicit
+    /// `Authorization` config header wins; otherwise the daemon reads the
+    /// server's stored OAuth bag and performs refresh when needed.
+    async fn remote_headers(&self, server_id: &str, config: &Value) -> Vec<(String, String)> {
+        let mut headers = config_headers(config);
+        if headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return headers;
+        }
+        let Some(store) = self.inner.oauth_store.as_ref() else {
+            return headers;
+        };
+        match McpOauthService::new(store)
+            .authorization_header(server_id)
+            .await
+        {
+            Ok(Some(value)) => headers.push(("Authorization".to_string(), value)),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                server = %server_id,
+                error = %error,
+                "failed to read mcp oauth bag; continuing without stored authorization"
+            ),
+        }
+        headers
+    }
+
+    /// Probe a remote config and shape the result as its lifecycle status.
+    async fn remote_probe_status(&self, id: &str, config: &Value) -> Value {
+        let headers = self.remote_headers(id, config).await;
+        match probe_remote(config, &headers).await {
+            Ok(tool_count) => {
+                status_value(id, "running", None, tool_count, None, Some(now_millis()))
+            }
+            Err(error) if is_auth_failure(&error) => status_auth_required(id, &error.to_string()),
+            Err(error) => status_error(id, &error.to_string()),
+        }
+    }
+
+    /// Move a tracked remote server to `auth_required` after a forwarded HTTP
+    /// request receives 401/403. Publish only on a real state transition.
+    async fn mark_auth_required(&self, server_id: &str, generation: u64, error: &Error) {
+        let status = status_auth_required(server_id, &error.to_string());
+        let changed = {
+            let mut servers = self.inner.servers.lock().unwrap();
+            let Some(server) = servers.get_mut(server_id) else {
+                return;
+            };
+            if !matches!(server.runtime, ServerRuntime::Remote) || server.generation != generation {
+                return;
+            }
+            let changed = server.status.get("state") != status.get("state");
+            server.status = status.clone();
+            changed
+        };
+        if changed {
+            self.publish_status(&status).await;
         }
     }
 }
@@ -797,14 +908,6 @@ async fn ping(conn: &Connection) -> bool {
         .is_ok()
 }
 
-/// Probe `config` and shape the outcome as a wire `McpServerStatus` (§5.22).
-async fn remote_probe_status(id: &str, config: &Value) -> Value {
-    match probe_remote(config).await {
-        Ok(tool_count) => status_value(id, "running", None, tool_count, None, Some(now_millis())),
-        Err(e) => status_error(id, &e.to_string()),
-    }
-}
-
 /// Probe a remote MCP endpoint from the daemon host. `http` runs the full MCP
 /// handshake (`initialize` → `notifications/initialized` → `tools/list`) over
 /// streamable HTTP POST; `sse` is a reachability probe only (full SSE sessions
@@ -812,7 +915,7 @@ async fn remote_probe_status(id: &str, config: &Value) -> Value {
 /// The whole probe is bounded by [`PROBE_TIMEOUT`] on top of the per-request
 /// [`HANDSHAKE_TIMEOUT`]. Redirects are never followed: configured headers may
 /// carry credentials that reqwest would forward to a cross-host redirect.
-async fn probe_remote(config: &Value) -> Result<Option<u64>> {
+async fn probe_remote(config: &Value, headers: &[(String, String)]) -> Result<Option<u64>> {
     let transport = config
         .get("transport")
         .and_then(Value::as_str)
@@ -828,11 +931,10 @@ async fn probe_remote(config: &Value) -> Result<Option<u64>> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| Error::Internal(format!("http client init failed: {e}")))?;
-    let headers = config_headers(config);
     let probe = async move {
         match transport {
-            "sse" => probe_sse(&client, &url, &headers).await.map(|()| None),
-            _ => probe_http_handshake(&client, &url, &headers).await,
+            "sse" => probe_sse(&client, &url, headers).await.map(|()| None),
+            _ => probe_http_handshake(&client, &url, headers).await,
         }
     };
     tokio::time::timeout(PROBE_TIMEOUT, probe)
@@ -1014,9 +1116,16 @@ async fn probe_http_handshake(
         .map(String::from);
     let sid = session.as_deref();
     let ver = proto.as_deref();
-    // Notification (servers typically answer 202); failures are non-fatal.
+    // Notification (servers typically answer 202); only authentication
+    // failures are fatal because later requests cannot use the session.
     let inited = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-    let _ = post_rpc(client, url, headers, sid, ver, &inited).await;
+    if let Ok(resp) = post_rpc(client, url, headers, sid, ver, &inited).await {
+        if matches!(resp.status().as_u16(), 401 | 403) {
+            let error = check_http_status(resp.status()).unwrap_err();
+            delete_session(client, url, headers, sid, ver).await;
+            return Err(error);
+        }
+    }
     let tools = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} });
     let tool_count = match post_rpc(client, url, headers, sid, ver, &tools).await {
         Ok(resp) if resp.status().is_success() => {
@@ -1026,6 +1135,11 @@ async fn probe_http_handshake(
                     .and_then(Value::as_array)
                     .map(|a| a.len() as u64)
             })
+        }
+        Ok(resp) if matches!(resp.status().as_u16(), 401 | 403) => {
+            let error = check_http_status(resp.status()).unwrap_err();
+            delete_session(client, url, headers, sid, ver).await;
+            return Err(error);
         }
         _ => None,
     };
@@ -1253,11 +1367,17 @@ fn check_http_status(status: reqwest::StatusCode) -> Result<()> {
     let code = status.as_u16();
     Err(match code {
         401 | 403 => Error::Internal(format!(
-            "authentication failed (HTTP {code}) — check configured headers"
+            "authentication failed (HTTP {code}) — authenticate or check configured credentials"
         )),
         500..=599 => Error::Internal(format!("server error (HTTP {code})")),
         _ => Error::Internal(format!("unexpected HTTP {code} from server")),
     })
+}
+
+/// Whether an internally-shaped remote HTTP failure represents a 401/403.
+/// Only messages emitted by [`check_http_status`] reach this helper.
+fn is_auth_failure(error: &Error) -> bool {
+    matches!(error, Error::Internal(message) if message.starts_with("authentication failed (HTTP 401)") || message.starts_with("authentication failed (HTTP 403)"))
 }
 
 /// Terminate a stdio server's whole process group (SIGTERM → grace → SIGKILL),
@@ -1440,9 +1560,9 @@ impl<'a> McpServersService<'a> {
         let normalized = merge_redacted_secrets(normalize_config(config, Some(server_id))?, stored);
         configs.insert(server_id.to_string(), normalized.clone());
         write_configs(self.secrets, &configs).await?;
-        // Apply live: any tracked server (running, or a remote in `error`)
-        // picks up the new definition on restart — an error-state remote must
-        // re-probe the updated URL/headers, not keep probing the old config.
+        // Apply live: any tracked server (running, or a remote in `error` or
+        // `auth_required`) picks up the new definition on restart. A failed
+        // remote must re-probe updated credentials, not keep the old config.
         let tracked = self.hub.status(server_id)["state"] != "stopped";
         if tracked {
             let enable = enable_user_servers(&self.effective());
@@ -3115,15 +3235,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_probe_401_maps_to_auth_error() {
+    async fn http_probe_401_maps_to_auth_required() {
         let (url, _guard) =
             http_stub("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await;
         let h = McpHub::new();
         let status = h.start(remote_cfg("r-auth", "http", &url), true).await;
-        assert_eq!(status["state"], json!("error"));
+        assert_eq!(status["state"], json!("auth_required"));
         let err = status["lastError"].as_str().unwrap();
         assert!(err.contains("authentication failed"), "got: {err}");
         assert!(err.contains("401"), "got: {err}");
+        assert!(err.contains("configured credentials"), "got: {err}");
     }
 
     #[tokio::test]
@@ -3256,7 +3377,7 @@ mod tests {
             http_stub("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await;
         let h = McpHub::new();
         let _ = h.start(remote_cfg("r-stop", "http", &url), true).await;
-        assert_eq!(h.status("r-stop")["state"], json!("error"));
+        assert_eq!(h.status("r-stop")["state"], json!("auth_required"));
         assert!(h.stop("r-stop").await, "tracked entry is stopped");
         assert_eq!(h.status("r-stop"), status_stopped("r-stop"));
     }
@@ -3508,6 +3629,7 @@ mod tests {
             },
             status: status_value(id, "running", None, None, None, None),
             failures: 0,
+            generation: h.next_generation(),
         };
         h.inner.servers.lock().unwrap().insert(id.to_string(), rs);
         (h, c2s_server, s2c_server)
@@ -3523,6 +3645,7 @@ mod tests {
             runtime: ServerRuntime::Remote,
             status: status_value(id, "running", None, None, None, None),
             failures: 0,
+            generation: h.next_generation(),
         };
         h.inner.servers.lock().unwrap().insert(id.to_string(), rs);
         h
@@ -3691,16 +3814,48 @@ mod tests {
     /// `tools/call` based on the request body (a `tools/call` naming the tool
     /// `boom` gets a JSON-RPC error envelope).
     async fn http_tool_stub() -> (String, tokio::task::JoinHandle<()>) {
+        http_tool_stub_with_options(None, None).await
+    }
+
+    /// The body-aware tool stub with an optional exact bearer requirement.
+    async fn http_tool_stub_with_auth(
+        required_auth: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        http_tool_stub_with_options(required_auth, None).await
+    }
+
+    /// The body-aware tool stub with optional auth and one denied request kind.
+    async fn http_tool_stub_with_options(
+        required_auth: Option<&str>,
+        denied_request: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let required_auth = required_auth.map(String::from);
+        let denied_request = denied_request.map(String::from);
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
+                let required_auth = required_auth.clone();
+                let denied_request = denied_request.clone();
                 tokio::spawn(async move {
                     while let Some(req) = read_http_request(&mut sock).await {
-                        let resp = if req.contains("\"method\":\"initialize\"") {
+                        let authorized = required_auth.as_ref().is_none_or(|expected| {
+                            req.lines().any(|line| {
+                                line.split_once(':').is_some_and(|(name, value)| {
+                                    name.eq_ignore_ascii_case("authorization")
+                                        && value.trim() == expected
+                                })
+                            })
+                        });
+                        let denied = denied_request
+                            .as_ref()
+                            .is_some_and(|request_kind| req.contains(request_kind));
+                        let resp = if !authorized || denied {
+                            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n".to_string()
+                        } else if req.contains("\"method\":\"initialize\"") {
                             ok_json_response(
                                 r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}}"#,
                             )
@@ -3790,6 +3945,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_probe_and_tool_call_use_stored_oauth_header() {
+        const TOKEN: &str = "unit-oauth-token";
+        let (url, _guard) = http_tool_stub_with_auth(Some(&format!("Bearer {TOKEN}"))).await;
+        let (_tmp, store) = open_store().await;
+        McpOauthService::new(&store)
+            .set(
+                "r-oauth",
+                json!({ "access_token": TOKEN, "token_type": "bearer" }),
+            )
+            .await
+            .unwrap();
+        let h = McpHub::with_oauth_store(store);
+
+        let status = h.start(remote_cfg("r-oauth", "http", &url), true).await;
+        assert_eq!(status["state"], json!("running"));
+        let result = h.call_tool("r-oauth", "t1", json!({}), None).await.unwrap();
+        assert_eq!(result["content"][0]["text"], json!("http-ok"));
+        assert!(!status.to_string().contains(TOKEN));
+        assert!(!result.to_string().contains(TOKEN));
+    }
+
+    #[tokio::test]
     async fn http_call_tool_surfaces_server_error_message() {
         let (url, _guard) = http_tool_stub().await;
         let h = remote_hub("r1", "http", &url, json!({}));
@@ -3822,7 +3999,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_tool_error_never_echoes_configured_headers() {
+    async fn http_tool_auth_error_updates_status_without_echoing_headers() {
         let (url, _guard) =
             http_stub("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await;
         let h = remote_hub(
@@ -3835,6 +4012,49 @@ mod tests {
         let msg = format!("{err}");
         assert!(!msg.contains("supersecret-token"), "leaked secret: {msg}");
         assert!(msg.contains("authentication failed"), "got: {msg}");
+        let status = h.status("r1");
+        assert_eq!(status["state"], json!("auth_required"));
+        assert!(!status.to_string().contains("supersecret-token"));
+    }
+
+    #[tokio::test]
+    async fn http_probe_follow_up_auth_errors_require_authentication() {
+        for denied_request in ["notifications/initialized", "\"method\":\"tools/list\""] {
+            let (url, guard) = http_tool_stub_with_options(None, Some(denied_request)).await;
+            let h = McpHub::new();
+            let status = h.start(remote_cfg("r-follow-up", "http", &url), true).await;
+            guard.abort();
+
+            assert_eq!(status["state"], json!("auth_required"), "{denied_request}");
+            assert!(
+                status["lastError"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("HTTP 401")),
+                "{denied_request}: {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_http_auth_error_does_not_replace_restarted_status() {
+        let (url, _guard) = http_tool_stub().await;
+        let h = remote_hub("r-stale", "http", &url, json!({}));
+        let old_generation = match h.tool_target("r-stale").unwrap() {
+            ToolTarget::Http { generation, .. } => generation,
+            ToolTarget::Stdio(_) => panic!("expected HTTP target"),
+        };
+
+        let restarted = h.restart(remote_cfg("r-stale", "http", &url), true).await;
+        assert_eq!(restarted["state"], json!("running"));
+
+        let stale_error = Error::Internal(
+            "authentication failed (HTTP 401) — authenticate or check configured credentials"
+                .to_string(),
+        );
+        h.mark_auth_required("r-stale", old_generation, &stale_error)
+            .await;
+
+        assert_eq!(h.status("r-stale")["state"], json!("running"));
     }
 
     #[test]

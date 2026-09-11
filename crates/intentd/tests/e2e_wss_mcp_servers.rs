@@ -259,9 +259,20 @@ fn node_available() -> bool {
 /// Spawn the mock MCP server in `--http` mode and return (child, base url).
 /// The fixture announces its ephemeral port as `PORT=<n>` on stdout.
 async fn spawn_http_fixture(script: &str) -> (tokio::process::Child, String) {
-    let mut child = tokio::process::Command::new("node")
-        .arg(script)
-        .arg("--http")
+    spawn_http_fixture_with_auth(script, None).await
+}
+
+/// Spawn the HTTP fixture with an optional exact Authorization requirement.
+async fn spawn_http_fixture_with_auth(
+    script: &str,
+    required_auth: Option<&str>,
+) -> (tokio::process::Child, String) {
+    let mut command = tokio::process::Command::new("node");
+    command.arg(script).arg("--http");
+    if let Some(required_auth) = required_auth {
+        command.env("MOCK_MCP_REQUIRED_AUTH", required_auth);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -459,6 +470,113 @@ async fn mcp_servers_remote_probe_over_wss() {
     assert_eq!(deleted["success"], json!(true));
     let list = wss_rpc(&mut rpc, 11, "mcp.servers.list", json!({})).await;
     assert_eq!(list["servers"].as_array().expect("servers array").len(), 0);
+}
+
+/// OAuth-aware remote lifecycle over production WSS: the unauthenticated
+/// probe reports `auth_required`; a presence-only token write followed by
+/// `mcp.servers.restart` performs a real re-probe with the daemon-owned token
+/// and recovers the server to `running` without exposing token material.
+#[tokio::test]
+async fn mcp_servers_oauth_auth_required_and_restart_recovery_over_wss() {
+    const OAUTH_TOKEN: &str = "wss-lifecycle-oauth-token";
+    let Some(script) = node_available().then_some(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mock-mcp-server.mjs"
+    )) else {
+        eprintln!("skipping mcp oauth lifecycle WSS E2E: node not on PATH");
+        return;
+    };
+    if !PathBuf::from(script).exists() {
+        eprintln!("skipping mcp oauth lifecycle WSS E2E: fixture missing");
+        return;
+    }
+    let (_fixture, base_url) =
+        spawn_http_fixture_with_auth(script, Some(&format!("Bearer {OAUTH_TOKEN}"))).await;
+
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("u16 port");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+    let cfg = client_config(fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let _ = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["mcp.servers:status-changed"] }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "mcp.servers.create",
+        json!({ "config": {
+            "name": "OAuth HTTP",
+            "transport": "http",
+            "url": base_url,
+            "enabled": false,
+        } }),
+    )
+    .await;
+    let server_id = created["server"]["id"].as_str().expect("id").to_string();
+
+    let enabled = wss_rpc(
+        &mut rpc,
+        3,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": true }),
+    )
+    .await;
+    assert_eq!(enabled["status"]["state"], json!("auth_required"));
+    assert!(!enabled.to_string().contains(OAUTH_TOKEN));
+    let auth_event = wait_for_state(&mut sub, &server_id, "auth_required").await;
+    assert!(!auth_event.to_string().contains(OAUTH_TOKEN));
+
+    let stored = wss_rpc(
+        &mut rpc,
+        4,
+        "mcp.oauth.set",
+        json!({ "serverId": server_id, "tokenBag": {
+            "access_token": OAUTH_TOKEN,
+            "token_type": "bearer",
+        } }),
+    )
+    .await;
+    assert_eq!(stored["value"], json!(PLACEHOLDER));
+    assert!(!stored.to_string().contains(OAUTH_TOKEN));
+
+    let restarted = wss_rpc(
+        &mut rpc,
+        5,
+        "mcp.servers.restart",
+        json!({ "serverId": server_id }),
+    )
+    .await;
+    assert_eq!(restarted["status"]["state"], json!("running"));
+    assert_eq!(restarted["status"]["toolCount"], json!(2));
+    assert!(!restarted.to_string().contains(OAUTH_TOKEN));
+    let _ = wait_for_state(&mut sub, &server_id, "running").await;
+
+    let got = wss_rpc(
+        &mut rpc,
+        6,
+        "mcp.servers.getStatus",
+        json!({ "serverId": server_id }),
+    )
+    .await;
+    assert_eq!(got["status"]["state"], json!("running"));
 }
 
 /// Spawn the mock MCP server in `--http --log-auth` mode: (child, stdout line
