@@ -221,9 +221,9 @@ async fn run(
     let max_lines = opt_i64(args, "maxLines");
     let ceiling = run_timeout_ceiling_secs(budget);
     // `timeoutSeconds` with the `timeout` alias (reference parity). An
-    // omitted timeout defaults to the ceiling: `None` makes the service
-    // layer wait unbounded, so the `timedOut` envelope would never be
-    // reachable within the budget.
+    // omitted or non-positive timeout defaults to the ceiling: `None` and
+    // non-positive values both make the service layer wait unbounded, so the
+    // `timedOut` envelope would never be reachable within the budget.
     let timeout_seconds = match opt_i64(args, "timeoutSeconds").or_else(|| opt_i64(args, "timeout"))
     {
         Some(requested) if requested > ceiling => {
@@ -235,8 +235,8 @@ async fn run(
                 budget.as_secs()
             ));
         }
-        Some(requested) => Some(requested),
-        None => Some(ceiling),
+        Some(requested) if requested > 0 => Some(requested),
+        _ => Some(ceiling),
     };
     api.script_run(ws.clone(), script_id, max_lines, timeout_seconds)
         .await

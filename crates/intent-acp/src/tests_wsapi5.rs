@@ -1253,6 +1253,25 @@ async fn script_run_omitted_timeout_defaults_to_ceiling() {
 }
 
 #[tokio::test]
+async fn script_run_non_positive_timeout_defaults_to_ceiling() {
+    // `ScriptManager::run` treats a non-positive timeout as absent (unbounded
+    // wait), so `0` / negatives must not bypass the ceiling.
+    let (srv, api) = server();
+    let resp = call(
+        &srv,
+        "return await ws.script.run('s-1', { timeoutSeconds: 0 });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let resp = call(&srv, "return await ws.script.run('s-1', { timeout: -5 });").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let calls = api.script_run_calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].1, Some(25));
+    assert_eq!(calls[1].1, Some(25));
+}
+
+#[tokio::test]
 async fn script_run_timeout_at_ceiling_passes_through() {
     let (srv, api) = server();
     let resp = call(
