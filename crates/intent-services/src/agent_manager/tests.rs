@@ -5467,6 +5467,999 @@ async fn terminal_failure_requeue_defaults_turn_id_to_new_id() {
     );
 }
 
+/// The intent-hq/intent#4703 failure text: a chat-stream 413 wrapped the way
+/// the ACP layer surfaces it.
+fn context_size_error_text() -> &'static str {
+    "internal error: session/prompt failed: JSON-RPC error -32603: Internal error: \
+     HTTP error: 413 Request Entity Too Large: {\"httpStatus\":413,\
+     \"message\":\"Conversation context too large for model\"}"
+}
+
+/// A payload one char over `CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`, built from
+/// a recognisable token so the retry test can prove it never reached the
+/// provider.
+fn oversized_payload() -> String {
+    let mut s = String::new();
+    while s.chars().count() <= super::CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS {
+        s.push_str("OVERSIZED-PAYLOAD-TOKEN ");
+    }
+    s
+}
+
+/// intent-hq/intent#4703: a context-size (413) failure on an entry above
+/// the size threshold re-queues the recovery MARKER in place of the payload,
+/// keeping the correlation `turn_id`, `queued_at`, `messageMetadata`,
+/// priority, and `requeuedAfterFailure: true`. `persisted` is forced to
+/// `false` so the retry drain appends the marker as the turn's user row.
+#[tokio::test]
+async fn context_size_requeue_replaces_oversized_entry_with_marker() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-413-big"), AgentId::from("a-413-big"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let payload = oversized_payload();
+    let original_chars = payload.chars().count();
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413".to_string()),
+        queued_at: Some("2026-01-01T00:00:00Z".to_string()),
+        message_metadata: Some(json!({"type": "hook_dispatch"})),
+        interrupt_priority: true,
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        &payload,
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(
+        queued.content,
+        super::context_size_requeue_marker(original_chars),
+        "oversized payload replaced by the recovery marker"
+    );
+    assert!(
+        queued.content.contains(&format!("{original_chars} chars")),
+        "marker names the dropped size: {}",
+        queued.content
+    );
+    assert!(!queued.content.contains("OVERSIZED-PAYLOAD-TOKEN"));
+    assert!(queued.requeued_after_failure);
+    assert!(
+        !queued.persisted,
+        "marker must be appended as the retry's user row"
+    );
+    assert_eq!(queued.turn_id, "turn-413");
+    assert_eq!(queued.queued_at, "2026-01-01T00:00:00Z");
+    assert_eq!(
+        queued.message_metadata,
+        Some(json!({"type": "hook_dispatch"}))
+    );
+    assert!(queued.interrupt_priority);
+    // Wire shape (`agent.getQueue`) shows the marker as a failure requeue.
+    let wire = queued.to_value(0);
+    assert_eq!(wire["requeuedAfterFailure"], json!(true));
+    assert_eq!(wire["content"], json!(queued.content));
+    assert_eq!(wire["turnId"], json!("turn-413"));
+}
+
+/// A context-size failure on an entry AT or UNDER the threshold is the
+/// accumulated context's problem, not the message's: the entry re-queues
+/// unchanged with `persisted` as given (existing behaviour). Covers a small
+/// ask, a payload of exactly `CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS` chars
+/// (the boundary is strictly greater-than), and a multibyte payload whose
+/// BYTE length exceeds the threshold while its char count does not (the
+/// threshold counts chars).
+#[tokio::test]
+async fn context_size_requeue_keeps_small_entry_unchanged() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-small"),
+        AgentId::from("a-413-small"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let threshold = super::CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS;
+    let exact = "x".repeat(threshold);
+    assert_eq!(exact.chars().count(), threshold);
+    let multibyte = "é".repeat(threshold);
+    assert_eq!(multibyte.chars().count(), threshold);
+    assert!(
+        multibyte.len() > threshold,
+        "byte length exceeds the threshold"
+    );
+
+    for (turn, content) in [
+        ("turn-413-small", "small ask"),
+        ("turn-413-exact", exact.as_str()),
+        ("turn-413-multibyte", multibyte.as_str()),
+    ] {
+        let options = super::TurnOptions {
+            turn_id: Some(turn.to_string()),
+            ..super::TurnOptions::default()
+        };
+        super::persist_error_and_requeue(
+            &mgr,
+            &id,
+            &ws,
+            content,
+            &options,
+            true,
+            context_size_error_text(),
+        )
+        .await;
+
+        let queued = mgr
+            .services
+            .dequeue_message(&id)
+            .expect("failed message requeued");
+        assert_eq!(queued.content, content, "{turn}: content unchanged");
+        assert!(
+            queued.persisted,
+            "{turn}: already-persisted row is not re-appended"
+        );
+        assert!(queued.requeued_after_failure);
+        assert_eq!(queued.turn_id, turn);
+    }
+}
+
+/// An oversized entry whose turn failed for a NON-context-size reason
+/// re-queues verbatim: the marker swap is gated on the 413 classifier, not
+/// on size alone.
+#[tokio::test]
+async fn non_context_size_failure_keeps_oversized_entry_unchanged() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-big-boom"),
+        AgentId::from("a-big-boom"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let payload = oversized_payload();
+    let options = super::TurnOptions::default();
+    super::persist_error_and_requeue(&mgr, &id, &ws, &payload, &options, true, "boom").await;
+
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(queued.content, payload);
+    assert!(queued.persisted);
+    assert!(queued.requeued_after_failure);
+}
+
+/// End-to-end (intent-hq/intent#4703): after a 413 on an oversized entry
+/// whose user row was ALREADY persisted by the failed turn, `agent.retry`
+/// sends the MARKER to the provider — the marker lands as the retry turn's
+/// user row exactly once, the original row stays in the transcript exactly
+/// once (neither duplicated nor removed), and the original payload is never
+/// re-sent.
+#[tokio::test]
+async fn context_size_requeue_retry_sends_marker_to_provider() {
+    let script = mock_agent_script();
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": "OVERSIZED-PAYLOAD-TOKEN",
+                "response": "original-delivered",
+            },
+            {
+                "ifPromptContains": "[Queued message of",
+                "response": "marker-received",
+            },
+        ],
+        "response": "neither marker nor payload in prompt",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+    ]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-retry"),
+        AgentId::from("a-413-retry"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+
+    let payload = oversized_payload();
+    // The failed turn already persisted the oversized user row (that is what
+    // `persisted = true` on the requeue asserts).
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": payload }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413-retry".to_string()),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        &payload,
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("agent.retry");
+    assert_eq!(result["redriven"], json!(true));
+    assert_eq!(result["turnId"], json!("turn-413-retry"));
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::RuntimeIdle
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry turn completes and the agent goes idle");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let marker_rows = messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("[Queued message of"))
+        })
+        .count();
+    assert_eq!(
+        marker_rows, 1,
+        "the marker lands in the transcript exactly once: {messages:?}"
+    );
+    let original_rows = messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && serde_json::to_string(&m.content)
+                    .unwrap()
+                    .contains("OVERSIZED-PAYLOAD-TOKEN")
+        })
+        .count();
+    assert_eq!(
+        original_rows, 1,
+        "the already-persisted original row stays exactly once (never re-appended, never \
+         removed): {messages:?}"
+    );
+    let assistant = messages
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("retried turn produced assistant output");
+    assert!(
+        serde_json::to_string(&assistant.content)
+            .unwrap()
+            .contains("marker-received"),
+        "provider received the marker, not the payload: {messages:?}"
+    );
+}
+
+/// A system-origin queue entry for the combined-flush requeue tests.
+fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage {
+    crate::agent_ops::QueuedMessage {
+        id: format!("qm-413-{suffix}"),
+        turn_id: format!("turn-413-{suffix}"),
+        content,
+        image_blocks: None,
+        file_blocks: None,
+        queued_at: format!("2026-01-01T00:00:0{}Z", suffix.len() % 10),
+        editing: false,
+        persisted: false,
+        requeued_after_failure: false,
+        message_metadata: Some(json!({"source": suffix})),
+        prepend_content: None,
+        prepend_image_blocks: None,
+        prepend_file_blocks: None,
+        interrupt_priority: false,
+        user_origin: false,
+        hold_kind: None,
+        hold_until: None,
+        child_agent_id: None,
+    }
+}
+
+/// Run a real combined flush over `batch` (rows persisted, entries
+/// annotated) and fail the resulting turn with the given error text.
+/// Returns the flushed entries as the turn carried them and the queue
+/// restored by the requeue in head-first order.
+async fn flush_then_fail(
+    mgr: &super::AgentManager,
+    ws: &WorkspaceId,
+    id: &AgentId,
+    batch: Vec<crate::agent_ops::QueuedMessage>,
+    error_text: &str,
+) -> (
+    Vec<crate::agent_ops::QueuedMessage>,
+    Vec<crate::agent_ops::QueuedMessage>,
+) {
+    let draining = mgr.services.mark_draining(id, &batch);
+    let super::FlushPrep::Turn { content, options } =
+        super::prepare_flush_turn(mgr, id, ws, batch, draining).await
+    else {
+        panic!("flush prep starts a turn");
+    };
+    let flushed = options
+        .flushed_entries
+        .clone()
+        .expect("flush options carry the flushed entries");
+    assert!(
+        flushed.iter().all(|e| e.persisted),
+        "every flushed entry persisted before the turn"
+    );
+    super::persist_error_and_requeue(mgr, id, ws, &content, &options, true, error_text).await;
+    let mut restored = Vec::new();
+    while let Some(entry) = mgr.services.dequeue_message(id) {
+        restored.push(entry);
+    }
+    (flushed, restored)
+}
+
+/// Combined flush (intent-hq/intent#4703): a 413 on a batch of one
+/// oversized entry between two small siblings restores the THREE entries
+/// individually at the queue front in original order — the small ones
+/// verbatim with their durable rows respected (`persisted: true`), the
+/// oversized one as the marker with `persisted: false` — each keeping its
+/// own id / `turn_id` / `queued_at` / metadata. The wire-only combined
+/// prompt is never parked as a single entry.
+#[tokio::test]
+async fn context_size_requeue_splits_flush_batch_and_replaces_only_oversized_entry() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-batch"),
+        AgentId::from("a-413-batch"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let batch = vec![
+        flush_entry("a", "small first".to_string()),
+        flush_entry("bb", oversized_payload()),
+        flush_entry("ccc", "small last".to_string()),
+    ];
+    let (flushed, restored) =
+        flush_then_fail(&mgr, &ws, &id, batch, context_size_error_text()).await;
+
+    assert_eq!(restored.len(), 3, "entries restored individually");
+    assert_eq!(
+        restored.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["qm-413-a", "qm-413-bb", "qm-413-ccc"],
+        "original order and ids kept"
+    );
+    for (entry, suffix) in restored.iter().zip(["a", "bb", "ccc"]) {
+        assert_eq!(entry.turn_id, format!("turn-413-{suffix}"));
+        assert_eq!(entry.message_metadata.as_ref().unwrap()["source"], suffix);
+        assert!(
+            entry.requeued_after_failure,
+            "{suffix}: requeuedAfterFailure"
+        );
+        assert!(!entry.editing);
+    }
+    assert!(restored[0].content.starts_with("small first"));
+    assert!(
+        restored[0].persisted,
+        "small sibling's durable row is not re-appended"
+    );
+    // The marker names the size of the entry AS FLUSHED (annotated).
+    assert_eq!(
+        restored[1].content,
+        super::context_size_requeue_marker(flushed[1].content.chars().count()),
+        "only the oversized entry becomes the marker"
+    );
+    assert_eq!(restored[0].content, flushed[0].content);
+    assert_eq!(restored[2].content, flushed[2].content);
+    assert!(
+        !restored[1].persisted,
+        "marker must be appended as the retry's user row"
+    );
+    assert!(restored[2].content.starts_with("small last"));
+    assert!(restored[2].persisted);
+    assert!(
+        restored
+            .iter()
+            .all(|e| !e.content.contains("OVERSIZED-PAYLOAD-TOKEN")),
+        "the oversized payload is gone from the queue"
+    );
+}
+
+/// Combined flush where EVERY entry is under the threshold but their SUM
+/// exceeded the model's limit: a 413 restores each entry verbatim
+/// (`persisted: true`, no marker) — the accumulated prompt was the problem,
+/// no single payload can be blamed, and nothing is lost.
+#[tokio::test]
+async fn context_size_requeue_restores_all_small_flush_entries_verbatim() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-batch-small"),
+        AgentId::from("a-413-batch-small"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let threshold = super::CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS;
+    let half = "h".repeat(threshold / 2 + 1);
+    let batch = vec![
+        flush_entry("a", half.clone()),
+        flush_entry("bb", half.clone()),
+        flush_entry("ccc", half.clone()),
+    ];
+    let combined_chars: usize = batch.iter().map(|e| e.content.chars().count()).sum();
+    assert!(combined_chars > threshold, "combined prompt over threshold");
+
+    let (flushed, restored) =
+        flush_then_fail(&mgr, &ws, &id, batch, context_size_error_text()).await;
+
+    assert_eq!(restored.len(), 3);
+    for ((entry, flushed), suffix) in restored.iter().zip(&flushed).zip(["a", "bb", "ccc"]) {
+        assert_eq!(entry.id, format!("qm-413-{suffix}"));
+        assert_eq!(
+            entry.content, flushed.content,
+            "{suffix}: payload kept verbatim (no marker)"
+        );
+        assert!(entry.content.starts_with(&half));
+        assert!(entry.persisted, "{suffix}: durable row respected");
+        assert!(entry.requeued_after_failure);
+    }
+}
+
+/// A NON-context-size failure on a combined flush turn keeps today's
+/// behaviour: the combined prompt requeues as ONE `persisted: true` entry
+/// under the head entry's `turn_id` (the flushed entries ride the options
+/// but are used only by the 413 branch).
+#[tokio::test]
+async fn non_context_size_flush_failure_requeues_combined_prompt_as_one_entry() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-flush-boom"),
+        AgentId::from("a-flush-boom"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let batch = vec![
+        flush_entry("a", oversized_payload()),
+        flush_entry("bb", "small".to_string()),
+    ];
+    let (_flushed, restored) = flush_then_fail(&mgr, &ws, &id, batch, "boom").await;
+
+    assert_eq!(restored.len(), 1, "combined prompt requeued as one entry");
+    assert!(restored[0].content.contains("OVERSIZED-PAYLOAD-TOKEN"));
+    assert!(restored[0].content.contains("small"));
+    assert!(restored[0].persisted);
+    assert_eq!(restored[0].turn_id, "turn-413-a");
+}
+
+/// `content` and `prepend_content` are measured separately: a 413 on a
+/// small message carrying an oversized preempted `prepend_content`
+/// (monorepo#1014) swaps ONLY the prepend for the marker; `content` and
+/// `persisted` are untouched (the prepend is prompt-only, its row is
+/// already durable). The mirror case — oversized `content`, small prepend —
+/// swaps only `content`.
+#[tokio::test]
+async fn context_size_requeue_measures_prepend_content_separately() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-prepend"),
+        AgentId::from("a-413-prepend"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let payload = oversized_payload();
+    let original_chars = payload.chars().count();
+    let marker = super::context_size_requeue_marker(original_chars);
+
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413-prepend-big".to_string()),
+        prepend_content: Some(payload.clone()),
+        prepend_image_blocks: Some(json!([{"data": "AA==", "mimeType": "image/png"}])),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        "small ask",
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(queued.content, "small ask", "small content untouched");
+    assert!(
+        queued.persisted,
+        "persisted untouched: only the prepend changed"
+    );
+    assert_eq!(
+        queued.prepend_content.as_deref(),
+        Some(marker.as_str()),
+        "oversized prepend replaced by the marker"
+    );
+    assert_eq!(
+        queued.prepend_image_blocks,
+        Some(json!([{"data": "AA==", "mimeType": "image/png"}])),
+        "prepend attachments ride along"
+    );
+    assert!(queued.requeued_after_failure);
+
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413-prepend-small".to_string()),
+        prepend_content: Some("small preempted".to_string()),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        &payload,
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(
+        queued.content, marker,
+        "oversized content becomes the marker"
+    );
+    assert!(!queued.persisted);
+    assert_eq!(
+        queued.prepend_content.as_deref(),
+        Some("small preempted"),
+        "small prepend kept verbatim"
+    );
+}
+
+struct StopRedeliveryFlush413 {
+    /// The queue as restored by the 413 requeue (head-first).
+    restored: Vec<crate::agent_ops::QueuedMessage>,
+    /// The failed flush turn's outbound prompt text.
+    first_text: String,
+    /// The retry turn's outbound prompt text + block types.
+    retry_text: String,
+    retry_blocks: Vec<String>,
+    messages: Vec<intent_core::AgentMessage>,
+}
+
+/// Drive the real stop-redelivery + combined-flush + 413 + `agent.retry`
+/// sequence against the mock provider: a zero-output user stop arms the
+/// stopped message (`stopped_text` + an image) for redelivery, two entries
+/// (`(content, own prepend)`) are queued and flushed as ONE turn
+/// (`spawn_worker` merges the armed payload in AFTER `prepare_flush_turn`
+/// captured the entries), the mock fails that first prompt with the
+/// intent-hq/intent#4703 413, and `agent.retry` redrives.
+async fn stop_redelivery_flush_413_retry(
+    tag: &str,
+    stopped_text: &str,
+    queued: [(&str, Option<&str>); 2],
+) -> StopRedeliveryFlush413 {
+    let script = mock_agent_script();
+    let prompt_log =
+        std::env::temp_dir().join(format!("itd-413-{tag}-{}.log", uuid::Uuid::new_v4()));
+    let prompt_log_s = prompt_log.to_string_lossy().into_owned();
+    let attempt_file = std::env::temp_dir().join(format!("itd-413-{tag}-{}", uuid::Uuid::new_v4()));
+    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    // `advertiseLoadSession` keeps the retry on the RESUME path: a recreated
+    // session replays the transcript (stopped row included) as history and
+    // suppresses prepend text wholesale, which would mask what this checks.
+    let behavior = json!({
+        "advertiseLoadSession": true,
+        "promptRpcErrorAttempts": 1,
+        "promptRpcError": {
+            "code": -32603,
+            "message": "Internal error: HTTP error: 413 Request Entity Too Large: \
+                        {\"httpStatus\":413,\"message\":\"Conversation context too large for model\"}",
+        },
+        "response": "retry-delivered",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log_s.as_str()),
+        ("MOCK_AGENT_ATTEMPT_FILE", attempt_file_s.as_str()),
+    ]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from(format!("ws-413-{tag}")),
+        AgentId::from(format!("a-413-{tag}")),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+
+    // Real zero-output stop (spawn-window fallback path): the stopped user
+    // row becomes the armed redelivery payload.
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([
+                { "type": "text", "text": stopped_text },
+                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services.set_live_turn(&id, "msg-stop-413", Vec::new());
+    assert!(mgr.interrupt(&id).await, "fallback stop finds the agent");
+    assert!(
+        mgr.stop_redelivery.lock().unwrap().contains_key(&id),
+        "zero-output stop arms the redelivery payload"
+    );
+    assert!(!mgr.is_busy(&id), "stop released the slot");
+
+    for (content, prepend) in queued {
+        let prepend = prepend.map(|p| crate::agent_ops::QueuedPrepend {
+            content: Some(p.to_string()),
+            image_blocks: None,
+            file_blocks: None,
+        });
+        mgr.services
+            .enqueue_message(&id, content.to_string(), None, None, None, prepend, false);
+    }
+    // The drain flushes both entries into ONE turn; the mock fails it 413.
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let status = mgr.services.store.get_agent_session_status(&id).await;
+            if status.ok() == Some(AgentStatus::Error)
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the flush turn fails terminally with the 413");
+    assert!(
+        !mgr.stop_redelivery.lock().unwrap().contains_key(&id),
+        "the flush consumed the armed payload"
+    );
+    let restored = mgr
+        .services
+        .agent_queues
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .unwrap_or_default();
+
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("agent.retry");
+    assert_eq!(result["redriven"], json!(true), "{result}");
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::RuntimeIdle
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+                && !mgr.services.has_ready_to_send(&id)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry turn completes and the agent goes idle");
+
+    let prompts: Vec<Value> = std::fs::read_to_string(&prompt_log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("prompt log line"))
+        .collect();
+    let _ = std::fs::remove_file(&prompt_log);
+    let _ = std::fs::remove_file(&attempt_file);
+    assert_eq!(
+        prompts.len(),
+        2,
+        "failed flush + one retry turn: {prompts:?}"
+    );
+    let first_text = prompts[0]["text"].as_str().expect("text").to_string();
+    let retry_text = prompts[1]["text"].as_str().expect("text").to_string();
+    let retry_blocks = prompts[1]["blockTypes"]
+        .as_array()
+        .expect("blockTypes")
+        .iter()
+        .filter_map(|b| b.as_str().map(str::to_string))
+        .collect();
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    StopRedeliveryFlush413 {
+        restored,
+        first_text,
+        retry_text,
+        retry_blocks,
+        messages,
+    }
+}
+
+fn user_rows_containing(messages: &[intent_core::AgentMessage], needle: &str) -> usize {
+    messages
+        .iter()
+        .filter(|m| m.role == "user" && serde_json::to_string(&m.content).unwrap().contains(needle))
+        .count()
+}
+
+/// A SMALL stopped message armed for redelivery rides a combined flush that
+/// fails 413 over an oversized sibling: the per-entry requeue keeps the
+/// redelivery on the LAST entry (text + image), the oversized tail's own
+/// content becomes the marker, the small head is untouched, and the retry
+/// prompt carries the stopped message exactly once, ahead of the batch —
+/// nothing is lost.
+#[tokio::test]
+async fn context_size_flush_requeue_keeps_small_stop_redelivery_prepend() {
+    let StopRedeliveryFlush413 {
+        restored,
+        retry_text,
+        retry_blocks,
+        messages,
+        ..
+    } = stop_redelivery_flush_413_retry(
+        "stop-small",
+        "stopped before output",
+        [("queued follow-up", None), (&oversized_payload(), None)],
+    )
+    .await;
+
+    assert_eq!(
+        restored.len(),
+        2,
+        "entries restored individually: {restored:?}"
+    );
+    let head = &restored[0];
+    assert!(head.content.starts_with("queued follow-up"));
+    assert!(head.persisted, "small head keeps its durable row");
+    assert!(
+        head.prepend_content.is_none(),
+        "no duplicated redelivery on the head"
+    );
+    assert!(head.requeued_after_failure);
+    let tail = &restored[1];
+    assert!(
+        tail.content.starts_with("[Queued message of"),
+        "{}",
+        tail.content
+    );
+    assert!(!tail.persisted);
+    assert_eq!(
+        tail.prepend_content.as_deref(),
+        Some("stopped before output"),
+        "the armed redelivery rides the last entry"
+    );
+    assert!(
+        tail.prepend_image_blocks
+            .as_ref()
+            .and_then(Value::as_array)
+            .is_some_and(|b| b.iter().any(|b| b["data"] == json!("aGVsbG8="))),
+        "the redelivered image rides along: {:?}",
+        tail.prepend_image_blocks
+    );
+
+    let stop_pos = retry_text
+        .find("stopped before output")
+        .unwrap_or_else(|| panic!("retry redelivers the stopped message: {retry_text:?}"));
+    assert_eq!(
+        retry_text.matches("stopped before output").count(),
+        1,
+        "redelivered exactly once: {retry_text:?}"
+    );
+    let follow_pos = retry_text
+        .find("queued follow-up")
+        .expect("head entry in retry");
+    assert!(
+        stop_pos < follow_pos,
+        "stopped message precedes the batch: {retry_text:?}"
+    );
+    assert!(
+        retry_text.contains("[Queued message of"),
+        "marker reached the provider"
+    );
+    assert!(
+        !retry_text.contains("OVERSIZED-PAYLOAD-TOKEN"),
+        "the oversized payload never reaches the retry"
+    );
+    assert!(
+        retry_blocks.iter().any(|t| t == "image"),
+        "redelivered image reached the wire: {retry_blocks:?}"
+    );
+
+    assert_eq!(
+        user_rows_containing(&messages, "queued follow-up"),
+        1,
+        "{messages:?}"
+    );
+    assert_eq!(
+        user_rows_containing(&messages, "OVERSIZED-PAYLOAD-TOKEN"),
+        1
+    );
+    assert_eq!(user_rows_containing(&messages, "[Queued message of"), 1);
+    let assistant = messages
+        .iter()
+        .rfind(|m| m.role == "assistant")
+        .expect("retry output");
+    assert!(serde_json::to_string(&assistant.content)
+        .unwrap()
+        .contains("retry-delivered"));
+}
+
+/// An OVERSIZED stopped message armed for redelivery over a flush of two
+/// small entries: the 413 requeue swaps only the last entry's prepend for
+/// the marker (`content` + `persisted` untouched), the small siblings stay
+/// verbatim and ordered, and the retry prompt carries the marker instead of
+/// the payload.
+#[tokio::test]
+async fn context_size_flush_requeue_replaces_oversized_stop_redelivery_prepend() {
+    let payload = oversized_payload();
+    let StopRedeliveryFlush413 {
+        restored,
+        retry_text,
+        messages,
+        ..
+    } = stop_redelivery_flush_413_retry(
+        "stop-big",
+        &payload,
+        [("small first", None), ("small last", None)],
+    )
+    .await;
+
+    assert_eq!(
+        restored.len(),
+        2,
+        "entries restored individually: {restored:?}"
+    );
+    let head = &restored[0];
+    assert!(head.content.starts_with("small first"));
+    assert!(head.persisted);
+    assert!(head.prepend_content.is_none());
+    let tail = &restored[1];
+    assert!(tail.content.starts_with("small last"));
+    assert!(
+        tail.persisted,
+        "last entry keeps its durable row: only the prepend changed"
+    );
+    assert_eq!(
+        tail.prepend_content.as_deref(),
+        Some(super::context_size_requeue_marker(payload.chars().count()).as_str()),
+        "the oversized redelivery becomes the marker"
+    );
+
+    assert!(
+        !retry_text.contains("OVERSIZED-PAYLOAD-TOKEN"),
+        "{retry_text:?}"
+    );
+    let marker_pos = retry_text
+        .find("[Queued message of")
+        .expect("marker in retry prompt");
+    let first_pos = retry_text.find("small first").expect("head entry in retry");
+    let last_pos = retry_text.find("small last").expect("tail entry in retry");
+    assert!(
+        marker_pos < first_pos && first_pos < last_pos,
+        "marker, then the siblings in order: {retry_text:?}"
+    );
+    assert_eq!(
+        user_rows_containing(&messages, "small first"),
+        1,
+        "{messages:?}"
+    );
+    assert_eq!(user_rows_containing(&messages, "small last"), 1);
+    assert_eq!(
+        user_rows_containing(&messages, "OVERSIZED-PAYLOAD-TOKEN"),
+        1
+    );
+}
+
+/// The consumed stop redelivery rides the LAST flushed entry so the retry
+/// rebuilds the failed turn's aggregate prepend order: entry prepends in
+/// entry order, then the stop redelivery. Both flushed entries carry their
+/// own prepend here; attaching the redelivery to the head would reorder it
+/// ahead of the second entry's prepend on the retry.
+#[tokio::test]
+async fn context_size_flush_requeue_keeps_stop_redelivery_prepend_order() {
+    let StopRedeliveryFlush413 {
+        restored,
+        first_text,
+        retry_text,
+        ..
+    } = stop_redelivery_flush_413_retry(
+        "stop-order",
+        "stopped before output",
+        [
+            ("first body", Some("first own prepend")),
+            ("second body", Some("second own prepend")),
+        ],
+    )
+    .await;
+
+    assert_eq!(restored.len(), 2, "{restored:?}");
+    assert_eq!(
+        restored[0].prepend_content.as_deref(),
+        Some("first own prepend"),
+        "head keeps only its own prepend"
+    );
+    assert_eq!(
+        restored[1].prepend_content.as_deref(),
+        Some("second own prepend\n\nstopped before output"),
+        "the redelivery follows the last entry's own prepend"
+    );
+
+    let expected = "first own prepend\n\nsecond own prepend\n\nstopped before output";
+    assert!(
+        first_text.contains(expected),
+        "failed flush aggregate order: {first_text:?}"
+    );
+    assert!(
+        retry_text.contains(expected),
+        "retry preserves the aggregate order: {retry_text:?}"
+    );
+    let prepend_section = |text: &str| -> String {
+        let start = text.find("first own prepend").expect("prepend start");
+        let end = text.find("first body").expect("batch start");
+        assert!(start < end, "prepends precede the batch: {text:?}");
+        text[start..end].to_string()
+    };
+    assert_eq!(
+        prepend_section(&retry_text),
+        prepend_section(&first_text),
+        "retry prepend section matches the first attempt"
+    );
+    assert_eq!(
+        retry_text.matches("stopped before output").count(),
+        1,
+        "{retry_text:?}"
+    );
+    let body_first = retry_text.find("first body").unwrap();
+    let body_second = retry_text.find("second body").unwrap();
+    assert!(body_first < body_second, "{retry_text:?}");
+}
+
 /// Wire surface (monorepo#1022): the terminal `agent:failed` +
 /// `agent:stream:end` pair carries the failed turn's `turnId` when present,
 /// and omits the key entirely when absent (never `null`).

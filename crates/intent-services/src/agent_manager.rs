@@ -106,6 +106,15 @@ pub(crate) const AUTO_UNARCHIVE_NOTICE_TEXT: &str =
 pub(crate) const AUTO_UNARCHIVE_PROMPT_NOTICE: &str =
     "[SYSTEM NOTICE] This workspace was archived; it has been automatically unarchived because this message was sent.";
 
+/// Queued-message size (chars) above which a turn failing with a
+/// context-size error (HTTP 413, [`crate::is_context_size_error`]) is
+/// treated as the MESSAGE being too large rather than the accumulated
+/// context: `publish_error_status_and_requeue` then re-queues a short
+/// recovery marker in place of the payload so the retry can succeed instead
+/// of re-failing forever (intent-hq/intent#4703). Matches the hook dispatch
+/// message cap. Entries at or under the threshold re-queue unchanged.
+pub(crate) const CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS: usize = 32 * 1024;
+
 /// [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`] with an `INTENTD_DEQUEUE_WAIT_MIN_MS`
 /// env override (whole milliseconds). Primarily for tests/CI — the e2e
 /// suites park entries behind short (~2s) mock busy turns and assert the
@@ -497,6 +506,15 @@ pub struct TurnOptions {
     /// failure requeue) inserts it with interrupt priority — front of the
     /// queue, behind earlier interrupts (user decision, spec §Decisions).
     pub interrupt_priority: bool,
+    /// The individual queue entries a combined flush turn
+    /// ([`prepare_flush_turn`]) delivered as ONE prompt, in message order,
+    /// each carrying its post-flush `persisted` state. Set ONLY by the flush
+    /// path (`None` everywhere else) so a terminal-failure requeue can hand
+    /// the entries back individually instead of parking the wire-only
+    /// combined prompt as a single entry — which is what a context-size
+    /// failure needs: replace only the oversized entries with a recovery
+    /// marker and keep the small siblings intact (intent-hq/intent#4703).
+    pub(crate) flushed_entries: Option<Vec<QueuedMessage>>,
 }
 
 impl TurnOptions {
@@ -6852,19 +6870,35 @@ impl AgentManager {
         // the prepend TEXT (`history_covers_prepend`), same as the
         // preemption path; attachments are still emitted (history is
         // text-only).
+        // A combined flush turn also carries its entries for the per-entry
+        // context-size requeue (`flushed_entries`, intent-hq/intent#4703);
+        // that path restores the ENTRIES, not the aggregate options, so the
+        // payload is merged into the LAST entry as well — an individual
+        // restore then redelivers it exactly once, and the retry's next
+        // flush rebuilds the same aggregate order as this turn (entry
+        // prepends in entry order, then the stop redelivery) instead of
+        // losing it with the discarded aggregate prepend.
         let armed = self.stop_redelivery.lock().unwrap().remove(&agent_id);
         let consumed_redelivery = armed.is_some();
         if let Some(armed) = armed {
-            if let Some(text) = armed.content.filter(|t| !t.is_empty()) {
-                options.prepend_content = Some(match options.prepend_content.take() {
-                    Some(existing) if !existing.is_empty() => format!("{existing}\n\n{text}"),
-                    _ => text,
-                });
+            if let Some(last) = options
+                .flushed_entries
+                .as_mut()
+                .and_then(|entries| entries.last_mut())
+            {
+                merge_prepend_payload(
+                    &mut last.prepend_content,
+                    &mut last.prepend_image_blocks,
+                    &mut last.prepend_file_blocks,
+                    armed.clone(),
+                );
             }
-            options.prepend_image_blocks =
-                merge_block_arrays(options.prepend_image_blocks.take(), armed.image_blocks);
-            options.prepend_file_blocks =
-                merge_block_arrays(options.prepend_file_blocks.take(), armed.file_blocks);
+            merge_prepend_payload(
+                &mut options.prepend_content,
+                &mut options.prepend_image_blocks,
+                &mut options.prepend_file_blocks,
+                armed,
+            );
         }
         let mgr = self.clone();
         let id = agent_id.clone();
@@ -8605,6 +8639,26 @@ fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Val
     }
 }
 
+/// Merge a consumed zero-output stop-redelivery payload
+/// (intent-hq/monorepo#1757) into a `prepend_*` triple: an existing prepend
+/// text stays FIRST (the armed row is the newest prepend payload) and the
+/// block arrays concatenate in the same order.
+fn merge_prepend_payload(
+    prepend_content: &mut Option<String>,
+    prepend_image_blocks: &mut Option<Value>,
+    prepend_file_blocks: &mut Option<Value>,
+    armed: crate::agent_ops::QueuedPrepend,
+) {
+    if let Some(text) = armed.content.filter(|t| !t.is_empty()) {
+        *prepend_content = Some(match prepend_content.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}\n\n{text}"),
+            _ => text,
+        });
+    }
+    *prepend_image_blocks = merge_block_arrays(prepend_image_blocks.take(), armed.image_blocks);
+    *prepend_file_blocks = merge_block_arrays(prepend_file_blocks.take(), armed.file_blocks);
+}
+
 /// Push one `image` content block per well-formed `{ data, mimeType }` entry.
 fn push_image_blocks(blocks: &mut Vec<ContentBlock>, image_blocks: Option<&Value>) {
     if let Some(imgs) = image_blocks.and_then(Value::as_array) {
@@ -8640,6 +8694,55 @@ pub(crate) fn attachment_reference_notice(
     id: &str,
 ) -> String {
     crate::harness::latest().attachment_reference_notice(name, mime, size, id)
+}
+
+/// The recovery marker that replaces an oversized queue entry after a
+/// context-size turn failure (see [`CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`]).
+/// Wording owned by the harness (H6).
+pub(crate) fn context_size_requeue_marker(original_chars: usize) -> String {
+    crate::harness::latest().context_size_requeue_marker(original_chars)
+}
+
+/// The `(content, persisted, prepend_content)` a queue entry re-queues with
+/// after a context-size turn failure (intent-hq/intent#4703). `content` and
+/// `prepend_content` are measured SEPARATELY against
+/// [`CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`]: an oversized `content` becomes
+/// the recovery marker with `persisted` forced to `false` (the retry drain
+/// must append the marker as the turn's user row); an oversized
+/// `prepend_content` becomes the marker with `persisted` untouched (the
+/// prepend is prompt-only, its row is already durable). Payloads at or
+/// under the threshold pass through verbatim.
+fn requeue_payload_after_context_failure(
+    agent_id: &AgentId,
+    content: &str,
+    persisted: bool,
+    prepend_content: Option<&str>,
+) -> (String, bool, Option<String>) {
+    let content_chars = content.chars().count();
+    let (content, persisted) = if content_chars > CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS {
+        tracing::warn!(
+            agent = %agent_id,
+            chars = content_chars,
+            "context-size turn failure on an oversized queued message; requeueing a recovery marker instead of the payload"
+        );
+        (context_size_requeue_marker(content_chars), false)
+    } else {
+        (content.to_string(), persisted)
+    };
+    let prepend_content = prepend_content.map(|prepend| {
+        let prepend_chars = prepend.chars().count();
+        if prepend_chars > CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS {
+            tracing::warn!(
+                agent = %agent_id,
+                chars = prepend_chars,
+                "context-size turn failure on an oversized prepended message; requeueing a recovery marker instead of the payload"
+            );
+            context_size_requeue_marker(prepend_chars)
+        } else {
+            prepend.to_string()
+        }
+    });
+    (content, persisted, prepend_content)
 }
 
 /// Push one content block per well-formed file entry: inline
@@ -10337,6 +10440,9 @@ async fn prepare_flush_turn(
         turn_id: Some(entries[0].turn_id.clone()),
         interrupt_priority: entries[0].interrupt_priority,
         origin: origin_from_user_flag(entries.iter().any(|m| m.user_origin)),
+        // Every entry is `persisted: true` here (the loop above either set
+        // it or returned Parked), so a per-entry requeue never re-appends.
+        flushed_entries: Some(entries),
         ..TurnOptions::default()
     };
     FlushPrep::Turn {
@@ -11018,28 +11124,103 @@ async fn publish_error_status_and_requeue(
     // `id` but keeps the failed turn's ORIGINAL `turn_id` (monorepo#1022) so
     // the retry correlates with the turn it redrives; a missing option (bare
     // test wiring — spawn_worker always mints one) falls back to the new id.
-    let id = new_message_id();
-    let queued = crate::agent_ops::QueuedMessage {
-        turn_id: options.turn_id.clone().unwrap_or_else(|| id.clone()),
-        id,
-        content: content.to_string(),
-        image_blocks: options.image_blocks.clone(),
-        file_blocks: options.file_blocks.clone(),
-        queued_at: options.queued_at.clone().unwrap_or_else(now_iso),
-        editing: false,
-        persisted,
-        requeued_after_failure: true,
-        message_metadata: options.message_metadata.clone(),
-        prepend_content: options.prepend_content.clone(),
-        prepend_image_blocks: options.prepend_image_blocks.clone(),
-        prepend_file_blocks: options.prepend_file_blocks.clone(),
-        interrupt_priority: options.interrupt_priority,
-        user_origin: options.origin.is_user(),
-        hold_kind: None,
-        hold_until: None,
-        child_agent_id: None,
-    };
-    mgr.services.requeue_front(agent_id, queued);
+    //
+    // Context-size failure on an oversized entry (intent-hq/intent#4703): a
+    // 413 against a payload above `CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`
+    // means the MESSAGE itself cannot fit, so re-queueing it verbatim would
+    // re-fail every retry and wedge the queue (hook payloads have no sender
+    // who could remove the entry). The content is replaced with a short
+    // recovery marker naming the dropped size, and `persisted` is forced to
+    // `false` so the retry drain appends the MARKER as the turn's user row
+    // and sends it to the provider — with `true` the drain would skip the
+    // append and the transcript would show the original text for a turn the
+    // provider never saw. The original row (when it was persisted) stays in
+    // the transcript untouched. A small entry that hits a 413 is the
+    // accumulated context's problem, not the message's: it re-queues
+    // unchanged and the identical-failure streak escalates as today.
+    // `content` and `prepend_content` are measured SEPARATELY: the prepend
+    // is prompt-only (its row is already persisted), so an oversized prepend
+    // is swapped for the marker without touching `persisted`.
+    //
+    // A combined flush turn (`options.flushed_entries`, `prepare_flush_turn`)
+    // delivered N entries as ONE prompt. On a context-size failure the
+    // entries are restored INDIVIDUALLY at the queue front in original
+    // order, each keeping its own id / `turn_id` / `queued_at` / metadata /
+    // `persisted` state, and only the entries above the threshold are
+    // replaced with the marker — so one oversized hook payload never takes
+    // its small siblings down with it, and a batch of small entries whose
+    // SUM exceeded the limit keeps every payload verbatim (the next flush
+    // still combines them; the per-entry drain never lost them). A stop
+    // redelivery consumed by the flush turn (`spawn_worker`) rides the LAST
+    // entry's `prepend_*`, so it is measured and restored with that entry
+    // — keeping the aggregate prepend order on the retry — rather than
+    // lost with the aggregate options. Any other failure on a
+    // flush turn requeues the combined prompt as ONE entry, exactly as
+    // before.
+    let context_size_failure = crate::is_context_size_error(error_text);
+    if let Some(entries) = options
+        .flushed_entries
+        .as_ref()
+        .filter(|entries| context_size_failure && !entries.is_empty())
+    {
+        let restored: Vec<crate::agent_ops::QueuedMessage> = entries
+            .iter()
+            .map(|entry| {
+                let (content, persisted, prepend_content) = requeue_payload_after_context_failure(
+                    agent_id,
+                    &entry.content,
+                    entry.persisted,
+                    entry.prepend_content.as_deref(),
+                );
+                crate::agent_ops::QueuedMessage {
+                    content,
+                    persisted,
+                    prepend_content,
+                    requeued_after_failure: true,
+                    editing: false,
+                    ..entry.clone()
+                }
+            })
+            .collect();
+        mgr.services.requeue_front_batch(agent_id, restored);
+    } else {
+        let (content, persisted, prepend_content) = if context_size_failure {
+            requeue_payload_after_context_failure(
+                agent_id,
+                content,
+                persisted,
+                options.prepend_content.as_deref(),
+            )
+        } else {
+            (
+                content.to_string(),
+                persisted,
+                options.prepend_content.clone(),
+            )
+        };
+        let id = new_message_id();
+        let queued = crate::agent_ops::QueuedMessage {
+            turn_id: options.turn_id.clone().unwrap_or_else(|| id.clone()),
+            id,
+            content,
+            image_blocks: options.image_blocks.clone(),
+            file_blocks: options.file_blocks.clone(),
+            queued_at: options.queued_at.clone().unwrap_or_else(now_iso),
+            editing: false,
+            persisted,
+            requeued_after_failure: true,
+            message_metadata: options.message_metadata.clone(),
+            prepend_content,
+            prepend_image_blocks: options.prepend_image_blocks.clone(),
+            prepend_file_blocks: options.prepend_file_blocks.clone(),
+            interrupt_priority: options.interrupt_priority,
+            user_origin: options.origin.is_user(),
+            hold_kind: None,
+            hold_until: None,
+            child_agent_id: None,
+        };
+        mgr.services.requeue_front(agent_id, queued);
+    }
 
     // Publish queue updated so FE reflects the requeued message
     mgr.services

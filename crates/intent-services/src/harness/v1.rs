@@ -528,6 +528,15 @@ impl Harness for V1 {
         )
     }
 
+    fn context_size_requeue_marker(&self, original_chars: usize) -> String {
+        format!(
+            "[Queued message of {original_chars} chars was dropped: the turn failed because \
+             the message was too large for the model (HTTP 413). The original content is not \
+             retained in the queue; re-obtain it from its source (e.g. ws.script.output / \
+             ws.host.exec) in bounded form.]"
+        )
+    }
+
     fn completion_wake(&self, params: &ChildSettlementParams<'_>, watch_retired: bool) -> String {
         let kind = settlement_kind(params.event_type);
         let label = child_label(params);
@@ -757,6 +766,19 @@ impl Harness for V1 {
         format!(
             "[hook state dropped: {state_bytes} bytes exceeds the {cap_bytes}-byte cap; \
              previous state kept]"
+        )
+    }
+
+    fn hook_wake_message_truncated_marker(
+        &self,
+        omitted_chars: usize,
+        total_chars: usize,
+        cap_chars: usize,
+    ) -> String {
+        format!(
+            "\n[hook message truncated: {omitted_chars} of {total_chars} chars omitted past the \
+             {cap_chars}-char cap — have the hook dispatch a summary and read the full data \
+             directly]"
         )
     }
 

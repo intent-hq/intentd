@@ -214,6 +214,10 @@ pub(crate) trait Harness: Send + Sync {
         size: Option<u64>,
         id: &str,
     ) -> String;
+    /// `[Queued message of N chars was dropped: …]` recovery marker that
+    /// replaces an oversized queue entry whose turn failed with a
+    /// context-size error (HTTP 413), so the retry can succeed.
+    fn context_size_requeue_marker(&self, original_chars: usize) -> String;
 
     // --- Completion / group / watch wakes (`lib.rs`, `agent_ops.rs`) ---
 
@@ -271,6 +275,14 @@ pub(crate) trait Harness: Send + Sync {
     fn hook_wake_logs_section(&self, message: &str, logs: Option<&str>) -> String;
     /// Log-line warning for a returned hook `state` exceeding the byte cap.
     fn hook_state_dropped_warning(&self, state_bytes: usize, cap_bytes: usize) -> String;
+    /// Trailing marker appended to a dispatch message (or eviction error
+    /// text) that was head-truncated to the wake-message char cap.
+    fn hook_wake_message_truncated_marker(
+        &self,
+        omitted_chars: usize,
+        total_chars: usize,
+        cap_chars: usize,
+    ) -> String;
     /// Diagnostic summary for a run whose `ws.host.exec` calls failed
     /// (nonzero exit / timeout) without the script throwing — persisted to
     /// `lastError` so silent check failures stay observable (monorepo#3231).
