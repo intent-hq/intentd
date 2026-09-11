@@ -672,6 +672,102 @@ async fn tunnel_idle_stream_times_out_with_close() {
     srv.ws.stop().await;
 }
 
+/// A non-reading target must not park the shared mux behind its full queue.
+/// Exercise the actual pinned WSS path, including a ping and a sibling echo.
+#[tokio::test]
+async fn tunnel_stalled_upload_does_not_block_sibling_or_ping() {
+    let srv = start().await;
+    let socket = TcpSocket::new_v4().expect("socket");
+    socket
+        .set_recv_buffer_size(1024)
+        .expect("small receive window");
+    socket.bind((Ipv4Addr::LOCALHOST, 0).into()).expect("bind");
+    let listener = socket.listen(1).expect("listen");
+    let port = listener.local_addr().expect("addr").port();
+    let echo_port = spawn_echo_listener().await;
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    send_frame(&mut ws, Frame::Open { stream_id: 1, port }).await;
+    assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id: 1 });
+    // Hold the accepted socket without reading until the test is over.
+    let (_stalled, _) = listener.accept().await.expect("accept");
+    send_frame(
+        &mut ws,
+        Frame::Open {
+            stream_id: 2,
+            port: echo_port,
+        },
+    )
+    .await;
+    assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id: 2 });
+
+    let (mut writer, mut reader) = ws.split();
+    let outcome = tokio::time::timeout(common::test_timeout(Duration::from_secs(5)), async {
+        let send = async {
+            // Exceed the 32-frame queue plus the kernel send buffer. Each
+            // frame remains within the existing 1 MiB protocol payload cap.
+            for _ in 0..48 {
+                writer
+                    .send(Message::Binary(
+                        Frame::Data {
+                            stream_id: 1,
+                            payload: vec![0; 1024 * 1024],
+                        }
+                        .encode()
+                        .into(),
+                    ))
+                    .await
+                    .expect("upload");
+            }
+            writer
+                .send(Message::Ping(b"sibling-progress".to_vec().into()))
+                .await
+                .expect("ping");
+            writer
+                .send(Message::Binary(
+                    Frame::Data {
+                        stream_id: 2,
+                        payload: b"still responsive".to_vec(),
+                    }
+                    .encode()
+                    .into(),
+                ))
+                .await
+                .expect("sibling request");
+        };
+        let receive = async {
+            let (mut closed, mut pong, mut echoed) = (false, false, Vec::new());
+            while !closed || !pong || echoed != b"still responsive" {
+                match reader
+                    .next()
+                    .await
+                    .expect("connection remains open")
+                    .expect("read")
+                {
+                    Message::Pong(payload) => {
+                        assert_eq!(payload.as_ref(), b"sibling-progress");
+                        pong = true;
+                    }
+                    Message::Binary(bytes) => match Frame::decode(&bytes).expect("frame") {
+                        Frame::Close { stream_id: 1 } => closed = true,
+                        Frame::Data {
+                            stream_id: 2,
+                            payload,
+                        } => echoed.extend(payload),
+                        other => panic!("unexpected frame: {other:?}"),
+                    },
+                    other => panic!("unexpected message: {other:?}"),
+                }
+            }
+        };
+        tokio::join!(send, receive);
+    })
+    .await;
+    drop(writer);
+    drop(reader);
+    srv.ws.stop().await;
+    outcome.expect("stalled stream must not delay sibling traffic or pongs");
+}
+
 /// The daemon-side TCP connect deadline answers `OPEN_ERR` naming the
 /// timeout. A firewalled/blackholed port is simulated with a bound listener
 /// whose backlog is exhausted; if the connect happens to be accepted by the

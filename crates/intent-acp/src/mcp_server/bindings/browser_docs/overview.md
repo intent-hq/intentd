@@ -245,4 +245,10 @@ lazily reconnects on the next inbound connection.
   dropping on transport changes or after idling); if a previously returned `localPort`
   refuses connections there, re-open with `openTunnel { remotePort }`.
 
+Do not persist or guess a client `localPort` across app restarts. To recover an ordinary
+Chrome link, find the preview's stable `requestedUrl` in `listTabs`, read its daemon-side
+port, call idempotent `openTunnel { remotePort }`, and use the returned current
+`http://127.0.0.1:<localPort>` URL. This works whether the previous forward survived or
+had to be re-created.
+
 Use `browser_docs` with topic="capture" or topic="examples" for detailed usage.

@@ -266,6 +266,13 @@ listener, so there `openTunnel` fails with an explanatory error.)
 // → { remotePort: 8000, closed: true }
 ```
 
+To recover a link for ordinary Chrome after an app or tunnel restart, do not reuse a
+remembered client port. Use `listTabs` to find the preview by its stable `requestedUrl`
+(for example `http://daemon.localhost:8000`), then call `openTunnel` with that URL's
+daemon-side port. Open `http://127.0.0.1:<localPort>` using the port returned by the
+current call. Because `openTunnel` is idempotent, this safely returns an existing live
+forward or creates its replacement.
+
 Lifecycle: forwards are persistent — a forward keeps its `localPort` for the Electron
 app's lifetime and survives transient daemon-connection drops (it lazily reconnects on
 the next inbound connection). It is closed only by an explicit `closeTunnel`, a daemon
