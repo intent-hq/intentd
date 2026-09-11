@@ -500,7 +500,10 @@ fn is_expired(expires_at: Option<&str>, skew_ms: i64) -> bool {
 /// `is_sub_agent` mirrors the owning session's bridge derivation
 /// (`parent_agent_id.is_some() || is_background`): a sub-agent-owned hook
 /// gets the same `ws.app.question.*` pruning + top-level-only dispatch
-/// denial its `workspace_api` bridge would apply.
+/// denial its `workspace_api` bridge would apply. `timeout` is the run's
+/// eval budget and is threaded to the bindings so `ws.script.run` derives
+/// its `timeoutSeconds` ceiling from the hook budget, not the `workspace_api`
+/// default.
 /// Never panics; every failure mode folds into [`RunOutcome::Failed`].
 async fn run_hook_script(
     api: Arc<dyn WorkspaceApi>,
@@ -516,6 +519,7 @@ async fn run_hook_script(
         None,
         agent_features.clone(),
         is_sub_agent,
+        timeout,
     );
     // Same `{__k, __v}` envelope as the `workspace_api` dispatch so an
     // `undefined` return (no dispatch) survives the JSON bridge, extended
@@ -3085,6 +3089,82 @@ mod tests {
         assert!(err.to_string().contains("boom"), "{err}");
         let hooks = svc.store().list_hooks_by_agent(&owner).await.unwrap();
         assert!(hooks.is_empty(), "failed validation run persists nothing");
+    }
+
+    // The hook bridge threads the hook eval budget (60s by default) into the
+    // bindings, so `ws.script.run`'s `timeoutSeconds` ceiling is budget − 5s
+    // = 55s — not the 25s the `workspace_api` default budget would give. The
+    // nonexistent script id never spawns anything: the ceiling check fires
+    // before the service call, so the schedule-time validation run fails
+    // immediately with the rejection text.
+    #[tokio::test]
+    async fn hook_script_run_ceiling_follows_default_hook_budget() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "over-budget-run",
+                    "code": "return await ws.script.run('no-such-script', { timeoutSeconds: 56 })",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("first run failed"), "{text}");
+        assert!(text.contains("timeoutSeconds 56 exceeds"), "{text}");
+        assert!(text.contains("ceiling 55s, budget 60s"), "{text}");
+    }
+
+    // Right at the hook ceiling (55s) the request is NOT rejected by the
+    // budget check: the call reaches the service layer, which fails on the
+    // unknown script id instead — proving the ceiling moved past the 25s
+    // `workspace_api` default without waiting 55s for a real process.
+    #[tokio::test]
+    async fn hook_script_run_at_hook_ceiling_reaches_service_layer() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "at-ceiling-run",
+                    "code": "return await ws.script.run('no-such-script', { timeoutSeconds: 55 })",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("first run failed"), "{text}");
+        assert!(!text.contains("exceeds"), "{text}");
+        assert!(text.contains("no-such-script"), "{text}");
+    }
+
+    // The ceiling tracks the injected hook eval budget, not a constant: with
+    // a 20s budget the ceiling is 15s and 16s is rejected with the budget
+    // named in the message.
+    #[tokio::test]
+    async fn hook_script_run_ceiling_follows_overridden_hook_budget() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let svc = svc.with_hook_eval_timeout(Duration::from_secs(20));
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "over-short-budget-run",
+                    "code": "return await ws.script.run('no-such-script', { timeoutSeconds: 16 })",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("timeoutSeconds 16 exceeds"), "{text}");
+        assert!(text.contains("ceiling 15s, budget 20s"), "{text}");
     }
 
     #[tokio::test]

@@ -363,11 +363,27 @@ pub struct Services {
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
     /// with the end-to-end orchestration flow; the queue surface itself is here.
     agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Entries a drain arm has popped from `agent_queues` but whose user rows
+    /// are not yet persisted (PROTOCOL §6.5 drain ordering). Client-visible
+    /// snapshots ([`agent_ops::Services::queue_snapshot`]) keep listing them
+    /// ahead of the live queue until the owning [`agent_ops::DrainingGuard`]
+    /// is dropped, so an unrelated concurrent mutation's `agent:queue:updated`
+    /// never shows the entry gone before its row exists. Never persisted.
+    /// Lock order: this mutex is taken BEFORE `agent_queues`, never after.
+    draining_queue_entries: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
     /// Serializes [`agent_ops`] queue write-through persists. Each persist
     /// snapshots the live queue *inside* this async lock, so the last write to
     /// the `agent_queue` table always reflects the newest in-memory state — an
     /// older snapshot can never overwrite a newer one out of mutation order.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes every `agent:queue:updated` publish
+    /// ([`agent_ops::Services::publish_queue_event`]): the snapshot is read
+    /// *inside* this async lock, immediately before the bus write, so a
+    /// publisher that paused (on the persist gate, on a store await) can
+    /// never emit a snapshot older than a mutation that completed before it
+    /// published — no pre-enqueue snapshot omitting a newer draining entry,
+    /// no old overlay copy arriving after the settled shrink.
+    agent_queue_publish_gate: Arc<tokio::sync::Mutex<()>>,
     /// Serializes `workspace.setBrowserClient` write + `workspace:updated`
     /// publish so concurrent setters never emit deltas out of order relative
     /// to the durable pin; the delta is read back from the committed row.
@@ -1123,7 +1139,9 @@ impl Services {
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
+            draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_tab_gate: Arc::new(tokio::sync::Mutex::new(())),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
@@ -26189,10 +26207,17 @@ impl WorkspaceApi for Services {
         content: String,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_queue_message_op(agent_id, content, image_blocks, file_blocks)
-                .await
+            self.agent_queue_message_op(
+                agent_id,
+                content,
+                image_blocks,
+                file_blocks,
+                message_metadata,
+            )
+            .await
         })
     }
 

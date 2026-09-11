@@ -1972,17 +1972,26 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `agent.queueMessage`: explicitly enqueue a message; `{ success,
     /// queuedMessage }` where `queuedMessage` is `{ id, content, queuedAt,
-    /// position, imageBlocks?, fileBlocks? }` (PROTOCOL §5.5). Attachment
-    /// arrays are preserved on the queued entry so the drained turn carries
-    /// the same blocks.
+    /// position, imageBlocks?, fileBlocks?, messageMetadata? }` (PROTOCOL
+    /// §5.5). Attachment arrays and the caller's `messageMetadata` are
+    /// preserved on the queued entry so the drained turn carries the same
+    /// blocks and the drain-time persist writes the same row metadata (a
+    /// queued `question_answers` answer resolves the pending question set).
     fn agent_queue_message(
         &self,
         agent_id: AgentId,
         content: String,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, content, image_blocks, file_blocks);
+        let _ = (
+            agent_id,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_queue_message not implemented".to_string(),

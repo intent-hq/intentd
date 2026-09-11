@@ -354,6 +354,8 @@ struct FlushSetup {
     rpc: common::TlsWs,
     agent_id: String,
     prompt_log: PathBuf,
+    /// Queue entry ids of `QUEUED_ONE` / `QUEUED_TWO`, in queue order.
+    queued_ids: [String; 2],
 }
 
 async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> FlushSetup {
@@ -448,6 +450,14 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
     )
     .await;
     assert_eq!(q2["success"], true, "queue two: {q2}");
+    let entry_id = |resp: &Value| {
+        resp["queuedMessage"]["id"]
+            .as_str()
+            .expect("queueMessage returns the entry id")
+            .to_string()
+    };
+    let queued_ids = [entry_id(&q1), entry_id(&q2)];
+    assert_ne!(queued_ids[0], queued_ids[1], "distinct entry ids");
 
     let queue = wss_rpc(
         &mut rpc,
@@ -460,6 +470,8 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
     assert_eq!(entries.len(), 2, "both messages queued mid-turn: {queue}");
     assert_eq!(entries[0]["content"], json!(QUEUED_ONE));
     assert_eq!(entries[1]["content"], json!(QUEUED_TWO));
+    assert_eq!(entries[0]["id"], json!(queued_ids[0]));
+    assert_eq!(entries[1]["id"], json!(queued_ids[1]));
 
     FlushSetup {
         _daemon: daemon,
@@ -467,6 +479,7 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
         rpc,
         agent_id,
         prompt_log,
+        queued_ids,
     }
 }
 
@@ -527,11 +540,14 @@ fn user_row_texts(conv: &Value) -> Vec<String> {
 /// been seen (kick-off turn + drained turn(s)), recording every non-empty
 /// `agent:queue:updated` queue length, every `agent:queue:processing`
 /// `turnId`, and the `turnId` of every user-row `agent:message` echo (the
-/// kick-off send's echo carries its own turn's id, so it appears first).
+/// kick-off send's echo carries its own turn's id, so it appears first),
+/// plus each user-row echo's drain identity link `queuedMessageId`
+/// (intentd#1783; `None` for the direct-send kick-off echo).
 struct DrainObservation {
     queue_lengths: Vec<usize>,
     processing_turn_ids: Vec<String>,
     user_row_turn_ids: Vec<String>,
+    user_row_queued_message_ids: Vec<Option<String>>,
 }
 
 async fn observe_drain(
@@ -542,6 +558,7 @@ async fn observe_drain(
     let mut queue_lengths = Vec::new();
     let mut processing_turn_ids = Vec::new();
     let mut user_row_turn_ids = Vec::new();
+    let mut user_row_queued_message_ids = Vec::new();
     let mut stream_ends = 0usize;
     for _ in 0..400 {
         let frame = wss_event(sub, 30).await;
@@ -567,6 +584,11 @@ async fn observe_drain(
                     if let Some(tid) = event["data"]["turnId"].as_str() {
                         user_row_turn_ids.push(tid.to_string());
                     }
+                    user_row_queued_message_ids.push(
+                        event["data"]["queuedMessageId"]
+                            .as_str()
+                            .map(str::to_string),
+                    );
                 }
             }
             Some("agent:stream:end") => {
@@ -586,6 +608,7 @@ async fn observe_drain(
         queue_lengths,
         processing_turn_ids,
         user_row_turn_ids,
+        user_row_queued_message_ids,
     }
 }
 
@@ -620,6 +643,11 @@ fn shrink_lengths(queue_lengths: &[usize]) -> &[usize] {
 /// 5. Batch grouping: both flushed rows carry the SAME
 ///    `metadata.queueInfo.batchId` on `agent.getConversation`; the direct
 ///    kick-off row carries none.
+/// 6. Drain identity link (intentd#1783): the two flushed rows carry
+///    DISTINCT `metadata.queueInfo.queuedMessageId`s — each its own queue
+///    entry's id, in queue order — and each row's `agent:message` echo
+///    lifts the same id as `queuedMessageId`; the kick-off row/echo carry
+///    none.
 #[tokio::test]
 async fn flush_combines_queued_messages_into_one_turn_over_wss() {
     let Some(script) = gate("WSS queued-message flush E2E") else {
@@ -758,6 +786,30 @@ async fn flush_combines_queued_messages_into_one_turn_over_wss() {
     assert!(
         row(KICKOFF_MSG)["metadata"]["queueInfo"]["batchId"].is_null(),
         "the direct-send kick-off row carries no batchId"
+    );
+
+    // (6) Drain identity link: each flushed row names ITS OWN queue entry
+    // (distinct ids, queue order), next to the shared batchId; each row's
+    // echo lifted the same id; the kick-off row/echo carry none.
+    let [one_id, two_id] = &setup.queued_ids;
+    assert_eq!(
+        row(QUEUED_ONE)["metadata"]["queueInfo"]["queuedMessageId"],
+        json!(one_id),
+        "first flushed row links its own entry"
+    );
+    assert_eq!(
+        row(QUEUED_TWO)["metadata"]["queueInfo"]["queuedMessageId"],
+        json!(two_id),
+        "second flushed row links its own entry"
+    );
+    assert!(
+        row(KICKOFF_MSG)["metadata"]["queueInfo"]["queuedMessageId"].is_null(),
+        "the direct-send kick-off row carries no queuedMessageId"
+    );
+    assert_eq!(
+        obs.user_row_queued_message_ids,
+        vec![None, Some(one_id.clone()), Some(two_id.clone())],
+        "kick-off echo unlinked; each flushed echo lifts its own entry id"
     );
 
     // Queue is empty after the flush.

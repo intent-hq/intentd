@@ -1144,6 +1144,44 @@ impl QueuedMessage {
     }
 }
 
+/// Keeps one or more popped queue entries listed in every client-visible
+/// queue snapshot ([`Services::queue_snapshot`]) from dequeue until the
+/// drain arm has persisted their user rows (PROTOCOL §6.5 drain ordering).
+/// Dropping the guard retires the entries from the overlay — on the settled
+/// path right before the shrunk `agent:queue:updated` is published, on every
+/// hand-back / failure path at scope exit, and when an aborted worker's
+/// future is dropped mid-drain, so no ghost entry ever outlives its arm.
+#[must_use = "drop the guard only once the drained rows are persisted"]
+pub(crate) struct DrainingGuard {
+    overlay: Arc<Mutex<HashMap<AgentId, Vec<QueuedMessage>>>>,
+    agent_id: AgentId,
+    ids: Vec<String>,
+}
+
+impl DrainingGuard {
+    /// Fold `other`'s entries into this guard so one drop retires them all
+    /// (a single popped entry folded into a batch flush behind it).
+    pub(crate) fn merge(&mut self, mut other: DrainingGuard) {
+        debug_assert_eq!(self.agent_id, other.agent_id);
+        self.ids.append(&mut other.ids);
+    }
+}
+
+impl Drop for DrainingGuard {
+    fn drop(&mut self) {
+        let mut overlay = self
+            .overlay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entries) = overlay.get_mut(&self.agent_id) {
+            entries.retain(|m| !self.ids.contains(&m.id));
+            if entries.is_empty() {
+                overlay.remove(&self.agent_id);
+            }
+        }
+    }
+}
+
 /// Combined-delivery carry-over bundle (monorepo#1014 / monorepo#1034): the
 /// preempted message's content threaded from the caller's `TurnOptions` into
 /// an enqueued entry, so the queue-fallback paths (concurrent-send slot race,
@@ -1686,6 +1724,10 @@ pub(crate) fn new_message_id() -> String {
 /// pre-existing three-field shape (backward compatible). `turn_id` is the
 /// turn correlation id (monorepo#1022) — present on user-row echoes emitted
 /// by a turn that carries one, omitted otherwise (never `null`).
+/// `queuedMessageId` is the drain identity link (intent-hq/intentd#1783):
+/// lifted from the row's `metadata.queueInfo.queuedMessageId` stamp so a
+/// queue-drained user row names the entry it drained from on the echo
+/// itself; omitted for rows without the stamp (never `null`).
 pub(crate) fn agent_message_event_payload(
     agent_id: &AgentId,
     message: &AgentMessage,
@@ -1701,6 +1743,15 @@ pub(crate) fn agent_message_event_payload(
     }
     if let Some(tid) = turn_id {
         payload["turnId"] = json!(tid);
+    }
+    if let Some(qid) = message
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("queueInfo"))
+        .and_then(|q| q.get("queuedMessageId"))
+        .and_then(Value::as_str)
+    {
+        payload["queuedMessageId"] = json!(qid);
     }
     payload
 }
@@ -5539,13 +5590,17 @@ impl Services {
     /// `agent:queue:updated`, and asks the runtime [`AgentManager`] (when attached)
     /// to drain the queue immediately if the agent is idle — closing the bug where
     /// a queued message would never be sent because the BE only drained the queue
-    /// from a live worker loop.
+    /// from a live worker loop. `message_metadata` (already
+    /// attribution-stripped by the router) is captured on the entry so the
+    /// drain-time persist writes it onto the user row — a queued
+    /// `question_answers` answer thereby resolves the pending question set.
     pub(crate) async fn agent_queue_message_op(
         &self,
         agent_id: AgentId,
         content: String,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
     ) -> Result<Value> {
         // Attachment-reference validation (PROTOCOL §5.5) before any state
         // change, matching `agent.sendMessage`.
@@ -5562,7 +5617,7 @@ impl Services {
             content,
             image_blocks,
             file_blocks,
-            None,
+            message_metadata,
             None,
             false,
             true,
@@ -6051,7 +6106,11 @@ impl Services {
     /// ("queued message not found") with NO side effects, so the client knows
     /// the atomic send did not happen. On a persist failure the entry is
     /// restored at the FRONT of the queue before the error surfaces — the
-    /// transactional guarantee that the message is never lost.
+    /// transactional guarantee that the message is never lost. Same §6.5
+    /// drain ordering as the runtime path: the shrunk `agent:queue:updated`
+    /// is published only after the user row is persisted (and the entry stays
+    /// listed in every snapshot until then), and the row carries the
+    /// `queueInfo.queuedMessageId` identity link.
     pub(crate) async fn agent_send_queued_message_now_op(
         &self,
         agent_id: AgentId,
@@ -6060,16 +6119,26 @@ impl Services {
         // Fail closed on a nonexistent target BEFORE touching the queue
         // (monorepo#564).
         let session = self.require_agent_session(&agent_id).await?;
-        let entry = self
-            .take_queued_message(&agent_id, &message_id)
+        let workspace_id = session.workspace_id.clone();
+        // Atomic dequeue; the entry stays listed in queue snapshots (§6.5
+        // drain ordering) until `draining` is dropped right before the shrunk
+        // publish below.
+        let (mut entry, draining) = self
+            .take_queued_message_draining(&agent_id, &message_id)
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
-        // Publish the shrunk snapshot (write-through persist inside).
-        self.publish_queue_updated(&agent_id).await;
+        // Identity link: parity with the runtime path.
+        crate::agent_manager::stamp_queued_message_id(&mut entry);
+        // Durable shrink now; the shrunk `agent:queue:updated` is published
+        // only after the user row below is persisted (§6.5 drain ordering).
+        self.persist_queue_snapshot(&agent_id).await;
         // A terminal-failure requeue whose user row already reached the
         // transcript must not double-append (STAB-112).
         if entry.persisted {
+            drop(draining);
+            self.publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+                .await;
             return Ok(json!({ "success": true, "queued": false, "messageId": entry.id }));
         }
         // Delivery-time unblocked hints (monorepo#2044): on the no-manager
@@ -6077,7 +6146,6 @@ impl Services {
         // — parity with the manager's `send_queued_message_now` and the
         // store-only `deliver_parent_wake` branch. Same idempotency guard:
         // a content that already carries the section is never re-annotated.
-        let mut entry = entry;
         if !entry
             .content
             .contains(ready_delta::UNBLOCKED_SECTION_PREFIX)
@@ -6115,18 +6183,20 @@ impl Services {
             Ok(message) => message,
             Err(e) => {
                 // Transactional guarantee: restore the entry at the front so
-                // the message is never lost, then surface the failure.
+                // the message is never lost, then surface the failure. No
+                // shrunk snapshot is ever published (fail-closed).
                 self.requeue_front(&agent_id, entry);
+                drop(draining);
                 self.publish_queue_updated(&agent_id).await;
                 return Err(e);
             }
         };
-        self.invalidate_agent_list_cache(&session.workspace_id);
+        self.invalidate_agent_list_cache(&workspace_id);
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
             .store
-            .refresh_agent_session_timestamp(&session.workspace_id, &agent_id, &created_at)
+            .refresh_agent_session_timestamp(&workspace_id, &agent_id, &created_at)
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
@@ -6135,10 +6205,10 @@ impl Services {
             // entries only — parity with the queue-drain `persist_user` gate:
             // on this store-only path no turn runs, so the user's force-sent
             // message is itself the boundary.
-            self.schedule_last_activity_event(session.workspace_id.clone());
+            self.schedule_last_activity_event(workspace_id.clone());
         }
         // Publish agent:message events using the store-returned message id.
-        self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
+        self.publish_agent_message_events(&workspace_id, &agent_id, &message, None)
             .await;
         // Answer intake (PROTOCOL §5.5, pending questions): parity with the
         // runtime `send_queued_message_now` persist — only a matching answer
@@ -6146,15 +6216,19 @@ impl Services {
         // workspace's needs_attention displayStatus (§6.5 step 0).
         if self
             .resolve_pending_questions_for_answer(
-                &session.workspace_id,
+                &workspace_id,
                 &agent_id,
                 entry.message_metadata.as_ref(),
             )
             .await
         {
-            self.maybe_emit_display_status_changed(&session.workspace_id)
-                .await;
+            self.maybe_emit_display_status_changed(&workspace_id).await;
         }
+        // §6.5 drain ordering: the shrunk snapshot goes out only now, after
+        // the row's `agent:message` echo and any marker-clearing `agent:updated`.
+        drop(draining);
+        self.publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+            .await;
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
@@ -13603,13 +13677,173 @@ impl Services {
     /// Snapshot the current queue contents as wire-shape `QueuedMessage` JSON
     /// (the §5.5 `{id, content, queuedAt, position, imageBlocks?, fileBlocks?}` shape) for
     /// `agent.getQueue` and the `agent:queue:updated` payload (§6).
+    ///
+    /// Entries a drain arm has popped but not yet delivered (§6.5 drain
+    /// ordering; see [`DrainingGuard`]) are listed FIRST, in drain order,
+    /// ahead of the live queue — so a snapshot taken by an unrelated
+    /// concurrent mutation (enqueue / edit / remove of another entry) still
+    /// shows the in-flight entry until its user row is persisted. A draining
+    /// entry that has already been handed back to the live queue (slot race,
+    /// persist-failure requeue — which mints a NEW id but keeps the entry's
+    /// `turnId`) is listed once, from the live queue.
     pub(crate) fn queue_snapshot(&self, agent_id: &AgentId) -> Vec<Value> {
-        self.agent_queues
+        let draining = self
+            .draining_queue_entries
             .lock()
-            .expect("agent queue registry poisoned")
+            .expect("draining queue registry poisoned");
+        let live = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let live = live.get(agent_id).map(Vec::as_slice).unwrap_or_default();
+        draining
             .get(agent_id)
-            .map(|q| q.iter().enumerate().map(|(i, m)| m.to_value(i)).collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .filter(|d| !live.iter().any(|m| m.id == d.id || m.turn_id == d.turn_id))
+            .chain(live.iter())
+            .enumerate()
+            .map(|(i, m)| m.to_value(i))
+            .collect()
+    }
+
+    /// Pop the next ready-to-send entry ([`Services::dequeue_message`]) and,
+    /// atomically with respect to [`Services::queue_snapshot`], keep it
+    /// listed as draining until the returned [`DrainingGuard`] is dropped
+    /// (§6.5 drain ordering).
+    pub(crate) fn dequeue_message_draining(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<(QueuedMessage, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_message(agent_id),
+            std::slice::from_ref,
+        )
+    }
+
+    /// [`Services::dequeue_user_origin_message`] with the same draining
+    /// registration as [`Services::dequeue_message_draining`].
+    pub(crate) fn dequeue_user_origin_message_draining(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<(QueuedMessage, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_user_origin_message(agent_id),
+            std::slice::from_ref,
+        )
+    }
+
+    /// [`Services::dequeue_flush_batch`] with the same draining registration
+    /// as [`Services::dequeue_message_draining`]; one guard covers the batch.
+    pub(crate) fn dequeue_flush_batch_draining(
+        &self,
+        agent_id: &AgentId,
+        mode: intent_core::FlushQueuedMessagesMode,
+        require_user_origin: bool,
+        min_ready: usize,
+    ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_flush_batch(agent_id, mode, require_user_origin, min_ready),
+            Vec::as_slice,
+        )
+    }
+
+    /// [`Services::dequeue_ready_batch`] with the same draining registration
+    /// as [`Services::dequeue_message_draining`]; one guard covers the batch.
+    pub(crate) fn dequeue_ready_batch_draining(
+        &self,
+        agent_id: &AgentId,
+        require_user_origin: bool,
+        min_ready: usize,
+    ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_ready_batch(agent_id, require_user_origin, min_ready),
+            Vec::as_slice,
+        )
+    }
+
+    /// [`Services::dequeue_system_only_batch`] with the same draining
+    /// registration as [`Services::dequeue_message_draining`].
+    pub(crate) fn dequeue_system_only_batch_draining(
+        &self,
+        agent_id: &AgentId,
+        min_ready: usize,
+    ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_system_only_batch(agent_id, min_ready),
+            Vec::as_slice,
+        )
+    }
+
+    /// [`Services::take_queued_message`] with the same draining registration
+    /// as [`Services::dequeue_message_draining`] (`agent.sendQueuedMessageNow`).
+    pub(crate) fn take_queued_message_draining(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Option<(QueuedMessage, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.take_queued_message(agent_id, message_id),
+            std::slice::from_ref,
+        )
+    }
+
+    /// Record already-popped `entries` as draining for `agent_id` (a batch a
+    /// caller assembled outside the pop helpers above).
+    #[cfg(test)]
+    pub(crate) fn mark_draining(
+        &self,
+        agent_id: &AgentId,
+        entries: &[QueuedMessage],
+    ) -> DrainingGuard {
+        let mut draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        self.register_draining(&mut draining, agent_id, entries)
+    }
+
+    /// Run a live-queue pop while holding the draining overlay lock (taken
+    /// BEFORE `agent_queues`, the order [`Services::queue_snapshot`] uses), so
+    /// no snapshot can observe the popped entries in neither place; the popped
+    /// entries are recorded as draining and the returned [`DrainingGuard`]
+    /// retires them.
+    fn pop_draining<T>(
+        &self,
+        agent_id: &AgentId,
+        pop: impl FnOnce(&Self) -> Option<T>,
+        entries: impl FnOnce(&T) -> &[QueuedMessage],
+    ) -> Option<(T, DrainingGuard)> {
+        let mut draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        let popped = pop(self)?;
+        let guard = self.register_draining(&mut draining, agent_id, entries(&popped));
+        Some((popped, guard))
+    }
+
+    fn register_draining(
+        &self,
+        draining: &mut HashMap<AgentId, Vec<QueuedMessage>>,
+        agent_id: &AgentId,
+        entries: &[QueuedMessage],
+    ) -> DrainingGuard {
+        draining
+            .entry(agent_id.clone())
+            .or_default()
+            .extend(entries.iter().cloned());
+        DrainingGuard {
+            overlay: Arc::clone(&self.draining_queue_entries),
+            agent_id: agent_id.clone(),
+            ids: entries.iter().map(|m| m.id.clone()).collect(),
+        }
     }
 
     /// Like [`Services::queue_snapshot`] but with each entry's `content`
@@ -13777,19 +14011,16 @@ impl Services {
     /// is wired, the call is a quiet no-op rather than an error: the durable
     /// mutation is the source of truth and a missing event is not fatal.
     ///
-    /// The queue snapshot is taken **outside** the mutex it lives behind, but
-    /// since this method only reads (under a brief lock that is dropped before
-    /// the await) it never holds the queue lock across an `await` point. The
-    /// snapshot is taken after the session lookup so the event payload and the
-    /// write-through snapshot in [`publish_queue_updated_for`] reflect queue
-    /// state from (nearly) the same moment.
+    /// The snapshot itself is read by [`Services::publish_queue_event`] right
+    /// before the bus write, never here: capturing it ahead of the session
+    /// lookup / write-through awaits would let this publisher emit a queue
+    /// older than a mutation that completed while it was suspended.
     pub(crate) async fn publish_queue_updated(&self, agent_id: &AgentId) {
         let workspace_id = match self.store.get_agent_session(agent_id).await {
             Ok(s) => s.workspace_id,
             Err(_) => return,
         };
-        let queue = self.queue_snapshot(agent_id);
-        self.publish_queue_updated_for(agent_id, &workspace_id, queue)
+        self.publish_queue_updated_for(agent_id, &workspace_id)
             .await;
     }
 
@@ -13800,28 +14031,63 @@ impl Services {
     /// Every queue mutation flows through here (or through
     /// [`publish_queue_updated`], which delegates here), so this is also the
     /// single write-through choke point: the durable `agent_queue` snapshot is
-    /// refreshed before the event is published.
+    /// refreshed before the event is published. The published snapshot is
+    /// read AFTER the persist await (inside the publish gate), so it is never
+    /// older than the durable state and never older than any mutation that
+    /// landed while the persist was pending.
     pub(crate) async fn publish_queue_updated_for(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-        queue: Vec<Value>,
     ) {
         self.persist_queue_snapshot(agent_id).await;
-        self.publish_queue_event(agent_id, workspace_id, queue)
-            .await;
+        self.publish_queue_event(agent_id, workspace_id).await;
     }
 
-    /// Publish `agent:queue:updated` WITHOUT the write-through persist — for
-    /// the one caller ([`Services::migrate_queue_and_gc_poisoned_session`])
-    /// whose durable snapshot was already committed by an atomic store op.
-    /// Everything else goes through [`Services::publish_queue_updated_for`].
-    async fn publish_queue_event(
+    /// Drain-delivery half of [`Services::publish_queue_updated_for`] (§6.5
+    /// drain ordering): the drain arms run the write-through persist of the
+    /// shrunk queue at dequeue time ([`Services::persist_queue_snapshot`],
+    /// unchanged durability window) but publish the shrunk
+    /// `agent:queue:updated` only AFTER the drained entry's user row is
+    /// persisted — after its `agent:message` echo and, for a tagged
+    /// `question_answers` answer, the marker-clearing `agent:updated` — so a
+    /// client never observes "entry gone from the queue" before it can
+    /// observe the row that replaced it. Between dequeue and this call the
+    /// entry stays listed in every snapshot through the drain arm's
+    /// [`DrainingGuard`], so an unrelated concurrent mutation's own
+    /// `agent:queue:updated` (enqueue / edit / remove of another entry) shows
+    /// it too; callers drop the guard right before this call, and the
+    /// snapshot read here is the first one without the entry.
+    pub(crate) async fn publish_queue_updated_after_drain_persist(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-        queue: Vec<Value>,
     ) {
+        self.publish_queue_event(agent_id, workspace_id).await;
+    }
+
+    /// The single `agent:queue:updated` publish choke point — every publisher
+    /// ends here. Publishes WITHOUT the write-through persist, for callers
+    /// whose durable snapshot was already committed:
+    /// [`Services::publish_queue_updated_for`] (persisted just before),
+    /// [`Services::publish_queue_updated_after_drain_persist`] (persisted at
+    /// dequeue time) and [`Services::migrate_queue_and_gc_poisoned_session`]
+    /// (atomic store op).
+    ///
+    /// Snapshot acquisition and the bus write happen together under
+    /// `agent_queue_publish_gate`: the queue is read
+    /// ([`Services::queue_snapshot`], draining overlay included) immediately
+    /// before the event is written, and no other publisher can interleave
+    /// between the two. Callers therefore never hand in a queue they captured
+    /// earlier — a `Vec` captured before an await could be older than a
+    /// mutation that completed in the meantime (a pre-enqueue snapshot
+    /// omitting an entry that is now draining, or an overlay snapshot
+    /// arriving after the settled shrink and resurrecting a drained entry).
+    /// Publication order thus equals snapshot order, so the stream of
+    /// `agent:queue:updated` payloads is monotone in queue mutation order.
+    async fn publish_queue_event(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) {
+        let _gate = self.agent_queue_publish_gate.lock().await;
+        let queue = self.queue_snapshot(agent_id);
         let event = intent_store::NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: now_iso(),
@@ -14058,9 +14324,7 @@ impl Services {
                     );
                 }
             }
-            let queue = self.queue_snapshot(target_id);
-            self.publish_queue_event(target_id, workspace_id, queue)
-                .await;
+            self.publish_queue_event(target_id, workspace_id).await;
         }
         self.agent_delete_op(poisoned_id.clone(), Some(workspace_id.clone()))
             .await?;
