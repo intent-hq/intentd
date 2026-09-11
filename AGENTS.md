@@ -185,9 +185,9 @@ make gate     # check, then test
 The raw equivalents in `packages/intentd` are `cargo fmt --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, and
 `cargo nextest run --workspace --show-progress none`. Saved `ws.script` runs are
-PTY-backed, so a raw invocation must pass `--show-progress none` and
-`CARGO_TERM_PROGRESS_WHEN=never` (the `make` targets already do) or progress-bar
-redraws flood the output buffer.
+PTY-backed, so raw invocations need `CARGO_TERM_PROGRESS_WHEN=never` in the
+environment (all three) and `--show-progress none` on the nextest command (the `make`
+targets already set both) or progress-bar redraws flood the output buffer.
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.
