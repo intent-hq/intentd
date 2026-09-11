@@ -27634,6 +27634,87 @@ async fn agent_send_queued_message_now_emits_agent_message_event() {
     assert_eq!(session.messages[0].id, event_message_id);
 }
 
+/// §6.5 drain ordering on the store-only fallback: the shrunk
+/// `agent:queue:updated` (entry gone) is published AFTER the user-row
+/// `agent:message` echo, no snapshot published before that echo omits the
+/// entry, and the row carries the `queueInfo.queuedMessageId` identity link
+/// (lifted onto the echo). Fails against the previous order (shrunk snapshot
+/// first, row after).
+#[tokio::test]
+async fn agent_send_queued_message_now_publishes_shrunk_queue_after_row_persist() {
+    use intent_core::events::AGENT_QUEUE_UPDATED;
+
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "SendNowOrder").await;
+    let queued = svc
+        .agent_queue_message_op(id.clone(), "queued content".into(), None, None, None)
+        .await
+        .expect("queue");
+    let queued_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_MESSAGE.to_string(), AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_send_queued_message_now_op(id.clone(), queued_id.clone())
+        .await
+        .expect("send now");
+    assert_eq!(r["success"], json!(true));
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let row_echo_at = events
+        .iter()
+        .position(|e| {
+            e.event_type == AGENT_MESSAGE
+                && e.data["role"] == json!("user")
+                && e.data["messageId"] == json!(queued_id)
+        })
+        .expect("user-row agent:message echo");
+    assert_eq!(
+        events[row_echo_at].data["queuedMessageId"],
+        json!(queued_id),
+        "echo lifts the identity link"
+    );
+    let lists_entry = |e: &Event| {
+        e.data["queue"]
+            .as_array()
+            .expect("queue array")
+            .iter()
+            .any(|m| m["id"] == json!(queued_id))
+    };
+    let shrunk_at = events
+        .iter()
+        .position(|e| e.event_type == AGENT_QUEUE_UPDATED && !lists_entry(e))
+        .expect("shrunk agent:queue:updated");
+    assert!(
+        shrunk_at > row_echo_at,
+        "shrunk snapshot (index {shrunk_at}) must follow the row echo (index {row_echo_at})"
+    );
+    assert!(
+        events[..row_echo_at]
+            .iter()
+            .filter(|e| e.event_type == AGENT_QUEUE_UPDATED)
+            .all(lists_entry),
+        "no snapshot before the row echo omits the entry"
+    );
+
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(
+        session.messages[0]
+            .metadata
+            .as_ref()
+            .and_then(|m| m["queueInfo"]["queuedMessageId"].as_str()),
+        Some(queued_id.as_str()),
+        "persisted row carries the identity link"
+    );
+    assert!(svc.queue_snapshot(&id).is_empty());
+}
+
 /// STAB-112: `persist_error_and_requeue` must surface the `requeuedAfterFailure`
 /// marker in `queue_snapshot` and `agent:queue:updated` payloads so the FE can
 /// distinguish terminal-failure requeues from normal queued messages.

@@ -206,7 +206,7 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
 /// `messageMetadata` with `-32602`; should one reach a drain arm anyway it
 /// is replaced the same way), an object is merged into — so EVERY drained
 /// row names its entry.
-fn stamp_queued_message_id(msg: &mut QueuedMessage) {
+pub(crate) fn stamp_queued_message_id(msg: &mut QueuedMessage) {
     if msg.persisted {
         return;
     }

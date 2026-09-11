@@ -6100,7 +6100,11 @@ impl Services {
     /// ("queued message not found") with NO side effects, so the client knows
     /// the atomic send did not happen. On a persist failure the entry is
     /// restored at the FRONT of the queue before the error surfaces — the
-    /// transactional guarantee that the message is never lost.
+    /// transactional guarantee that the message is never lost. Same §6.5
+    /// drain ordering as the runtime path: the shrunk `agent:queue:updated`
+    /// is published only after the user row is persisted (and the entry stays
+    /// listed in every snapshot until then), and the row carries the
+    /// `queueInfo.queuedMessageId` identity link.
     pub(crate) async fn agent_send_queued_message_now_op(
         &self,
         agent_id: AgentId,
@@ -6109,16 +6113,26 @@ impl Services {
         // Fail closed on a nonexistent target BEFORE touching the queue
         // (monorepo#564).
         let session = self.require_agent_session(&agent_id).await?;
-        let entry = self
-            .take_queued_message(&agent_id, &message_id)
+        let workspace_id = session.workspace_id.clone();
+        // Atomic dequeue; the entry stays listed in queue snapshots (§6.5
+        // drain ordering) until `draining` is dropped right before the shrunk
+        // publish below.
+        let (mut entry, draining) = self
+            .take_queued_message_draining(&agent_id, &message_id)
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
-        // Publish the shrunk snapshot (write-through persist inside).
-        self.publish_queue_updated(&agent_id).await;
+        // Identity link: parity with the runtime path.
+        crate::agent_manager::stamp_queued_message_id(&mut entry);
+        // Durable shrink now; the shrunk `agent:queue:updated` is published
+        // only after the user row below is persisted (§6.5 drain ordering).
+        self.persist_queue_snapshot(&agent_id).await;
         // A terminal-failure requeue whose user row already reached the
         // transcript must not double-append (STAB-112).
         if entry.persisted {
+            drop(draining);
+            self.publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+                .await;
             return Ok(json!({ "success": true, "queued": false, "messageId": entry.id }));
         }
         // Delivery-time unblocked hints (monorepo#2044): on the no-manager
@@ -6126,7 +6140,6 @@ impl Services {
         // — parity with the manager's `send_queued_message_now` and the
         // store-only `deliver_parent_wake` branch. Same idempotency guard:
         // a content that already carries the section is never re-annotated.
-        let mut entry = entry;
         if !entry
             .content
             .contains(ready_delta::UNBLOCKED_SECTION_PREFIX)
@@ -6164,18 +6177,20 @@ impl Services {
             Ok(message) => message,
             Err(e) => {
                 // Transactional guarantee: restore the entry at the front so
-                // the message is never lost, then surface the failure.
+                // the message is never lost, then surface the failure. No
+                // shrunk snapshot is ever published (fail-closed).
                 self.requeue_front(&agent_id, entry);
+                drop(draining);
                 self.publish_queue_updated(&agent_id).await;
                 return Err(e);
             }
         };
-        self.invalidate_agent_list_cache(&session.workspace_id);
+        self.invalidate_agent_list_cache(&workspace_id);
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
             .store
-            .refresh_agent_session_timestamp(&session.workspace_id, &agent_id, &created_at)
+            .refresh_agent_session_timestamp(&workspace_id, &agent_id, &created_at)
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
@@ -6184,10 +6199,10 @@ impl Services {
             // entries only — parity with the queue-drain `persist_user` gate:
             // on this store-only path no turn runs, so the user's force-sent
             // message is itself the boundary.
-            self.schedule_last_activity_event(session.workspace_id.clone());
+            self.schedule_last_activity_event(workspace_id.clone());
         }
         // Publish agent:message events using the store-returned message id.
-        self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
+        self.publish_agent_message_events(&workspace_id, &agent_id, &message, None)
             .await;
         // Answer intake (PROTOCOL §5.5, pending questions): parity with the
         // runtime `send_queued_message_now` persist — only a matching answer
@@ -6195,15 +6210,19 @@ impl Services {
         // workspace's needs_attention displayStatus (§6.5 step 0).
         if self
             .resolve_pending_questions_for_answer(
-                &session.workspace_id,
+                &workspace_id,
                 &agent_id,
                 entry.message_metadata.as_ref(),
             )
             .await
         {
-            self.maybe_emit_display_status_changed(&session.workspace_id)
-                .await;
+            self.maybe_emit_display_status_changed(&workspace_id).await;
         }
+        // §6.5 drain ordering: the shrunk snapshot goes out only now, after
+        // the row's `agent:message` echo and any marker-clearing `agent:updated`.
+        drop(draining);
+        self.publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+            .await;
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
