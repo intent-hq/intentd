@@ -157,6 +157,12 @@ pub(crate) static V2_2: InstructionSet = InstructionSet {
     ..V2
 };
 
+/// Harness v2.4 adds self-contained plain-language communication guidance.
+pub(crate) static V2_4: InstructionSet = InstructionSet {
+    common: instr!("v2.4", "common"),
+    ..V2_2
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
