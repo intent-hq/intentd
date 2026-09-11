@@ -106,6 +106,12 @@ const HOOK_WAKE_LOGS_CAP: usize = crate::harness::v1::HOOK_WAKE_LOGS_CAP;
 /// appended to that run's logs.
 const HOOK_STATE_MAX_BYTES: usize = 16 * 1024;
 
+/// Cap (in chars) on the `message` a dispatching run returns and on the error
+/// text an eviction wake carries. Longer text is head-kept and tail-marked
+/// before framing, so a hook cannot queue a wake larger than the owner's
+/// model can accept.
+const HOOK_DISPATCH_MESSAGE_MAX_CHARS: usize = 32 * 1024;
+
 /// Caps on the per-run `ws.host.exec` failure capture (monorepo#3231): at
 /// most this many failed-exec lines are recorded per run, each truncated to
 /// this many chars, so a looping script cannot bloat the summary that lands
@@ -659,11 +665,11 @@ fn parse_outcome(v: &Value, logs: Option<String>, exec_error: Option<String>) ->
     let mut logs = logs;
     let state = parse_state(v, &mut logs);
     if v.get("dispatch").and_then(Value::as_bool) == Some(true) {
-        let message = v
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("(hook dispatched with no message)")
-            .to_string();
+        let message = bound_wake_text(
+            v.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("(hook dispatched with no message)"),
+        );
         return RunOutcome::Dispatch {
             message,
             logs,
@@ -755,6 +761,28 @@ fn tail_truncate(s: String, max_bytes: usize) -> String {
 /// nothing. Wording and truncation owned by the harness (H6).
 pub(crate) fn with_wake_logs(message: &str, logs: Option<&str>) -> String {
     crate::harness::latest().hook_wake_logs_section(message, logs)
+}
+
+/// Bound a dispatch message (or eviction error text) to
+/// [`HOOK_DISPATCH_MESSAGE_MAX_CHARS`]: text within the cap is returned
+/// verbatim; longer text keeps its head (cut on a char boundary) and gains a
+/// trailing marker naming the omitted count. Marker wording owned by the
+/// harness (H6).
+fn bound_wake_text(text: &str) -> String {
+    let total = text.chars().count();
+    if total <= HOOK_DISPATCH_MESSAGE_MAX_CHARS {
+        return text.to_string();
+    }
+    let end = text
+        .char_indices()
+        .nth(HOOK_DISPATCH_MESSAGE_MAX_CHARS)
+        .map_or(text.len(), |(i, _)| i);
+    let marker = crate::harness::latest().hook_wake_message_truncated_marker(
+        total - HOOK_DISPATCH_MESSAGE_MAX_CHARS,
+        total,
+        HOOK_DISPATCH_MESSAGE_MAX_CHARS,
+    );
+    format!("{}{marker}", &text[..end])
 }
 
 /// Project one active hook into its idle-visibility `waitingOnHooks` entry:
@@ -1827,8 +1855,8 @@ impl Services {
                 hook.run_count += 1;
                 hook.last_error = Some(error.clone());
                 self.emit_hook_event(HOOK_EVICTED, hook, None).await;
-                let notice =
-                    crate::harness::latest().hook_evicted_failed_run_notice(&hook.name, &error);
+                let notice = crate::harness::latest()
+                    .hook_evicted_failed_run_notice(&hook.name, &bound_wake_text(&error));
                 let notice = match logs {
                     RunLogs::Captured(ref l) => with_wake_logs(&notice, l.as_deref()),
                     RunLogs::Lost => notice,
@@ -1910,8 +1938,8 @@ impl Services {
         hook.next_run_at = None;
         hook.last_error = Some(error.clone());
         self.emit_hook_event(HOOK_EVICTED, hook, None).await;
-        let notice =
-            crate::harness::latest().hook_evicted_internal_error_notice(&hook.name, &error);
+        let notice = crate::harness::latest()
+            .hook_evicted_internal_error_notice(&hook.name, &bound_wake_text(&error));
         self.wake_hook_owner(hook, &notice, "evicted").await;
         // The last active hook settling can demote the derived displayStatus
         // (§6.5) and drop the `waiting` flag (§5.1) — best-effort like
@@ -4709,6 +4737,112 @@ mod tests {
         assert_eq!(
             out.len(),
             "msg\n\n[hook logs]\n[earlier log lines truncated]\n".len() + HOOK_WAKE_LOGS_CAP
+        );
+    }
+
+    #[test]
+    fn bound_wake_text_keeps_under_cap_and_head_truncates_over_cap() {
+        assert_eq!(bound_wake_text("short"), "short");
+        let exact = "x".repeat(HOOK_DISPATCH_MESSAGE_MAX_CHARS);
+        assert_eq!(bound_wake_text(&exact), exact);
+
+        let over = "x".repeat(HOOK_DISPATCH_MESSAGE_MAX_CHARS + 100);
+        let out = bound_wake_text(&over);
+        assert!(out.starts_with(&exact), "head kept");
+        let marker = &out[HOOK_DISPATCH_MESSAGE_MAX_CHARS..];
+        assert!(
+            marker.starts_with("\n[hook message truncated: 100 of "),
+            "{marker}"
+        );
+        assert!(marker.ends_with(']'), "{marker}");
+
+        // Multi-byte chars: the cut lands on a char boundary and counts
+        // chars, not bytes.
+        let wide = "é".repeat(HOOK_DISPATCH_MESSAGE_MAX_CHARS + 1);
+        let out = bound_wake_text(&wide);
+        assert!(out.starts_with(&"é".repeat(HOOK_DISPATCH_MESSAGE_MAX_CHARS)));
+        assert!(out.contains("[hook message truncated: 1 of "), "{out}");
+    }
+
+    /// A hook returning a multi-megabyte dispatch `message` cannot queue it
+    /// verbatim: the persisted wake carries the head plus a truncation
+    /// marker, bounded near the cap.
+    #[tokio::test]
+    async fn oversized_dispatch_message_is_bounded_before_wake() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "chatty",
+                    "code": "return { dispatch: true, message: 'x'.repeat(2 * 1024 * 1024) };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        assert_eq!(out["dispatched"], json!(true));
+        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let last = session.messages.last().expect("wake message persisted");
+        let text = serde_json::to_string(&last.content).unwrap();
+        assert!(text.contains("[hook message truncated:"), "marker missing");
+        assert!(
+            !text.contains(&"x".repeat(HOOK_DISPATCH_MESSAGE_MAX_CHARS + 1)),
+            "payload past the cap leaked into the wake"
+        );
+        assert!(
+            text.len() < HOOK_DISPATCH_MESSAGE_MAX_CHARS + 1024,
+            "wake not bounded: {} bytes",
+            text.len()
+        );
+    }
+
+    /// A run that throws a multi-megabyte error cannot flood the eviction
+    /// wake either: the notice carries the bounded error text.
+    #[tokio::test]
+    async fn oversized_eviction_error_is_bounded_before_wake() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: "loud-throw".to_string(),
+            code: "throw new Error('k'.repeat(2 * 1024 * 1024));".to_string(),
+            delay_ms: 10_000,
+            cron: None,
+            run_at: None,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
+            perpetual: false,
+            dispatch_count: 0,
+        };
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Evicted).await;
+        wait_for_wake(&svc, &owner, "[hook message truncated:").await;
+        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let last = session.messages.last().expect("wake message persisted");
+        let text = serde_json::to_string(&last.content).unwrap();
+        assert!(text.contains("evicted"), "eviction notice missing");
+        assert!(
+            !text.contains(&"k".repeat(HOOK_DISPATCH_MESSAGE_MAX_CHARS + 1)),
+            "error text past the cap leaked into the wake"
+        );
+        assert!(
+            text.len() < HOOK_DISPATCH_MESSAGE_MAX_CHARS + 1024,
+            "wake not bounded: {} bytes",
+            text.len()
         );
     }
 

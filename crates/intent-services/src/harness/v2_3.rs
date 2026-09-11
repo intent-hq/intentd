@@ -167,6 +167,10 @@ impl Harness for V2_3 {
         V1.attachment_reference_notice(name, mime, size, id)
     }
 
+    fn context_size_requeue_marker(&self, original_chars: usize) -> String {
+        V1.context_size_requeue_marker(original_chars)
+    }
+
     fn completion_wake(&self, params: &ChildSettlementParams<'_>, watch_retired: bool) -> String {
         V1.completion_wake(params, watch_retired)
     }
@@ -224,6 +228,15 @@ impl Harness for V2_3 {
 
     fn hook_state_dropped_warning(&self, state_bytes: usize, cap_bytes: usize) -> String {
         V1.hook_state_dropped_warning(state_bytes, cap_bytes)
+    }
+
+    fn hook_wake_message_truncated_marker(
+        &self,
+        omitted_chars: usize,
+        total_chars: usize,
+        cap_chars: usize,
+    ) -> String {
+        V1.hook_wake_message_truncated_marker(omitted_chars, total_chars, cap_chars)
     }
 
     fn hook_exec_failures_warning(&self, lines: &[&str], total: usize) -> String {
