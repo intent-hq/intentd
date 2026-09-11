@@ -5760,6 +5760,283 @@ async fn context_size_requeue_retry_sends_marker_to_provider() {
     );
 }
 
+/// A system-origin queue entry for the combined-flush requeue tests.
+fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage {
+    crate::agent_ops::QueuedMessage {
+        id: format!("qm-413-{suffix}"),
+        turn_id: format!("turn-413-{suffix}"),
+        content,
+        image_blocks: None,
+        file_blocks: None,
+        queued_at: format!("2026-01-01T00:00:0{}Z", suffix.len() % 10),
+        editing: false,
+        persisted: false,
+        requeued_after_failure: false,
+        message_metadata: Some(json!({"source": suffix})),
+        prepend_content: None,
+        prepend_image_blocks: None,
+        prepend_file_blocks: None,
+        interrupt_priority: false,
+        user_origin: false,
+        hold_kind: None,
+        hold_until: None,
+        child_agent_id: None,
+    }
+}
+
+/// Run a real combined flush over `batch` (rows persisted, entries
+/// annotated) and fail the resulting turn with the given error text.
+/// Returns the flushed entries as the turn carried them and the queue
+/// restored by the requeue in head-first order.
+async fn flush_then_fail(
+    mgr: &super::AgentManager,
+    ws: &WorkspaceId,
+    id: &AgentId,
+    batch: Vec<crate::agent_ops::QueuedMessage>,
+    error_text: &str,
+) -> (
+    Vec<crate::agent_ops::QueuedMessage>,
+    Vec<crate::agent_ops::QueuedMessage>,
+) {
+    let super::FlushPrep::Turn { content, options } =
+        super::prepare_flush_turn(mgr, id, ws, batch).await
+    else {
+        panic!("flush prep starts a turn");
+    };
+    let flushed = options
+        .flushed_entries
+        .clone()
+        .expect("flush options carry the flushed entries");
+    assert!(
+        flushed.iter().all(|e| e.persisted),
+        "every flushed entry persisted before the turn"
+    );
+    super::persist_error_and_requeue(mgr, id, ws, &content, &options, true, error_text).await;
+    let mut restored = Vec::new();
+    while let Some(entry) = mgr.services.dequeue_message(id) {
+        restored.push(entry);
+    }
+    (flushed, restored)
+}
+
+/// Combined flush (intent-hq/intent#4703): a 413 on a batch of one
+/// oversized entry between two small siblings restores the THREE entries
+/// individually at the queue front in original order — the small ones
+/// verbatim with their durable rows respected (`persisted: true`), the
+/// oversized one as the marker with `persisted: false` — each keeping its
+/// own id / `turn_id` / `queued_at` / metadata. The wire-only combined
+/// prompt is never parked as a single entry.
+#[tokio::test]
+async fn context_size_requeue_splits_flush_batch_and_replaces_only_oversized_entry() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-batch"),
+        AgentId::from("a-413-batch"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let batch = vec![
+        flush_entry("a", "small first".to_string()),
+        flush_entry("bb", oversized_payload()),
+        flush_entry("ccc", "small last".to_string()),
+    ];
+    let (flushed, restored) =
+        flush_then_fail(&mgr, &ws, &id, batch, context_size_error_text()).await;
+
+    assert_eq!(restored.len(), 3, "entries restored individually");
+    assert_eq!(
+        restored.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["qm-413-a", "qm-413-bb", "qm-413-ccc"],
+        "original order and ids kept"
+    );
+    for (entry, suffix) in restored.iter().zip(["a", "bb", "ccc"]) {
+        assert_eq!(entry.turn_id, format!("turn-413-{suffix}"));
+        assert_eq!(entry.message_metadata.as_ref().unwrap()["source"], suffix);
+        assert!(
+            entry.requeued_after_failure,
+            "{suffix}: requeuedAfterFailure"
+        );
+        assert!(!entry.editing);
+    }
+    assert!(restored[0].content.starts_with("small first"));
+    assert!(
+        restored[0].persisted,
+        "small sibling's durable row is not re-appended"
+    );
+    // The marker names the size of the entry AS FLUSHED (annotated).
+    assert_eq!(
+        restored[1].content,
+        super::context_size_requeue_marker(flushed[1].content.chars().count()),
+        "only the oversized entry becomes the marker"
+    );
+    assert_eq!(restored[0].content, flushed[0].content);
+    assert_eq!(restored[2].content, flushed[2].content);
+    assert!(
+        !restored[1].persisted,
+        "marker must be appended as the retry's user row"
+    );
+    assert!(restored[2].content.starts_with("small last"));
+    assert!(restored[2].persisted);
+    assert!(
+        restored
+            .iter()
+            .all(|e| !e.content.contains("OVERSIZED-PAYLOAD-TOKEN")),
+        "the oversized payload is gone from the queue"
+    );
+}
+
+/// Combined flush where EVERY entry is under the threshold but their SUM
+/// exceeded the model's limit: a 413 restores each entry verbatim
+/// (`persisted: true`, no marker) — the accumulated prompt was the problem,
+/// no single payload can be blamed, and nothing is lost.
+#[tokio::test]
+async fn context_size_requeue_restores_all_small_flush_entries_verbatim() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-batch-small"),
+        AgentId::from("a-413-batch-small"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let threshold = super::CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS;
+    let half = "h".repeat(threshold / 2 + 1);
+    let batch = vec![
+        flush_entry("a", half.clone()),
+        flush_entry("bb", half.clone()),
+        flush_entry("ccc", half.clone()),
+    ];
+    let combined_chars: usize = batch.iter().map(|e| e.content.chars().count()).sum();
+    assert!(combined_chars > threshold, "combined prompt over threshold");
+
+    let (flushed, restored) =
+        flush_then_fail(&mgr, &ws, &id, batch, context_size_error_text()).await;
+
+    assert_eq!(restored.len(), 3);
+    for ((entry, flushed), suffix) in restored.iter().zip(&flushed).zip(["a", "bb", "ccc"]) {
+        assert_eq!(entry.id, format!("qm-413-{suffix}"));
+        assert_eq!(
+            entry.content, flushed.content,
+            "{suffix}: payload kept verbatim (no marker)"
+        );
+        assert!(entry.content.starts_with(&half));
+        assert!(entry.persisted, "{suffix}: durable row respected");
+        assert!(entry.requeued_after_failure);
+    }
+}
+
+/// A NON-context-size failure on a combined flush turn keeps today's
+/// behaviour: the combined prompt requeues as ONE `persisted: true` entry
+/// under the head entry's `turn_id` (the flushed entries ride the options
+/// but are used only by the 413 branch).
+#[tokio::test]
+async fn non_context_size_flush_failure_requeues_combined_prompt_as_one_entry() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-flush-boom"),
+        AgentId::from("a-flush-boom"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let batch = vec![
+        flush_entry("a", oversized_payload()),
+        flush_entry("bb", "small".to_string()),
+    ];
+    let (_flushed, restored) = flush_then_fail(&mgr, &ws, &id, batch, "boom").await;
+
+    assert_eq!(restored.len(), 1, "combined prompt requeued as one entry");
+    assert!(restored[0].content.contains("OVERSIZED-PAYLOAD-TOKEN"));
+    assert!(restored[0].content.contains("small"));
+    assert!(restored[0].persisted);
+    assert_eq!(restored[0].turn_id, "turn-413-a");
+}
+
+/// `content` and `prepend_content` are measured separately: a 413 on a
+/// small message carrying an oversized preempted `prepend_content`
+/// (monorepo#1014) swaps ONLY the prepend for the marker; `content` and
+/// `persisted` are untouched (the prepend is prompt-only, its row is
+/// already durable). The mirror case — oversized `content`, small prepend —
+/// swaps only `content`.
+#[tokio::test]
+async fn context_size_requeue_measures_prepend_content_separately() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-prepend"),
+        AgentId::from("a-413-prepend"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let payload = oversized_payload();
+    let original_chars = payload.chars().count();
+    let marker = super::context_size_requeue_marker(original_chars);
+
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413-prepend-big".to_string()),
+        prepend_content: Some(payload.clone()),
+        prepend_image_blocks: Some(json!([{"data": "AA==", "mimeType": "image/png"}])),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        "small ask",
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(queued.content, "small ask", "small content untouched");
+    assert!(
+        queued.persisted,
+        "persisted untouched: only the prepend changed"
+    );
+    assert_eq!(
+        queued.prepend_content.as_deref(),
+        Some(marker.as_str()),
+        "oversized prepend replaced by the marker"
+    );
+    assert_eq!(
+        queued.prepend_image_blocks,
+        Some(json!([{"data": "AA==", "mimeType": "image/png"}])),
+        "prepend attachments ride along"
+    );
+    assert!(queued.requeued_after_failure);
+
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413-prepend-small".to_string()),
+        prepend_content: Some("small preempted".to_string()),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        &payload,
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(
+        queued.content, marker,
+        "oversized content becomes the marker"
+    );
+    assert!(!queued.persisted);
+    assert_eq!(
+        queued.prepend_content.as_deref(),
+        Some("small preempted"),
+        "small prepend kept verbatim"
+    );
+}
+
 /// Wire surface (monorepo#1022): the terminal `agent:failed` +
 /// `agent:stream:end` pair carries the failed turn's `turnId` when present,
 /// and omits the key entirely when absent (never `null`).
