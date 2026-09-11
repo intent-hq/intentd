@@ -30245,7 +30245,10 @@ impl Services {
     /// Restore agent attribution for the files of the undone commits (mirrors the
     /// TS `recordAgentWrite` loop): after the soft reset each changed path is
     /// re-attributed to its original agent/task at whichever stage it now sits.
-    /// Best-effort — failures never fail the undo.
+    /// Scans with rename detection off so an undone rename yields rows for
+    /// both its old (deleted) and new (added) path — the commit's `files`
+    /// carry both, and the next attributed checkpoint needs both to land the
+    /// deletion. Best-effort — failures never fail the undo.
     async fn ac_restore_undo_attribution(
         &self,
         workspace_id: &WorkspaceId,
@@ -30255,11 +30258,11 @@ impl Services {
         if metadata.is_empty() {
             return;
         }
-        let Ok(status) = intent_git::status::status(worktree) else {
+        let Ok(files) = intent_git::status::files_without_renames(worktree) else {
             return;
         };
         let mut by_path: HashMap<String, (bool, &'static str)> = HashMap::new();
-        for f in &status.files {
+        for f in &files {
             let word = match f.status {
                 intent_core::GitFileStatus::Added | intent_core::GitFileStatus::Untracked => {
                     "added"
