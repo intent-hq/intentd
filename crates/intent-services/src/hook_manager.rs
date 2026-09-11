@@ -4846,6 +4846,145 @@ mod tests {
         );
     }
 
+    /// Functional counterpart of the store-only bound test above: with a real
+    /// `AgentManager` attached and the mock ACP provider, the validation-run
+    /// dispatch of a 2 MiB message wakes the owner through the runtime path
+    /// (`deliver_wake_message` → `try_begin_turn` → worker), the prompt the
+    /// provider actually receives is bounded and carries the marker, and a
+    /// follow-up turn on the same session completes normally.
+    #[tokio::test]
+    async fn oversized_dispatch_wake_drives_bounded_provider_turn() {
+        use std::sync::Arc;
+
+        use intent_acp::EventSink;
+
+        use crate::agent_manager::{AgentManager, BusEventSink, TurnOptions};
+
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../intentd/tests/fixtures/mock-acp-agent.mjs")
+            .canonicalize()
+            .expect("mock-acp-agent.mjs fixture exists")
+            .display()
+            .to_string();
+        let prompt_log =
+            std::env::temp_dir().join(format!("itd-hook-bound-{}.jsonl", uuid::Uuid::new_v4()));
+        let prompt_log_s = prompt_log.to_string_lossy().into_owned();
+        let _env = crate::agent_manager::tests::EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("MOCK_AGENT_PROMPT_LOG", prompt_log_s.as_str()),
+        ]);
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let owner = AgentId::from("agent-hooks-mock");
+        let mut session = agent(&ws, "agent-hooks-mock");
+        session.provider = Some("mock".to_string());
+        store.insert_agent_session(&session).await.expect("agent");
+        let bus = EventBus::new(store.clone());
+        let root = tempfile::tempdir().expect("temp workspaces root");
+        let svc = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_workspaces_root(root.path().to_path_buf());
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+        let mgr = Arc::new(AgentManager::new(svc.clone(), sink, 8));
+        svc.attach_agent_manager(&mgr);
+
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "chatty",
+                    "code": "return { dispatch: true, message: 'x'.repeat(2 * 1024 * 1024) };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        assert_eq!(out["dispatched"], json!(true));
+
+        // The wake drove a real provider turn: an assistant row lands and the
+        // manager settles idle.
+        let assistant_rows = |messages: &[intent_core::AgentMessage]| {
+            messages.iter().filter(|m| m.role == "assistant").count()
+        };
+        let messages = wait_for_assistant_rows(&svc, &mgr, &owner, 1).await;
+        assert_eq!(assistant_rows(&messages), 1, "{messages:?}");
+
+        // What the provider RECEIVED (mock prompt log, turn 1) is the bounded
+        // wake: the marker is present and the payload run is exactly the cap
+        // (the first-turn prelude around it is not the hook's to bound).
+        let log = std::fs::read_to_string(&prompt_log).expect("mock prompt log written");
+        let turn1: serde_json::Value =
+            serde_json::from_str(log.lines().next().expect("turn 1 logged")).unwrap();
+        assert_eq!(turn1["turn"], json!(1));
+        let prompt = turn1["text"].as_str().expect("prompt text");
+        assert!(
+            prompt.contains("[hook message truncated:"),
+            "provider prompt lacks the marker"
+        );
+        assert!(
+            prompt.contains(&"x".repeat(HOOK_DISPATCH_MESSAGE_MAX_CHARS)),
+            "the kept head did not reach the provider"
+        );
+        assert!(
+            !prompt.contains(&"x".repeat(HOOK_DISPATCH_MESSAGE_MAX_CHARS + 1)),
+            "payload past the cap reached the provider"
+        );
+
+        // The owner keeps working after the bounded wake: a follow-up turn
+        // runs to completion on the same session.
+        mgr.send_message(
+            owner.clone(),
+            ws.clone(),
+            "follow-up after the bounded wake".to_string(),
+            None,
+            TurnOptions::default(),
+        )
+        .await
+        .expect("follow-up send_message");
+        let messages = wait_for_assistant_rows(&svc, &mgr, &owner, 2).await;
+        assert_eq!(assistant_rows(&messages), 2, "{messages:?}");
+        let log = std::fs::read_to_string(&prompt_log).expect("mock prompt log");
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "provider saw exactly two prompts: {log}"
+        );
+        let _ = std::fs::remove_file(&prompt_log);
+    }
+
+    /// Poll the persisted transcript until it holds `want` assistant rows and
+    /// the manager reports the owner idle (the mock ACP turn is a real child
+    /// process, so allow well past `POLL_DEADLINE`).
+    async fn wait_for_assistant_rows(
+        svc: &Services,
+        mgr: &crate::agent_manager::AgentManager,
+        owner: &AgentId,
+        want: usize,
+    ) -> Vec<intent_core::AgentMessage> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let messages = svc
+                .store()
+                .get_agent_messages(owner, None)
+                .await
+                .expect("messages");
+            let have = messages.iter().filter(|m| m.role == "assistant").count();
+            if have >= want && !mgr.is_busy(owner) {
+                return messages;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "turn never completed: {have}/{want} assistant rows, busy={}",
+                mgr.is_busy(owner)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     #[tokio::test]
     async fn state_persists_from_validation_run_and_carries_into_next_run() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
