@@ -7259,15 +7259,20 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
         );
     } else {
         // The norm — the drain reads exactly like an immediate delivery: no
-        // dequeue-wait system note (checked above) and no queueInfo stamp,
-        // neither on the row metadata nor the in-block fold.
-        assert!(
-            drained["metadata"]["queueInfo"].is_null(),
-            "sub-threshold drain must not stamp queueInfo on row metadata: {drained}"
+        // dequeue-wait system note (checked above) and no wait stamp
+        // (`queuedAt` / `waitedMs`). The drain identity link
+        // (`queueInfo.queuedMessageId`, intentd#1783) is threshold-independent,
+        // so queueInfo carries ONLY that key — on the row metadata and the
+        // in-block fold alike.
+        let queue_info = &drained["metadata"]["queueInfo"];
+        assert_eq!(
+            queue_info,
+            &json!({ "queuedMessageId": queued_id }),
+            "sub-threshold drain stamps only the identity link: {drained}"
         );
-        assert!(
-            drained["contentBlocks"][0]["messageMetadata"]["queueInfo"].is_null(),
-            "sub-threshold drain must not fold queueInfo into the block: {drained}"
+        assert_eq!(
+            &drained["contentBlocks"][0]["messageMetadata"]["queueInfo"], queue_info,
+            "the in-block fold carries the same queueInfo: {drained}"
         );
     }
     // Caller-supplied messageMetadata still persists verbatim.

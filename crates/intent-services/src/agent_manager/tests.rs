@@ -15530,6 +15530,119 @@ mod flush_batch_id_tests {
     }
 }
 
+/// Drain identity link (intent-hq/intentd#1783): [`super::stamp_queued_message_id`]
+/// stamps `queueInfo.queuedMessageId` = the entry's own id on every drained
+/// entry, threshold-independent, alongside the wait/batch stamps, always
+/// naming the entry delivering NOW, and skipping `persisted: true` requeues.
+#[cfg(test)]
+mod queued_message_id_stamp_tests {
+    use super::dequeue_wait_tests::{iso_secs_ago, queued_msg};
+    use super::*;
+
+    #[test]
+    fn sub_threshold_entry_gets_identity_link_only() {
+        let mut msg = queued_msg("instant hop", &intent_core::now_iso(), false);
+        super::super::annotate_dequeue_wait(&mut msg);
+        assert_eq!(msg.message_metadata, None, "precondition: no wait stamp");
+        super::super::stamp_queued_message_id(&mut msg);
+        assert_eq!(
+            msg.message_metadata,
+            Some(json!({ "queueInfo": { "queuedMessageId": "qm-wait-test" } })),
+            "queueInfo carries ONLY the identity link"
+        );
+    }
+
+    #[test]
+    fn identity_link_rides_alongside_wait_and_batch_stamps() {
+        let mut entries = vec![
+            queued_msg("first", &iso_secs_ago(60), false),
+            queued_msg("second", &iso_secs_ago(60), false),
+        ];
+        entries[1].id = "qm-second".to_string();
+        for e in &mut entries {
+            super::super::annotate_dequeue_wait(e);
+            super::super::stamp_queued_message_id(e);
+        }
+        super::super::stamp_flush_batch_id(&mut entries);
+        for (e, expected) in entries.iter().zip(["qm-wait-test", "qm-second"]) {
+            let info = &e.message_metadata.as_ref().unwrap()["queueInfo"];
+            assert_eq!(
+                info["queuedMessageId"], expected,
+                "each row names its own entry: {info}"
+            );
+            assert!(
+                info["queuedAt"].as_str().is_some(),
+                "wait stamp kept: {info}"
+            );
+            assert!(
+                info["waitedMs"].as_u64().is_some(),
+                "wait stamp kept: {info}"
+            );
+            assert!(
+                info["batchId"].as_str().is_some(),
+                "batch stamp added: {info}"
+            );
+        }
+    }
+
+    #[test]
+    fn caller_metadata_is_preserved_next_to_the_link() {
+        let mut msg = queued_msg("answer", &intent_core::now_iso(), false);
+        msg.message_metadata = Some(json!({
+            "type": "question_answers",
+            "answeredQuestionsMessageId": "msg-asked",
+        }));
+        super::super::stamp_queued_message_id(&mut msg);
+        assert_eq!(
+            msg.message_metadata,
+            Some(json!({
+                "type": "question_answers",
+                "answeredQuestionsMessageId": "msg-asked",
+                "queueInfo": { "queuedMessageId": "qm-wait-test" },
+            })),
+            "caller keys untouched, queueInfo added"
+        );
+    }
+
+    #[test]
+    fn link_always_names_the_delivering_entry() {
+        // A requeue re-drained under a fresh entry id re-links to that id —
+        // unlike the wait/batch stamps, this one overwrites.
+        let mut msg = queued_msg("retried", &iso_secs_ago(60), false);
+        msg.id = "qm-fresh".to_string();
+        msg.message_metadata = Some(json!({
+            "queueInfo": { "queuedAt": "2026-01-01T00:00:00Z", "waitedMs": 42, "queuedMessageId": "qm-old" }
+        }));
+        super::super::stamp_queued_message_id(&mut msg);
+        let info = &msg.message_metadata.as_ref().unwrap()["queueInfo"];
+        assert_eq!(info["queuedMessageId"], "qm-fresh");
+        assert_eq!(info["queuedAt"], "2026-01-01T00:00:00Z");
+        assert_eq!(info["waitedMs"], 42);
+    }
+
+    #[test]
+    fn persisted_requeue_is_never_stamped() {
+        let mut msg = queued_msg("already durable", &iso_secs_ago(60), true);
+        super::super::stamp_queued_message_id(&mut msg);
+        assert_eq!(
+            msg.message_metadata, None,
+            "persisted rows are never rewritten"
+        );
+    }
+
+    #[test]
+    fn non_object_metadata_is_left_alone() {
+        let mut msg = queued_msg("odd", &iso_secs_ago(60), false);
+        msg.message_metadata = Some(json!("not-an-object"));
+        super::super::stamp_queued_message_id(&mut msg);
+        assert_eq!(msg.message_metadata, Some(json!("not-an-object")));
+        let mut msg = queued_msg("odd", &iso_secs_ago(60), false);
+        msg.message_metadata = Some(json!({ "queueInfo": 7 }));
+        super::super::stamp_queued_message_id(&mut msg);
+        assert_eq!(msg.message_metadata, Some(json!({ "queueInfo": 7 })));
+    }
+}
+
 /// Delivery-time "tasks now unblocked" annotation (intent-hq/monorepo#2044):
 /// [`super::annotate_unblocked_hints`] resolves the stamped trigger ids
 /// against CURRENT task state as a batch drains, coalescing all

@@ -186,6 +186,45 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
     }
 }
 
+/// Drain identity link ([intent-hq/intentd#1783](https://github.com/intent-hq/intentd/pull/1783)):
+/// the drained entry's `messageMetadata` is stamped with the queue entry id
+/// it was drained from — `queueInfo.queuedMessageId` (PROTOCOL §5.5) — so
+/// the persisted user row (and its `agent:message` echo) can be matched to
+/// the `agent:queue:updated` entry that is still listed until the shrunk
+/// snapshot lands (§6.5 drain ordering). The row keeps its own freshly
+/// minted id; this stamp is the only link. Runs on every drain arm and on
+/// `agent.sendQueuedMessageNow`, after [`annotate_dequeue_wait`] (which
+/// creates `queueInfo` when the wait crosses the threshold). Unlike the wait
+/// and batch stamps this one always writes: the stamp names the entry that
+/// is delivering NOW, so a requeue that re-drains under a fresh entry id
+/// re-links to that id. Same skips as the other stamps: `persisted: true`
+/// requeues (row already durable, never rewritten) and a non-object
+/// `messageMetadata` / `queueInfo` are left alone.
+fn stamp_queued_message_id(msg: &mut QueuedMessage) {
+    if msg.persisted {
+        return;
+    }
+    let metadata = msg.message_metadata.get_or_insert_with(|| json!({}));
+    let Value::Object(map) = metadata else {
+        tracing::warn!(
+            id = %msg.id,
+            "queuedMessageId stamp skipped: messageMetadata is not an object"
+        );
+        return;
+    };
+    match map.entry("queueInfo").or_insert_with(|| json!({})) {
+        Value::Object(queue_info) => {
+            queue_info.insert("queuedMessageId".to_string(), Value::String(msg.id.clone()));
+        }
+        _ => {
+            tracing::warn!(
+                id = %msg.id,
+                "queuedMessageId stamp skipped: queueInfo is not an object"
+            );
+        }
+    }
+}
+
 /// Batch-flush grouping stamp: when a flush delivers two or more entries as
 /// ONE combined turn ([`prepare_flush_turn`]), every drained entry's
 /// `messageMetadata` gains the same freshly minted `queueInfo.batchId`
@@ -6131,6 +6170,8 @@ impl AgentManager {
         // Dequeue-wait note: same placement contract — the persisted row and
         // the provider prompt both carry the enqueue time + wait.
         annotate_dequeue_wait(&mut next);
+        // Identity link: the persisted row names the entry it drained from.
+        stamp_queued_message_id(&mut next);
         // Delivery-time unblocked hints (monorepo#2044): resolved NOW, at
         // render time, from the trigger ids the wake stamped at enqueue.
         annotate_unblocked_hints(&self.services, &agent_id, std::slice::from_mut(&mut next)).await;
@@ -6281,6 +6322,8 @@ impl AgentManager {
         // Dequeue-wait note: parity with the drain paths — the "send now"
         // delivery tells the target when the entry was enqueued.
         annotate_dequeue_wait(&mut entry);
+        // Identity link: parity with the drain paths.
+        stamp_queued_message_id(&mut entry);
         // Delivery-time unblocked hints (monorepo#2044): parity with the
         // drain paths — resolved at render time.
         annotate_unblocked_hints(&self.services, &agent_id, std::slice::from_mut(&mut entry)).await;
@@ -9762,6 +9805,8 @@ async fn run_message_worker(
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
             // Dequeue-wait note: same placement contract as the stale check.
             annotate_dequeue_wait(&mut next);
+            // Identity link: same placement as the single-entry drain arm.
+            stamp_queued_message_id(&mut next);
             // Delivery-time unblocked hints (monorepo#2044): resolved at
             // render time, same placement as the single-entry drain arm.
             annotate_unblocked_hints(&mgr.services, &agent_id, std::slice::from_mut(&mut next))
@@ -9967,6 +10012,8 @@ async fn run_message_worker(
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
             // Dequeue-wait note: same placement contract as the stale check.
             annotate_dequeue_wait(&mut next);
+            // Identity link: same contract as the pre-release drain arm.
+            stamp_queued_message_id(&mut next);
             // Delivery-time unblocked hints (monorepo#2044): same contract
             // as the pre-release drain arm.
             annotate_unblocked_hints(&mgr.services, &agent_id, std::slice::from_mut(&mut next))
@@ -10150,6 +10197,9 @@ async fn prepare_flush_turn(
     for entry in &mut entries {
         let stale = mgr.annotate_stale_redrive(agent_id, entry).await;
         annotate_dequeue_wait(entry);
+        // Identity link: each row names its own entry (the batchId below
+        // groups them; this distinguishes them).
+        stamp_queued_message_id(entry);
         stale_flags.push(stale);
     }
     // Batch grouping stamp — after the wait stamps (it creates `queueInfo`

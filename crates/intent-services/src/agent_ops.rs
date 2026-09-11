@@ -1684,6 +1684,10 @@ pub(crate) fn new_message_id() -> String {
 /// pre-existing three-field shape (backward compatible). `turn_id` is the
 /// turn correlation id (monorepo#1022) — present on user-row echoes emitted
 /// by a turn that carries one, omitted otherwise (never `null`).
+/// `queuedMessageId` is the drain identity link (intent-hq/intentd#1783):
+/// lifted from the row's `metadata.queueInfo.queuedMessageId` stamp so a
+/// queue-drained user row names the entry it drained from on the echo
+/// itself; omitted for rows without the stamp (never `null`).
 pub(crate) fn agent_message_event_payload(
     agent_id: &AgentId,
     message: &AgentMessage,
@@ -1699,6 +1703,15 @@ pub(crate) fn agent_message_event_payload(
     }
     if let Some(tid) = turn_id {
         payload["turnId"] = json!(tid);
+    }
+    if let Some(qid) = message
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("queueInfo"))
+        .and_then(|q| q.get("queuedMessageId"))
+        .and_then(Value::as_str)
+    {
+        payload["queuedMessageId"] = json!(qid);
     }
     payload
 }

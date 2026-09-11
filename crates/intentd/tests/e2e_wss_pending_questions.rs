@@ -1314,6 +1314,7 @@ async fn queued_answer_via_queue_message_clears_marker_over_wss() {
         .to_string();
     let mut saw_entry_snapshot = false;
     let mut user_row_seen = false;
+    let mut user_row_echo = Value::Null;
     let mut marker_cleared_seen = false;
     let mut shrunk_seen = false;
     for _ in 0..600 {
@@ -1348,6 +1349,7 @@ async fn queued_answer_via_queue_message_clears_marker_over_wss() {
                     && event["data"]["turnId"].as_str() == Some(queued_turn_id.as_str()) =>
             {
                 user_row_seen = true;
+                user_row_echo = event["data"].clone();
             }
             Some("agent:updated")
                 if event["data"]["pendingQuestionsMessageId"].as_str() == Some("") =>
@@ -1360,6 +1362,18 @@ async fn queued_answer_via_queue_message_clears_marker_over_wss() {
     assert!(
         shrunk_seen,
         "the drain published the shrunk agent:queue:updated after the answer row + marker clear"
+    );
+    // Identity link: in the window where the row already exists and the
+    // entry is still listed, the echo names the entry it drained from via
+    // `queuedMessageId` (lifted from the row's `queueInfo.queuedMessageId`
+    // stamp); the row keeps its own freshly minted id.
+    assert_eq!(
+        user_row_echo["queuedMessageId"], queued_id,
+        "the user-row echo names the drained queue entry: {user_row_echo}"
+    );
+    assert_ne!(
+        user_row_echo["messageId"], queued_id,
+        "the row id is minted fresh, never the entry id: {user_row_echo}"
     );
     let conv = await_conversation(&mut rpc, &ws_id, &asker_id, "answer drained", |m| {
         user_row_index(m, ANSWER_TEXT).is_some()
@@ -1380,6 +1394,14 @@ async fn queued_answer_via_queue_message_clears_marker_over_wss() {
     assert_eq!(
         row_meta["answeredQuestionsMessageId"], asked_mid,
         "the persisted row names the answered message: {row_meta}"
+    );
+    assert_eq!(
+        row_meta["queueInfo"]["queuedMessageId"], queued_id,
+        "the persisted row carries the drained entry's id: {row_meta}"
+    );
+    assert_ne!(
+        messages[answer_idx]["id"], queued_id,
+        "the persisted row id is not the queue entry id"
     );
     let got = wss_rpc(&mut rpc, "agent.get", json!({ "agentId": asker_id })).await;
     assert_eq!(
