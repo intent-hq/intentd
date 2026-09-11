@@ -1223,7 +1223,7 @@ async fn script_run_rejects_timeout_above_eval_budget_before_spawning() {
     assert_eq!(resp["result"]["isError"], json!(true));
     let t = text(&resp);
     assert!(t.contains("timeoutSeconds 600 exceeds"), "unexpected: {t}");
-    assert!(t.contains("ceiling 28s, budget 30s"), "unexpected: {t}");
+    assert!(t.contains("ceiling 25s, budget 30s"), "unexpected: {t}");
     assert!(t.contains("ws.script.start"), "unexpected: {t}");
     assert!(t.contains("ws.hook.schedule"), "unexpected: {t}");
     assert!(t.contains("ws.script.status"), "unexpected: {t}");
@@ -1236,9 +1236,9 @@ async fn script_run_rejects_timeout_above_eval_budget_before_spawning() {
 #[tokio::test]
 async fn script_run_rejects_timeout_alias_above_eval_budget() {
     let (srv, api) = server();
-    let resp = call(&srv, "return await ws.script.run('s-1', { timeout: 29 });").await;
+    let resp = call(&srv, "return await ws.script.run('s-1', { timeout: 26 });").await;
     assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("timeoutSeconds 29 exceeds"));
+    assert!(text(&resp).contains("timeoutSeconds 26 exceeds"));
     assert!(api.script_run_calls.lock().unwrap().is_empty());
 }
 
@@ -1249,7 +1249,7 @@ async fn script_run_omitted_timeout_defaults_to_ceiling() {
     let (srv, api) = server();
     let resp = call(&srv, "return await ws.script.run('s-1');").await;
     assert_eq!(resp["result"]["isError"], json!(false));
-    assert_eq!(api.script_run_calls.lock().unwrap()[0].1, Some(28));
+    assert_eq!(api.script_run_calls.lock().unwrap()[0].1, Some(25));
 }
 
 #[tokio::test]
@@ -1257,11 +1257,11 @@ async fn script_run_timeout_at_ceiling_passes_through() {
     let (srv, api) = server();
     let resp = call(
         &srv,
-        "return await ws.script.run('s-1', { timeoutSeconds: 28 });",
+        "return await ws.script.run('s-1', { timeoutSeconds: 25 });",
     )
     .await;
     assert_eq!(resp["result"]["isError"], json!(false));
-    assert_eq!(api.script_run_calls.lock().unwrap()[0].1, Some(28));
+    assert_eq!(api.script_run_calls.lock().unwrap()[0].1, Some(25));
 }
 
 #[tokio::test]
@@ -1273,23 +1273,23 @@ async fn script_run_ceiling_follows_overridden_eval_budget() {
         .with_workspace_api_timeout(Duration::from_secs(120));
     let resp = call(
         &srv,
-        "return await ws.script.run('s-1', { timeoutSeconds: 118 });",
+        "return await ws.script.run('s-1', { timeoutSeconds: 115 });",
     )
     .await;
     assert_eq!(resp["result"]["isError"], json!(false), "{}", text(&resp));
     let resp = call(
         &srv,
-        "return await ws.script.run('s-1', { timeoutSeconds: 119 });",
+        "return await ws.script.run('s-1', { timeoutSeconds: 116 });",
     )
     .await;
     assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("ceiling 118s, budget 120s"));
+    assert!(text(&resp).contains("ceiling 115s, budget 120s"));
     let resp = call(&srv, "return await ws.script.run('s-1');").await;
     assert_eq!(resp["result"]["isError"], json!(false));
     let calls = api.script_run_calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].1, Some(118));
-    assert_eq!(calls[1].1, Some(118));
+    assert_eq!(calls[0].1, Some(115));
+    assert_eq!(calls[1].1, Some(115));
 }
 
 // ============================================================================

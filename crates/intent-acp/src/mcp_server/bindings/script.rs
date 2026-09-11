@@ -17,10 +17,13 @@ use super::{map_err, opt_bool, opt_i64, opt_str, req_str};
 
 /// Seconds held back from the `workspace_api` eval budget so `script.run`
 /// can return its `timedOut` envelope before the transport aborts the call.
-const RUN_TIMEOUT_MARGIN_SECS: u64 = 2;
+/// Covers the PTY host's 2s TERM grace before SIGKILL on a TERM-trapping
+/// child, the kill / straggler-reap / scrollback-read tail after the run
+/// timeout, and the eval time already spent before the binding is invoked.
+const RUN_TIMEOUT_MARGIN_SECS: u64 = 5;
 
 /// The largest `timeoutSeconds` one `ws.script.run` call can honor under
-/// `budget`: `floor(budget) - 2`, never below 1 (28s on the default 30s
+/// `budget`: `floor(budget) - 5`, never below 1 (25s on the default 30s
 /// budget). `script_run` kills the process when its timeout elapses, so a
 /// wait longer than the eval budget would be aborted by the transport while
 /// the process keeps running — the binding rejects such requests up front
@@ -256,9 +259,10 @@ mod tests {
 
     #[test]
     fn run_timeout_ceiling_is_budget_minus_margin_floored_at_one() {
-        assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(30)), 28);
-        assert_eq!(run_timeout_ceiling_secs(Duration::from_millis(30_900)), 28);
-        assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(120)), 118);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(30)), 25);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_millis(30_900)), 25);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(120)), 115);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(6)), 1);
         assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(3)), 1);
         assert_eq!(run_timeout_ceiling_secs(Duration::from_millis(250)), 1);
     }
