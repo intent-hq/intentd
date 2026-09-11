@@ -6037,24 +6037,29 @@ async fn context_size_requeue_measures_prepend_content_separately() {
     );
 }
 
+struct StopRedeliveryFlush413 {
+    /// The queue as restored by the 413 requeue (head-first).
+    restored: Vec<crate::agent_ops::QueuedMessage>,
+    /// The failed flush turn's outbound prompt text.
+    first_text: String,
+    /// The retry turn's outbound prompt text + block types.
+    retry_text: String,
+    retry_blocks: Vec<String>,
+    messages: Vec<intent_core::AgentMessage>,
+}
+
 /// Drive the real stop-redelivery + combined-flush + 413 + `agent.retry`
 /// sequence against the mock provider: a zero-output user stop arms the
 /// stopped message (`stopped_text` + an image) for redelivery, two entries
-/// are queued and flushed as ONE turn (`spawn_worker` merges the armed
-/// payload in AFTER `prepare_flush_turn` captured the entries), the mock
-/// fails that first prompt with the intent-hq/intent#4703 413, and
-/// `agent.retry` redrives. Returns the queue as restored by the 413 requeue
-/// (head-first) and the retry's outbound prompt text + block types.
+/// (`(content, own prepend)`) are queued and flushed as ONE turn
+/// (`spawn_worker` merges the armed payload in AFTER `prepare_flush_turn`
+/// captured the entries), the mock fails that first prompt with the
+/// intent-hq/intent#4703 413, and `agent.retry` redrives.
 async fn stop_redelivery_flush_413_retry(
     tag: &str,
     stopped_text: &str,
-    queued: [&str; 2],
-) -> (
-    Vec<crate::agent_ops::QueuedMessage>,
-    String,
-    Vec<String>,
-    Vec<intent_core::AgentMessage>,
-) {
+    queued: [(&str, Option<&str>); 2],
+) -> StopRedeliveryFlush413 {
     let script = mock_agent_script();
     let prompt_log =
         std::env::temp_dir().join(format!("itd-413-{tag}-{}.log", uuid::Uuid::new_v4()));
@@ -6115,9 +6120,14 @@ async fn stop_redelivery_flush_413_retry(
     );
     assert!(!mgr.is_busy(&id), "stop released the slot");
 
-    for content in queued {
+    for (content, prepend) in queued {
+        let prepend = prepend.map(|p| crate::agent_ops::QueuedPrepend {
+            content: Some(p.to_string()),
+            image_blocks: None,
+            file_blocks: None,
+        });
         mgr.services
-            .enqueue_message(&id, content.to_string(), None, None, None, None, false);
+            .enqueue_message(&id, content.to_string(), None, None, None, prepend, false);
     }
     // The drain flushes both entries into ONE turn; the mock fails it 413.
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -6181,6 +6191,7 @@ async fn stop_redelivery_flush_413_retry(
         2,
         "failed flush + one retry turn: {prompts:?}"
     );
+    let first_text = prompts[0]["text"].as_str().expect("text").to_string();
     let retry_text = prompts[1]["text"].as_str().expect("text").to_string();
     let retry_blocks = prompts[1]["blockTypes"]
         .as_array()
@@ -6194,7 +6205,13 @@ async fn stop_redelivery_flush_413_retry(
         .get_agent_messages(&id, None)
         .await
         .expect("messages");
-    (restored, retry_text, retry_blocks, messages)
+    StopRedeliveryFlush413 {
+        restored,
+        first_text,
+        retry_text,
+        retry_blocks,
+        messages,
+    }
 }
 
 fn user_rows_containing(messages: &[intent_core::AgentMessage], needle: &str) -> usize {
@@ -6206,15 +6223,22 @@ fn user_rows_containing(messages: &[intent_core::AgentMessage], needle: &str) ->
 
 /// A SMALL stopped message armed for redelivery rides a combined flush that
 /// fails 413 over an oversized sibling: the per-entry requeue keeps the
-/// redelivery on the head entry (text + image, `persisted` untouched), the
-/// oversized tail becomes the marker, and the retry prompt carries the
-/// stopped message exactly once, ahead of the batch — nothing is lost.
+/// redelivery on the LAST entry (text + image), the oversized tail's own
+/// content becomes the marker, the small head is untouched, and the retry
+/// prompt carries the stopped message exactly once, ahead of the batch —
+/// nothing is lost.
 #[tokio::test]
 async fn context_size_flush_requeue_keeps_small_stop_redelivery_prepend() {
-    let (restored, retry_text, retry_blocks, messages) = stop_redelivery_flush_413_retry(
+    let StopRedeliveryFlush413 {
+        restored,
+        retry_text,
+        retry_blocks,
+        messages,
+        ..
+    } = stop_redelivery_flush_413_retry(
         "stop-small",
         "stopped before output",
-        ["queued follow-up", &oversized_payload()],
+        [("queued follow-up", None), (&oversized_payload(), None)],
     )
     .await;
 
@@ -6226,18 +6250,9 @@ async fn context_size_flush_requeue_keeps_small_stop_redelivery_prepend() {
     let head = &restored[0];
     assert!(head.content.starts_with("queued follow-up"));
     assert!(head.persisted, "small head keeps its durable row");
-    assert_eq!(
-        head.prepend_content.as_deref(),
-        Some("stopped before output"),
-        "the armed redelivery rides the head entry"
-    );
     assert!(
-        head.prepend_image_blocks
-            .as_ref()
-            .and_then(Value::as_array)
-            .is_some_and(|b| b.iter().any(|b| b["data"] == json!("aGVsbG8="))),
-        "the redelivered image rides along: {:?}",
-        head.prepend_image_blocks
+        head.prepend_content.is_none(),
+        "no duplicated redelivery on the head"
     );
     assert!(head.requeued_after_failure);
     let tail = &restored[1];
@@ -6247,9 +6262,18 @@ async fn context_size_flush_requeue_keeps_small_stop_redelivery_prepend() {
         tail.content
     );
     assert!(!tail.persisted);
+    assert_eq!(
+        tail.prepend_content.as_deref(),
+        Some("stopped before output"),
+        "the armed redelivery rides the last entry"
+    );
     assert!(
-        tail.prepend_content.is_none(),
-        "no duplicated redelivery on the tail"
+        tail.prepend_image_blocks
+            .as_ref()
+            .and_then(Value::as_array)
+            .is_some_and(|b| b.iter().any(|b| b["data"] == json!("aGVsbG8="))),
+        "the redelivered image rides along: {:?}",
+        tail.prepend_image_blocks
     );
 
     let stop_pos = retry_text
@@ -6300,15 +6324,24 @@ async fn context_size_flush_requeue_keeps_small_stop_redelivery_prepend() {
 }
 
 /// An OVERSIZED stopped message armed for redelivery over a flush of two
-/// small entries: the 413 requeue swaps only the head entry's prepend for
+/// small entries: the 413 requeue swaps only the last entry's prepend for
 /// the marker (`content` + `persisted` untouched), the small siblings stay
 /// verbatim and ordered, and the retry prompt carries the marker instead of
 /// the payload.
 #[tokio::test]
 async fn context_size_flush_requeue_replaces_oversized_stop_redelivery_prepend() {
     let payload = oversized_payload();
-    let (restored, retry_text, _retry_blocks, messages) =
-        stop_redelivery_flush_413_retry("stop-big", &payload, ["small first", "small last"]).await;
+    let StopRedeliveryFlush413 {
+        restored,
+        retry_text,
+        messages,
+        ..
+    } = stop_redelivery_flush_413_retry(
+        "stop-big",
+        &payload,
+        [("small first", None), ("small last", None)],
+    )
+    .await;
 
     assert_eq!(
         restored.len(),
@@ -6317,19 +6350,19 @@ async fn context_size_flush_requeue_replaces_oversized_stop_redelivery_prepend()
     );
     let head = &restored[0];
     assert!(head.content.starts_with("small first"));
+    assert!(head.persisted);
+    assert!(head.prepend_content.is_none());
+    let tail = &restored[1];
+    assert!(tail.content.starts_with("small last"));
     assert!(
-        head.persisted,
-        "head keeps its durable row: only the prepend changed"
+        tail.persisted,
+        "last entry keeps its durable row: only the prepend changed"
     );
     assert_eq!(
-        head.prepend_content.as_deref(),
+        tail.prepend_content.as_deref(),
         Some(super::context_size_requeue_marker(payload.chars().count()).as_str()),
         "the oversized redelivery becomes the marker"
     );
-    let tail = &restored[1];
-    assert!(tail.content.starts_with("small last"));
-    assert!(tail.persisted);
-    assert!(tail.prepend_content.is_none());
 
     assert!(
         !retry_text.contains("OVERSIZED-PAYLOAD-TOKEN"),
@@ -6354,6 +6387,70 @@ async fn context_size_flush_requeue_replaces_oversized_stop_redelivery_prepend()
         user_rows_containing(&messages, "OVERSIZED-PAYLOAD-TOKEN"),
         1
     );
+}
+
+/// The consumed stop redelivery rides the LAST flushed entry so the retry
+/// rebuilds the failed turn's aggregate prepend order: entry prepends in
+/// entry order, then the stop redelivery. Both flushed entries carry their
+/// own prepend here; attaching the redelivery to the head would reorder it
+/// ahead of the second entry's prepend on the retry.
+#[tokio::test]
+async fn context_size_flush_requeue_keeps_stop_redelivery_prepend_order() {
+    let StopRedeliveryFlush413 {
+        restored,
+        first_text,
+        retry_text,
+        ..
+    } = stop_redelivery_flush_413_retry(
+        "stop-order",
+        "stopped before output",
+        [
+            ("first body", Some("first own prepend")),
+            ("second body", Some("second own prepend")),
+        ],
+    )
+    .await;
+
+    assert_eq!(restored.len(), 2, "{restored:?}");
+    assert_eq!(
+        restored[0].prepend_content.as_deref(),
+        Some("first own prepend"),
+        "head keeps only its own prepend"
+    );
+    assert_eq!(
+        restored[1].prepend_content.as_deref(),
+        Some("second own prepend\n\nstopped before output"),
+        "the redelivery follows the last entry's own prepend"
+    );
+
+    let expected = "first own prepend\n\nsecond own prepend\n\nstopped before output";
+    assert!(
+        first_text.contains(expected),
+        "failed flush aggregate order: {first_text:?}"
+    );
+    assert!(
+        retry_text.contains(expected),
+        "retry preserves the aggregate order: {retry_text:?}"
+    );
+    let prepend_section = |text: &str| -> String {
+        let start = text.find("first own prepend").expect("prepend start");
+        let end = text.find("first body").expect("batch start");
+        assert!(start < end, "prepends precede the batch: {text:?}");
+        text[start..end].to_string()
+    };
+    assert_eq!(
+        prepend_section(&retry_text),
+        prepend_section(&first_text),
+        "retry prepend section matches the first attempt"
+    );
+    assert_eq!(
+        retry_text.matches("stopped before output").count(),
+        1,
+        "{retry_text:?}"
+    );
+    let body_first = retry_text.find("first body").unwrap();
+    let body_second = retry_text.find("second body").unwrap();
+    assert!(body_first < body_second, "{retry_text:?}");
 }
 
 /// Wire surface (monorepo#1022): the terminal `agent:failed` +

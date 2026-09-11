@@ -6819,21 +6819,23 @@ impl AgentManager {
         // A combined flush turn also carries its entries for the per-entry
         // context-size requeue (`flushed_entries`, intent-hq/intent#4703);
         // that path restores the ENTRIES, not the aggregate options, so the
-        // payload is merged into the HEAD entry as well — an individual
-        // restore then redelivers it exactly once, ahead of the batch,
-        // instead of losing it with the discarded aggregate prepend.
+        // payload is merged into the LAST entry as well — an individual
+        // restore then redelivers it exactly once, and the retry's next
+        // flush rebuilds the same aggregate order as this turn (entry
+        // prepends in entry order, then the stop redelivery) instead of
+        // losing it with the discarded aggregate prepend.
         let armed = self.stop_redelivery.lock().unwrap().remove(&agent_id);
         let consumed_redelivery = armed.is_some();
         if let Some(armed) = armed {
-            if let Some(head) = options
+            if let Some(last) = options
                 .flushed_entries
                 .as_mut()
-                .and_then(|entries| entries.first_mut())
+                .and_then(|entries| entries.last_mut())
             {
                 merge_prepend_payload(
-                    &mut head.prepend_content,
-                    &mut head.prepend_image_blocks,
-                    &mut head.prepend_file_blocks,
+                    &mut last.prepend_content,
+                    &mut last.prepend_image_blocks,
+                    &mut last.prepend_file_blocks,
                     armed.clone(),
                 );
             }
@@ -11074,9 +11076,10 @@ async fn publish_error_status_and_requeue(
     // its small siblings down with it, and a batch of small entries whose
     // SUM exceeded the limit keeps every payload verbatim (the next flush
     // still combines them; the per-entry drain never lost them). A stop
-    // redelivery consumed by the flush turn (`spawn_worker`) rides the HEAD
+    // redelivery consumed by the flush turn (`spawn_worker`) rides the LAST
     // entry's `prepend_*`, so it is measured and restored with that entry
-    // rather than lost with the aggregate options. Any other failure on a
+    // — keeping the aggregate prepend order on the retry — rather than
+    // lost with the aggregate options. Any other failure on a
     // flush turn requeues the combined prompt as ONE entry, exactly as
     // before.
     let context_size_failure = crate::is_context_size_error(error_text);
