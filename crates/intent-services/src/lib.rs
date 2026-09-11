@@ -12905,6 +12905,26 @@ pub(crate) fn is_deterministic_prompt_rejection(stop_reason: &str) -> bool {
         && lower.contains("\"apistatus\":\"invalidargument\"")
 }
 
+/// Classify a terminal-failure text as a context-size rejection: the
+/// provider refused the request because the prompt (or the accumulated
+/// context) exceeded what the model accepts — the HTTP 413 shape
+/// (`HTTP error: 413 Request Entity Too Large: … "Conversation context too
+/// large for model"`). Substring-anchored like its neighbours and
+/// deliberately narrow: it requires the `413` status together with one of
+/// the load-bearing phrases (`request entity too large`, `too large for
+/// model`, `context too large`), so plain 4xx/5xx errors and other texts do
+/// not classify. This is a MESSAGE problem, not a session problem — it is
+/// intentionally NOT part of [`is_session_fatal_error`] and never poisons a
+/// session on its own; `publish_error_status_and_requeue` uses it to swap an
+/// oversized queued payload for a short recovery marker.
+pub(crate) fn is_context_size_error(error_text: &str) -> bool {
+    let lower = error_text.to_ascii_lowercase();
+    lower.contains("413")
+        && (lower.contains("request entity too large")
+            || lower.contains("too large for model")
+            || lower.contains("context too large"))
+}
+
 /// Classify a terminal-failure text as session-fatal on its own (independent
 /// of the failure streak): a provider block ([`is_session_fatal_stop_reason`])
 /// or the deterministic chat-stream 400 prompt rejection

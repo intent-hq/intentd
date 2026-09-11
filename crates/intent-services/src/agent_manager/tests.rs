@@ -5461,6 +5461,261 @@ async fn terminal_failure_requeue_defaults_turn_id_to_new_id() {
     );
 }
 
+/// The intent-hq/intent#4703 failure text: a chat-stream 413 wrapped the way
+/// the ACP layer surfaces it.
+fn context_size_error_text() -> &'static str {
+    "internal error: session/prompt failed: JSON-RPC error -32603: Internal error: \
+     HTTP error: 413 Request Entity Too Large: {\"httpStatus\":413,\
+     \"message\":\"Conversation context too large for model\"}"
+}
+
+/// A payload one char over `CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`, built from
+/// a recognisable token so the retry test can prove it never reached the
+/// provider.
+fn oversized_payload() -> String {
+    let mut s = String::new();
+    while s.chars().count() <= super::CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS {
+        s.push_str("OVERSIZED-PAYLOAD-TOKEN ");
+    }
+    s
+}
+
+/// intent-hq/intent#4703: a context-size (413) failure on an entry above
+/// the size threshold re-queues the recovery MARKER in place of the payload,
+/// keeping the correlation `turn_id`, `queued_at`, `messageMetadata`,
+/// priority, and `requeuedAfterFailure: true`. `persisted` is forced to
+/// `false` so the retry drain appends the marker as the turn's user row.
+#[tokio::test]
+async fn context_size_requeue_replaces_oversized_entry_with_marker() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-413-big"), AgentId::from("a-413-big"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let payload = oversized_payload();
+    let original_chars = payload.chars().count();
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413".to_string()),
+        queued_at: Some("2026-01-01T00:00:00Z".to_string()),
+        message_metadata: Some(json!({"type": "hook_dispatch"})),
+        interrupt_priority: true,
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        &payload,
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(
+        queued.content,
+        super::context_size_requeue_marker(original_chars),
+        "oversized payload replaced by the recovery marker"
+    );
+    assert!(
+        queued.content.contains(&format!("{original_chars} chars")),
+        "marker names the dropped size: {}",
+        queued.content
+    );
+    assert!(!queued.content.contains("OVERSIZED-PAYLOAD-TOKEN"));
+    assert!(queued.requeued_after_failure);
+    assert!(
+        !queued.persisted,
+        "marker must be appended as the retry's user row"
+    );
+    assert_eq!(queued.turn_id, "turn-413");
+    assert_eq!(queued.queued_at, "2026-01-01T00:00:00Z");
+    assert_eq!(
+        queued.message_metadata,
+        Some(json!({"type": "hook_dispatch"}))
+    );
+    assert!(queued.interrupt_priority);
+    // Wire shape (`agent.getQueue`) shows the marker as a failure requeue.
+    let wire = queued.to_value(0);
+    assert_eq!(wire["requeuedAfterFailure"], json!(true));
+    assert_eq!(wire["content"], json!(queued.content));
+    assert_eq!(wire["turnId"], json!("turn-413"));
+}
+
+/// A context-size failure on a SMALL entry (at/under the threshold) is the
+/// accumulated context's problem, not the message's: the entry re-queues
+/// unchanged with `persisted` as given (existing behaviour).
+#[tokio::test]
+async fn context_size_requeue_keeps_small_entry_unchanged() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-small"),
+        AgentId::from("a-413-small"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413-small".to_string()),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        "small ask",
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(queued.content, "small ask");
+    assert!(queued.persisted, "already-persisted row is not re-appended");
+    assert!(queued.requeued_after_failure);
+    assert_eq!(queued.turn_id, "turn-413-small");
+}
+
+/// An oversized entry whose turn failed for a NON-context-size reason
+/// re-queues verbatim: the marker swap is gated on the 413 classifier, not
+/// on size alone.
+#[tokio::test]
+async fn non_context_size_failure_keeps_oversized_entry_unchanged() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-big-boom"),
+        AgentId::from("a-big-boom"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let payload = oversized_payload();
+    let options = super::TurnOptions::default();
+    super::persist_error_and_requeue(&mgr, &id, &ws, &payload, &options, true, "boom").await;
+
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(queued.content, payload);
+    assert!(queued.persisted);
+    assert!(queued.requeued_after_failure);
+}
+
+/// End-to-end (intent-hq/intent#4703): after a 413 on an oversized entry,
+/// `agent.retry` sends the MARKER to the provider — the marker lands as the
+/// retry turn's user row exactly once and the original payload is never
+/// re-sent.
+#[tokio::test]
+async fn context_size_requeue_retry_sends_marker_to_provider() {
+    let script = mock_agent_script();
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": "OVERSIZED-PAYLOAD-TOKEN",
+                "response": "original-delivered",
+            },
+            {
+                "ifPromptContains": "[Queued message of",
+                "response": "marker-received",
+            },
+        ],
+        "response": "neither marker nor payload in prompt",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+    ]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-retry"),
+        AgentId::from("a-413-retry"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+
+    let payload = oversized_payload();
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413-retry".to_string()),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        &payload,
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("agent.retry");
+    assert_eq!(result["redriven"], json!(true));
+    assert_eq!(result["turnId"], json!("turn-413-retry"));
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::RuntimeIdle
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry turn completes and the agent goes idle");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let marker_rows = messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("[Queued message of"))
+        })
+        .count();
+    assert_eq!(
+        marker_rows, 1,
+        "the marker lands in the transcript exactly once: {messages:?}"
+    );
+    assert!(
+        !messages.iter().any(|m| m.role == "user"
+            && serde_json::to_string(&m.content)
+                .unwrap()
+                .contains("OVERSIZED-PAYLOAD-TOKEN")),
+        "the original payload is never re-appended: {messages:?}"
+    );
+    let assistant = messages
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("retried turn produced assistant output");
+    assert!(
+        serde_json::to_string(&assistant.content)
+            .unwrap()
+            .contains("marker-received"),
+        "provider received the marker, not the payload: {messages:?}"
+    );
+}
+
 /// Wire surface (monorepo#1022): the terminal `agent:failed` +
 /// `agent:stream:end` pair carries the failed turn's `turnId` when present,
 /// and omits the key entirely when absent (never `null`).

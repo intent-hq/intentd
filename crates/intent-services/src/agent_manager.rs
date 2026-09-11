@@ -104,6 +104,15 @@ pub(crate) const AUTO_UNARCHIVE_NOTICE_TEXT: &str =
 pub(crate) const AUTO_UNARCHIVE_PROMPT_NOTICE: &str =
     "[SYSTEM NOTICE] This workspace was archived; it has been automatically unarchived because this message was sent.";
 
+/// Queued-message size (chars) above which a turn failing with a
+/// context-size error (HTTP 413, [`crate::is_context_size_error`]) is
+/// treated as the MESSAGE being too large rather than the accumulated
+/// context: `publish_error_status_and_requeue` then re-queues a short
+/// recovery marker in place of the payload so the retry can succeed instead
+/// of re-failing forever (intent-hq/intent#4703). Matches the hook dispatch
+/// message cap. Entries at or under the threshold re-queue unchanged.
+pub(crate) const CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS: usize = 32 * 1024;
+
 /// [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`] with an `INTENTD_DEQUEUE_WAIT_MIN_MS`
 /// env override (whole milliseconds). Primarily for tests/CI — the e2e
 /// suites park entries behind short (~2s) mock busy turns and assert the
@@ -8588,6 +8597,13 @@ pub(crate) fn attachment_reference_notice(
     crate::harness::latest().attachment_reference_notice(name, mime, size, id)
 }
 
+/// The recovery marker that replaces an oversized queue entry after a
+/// context-size turn failure (see [`CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`]).
+/// Wording owned by the harness (H6).
+pub(crate) fn context_size_requeue_marker(original_chars: usize) -> String {
+    crate::harness::latest().context_size_requeue_marker(original_chars)
+}
+
 /// Push one content block per well-formed file entry: inline
 /// `{ data, mimeType, fileName }` entries become `resource` blocks carrying
 /// the blob; attachment-reference `{ attachmentId, fileName }` entries
@@ -10943,11 +10959,38 @@ async fn publish_error_status_and_requeue(
     // `id` but keeps the failed turn's ORIGINAL `turn_id` (monorepo#1022) so
     // the retry correlates with the turn it redrives; a missing option (bare
     // test wiring — spawn_worker always mints one) falls back to the new id.
+    //
+    // Context-size failure on an oversized entry (intent-hq/intent#4703): a
+    // 413 against a payload above `CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`
+    // means the MESSAGE itself cannot fit, so re-queueing it verbatim would
+    // re-fail every retry and wedge the queue (hook payloads have no sender
+    // who could remove the entry). The content is replaced with a short
+    // recovery marker naming the dropped size, and `persisted` is forced to
+    // `false` so the retry drain appends the MARKER as the turn's user row
+    // and sends it to the provider — with `true` the drain would skip the
+    // append and the transcript would show the original text for a turn the
+    // provider never saw. The original row (when it was persisted) stays in
+    // the transcript untouched. A small entry that hits a 413 is the
+    // accumulated context's problem, not the message's: it re-queues
+    // unchanged and the identical-failure streak escalates as today.
+    let original_chars = content.chars().count();
+    let oversized_context_failure = crate::is_context_size_error(error_text)
+        && original_chars > CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS;
+    let (content, persisted) = if oversized_context_failure {
+        tracing::warn!(
+            agent = %agent_id,
+            chars = original_chars,
+            "context-size turn failure on an oversized queued message; requeueing a recovery marker instead of the payload"
+        );
+        (context_size_requeue_marker(original_chars), false)
+    } else {
+        (content.to_string(), persisted)
+    };
     let id = new_message_id();
     let queued = crate::agent_ops::QueuedMessage {
         turn_id: options.turn_id.clone().unwrap_or_else(|| id.clone()),
         id,
-        content: content.to_string(),
+        content,
         image_blocks: options.image_blocks.clone(),
         file_blocks: options.file_blocks.clone(),
         queued_at: options.queued_at.clone().unwrap_or_else(now_iso),
