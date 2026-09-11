@@ -6816,19 +6816,33 @@ impl AgentManager {
         // the prepend TEXT (`history_covers_prepend`), same as the
         // preemption path; attachments are still emitted (history is
         // text-only).
+        // A combined flush turn also carries its entries for the per-entry
+        // context-size requeue (`flushed_entries`, intent-hq/intent#4703);
+        // that path restores the ENTRIES, not the aggregate options, so the
+        // payload is merged into the HEAD entry as well — an individual
+        // restore then redelivers it exactly once, ahead of the batch,
+        // instead of losing it with the discarded aggregate prepend.
         let armed = self.stop_redelivery.lock().unwrap().remove(&agent_id);
         let consumed_redelivery = armed.is_some();
         if let Some(armed) = armed {
-            if let Some(text) = armed.content.filter(|t| !t.is_empty()) {
-                options.prepend_content = Some(match options.prepend_content.take() {
-                    Some(existing) if !existing.is_empty() => format!("{existing}\n\n{text}"),
-                    _ => text,
-                });
+            if let Some(head) = options
+                .flushed_entries
+                .as_mut()
+                .and_then(|entries| entries.first_mut())
+            {
+                merge_prepend_payload(
+                    &mut head.prepend_content,
+                    &mut head.prepend_image_blocks,
+                    &mut head.prepend_file_blocks,
+                    armed.clone(),
+                );
             }
-            options.prepend_image_blocks =
-                merge_block_arrays(options.prepend_image_blocks.take(), armed.image_blocks);
-            options.prepend_file_blocks =
-                merge_block_arrays(options.prepend_file_blocks.take(), armed.file_blocks);
+            merge_prepend_payload(
+                &mut options.prepend_content,
+                &mut options.prepend_image_blocks,
+                &mut options.prepend_file_blocks,
+                armed,
+            );
         }
         let mgr = self.clone();
         let id = agent_id.clone();
@@ -8567,6 +8581,26 @@ fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Val
         (Some(a), None | Some(_)) | (None, Some(a)) => Some(a),
         (None, None) => None,
     }
+}
+
+/// Merge a consumed zero-output stop-redelivery payload
+/// (intent-hq/monorepo#1757) into a `prepend_*` triple: an existing prepend
+/// text stays FIRST (the armed row is the newest prepend payload) and the
+/// block arrays concatenate in the same order.
+fn merge_prepend_payload(
+    prepend_content: &mut Option<String>,
+    prepend_image_blocks: &mut Option<Value>,
+    prepend_file_blocks: &mut Option<Value>,
+    armed: crate::agent_ops::QueuedPrepend,
+) {
+    if let Some(text) = armed.content.filter(|t| !t.is_empty()) {
+        *prepend_content = Some(match prepend_content.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}\n\n{text}"),
+            _ => text,
+        });
+    }
+    *prepend_image_blocks = merge_block_arrays(prepend_image_blocks.take(), armed.image_blocks);
+    *prepend_file_blocks = merge_block_arrays(prepend_file_blocks.take(), armed.file_blocks);
 }
 
 /// Push one `image` content block per well-formed `{ data, mimeType }` entry.
@@ -11039,9 +11073,12 @@ async fn publish_error_status_and_requeue(
     // replaced with the marker — so one oversized hook payload never takes
     // its small siblings down with it, and a batch of small entries whose
     // SUM exceeded the limit keeps every payload verbatim (the next flush
-    // still combines them; the per-entry drain never lost them). Any other
-    // failure on a flush turn requeues the combined prompt as ONE entry,
-    // exactly as before.
+    // still combines them; the per-entry drain never lost them). A stop
+    // redelivery consumed by the flush turn (`spawn_worker`) rides the HEAD
+    // entry's `prepend_*`, so it is measured and restored with that entry
+    // rather than lost with the aggregate options. Any other failure on a
+    // flush turn requeues the combined prompt as ONE entry, exactly as
+    // before.
     let context_size_failure = crate::is_context_size_error(error_text);
     if let Some(entries) = options
         .flushed_entries
