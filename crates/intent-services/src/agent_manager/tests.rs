@@ -2774,7 +2774,13 @@ async fn aborted_acquire_release_still_kicks_drain_for_parked_message() {
     // Mid-kill, a send parks behind the claim (its inline drain kick loses
     // `try_begin` against the held claim).
     mgr.services
-        .agent_queue_message_op(victim.clone(), "parked behind claim".into(), None, None)
+        .agent_queue_message_op(
+            victim.clone(),
+            "parked behind claim".into(),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("queue message");
     assert_eq!(services.queue_snapshot(&victim).len(), 1, "message parked");
@@ -6174,7 +6180,7 @@ async fn interrupt_suppresses_idle_when_queue_has_ready_to_send() {
     // so they're immediately ready to send.
     let _ = mgr
         .services
-        .agent_queue_message_op(id.clone(), "follow-up".into(), None, None)
+        .agent_queue_message_op(id.clone(), "follow-up".into(), None, None, None)
         .await
         .expect("queue");
 
@@ -7602,13 +7608,13 @@ async fn send_queued_message_now_delivers_entry_and_preserves_rest_of_queue() {
     let _agent = track_mock_agent(&mgr, &id, false);
     let first = mgr
         .services
-        .agent_queue_message_op(id.clone(), "first queued".into(), None, None)
+        .agent_queue_message_op(id.clone(), "first queued".into(), None, None, None)
         .await
         .expect("queue first");
     let first_id = first["queuedMessage"]["id"].as_str().unwrap().to_string();
     let second = mgr
         .services
-        .agent_queue_message_op(id.clone(), "second queued".into(), None, None)
+        .agent_queue_message_op(id.clone(), "second queued".into(), None, None, None)
         .await
         .expect("queue second");
     let second_id = second["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -7653,7 +7659,7 @@ async fn send_queued_message_now_not_found_has_no_side_effects() {
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-sqmn-missing"));
     seed_agent(&mgr, &ws, &id).await;
     mgr.services
-        .agent_queue_message_op(id.clone(), "still queued".into(), None, None)
+        .agent_queue_message_op(id.clone(), "still queued".into(), None, None, None)
         .await
         .expect("queue");
 
@@ -7709,7 +7715,7 @@ async fn send_queued_message_now_preempts_busy_turn_without_kill() {
         .unwrap();
     let queued = mgr
         .services
-        .agent_queue_message_op(id.clone(), "urgent queued".into(), None, None)
+        .agent_queue_message_op(id.clone(), "urgent queued".into(), None, None, None)
         .await
         .expect("queue");
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -7749,13 +7755,13 @@ async fn send_queued_message_now_restores_entry_when_slot_unavailable() {
     assert!(mgr.try_begin(&id, &ws).await);
     let other = mgr
         .services
-        .agent_queue_message_op(id.clone(), "ahead".into(), None, None)
+        .agent_queue_message_op(id.clone(), "ahead".into(), None, None, None)
         .await
         .expect("queue other");
     let other_id = other["queuedMessage"]["id"].as_str().unwrap().to_string();
     let queued = mgr
         .services
-        .agent_queue_message_op(id.clone(), "send me now".into(), None, None)
+        .agent_queue_message_op(id.clone(), "send me now".into(), None, None, None)
         .await
         .expect("queue target");
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -7789,7 +7795,7 @@ async fn send_queued_message_now_persist_failure_requeues_front() {
     seed_agent(&mgr, &ws, &id).await;
     let queued = mgr
         .services
-        .agent_queue_message_op(id.clone(), "doomed append".into(), None, None)
+        .agent_queue_message_op(id.clone(), "doomed append".into(), None, None, None)
         .await
         .expect("queue");
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -7833,7 +7839,7 @@ async fn send_queued_message_now_leaves_entry_queued_when_quarantined() {
     seed_agent(&mgr, &ws, &id).await;
     let queued = mgr
         .services
-        .agent_queue_message_op(id.clone(), "parked".into(), None, None)
+        .agent_queue_message_op(id.clone(), "parked".into(), None, None, None)
         .await
         .expect("queue");
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -7891,7 +7897,7 @@ async fn send_queued_message_now_annotates_stale_redrive() {
     let _agent = track_mock_agent(&mgr, &id, false);
     let queued = mgr
         .services
-        .agent_queue_message_op(id.clone(), "queued before report".into(), None, None)
+        .agent_queue_message_op(id.clone(), "queued before report".into(), None, None, None)
         .await
         .expect("queue");
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -9339,7 +9345,7 @@ async fn archive_workspace_parks_queue_until_unarchive() {
     // `agent_queue_message_op` is a no-op while the slot is held).
     assert!(mgr.try_begin(&id, &ws).await);
     mgr.services
-        .agent_queue_message_op(id.clone(), "follow-up".into(), None, None)
+        .agent_queue_message_op(id.clone(), "follow-up".into(), None, None, None)
         .await
         .expect("queue message");
     assert_eq!(services.queue_snapshot(&id).len(), 1, "message queued");
@@ -15157,7 +15163,7 @@ mod dequeue_wait_tests {
         let _agent = track_mock_agent(&mgr, &id, false);
         let queued = mgr
             .services
-            .agent_queue_message_op(id.clone(), "queued work".into(), None, None)
+            .agent_queue_message_op(id.clone(), "queued work".into(), None, None, None)
             .await
             .expect("queue");
         let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();

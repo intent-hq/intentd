@@ -5534,13 +5534,17 @@ impl Services {
     /// `agent:queue:updated`, and asks the runtime [`AgentManager`] (when attached)
     /// to drain the queue immediately if the agent is idle — closing the bug where
     /// a queued message would never be sent because the BE only drained the queue
-    /// from a live worker loop.
+    /// from a live worker loop. `message_metadata` (already
+    /// attribution-stripped by the router) is captured on the entry so the
+    /// drain-time persist writes it onto the user row — a queued
+    /// `question_answers` answer thereby resolves the pending question set.
     pub(crate) async fn agent_queue_message_op(
         &self,
         agent_id: AgentId,
         content: String,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
     ) -> Result<Value> {
         // Attachment-reference validation (PROTOCOL §5.5) before any state
         // change, matching `agent.sendMessage`.
@@ -5557,7 +5561,7 @@ impl Services {
             content,
             image_blocks,
             file_blocks,
-            None,
+            message_metadata,
             None,
             false,
         );

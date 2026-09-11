@@ -1554,7 +1554,7 @@ async fn idle_with_editing_only_queue_delivers_and_retires_watch() {
     )
     .expect("register watch");
     let q = svc
-        .agent_queue_message_op(child.clone(), "draft".into(), None, None)
+        .agent_queue_message_op(child.clone(), "draft".into(), None, None, None)
         .await
         .expect("queue message");
     let mid = q["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -1888,7 +1888,7 @@ async fn editing_flip_after_interim_idle_fires_stranded_watch() {
     .expect("register watch");
 
     let q = svc
-        .agent_queue_message_op(child.clone(), "draft".into(), None, None)
+        .agent_queue_message_op(child.clone(), "draft".into(), None, None, None)
         .await
         .expect("queue message");
     let mid = q["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -11994,7 +11994,7 @@ async fn queue_lifecycle_add_get_edit_remove() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Q").await;
     let added = svc
-        .agent_queue_message_op(id.clone(), "hello".into(), None, None)
+        .agent_queue_message_op(id.clone(), "hello".into(), None, None, None)
         .await
         .expect("queue");
     assert_eq!(added["success"], true);
@@ -12035,6 +12035,43 @@ async fn queue_lifecycle_add_get_edit_remove() {
         .expect("remove");
     let q = svc.agent_get_queue_op(id, None).await.expect("getQueue");
     assert_eq!(q["queue"].as_array().unwrap().len(), 0);
+}
+
+/// `agent.queueMessage` captures the caller's `messageMetadata` on the
+/// queued entry (result + `agent.getQueue`), and an absent one leaves the
+/// entry without a `messageMetadata` key.
+#[tokio::test]
+async fn queue_message_captures_message_metadata_on_entry() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+    let tag = json!({
+        "type": "question_answers",
+        "answeredQuestionsMessageId": "asst-msg-1",
+    });
+    let added = svc
+        .agent_queue_message_op(
+            id.clone(),
+            "Q: env?\nA: Staging".into(),
+            None,
+            None,
+            Some(tag.clone()),
+        )
+        .await
+        .expect("queue tagged");
+    assert_eq!(added["success"], true);
+    assert_eq!(added["queuedMessage"]["messageMetadata"], tag);
+
+    let plain = svc
+        .agent_queue_message_op(id.clone(), "plain".into(), None, None, None)
+        .await
+        .expect("queue plain");
+    assert!(plain["queuedMessage"].get("messageMetadata").is_none());
+
+    let q = svc.agent_get_queue_op(id, None).await.expect("getQueue");
+    let queue = q["queue"].as_array().unwrap();
+    assert_eq!(queue.len(), 2);
+    assert_eq!(queue[0]["messageMetadata"], tag);
+    assert!(queue[1].get("messageMetadata").is_none());
 }
 
 #[tokio::test]
@@ -12143,7 +12180,7 @@ async fn remove_queued_message_owned_rejects_user_entry() {
     let target = create_agent(&svc, &ws, "Target").await;
     let caller = create_agent(&svc, &ws, "Caller").await;
     let queued = svc
-        .agent_queue_message_op(target.clone(), "user entry".into(), None, None)
+        .agent_queue_message_op(target.clone(), "user entry".into(), None, None, None)
         .await
         .expect("queue");
     let mid = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -12183,7 +12220,7 @@ async fn queue_message_emits_queue_updated_with_snapshot() {
     });
 
     let added = svc
-        .agent_queue_message_op(id.clone(), "first".into(), None, None)
+        .agent_queue_message_op(id.clone(), "first".into(), None, None, None)
         .await
         .expect("queue");
     let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -12213,7 +12250,7 @@ async fn remove_queued_message_emits_queue_updated_only_when_present() {
 
     // Seed one queued message, then drain the events for the seed enqueue.
     let added = svc
-        .agent_queue_message_op(id.clone(), "first".into(), None, None)
+        .agent_queue_message_op(id.clone(), "first".into(), None, None, None)
         .await
         .expect("queue");
     let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -12259,12 +12296,12 @@ async fn editing_flag_excludes_message_from_dequeue() {
     let id = create_agent(&svc, &ws, "Q").await;
 
     let a = svc
-        .agent_queue_message_op(id.clone(), "first".into(), None, None)
+        .agent_queue_message_op(id.clone(), "first".into(), None, None, None)
         .await
         .expect("queue first");
     let a_mid = a["queuedMessage"]["id"].as_str().unwrap().to_string();
     let b = svc
-        .agent_queue_message_op(id.clone(), "second".into(), None, None)
+        .agent_queue_message_op(id.clone(), "second".into(), None, None, None)
         .await
         .expect("queue second");
     let b_mid = b["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -12311,7 +12348,7 @@ async fn clearing_editing_flag_emits_queue_updated() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "Q").await;
     let added = svc
-        .agent_queue_message_op(id.clone(), "draft".into(), None, None)
+        .agent_queue_message_op(id.clone(), "draft".into(), None, None, None)
         .await
         .expect("queue");
     let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -12514,7 +12551,7 @@ async fn queue_message_op_rejects_unknown_agent() {
         ..Default::default()
     });
     let err = svc
-        .agent_queue_message_op(id.clone(), "hi".into(), None, None)
+        .agent_queue_message_op(id.clone(), "hi".into(), None, None, None)
         .await
         .expect_err("unknown agent must be rejected");
     match &err {
@@ -12764,6 +12801,7 @@ async fn send_queued_message_now_op_persists_attachment_blocks_in_transcript() {
             "queued with image".into(),
             Some(image_blocks),
             None,
+            None,
         )
         .await
         .expect("queue");
@@ -12800,7 +12838,7 @@ async fn send_queued_message_now_op_persists_attachment_blocks_in_transcript() {
 async fn send_queued_message_now_op_not_found_has_no_side_effects() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "SendNowMissing").await;
-    svc.agent_queue_message_op(id.clone(), "still here".into(), None, None)
+    svc.agent_queue_message_op(id.clone(), "still here".into(), None, None, None)
         .await
         .expect("queue");
     let err = svc
@@ -27559,7 +27597,7 @@ async fn agent_send_queued_message_now_emits_agent_message_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "SendNow").await;
     let queued = svc
-        .agent_queue_message_op(id.clone(), "queued content".into(), None, None)
+        .agent_queue_message_op(id.clone(), "queued content".into(), None, None, None)
         .await
         .expect("queue");
     let queued_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -28111,11 +28149,12 @@ async fn queue_mutations_write_through_to_store() {
             "first".into(),
             Some(json!([{ "type": "image", "data": "abc" }])),
             None,
+            None,
         )
         .await
         .expect("queue first");
     let first_id = first["queuedMessage"]["id"].as_str().unwrap().to_string();
-    svc.agent_queue_message_op(id.clone(), "second".into(), None, None)
+    svc.agent_queue_message_op(id.clone(), "second".into(), None, None, None)
         .await
         .expect("queue second");
     let rows = persisted_queue(&svc, &id).await;
@@ -28212,7 +28251,7 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
 async fn clear_queue_write_through_empties_persisted_snapshot() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Cleared").await;
-    svc.agent_queue_message_op(id.clone(), "doomed".into(), None, None)
+    svc.agent_queue_message_op(id.clone(), "doomed".into(), None, None, None)
         .await
         .expect("queue");
     assert_eq!(persisted_queue(&svc, &id).await.len(), 1);
@@ -28309,7 +28348,7 @@ async fn rehydrate_restores_queue_resets_editing_and_keeps_flags() {
 async fn rehydrate_preserves_live_map() {
     let (tmp, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Live").await;
-    svc.agent_queue_message_op(id.clone(), "persisted".into(), None, None)
+    svc.agent_queue_message_op(id.clone(), "persisted".into(), None, None, None)
         .await
         .expect("queue");
 
@@ -28318,7 +28357,7 @@ async fn rehydrate_preserves_live_map() {
     let store = Store::open(&tmp.path).await.expect("reopen store");
     let restarted = Services::new(store);
     restarted
-        .agent_queue_message_op(id.clone(), "live".into(), None, None)
+        .agent_queue_message_op(id.clone(), "live".into(), None, None, None)
         .await
         .expect("live queue");
     // The live enqueue's write-through replaced the persisted snapshot, so

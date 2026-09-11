@@ -1740,8 +1740,26 @@ async fn dispatch(
             let content = require_str_param(params, "content")?;
             let image_blocks = opt_value(params, "imageBlocks");
             let file_blocks = opt_value(params, "fileBlocks");
+            // Opaque per-message payload (PROTOCOL §5.5), captured on the
+            // queued entry so the drain-time persist writes the same row
+            // metadata a direct `agent.sendMessage` would (a queued
+            // `question_answers` answer resolves the pending question set).
+            // Same user-origin front door as `agent.sendMessage`: the
+            // reserved attribution fields are stripped; a non-object value
+            // is rejected.
+            let message_metadata = match opt_value(params, "messageMetadata") {
+                None => None,
+                Some(Value::Object(obj)) => strip_sender_attribution(Some(Value::Object(obj))),
+                Some(_) => return Err(invalid_params("messageMetadata must be an object")),
+            };
             let result = api
-                .agent_queue_message(agent_id, content, image_blocks, file_blocks)
+                .agent_queue_message(
+                    agent_id,
+                    content,
+                    image_blocks,
+                    file_blocks,
+                    message_metadata,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

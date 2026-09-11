@@ -1133,6 +1133,214 @@ async fn user_answer_parked_behind_busy_automatic_turn_clears_marker_over_wss() 
     );
 }
 
+/// Send one JSON-RPC request and return the FULL response envelope (error
+/// responses included) — for asserting `-32602` rejections.
+async fn wss_rpc_envelope<S>(ws: &mut WebSocketStream<S>, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let id = next_id();
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send rpc frame");
+    loop {
+        let next = timeout(Duration::from_secs(30), ws.next())
+            .await
+            .expect("wss rpc timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["id"] == json!(id) {
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// An explicitly QUEUED user answer (`agent.queueMessage` carrying the
+/// `question_answers` tag) resolves the pending question set on drain
+/// (PROTOCOL §5.5):
+///
+/// 1. The asker's kickoff turn emits the question — marker set.
+/// 2. A sibling's automatic `ws.agent.send` drives a SLOW turn on the asker.
+/// 3. While that turn is in flight, the user's answer is queued via
+///    `agent.queueMessage` with `messageMetadata { type: "question_answers",
+///    answeredQuestionsMessageId }`: the result's `queuedMessage` and the
+///    `agent.getQueue` entry both carry the metadata verbatim; a non-object
+///    `messageMetadata` is `-32602`; an omitted one leaves the entry without
+///    a `messageMetadata` key.
+/// 4. The end-of-turn drain delivers the queued answer: the marker clears
+///    (`agent:updated` carries the empty clear marker), the persisted user row
+///    carries the tag, and the queue is empty.
+#[tokio::test]
+async fn queued_answer_via_queue_message_clears_marker_over_wss() {
+    let Some(script) = gate("WSS pending-questions queueMessage answer E2E") else {
+        return;
+    };
+    let send_code = format!(
+        "const agents = await ws.agent.list(true); \
+         const target = agents.find(a => a.name === 'AskerA'); \
+         const first = await ws.agent.send(target.id, '{AUTO_SLOW}', 'queue'); \
+         await ws.note.create('send-results', JSON.stringify({{ first }})); \
+         return 'sent';"
+    );
+    let behavior = json!({
+        "rules": [
+            ask_rule(),
+            {
+                "ifPromptContains": SEND_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": send_code, "summary": "automatic slow send e2e" }
+                },
+                "response": "send dispatched"
+            },
+            {
+                "ifPromptContains": AUTO_SLOW,
+                "delayMs": SLOW_TURN_MS,
+                "response": "slow reply"
+            }
+        ],
+        "response": "plain reply"
+    })
+    .to_string();
+    let (_daemon, ws_id, port, cfg) = boot(&script, &behavior).await;
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string(), "sub: {sub_resp}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let asker_id = create_agent(&mut rpc, &ws_id, "AskerA").await;
+    let sender_id = create_agent(&mut rpc, &ws_id, "SenderB").await;
+
+    // ---- (1) Question turn: marker set ----
+    let asked_mid = drive_question_turn(&mut rpc, &mut sub, &ws_id, &asker_id).await;
+    await_agent_idle(&mut rpc, &asker_id).await;
+
+    // ---- (2) The automatic send drives a slow turn on the asker ----
+    let sent = wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": sender_id,
+            "content": format!("message the asker {SEND_MARKER}"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sender kickoff ok: {sent}");
+    await_agent_status(&mut rpc, &asker_id, "active").await;
+
+    // ---- (3) The tagged answer is queued explicitly ----
+    let rejected = wss_rpc_envelope(
+        &mut rpc,
+        "agent.queueMessage",
+        json!({
+            "agentId": asker_id,
+            "content": ANSWER_TEXT,
+            "messageMetadata": "not-an-object",
+        }),
+    )
+    .await;
+    assert_eq!(
+        rejected["error"]["code"], -32602,
+        "non-object messageMetadata is invalid params: {rejected}"
+    );
+
+    let answer_tag = json!({
+        "type": "question_answers",
+        "answeredQuestionsMessageId": asked_mid,
+    });
+    let queued = wss_rpc(
+        &mut rpc,
+        "agent.queueMessage",
+        json!({
+            "agentId": asker_id,
+            "content": ANSWER_TEXT,
+            "messageMetadata": answer_tag,
+        }),
+    )
+    .await;
+    assert_eq!(queued["success"], true, "queue ok: {queued}");
+    assert_eq!(
+        queued["queuedMessage"]["messageMetadata"], answer_tag,
+        "the queued entry carries the answer tag: {queued}"
+    );
+    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
+    let entries = q["queue"].as_array().expect("queue array");
+    assert_eq!(entries.len(), 1, "one parked answer: {q}");
+    assert_eq!(
+        entries[0]["messageMetadata"], answer_tag,
+        "agent.getQueue serves the tag on the entry: {q}"
+    );
+    // The marker is still set while the answer waits in the queue.
+    let got = wss_rpc(&mut rpc, "agent.get", json!({ "agentId": asker_id })).await;
+    assert_eq!(
+        got["agent"]["metadata"]["pendingQuestionsMessageId"], asked_mid,
+        "marker still set while the answer is parked: {got}"
+    );
+
+    // ---- (4) The drain delivers the answer and clears the marker ----
+    await_pending_marker_event(&mut sub, &asker_id, "").await;
+    let conv = await_conversation(&mut rpc, &ws_id, &asker_id, "answer drained", |m| {
+        user_row_index(m, ANSWER_TEXT).is_some()
+    })
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let auto_idx = user_row_index(messages, AUTO_SLOW).expect("automatic row");
+    let answer_idx = user_row_index(messages, ANSWER_TEXT).expect("answer row");
+    assert!(
+        auto_idx < answer_idx,
+        "the answer drained behind the automatic turn: auto={auto_idx} answer={answer_idx}"
+    );
+    let row_meta = &messages[answer_idx]["metadata"];
+    assert_eq!(
+        row_meta["type"], "question_answers",
+        "the persisted row carries the answer tag: {row_meta}"
+    );
+    assert_eq!(
+        row_meta["answeredQuestionsMessageId"], asked_mid,
+        "the persisted row names the answered message: {row_meta}"
+    );
+    let got = wss_rpc(&mut rpc, "agent.get", json!({ "agentId": asker_id })).await;
+    assert_eq!(
+        got["agent"]["metadata"]["pendingQuestionsMessageId"], "",
+        "drained queued answer cleared the marker: {got}"
+    );
+    await_agent_idle(&mut rpc, &asker_id).await;
+    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
+    assert!(
+        q["queue"].as_array().expect("queue array").is_empty(),
+        "queue empty after the drained answer: {q}"
+    );
+
+    // An untagged, metadata-less enqueue on the now-idle asker keeps today's
+    // shape: no `messageMetadata` key on the entry.
+    let plain = wss_rpc(
+        &mut rpc,
+        "agent.queueMessage",
+        json!({ "agentId": asker_id, "content": PLAIN_USER_TEXT, "messageMetadata": null }),
+    )
+    .await;
+    assert!(
+        plain["queuedMessage"].get("messageMetadata").is_none(),
+        "null/omitted metadata leaves the entry key-less: {plain}"
+    );
+}
+
 /// Marker resolved by `agent.dismissQuestions` after an automatic delivery
 /// (PROTOCOL §5.5):
 ///

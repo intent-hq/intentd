@@ -26188,10 +26188,17 @@ impl WorkspaceApi for Services {
         content: String,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_queue_message_op(agent_id, content, image_blocks, file_blocks)
-                .await
+            self.agent_queue_message_op(
+                agent_id,
+                content,
+                image_blocks,
+                file_blocks,
+                message_metadata,
+            )
+            .await
         })
     }
 
