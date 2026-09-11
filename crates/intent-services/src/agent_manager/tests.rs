@@ -15631,16 +15631,31 @@ mod queued_message_id_stamp_tests {
         );
     }
 
+    /// `queueInfo` is daemon-reserved: a non-object value (or a non-object
+    /// `messageMetadata`, which the wire path rejects anyway) is replaced so
+    /// the drained row still names its entry — no carve-out.
     #[test]
-    fn non_object_metadata_is_left_alone() {
+    fn non_object_queue_info_is_replaced_by_the_link() {
         let mut msg = queued_msg("odd", &iso_secs_ago(60), false);
         msg.message_metadata = Some(json!("not-an-object"));
         super::super::stamp_queued_message_id(&mut msg);
-        assert_eq!(msg.message_metadata, Some(json!("not-an-object")));
-        let mut msg = queued_msg("odd", &iso_secs_ago(60), false);
-        msg.message_metadata = Some(json!({ "queueInfo": 7 }));
-        super::super::stamp_queued_message_id(&mut msg);
-        assert_eq!(msg.message_metadata, Some(json!({ "queueInfo": 7 })));
+        assert_eq!(
+            msg.message_metadata,
+            Some(json!({ "queueInfo": { "queuedMessageId": "qm-wait-test" } }))
+        );
+        for odd in [json!(7), Value::Null, json!("x"), json!([1])] {
+            let mut msg = queued_msg("odd", &iso_secs_ago(60), false);
+            msg.message_metadata = Some(json!({ "keep": true, "queueInfo": odd }));
+            super::super::stamp_queued_message_id(&mut msg);
+            assert_eq!(
+                msg.message_metadata,
+                Some(json!({
+                    "keep": true,
+                    "queueInfo": { "queuedMessageId": "qm-wait-test" },
+                })),
+                "caller keys kept, reserved queueInfo replaced"
+            );
+        }
     }
 }
 

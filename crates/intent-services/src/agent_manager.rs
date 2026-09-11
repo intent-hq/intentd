@@ -199,32 +199,38 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
 /// creates `queueInfo` when the wait crosses the threshold). Unlike the wait
 /// and batch stamps this one always writes: the stamp names the entry that
 /// is delivering NOW, so a requeue that re-drains under a fresh entry id
-/// re-links to that id. Same skips as the other stamps: `persisted: true`
-/// requeues (row already durable, never rewritten) and a non-object
-/// `messageMetadata` / `queueInfo` are left alone.
+/// re-links to that id. The only skip is a `persisted: true` requeue (row
+/// already durable, never rewritten). `queueInfo` is daemon-reserved: an
+/// absent / null / non-object value is replaced by a fresh object carrying
+/// the link (and the wire path already rejects a non-object
+/// `messageMetadata` with `-32602`; should one reach a drain arm anyway it
+/// is replaced the same way), an object is merged into — so EVERY drained
+/// row names its entry.
 fn stamp_queued_message_id(msg: &mut QueuedMessage) {
     if msg.persisted {
         return;
     }
     let metadata = msg.message_metadata.get_or_insert_with(|| json!({}));
-    let Value::Object(map) = metadata else {
+    if !metadata.is_object() {
         tracing::warn!(
             id = %msg.id,
-            "queuedMessageId stamp skipped: messageMetadata is not an object"
+            "queuedMessageId stamp: replacing non-object messageMetadata"
         );
-        return;
-    };
-    match map.entry("queueInfo").or_insert_with(|| json!({})) {
-        Value::Object(queue_info) => {
-            queue_info.insert("queuedMessageId".to_string(), Value::String(msg.id.clone()));
-        }
-        _ => {
-            tracing::warn!(
-                id = %msg.id,
-                "queuedMessageId stamp skipped: queueInfo is not an object"
-            );
-        }
+        *metadata = json!({});
     }
+    let map = metadata.as_object_mut().expect("object ensured above");
+    let queue_info = map.entry("queueInfo").or_insert_with(|| json!({}));
+    if !queue_info.is_object() {
+        tracing::warn!(
+            id = %msg.id,
+            "queuedMessageId stamp: replacing non-object queueInfo"
+        );
+        *queue_info = json!({});
+    }
+    queue_info
+        .as_object_mut()
+        .expect("object ensured above")
+        .insert("queuedMessageId".to_string(), Value::String(msg.id.clone()));
 }
 
 /// Batch-flush grouping stamp: when a flush delivers two or more entries as
