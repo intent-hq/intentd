@@ -26,7 +26,7 @@ use intent_core::events::{
 };
 use intent_core::{
     now_epoch_ms, now_iso, ActorType, AgentId, AgentSession, ContextUsage, Error, EventActor,
-    Result, UsageCost, WorkspaceId, WorkspaceStatus,
+    MessageOrigin, Result, UsageCost, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -4120,7 +4120,7 @@ impl Services {
                     "empty harness-wake response on a delegated in-task agent — enqueueing recovery nudge (monorepo#3262)"
                 );
                 let nudge = crate::harness::latest().empty_wake_redrive_nudge();
-                self.enqueue_message_with_origin(
+                self.enqueue_message(
                     agent_id,
                     nudge,
                     None,
@@ -4128,7 +4128,7 @@ impl Services {
                     Some(json!({ "type": "empty_wake_redrive" })),
                     None,
                     false,
-                    false,
+                    MessageOrigin::Automatic,
                 );
                 self.publish_queue_updated(agent_id).await;
                 return true;

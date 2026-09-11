@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::{
-    now_iso, ActorType, AgentId, Event, EventActor, Workspace, WorkspaceActivity,
+    now_iso, ActorType, AgentId, Event, EventActor, MessageOrigin, Workspace, WorkspaceActivity,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
@@ -2112,7 +2112,16 @@ async fn golden_snapshot_line_shape() {
     let (_t, svc, ws) = setup().await;
     let owner = AgentId::from("agent-snap");
     seed_agent(&svc, &ws, &owner).await;
-    svc.enqueue_message(&owner, "pending".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &owner,
+        "pending".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     let line = svc
         .agent_state_snapshot_line(&owner)
         .await

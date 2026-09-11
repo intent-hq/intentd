@@ -18,9 +18,10 @@ use intent_core::events::{
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
     AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    ConversationProjection, Error, Event, EventActor, NoteId, PullRequestInfo, PullRequestStatus,
-    Result, SessionStats, TaskStatus, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
-    PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED, SLIM_PAGE_BUDGET_BYTES,
+    ConversationProjection, Error, Event, EventActor, MessageOrigin, NoteId, PullRequestInfo,
+    PullRequestStatus, Result, SessionStats, TaskStatus, WorkspaceApi, WorkspaceId,
+    MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED,
+    SLIM_PAGE_BUDGET_BYTES,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -5612,7 +5613,7 @@ impl Services {
         let session = self.require_agent_session(&agent_id).await?;
         self.validate_image_block_refs("agent.queueMessage", image_blocks.as_ref())
             .await?;
-        let (queued, position) = self.enqueue_message_with_origin(
+        let (queued, position) = self.enqueue_message(
             &agent_id,
             content,
             image_blocks,
@@ -5620,7 +5621,7 @@ impl Services {
             message_metadata,
             None,
             false,
-            true,
+            MessageOrigin::User,
         );
         let result = json!({
             "success": true,
@@ -6085,6 +6086,7 @@ impl Services {
                     message_metadata,
                     None,
                     false,
+                    MessageOrigin::Automatic,
                 );
                 let result = json!({
                     "success": true,
@@ -12449,6 +12451,7 @@ impl Services {
                         message_metadata.cloned(),
                         None,
                         false,
+                        MessageOrigin::Automatic,
                     );
                     let result = json!({
                         "success": true,
@@ -12502,6 +12505,7 @@ impl Services {
                     message_metadata.cloned(),
                     None,
                     false,
+                    MessageOrigin::Automatic,
                 );
                 let result = json!({
                     "success": true,
@@ -12557,6 +12561,7 @@ impl Services {
                 message_metadata.cloned(),
                 None,
                 false,
+                MessageOrigin::Automatic,
             );
             self.publish_queue_updated(agent_id).await;
             return Ok(json!({
@@ -12618,6 +12623,7 @@ impl Services {
                     message_metadata.cloned(),
                     None,
                     false,
+                    MessageOrigin::Automatic,
                 );
                 self.publish_queue_updated(agent_id).await;
                 manager
@@ -12727,6 +12733,7 @@ impl Services {
                     message_metadata.cloned(),
                     None,
                     false,
+                    MessageOrigin::Automatic,
                 );
                 let result = json!({
                     "success": true,
@@ -12799,6 +12806,17 @@ impl Services {
     /// interrupts, and every fallback path that parks an interrupt (archived
     /// gate, busy race, quarantine park, append-failure auto-queue) shares
     /// this ordering. Normal enqueues append at the tail.
+    ///
+    /// `origin` is required at every call site — there is deliberately no
+    /// defaulting wrapper (intent-hq/intentd#1790: a user reply parked through
+    /// a defaulting path was recorded as automatic origin, so the drain never
+    /// cleared the pending attention request). `MessageOrigin::User` records
+    /// that the entry carries a USER-originated message — an
+    /// `agent.sendMessage` parked by a queue-fallback path (busy race,
+    /// quarantine, append-failure) or a user-typed `agent.queueMessage`
+    /// entry. The archived-workspace drain gate delivers post-archive
+    /// user-origin entries instead of parking them (intent-hq/intent#3883),
+    /// and a drained user-origin entry keeps its originator's semantics.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message(
         &self,
@@ -12809,40 +12827,9 @@ impl Services {
         message_metadata: Option<Value>,
         prepend: Option<QueuedPrepend>,
         interrupt: bool,
+        origin: MessageOrigin,
     ) -> (QueuedMessage, usize) {
-        self.enqueue_message_with_origin(
-            agent_id,
-            content,
-            image_blocks,
-            file_blocks,
-            message_metadata,
-            prepend,
-            interrupt,
-            false,
-        )
-    }
-
-    /// [`Services::enqueue_message`] with an explicit `user_origin` marker:
-    /// `true` records that the entry carries a USER-originated message — an
-    /// `agent.sendMessage` parked by a queue-fallback path (busy race,
-    /// quarantine, append-failure) or a user-typed `agent.queueMessage`
-    /// entry. The archived-workspace drain gate
-    /// delivers post-archive user-origin entries instead of parking them
-    /// (intent-hq/intent#3883), and a drained user-origin entry keeps its
-    /// originator's semantics.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn enqueue_message_with_origin(
-        &self,
-        agent_id: &AgentId,
-        content: String,
-        image_blocks: Option<Value>,
-        file_blocks: Option<Value>,
-        message_metadata: Option<Value>,
-        prepend: Option<QueuedPrepend>,
-        interrupt: bool,
-        user_origin: bool,
-    ) -> (QueuedMessage, usize) {
-        self.enqueue_message_with_id_and_origin(
+        self.enqueue_message_with_id(
             agent_id,
             None,
             content,
@@ -12851,15 +12838,16 @@ impl Services {
             message_metadata,
             prepend,
             interrupt,
-            user_origin,
+            origin,
         )
     }
 
     /// Queue a message under a caller-selected durable id. Completion-watch
     /// delivery uses this so a restart retry adopts the already-persisted queue
-    /// entry instead of creating a duplicate terminal wake.
+    /// entry instead of creating a duplicate terminal wake. `origin` is stored
+    /// as the entry's `user_origin` flag (see [`Services::enqueue_message`]).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn enqueue_message_with_id_and_origin(
+    pub(crate) fn enqueue_message_with_id(
         &self,
         agent_id: &AgentId,
         message_id: Option<String>,
@@ -12869,7 +12857,7 @@ impl Services {
         message_metadata: Option<Value>,
         prepend: Option<QueuedPrepend>,
         interrupt: bool,
-        user_origin: bool,
+        origin: MessageOrigin,
     ) -> (QueuedMessage, usize) {
         let prepend = prepend.unwrap_or_default();
         let id = message_id.unwrap_or_else(new_message_id);
@@ -12898,7 +12886,7 @@ impl Services {
             prepend_image_blocks: prepend.image_blocks,
             prepend_file_blocks: prepend.file_blocks,
             interrupt_priority: interrupt,
-            user_origin,
+            user_origin: origin.is_user(),
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,

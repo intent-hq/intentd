@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{
-    now_iso, AgentDelegateInput, AgentId, AgentStatus, Error, NoteCreate, NoteUpdateInput,
-    PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource, WorkspaceId,
-    WorkspaceStatus,
+    now_iso, AgentDelegateInput, AgentId, AgentStatus, Error, MessageOrigin, NoteCreate,
+    NoteUpdateInput, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity,
+    WorkspaceApi, WorkspaceAttention, WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource,
+    WorkspaceId, WorkspaceStatus,
 };
 use std::time::Duration;
 
@@ -1220,8 +1220,16 @@ async fn interim_idle_with_pending_queue_neither_delivers_nor_retires_watch() {
     .expect("register watch");
 
     // A ready-to-send queue entry makes the next idle an interim idle.
-    let (queued, _) =
-        svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+    let (queued, _) = svc.enqueue_message(
+        &child,
+        "follow-up".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
 
     svc.handle_completion_event(&completion_event(
         &ws,
@@ -1514,6 +1522,7 @@ async fn failed_with_pending_queue_still_delivers_and_retires_watch() {
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
 
     svc.handle_completion_event(&completion_event(
@@ -1607,8 +1616,16 @@ async fn progress_report_watch_survives_interim_idle_and_fires_at_completion() {
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
 
     // Interim idle: a ready-to-send entry keeps the progress watch armed.
-    let (queued, _) =
-        svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+    let (queued, _) = svc.enqueue_message(
+        &child,
+        "follow-up".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -1664,7 +1681,16 @@ async fn grouped_watch_records_completion_on_interim_idle() {
         Some(gid.clone()),
     )
     .expect("grouped watch");
-    svc.enqueue_message(&child, "pending".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &child,
+        "pending".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
 
     svc.handle_completion_event(&completion_event(
         &ws,
@@ -1706,8 +1732,16 @@ async fn queue_retraction_after_interim_idle_fires_stranded_watch_once() {
     )
     .expect("register watch");
 
-    let (queued, _) =
-        svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+    let (queued, _) = svc.enqueue_message(
+        &child,
+        "follow-up".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -1778,6 +1812,7 @@ async fn owned_queue_retraction_after_interim_idle_fires_stranded_watch() {
         Some(json!({ "fromAgentId": parent.0 })),
         None,
         false,
+        MessageOrigin::Automatic,
     );
     svc.handle_completion_event(&completion_event(
         &ws,
@@ -1827,8 +1862,16 @@ async fn queue_retraction_while_busy_defers_redelivery() {
     )
     .expect("register watch");
 
-    let (queued, _) =
-        svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+    let (queued, _) = svc.enqueue_message(
+        &child,
+        "follow-up".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -1940,8 +1983,16 @@ async fn normal_drain_after_interim_idle_delivers_once_and_clears_marker() {
     )
     .expect("register watch");
 
-    let (queued, _) =
-        svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+    let (queued, _) = svc.enqueue_message(
+        &child,
+        "follow-up".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -1970,7 +2021,16 @@ async fn normal_drain_after_interim_idle_delivers_once_and_clears_marker() {
 
     // A later enqueue + retraction must not synthesize a stale second wake:
     // the non-interim completion above cleared the marker.
-    let (later, _) = svc.enqueue_message(&child, "later".into(), None, None, None, None, false);
+    let (later, _) = svc.enqueue_message(
+        &child,
+        "later".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     svc.agent_remove_queued_message_op(child.clone(), later.id)
         .await
         .expect("remove later message");
@@ -4724,6 +4784,7 @@ async fn app_agents_ask_keeps_watch_armed_while_target_has_queued_work() {
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
     svc.handle_completion_event(&completion_event(
         &target_ws,
@@ -10626,6 +10687,7 @@ async fn flushed_report_send_failure_restores_entry_for_retry() {
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
 
     // Settlement with the durable send failing: the retraction must be
@@ -10780,6 +10842,7 @@ async fn debounce_zero_report_wake_retracted_at_settlement() {
         Some(metadata),
         None,
         false,
+        MessageOrigin::Automatic,
     );
     let parked = svc.queue_snapshot(&parent);
     assert_eq!(parked.len(), 1, "{parked:?}");
@@ -10965,7 +11028,7 @@ async fn durable_completion_queue_retry_adopts_existing_message_id() {
     let parent = create_agent(&svc, &ws, "Parent").await;
     let wake_id = "completion-wake:test-queued".to_string();
 
-    let (first, first_position) = svc.enqueue_message_with_id_and_origin(
+    let (first, first_position) = svc.enqueue_message_with_id(
         &parent,
         Some(wake_id.clone()),
         "terminal wake".into(),
@@ -10974,9 +11037,9 @@ async fn durable_completion_queue_retry_adopts_existing_message_id() {
         None,
         None,
         false,
-        false,
+        MessageOrigin::Automatic,
     );
-    let (retry, retry_position) = svc.enqueue_message_with_id_and_origin(
+    let (retry, retry_position) = svc.enqueue_message_with_id(
         &parent,
         Some(wake_id.clone()),
         "terminal wake".into(),
@@ -10985,7 +11048,7 @@ async fn durable_completion_queue_retry_adopts_existing_message_id() {
         None,
         None,
         false,
-        false,
+        MessageOrigin::Automatic,
     );
 
     assert_eq!(first.id, wake_id);
@@ -11318,8 +11381,16 @@ async fn clean_interim_retry_pass_stops_polling() {
 
     // Make the child queue-interim BEFORE clearing the failure, so the next
     // retry pass observes a clean interim classification (no delivery error).
-    let (queued, _) =
-        svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+    let (queued, _) = svc.enqueue_message(
+        &child,
+        "follow-up".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     sqlx::query("DROP TRIGGER fail_completion_wake")
         .execute(svc.store().write_pool())
         .await
@@ -12132,6 +12203,7 @@ async fn remove_queued_message_owned_removes_own_entry() {
         })),
         None,
         false,
+        MessageOrigin::Automatic,
     );
     let r = svc
         .agent_remove_queued_message_owned_op(target.clone(), queued.id.clone(), caller)
@@ -12159,6 +12231,7 @@ async fn remove_queued_message_owned_rejects_foreign_sender() {
         })),
         None,
         false,
+        MessageOrigin::Automatic,
     );
     let err = svc
         .agent_remove_queued_message_owned_op(target.clone(), queued.id, caller)
@@ -14257,10 +14330,20 @@ async fn diagnostics_reports_queue_snapshots() {
         })),
         None,
         false,
+        MessageOrigin::Automatic,
     );
     // A later interrupt-priority entry drains FIRST — the snapshot must list
     // it ahead of the earlier normal entry.
-    svc.enqueue_message(&target, "urgent".into(), None, None, None, None, true);
+    svc.enqueue_message(
+        &target,
+        "urgent".into(),
+        None,
+        None,
+        None,
+        None,
+        true,
+        MessageOrigin::Automatic,
+    );
 
     let result = svc
         .agent_diagnostics_op(ws.clone(), None, None, None)
@@ -14586,7 +14669,16 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
     let target = create_agent(&svc, &ws, "Idle").await;
 
     // Fresh entry on a non-running agent: below the age threshold, no risk.
-    svc.enqueue_message(&target, "old".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &target,
+        "old".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     let result = svc
         .agent_diagnostics_op(ws.clone(), None, None, None)
         .await
@@ -14608,7 +14700,16 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         q[0].queued_at = "2020-01-01T00:00:00Z".into();
         q[0].id.clone()
     };
-    svc.enqueue_message(&target, "fresh".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &target,
+        "fresh".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     let result = svc
         .agent_diagnostics_op(ws.clone(), None, None, None)
         .await
@@ -14770,7 +14871,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
 
     // A stale user-origin entry is a genuine risk too — counted alongside the
     // automatic one, the oldest named.
-    svc.enqueue_message_with_origin(
+    svc.enqueue_message(
         &target,
         "user answer".into(),
         None,
@@ -14778,7 +14879,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         None,
         None,
         false,
-        true,
+        MessageOrigin::User,
     );
     let user_entry_id = {
         let mut guard = svc.agent_queues.lock().unwrap();
@@ -18625,7 +18726,16 @@ async fn queue_interim_monitoring_idle_gets_no_advisory() {
     )
     .expect("register watch");
     // A ready-to-send queue entry makes the idle queue-interim too.
-    svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &child,
+        "follow-up".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
 
     svc.handle_completion_event(&completion_event(
         &ws,
@@ -20676,7 +20786,16 @@ async fn terminal_watch_chain_requires_each_holder_to_settle() {
 
     // B idles with a ready-to-send entry: queue-interim, so A's watch defers
     // and the interim-skip marker is recorded.
-    let (queued, _) = svc.enqueue_message(&b, "follow-up".into(), None, None, None, None, false);
+    let (queued, _) = svc.enqueue_message(
+        &b,
+        "follow-up".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -20731,8 +20850,16 @@ async fn chained_terminal_watches_advance_one_explicit_settlement_at_a_time() {
     // Defer B, then A, via queue-interim idles; drain both queues so only the
     // watch retirements remain as triggers.
     for agent in [&b, &a] {
-        let (queued, _) =
-            svc.enqueue_message(agent, "follow-up".into(), None, None, None, None, false);
+        let (queued, _) = svc.enqueue_message(
+            agent,
+            "follow-up".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         svc.handle_completion_event(&completion_event(
             &ws,
             AGENT_IDLE,
@@ -21518,7 +21645,16 @@ async fn interim_parent_idle_does_not_seal_group_and_late_delegate_joins() {
         .group_id;
 
     // A queued redrive makes the parent's next idle interim: no seal.
-    let (queued, _) = svc.enqueue_message(&parent, "redrive".into(), None, None, None, None, false);
+    let (queued, _) = svc.enqueue_message(
+        &parent,
+        "redrive".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -21716,7 +21852,16 @@ async fn group_seals_at_real_completion_when_redriven_turn_delegates_nothing() {
         json!({ "agentId": c1.0 }),
     ))
     .await;
-    let (queued, _) = svc.enqueue_message(&parent, "redrive".into(), None, None, None, None, false);
+    let (queued, _) = svc.enqueue_message(
+        &parent,
+        "redrive".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -21767,7 +21912,16 @@ async fn queue_retraction_synthesized_idle_seals_group() {
         json!({ "agentId": c1.0 }),
     ))
     .await;
-    let (queued, _) = svc.enqueue_message(&parent, "redrive".into(), None, None, None, None, false);
+    let (queued, _) = svc.enqueue_message(
+        &parent,
+        "redrive".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -22896,6 +23050,7 @@ async fn agent_watch_accepts_idle_target_with_queued_message() {
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
 
     svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
@@ -27137,6 +27292,7 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
     assert!(svc.live_turn(&a).is_some(), "live-turn slot seeded");
     assert!(svc.has_ready_to_send(&c), "queue seeded");
@@ -27806,6 +27962,7 @@ async fn queued_message_metadata_surfaces_in_queue_snapshot() {
         Some(metadata.clone()),
         None,
         false,
+        MessageOrigin::Automatic,
     );
     assert_eq!(queued.to_value(position)["messageMetadata"], metadata);
     svc.publish_queue_updated(&id).await;
@@ -27828,8 +27985,16 @@ async fn queued_message_metadata_surfaces_in_queue_snapshot() {
     assert_eq!(evt.data["queue"][0]["messageMetadata"], metadata);
 
     // Legacy shape: an entry enqueued without metadata omits the key.
-    let (plain, plain_pos) =
-        svc.enqueue_message(&id, "plain".to_string(), None, None, None, None, false);
+    let (plain, plain_pos) = svc.enqueue_message(
+        &id,
+        "plain".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     let v = plain.to_value(plain_pos);
     assert!(
         v.get("messageMetadata").is_none(),
@@ -28277,8 +28442,16 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
     let id = create_agent(&svc, &ws, "TurnId").await;
 
     // Fresh enqueue: turn_id == id, surfaced as `turnId` on the wire.
-    let (queued, position) =
-        svc.enqueue_message(&id, "fresh".to_string(), None, None, None, None, false);
+    let (queued, position) = svc.enqueue_message(
+        &id,
+        "fresh".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     assert_eq!(
         queued.turn_id, queued.id,
         "fresh enqueue mints turn_id = id"
@@ -28865,7 +29038,16 @@ async fn migrate_queue_missing_poisoned_session_is_idempotent() {
 async fn migrate_queue_rejects_unknown_target_without_draining() {
     let (_t, svc, ws) = setup().await;
     let poisoned = create_agent(&svc, &ws, "Poisoned").await;
-    svc.enqueue_message(&poisoned, "parked".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &poisoned,
+        "parked".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
 
     let err = svc
@@ -28966,7 +29148,16 @@ async fn migrate_queue_rearms_hold_timers_for_target() {
             "child-1",
         )
         .await;
-    svc.enqueue_message(&poisoned, "plain".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &poisoned,
+        "plain".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
 
     let migrated = svc
         .migrate_queue_and_gc_poisoned_session(&poisoned, &target, &ws)
@@ -31851,6 +32042,7 @@ async fn empty_wake_recovery_skips_on_ready_queue_and_pending_attention() {
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
     assert!(!svc.recover_empty_harness_wake(&queued, &ws).await);
     let session = svc.store().get_agent_session(&queued).await.expect("s");
@@ -34573,6 +34765,7 @@ async fn dismiss_questions_notice_delivers_despite_newer_pending_question() {
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
     svc.store()
         .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
@@ -34756,11 +34949,47 @@ async fn interrupt_enqueue_orders_ahead_of_normal_and_persists() {
     let (tmp, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Interrupted").await;
 
-    svc.enqueue_message(&id, "normal-1".into(), None, None, None, None, false);
-    svc.enqueue_message(&id, "normal-2".into(), None, None, None, None, false);
-    let (int1, pos1) = svc.enqueue_message(&id, "int-1".into(), None, None, None, None, true);
+    svc.enqueue_message(
+        &id,
+        "normal-1".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
+        &id,
+        "normal-2".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    let (int1, pos1) = svc.enqueue_message(
+        &id,
+        "int-1".into(),
+        None,
+        None,
+        None,
+        None,
+        true,
+        MessageOrigin::Automatic,
+    );
     assert_eq!(pos1, 0, "first interrupt jumps the whole queue");
-    let (_int2, pos2) = svc.enqueue_message(&id, "int-2".into(), None, None, None, None, true);
+    let (_int2, pos2) = svc.enqueue_message(
+        &id,
+        "int-2".into(),
+        None,
+        None,
+        None,
+        None,
+        true,
+        MessageOrigin::Automatic,
+    );
     assert_eq!(pos2, 1, "second interrupt queues behind the first");
 
     let snapshot = svc.queue_snapshot(&id);
@@ -36177,11 +36406,47 @@ async fn dequeue_ready_batch_pops_ready_in_drain_order_and_skips_editing() {
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "Batch").await;
 
-    svc.enqueue_message(&agent, "first".into(), None, None, None, None, false);
-    let (edited, _) = svc.enqueue_message(&agent, "held".into(), None, None, None, None, false);
-    svc.enqueue_message(&agent, "second".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &agent,
+        "first".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    let (edited, _) = svc.enqueue_message(
+        &agent,
+        "held".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
+        &agent,
+        "second".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     // Interrupt entry inserts at the queue head (drain order).
-    svc.enqueue_message(&agent, "urgent".into(), None, None, None, None, true);
+    svc.enqueue_message(
+        &agent,
+        "urgent".into(),
+        None,
+        None,
+        None,
+        None,
+        true,
+        MessageOrigin::Automatic,
+    );
     svc.agent_edit_queued_message_op(agent.clone(), edited.id, "held".into(), Some(true))
         .await
         .expect("mark editing");
@@ -36206,7 +36471,16 @@ async fn dequeue_ready_batch_pops_ready_in_drain_order_and_skips_editing() {
 async fn dequeue_ready_batch_returns_none_below_min_ready() {
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "BatchMin").await;
-    svc.enqueue_message(&agent, "only".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &agent,
+        "only".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
 
     assert!(
         svc.dequeue_ready_batch(&agent, false, 2).is_none(),
@@ -36229,8 +36503,17 @@ async fn dequeue_ready_batch_user_led_carries_automatic_entries_with_user_entry(
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "BatchHold").await;
 
-    svc.enqueue_message(&agent, "auto-1".into(), None, None, None, None, false);
-    svc.enqueue_message_with_origin(
+    svc.enqueue_message(
+        &agent,
+        "auto-1".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
         &agent,
         "answer-1".into(),
         None,
@@ -36238,9 +36521,18 @@ async fn dequeue_ready_batch_user_led_carries_automatic_entries_with_user_entry(
         None,
         None,
         false,
-        true,
+        MessageOrigin::User,
     );
-    svc.enqueue_message(&agent, "auto-2".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &agent,
+        "auto-2".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
 
     let batch = svc
         .dequeue_ready_batch(&agent, true, 2)
@@ -36265,8 +36557,26 @@ async fn dequeue_ready_batch_user_led_without_user_entry_is_noop() {
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "BatchHoldAuto").await;
 
-    svc.enqueue_message(&agent, "auto-1".into(), None, None, None, None, false);
-    svc.enqueue_message(&agent, "auto-2".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &agent,
+        "auto-1".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
+        &agent,
+        "auto-2".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
 
     assert!(
         svc.dequeue_ready_batch(&agent, true, 2).is_none(),
@@ -36288,11 +36598,56 @@ async fn dequeue_system_only_batch_pulls_interleaved_system_entries_in_order() {
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "SystemOnlyBatch").await;
 
-    svc.enqueue_message(&agent, "sys-1".into(), None, None, None, None, false);
-    svc.enqueue_message_with_origin(&agent, "user-1".into(), None, None, None, None, false, true);
-    svc.enqueue_message(&agent, "sys-2".into(), None, None, None, None, false);
-    svc.enqueue_message_with_origin(&agent, "user-2".into(), None, None, None, None, false, true);
-    svc.enqueue_message(&agent, "sys-3".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &agent,
+        "sys-1".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
+        &agent,
+        "user-1".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    svc.enqueue_message(
+        &agent,
+        "sys-2".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
+        &agent,
+        "user-2".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    svc.enqueue_message(
+        &agent,
+        "sys-3".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
 
     let batch = svc
         .dequeue_system_only_batch(&agent, 2)
@@ -36318,7 +36673,16 @@ async fn dequeue_system_only_batch_pulls_interleaved_system_entries_in_order() {
 async fn dequeue_system_only_batch_returns_none_below_min_ready() {
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "SystemOnlyMin").await;
-    svc.enqueue_message(&agent, "sys-only".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &agent,
+        "sys-only".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
 
     assert!(
         svc.dequeue_system_only_batch(&agent, 2).is_none(),
@@ -36342,8 +36706,26 @@ async fn dequeue_flush_batch_dispatches_by_mode() {
 
     // `All` batches every ready entry.
     let agent_all = create_agent(&svc, &ws, "ModeAll").await;
-    svc.enqueue_message(&agent_all, "a".into(), None, None, None, None, false);
-    svc.enqueue_message(&agent_all, "b".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &agent_all,
+        "a".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
+        &agent_all,
+        "b".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     let batch = svc
         .dequeue_flush_batch(
             &agent_all,
@@ -36356,8 +36738,26 @@ async fn dequeue_flush_batch_dispatches_by_mode() {
 
     // `SystemOnly` batches only system-origin entries.
     let agent_sys = create_agent(&svc, &ws, "ModeSystemOnly").await;
-    svc.enqueue_message(&agent_sys, "sys-a".into(), None, None, None, None, false);
-    svc.enqueue_message(&agent_sys, "sys-b".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &agent_sys,
+        "sys-a".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
+        &agent_sys,
+        "sys-b".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     let batch = svc
         .dequeue_flush_batch(
             &agent_sys,
@@ -36370,8 +36770,26 @@ async fn dequeue_flush_batch_dispatches_by_mode() {
 
     // `SystemOnly` never batches while a hold is active.
     let agent_hold = create_agent(&svc, &ws, "ModeSystemOnlyHold").await;
-    svc.enqueue_message(&agent_hold, "sys-a".into(), None, None, None, None, false);
-    svc.enqueue_message(&agent_hold, "sys-b".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &agent_hold,
+        "sys-a".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
+        &agent_hold,
+        "sys-b".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     assert!(
         svc.dequeue_flush_batch(
             &agent_hold,
@@ -36385,8 +36803,26 @@ async fn dequeue_flush_batch_dispatches_by_mode() {
 
     // `Off` always returns `None`.
     let agent_off = create_agent(&svc, &ws, "ModeOff").await;
-    svc.enqueue_message(&agent_off, "a".into(), None, None, None, None, false);
-    svc.enqueue_message(&agent_off, "b".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &agent_off,
+        "a".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
+        &agent_off,
+        "b".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     assert!(
         svc.dequeue_flush_batch(
             &agent_off,
@@ -36406,9 +36842,36 @@ async fn requeue_front_batch_preserves_order_ahead_of_existing_entries() {
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "BatchRequeue").await;
 
-    svc.enqueue_message(&agent, "a".into(), None, None, None, None, false);
-    svc.enqueue_message(&agent, "b".into(), None, None, None, None, false);
-    svc.enqueue_message(&agent, "later".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &agent,
+        "a".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
+        &agent,
+        "b".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
+        &agent,
+        "later".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     let mut batch = svc
         .dequeue_ready_batch(&agent, false, 3)
         .expect("all three ready");
@@ -36480,8 +36943,26 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
     svc.agent_watch_op(ws.clone(), parent.clone(), other.clone())
         .await
         .expect("watch");
-    svc.enqueue_message(&parent, "m1".into(), None, None, None, None, false);
-    svc.enqueue_message(&parent, "m2".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &parent,
+        "m1".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    svc.enqueue_message(
+        &parent,
+        "m2".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     svc.register_event_subscription(
         &ws,
         Some(parent.clone()),
@@ -36549,7 +37030,16 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
 async fn agent_snapshot_line_gated_by_session_snapshot_not_live_setting() {
     let (_t, svc, ws, registry, _cfg) = setup_with_task_graph(false).await;
     let before = create_agent(&svc, &ws, "Before").await;
-    svc.enqueue_message(&before, "pending".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &before,
+        "pending".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     assert!(
         svc.agent_state_snapshot_line(&before).await.is_some(),
         "stamped-on session injects"
@@ -36564,7 +37054,16 @@ async fn agent_snapshot_line_gated_by_session_snapshot_not_live_setting() {
     );
 
     let after = create_agent(&svc, &ws, "After").await;
-    svc.enqueue_message(&after, "pending".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &after,
+        "pending".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     assert_eq!(
         svc.agent_state_snapshot_line(&after).await,
         None,
@@ -38800,6 +39299,7 @@ async fn no_manager_send_now_resolves_unblocked_section() {
         Some(metadata),
         None,
         false,
+        MessageOrigin::Automatic,
     );
 
     let r = svc

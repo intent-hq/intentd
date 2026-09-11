@@ -11,8 +11,8 @@ use intent_acp::{
     PermissionOutcome, PermissionPolicy, PermissionRequestData,
 };
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, Error, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, Error, MessageOrigin, Workspace,
+    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -6133,8 +6133,16 @@ async fn stop_redelivery_flush_413_retry(
             image_blocks: None,
             file_blocks: None,
         });
-        mgr.services
-            .enqueue_message(&id, content.to_string(), None, None, None, prepend, false);
+        mgr.services.enqueue_message(
+            &id,
+            content.to_string(),
+            None,
+            None,
+            None,
+            prepend,
+            false,
+            MessageOrigin::Automatic,
+        );
     }
     // The drain flushes both entries into ONE turn; the mock fails it 413.
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -6705,6 +6713,7 @@ async fn drain_emits_queue_processing_with_turn_id() {
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -11086,8 +11095,16 @@ async fn try_drain_queue_no_op_when_already_busy() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-drain"), AgentId::from("a-drain"));
     // Queue a ready message so the only barrier is the busy flag.
-    mgr.services
-        .enqueue_message(&id, "queued".to_string(), None, None, None, None, false);
+    mgr.services.enqueue_message(
+        &id,
+        "queued".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     assert!(mgr.try_begin(&id, &ws).await);
 
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -11129,8 +11146,16 @@ async fn try_drain_queue_skips_agent_parked_in_error() {
         .await
         .expect("park session in error");
     // A ready-to-send message is waiting (the terminal-failure requeue).
-    mgr.services
-        .enqueue_message(&id, "requeued".to_string(), None, None, None, None, false);
+    mgr.services.enqueue_message(
+        &id,
+        "requeued".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
 
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
 
@@ -12099,8 +12124,16 @@ async fn failed_drain_persist_is_reattempted_by_retry_drain() {
 
     // Queue an unpersisted message, then hide the transcript table so the
     // drain's pre-turn `persist_user` append fails.
-    mgr.services
-        .enqueue_message(&id, "boom".to_string(), None, None, None, None, false);
+    mgr.services.enqueue_message(
+        &id,
+        "boom".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
         .execute(mgr.services.store.write_pool())
         .await
@@ -12283,8 +12316,16 @@ async fn drain_against_vanished_session_drops_queue() {
     );
     seed_agent(&mgr, &ws, &id).await;
 
-    mgr.services
-        .enqueue_message(&id, "wedged".to_string(), None, None, None, None, false);
+    mgr.services.enqueue_message(
+        &id,
+        "wedged".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     mgr.services
         .store
         .delete_agent_session(&ws, &id)
@@ -12577,9 +12618,16 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     // Queue an unpersisted message, then hide the transcript table so every
     // pre-turn `persist_user` attempt (initial + bounded retries) fails.
-    let (enqueued, _) =
-        mgr.services
-            .enqueue_message(&id, "boom".to_string(), None, None, None, None, false);
+    let (enqueued, _) = mgr.services.enqueue_message(
+        &id,
+        "boom".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
         .execute(mgr.services.store.write_pool())
         .await
@@ -12747,8 +12795,16 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
         .await
         .expect("set mock provider");
 
-    mgr.services
-        .enqueue_message(&id, "blip".to_string(), None, None, None, None, false);
+    mgr.services.enqueue_message(
+        &id,
+        "blip".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
         .execute(mgr.services.store.write_pool())
         .await
@@ -13215,6 +13271,7 @@ async fn idle_timeout_injects_warning_and_redrives() {
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
 
     // The warning redrive + queued drain complete: the agent settles idle.
@@ -13659,6 +13716,7 @@ async fn queue_dequeue_round_trip_preserves_image_and_file_blocks() {
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
     let drained = mgr
         .services
@@ -15799,8 +15857,16 @@ mod stale_redrive_tests {
         // Enqueue FIRST, then persist the report: queued_at < report_ts, the
         // exact incident ordering (message queued while the reporting turn
         // was still in flight).
-        mgr.services
-            .enqueue_message(&id, "stale wake".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &id,
+            "stale wake".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
         set_delegated_report(&mgr, &ws, &id, &now_iso()).await;
 
@@ -15878,6 +15944,7 @@ mod stale_redrive_tests {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
         let mut entry = mgr
             .services
@@ -16740,9 +16807,16 @@ mod draining_overlay_tests {
         );
         seed_agent(&mgr, &ws, &id).await;
         let mut sub = bus.subscribe(SubscriptionFilter::default());
-        let (b, _) =
-            mgr.services
-                .enqueue_message(&id, "entry B".to_string(), None, None, None, None, false);
+        let (b, _) = mgr.services.enqueue_message(
+            &id,
+            "entry B".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
 
         let persist_gate = mgr.services.agent_queue_persist_gate.clone();
         let held = persist_gate.lock().await;
@@ -16757,9 +16831,16 @@ mod draining_overlay_tests {
         }
         assert!(!publisher.is_finished(), "P is parked on the persist gate");
 
-        let (a, _) =
-            mgr.services
-                .enqueue_message(&id, "entry A".to_string(), None, None, None, None, false);
+        let (a, _) = mgr.services.enqueue_message(
+            &id,
+            "entry A".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         let (_, guard) = mgr
             .services
             .take_queued_message_draining(&id, &a.id)
@@ -16792,7 +16873,16 @@ mod draining_overlay_tests {
         let id = AgentId::from("a-overlay");
         let enqueue = |text: &str| {
             mgr.services
-                .enqueue_message(&id, text.to_string(), None, None, None, None, false)
+                .enqueue_message(
+                    &id,
+                    text.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    MessageOrigin::Automatic,
+                )
                 .0
         };
         let (a, b) = (enqueue("A"), enqueue("B"));
@@ -16865,8 +16955,16 @@ mod draining_overlay_tests {
         let (_tmp, mgr) = manager().await;
         let id = AgentId::from("a-overlay-merge");
         for text in ["A", "B", "C"] {
-            mgr.services
-                .enqueue_message(&id, text.to_string(), None, None, None, None, false);
+            mgr.services.enqueue_message(
+                &id,
+                text.to_string(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                MessageOrigin::Automatic,
+            );
         }
         let (_, mut guard) = mgr.services.dequeue_message_draining(&id).expect("A pops");
         let (batch, extra) = mgr
@@ -16913,9 +17011,16 @@ mod draining_overlay_tests {
             .expect("set mock provider");
         let mut sub = bus.subscribe(SubscriptionFilter::default());
 
-        let (a, _) =
-            mgr.services
-                .enqueue_message(&id, "entry A".to_string(), None, None, None, None, false);
+        let (a, _) = mgr.services.enqueue_message(
+            &id,
+            "entry A".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
             .execute(mgr.services.store.write_pool())
             .await
@@ -16925,18 +17030,32 @@ mod draining_overlay_tests {
 
         // A is dequeued; its persist attempt fails against the hidden table
         // and the arm suspends in the retry backoff. Mutate the queue around it.
-        let (b, _) =
-            mgr.services
-                .enqueue_message(&id, "entry B".to_string(), None, None, None, None, false);
+        let (b, _) = mgr.services.enqueue_message(
+            &id,
+            "entry B".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         publish_mutation(&mgr, &ws, &id).await;
         mgr.services
             .agent_edit_queued_message_op(id.clone(), b.id.clone(), "entry B edited".into(), None)
             .await
             .expect("edit B");
         publish_mutation(&mgr, &ws, &id).await;
-        let (c, _) =
-            mgr.services
-                .enqueue_message(&id, "entry C".to_string(), None, None, None, None, false);
+        let (c, _) = mgr.services.enqueue_message(
+            &id,
+            "entry C".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         publish_mutation(&mgr, &ws, &id).await;
         mgr.services
             .agent_remove_queued_message_op(id.clone(), c.id.clone())
@@ -17035,9 +17154,16 @@ mod draining_overlay_tests {
             .expect("set mock provider");
         let mut sub = bus.subscribe(SubscriptionFilter::default());
 
-        let (a, _) =
-            mgr.services
-                .enqueue_message(&id, "entry A".to_string(), None, None, None, None, false);
+        let (a, _) = mgr.services.enqueue_message(
+            &id,
+            "entry A".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
             .execute(mgr.services.store.write_pool())
             .await
@@ -17045,9 +17171,16 @@ mod draining_overlay_tests {
         let drain = tokio::spawn(mgr.clone().try_drain_queue(id.clone(), ws.clone()));
         wait_until_draining(&mgr, &id, &a.id).await;
 
-        let (b, _) =
-            mgr.services
-                .enqueue_message(&id, "entry B".to_string(), None, None, None, None, false);
+        let (b, _) = mgr.services.enqueue_message(
+            &id,
+            "entry B".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         publish_mutation(&mgr, &ws, &id).await;
         assert_eq!(
             ids(&mgr.services.queue_snapshot(&id)),
@@ -18022,6 +18155,7 @@ mod harness_wake_tests {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
         assert!(mgr.services.has_ready_to_send(&id));
 
@@ -18606,8 +18740,16 @@ mod pending_questions_no_gate {
         let mgr = Arc::new(mgr);
         let (ws, id) = mock_agent(&mgr, "ws-pq-drain", "a-pq-drain").await;
 
-        mgr.services
-            .enqueue_message(&id, "parked".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &id,
+            "parked".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         let asked = mark_pending(&mgr, &ws, &id).await;
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -19137,8 +19279,16 @@ mod archived_flush_gates {
         archive_row(&mgr, &ws).await;
 
         // Automatic entries alone stay parked.
-        mgr.services
-            .enqueue_message(&id, "auto wake".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &id,
+            "auto wake".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         assert!(!mgr.is_busy(&id), "automatic-only queue stays parked");
         assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
@@ -19148,7 +19298,7 @@ mod archived_flush_gates {
         // A user-origin entry queued INTO the archived workspace (at or
         // after `archivedAt`) exempts the gate: the next kick drains
         // everything and unarchives.
-        mgr.services.enqueue_message_with_origin(
+        mgr.services.enqueue_message(
             &id,
             "user follow-up".to_string(),
             None,
@@ -19156,7 +19306,7 @@ mod archived_flush_gates {
             None,
             None,
             false,
-            true,
+            MessageOrigin::User,
         );
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         await_settled(&mgr, &id).await;
@@ -19184,7 +19334,7 @@ mod archived_flush_gates {
         seed_mock_agent(&mgr, &ws, &id).await;
 
         // A user message parked by the busy race BEFORE the archive.
-        mgr.services.enqueue_message_with_origin(
+        mgr.services.enqueue_message(
             &id,
             "pre-archival user leftover".to_string(),
             None,
@@ -19192,7 +19342,7 @@ mod archived_flush_gates {
             None,
             None,
             false,
-            true,
+            MessageOrigin::User,
         );
         // Ensure `queuedAt` strictly precedes `archivedAt` even at coarse
         // clock resolution.
@@ -19442,7 +19592,7 @@ mod attention_request_clear_gates {
             origin: MessageOrigin::User,
             ..TurnOptions::default()
         };
-        mgr.services.enqueue_message_with_origin(
+        mgr.services.enqueue_message(
             &id,
             "parked user answer".to_string(),
             None,
@@ -19450,7 +19600,7 @@ mod attention_request_clear_gates {
             None,
             opts.queued_prepend(),
             opts.interrupt_priority,
-            opts.origin.is_user(),
+            opts.origin,
         );
         let mut sub = bus.subscribe(SubscriptionFilter::default());
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -19528,6 +19678,7 @@ mod attention_request_clear_gates {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
         let mut sub = bus.subscribe(SubscriptionFilter::default());
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -19774,6 +19925,7 @@ mod flush_queued_messages_tests {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
         mgr.services.enqueue_message(
             &id,
@@ -19783,6 +19935,7 @@ mod flush_queued_messages_tests {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -19887,6 +20040,7 @@ mod flush_queued_messages_tests {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
         mgr.services.enqueue_message(
             &id,
@@ -19896,6 +20050,7 @@ mod flush_queued_messages_tests {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -19968,9 +20123,17 @@ mod flush_queued_messages_tests {
         );
         seed_mock_agent(&mgr, &ws, &id).await;
 
-        mgr.services
-            .enqueue_message(&id, "sys-1".to_string(), None, None, None, None, false);
-        mgr.services.enqueue_message_with_origin(
+        mgr.services.enqueue_message(
+            &id,
+            "sys-1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        mgr.services.enqueue_message(
             &id,
             "user-1".to_string(),
             None,
@@ -19978,10 +20141,18 @@ mod flush_queued_messages_tests {
             None,
             None,
             false,
-            true,
+            MessageOrigin::User,
         );
-        mgr.services
-            .enqueue_message(&id, "sys-2".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &id,
+            "sys-2".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         timeout(Duration::from_secs(15), async {
@@ -20064,8 +20235,16 @@ mod flush_queued_messages_tests {
         );
         seed_mock_agent(&mgr, &ws, &id).await;
 
-        mgr.services
-            .enqueue_message(&id, "sys-only".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &id,
+            "sys-only".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         timeout(Duration::from_secs(15), async {
@@ -20110,10 +20289,26 @@ mod flush_queued_messages_tests {
         );
         seed_mock_agent(&mgr, &ws, &id).await;
 
-        mgr.services
-            .enqueue_message(&id, "boom-1".to_string(), None, None, None, None, false);
-        mgr.services
-            .enqueue_message(&id, "boom-2".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &id,
+            "boom-1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        mgr.services.enqueue_message(
+            &id,
+            "boom-2".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
             .execute(mgr.services.store.write_pool())
             .await
@@ -20395,5 +20590,271 @@ mod session_model_tests {
             AgentManager::session_model_effort(codex, Some("grok:foo[low]"), None),
             None
         );
+    }
+}
+
+/// Enqueue-origin table (intent-hq/intentd#1790): every queue-producing front
+/// door records the `MessageOrigin` its caller carries, so a user reply that
+/// parks behind a busy turn still clears the pending attention request (and
+/// keeps the archived-workspace exemption) when it drains. The agent's turn
+/// slot is held for the whole table so each front door falls into its
+/// queue-fallback path, and the recorded `QueuedMessage.user_origin` is read
+/// straight off the in-memory queue (it is neither persisted nor on the wire).
+///
+/// One row per front door — adding a queue-producing entry point means adding
+/// a row here. `agent.editAndRegenerate` has no row: it is not a queue
+/// producer (it stops the in-flight turn, then routes through `send_message`
+/// with `origin = User`).
+mod enqueue_origin_table {
+    use super::*;
+    use intent_core::{MessageOrigin, NoteCreate, NoteId, WorkspaceApi};
+
+    #[derive(Debug, Clone, Copy)]
+    enum FrontDoor {
+        /// FE `agent.sendMessage` (`WorkspaceApi::agent_send_message`,
+        /// `MessageOrigin::User`).
+        FeSendMessage,
+        /// MCP `ws.agent.send` → the same trait method with
+        /// `MessageOrigin::Automatic`.
+        McpSendMessage,
+        /// `agent.queueMessage` (a user-typed queue entry).
+        QueueMessage,
+        /// `agent.sendToTask` (agent-to-agent, task note with an assignee).
+        SendToTask,
+        /// `agent.sendQueuedMessageNow` losing the slot race: the dequeued
+        /// entry is restored at the front as user-origin.
+        SendQueuedMessageNow,
+        /// Wake / hook / system notice (`deliver_wake_message`).
+        WakeNotice,
+    }
+
+    struct Row {
+        method: &'static str,
+        door: FrontDoor,
+        expect_user: bool,
+    }
+
+    const ROWS: &[Row] = &[
+        Row {
+            method: "agent.sendMessage (FE)",
+            door: FrontDoor::FeSendMessage,
+            expect_user: true,
+        },
+        Row {
+            method: "agent.sendMessage (MCP)",
+            door: FrontDoor::McpSendMessage,
+            expect_user: false,
+        },
+        Row {
+            method: "agent.queueMessage",
+            door: FrontDoor::QueueMessage,
+            expect_user: true,
+        },
+        Row {
+            method: "agent.sendToTask",
+            door: FrontDoor::SendToTask,
+            expect_user: false,
+        },
+        Row {
+            method: "agent.sendQueuedMessageNow (slot held)",
+            door: FrontDoor::SendQueuedMessageNow,
+            expect_user: true,
+        },
+        Row {
+            method: "wake / hook notice (deliver_wake_message)",
+            door: FrontDoor::WakeNotice,
+            expect_user: false,
+        },
+    ];
+
+    const CONTENT: &str = "origin probe";
+
+    /// `assign_agent` validates the `agent-{uuid}` shape, so every row uses
+    /// a well-formed id.
+    fn agent_id(index: usize) -> AgentId {
+        AgentId::from(format!("agent-17900000-0000-4000-8000-{index:012}").as_str())
+    }
+
+    async fn seed_assigned_task(services: &Services, ws: &WorkspaceId, id: &AgentId) -> NoteId {
+        let note = services
+            .create_note(
+                ws.clone(),
+                NoteCreate {
+                    title: "origin probe task".into(),
+                    content: Some("body".into()),
+                    tags: None,
+                    parent_id: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("create note")
+            .note;
+        WorkspaceApi::mark_as_task(
+            services,
+            ws.clone(),
+            note.id.clone(),
+            "not_started".into(),
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("mark as task");
+        services
+            .assign_agent(ws.clone(), note.id.clone(), id.0.clone(), None)
+            .await
+            .expect("assign agent");
+        note.id
+    }
+
+    /// Drive one front door with the slot already held and return the id of
+    /// the queue entry it produced.
+    async fn drive(
+        door: FrontDoor,
+        mgr: &Arc<AgentManager>,
+        ws: &WorkspaceId,
+        id: &AgentId,
+    ) -> String {
+        let svc = &mgr.services;
+        match door {
+            FrontDoor::FeSendMessage | FrontDoor::McpSendMessage => {
+                let origin = match door {
+                    FrontDoor::FeSendMessage => MessageOrigin::User,
+                    _ => MessageOrigin::Automatic,
+                };
+                let r = svc
+                    .agent_send_message(
+                        ws.clone(),
+                        id.clone(),
+                        CONTENT.into(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        origin,
+                    )
+                    .await
+                    .expect("send");
+                assert_eq!(r["queued"], json!(true), "slot held → queue fallback: {r}");
+                r["queuedMessage"]["id"]
+                    .as_str()
+                    .expect("entry id")
+                    .to_string()
+            }
+            FrontDoor::QueueMessage => {
+                let r = svc
+                    .agent_queue_message(id.clone(), CONTENT.into(), None, None, None)
+                    .await
+                    .expect("queue");
+                r["queuedMessage"]["id"]
+                    .as_str()
+                    .expect("entry id")
+                    .to_string()
+            }
+            FrontDoor::SendToTask => {
+                let note_id = seed_assigned_task(svc, ws, id).await;
+                let r = svc
+                    .agent_send_to_task(ws.clone(), note_id, CONTENT.into(), None, None)
+                    .await
+                    .expect("send to task");
+                assert_eq!(r["ok"], json!(true), "{r}");
+                assert_eq!(
+                    r["result"]["queued"],
+                    json!(true),
+                    "slot held → queue fallback: {r}"
+                );
+                r["result"]["queuedMessage"]["id"]
+                    .as_str()
+                    .expect("entry id")
+                    .to_string()
+            }
+            FrontDoor::SendQueuedMessageNow => {
+                let (parked, _) = svc.enqueue_message(
+                    id,
+                    CONTENT.into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    MessageOrigin::Automatic,
+                );
+                let r = svc
+                    .agent_send_queued_message_now(ws.clone(), id.clone(), parked.id.clone())
+                    .await
+                    .expect("send now");
+                assert_eq!(
+                    r["queued"],
+                    json!(true),
+                    "slot held → restored at front: {r}"
+                );
+                parked.id
+            }
+            FrontDoor::WakeNotice => {
+                let r = svc
+                    .deliver_wake_message(
+                        ws,
+                        id,
+                        CONTENT,
+                        Some(&json!({ "type": "event_notification" })),
+                    )
+                    .await
+                    .expect("wake");
+                assert_eq!(r["queued"], json!(true), "slot held → fast enqueue: {r}");
+                r["queuedMessage"]["id"]
+                    .as_str()
+                    .expect("entry id")
+                    .to_string()
+            }
+        }
+    }
+
+    fn recorded_user_origin(svc: &Services, id: &AgentId, entry_id: &str) -> bool {
+        let guard = svc.agent_queues.lock().unwrap();
+        guard
+            .get(id)
+            .and_then(|queue| queue.iter().find(|m| m.id == entry_id))
+            .unwrap_or_else(|| panic!("entry {entry_id} missing from {id}'s queue"))
+            .user_origin
+    }
+
+    #[tokio::test]
+    async fn every_front_door_records_its_origin() {
+        for (index, row) in ROWS.iter().enumerate() {
+            let (_tmp, mgr) = manager().await;
+            let mgr = Arc::new(mgr);
+            mgr.services.attach_agent_manager(&mgr);
+            let ws = WorkspaceId::from(format!("ws-origin-{index}").as_str());
+            let id = agent_id(index);
+            seed_agent(&mgr, &ws, &id).await;
+            assert!(
+                mgr.try_begin(&id, &ws).await,
+                "hold the slot for {}",
+                row.method
+            );
+
+            let entry_id = drive(row.door, &mgr, &ws, &id).await;
+            assert!(
+                mgr.is_busy(&id),
+                "{}: the held slot must survive the call",
+                row.method
+            );
+            assert_eq!(
+                recorded_user_origin(&mgr.services, &id, &entry_id),
+                row.expect_user,
+                "{}: recorded user_origin should be {} ({:?})",
+                row.method,
+                row.expect_user,
+                row.door
+            );
+        }
     }
 }
