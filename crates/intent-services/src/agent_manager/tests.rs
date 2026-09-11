@@ -17881,6 +17881,43 @@ mod attention_request_clear_gates {
         assert_eq!(session.attention_request_timestamp, None);
     }
 
+    /// A reply the FE parks behind a busy turn goes through
+    /// `agent.queueMessage`, not `agent.sendMessage`. The op must enqueue the
+    /// entry user-origin so its drain clears the request on a TOP-LEVEL
+    /// FOREGROUND agent exactly like an idle-agent reply does.
+    #[tokio::test]
+    async fn drained_queue_message_op_entry_clears_attention_request() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+        ]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-attn-drain-queue-op"),
+            AgentId::from("a-attn-drain-queue-op"),
+        );
+        seed_with_pending_request(&mgr, &ws, &id).await;
+
+        mgr.services
+            .agent_queue_message_op(id.clone(), "queued user reply".into(), None, None)
+            .await
+            .expect("queue user reply");
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        await_worker_idle(&mgr, &id).await;
+
+        assert!(
+            saw_cleared_event(&mut sub).await,
+            "drained agent.queueMessage entry emits attentionRequestCleared"
+        );
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(session.attention_request_kind, None);
+        assert_eq!(session.attention_request_reason, None);
+        assert_eq!(session.attention_request_timestamp, None);
+    }
+
     /// A drained AUTOMATIC queue entry (e.g. a parked A2A wake) leaves the
     /// request pending — the restored origin is `Automatic`.
     #[tokio::test]

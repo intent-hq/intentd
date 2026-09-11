@@ -1033,10 +1033,12 @@ pub(crate) struct QueuedMessage {
     /// so queue snapshots reflect the marker.
     #[serde(default)]
     pub interrupt_priority: bool,
-    /// `true` when the entry carries a USER-originated `agent.sendMessage`
-    /// that was parked by a queue-fallback path (busy race, quarantine,
-    /// append-failure). A drained user-origin entry keeps its originator's
-    /// semantics (attention-request clear, `systemOnly` flush exclusion),
+    /// `true` when the entry carries a USER-originated message: an
+    /// `agent.sendMessage` parked by a queue-fallback path (busy race,
+    /// quarantine, append-failure) or a user-typed `agent.queueMessage`
+    /// entry (the FE's mid-turn reply front door). A drained user-origin
+    /// entry keeps its originator's semantics (attention-request clear,
+    /// `systemOnly` flush exclusion),
     /// and a user entry queued into an ARCHIVED workspace is the explicit
     /// resurrection signal its drain gate exempts (intent-hq/intent#3883).
     /// Persisted so the marker survives daemon restarts.
@@ -5530,7 +5532,10 @@ impl Services {
         }
     }
 
-    /// `agent.queueMessage` (PROTOCOL §5.5). Enqueues the message, publishes
+    /// `agent.queueMessage` (PROTOCOL §5.5). Enqueues the message as a
+    /// USER-origin entry (this is the FE's front door for a reply typed while
+    /// the agent is mid-turn, so its drain must clear a pending attention
+    /// request like a direct `agent.sendMessage`), publishes
     /// `agent:queue:updated`, and asks the runtime [`AgentManager`] (when attached)
     /// to drain the queue immediately if the agent is idle — closing the bug where
     /// a queued message would never be sent because the BE only drained the queue
@@ -5552,7 +5557,7 @@ impl Services {
         let session = self.require_agent_session(&agent_id).await?;
         self.validate_image_block_refs("agent.queueMessage", image_blocks.as_ref())
             .await?;
-        let (queued, position) = self.enqueue_message(
+        let (queued, position) = self.enqueue_message_with_origin(
             &agent_id,
             content,
             image_blocks,
@@ -5560,6 +5565,7 @@ impl Services {
             None,
             None,
             false,
+            true,
         );
         let result = json!({
             "success": true,
@@ -12743,9 +12749,10 @@ impl Services {
     }
 
     /// [`Services::enqueue_message`] with an explicit `user_origin` marker:
-    /// `true` records that the entry carries a USER-originated
+    /// `true` records that the entry carries a USER-originated message — an
     /// `agent.sendMessage` parked by a queue-fallback path (busy race,
-    /// quarantine, append-failure). The archived-workspace drain gate
+    /// quarantine, append-failure) or a user-typed `agent.queueMessage`
+    /// entry. The archived-workspace drain gate
     /// delivers post-archive user-origin entries instead of parking them
     /// (intent-hq/intent#3883), and a drained user-origin entry keeps its
     /// originator's semantics.
