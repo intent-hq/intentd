@@ -1722,7 +1722,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "prMonitor.hourlyRequestBudget",
             "PR monitor hourly request budget",
-            "Forge REST calls per hour the centralized loop may spend across all monitored PRs; each PR poll costs 3 calls, so the per-PR interval stretches above pollSeconds once PRs × 3 × 3600 / budget exceeds it. 1500 is ~30% of GitHub's 5,000/h core quota (minimum 60, maximum 5000)",
+            "Forge REST calls per hour the centralized loop plans to spend across all monitored PRs — a cadence cost model, not a hard ceiling: each PR poll is costed at 3 calls (a single-page estimate; paginated review lists and REST fallbacks cost more), so the per-PR interval stretches above pollSeconds once PRs × 3 × 3600 / budget exceeds it; requests are not counted or blocked against it. 1500 is ~30% of GitHub's 5,000/h core quota (minimum 60, maximum 5000)",
             "prMonitor",
             Some(60.0),
             Some(5_000.0),
@@ -4137,6 +4137,19 @@ mod tests {
                 }
             ),
             "hourlyRequestBudget caps at 5000"
+        );
+        // The catalog range and the read-time clamp constants must agree.
+        assert_eq!(
+            intent_core::config::MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            60
+        );
+        assert_eq!(
+            intent_core::config::MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            5000
+        );
+        assert_eq!(
+            intent_core::config::DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            1500
         );
 
         let tag = uuid::Uuid::new_v4();

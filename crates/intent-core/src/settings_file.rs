@@ -1012,10 +1012,12 @@ pub struct PrMonitorSettings {
     /// loop and the per-PR poll interval floor (config-file key; not exposed
     /// in the Settings UI).
     pub poll_seconds: u64,
-    /// `prMonitor.hourlyRequestBudget` — forge REST calls per hour the loop
-    /// may spend across every monitored PR; the per-PR interval stretches
-    /// above `pollSeconds` once the monitored-PR count would exceed it
-    /// (config-file key; not exposed in the Settings UI).
+    /// `prMonitor.hourlyRequestBudget` — the forge REST calls per hour the
+    /// loop plans to spend across every monitored PR. A cadence cost model,
+    /// not an enforced ceiling: the per-PR interval stretches above
+    /// `pollSeconds` once the monitored-PR count would exceed it, but no
+    /// request is counted or blocked against it (config-file key; not
+    /// exposed in the Settings UI).
     pub hourly_request_budget: u64,
 }
 
@@ -1774,10 +1776,12 @@ debounceSeconds = 60
 # PR monitor poll seconds -- tick cadence (in seconds) of the centralized loop
 # and the per-PR poll interval floor (minimum 10).
 pollSeconds = 30
-# PR monitor hourly request budget -- forge REST calls per hour the loop may
-# spend across all monitored PRs; each PR poll costs 3 calls, so the per-PR
-# interval stretches above pollSeconds once PRs x 3 x 3600 / budget exceeds
-# it (minimum 60, maximum 5000).
+# PR monitor hourly request budget -- forge REST calls per hour the loop
+# plans to spend across all monitored PRs. A cadence cost model, not a hard
+# ceiling: each PR poll is costed at 3 calls (a single-page estimate), so the
+# per-PR interval stretches above pollSeconds once PRs x 3 x 3600 / budget
+# exceeds it; requests are not counted or blocked against it (minimum 60,
+# maximum 5000).
 hourlyRequestBudget = 1500
 "#;
 

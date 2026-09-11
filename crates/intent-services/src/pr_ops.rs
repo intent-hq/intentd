@@ -965,7 +965,9 @@ pub(crate) fn merge_requirements(
 /// tally, a failing review read leaves the approvals aggregate empty, and a
 /// failing review-thread read reports zero unresolved threads. Only
 /// [`SourceControl::get_pr`] is load-bearing, so a partially-visible forge
-/// still yields a usable checklist.
+/// still yields a usable checklist. The one exception is quota exhaustion:
+/// [`Error::RateLimited`] from ANY sub-read propagates (see
+/// [`merge_requirements_for_pr`]).
 #[cfg(test)]
 pub(crate) async fn fetch_merge_requirements(
     sc: &dyn SourceControl,
@@ -988,15 +990,34 @@ pub(crate) async fn fetch_merge_requirements_detailed(
 ) -> Result<(PullRequest, MergeRequirements, i64, bool)> {
     let pr = sc.get_pr(repo_ref, number).await.map_err(map_sc_err)?;
     let (requirements, review_comments, ejection_known) =
-        merge_requirements_for_pr(sc, repo_ref, number, &pr).await;
+        merge_requirements_for_pr(sc, repo_ref, number, &pr).await?;
     Ok((pr, requirements, review_comments, ejection_known))
+}
+
+/// Split a best-effort forge read into "answered" / "degraded" while
+/// preserving quota exhaustion: an ordinary error becomes `Ok(None)` for the
+/// caller to degrade on, but [`intent_sourcecontrol::Error::RateLimited`]
+/// propagates as [`Error::RateLimited`] so a quota hit on a secondary read is
+/// never mistaken for a degraded-but-successful poll (the sweep must pause
+/// the shared gate, not persist the degraded snapshot).
+fn degrade_unless_rate_limited<T>(
+    result: std::result::Result<T, intent_sourcecontrol::Error>,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(intent_sourcecontrol::Error::RateLimited(msg)) => Err(Error::RateLimited(msg)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// [`fetch_merge_requirements_detailed`] for a [`PullRequest`] the caller
 /// already read — the composition shared by the PR monitor and the one-shot
 /// `ws.pr.snapshot`, so both surfaces describe a PR with the same object.
-/// Infallible: every forge sub-read degrades on its own (see
-/// [`fetch_merge_requirements`]). Returns the checklist, the review-comment
+/// Every forge sub-read degrades on its own (see
+/// [`fetch_merge_requirements`]); the ONLY error is [`Error::RateLimited`],
+/// returned as soon as any sub-read reports quota exhaustion so no further
+/// forge calls are issued and the caller never persists a degraded snapshot
+/// as a successful poll. Returns the checklist, the review-comment
 /// count from the same thread fetch, and whether the merge-requirements
 /// probe itself answered — the probe is the ONLY source of the merge-queue
 /// ejection signal, so `false` means the checklist's `mergeQueueEjection` is
@@ -1007,20 +1028,19 @@ pub(crate) async fn merge_requirements_for_pr(
     repo_ref: &RepoRef,
     number: u64,
     pr: &PullRequest,
-) -> (MergeRequirements, i64, bool) {
+) -> Result<(MergeRequirements, i64, bool)> {
     let (signals, reviews) = tokio::join!(
         sc.merge_requirements(repo_ref, number),
         sc.list_reviews(repo_ref, number)
     );
-    let mut signals = signals
-        .inspect_err(|e| {
-            tracing::debug!(
-                error = %e,
-                pr_number = number,
-                "merge requirements: probe unavailable, degrading to snapshot-only checklist"
-            );
-        })
-        .ok();
+    let mut signals = degrade_unless_rate_limited(signals.inspect_err(|e| {
+        tracing::debug!(
+            error = %e,
+            pr_number = number,
+            "merge requirements: probe unavailable, degrading to snapshot-only checklist"
+        );
+    }))?;
+    let reviews = degrade_unless_rate_limited(reviews)?;
     // Captured BEFORE the review-decision backfill below can fabricate a
     // stub `signals` for a failed probe.
     let ejection_known = signals.is_some();
@@ -1032,18 +1052,16 @@ pub(crate) async fn merge_requirements_for_pr(
     // aggregate merely because the probe is unavailable. A failing read
     // degrades to `None` (aggregate-derived decision).
     if signals.as_ref().is_none_or(|s| s.review_decision.is_none()) {
-        let decision = sc
-            .review_decision(repo_ref, number)
-            .await
-            .inspect_err(|e| {
+        let decision = degrade_unless_rate_limited(
+            sc.review_decision(repo_ref, number).await.inspect_err(|e| {
                 tracing::debug!(
                     error = %e,
                     pr_number = number,
                     "merge requirements: review_decision fetch failed, falling back to aggregate"
                 );
-            })
-            .ok()
-            .flatten();
+            }),
+        )?
+        .flatten();
         if let Some(decision) = decision {
             signals.get_or_insert_with(Default::default).review_decision = Some(decision);
         }
@@ -1058,7 +1076,8 @@ pub(crate) async fn merge_requirements_for_pr(
         .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
     let fallback_runs = match head_ref {
         Some(git_ref) if !rollup_known && sc.capabilities().check_runs => {
-            sc.check_runs(repo_ref, &git_ref).await.unwrap_or_default()
+            degrade_unless_rate_limited(sc.check_runs(repo_ref, &git_ref).await)?
+                .unwrap_or_default()
         }
         _ => Vec::new(),
     };
@@ -1074,6 +1093,9 @@ pub(crate) async fn merge_requirements_for_pr(
     .await
     {
         Ok((threads, _, _)) => count_thread_comments(&threads),
+        Err(intent_sourcecontrol::Error::RateLimited(msg)) => {
+            return Err(Error::RateLimited(msg));
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -1082,6 +1104,9 @@ pub(crate) async fn merge_requirements_for_pr(
             );
             match fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)).await {
                 Ok((comments, _, _)) => count_thread_comments(&fallback_threads(comments)),
+                Err(intent_sourcecontrol::Error::RateLimited(msg)) => {
+                    return Err(Error::RateLimited(msg));
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -1095,7 +1120,7 @@ pub(crate) async fn merge_requirements_for_pr(
     };
 
     let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
-    (requirements, review_comments, ejection_known)
+    Ok((requirements, review_comments, ejection_known))
 }
 
 // ===========================================================================

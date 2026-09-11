@@ -22,15 +22,23 @@
 //! a pending emit that was persisted but never delivered — fires immediately,
 //! without debounce. Debounce applies again from the next change onward.
 //!
-//! The loop's forge request rate is bounded by `prMonitor.hourlyRequestBudget`
-//! rather than growing with the number of monitored PRs: the loop keeps
-//! ticking every `prMonitor.pollSeconds`, but each distinct PR is revisited on
-//! the **effective** interval ([`effective_pr_monitor_interval_secs`]) and
-//! each tick fetches at most a capped, oldest-first subset of the due PRs
+//! The loop's forge request rate is planned against
+//! `prMonitor.hourlyRequestBudget` rather than growing with the number of
+//! monitored PRs: the loop keeps ticking every `prMonitor.pollSeconds`, but
+//! each distinct PR is revisited on the **effective** interval
+//! ([`effective_pr_monitor_interval_secs`]) and each tick fetches at most a
+//! capped, oldest-first subset of the due PRs
 //! ([`pr_monitor_fetches_per_tick`]), so a large monitor set is spread
-//! across ticks instead of burst-fetched. The debounce window is evaluated
-//! at that effective cadence, so a wake may arrive up to one effective
-//! interval late.
+//! across ticks instead of burst-fetched. The budget is a **cost model**
+//! that derives the cadence (each PR poll costed at
+//! [`PR_MONITOR_REQUESTS_PER_POLL`] REST calls), not a hard ceiling: no
+//! request is counted or blocked against it, and actual spend can differ
+//! (the 3-call unit is a single-page estimate: a multi-page review list or
+//! a degraded-path REST fallback costs more; GraphQL reads ride their own
+//! quota). Genuine
+//! quota exhaustion is handled by the shared rate-limit gate instead. The
+//! debounce window is evaluated at that effective cadence, so a wake may
+//! arrive up to one effective interval late.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -53,29 +61,35 @@ use crate::workspace_status::MonitorPrSignals;
 use crate::{publish_event, system_actor, Services};
 
 use intent_core::config::{
-    MIN_PR_MONITOR_DEBOUNCE_SECONDS, MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
-    MIN_PR_MONITOR_POLL_SECONDS,
+    MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET, MIN_PR_MONITOR_DEBOUNCE_SECONDS,
+    MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET, MIN_PR_MONITOR_POLL_SECONDS,
 };
 
 /// Cap on concurrently ACTIVE monitors per agent (mirrors the background-hook
 /// `maxPerAgent` convention).
 pub(crate) const DEFAULT_PR_MONITORS_MAX_PER_AGENT: u32 = 5;
 
-/// Forge REST calls one distinct-PR poll costs on the steady-state GitHub
-/// path: the PR read, the reviews list, and the conversation-comment list.
-/// The merge-requirements probe, review decision, and review threads ride
-/// GraphQL (its own quota); the REST check-runs read is a fallback taken
-/// only when the probe fails. The unit `prMonitor.hourlyRequestBudget` is
-/// spent in.
+/// Forge REST calls one distinct-PR poll is COSTED at on the steady-state
+/// GitHub path: the PR read, the reviews list, and the conversation-comment
+/// list — a single-page estimate. The merge-requirements probe, review
+/// decision, and review threads ride GraphQL (its own quota); the REST
+/// check-runs read is a fallback taken only when the probe fails. This is
+/// the unit of the `prMonitor.hourlyRequestBudget` cost model — a planning
+/// constant for the cadence math, not a measured or enforced per-poll spend
+/// (a PR whose review list spans several REST pages, or a degraded poll
+/// taking a REST fallback, issues more calls than this; nothing counts them
+/// against the budget).
 pub(crate) const PR_MONITOR_REQUESTS_PER_POLL: u64 = 3;
 
 /// The effective per-PR poll interval (seconds) for `distinct_prs` monitored
 /// PRs: the configured `poll_secs`, stretched so that revisiting every PR
-/// at that interval spends at most `hourly_budget` REST calls per hour —
-/// `max(poll_secs, ceil(distinct_prs × PR_MONITOR_REQUESTS_PER_POLL × 3600 /
-/// hourly_budget))`. Both inputs are clamped to their floors first. At the
-/// defaults (30s, 1500/h) up to 4 PRs keep the configured 30s; 10 PRs → 72s,
-/// 20 PRs → 144s.
+/// at that interval is MODELLED to spend at most `hourly_budget` REST calls
+/// per hour — `max(poll_secs, ceil(distinct_prs × PR_MONITOR_REQUESTS_PER_POLL
+/// × 3600 / hourly_budget))`. Both inputs are clamped to their floors first
+/// (the budget's ceiling is applied by the settings getter). At the defaults
+/// (30s, 1500/h) up to 4 PRs keep the configured 30s; 10 PRs → 72s, 20 PRs
+/// → 144s. The budget is a cost model that sets the cadence; it is not a
+/// limiter that counts or blocks requests.
 pub(crate) fn effective_pr_monitor_interval_secs(
     distinct_prs: usize,
     poll_secs: u64,
@@ -327,7 +341,11 @@ impl SharedPrSnapshot {
 
 /// Fetch the current shared state of one PR: the merge-requirements
 /// checklist (which already degrades per-signal) plus the
-/// conversation-comment count (`None` when that read fails).
+/// conversation-comment count (`None` when that read fails). Quota
+/// exhaustion is the one non-degrading failure: [`Error::RateLimited`] from
+/// ANY forge read — the load-bearing `get_pr`, a checklist sub-read, or the
+/// comment count — propagates so the sweep pauses the shared gate instead of
+/// persisting a degraded snapshot as a successful poll.
 pub(crate) async fn fetch_shared_snapshot(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
@@ -337,6 +355,9 @@ pub(crate) async fn fetch_shared_snapshot(
         pr_ops::fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
     let conversation_count = match sc.list_comments(repo_ref, number).await {
         Ok(comments) => Some(i64::try_from(comments.len()).expect("value fits in i64")),
+        Err(intent_sourcecontrol::Error::RateLimited(detail)) => {
+            return Err(Error::RateLimited(detail));
+        }
         Err(e) => {
             tracing::debug!(
                 error = %e,
@@ -733,14 +754,20 @@ impl Services {
         Duration::from_secs(secs)
     }
 
-    /// The hourly forge request budget for the monitor loop
-    /// (`prMonitor.hourlyRequestBudget`), clamped to
-    /// [`MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET`]. Read live on every tick like
-    /// the poll cadence; an explicit override wins when wired.
+    /// The hourly forge request budget the monitor loop's cadence is
+    /// modelled on (`prMonitor.hourlyRequestBudget`), clamped into
+    /// [[`MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET`],
+    /// [`MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET`]] so a hand-edited config
+    /// file can neither divide by zero nor plan more polling than the forge
+    /// quota serves. Read live on every tick like the poll cadence; an
+    /// explicit override wins when wired.
     pub(crate) fn pr_monitor_hourly_request_budget(&self) -> u64 {
         self.pr_monitor_hourly_request_budget
             .unwrap_or_else(|| self.effective_settings().pr_monitor.hourly_request_budget)
-            .max(MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET)
+            .clamp(
+                MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+                MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            )
     }
 
     /// Log the effective per-PR interval at INFO once per change (never per
@@ -1333,7 +1360,10 @@ impl Services {
     /// fetch that fails with [`Error::RateLimited`] opens the pause, records
     /// a pause `lastError` on every monitor of that PR, and stops fetching
     /// further PRs in this sweep — monitors not yet reached keep their
-    /// previous `lastError` and baseline.
+    /// previous `lastError` and baseline. The shared gate is re-consulted
+    /// before EVERY vacant-cache fetch, not just at the top of the sweep, so
+    /// a pause opened mid-sweep by a sibling sweep (PR refresh, git roots)
+    /// stops this sweep's remaining fetches too.
     async fn sweep_pr_monitors(&self, skip_fresh: bool) {
         if self.sweeps_rate_limited() {
             tracing::debug!("pr monitor sweep: forge rate limit pause active; skipping tick");
@@ -1367,9 +1397,20 @@ impl Services {
         for monitor in monitors {
             let fetched = match shared.entry(pr_key(&monitor)) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
-                // The gate closed mid-sweep: PRs not fetched yet stay
+                // The gate closed mid-sweep — by this sweep's own fetch or by
+                // a sibling sweep sharing the gate: PRs not fetched yet stay
                 // untouched until the pause window elapses.
-                std::collections::hash_map::Entry::Vacant(_) if rate_limited => continue,
+                std::collections::hash_map::Entry::Vacant(_)
+                    if rate_limited || self.sweeps_rate_limited() =>
+                {
+                    if !rate_limited {
+                        tracing::debug!(
+                            "pr monitor sweep: forge rate limit pause opened mid-sweep; skipping remaining fetches"
+                        );
+                        rate_limited = true;
+                    }
+                    continue;
+                }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
                     // The timeout is defense in depth above the client-level
@@ -2319,6 +2360,12 @@ mod tests {
         fail_merge_requirements: bool,
         /// `get_pr` fails with the forge's quota-exhausted error.
         rate_limit_get_pr: bool,
+        /// `list_reviews` (a checklist sub-read) fails with the forge's
+        /// quota-exhausted error while `get_pr` still answers.
+        rate_limit_list_reviews: bool,
+        /// `list_comments` (the conversation count) fails with the forge's
+        /// quota-exhausted error while every other read still answers.
+        rate_limit_list_comments: bool,
         /// PR number whose `get_pr` pends forever (hung-connection regression).
         hang_get_pr: Option<u64>,
     }
@@ -2345,16 +2392,24 @@ mod tests {
                 fail_list_comments: false,
                 fail_merge_requirements: false,
                 rate_limit_get_pr: false,
+                rate_limit_list_reviews: false,
+                rate_limit_list_comments: false,
                 hang_get_pr: None,
             }
         }
     }
+
+    /// Side effect run at the start of every `get_pr` (with the PR number),
+    /// standing in for work that happens elsewhere in the daemon while a
+    /// sweep is mid-flight — e.g. a sibling sweep pausing the shared gate.
+    type GetPrHook = Box<dyn Fn(u64) + Send + Sync>;
 
     #[derive(Clone)]
     struct StubForge {
         state: Arc<Mutex<ForgeState>>,
         get_pr_calls: Arc<std::sync::atomic::AtomicUsize>,
         get_pr_numbers: Arc<Mutex<Vec<u64>>>,
+        on_get_pr: Arc<Mutex<Option<GetPrHook>>>,
     }
 
     impl StubForge {
@@ -2363,11 +2418,17 @@ mod tests {
                 state: Arc::new(Mutex::new(ForgeState::default())),
                 get_pr_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 get_pr_numbers: Arc::new(Mutex::new(Vec::new())),
+                on_get_pr: Arc::new(Mutex::new(None)),
             }
         }
 
         fn edit(&self, f: impl FnOnce(&mut ForgeState)) {
             f(&mut self.state.lock().unwrap());
+        }
+
+        /// Install (or clear) the per-`get_pr` side effect.
+        fn set_on_get_pr(&self, hook: Option<GetPrHook>) {
+            *self.on_get_pr.lock().unwrap() = hook;
         }
 
         /// Snapshot-fetch attempts so far: `get_pr` is called exactly once
@@ -2456,6 +2517,9 @@ mod tests {
             self.get_pr_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.get_pr_numbers.lock().unwrap().push(number);
+            if let Some(hook) = self.on_get_pr.lock().unwrap().as_ref() {
+                hook(number);
+            }
             let s = self.state.lock().unwrap().clone();
             if s.hang_get_pr == Some(number) {
                 // A TCP connection that went dark: the future never resolves.
@@ -2543,11 +2607,13 @@ mod tests {
             _: &RepoRef,
             _: u64,
         ) -> intent_sourcecontrol::Result<Vec<Review>> {
-            Ok(self
-                .state
-                .lock()
-                .unwrap()
-                .approvals
+            let s = self.state.lock().unwrap();
+            if s.rate_limit_list_reviews {
+                return Err(intent_sourcecontrol::Error::RateLimited(
+                    "API rate limit exceeded".into(),
+                ));
+            }
+            Ok(s.approvals
                 .iter()
                 .map(|a| Review {
                     author: a.clone(),
@@ -2587,10 +2653,19 @@ mod tests {
             _: &RepoRef,
             _: u64,
         ) -> intent_sourcecontrol::Result<Vec<Comment>> {
-            let (n, fail) = {
+            let (n, fail, rate_limited) = {
                 let s = self.state.lock().unwrap();
-                (s.conversation_comments, s.fail_list_comments)
+                (
+                    s.conversation_comments,
+                    s.fail_list_comments,
+                    s.rate_limit_list_comments,
+                )
             };
+            if rate_limited {
+                return Err(intent_sourcecontrol::Error::RateLimited(
+                    "API rate limit exceeded".into(),
+                ));
+            }
             if fail {
                 return Err(intent_sourcecontrol::Error::Unsupported(
                     "comments down".into(),
@@ -4725,6 +4800,159 @@ mod tests {
         }
     }
 
+    /// The shared gate is re-consulted before EVERY vacant-cache fetch, not
+    /// only at the top of the sweep: when a sibling sweep (PR refresh, git
+    /// roots) pauses the gate while this sweep is mid-flight, the PRs not
+    /// fetched yet are skipped — no further forge calls, rows untouched —
+    /// while the PR fetched before the pause still completes its poll.
+    #[tokio::test]
+    async fn a_gate_paused_mid_sweep_by_a_sibling_stops_the_remaining_fetches() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitor_poll_seconds(30)
+            .with_pr_monitor_hourly_request_budget(1500);
+        let mut ids = Vec::new();
+        for pr in [1_u64, 2, 3] {
+            let (m, _) = svc
+                .pr_monitor_register(&ws, &owner, "o", "r", pr)
+                .await
+                .expect("register");
+            backdate(&svc, &m.monitor_id, &format!("2020-01-01T00:00:0{pr}Z")).await;
+            ids.push(m.monitor_id);
+        }
+        let before: Vec<PrMonitor> = {
+            let mut rows = Vec::new();
+            for id in &ids {
+                rows.push(svc.store().get_pr_monitor(id).await.unwrap());
+            }
+            rows
+        };
+        forge.take_fetched_numbers();
+
+        // The first PR's fetch succeeds, but a sibling sweep pauses the
+        // shared gate while it is in flight.
+        let gate = Arc::clone(&svc.sweep_rate_limit);
+        forge.set_on_get_pr(Some(Box::new(move |_| {
+            gate.pause_for(Duration::from_secs(300));
+        })));
+        forge.edit(|s| s.conversation_comments = 7);
+        svc.poll_due_pr_monitors().await;
+        forge.set_on_get_pr(None);
+
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![1],
+            "the sweep stops at the first vacant fetch after the gate closed"
+        );
+        let first = svc.store().get_pr_monitor(&ids[0]).await.unwrap();
+        assert_ne!(
+            first.last_polled_at, before[0].last_polled_at,
+            "the PR fetched before the pause completes its poll"
+        );
+        assert_eq!(first.last_error, None);
+        for (id, previous) in ids[1..].iter().zip(&before[1..]) {
+            assert_eq!(
+                &svc.store().get_pr_monitor(id).await.unwrap(),
+                previous,
+                "PRs not reached before the pause keep their previous row"
+            );
+        }
+
+        // Pause window over: the skipped PRs are polled on the next sweep.
+        svc.sweep_rate_limit.clear();
+        svc.poll_pr_monitors().await;
+        let mut fetched = forge.take_fetched_numbers();
+        fetched.sort_unstable();
+        assert_eq!(fetched, vec![1, 2, 3]);
+    }
+
+    /// Quota exhaustion on a SECONDARY read — a checklist sub-read
+    /// (`list_reviews`) or the conversation-comment count (`list_comments`)
+    /// — is not a degraded-but-successful poll: it propagates as
+    /// `RateLimited`, pauses the shared gate, records the pause `lastError`
+    /// and leaves the baseline untouched, exactly like a rate-limited
+    /// `get_pr`. Ordinary secondary failures still degrade (covered by
+    /// `list_comments_failure_keeps_previous_conversation_count` and the
+    /// probe-degradation tests).
+    #[tokio::test]
+    async fn a_rate_limited_secondary_read_pauses_the_gate_like_get_pr() {
+        for rate_limit_read in ["list_reviews", "list_comments"] {
+            let (_db, _root, svc, forge, ws, owner) = setup().await;
+            let svc = svc
+                .with_pr_monitor_poll_seconds(30)
+                .with_pr_monitor_hourly_request_budget(1500);
+            let mut ids = Vec::new();
+            for pr in [1_u64, 2] {
+                let (m, _) = svc
+                    .pr_monitor_register(&ws, &owner, "o", "r", pr)
+                    .await
+                    .expect("register");
+                backdate(&svc, &m.monitor_id, &format!("2020-01-01T00:00:0{pr}Z")).await;
+                ids.push(m.monitor_id);
+            }
+            let baseline = svc.store().get_pr_monitor(&ids[0]).await.unwrap();
+            forge.take_fetched_numbers();
+
+            // A real change lands alongside the quota hit: it must NOT be
+            // persisted as a successful poll.
+            forge.edit(|s| {
+                s.approvals = vec!["reviewer".into()];
+                match rate_limit_read {
+                    "list_reviews" => s.rate_limit_list_reviews = true,
+                    _ => s.rate_limit_list_comments = true,
+                }
+            });
+            svc.poll_due_pr_monitors().await;
+
+            assert_eq!(
+                forge.take_fetched_numbers(),
+                vec![1],
+                "{rate_limit_read}: the sweep stops at the rate-limited PR"
+            );
+            assert!(
+                svc.sweep_rate_limit.paused_remaining().is_some(),
+                "{rate_limit_read}: the global gate is paused"
+            );
+            let paused = svc.store().get_pr_monitor(&ids[0]).await.unwrap();
+            assert!(
+                paused
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("rate limited; PR monitor polling paused for ~")),
+                "{rate_limit_read}: the pause is recorded as lastError: {:?}",
+                paused.last_error
+            );
+            assert_eq!(
+                paused.last_snapshot, baseline.last_snapshot,
+                "{rate_limit_read}: the baseline is untouched"
+            );
+            assert_eq!(
+                svc.store()
+                    .get_pr_monitor(&ids[1])
+                    .await
+                    .unwrap()
+                    .last_error,
+                None,
+                "{rate_limit_read}: the monitor not reached keeps its previous row"
+            );
+
+            // Pause window over and quota back: the poll succeeds, clears
+            // the pause error and only now records the change.
+            svc.sweep_rate_limit.clear();
+            forge.edit(|s| {
+                s.rate_limit_list_reviews = false;
+                s.rate_limit_list_comments = false;
+            });
+            svc.poll_pr_monitors().await;
+            let recovered = svc.store().get_pr_monitor(&ids[0]).await.unwrap();
+            assert_eq!(recovered.last_error, None, "{rate_limit_read}");
+            assert_ne!(
+                recovered.last_snapshot, baseline.last_snapshot,
+                "{rate_limit_read}: the change is observed once quota is back"
+            );
+        }
+    }
+
     /// Sibling monitors on one PR count once toward the effective interval
     /// and share the one fetch: two agents each watching the same four PRs
     /// keep the configured 30s cadence and one tick fetches all four.
@@ -6271,6 +6499,38 @@ mod tests {
         assert_eq!(
             clamped.pr_monitor_debounce(),
             Duration::from_secs(MIN_PR_MONITOR_DEBOUNCE_SECONDS)
+        );
+    }
+
+    /// The hourly request budget getter clamps into [floor, ceiling]: a
+    /// hand-edited config below 60 reads as 60 and one above GitHub's
+    /// 5,000/h core quota reads as 5000, so the cadence math never plans
+    /// more polling than the forge serves.
+    #[tokio::test]
+    async fn hourly_request_budget_clamps_to_floor_and_ceiling() {
+        use intent_core::config::DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET;
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        assert_eq!(
+            svc.pr_monitor_hourly_request_budget(),
+            DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET
+        );
+        assert_eq!(
+            svc.clone()
+                .with_pr_monitor_hourly_request_budget(0)
+                .pr_monitor_hourly_request_budget(),
+            MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET
+        );
+        assert_eq!(
+            svc.clone()
+                .with_pr_monitor_hourly_request_budget(1_000_000)
+                .pr_monitor_hourly_request_budget(),
+            MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET
+        );
+        assert_eq!(
+            svc.clone()
+                .with_pr_monitor_hourly_request_budget(MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET)
+                .pr_monitor_hourly_request_budget(),
+            MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET
         );
     }
 }

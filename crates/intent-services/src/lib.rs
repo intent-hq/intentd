@@ -1000,9 +1000,10 @@ pub struct Services {
     /// the floor are clamped at read time.
     pr_monitor_poll_seconds: Option<u64>,
     /// Explicit override for the PR-monitor loop's hourly forge request
-    /// budget. `None` — the production wiring — reads
-    /// `prMonitor.hourlyRequestBudget` live from the settings registry;
-    /// values below the floor are clamped at read time.
+    /// budget (the cadence cost model, not an enforced ceiling). `None` —
+    /// the production wiring — reads `prMonitor.hourlyRequestBudget` live
+    /// from the settings registry; values outside [floor, ceiling] are
+    /// clamped at read time.
     pr_monitor_hourly_request_budget: Option<u64>,
     /// The last effective per-PR poll interval (seconds) the monitor loop
     /// logged, so a cadence change is logged once — never per tick. Shared
@@ -1258,8 +1259,8 @@ impl Services {
     }
 
     /// Pin the PR-monitor hourly forge request budget, bypassing the live
-    /// `prMonitor.hourlyRequestBudget` setting (test wiring). Values below
-    /// the floor are clamped when read.
+    /// `prMonitor.hourlyRequestBudget` setting (test wiring). Values outside
+    /// [floor, ceiling] are clamped when read.
     #[cfg(test)]
     pub(crate) fn with_pr_monitor_hourly_request_budget(mut self, budget: u64) -> Self {
         self.pr_monitor_hourly_request_budget = Some(budget);
@@ -27095,9 +27096,11 @@ impl WorkspaceApi for Services {
             // works with, so `ws.pr.snapshot`, monitor wakes and
             // `prMonitor.list` summaries all describe a PR with the same
             // object — this registers nothing and triggers no monitoring.
-            // Every forge sub-read inside degrades on its own.
+            // Every forge sub-read inside degrades on its own; only quota
+            // exhaustion (`RateLimited`) fails the snapshot, exactly as a
+            // rate-limited `get_pr` above would.
             let (requirements, review_comment_count, _ejection_known) =
-                pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo_ref, pr_number, &pr).await;
+                pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo_ref, pr_number, &pr).await?;
             let unresolved_thread_count = requirements.threads.unresolved;
             // The conversation-comment count is not part of the checklist; a
             // failing read reports zero rather than failing the snapshot.
