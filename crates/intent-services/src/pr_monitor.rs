@@ -61,9 +61,12 @@ use intent_core::config::{
 /// `maxPerAgent` convention).
 pub(crate) const DEFAULT_PR_MONITORS_MAX_PER_AGENT: u32 = 5;
 
-/// Forge REST calls one distinct-PR poll costs (PR read, merge requirements,
-/// check runs; the review-thread read rides GraphQL, which has its own
-/// quota). The unit `prMonitor.hourlyRequestBudget` is spent in.
+/// Forge REST calls one distinct-PR poll costs on the steady-state GitHub
+/// path: the PR read, the reviews list, and the conversation-comment list.
+/// The merge-requirements probe, review decision, and review threads ride
+/// GraphQL (its own quota); the REST check-runs read is a fallback taken
+/// only when the probe fails. The unit `prMonitor.hourlyRequestBudget` is
+/// spent in.
 pub(crate) const PR_MONITOR_REQUESTS_PER_POLL: u64 = 3;
 
 /// The effective per-PR poll interval (seconds) for `distinct_prs` monitored
@@ -113,47 +116,88 @@ fn pr_key(m: &PrMonitor) -> PrKey {
     (m.repo_owner.clone(), m.repo_name.clone(), m.pr_number)
 }
 
-/// A monitor's staleness anchor for the due-sweep: its parsed `lastPolledAt`
-/// (registration and re-registration fetch their own baseline and stamp the
-/// field), or `None` — never fresh, sorts oldest — when it was never polled
-/// or is catch-up-marked (its first post-restart poll must deliver promptly).
-fn pr_monitor_poll_anchor(
-    monitor: &PrMonitor,
-    catch_up: &HashSet<PrMonitorId>,
-) -> Option<time::OffsetDateTime> {
-    if catch_up.contains(&monitor.monitor_id) {
-        return None;
-    }
-    monitor.last_polled_at.as_deref().and_then(parse_iso)
+/// One active monitor as the due-sweep sees it: its staleness anchor (parsed
+/// `lastPolledAt`; registration and re-registration fetch their own baseline
+/// and stamp the field; `None` = never polled, sorts oldest) and whether its
+/// restart catch-up marker is still unattempted.
+#[derive(Clone)]
+pub(crate) struct DueCandidate {
+    pub(crate) anchor: Option<time::OffsetDateTime>,
+    pub(crate) catch_up: bool,
+    pub(crate) monitor: PrMonitor,
 }
 
-/// Pick the monitors one due-sweep tick polls: `due` carries every due
-/// monitor with its staleness anchor (`lastPolledAt`; `None` = never polled
-/// or catch-up-marked, which sorts oldest). Distinct PRs are ordered by
-/// their oldest anchor first, the first `cap` PRs are kept, and every
-/// monitor on a kept PR is returned (siblings share the one fetch).
+/// Whether a monitor's catch-up marker still exempts it from the freshness
+/// check: marked by boot rehydration at `marked_at` and not yet ATTEMPTED
+/// since (its `lastPolledAt` predates the mark). A failed post-restart
+/// attempt stamps `lastPolledAt` past the mark, so the monitor rejoins the
+/// normal cadence — the marker itself survives until a successful poll
+/// consumes it, keeping the undebounced-delivery guarantee for that poll.
+fn catch_up_unattempted(
+    monitor: &PrMonitor,
+    catch_up: &HashMap<PrMonitorId, time::OffsetDateTime>,
+) -> bool {
+    catch_up.get(&monitor.monitor_id).is_some_and(|marked_at| {
+        monitor
+            .last_polled_at
+            .as_deref()
+            .and_then(parse_iso)
+            .is_none_or(|at| at <= *marked_at)
+    })
+}
+
+/// Pick the monitors one due-sweep tick polls. Monitors are grouped per
+/// distinct PR: a PR's anchor is the OLDEST anchor among its sibling
+/// monitors and it is due when that anchor is older than `interval` (or
+/// missing, or any sibling is catch-up-unattempted). Due PRs are ordered
+/// oldest anchor first (PR key breaks ties), the first `cap` are kept, and
+/// EVERY active monitor on a kept PR is returned in that order — siblings
+/// share the one fetch and leave the tick with aligned `lastPolledAt`
+/// stamps, so a PR is fetched once per interval however many agents watch
+/// it and however staggered their registrations were.
 pub(crate) fn select_due_pr_monitors(
-    due: Vec<(Option<time::OffsetDateTime>, PrMonitor)>,
+    candidates: Vec<DueCandidate>,
+    now: time::OffsetDateTime,
+    interval: time::Duration,
     cap: usize,
 ) -> Vec<PrMonitor> {
-    let mut oldest: HashMap<PrKey, Option<time::OffsetDateTime>> = HashMap::new();
-    for (at, m) in &due {
-        oldest
-            .entry(pr_key(m))
-            .and_modify(|o| {
-                if *at < *o {
-                    *o = *at;
-                }
-            })
-            .or_insert(*at);
+    struct Group {
+        anchor: Option<time::OffsetDateTime>,
+        catch_up: bool,
+        monitors: Vec<PrMonitor>,
     }
-    let mut order: Vec<(Option<time::OffsetDateTime>, PrKey)> =
-        oldest.into_iter().map(|(k, at)| (at, k)).collect();
-    order.sort();
-    let keep: HashSet<PrKey> = order.into_iter().take(cap).map(|(_, k)| k).collect();
+    let mut index: HashMap<PrKey, usize> = HashMap::new();
+    let mut groups: Vec<(PrKey, Group)> = Vec::new();
+    for c in candidates {
+        let key = pr_key(&c.monitor);
+        if let Some(&i) = index.get(&key) {
+            let group = &mut groups[i].1;
+            if c.anchor < group.anchor {
+                group.anchor = c.anchor;
+            }
+            group.catch_up |= c.catch_up;
+            group.monitors.push(c.monitor);
+        } else {
+            index.insert(key.clone(), groups.len());
+            groups.push((
+                key,
+                Group {
+                    anchor: c.anchor,
+                    catch_up: c.catch_up,
+                    monitors: vec![c.monitor],
+                },
+            ));
+        }
+    }
+    let mut due: Vec<(Option<time::OffsetDateTime>, PrKey, Vec<PrMonitor>)> = groups
+        .into_iter()
+        .filter(|(_, g)| g.catch_up || g.anchor.is_none_or(|at| now - at >= interval))
+        .map(|(key, g)| (g.anchor, key, g.monitors))
+        .collect();
+    due.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
     due.into_iter()
-        .filter(|(_, m)| keep.contains(&pr_key(m)))
-        .map(|(_, m)| m)
+        .take(cap)
+        .flat_map(|(_, _, monitors)| monitors)
         .collect()
 }
 
@@ -185,11 +229,15 @@ pub(crate) const PR_MONITOR_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const PR_MONITOR_DEBOUNCE_MAX_WAIT_FACTOR: i32 = 5;
 
 /// Monitors whose next poll must deliver WITHOUT waiting out the debounce
-/// window: populated by boot rehydration so a baseline that moved (or a
-/// pending emit that was persisted but never delivered) while the daemon was
-/// down fires immediately. Shared across [`Services`] clones; an entry is
-/// consumed by the first poll that acts on it.
-pub(crate) type PrMonitorCatchUp = Arc<Mutex<HashSet<PrMonitorId>>>;
+/// window, keyed to the instant they were marked: populated by boot
+/// rehydration so a baseline that moved (or a pending emit that was persisted
+/// but never delivered) while the daemon was down fires immediately. Shared
+/// across [`Services`] clones; an entry is consumed by the first poll that
+/// acts on it. The mark time lets the due-sweep exempt a monitor from the
+/// freshness check only until its first post-restart ATTEMPT
+/// ([`catch_up_unattempted`]), so a failing fetch cannot keep it perpetually
+/// due and starve the rotation.
+pub(crate) type PrMonitorCatchUp = Arc<Mutex<HashMap<PrMonitorId, time::OffsetDateTime>>>;
 
 /// The diffable state of one monitored PR: the merge-requirements checklist
 /// plus the identity/comment-count fields the checklist itself does not
@@ -1250,13 +1298,15 @@ impl Services {
     }
 
     /// The loop-driven sweep: like [`Self::poll_pr_monitors`] but skips
-    /// monitors whose `lastPolledAt` is fresher than the **effective** poll
-    /// interval — typically a monitor that was just registered or
-    /// re-registered, whose registration fetch already stamped a current
-    /// baseline — and fetches at most [`pr_monitor_fetches_per_tick`]
-    /// distinct due PRs, oldest `lastPolledAt` first, so the rest roll over
-    /// to later ticks. Catch-up-marked monitors (boot rehydration) are never
-    /// skipped for freshness and sort first.
+    /// PRs whose oldest sibling `lastPolledAt` is fresher than the
+    /// **effective** poll interval — typically a PR whose monitor was just
+    /// registered or re-registered, whose registration fetch already stamped
+    /// a current baseline — and fetches at most
+    /// [`pr_monitor_fetches_per_tick`] distinct due PRs, oldest
+    /// `lastPolledAt` first, so the rest roll over to later ticks. A due PR
+    /// polls EVERY sibling monitor on it. Catch-up-marked monitors (boot
+    /// rehydration) skip the freshness check for their first post-restart
+    /// attempt and sort first.
     ///
     /// `pub` for the same reason as [`Self::poll_pr_monitors`]: integration
     /// tests drive one deterministic due-sweep instead of racing the loop's
@@ -1351,9 +1401,9 @@ impl Services {
     }
 
     /// The due-sweep selection: compute the effective per-PR interval from
-    /// the distinct active PR count (siblings on one PR count once), drop
-    /// monitors polled within it, then keep the oldest-polled distinct PRs
-    /// up to this tick's fetch cap ([`select_due_pr_monitors`]).
+    /// the distinct active PR count (siblings on one PR count once), then
+    /// keep the oldest-polled due PRs — every sibling monitor included — up
+    /// to this tick's fetch cap ([`select_due_pr_monitors`]).
     fn select_due_pr_monitors(&self, monitors: Vec<PrMonitor>) -> Vec<PrMonitor> {
         let distinct_prs = monitors.iter().map(pr_key).collect::<HashSet<_>>().len();
         let poll_secs = self.pr_monitor_poll_interval().as_secs();
@@ -1366,18 +1416,18 @@ impl Services {
         let interval = time::Duration::seconds(effective_secs.cast_signed());
         let now = time::OffsetDateTime::now_utc();
         let catch_up = self.pr_monitor_catch_up.lock().unwrap().clone();
-        let due = monitors
+        let candidates = monitors
             .into_iter()
-            .filter_map(|monitor| {
-                let anchor = pr_monitor_poll_anchor(&monitor, &catch_up);
-                match anchor {
-                    Some(at) if now - at < interval => None,
-                    anchor => Some((anchor, monitor)),
-                }
+            .map(|monitor| DueCandidate {
+                anchor: monitor.last_polled_at.as_deref().and_then(parse_iso),
+                catch_up: catch_up_unattempted(&monitor, &catch_up),
+                monitor,
             })
             .collect();
         select_due_pr_monitors(
-            due,
+            candidates,
+            now,
+            interval,
             pr_monitor_fetches_per_tick(distinct_prs, poll_secs, effective_secs),
         )
     }
@@ -1453,7 +1503,7 @@ impl Services {
             .pr_monitor_catch_up
             .lock()
             .unwrap()
-            .contains(&monitor.monitor_id);
+            .contains_key(&monitor.monitor_id);
 
         let now = now_iso();
         // Anchors: `pending_since` marks when the coalesced set first became
@@ -1858,7 +1908,7 @@ impl Services {
             self.pr_monitor_catch_up
                 .lock()
                 .unwrap()
-                .insert(monitor.monitor_id.clone());
+                .insert(monitor.monitor_id.clone(), time::OffsetDateTime::now_utc());
             resumed += 1;
         }
         Ok(resumed)
@@ -4374,10 +4424,43 @@ mod tests {
             .unwrap());
     }
 
+    /// Simulate `secs` of wall-clock passing for the due-sweep: shift every
+    /// active monitor's `lastPolledAt` back by that much (a missing stamp
+    /// stays missing).
+    async fn age_all(svc: &Services, secs: i64) {
+        for row in svc.store().load_active_pr_monitors().await.unwrap() {
+            let Some(at) = row.last_polled_at.as_deref().and_then(parse_iso) else {
+                continue;
+            };
+            let aged = (at - time::Duration::seconds(secs))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            assert!(svc
+                .store()
+                .update_pr_monitor_poll(
+                    &row.monitor_id,
+                    PrMonitorPollUpdate {
+                        last_snapshot: row.last_snapshot.as_deref(),
+                        baseline_snapshot: row.baseline_snapshot.as_deref(),
+                        pending_changes: &row.pending_changes,
+                        pending_since: row.pending_since.as_deref(),
+                        last_change_at: row.last_change_at.as_deref(),
+                        last_polled_at: Some(&aged),
+                        last_error: row.last_error.as_deref(),
+                        updated_at: &now_iso(),
+                        expected_updated_at: &row.updated_at,
+                    },
+                )
+                .await
+                .unwrap());
+        }
+    }
+
     /// Ten distinct PRs at the defaults stretch the interval to 72s, so one
     /// tick fetches only ceil(10 × 30 / 72) = 5 PRs — the five with the
-    /// oldest `lastPolledAt`, regardless of registration order — and
-    /// successive ticks rotate through the rest before any PR repeats.
+    /// oldest `lastPolledAt`, in strictly oldest-first forge-call order and
+    /// regardless of registration order — and successive ticks rotate
+    /// through the rest before any PR repeats.
     #[tokio::test]
     async fn due_sweep_fetches_the_oldest_capped_subset_and_rotates() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
@@ -4398,20 +4481,90 @@ mod tests {
         forge.take_fetched_numbers();
 
         svc.poll_due_pr_monitors().await;
-        let mut first = forge.take_fetched_numbers();
-        first.sort_unstable();
-        assert_eq!(first, vec![6, 7, 8, 9, 10], "oldest five PRs first");
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![10, 9, 8, 7, 6],
+            "oldest five PRs first, oldest-first call order"
+        );
 
         svc.poll_due_pr_monitors().await;
-        let mut second = forge.take_fetched_numbers();
-        second.sort_unstable();
-        assert_eq!(second, vec![1, 2, 3, 4, 5], "the rest on the next tick");
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![5, 4, 3, 2, 1],
+            "the rest on the next tick, oldest-first call order"
+        );
 
         // Every PR was polled once within the effective interval, so the
         // next tick has nothing due — no PR is fetched twice before all
         // were fetched once.
         svc.poll_due_pr_monitors().await;
         assert!(forge.take_fetched_numbers().is_empty(), "all fresh");
+    }
+
+    /// Catch-up markers (boot rehydration) exempt a monitor from the
+    /// freshness check only until its first post-restart ATTEMPT: when the
+    /// forge is down the marked set still rotates through the cap oldest
+    /// first, a failed attempt rejoins the normal cadence instead of staying
+    /// perpetually due, and the marker itself survives until a successful
+    /// poll consumes it.
+    #[tokio::test]
+    async fn catch_up_rotation_rate_limits_failed_attempts() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitors_max_per_agent(20)
+            .with_pr_monitor_poll_seconds(30)
+            .with_pr_monitor_hourly_request_budget(1500);
+        let mut ids = Vec::new();
+        for pr in 1..=10_u64 {
+            let (m, _) = svc
+                .pr_monitor_register(&ws, &owner, "o", "r", pr)
+                .await
+                .expect("register");
+            backdate(
+                &svc,
+                &m.monitor_id,
+                &format!("2020-01-01T00:00:{:02}Z", 10 - pr),
+            )
+            .await;
+            ids.push(m.monitor_id);
+        }
+        forge.take_fetched_numbers();
+        forge.edit(|s| s.fail_get_pr = true);
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 10);
+        let marked = || svc.pr_monitor_catch_up.lock().unwrap().len();
+        assert_eq!(marked(), 10);
+
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![10, 9, 8, 7, 6],
+            "catch-up attempts rotate oldest first under the cap"
+        );
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![5, 4, 3, 2, 1],
+            "the rest are attempted before any PR is retried"
+        );
+        // Every attempt failed and stamped `lastPolledAt`: nothing is due
+        // again inside the effective interval, so the failing forge is not
+        // hammered — but the markers survive for the eventual delivery.
+        svc.poll_due_pr_monitors().await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "failed attempts are rate-limited"
+        );
+        assert_eq!(marked(), 10, "markers survive failed attempts");
+
+        // Forge back: the next due tick delivers and consumes the markers
+        // of the PRs it reached.
+        forge.edit(|s| s.fail_get_pr = false);
+        for (i, id) in ids.iter().enumerate() {
+            backdate(&svc, id, &format!("2020-01-01T00:00:{:02}Z", 9 - i)).await;
+        }
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(forge.take_fetched_numbers(), vec![10, 9, 8, 7, 6]);
+        assert_eq!(marked(), 5, "successful polls consume their markers");
     }
 
     /// Sibling monitors on one PR count once toward the effective interval
@@ -4442,14 +4595,88 @@ mod tests {
         // 8 monitors, 4 distinct PRs: not stretched (4 × 3 × 3600 / 1500 =
         // 28.8 < 30), so the cap is 4 and every PR is fetched exactly once.
         svc.poll_due_pr_monitors().await;
-        let mut fetched = forge.take_fetched_numbers();
-        fetched.sort_unstable();
-        assert_eq!(fetched, vec![1, 2, 3, 4], "one fetch per distinct PR");
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![1, 2, 3, 4],
+            "one fetch per distinct PR, PR key breaks the anchor tie"
+        );
     }
 
-    /// The pure selection helper: oldest anchor first per distinct PR, a
-    /// `None` anchor (never polled / catch-up) sorts oldest, and every
-    /// monitor on a kept PR is returned so siblings share one fetch.
+    /// Staggered siblings: two agents watching the same ten PRs, one
+    /// sibling stale and the other fresh. A due PR polls BOTH siblings off
+    /// the one fetch (aligning their `lastPolledAt`), so over a simulated
+    /// stretch the distinct-PR fetch count stays within the hourly budget —
+    /// per-monitor freshness would have polled the two siblings on separate
+    /// ticks and spent twice the budget.
+    #[tokio::test]
+    async fn staggered_siblings_share_fetches_and_respect_the_budget() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitors_max_per_agent(20)
+            .with_pr_monitor_poll_seconds(30)
+            .with_pr_monitor_hourly_request_budget(1500);
+        let sibling = AgentId::from("agent-prmon-sibling");
+        svc.store()
+            .insert_agent_session(&agent(&ws, "agent-prmon-sibling"))
+            .await
+            .expect("sibling agent");
+        let fresh_stamp = (time::OffsetDateTime::now_utc() - time::Duration::seconds(50))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        for pr in 1..=10_u64 {
+            let (stale, _) = svc
+                .pr_monitor_register(&ws, &owner, "o", "r", pr)
+                .await
+                .expect("register");
+            backdate(
+                &svc,
+                &stale.monitor_id,
+                &format!("2020-01-01T00:00:{:02}Z", 10 - pr),
+            )
+            .await;
+            let (fresh, _) = svc
+                .pr_monitor_register(&ws, &sibling, "o", "r", pr)
+                .await
+                .expect("register sibling");
+            backdate(&svc, &fresh.monitor_id, &fresh_stamp).await;
+        }
+        forge.take_fetched_numbers();
+        let started = time::OffsetDateTime::now_utc();
+
+        // 10 distinct PRs → 72s effective interval, cap 5 per tick. The
+        // first tick reaches the five stalest PRs and stamps BOTH siblings.
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(forge.take_fetched_numbers(), vec![10, 9, 8, 7, 6]);
+        for row in svc.store().load_active_pr_monitors().await.unwrap() {
+            let polled_at = row.last_polled_at.as_deref().and_then(parse_iso).unwrap();
+            if row.pr_number >= 6 {
+                assert!(polled_at >= started, "PR {} sibling stamped", row.pr_number);
+            } else {
+                assert!(polled_at < started, "PR {} untouched", row.pr_number);
+            }
+        }
+
+        // Eight more ticks 30s apart (4.5 simulated minutes in total): the
+        // budget allows 1500 × 4.5 / 60 = 112 REST calls = 37 fetches.
+        let mut fetches = 5;
+        for _ in 0..8 {
+            age_all(&svc, 30).await;
+            svc.poll_due_pr_monitors().await;
+            fetches += forge.take_fetched_numbers().len();
+        }
+        let per_poll = usize::try_from(PR_MONITOR_REQUESTS_PER_POLL).unwrap();
+        assert!(
+            fetches * per_poll <= 1500 * 9 * 30 / 3600,
+            "{fetches} fetches over 9 ticks exceed the hourly budget"
+        );
+    }
+
+    /// The pure selection helper: PRs are grouped across siblings (oldest
+    /// sibling anchor wins, a `None` anchor sorts oldest), a PR whose only
+    /// stale sibling is fresh but catch-up-unattempted is still due, fresh
+    /// PRs are skipped, due PRs are ordered oldest anchor then PR key, the
+    /// first `cap` are kept, and every monitor on a kept PR is returned in
+    /// that order so siblings share one fetch.
     #[test]
     fn select_due_pr_monitors_orders_by_oldest_anchor_and_keeps_siblings() {
         let mk = |pr: i64| PrMonitor {
@@ -4470,24 +4697,41 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
         };
+        let now = time::OffsetDateTime::from_unix_timestamp(1_600_000_100).unwrap();
         let at = |secs: i64| {
             Some(time::OffsetDateTime::from_unix_timestamp(1_600_000_000 + secs).unwrap())
         };
-        assert!(select_due_pr_monitors(vec![], 1).is_empty());
-        let due = vec![
-            (at(30), mk(1)),
-            (at(10), mk(2)),
-            (at(20), mk(3)),
-            // A sibling on PR 3 whose own anchor is the oldest of all:
-            // it drags PR 3 to the front, and both PR-3 monitors come along.
-            (at(0), mk(3)),
-            (None, mk(4)),
+        let candidate = |anchor, catch_up, pr| DueCandidate {
+            anchor,
+            catch_up,
+            monitor: mk(pr),
+        };
+        let interval = time::Duration::seconds(60);
+        assert!(select_due_pr_monitors(vec![], now, interval, 1).is_empty());
+        let candidates = vec![
+            candidate(at(30), false, 1),
+            candidate(at(10), false, 2),
+            // PR 3: a fresh sibling (20s old) plus a sibling whose own
+            // anchor is the oldest of all — it drags PR 3 to the front and
+            // both PR-3 monitors come along.
+            candidate(at(80), false, 3),
+            candidate(at(0), false, 3),
+            candidate(None, false, 4),
+            // PR 5 is fresh but catch-up-unattempted: due regardless.
+            candidate(at(90), true, 5),
+            // PR 6 is fresh: skipped.
+            candidate(at(90), false, 6),
+            // PR 7 ties PR 2's anchor: the PR key breaks the tie.
+            candidate(at(10), false, 7),
         ];
-        let kept: Vec<i64> = select_due_pr_monitors(due, 2)
-            .into_iter()
-            .map(|m| m.pr_number)
-            .collect();
-        assert_eq!(kept, vec![3, 3, 4]);
+        let kept = |cap| -> Vec<i64> {
+            select_due_pr_monitors(candidates.clone(), now, interval, cap)
+                .into_iter()
+                .map(|m| m.pr_number)
+                .collect()
+        };
+        assert_eq!(kept(2), vec![4, 3, 3]);
+        assert_eq!(kept(usize::MAX), vec![4, 3, 3, 2, 7, 1, 5]);
     }
 
     #[tokio::test]

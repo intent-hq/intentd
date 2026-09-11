@@ -1229,7 +1229,7 @@ impl Services {
             hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
             suspend_tracker: None,
-            pr_monitor_catch_up: Arc::new(Mutex::new(HashSet::new())),
+            pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
             pr_monitor_poll_seconds: None,
             pr_monitor_hourly_request_budget: None,
             pr_monitor_logged_interval: Arc::new(Mutex::new(None)),
