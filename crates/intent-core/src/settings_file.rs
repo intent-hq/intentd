@@ -38,13 +38,14 @@ use crate::config::{
     ACP_NODE_MAX_OLD_SPACE_MB_MAX, ACP_NODE_MAX_OLD_SPACE_MB_MIN,
     DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS, DEFAULT_HOOKS_MAX_PER_AGENT,
     DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS, DEFAULT_MAX_TOP_LEVEL_AGENTS,
-    DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_POLL_SECONDS,
-    DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
-    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
-    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
-    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
-    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
-    MAX_CONCURRENT_ADAPTERS_LIMIT, TOOL_PAYLOAD_RETENTION_DAYS_MAX,
+    DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
+    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, DEFAULT_WAKE_RESUME_ENABLED,
+    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
+    DEFAULT_WORKSPACE_API_TOON_OUTPUT, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
+    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN, MAX_CONCURRENT_ADAPTERS_LIMIT,
+    TOOL_PAYLOAD_RETENTION_DAYS_MAX,
 };
 use crate::error::{Error, Result};
 
@@ -998,7 +999,7 @@ impl Default for WakeResumeSettings {
     }
 }
 
-/// `[prMonitor]` — centralized PR-monitor loop knobs (`prMonitor.*`). Both
+/// `[prMonitor]` — centralized PR-monitor loop knobs (`prMonitor.*`). All
 /// values are read live by the monitor loop, so a change applies without a
 /// daemon restart; sub-floor values are clamped at read time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1007,9 +1008,17 @@ pub struct PrMonitorSettings {
     /// `prMonitor.debounceSeconds` — quiet window a changed PR must observe
     /// before its consolidated wake is delivered.
     pub debounce_seconds: u64,
-    /// `prMonitor.pollSeconds` — poll cadence for the centralized monitor
-    /// loop (config-file key; not exposed in the Settings UI).
+    /// `prMonitor.pollSeconds` — tick cadence of the centralized monitor
+    /// loop and the per-PR poll interval floor (config-file key; not exposed
+    /// in the Settings UI).
     pub poll_seconds: u64,
+    /// `prMonitor.hourlyRequestBudget` — the forge REST calls per hour the
+    /// loop plans to spend across every monitored PR. A cadence cost model,
+    /// not an enforced ceiling: the per-PR interval stretches above
+    /// `pollSeconds` once the monitored-PR count would exceed it, but no
+    /// request is counted or blocked against it (config-file key; not
+    /// exposed in the Settings UI).
+    pub hourly_request_budget: u64,
 }
 
 impl Default for PrMonitorSettings {
@@ -1017,6 +1026,7 @@ impl Default for PrMonitorSettings {
         Self {
             debounce_seconds: DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
             poll_seconds: DEFAULT_PR_MONITOR_POLL_SECONDS,
+            hourly_request_budget: DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
         }
     }
 }
@@ -1763,9 +1773,16 @@ thresholdSeconds = 10
 # PR monitor debounce seconds -- quiet window (in seconds) a changed PR must
 # observe before its consolidated wake is delivered (minimum 10).
 debounceSeconds = 60
-# PR monitor poll seconds -- how often (in seconds) the centralized loop polls
-# each monitored PR (minimum 10).
+# PR monitor poll seconds -- tick cadence (in seconds) of the centralized loop
+# and the per-PR poll interval floor (minimum 10).
 pollSeconds = 30
+# PR monitor hourly request budget -- forge REST calls per hour the loop
+# plans to spend across all monitored PRs. A cadence cost model, not a hard
+# ceiling: each PR poll is costed at 3 calls (a single-page estimate), so the
+# per-PR interval stretches above pollSeconds once PRs x 3 x 3600 / budget
+# exceeds it; requests are not counted or blocked against it (minimum 60,
+# maximum 5000).
+hourlyRequestBudget = 1500
 "#;
 
 #[cfg(test)]
@@ -2634,6 +2651,10 @@ mod tests {
             parsed.pr_monitor.poll_seconds,
             DEFAULT_PR_MONITOR_POLL_SECONDS
         );
+        assert_eq!(
+            parsed.pr_monitor.hourly_request_budget,
+            DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET
+        );
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[prMonitor]"));
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
         assert_eq!(templated.pr_monitor, parsed.pr_monitor);
@@ -2911,12 +2932,13 @@ mod tests {
     #[test]
     fn pr_monitor_explicit_override_parses() {
         let parsed = SettingsFile::parse_str(
-            "[agentFeatures]\nprMonitor = false\n\n[prMonitor]\ndebounceSeconds = 15\npollSeconds = 90\n",
+            "[agentFeatures]\nprMonitor = false\n\n[prMonitor]\ndebounceSeconds = 15\npollSeconds = 90\nhourlyRequestBudget = 500\n",
         )
         .expect("override parses");
         assert!(!parsed.agent_features.pr_monitor);
         assert_eq!(parsed.pr_monitor.debounce_seconds, 15);
         assert_eq!(parsed.pr_monitor.poll_seconds, 90);
+        assert_eq!(parsed.pr_monitor.hourly_request_budget, 500);
     }
 
     #[test]

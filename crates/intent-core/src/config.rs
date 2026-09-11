@@ -135,6 +135,33 @@ pub const DEFAULT_PR_MONITOR_POLL_SECONDS: u64 = 30;
 /// forge. Sub-minimum values (notably `0`) are clamped up at read time.
 pub const MIN_PR_MONITOR_POLL_SECONDS: u64 = 10;
 
+/// Default for `prMonitor.hourlyRequestBudget` — the forge REST calls per
+/// hour the centralized PR-monitor loop plans to spend across every
+/// monitored PR. This is a **cadence cost model**, not a hard ceiling: the
+/// loop does not count or block requests against it; it derives the per-PR
+/// poll interval from it, costing each distinct-PR poll
+/// `PR_MONITOR_REQUESTS_PER_POLL` (3) steady-state REST calls and stretching
+/// the interval above `pollSeconds` once `distinct PRs × 3 × 3600 / budget`
+/// exceeds it. Actual spend can differ from the model (the 3-call unit is a
+/// single-page estimate — multi-page review lists and degraded-path REST
+/// fallbacks cost more; GraphQL reads ride their own quota); the shared
+/// rate-limit gate is the backstop for genuine quota exhaustion. 1500/h is
+/// ~30% of GitHub's
+/// 5,000/h authenticated core quota, leaving headroom for the PR-refresh
+/// sweep and agents' own `gh` use.
+pub const DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 1500;
+
+/// Floor for `prMonitor.hourlyRequestBudget` (one call per minute). Sub-floor
+/// values (notably `0`, which would divide by zero) are clamped up at read
+/// time.
+pub const MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 60;
+
+/// Ceiling for `prMonitor.hourlyRequestBudget` — GitHub's authenticated core
+/// quota; a larger model would plan more polling than the forge can serve.
+/// Over-ceiling values are clamped down at read time, mirroring the floor
+/// (the settings catalog also rejects them up front).
+pub const MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 5000;
+
 /// Default quiet window a changed PR must observe before its consolidated
 /// wake is delivered (`prMonitor.debounceSeconds`).
 pub const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;

@@ -127,6 +127,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.mcpTools",
     "prMonitor.debounceSeconds",
     "prMonitor.pollSeconds",
+    "prMonitor.hourlyRequestBudget",
 ];
 
 /// Where a key's effective value comes from (lowest to highest precedence).

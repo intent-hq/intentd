@@ -1713,11 +1713,20 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "prMonitor.pollSeconds",
             "PR monitor poll seconds",
-            "How often (in seconds) the centralized loop polls each monitored PR (minimum 10)",
+            "Tick cadence (in seconds) of the centralized loop and the per-PR poll interval floor (minimum 10)",
             "prMonitor",
             Some(10.0),
             Some(3_600.0),
             30.0,
+        ),
+        number(
+            "prMonitor.hourlyRequestBudget",
+            "PR monitor hourly request budget",
+            "Forge REST calls per hour the centralized loop plans to spend across all monitored PRs — a cadence cost model, not a hard ceiling: each PR poll is costed at 3 calls (a single-page estimate; paginated review lists and REST fallbacks cost more), so the per-PR interval stretches above pollSeconds once PRs × 3 × 3600 / budget exceeds it; requests are not counted or blocked against it. 1500 is ~30% of GitHub's 5,000/h core quota (minimum 60, maximum 5000)",
+            "prMonitor",
+            Some(60.0),
+            Some(5_000.0),
+            1_500.0,
         ),
     ]
 }
@@ -4092,33 +4101,56 @@ mod tests {
         );
     }
 
-    /// `[prMonitor]` exposes two TOML-backed numbers with a floor of 10:
-    /// `debounceSeconds` (default 60) and `pollSeconds` (default 30, a
-    /// config-file key the Settings UI does not surface). Both round-trip
-    /// through the registry-wired service and reject sub-floor values.
+    /// `[prMonitor]` exposes three TOML-backed numbers: `debounceSeconds`
+    /// (default 60, floor 10), `pollSeconds` (default 30, floor 10) and
+    /// `hourlyRequestBudget` (default 1500, floor 60, max 5000) — the latter
+    /// two are config-file keys the Settings UI does not surface. All
+    /// round-trip through the registry-wired service and reject sub-floor
+    /// values.
     #[tokio::test]
     async fn pr_monitor_intervals_round_trip_via_registry() {
-        for (path, default) in [
-            ("prMonitor.debounceSeconds", 60.0),
-            ("prMonitor.pollSeconds", 30.0),
+        for (path, default, floor) in [
+            ("prMonitor.debounceSeconds", 60.0, 10.0),
+            ("prMonitor.pollSeconds", 30.0, 10.0),
+            ("prMonitor.hourlyRequestBudget", 1500.0, 60.0),
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");
             assert!(!def.read_only, "{path} must not be read-only");
             assert_eq!(def.category, "prMonitor");
+            let SettingType::Number { min, .. } = def.ty else {
+                panic!("{path} must be a number setting");
+            };
             assert!(
-                matches!(
-                    def.ty,
-                    SettingType::Number {
-                        min: Some(10.0),
-                        ..
-                    }
-                ),
-                "{path} number with a floor of 10"
+                min.is_some_and(|m| (m - floor).abs() < f64::EPSILON),
+                "{path} floor must be {floor}, got {min:?}"
             );
             assert_eq!(def.default_value, Some(json!(default)), "{path} default");
             assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
         }
+        assert!(
+            matches!(
+                find_definition("prMonitor.hourlyRequestBudget").unwrap().ty,
+                SettingType::Number {
+                    max: Some(5000.0),
+                    ..
+                }
+            ),
+            "hourlyRequestBudget caps at 5000"
+        );
+        // The catalog range and the read-time clamp constants must agree.
+        assert_eq!(
+            intent_core::config::MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            60
+        );
+        assert_eq!(
+            intent_core::config::MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            5000
+        );
+        assert_eq!(
+            intent_core::config::DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            1500
+        );
 
         let tag = uuid::Uuid::new_v4();
         let tmp = std::env::temp_dir().join(format!("intentd-settings-prmon-{tag}.db"));
@@ -4133,6 +4165,7 @@ mod tests {
         for (path, default) in [
             ("prMonitor.debounceSeconds", 60.0),
             ("prMonitor.pollSeconds", 30.0),
+            ("prMonitor.hourlyRequestBudget", 1500.0),
         ] {
             let got = svc.get(path).await.expect("get");
             assert_eq!(got["value"], json!(default), "{path} default");

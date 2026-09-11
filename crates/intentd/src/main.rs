@@ -1979,7 +1979,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // clean shutdown.
     let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(180));
     // Centralized PR-monitor loop (`ws.pr.monitor`): every `[prMonitor]
-    // pollSeconds` (read live, floor 10s), poll each active monitor, diff it
+    // pollSeconds` (read live, floor 10s), poll the due active monitors —
+    // each PR on an effective interval stretched to fit the `[prMonitor]
+    // hourlyRequestBudget` cost model (a cadence planner, not a request
+    // limiter), a capped oldest-first subset per tick — diff each
     // against its persisted baseline, and deliver one consolidated wake once
     // the PR has been quiet for the debounce window. Safe when source control
     // is unconfigured (the tick logs and returns). Aborted on clean shutdown.

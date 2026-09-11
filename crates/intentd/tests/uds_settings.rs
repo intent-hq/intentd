@@ -579,16 +579,19 @@ async fn settings_round_trip_redaction_validation_and_event() {
         assert!(e.get("sensitive").is_none(), "{path}");
     }
 
-    // `[prMonitor]` — two non-secret TOML-backed numbers with a floor of 10.
-    for (path, default) in [
-        ("prMonitor.debounceSeconds", 60.0),
-        ("prMonitor.pollSeconds", 30.0),
+    // `[prMonitor]` — three non-secret TOML-backed numbers: the two interval
+    // knobs (floor 10) and the hourly request budget (floor 60, max 5000).
+    for (path, default, min, max) in [
+        ("prMonitor.debounceSeconds", 60.0, 10.0, 86_400.0),
+        ("prMonitor.pollSeconds", 30.0, 10.0, 3_600.0),
+        ("prMonitor.hourlyRequestBudget", 1500.0, 60.0, 5_000.0),
     ] {
         let e = entry(&list, path);
         assert_eq!(e["type"], "number", "{path}");
         assert_eq!(e["value"], json!(default), "{path}");
         assert_eq!(e["category"], "prMonitor", "{path}");
-        assert_eq!(e["min"], json!(10.0), "{path}");
+        assert_eq!(e["min"], json!(min), "{path}");
+        assert_eq!(e["max"], json!(max), "{path}");
         assert!(e.get("sensitive").is_none(), "{path}");
     }
     let resp = call(
