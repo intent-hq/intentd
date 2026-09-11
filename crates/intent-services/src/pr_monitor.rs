@@ -1325,7 +1325,20 @@ impl Services {
     /// failed fetch is cached the same way and recorded on each affected
     /// monitor, so an unreachable PR costs one fetch attempt per tick, not
     /// one per monitor.
+    ///
+    /// The sweep honours the global forge rate-limit gate shared with the
+    /// PR-refresh and git-root sweeps (monorepo#2961): while the gate is
+    /// paused the tick is skipped before any forge call (no `lastError`
+    /// churn; catch-up markers survive for the post-pause sweep), and a
+    /// fetch that fails with [`Error::RateLimited`] opens the pause, records
+    /// a pause `lastError` on every monitor of that PR, and stops fetching
+    /// further PRs in this sweep — monitors not yet reached keep their
+    /// previous `lastError` and baseline.
     async fn sweep_pr_monitors(&self, skip_fresh: bool) {
+        if self.sweeps_rate_limited() {
+            tracing::debug!("pr monitor sweep: forge rate limit pause active; skipping tick");
+            return;
+        }
         let monitors = match self.store.load_active_pr_monitors().await {
             Ok(monitors) => monitors,
             Err(e) => {
@@ -1350,9 +1363,13 @@ impl Services {
         };
         let mut shared: HashMap<PrKey, std::result::Result<SharedPrSnapshot, String>> =
             HashMap::new();
+        let mut rate_limited = false;
         for monitor in monitors {
             let fetched = match shared.entry(pr_key(&monitor)) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                // The gate closed mid-sweep: PRs not fetched yet stay
+                // untouched until the pause window elapses.
+                std::collections::hash_map::Entry::Vacant(_) if rate_limited => continue,
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
                     // The timeout is defense in depth above the client-level
@@ -1369,6 +1386,17 @@ impl Services {
                     )
                     .await
                     {
+                        Ok(Err(Error::RateLimited(detail))) => {
+                            self.pause_sweeps_for_rate_limit(&sc, &detail).await;
+                            rate_limited = true;
+                            let pause_secs = self
+                                .sweep_rate_limit
+                                .paused_remaining()
+                                .map_or(0, |d| d.as_secs());
+                            Err(format!(
+                                "rate limited; PR monitor polling paused for ~{pause_secs}s"
+                            ))
+                        }
                         Ok(result) => result.map_err(|e| e.to_string()),
                         Err(_) => Err(format!(
                             "PR fetch timed out after {:?}",
@@ -2289,6 +2317,8 @@ mod tests {
         fail_get_pr: bool,
         fail_list_comments: bool,
         fail_merge_requirements: bool,
+        /// `get_pr` fails with the forge's quota-exhausted error.
+        rate_limit_get_pr: bool,
         /// PR number whose `get_pr` pends forever (hung-connection regression).
         hang_get_pr: Option<u64>,
     }
@@ -2314,6 +2344,7 @@ mod tests {
                 fail_get_pr: false,
                 fail_list_comments: false,
                 fail_merge_requirements: false,
+                rate_limit_get_pr: false,
                 hang_get_pr: None,
             }
         }
@@ -2433,6 +2464,11 @@ mod tests {
             if s.fail_get_pr {
                 return Err(intent_sourcecontrol::Error::Unsupported(
                     "forge down".into(),
+                ));
+            }
+            if s.rate_limit_get_pr {
+                return Err(intent_sourcecontrol::Error::RateLimited(
+                    "API rate limit exceeded".into(),
                 ));
             }
             Ok(PullRequest {
@@ -4567,6 +4603,92 @@ mod tests {
         assert_eq!(marked(), 5, "successful polls consume their markers");
     }
 
+    /// A forge fetch failing with the quota-exhausted error pauses the
+    /// global sweep rate-limit gate (monorepo#2961): the sweep stops
+    /// fetching further PRs, every monitor of the rate-limited PR records
+    /// the pause as `lastError` while monitors not yet reached keep their
+    /// previous row, later sweeps make zero forge calls while paused, and
+    /// the first successful post-pause poll clears the error.
+    #[tokio::test]
+    async fn a_rate_limited_fetch_pauses_the_gate_and_skips_the_rest_of_the_sweep() {
+        async fn last_error(svc: &Services, id: &PrMonitorId) -> Option<String> {
+            svc.store().get_pr_monitor(id).await.unwrap().last_error
+        }
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitor_poll_seconds(30)
+            .with_pr_monitor_hourly_request_budget(1500);
+        let sibling = AgentId::from("agent-prmon-sibling");
+        svc.store()
+            .insert_agent_session(&agent(&ws, "agent-prmon-sibling"))
+            .await
+            .expect("sibling agent");
+        let mut ids = Vec::new();
+        for (pr, who) in [(1_u64, &owner), (1, &sibling), (2, &owner), (3, &owner)] {
+            let (m, _) = svc
+                .pr_monitor_register(&ws, who, "o", "r", pr)
+                .await
+                .expect("register");
+            backdate(&svc, &m.monitor_id, &format!("2020-01-01T00:00:0{pr}Z")).await;
+            ids.push(m.monitor_id);
+        }
+        forge.take_fetched_numbers();
+
+        forge.edit(|s| s.rate_limit_get_pr = true);
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![1],
+            "the sweep stops at the rate-limited PR"
+        );
+        assert!(
+            svc.sweep_rate_limit.paused_remaining().is_some(),
+            "the global gate is paused"
+        );
+        for id in &ids[..2] {
+            let error = last_error(&svc, id).await;
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("rate limited; PR monitor polling paused for ~")),
+                "both monitors on the rate-limited PR record the pause: {error:?}"
+            );
+        }
+        for id in &ids[2..] {
+            assert_eq!(
+                last_error(&svc, id).await,
+                None,
+                "monitors not reached keep their previous row"
+            );
+        }
+
+        // While paused, sweeps skip the forge entirely — even a due sweep
+        // over backdated rows, and even once the forge would answer again.
+        svc.poll_due_pr_monitors().await;
+        svc.poll_pr_monitors().await;
+        forge.edit(|s| s.rate_limit_get_pr = false);
+        svc.poll_due_pr_monitors().await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "no forge calls while the gate is paused"
+        );
+        assert!(
+            last_error(&svc, &ids[0]).await.is_some(),
+            "the pause error is recorded once and stays until a poll succeeds"
+        );
+
+        // Pause window over: polling resumes and the first successful poll
+        // clears the pause error.
+        svc.sweep_rate_limit.clear();
+        svc.poll_pr_monitors().await;
+        let mut fetched = forge.take_fetched_numbers();
+        fetched.sort_unstable();
+        assert_eq!(fetched, vec![1, 2, 3]);
+        for id in &ids {
+            assert_eq!(last_error(&svc, id).await, None);
+        }
+    }
+
     /// Sibling monitors on one PR count once toward the effective interval
     /// and share the one fetch: two agents each watching the same four PRs
     /// keep the configured 30s cadence and one tick fetches all four.
@@ -4750,6 +4872,10 @@ mod tests {
         assert_eq!(failed.state, PrMonitorState::Active, "the loop survives");
         assert!(failed.last_error.is_some(), "error recorded");
         assert_eq!(failed.last_snapshot, baseline, "baseline untouched");
+        assert!(
+            svc.sweep_rate_limit.paused_remaining().is_none(),
+            "an ordinary forge error never pauses the rate-limit gate"
+        );
 
         // Recovery clears the error and resumes diffing from that baseline.
         forge.edit(|s| {

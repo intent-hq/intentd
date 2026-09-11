@@ -1029,8 +1029,9 @@ pub struct Services {
     pr_refresh_fetch_timeout: std::time::Duration,
     /// Global forge rate-limit pause gate for the background sweeps
     /// (monorepo#2961): after a sweep forge call fails with
-    /// [`Error::RateLimited`], every forge-touching sweep — PR refresh and
-    /// git-root refresh alike, across all workspaces — is skipped until the
+    /// [`Error::RateLimited`], every forge-touching sweep — PR refresh,
+    /// git-root refresh and PR-monitor polling alike, across all
+    /// workspaces — is skipped until the
     /// quota window resets (honoring the forge-reported reset timestamp,
     /// else a fixed fallback), and the condition is logged once per pause
     /// window instead of once per root/workspace per tick. Shared across
@@ -4345,7 +4346,7 @@ impl Services {
                 pause_secs = pause.as_secs(),
                 reset_unix,
                 detail,
-                "forge rate limit hit: pausing pr refresh + git root sweeps globally"
+                "forge rate limit hit: pausing pr refresh, git root + pr monitor sweeps globally"
             );
         }
     }

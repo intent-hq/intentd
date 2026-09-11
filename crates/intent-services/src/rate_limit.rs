@@ -1,8 +1,8 @@
 //! Global forge rate-limit pause gate for the background sweeps
 //! (monorepo#2961).
 //!
-//! When the PR-refresh sweep or the git-root sweep hits a forge rate limit
-//! (REST 403/429 with an exhausted quota, surfaced as
+//! When the PR-refresh sweep, the git-root sweep or the PR-monitor sweep
+//! hits a forge rate limit (REST 403/429 with an exhausted quota, surfaced as
 //! [`intent_core::Error::RateLimited`]), continuing to call the forge for
 //! every remaining root/workspace on every tick both spams WARN logs (one
 //! per root per tick, masking real failures) and burns the freshly-reset
@@ -86,6 +86,13 @@ impl RateLimitGate {
                 true
             }
         }
+    }
+
+    /// Re-open the gate immediately (tests simulate the pause window
+    /// elapsing without waiting out the minimum pause).
+    #[cfg(test)]
+    pub(crate) fn clear(&self) {
+        *self.paused_until.lock().expect("gate lock") = None;
     }
 }
 
