@@ -173,21 +173,21 @@ that contract:
 
 ## Gates — keep them green
 
-Before opening a submodule PR (and before bumping the monorepo gitlink), all three of the
-following must pass in `packages/intentd`:
+Before opening a submodule PR (and before bumping the monorepo gitlink), the gates must
+pass. Run them from the monorepo root via the top-level `Makefile`:
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test
+make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
+make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
+make gate     # check, then test
 ```
 
-From the monorepo root the same gates are exposed via the top-level `Makefile`:
-
-```bash
-make check    # fmt + clippy against packages/intentd
-make test     # cargo test against packages/intentd
-```
+The raw equivalents in `packages/intentd` are `cargo fmt --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo nextest run --workspace --show-progress none`. Saved `ws.script` runs are
+PTY-backed, so raw invocations need `CARGO_TERM_PROGRESS_WHEN=never` in the
+environment (all three) and `--show-progress none` on the nextest command (the `make`
+targets already set both) or progress-bar redraws flood the output buffer.
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.
