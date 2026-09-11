@@ -4789,6 +4789,294 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
     );
 }
 
+/// Agent attention requests over WSS — a user-typed `agent.queueMessage`
+/// entry drained behind a busy turn retires a TOP-LEVEL FOREGROUND agent's
+/// pending request (PROTOCOL §5.5 "Attention requests" step 1). Same setup
+/// as `attention_request_foreground_automatic_delivery_negative_over_wss`:
+/// the request is raised via `requestDiscussion`, then an AUTOMATIC
+/// `agent.sendToTask` nudge (which the negative test proves does NOT clear)
+/// parks the agent in a slow turn; the FE's mid-turn reply path
+/// `agent.queueMessage` lands an entry behind it. Asserts over the wire
+/// that the drained entry is user-origin: `agent:updated` with
+/// `attentionRequestCleared: true` fires AFTER the nudge turn's
+/// `agent:stream:end` (whose `agent:idle` is suppressed by the parked
+/// entry) and BEFORE the drain turn's, and `agent.getSession` no longer
+/// serves the `attentionRequest*` fields. Regression for
+/// intent-hq/intentd#1790 (the entry used to park as system-origin, so the
+/// banner survived the reply).
+#[tokio::test]
+async fn attention_request_cleared_by_drained_queue_message_over_wss() {
+    const RAISE_MARKER: &str = "ATTN_QM_RAISE";
+    const SLOW_MARKER: &str = "ATTN_QM_SLOW";
+    const REPLY: &str = "ATTN_QM user reply typed mid-turn";
+    const REASON: &str = "ATTN_WSS foreground needs the user's decision (queueMessage)";
+    let Some(script) = gate("WSS attention-request queueMessage clear E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    let request_js = format!(
+        "return await ws.agent.requestDiscussion({});",
+        json!(REASON)
+    );
+    // The slow rule parks the nudge turn 2s: a deterministic window to queue
+    // the reply while the worker is busy. The drained reply matches no rule.
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": RAISE_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": request_js, "summary": "raise discussion request" }
+                },
+                "response": "turn ended after requestDiscussion",
+            },
+            {
+                "ifPromptContains": SLOW_MARKER,
+                "delayMs": 2000,
+                "response": "slow nudge acknowledged",
+            },
+        ],
+        "response": "queued reply acknowledged",
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — agent events, registered BEFORE any turn.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let marked = wss_rpc(
+        &mut rpc,
+        10,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+
+    // TOP-LEVEL FOREGROUND agent (`agent.create` front door), assigned to
+    // the task note so `agent.sendToTask` resolves it as the assignee.
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "FG-Attn-QM", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let assigned = wss_rpc(
+        &mut rpc,
+        12,
+        "task.assignAgent",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(assigned["ok"], true, "assignAgent ok: {assigned}");
+
+    // Raise: a user message carrying the behavior marker drives the
+    // requestDiscussion turn, leaving a pending request on the session.
+    let sent = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": format!("{RAISE_MARKER} raise a discussion request"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "raise sendMessage ok: {sent}");
+    let mut raised = false;
+    let mut idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(raised && idle) {
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the raise: raised={raised} idle={idle}")
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:updated"
+                if data["agentId"] == json!(agent_id)
+                    && data["attentionRequestKind"].is_string() =>
+            {
+                raised = true;
+            }
+            "agent:idle" if data["agentId"] == json!(agent_id) => idle = true,
+            _ => {}
+        }
+    }
+    let got = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "discussion",
+        "pending attentionRequestKind before the queued reply: {session}"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], REASON,
+        "pending attentionRequestReason before the queued reply: {session}"
+    );
+
+    // Park the agent in a slow AUTOMATIC turn (agent.sendToTask — proven
+    // NOT to clear for a top-level foreground agent by the negative test),
+    // then land the user-typed reply behind it through `agent.queueMessage`
+    // — the FE's mid-turn reply path.
+    let auto_sent = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.sendToTask",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": note_id,
+            "message": format!("{SLOW_MARKER} automatic slow nudge"),
+        }),
+    )
+    .await;
+    assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
+    let queued = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.queueMessage",
+        json!({ "agentId": agent_id, "content": REPLY }),
+    )
+    .await;
+    assert_eq!(queued["success"], true, "queueMessage ok: {queued}");
+    assert_eq!(
+        queued["queuedMessage"]["content"],
+        json!(REPLY),
+        "queueMessage echoes the parked entry: {queued}"
+    );
+
+    // Order over the wire: the nudge turn's terminal `agent:stream:end`
+    // (its `agent:idle` is SUPPRESSED — PROTOCOL §5.5/§6.5: a ready-to-send
+    // entry is parked behind it), THEN `agent:queue:processing` flips the
+    // reply in-flight and the drain turn's begin publishes
+    // `attentionRequestCleared: true` (the drained entry is user-origin),
+    // THEN the drain turn's `agent:stream:end` and the single terminal
+    // `agent:idle`. A clear before the first stream:end would be the
+    // (forbidden) automatic nudge's.
+    let mut stream_ends = 0usize;
+    let mut processing = 0usize;
+    let mut cleared_after_stream_ends: Option<usize> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
+                "timed out waiting for the drain: stream_ends={stream_ends} processing={processing} \
+                 cleared_after_stream_ends={cleared_after_stream_ends:?}"
+            )
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        if data["agentId"] != json!(agent_id) {
+            continue;
+        }
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:updated" if data["attentionRequestCleared"] == json!(true) => {
+                assert!(
+                    cleared_after_stream_ends.is_none(),
+                    "attentionRequestCleared fires exactly once: {ev}"
+                );
+                cleared_after_stream_ends = Some(stream_ends);
+            }
+            "agent:queue:processing" => processing += 1,
+            "agent:stream:end" => stream_ends += 1,
+            "agent:idle" => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        stream_ends, 2,
+        "the nudge turn and the drain turn each close with one agent:stream:end \
+         before the terminal agent:idle"
+    );
+    assert_eq!(
+        processing, 1,
+        "exactly one agent:queue:processing: the parked reply drained as its own turn"
+    );
+    assert_eq!(
+        cleared_after_stream_ends,
+        Some(1),
+        "the drained user-typed agent.queueMessage entry retires the request \
+         (after the automatic nudge's stream:end, before the drain turn's)"
+    );
+
+    let got = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert!(
+        session["attentionRequestKind"].is_null(),
+        "attentionRequestKind cleared by the drained queueMessage entry: {session}"
+    );
+    assert!(
+        session["attentionRequestReason"].is_null(),
+        "attentionRequestReason cleared by the drained queueMessage entry: {session}"
+    );
+    assert!(
+        session["attentionRequestTimestamp"].is_null(),
+        "attentionRequestTimestamp cleared by the drained queueMessage entry: {session}"
+    );
+    let queue = wss_rpc(
+        &mut rpc,
+        18,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        queue["queue"].as_array().expect("queue array").is_empty(),
+        "queue empty after the drain: {queue}"
+    );
+}
+
 /// Agent attention requests over WSS — blocker kind + the taskless-caller
 /// path. Phase 1: a task-linked delegated agent calls
 /// `ws.agent.reportBlocker(reason)` → `agent:attention-requested` with

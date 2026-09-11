@@ -15,10 +15,11 @@
 //! drains legacy one-at-a-time — one turn per queued message, no combined
 //! header, and the queue shrinks 2 → 1 → 0.
 //!
-//! Case 3 (`flushQueuedMessages = "systemOnly"`): two SYSTEM-origin messages
-//! queued behind a busy turn (via `agent.queueMessage`'s system-origin path,
-//! which parks as `user_origin: false`) are delivered as ONE combined turn,
-//! same contract as case 1.
+//! Case 3 (`flushQueuedMessages = "systemOnly"`): `agent.queueMessage` is the
+//! FE's user-typed mid-turn reply path and parks as `user_origin: true`, so
+//! two messages queued behind a busy turn via that RPC are EXCLUDED from the
+//! system-only batch and drain one-at-a-time — same observable shape as
+//! case 2 (one turn per message, no combined header, queue 2 → 1 → 0).
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -933,12 +934,15 @@ async fn flush_disabled_drains_queue_one_turn_per_message_over_wss() {
 }
 
 /// FLUSH-3 (`agents.flushQueuedMessages = "systemOnly"` in `config.toml`):
-/// `agent.queueMessage` enqueues with `user_origin: false` (system-origin),
-/// so two messages queued behind a busy turn via that RPC batch into ONE
-/// combined turn under `systemOnly` — the same wire contract as the default
-/// `"all"` case (FLUSH-1).
+/// `agent.queueMessage` is the FE's user-typed mid-turn reply path and
+/// enqueues with `user_origin: true`, so two messages queued behind a busy
+/// turn via that RPC are excluded from the system-only batch and drain
+/// one-at-a-time over WSS — one turn per message, no batch header, TWO
+/// `agent:queue:processing` signals, and the queue shrinking through 1
+/// (the same observable shape as FLUSH-2). A combined turn here would mean
+/// `agent.queueMessage` regressed to system-origin.
 #[tokio::test]
-async fn flush_system_only_combines_queued_messages_into_one_turn_over_wss() {
+async fn flush_system_only_excludes_queue_message_entries_over_wss() {
     let Some(script) = gate("WSS queued-message flush systemOnly E2E") else {
         return;
     };
@@ -946,14 +950,14 @@ async fn flush_system_only_combines_queued_messages_into_one_turn_over_wss() {
     seed_flush_mode(&data_dir, "systemOnly");
     let mut setup = setup_busy_agent_with_two_queued(&data_dir, &script).await;
 
-    // Two terminal stream:ends: the kick-off turn, then the ONE combined
-    // flush turn (a third would mean the drain split the batch).
-    let obs = observe_drain(&mut setup.sub, &setup.agent_id, 2).await;
+    // Three terminal stream:ends: kick-off + one turn PER queued message
+    // (two would mean the user-origin entries were batched).
+    let obs = observe_drain(&mut setup.sub, &setup.agent_id, 3).await;
 
     let shrink = shrink_lengths(&obs.queue_lengths);
     assert!(
-        !shrink.contains(&1),
-        "queue must empty in one snapshot (2 → 0), never through 1: {:?}",
+        shrink.contains(&1),
+        "user-origin entries drain one-at-a-time under systemOnly (2 → 1 → 0): {:?}",
         obs.queue_lengths
     );
     assert!(
@@ -963,25 +967,48 @@ async fn flush_system_only_combines_queued_messages_into_one_turn_over_wss() {
     );
     assert_eq!(
         obs.processing_turn_ids.len(),
-        1,
-        "exactly ONE agent:queue:processing for the combined turn: {:?}",
+        2,
+        "one agent:queue:processing per drained message: {:?}",
         obs.processing_turn_ids
     );
 
-    let prompts = await_prompts(&setup.prompt_log, 2).await;
-    assert_eq!(prompts.len(), 2, "kick-off + ONE flush turn: {prompts:?}");
-    let flush = &prompts[1];
-    assert!(
-        flush.starts_with(FLUSH_HEADER),
-        "systemOnly flush prompt starts with the batch header: {flush}"
+    let prompts = await_prompts(&setup.prompt_log, 3).await;
+    assert_eq!(
+        prompts.len(),
+        3,
+        "kick-off + one turn per queued message: {prompts:?}"
     );
-    let i_one = flush
-        .find(QUEUED_ONE)
-        .unwrap_or_else(|| panic!("flush prompt carries {QUEUED_ONE:?}: {flush}"));
-    let i_two = flush
-        .find(QUEUED_TWO)
-        .unwrap_or_else(|| panic!("flush prompt carries {QUEUED_TWO:?}: {flush}"));
-    assert!(i_one < i_two, "messages appear in queue order: {flush}");
+    assert!(
+        prompts[1].starts_with(QUEUED_ONE),
+        "second turn delivers the first queued message: {}",
+        prompts[1]
+    );
+    assert!(
+        prompts[2].starts_with(QUEUED_TWO),
+        "third turn delivers the second queued message: {}",
+        prompts[2]
+    );
+    for p in &prompts {
+        assert!(
+            !p.starts_with(FLUSH_HEADER),
+            "user-origin agent.queueMessage entries never batch under systemOnly: {p}"
+        );
+    }
+
+    // One-at-a-time drains group nothing: no user row carries a batchId.
+    let conv = wss_rpc(
+        &mut setup.rpc,
+        20,
+        "agent.getConversation",
+        json!({ "agentId": setup.agent_id }),
+    )
+    .await;
+    for needle in [KICKOFF_MSG, QUEUED_ONE, QUEUED_TWO] {
+        assert!(
+            user_row(&conv, needle)["metadata"]["queueInfo"]["batchId"].is_null(),
+            "single-message drains never stamp a batchId: {needle:?}"
+        );
+    }
 
     let queue = wss_rpc(
         &mut setup.rpc,
@@ -992,6 +1019,6 @@ async fn flush_system_only_combines_queued_messages_into_one_turn_over_wss() {
     .await;
     assert!(
         queue["queue"].as_array().expect("queue array").is_empty(),
-        "queue empty after flush: {queue}"
+        "queue empty after drain: {queue}"
     );
 }
