@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use intent_core::{
     AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, GitAgentCommitResult, NoteId,
@@ -1206,6 +1207,108 @@ async fn script_run_accepts_timeout_alias() {
     let resp = call(&srv, "return await ws.script.run('s-1', { timeout: 7 });").await;
     assert_eq!(resp["result"]["isError"], json!(false));
     assert_eq!(api.script_run_calls.lock().unwrap()[0].1, Some(7));
+}
+
+#[tokio::test]
+async fn script_run_rejects_timeout_above_eval_budget_before_spawning() {
+    // A wait longer than the eval budget would be aborted by the transport
+    // while the process kept running (monorepo#4703): refuse it up front,
+    // naming the ceiling and the start + hook + status pattern.
+    let (srv, api) = server();
+    let resp = call(
+        &srv,
+        "return await ws.script.run('s-1', { timeoutSeconds: 600 });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    let t = text(&resp);
+    assert!(t.contains("timeoutSeconds 600 exceeds"), "unexpected: {t}");
+    assert!(t.contains("ceiling 25s, budget 30s"), "unexpected: {t}");
+    assert!(t.contains("ws.script.start"), "unexpected: {t}");
+    assert!(t.contains("ws.hook.schedule"), "unexpected: {t}");
+    assert!(t.contains("ws.script.status"), "unexpected: {t}");
+    assert!(
+        api.script_run_calls.lock().unwrap().is_empty(),
+        "no process may be started for a rejected timeout"
+    );
+}
+
+#[tokio::test]
+async fn script_run_rejects_timeout_alias_above_eval_budget() {
+    let (srv, api) = server();
+    let resp = call(&srv, "return await ws.script.run('s-1', { timeout: 26 });").await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("timeoutSeconds 26 exceeds"));
+    assert!(api.script_run_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn script_run_omitted_timeout_defaults_to_ceiling() {
+    // `None` makes the service layer wait unbounded, so the default is
+    // pinned to the ceiling to keep `timedOut` reachable within the budget.
+    let (srv, api) = server();
+    let resp = call(&srv, "return await ws.script.run('s-1');").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    assert_eq!(api.script_run_calls.lock().unwrap()[0].1, Some(25));
+}
+
+#[tokio::test]
+async fn script_run_non_positive_timeout_defaults_to_ceiling() {
+    // `ScriptManager::run` treats a non-positive timeout as absent (unbounded
+    // wait), so `0` / negatives must not bypass the ceiling.
+    let (srv, api) = server();
+    let resp = call(
+        &srv,
+        "return await ws.script.run('s-1', { timeoutSeconds: 0 });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let resp = call(&srv, "return await ws.script.run('s-1', { timeout: -5 });").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let calls = api.script_run_calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].1, Some(25));
+    assert_eq!(calls[1].1, Some(25));
+}
+
+#[tokio::test]
+async fn script_run_timeout_at_ceiling_passes_through() {
+    let (srv, api) = server();
+    let resp = call(
+        &srv,
+        "return await ws.script.run('s-1', { timeoutSeconds: 25 });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    assert_eq!(api.script_run_calls.lock().unwrap()[0].1, Some(25));
+}
+
+#[tokio::test]
+async fn script_run_ceiling_follows_overridden_eval_budget() {
+    // The ceiling tracks the effective budget (`INTENTD_WORKSPACE_API_TIMEOUT_MS`
+    // / builder override), not the 30s constant.
+    let api = Arc::new(FakeApi::default());
+    let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"))
+        .with_workspace_api_timeout(Duration::from_secs(120));
+    let resp = call(
+        &srv,
+        "return await ws.script.run('s-1', { timeoutSeconds: 115 });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(false), "{}", text(&resp));
+    let resp = call(
+        &srv,
+        "return await ws.script.run('s-1', { timeoutSeconds: 116 });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("ceiling 115s, budget 120s"));
+    let resp = call(&srv, "return await ws.script.run('s-1');").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let calls = api.script_run_calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].1, Some(115));
+    assert_eq!(calls[1].1, Some(115));
 }
 
 // ============================================================================
