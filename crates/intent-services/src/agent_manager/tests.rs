@@ -18493,7 +18493,7 @@ mod attention_request_clear_gates {
         seed_with_pending_request(&mgr, &ws, &id).await;
 
         mgr.services
-            .agent_queue_message_op(id.clone(), "queued user reply".into(), None, None)
+            .agent_queue_message_op(id.clone(), "queued user reply".into(), None, None, None)
             .await
             .expect("queue user reply");
         let mut sub = bus.subscribe(SubscriptionFilter::default());

@@ -388,12 +388,15 @@ async fn get_subscriptions_stays_within_statement_budget() {
 /// now a chunked bulk statement, keeping every queue mutation at a flat
 /// statement count regardless of queue depth.
 ///
-/// Hermetic shape: the workspace is archived, whose drain gate parks
-/// automatic-origin entries (no provider turn ever spawns). 40
-/// `agent.queueMessage` calls then grow the queue to 40 entries; pre-fix the
+/// Hermetic shape: the workspace is archived, whose send/drain gates park
+/// AUTOMATIC-origin entries (no provider turn ever spawns). 40
+/// `agent.sendToTask` calls — the same default-origin path as A2A sends and
+/// system wakes — then grow the queue to 40 parked entries; pre-fix the
 /// later dispatches ran 40+ statements each (DELETE + one INSERT per entry),
 /// tripping the default budget of 25 — the batched shape stays at a handful
-/// per call.
+/// per call. `agent.queueMessage` cannot serve here: its entries are
+/// user-origin (PROTOCOL §5.5), which the archived gate exempts, so each
+/// call would revive the workspace and drive a (non-hermetic) provider turn.
 #[tokio::test]
 async fn queue_mutations_stay_within_statement_budget_at_depth() {
     let (_daemon, socket, log_path) = spawn_daemon("itdp-queue", &[]);
@@ -422,8 +425,35 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
         .expect("agent id")
         .to_string();
 
-    // Archive the workspace so queued entries park instead of draining into
-    // a (non-hermetic) provider turn.
+    // A task note assigned to the agent so `agent.sendToTask` resolves it
+    // as the assignee.
+    let resp = rpc_with_params(
+        &socket,
+        "note.create",
+        json!({ "workspaceId": workspace_id, "title": "Queue Task", "content": "Queue depth" }),
+    )
+    .await;
+    let task_note_id = resp["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+    let resp = rpc_with_params(
+        &socket,
+        "task.markAsTask",
+        json!({ "workspaceId": workspace_id, "noteId": task_note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert!(resp["error"].is_null(), "markAsTask failed: {resp}");
+    let resp = rpc_with_params(
+        &socket,
+        "task.assignAgent",
+        json!({ "workspaceId": workspace_id, "noteId": task_note_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(resp["error"].is_null(), "assignAgent failed: {resp}");
+
+    // Archive the workspace so automatic sends park instead of draining
+    // into a (non-hermetic) provider turn.
     let resp = rpc_with_params(
         &socket,
         "workspace.archive",
@@ -435,15 +465,20 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
     for i in 0..40 {
         let resp = rpc_with_params(
             &socket,
-            "agent.queueMessage",
+            "agent.sendToTask",
             json!({
                 "workspaceId": workspace_id,
-                "agentId": agent_id,
-                "content": format!("queued message {i}"),
+                "taskNoteId": task_note_id,
+                "message": format!("queued message {i}"),
             }),
         )
         .await;
-        assert!(resp["error"].is_null(), "queueMessage {i} failed: {resp}");
+        assert!(resp["error"].is_null(), "sendToTask {i} failed: {resp}");
+        assert_eq!(
+            resp["result"]["result"]["archivedParked"],
+            json!(true),
+            "sendToTask {i} parked behind the archived gate: {resp}"
+        );
     }
 
     // All 40 entries are parked (the workspace stays archived).
@@ -465,10 +500,10 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
     assert_eq!(
         count_lines(
             &log,
-            &["exceeded SQL statement budget", "method=agent.queueMessage"]
+            &["exceeded SQL statement budget", "method=agent.sendToTask"]
         ),
         0,
-        "agent.queueMessage exceeded the statement budget at queue depth, log:\n{log}"
+        "agent.sendToTask exceeded the statement budget at queue depth, log:\n{log}"
     );
 }
 
