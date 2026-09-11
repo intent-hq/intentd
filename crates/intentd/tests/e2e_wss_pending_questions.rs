@@ -1178,7 +1178,10 @@ where
 ///    a `messageMetadata` key.
 /// 4. The end-of-turn drain delivers the queued answer: the marker clears
 ///    (`agent:updated` carries the empty clear marker), the persisted user row
-///    carries the tag, and the queue is empty.
+///    carries the tag, and the queue is empty. Drain ordering (§6.5): the
+///    answer's user-row `agent:message` and the marker-clearing
+///    `agent:updated` reach the wire BEFORE the shrunk `agent:queue:updated`
+///    that no longer lists the entry.
 #[tokio::test]
 async fn queued_answer_via_queue_message_clears_marker_over_wss() {
     let Some(script) = gate("WSS pending-questions queueMessage answer E2E") else {
@@ -1294,7 +1297,70 @@ async fn queued_answer_via_queue_message_clears_marker_over_wss() {
     );
 
     // ---- (4) The drain delivers the answer and clears the marker ----
-    await_pending_marker_event(&mut sub, &asker_id, "").await;
+    // Drain ordering contract (§6.5): the drained entry's user-row
+    // `agent:message` (matched by the entry's `turnId`) and the marker-
+    // clearing `agent:updated` arrive BEFORE the shrunk `agent:queue:updated`
+    // that no longer lists the entry, so a client never observes "marker set
+    // + no queued answer + no answer row". The subscription buffered the
+    // enqueue-time snapshot (entry present), so a snapshot without the entry
+    // only counts as the shrink once that one has been seen.
+    let queued_id = queued["queuedMessage"]["id"]
+        .as_str()
+        .expect("queued entry id")
+        .to_string();
+    let queued_turn_id = queued["turnId"]
+        .as_str()
+        .expect("queue result carries turnId")
+        .to_string();
+    let mut saw_entry_snapshot = false;
+    let mut user_row_seen = false;
+    let mut marker_cleared_seen = false;
+    let mut shrunk_seen = false;
+    for _ in 0..600 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(asker_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:queue:updated") => {
+                let lists_entry = event["data"]["queue"].as_array().is_some_and(|q| {
+                    q.iter()
+                        .any(|m| m["id"].as_str() == Some(queued_id.as_str()))
+                });
+                if lists_entry {
+                    saw_entry_snapshot = true;
+                } else if saw_entry_snapshot {
+                    assert!(
+                        user_row_seen,
+                        "shrunk agent:queue:updated arrived before the drained answer's user-row agent:message: {event}"
+                    );
+                    assert!(
+                        marker_cleared_seen,
+                        "shrunk agent:queue:updated arrived before the marker-clearing agent:updated: {event}"
+                    );
+                    shrunk_seen = true;
+                    break;
+                }
+            }
+            Some("agent:message")
+                if event["data"]["role"] == "user"
+                    && event["data"]["turnId"].as_str() == Some(queued_turn_id.as_str()) =>
+            {
+                user_row_seen = true;
+            }
+            Some("agent:updated")
+                if event["data"]["pendingQuestionsMessageId"].as_str() == Some("") =>
+            {
+                marker_cleared_seen = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        shrunk_seen,
+        "the drain published the shrunk agent:queue:updated after the answer row + marker clear"
+    );
     let conv = await_conversation(&mut rpc, &ws_id, &asker_id, "answer drained", |m| {
         user_row_index(m, ANSWER_TEXT).is_some()
     })

@@ -6121,13 +6121,9 @@ impl AgentManager {
                 .await;
             return;
         };
-        self.services
-            .publish_queue_updated_for(
-                &agent_id,
-                &workspace_id,
-                self.services.queue_snapshot(&agent_id),
-            )
-            .await;
+        // Durable shrink now; the shrunk `agent:queue:updated` is published
+        // only after the user row below is persisted (§6.5 drain ordering).
+        self.services.persist_queue_snapshot(&agent_id).await;
         // Stale-redrive check (#576) BEFORE the transcript append so the
         // annotated content reaches both the persisted user row and the
         // provider prompt.
@@ -6200,6 +6196,9 @@ impl AgentManager {
             self.release_in_flight_slot(&agent_id);
             return;
         }
+        self.services
+            .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+            .await;
         self.spawn_worker(
             agent_id,
             workspace_id,
@@ -6285,15 +6284,10 @@ impl AgentManager {
         // Delivery-time unblocked hints (monorepo#2044): parity with the
         // drain paths — resolved at render time.
         annotate_unblocked_hints(&self.services, &agent_id, std::slice::from_mut(&mut entry)).await;
-        // Publish the shrunk snapshot (write-through persist inside) so
-        // clients see the entry leave the queue before the turn starts.
-        self.services
-            .publish_queue_updated_for(
-                &agent_id,
-                &workspace_id,
-                self.services.queue_snapshot(&agent_id),
-            )
-            .await;
+        // Durable shrink now; the shrunk `agent:queue:updated` is published
+        // only after the user row below is persisted (§6.5 drain ordering),
+        // still before the turn starts.
+        self.services.persist_queue_snapshot(&agent_id).await;
         // Queue-drained turns carry no per-turn prompt hints of their own;
         // the entry's captured attachments and metadata ride along, same as
         // `try_drain_queue`.
@@ -6402,6 +6396,9 @@ impl AgentManager {
                     .await;
             }
         }
+        self.services
+            .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+            .await;
         let entry_id = entry.id.clone();
         let turn_id = entry.turn_id.clone();
         self.spawn_worker(agent_id, workspace_id, entry.content, options, true);
@@ -9754,13 +9751,10 @@ async fn run_message_worker(
             }
         }
         if let Some(mut next) = mgr.services.dequeue_message(&agent_id) {
-            mgr.services
-                .publish_queue_updated_for(
-                    &agent_id,
-                    &workspace_id,
-                    mgr.services.queue_snapshot(&agent_id),
-                )
-                .await;
+            // Durable shrink now; the shrunk `agent:queue:updated` is
+            // published only after the user row below is persisted (§6.5
+            // drain ordering).
+            mgr.services.persist_queue_snapshot(&agent_id).await;
             // Stale-redrive check (#576) BEFORE the transcript append so the
             // annotated content reaches both the persisted user row and the
             // provider prompt. Runs before the next iteration's report clear,
@@ -9827,6 +9821,9 @@ async fn run_message_worker(
                 mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
+            mgr.services
+                .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+                .await;
             continue;
         }
         // Queue drained: release the slot, then re-check for a message that
@@ -9960,13 +9957,10 @@ async fn run_message_worker(
                     }
                 }
             }
-            mgr.services
-                .publish_queue_updated_for(
-                    &agent_id,
-                    &workspace_id,
-                    mgr.services.queue_snapshot(&agent_id),
-                )
-                .await;
+            // Durable shrink now; the shrunk `agent:queue:updated` is
+            // published only after the user row below is persisted (§6.5
+            // drain ordering).
+            mgr.services.persist_queue_snapshot(&agent_id).await;
             // Stale-redrive check (#576): same contract as the pre-release
             // drain arm. Runs only after the slot is re-claimed so a message
             // handed back via `requeue_front` below is never annotated here.
@@ -10026,6 +10020,9 @@ async fn run_message_worker(
                 mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
+            mgr.services
+                .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+                .await;
             continue 'outer;
         }
         // A concurrent send won the slot; hand the message(s) back to it in
@@ -10110,9 +10107,10 @@ enum FlushPrep {
 /// sequence once per entry — stale-redrive (#576) + dequeue-wait annotation,
 /// then the transcript row append (`persist_user`; entries already persisted
 /// by a terminal-failure requeue are not re-appended) — while emitting ONE
-/// `agent:queue:updated` (the fully-shrunk queue) and ONE
 /// `agent:queue:processing` (the head entry, whose `turn_id` is the combined
-/// turn's id). Each row persist emits its normal `agent:message`, so clients
+/// turn's id) and, AFTER every row is persisted, ONE `agent:queue:updated`
+/// (the fully-shrunk queue; §6.5 drain ordering — the durable shrink itself
+/// happens up front). Each row persist emits its normal `agent:message`, so clients
 /// render N stacked user rows — and every row echo carries the COMBINED
 /// turn's `turn_id` (the head entry's), not the entry's own, so all N echoes
 /// correlate with the single `agent:queue:processing`/`agent:stream:*`
@@ -10142,13 +10140,9 @@ async fn prepare_flush_turn(
     workspace_id: &WorkspaceId,
     mut entries: Vec<QueuedMessage>,
 ) -> FlushPrep {
-    mgr.services
-        .publish_queue_updated_for(
-            agent_id,
-            workspace_id,
-            mgr.services.queue_snapshot(agent_id),
-        )
-        .await;
+    // Durable shrink now; the ONE shrunk `agent:queue:updated` is published
+    // only after every row below is persisted (§6.5 drain ordering).
+    mgr.services.persist_queue_snapshot(agent_id).await;
     // Per-entry annotations, same order as the single-entry drain arms: the
     // stale check before the wait note, both before the row persist so the
     // persisted row and the provider prompt carry the same content.
@@ -10230,6 +10224,9 @@ async fn prepare_flush_turn(
             .await;
         return FlushPrep::Parked;
     }
+    mgr.services
+        .publish_queue_updated_after_drain_persist(agent_id, workspace_id)
+        .await;
     let content = flush_combined_prompt(&entries);
     let mut image_blocks = None;
     let mut file_blocks = None;

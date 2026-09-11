@@ -13809,10 +13809,32 @@ impl Services {
             .await;
     }
 
+    /// Drain-delivery half of [`Services::publish_queue_updated_for`] (§6.5
+    /// drain ordering): the drain arms run the write-through persist of the
+    /// shrunk queue at dequeue time ([`Services::persist_queue_snapshot`],
+    /// unchanged durability window) but publish the shrunk
+    /// `agent:queue:updated` only AFTER the drained entry's user row is
+    /// persisted — after its `agent:message` echo and, for a tagged
+    /// `question_answers` answer, the marker-clearing `agent:updated` — so a
+    /// client never observes "entry gone from the queue" before it can
+    /// observe the row that replaced it. The snapshot is re-read here, so it
+    /// reflects any enqueue that raced in during the persist (that enqueue
+    /// published its own event already).
+    pub(crate) async fn publish_queue_updated_after_drain_persist(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) {
+        self.publish_queue_event(agent_id, workspace_id, self.queue_snapshot(agent_id))
+            .await;
+    }
+
     /// Publish `agent:queue:updated` WITHOUT the write-through persist — for
-    /// the one caller ([`Services::migrate_queue_and_gc_poisoned_session`])
-    /// whose durable snapshot was already committed by an atomic store op.
-    /// Everything else goes through [`Services::publish_queue_updated_for`].
+    /// callers whose durable snapshot was already committed:
+    /// [`Services::migrate_queue_and_gc_poisoned_session`] (atomic store op)
+    /// and [`Services::publish_queue_updated_after_drain_persist`] (persisted
+    /// at dequeue time). Everything else goes through
+    /// [`Services::publish_queue_updated_for`].
     async fn publish_queue_event(
         &self,
         agent_id: &AgentId,
