@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.43] - 2026-09-11
+
+### 🚀 Features
+
+- *(pr-monitor)* Adaptive polling cadence bounded by a configurable hourly budget and the forge rate-limit gate ([#1796](https://github.com/intent-hq/intentd/pull/1796))
+
+### 🐛 Bug Fixes
+
+- *(hooks)* Bound hook dispatch payloads and stop re-queuing oversized messages after a 413 ([#1792](https://github.com/intent-hq/intentd/pull/1792))
+
+### 🔧 Refactor
+
+- *(services)* Require an explicit MessageOrigin at every queue enqueue ([#1797](https://github.com/intent-hq/intentd/pull/1797))
+
+
 ## [0.9.42] - 2026-09-11
 
 ### 🚀 Features
