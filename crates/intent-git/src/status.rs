@@ -206,14 +206,30 @@ fn ahead_behind(repo: &Repository, branch: &str) -> (i64, i64, bool) {
 
 /// Build the file list from `repo.statuses`, replicating the porcelain
 /// `--untracked-files=all` parse (directories skipped; staged+unstaged split).
+/// Rename detection is enabled on both sides (monorepo#4594) so a `git mv`
+/// surfaces as one `R` entry under its new path, as `git status --porcelain`
+/// prints `R  old -> new`, instead of a `D` + `A` pair.
 /// Shared with [`crate::local_changes`] so its `uncommittedCount` covers the
 /// exact entry set `git.status.files` reports.
 pub(crate) fn collect_files(repo: &Repository) -> Result<Vec<FileStatus>> {
+    collect_files_with(repo, true)
+}
+
+/// [`collect_files`] with rename detection switchable. `detect_renames: false`
+/// reports a rename as its `D` + `A` pair — the form the pathspec-limited
+/// commit set in [`crate::commit`] needs, so the old path's deletion lands in
+/// the commit alongside the new path.
+pub(crate) fn collect_files_with(
+    repo: &Repository,
+    detect_renames: bool,
+) -> Result<Vec<FileStatus>> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .include_ignored(false)
-        .include_unmodified(false);
+        .include_unmodified(false)
+        .renames_head_to_index(detect_renames)
+        .renames_index_to_workdir(detect_renames);
     let statuses = repo.statuses(Some(&mut opts)).map_err(map_git_err)?;
     let mut files = Vec::new();
     for entry in statuses.iter() {
@@ -222,11 +238,19 @@ pub(crate) fn collect_files(repo: &Repository) -> Result<Vec<FileStatus>> {
             continue;
         }
         let (index_char, wt_char) = porcelain_chars(entry.status());
-        let staged_link = entry.head_to_index().as_ref().and_then(gitlink_info);
-        let unstaged_link = entry.index_to_workdir().as_ref().and_then(gitlink_info);
+        let head_to_index = entry.head_to_index();
+        let index_to_workdir = entry.index_to_workdir();
+        let staged_link = head_to_index.as_ref().and_then(gitlink_info);
+        let unstaged_link = index_to_workdir.as_ref().and_then(gitlink_info);
+        // `entry.path()` is the delta's *old* side, so a detected rename must
+        // take its path from each delta's new side to be reported under the
+        // new name; for every other delta both sides carry the same path.
+        let staged_path = new_path(head_to_index.as_ref()).unwrap_or(path);
+        let unstaged_path = new_path(index_to_workdir.as_ref()).unwrap_or(path);
         push_entries(
             &mut files,
-            path,
+            staged_path,
+            unstaged_path,
             index_char,
             wt_char,
             staged_link,
@@ -234,6 +258,11 @@ pub(crate) fn collect_files(repo: &Repository) -> Result<Vec<FileStatus>> {
         );
     }
     Ok(files)
+}
+
+/// The new-side path of a status delta, `None` when absent or non-UTF-8.
+fn new_path<'a>(delta: Option<&DiffDelta<'a>>) -> Option<&'a str> {
+    delta?.new_file().path()?.to_str()
 }
 
 /// Gitlink metadata for one status delta: `Some((mode, old_sha, new_sha))`
@@ -302,12 +331,15 @@ fn porcelain_chars(s: Status) -> (char, char) {
 
 /// Append the `FileStatus` entries for one porcelain line, replicating
 /// `parseStatusOutput`: a file with both staged and unstaged changes yields two
-/// entries (staged + unstaged); otherwise a single entry. `staged_link` /
-/// `unstaged_link` carry the per-delta gitlink metadata from [`gitlink_info`],
-/// attached to the corresponding entry when present.
+/// entries (staged + unstaged); otherwise a single entry. `staged_path` /
+/// `unstaged_path` are the per-delta new-side paths (they differ only across a
+/// rename), and `staged_link` / `unstaged_link` carry the per-delta gitlink
+/// metadata from [`gitlink_info`], attached to the corresponding entry when
+/// present.
 fn push_entries(
     files: &mut Vec<FileStatus>,
-    path: &str,
+    staged_path: &str,
+    unstaged_path: &str,
     index_status: char,
     work_tree_status: char,
     staged_link: Option<(String, Option<String>, Option<String>)>,
@@ -322,7 +354,8 @@ fn push_entries(
     };
     let has_staged = index_status != ' ' && index_status != '?';
     let has_unstaged = work_tree_status != ' ';
-    let entry = |status: GitFileStatus,
+    let entry = |path: &str,
+                 status: GitFileStatus,
                  staged: bool,
                  link: Option<(String, Option<String>, Option<String>)>| {
         let (mode, old_sha, new_sha) = match link {
@@ -340,18 +373,18 @@ fn push_entries(
     };
     if has_staged && has_unstaged {
         if let Some(status) = char_to_status(index_status) {
-            files.push(entry(status, true, staged_link));
+            files.push(entry(staged_path, status, true, staged_link));
         }
         if let Some(status) = char_to_status(work_tree_status) {
-            files.push(entry(status, false, unstaged_link));
+            files.push(entry(unstaged_path, status, false, unstaged_link));
         }
     } else if let Some(status) = char_to_status(actual) {
-        let link = if has_staged {
-            staged_link
+        let (path, link) = if has_staged {
+            (staged_path, staged_link)
         } else {
-            unstaged_link
+            (unstaged_path, unstaged_link)
         };
-        files.push(entry(status, has_staged, link));
+        files.push(entry(path, status, has_staged, link));
     }
 }
 
@@ -405,6 +438,104 @@ mod tests {
             .iter()
             .any(|f| !f.staged && f.status == GitFileStatus::Modified));
         assert!(st.has_uncommitted_changes);
+    }
+
+    /// Stage `git mv old new` through the index (no subprocess): remove the
+    /// old path, write the new one with the same content, add it.
+    fn stage_rename(worktree: &std::path::Path, old: &str, new: &str) {
+        let repo = git2::Repository::open(worktree).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(std::path::Path::new(old)).unwrap();
+        std::fs::rename(worktree.join(old), worktree.join(new)).unwrap();
+        index.add_path(std::path::Path::new(new)).unwrap();
+        index.write().unwrap();
+    }
+
+    /// A staged `git mv` is one `R` entry under the new path (monorepo#4594),
+    /// not a `D` + `A` pair, matching porcelain `R  old -> new`.
+    #[test]
+    fn staged_rename_is_single_renamed_entry_under_new_path() {
+        let dir = init_repo("status-rename-staged");
+        commit_file(dir.path(), "old.txt", "same content\nacross the move\n");
+        stage_rename(dir.path(), "old.txt", "new.txt");
+        let st = status(dir.path()).unwrap();
+        assert_eq!(
+            st.files,
+            vec![file("new.txt", GitFileStatus::Renamed, true)],
+            "expected exactly one staged R entry: {:?}",
+            st.files
+        );
+        assert!(st.has_uncommitted_changes);
+        assert!(!st.has_untracked_files);
+    }
+
+    /// A rename made only in the working tree (old path gone, identical new
+    /// file untracked) is one unstaged `R` entry under the new path.
+    #[test]
+    fn unstaged_rename_is_single_renamed_entry_under_new_path() {
+        let dir = init_repo("status-rename-unstaged");
+        commit_file(dir.path(), "old.txt", "same content\nacross the move\n");
+        std::fs::rename(dir.path().join("old.txt"), dir.path().join("new.txt")).unwrap();
+        let st = status(dir.path()).unwrap();
+        assert_eq!(
+            st.files,
+            vec![file("new.txt", GitFileStatus::Renamed, false)],
+            "expected exactly one unstaged R entry: {:?}",
+            st.files
+        );
+        assert!(st.has_uncommitted_changes);
+        assert!(!st.has_untracked_files);
+    }
+
+    /// A staged rename whose new file was then edited in the working tree
+    /// keeps the staged+unstaged double-entry rule, both under the new path.
+    #[test]
+    fn staged_rename_with_unstaged_edit_yields_two_entries_under_new_path() {
+        let dir = init_repo("status-rename-then-edit");
+        commit_file(dir.path(), "old.txt", "same content\nacross the move\n");
+        stage_rename(dir.path(), "old.txt", "new.txt");
+        write_file(
+            dir.path(),
+            "new.txt",
+            "same content\nacross the move\nplus\n",
+        );
+        let st = status(dir.path()).unwrap();
+        assert_eq!(
+            st.files,
+            vec![
+                file("new.txt", GitFileStatus::Renamed, true),
+                file("new.txt", GitFileStatus::Modified, false),
+            ],
+            "{:?}",
+            st.files
+        );
+    }
+
+    /// A delete plus an unrelated add (content past the similarity
+    /// threshold) is still reported as `D` + `A`, never folded into a rename.
+    #[test]
+    fn unrelated_delete_and_add_stay_separate_entries() {
+        let dir = init_repo("status-rename-unrelated");
+        commit_file(dir.path(), "old.txt", "alpha beta gamma\ndelta epsilon\n");
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(std::path::Path::new("old.txt")).unwrap();
+        std::fs::remove_file(dir.path().join("old.txt")).unwrap();
+        write_file(dir.path(), "new.txt", "0123456789\nzyxwvutsrq\nunrelated\n");
+        index.add_path(std::path::Path::new("new.txt")).unwrap();
+        index.write().unwrap();
+        let st = status(dir.path()).unwrap();
+        let mut files = st.files.clone();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            files,
+            vec![
+                file("new.txt", GitFileStatus::Added, true),
+                file("old.txt", GitFileStatus::Deleted, true),
+            ],
+            "{:?}",
+            st.files
+        );
     }
 
     #[test]

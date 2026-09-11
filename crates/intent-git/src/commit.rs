@@ -297,14 +297,17 @@ fn collapse_blank_lines(s: &str) -> String {
 
 /// All distinct paths with worktree changes (staged, unstaged, or untracked),
 /// the auto-stage set for `agentCommit` in the absence of agent attribution.
+/// Renames are kept as their `D` + `A` pair so both paths enter the
+/// pathspec-limited commit (a rename collapsed to its new path would leave the
+/// old path's deletion uncommitted).
 ///
 /// # Errors
 ///
 /// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn all_changed_paths(worktree_path: &Path) -> Result<Vec<String>> {
-    let st = crate::status::status(worktree_path)?;
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let mut paths = Vec::new();
-    for f in st.files {
+    for f in crate::status::collect_files_with(&repo, false)? {
         if !paths.contains(&f.path) {
             paths.push(f.path);
         }
@@ -315,15 +318,16 @@ pub fn all_changed_paths(worktree_path: &Path) -> Result<Vec<String>> {
 /// All distinct paths with **index (staged)** changes only — the commit set
 /// for a `userRequested` `agentCommit` given no explicit `files`: a user
 /// checkpoint commits what the user staged (plain `git commit` semantics)
-/// instead of sweeping every change in the worktree into the commit.
+/// instead of sweeping every change in the worktree into the commit. Renames
+/// are kept as their `D` + `A` pair, as in [`all_changed_paths`].
 ///
 /// # Errors
 ///
 /// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn staged_paths(worktree_path: &Path) -> Result<Vec<String>> {
-    let st = crate::status::status(worktree_path)?;
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let mut paths = Vec::new();
-    for f in st.files {
+    for f in crate::status::collect_files_with(&repo, false)? {
         if f.staged && !paths.contains(&f.path) {
             paths.push(f.path);
         }
@@ -741,6 +745,36 @@ mod tests {
         write_file(dir.path(), "tracked.txt", "two\n");
         write_file(dir.path(), "untracked.txt", "new\n");
         assert_eq!(staged_paths(dir.path()).unwrap(), vec!["staged.txt"]);
+    }
+
+    /// A staged `git mv` (one `R` entry on the `git.status` wire,
+    /// monorepo#4594) must still contribute both paths to the commit set, so a
+    /// pathspec-limited checkpoint commit lands the old path's deletion too
+    /// and leaves the tree clean.
+    #[test]
+    fn staged_paths_keeps_both_sides_of_a_rename_and_commit_lands_it() {
+        let dir = init_repo("commit-staged-rename");
+        commit_file(dir.path(), "old.txt", "same content\nacross the move\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("old.txt")).unwrap();
+        std::fs::rename(dir.path().join("old.txt"), dir.path().join("new.txt")).unwrap();
+        index.add_path(Path::new("new.txt")).unwrap();
+        index.write().unwrap();
+
+        let mut paths = staged_paths(dir.path()).unwrap();
+        paths.sort();
+        assert_eq!(paths, vec!["new.txt".to_string(), "old.txt".to_string()]);
+        let mut all = all_changed_paths(dir.path()).unwrap();
+        all.sort();
+        assert_eq!(all, paths);
+
+        let out = commit_paths_with_trailers(dir.path(), "Move", None, None, &paths).unwrap();
+        let mut committed = out.files.clone();
+        committed.sort();
+        assert_eq!(committed, paths);
+        let st = crate::status::status(dir.path()).unwrap();
+        assert!(st.files.is_empty(), "tree must be clean: {:?}", st.files);
     }
 
     #[test]
