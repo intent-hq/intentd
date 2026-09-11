@@ -221,8 +221,9 @@ async fn run(
     let max_lines = opt_i64(args, "maxLines");
     let ceiling = run_timeout_ceiling_secs(budget);
     // `timeoutSeconds` with the `timeout` alias (reference parity). An
-    // omitted timeout defaults to the ceiling rather than the service-layer
-    // 30s so the `timedOut` envelope is always reachable within the budget.
+    // omitted timeout defaults to the ceiling: `None` makes the service
+    // layer wait unbounded, so the `timedOut` envelope would never be
+    // reachable within the budget.
     let timeout_seconds = match opt_i64(args, "timeoutSeconds").or_else(|| opt_i64(args, "timeout"))
     {
         Some(requested) if requested > ceiling => {

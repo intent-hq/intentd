@@ -1244,8 +1244,8 @@ async fn script_run_rejects_timeout_alias_above_eval_budget() {
 
 #[tokio::test]
 async fn script_run_omitted_timeout_defaults_to_ceiling() {
-    // `None` would resolve to the service-layer 30s — equal to the budget —
-    // so the default is pinned to the ceiling to keep `timedOut` reachable.
+    // `None` makes the service layer wait unbounded, so the default is
+    // pinned to the ceiling to keep `timedOut` reachable within the budget.
     let (srv, api) = server();
     let resp = call(&srv, "return await ws.script.run('s-1');").await;
     assert_eq!(resp["result"]["isError"], json!(false));
