@@ -2783,9 +2783,12 @@ pub(crate) const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
 pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
 
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5).
-/// `User` marks the FE `agent.sendMessage` RPC — the ONLY user-originated
-/// entry point — which is an explicit user action: it revives an archived
-/// workspace and retires a pending attention request. Everything else (MCP
+/// `User` marks the explicit user-action front doors — the FE
+/// `agent.sendMessage` RPC, a user-typed `agent.queueMessage` entry (the
+/// FE's mid-turn reply path, restored as `User` on drain),
+/// `agent.sendQueuedMessageNow`, and `agent.editAndRegenerate` — each of
+/// which revives an archived workspace and retires a pending attention
+/// request. Everything else (MCP
 /// front-door sends, reportToParent / completion-watch / event-subscription
 /// wakes, `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations)
 /// is `Automatic`: parked in the queue while the target's workspace is
@@ -2796,7 +2799,9 @@ pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
 /// paths fail closed (never mistaken for a user action).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageOrigin {
-    /// FE-originated `agent.sendMessage` (typed message or wizard answers).
+    /// FE-originated user action: `agent.sendMessage` (typed message or
+    /// wizard answers), a drained `agent.queueMessage` entry,
+    /// `agent.sendQueuedMessageNow`, or `agent.editAndRegenerate`.
     User,
     /// System/agent-originated delivery.
     #[default]
