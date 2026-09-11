@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.41] - 2026-09-11
+
+### 🐛 Bug Fixes
+
+- *(acp)* Reject over-budget timeoutSeconds in ws.script.run ([#1787](https://github.com/intent-hq/intentd/pull/1787))
+
+
 ## [0.9.40] - 2026-09-11
 
 ### 🐛 Bug Fixes

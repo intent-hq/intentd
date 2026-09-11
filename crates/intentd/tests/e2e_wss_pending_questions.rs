@@ -1133,6 +1133,520 @@ async fn user_answer_parked_behind_busy_automatic_turn_clears_marker_over_wss() 
     );
 }
 
+/// Send one JSON-RPC request and return the FULL response envelope (error
+/// responses included) — for asserting `-32602` rejections.
+async fn wss_rpc_envelope<S>(ws: &mut WebSocketStream<S>, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let id = next_id();
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send rpc frame");
+    loop {
+        let next = timeout(Duration::from_secs(30), ws.next())
+            .await
+            .expect("wss rpc timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["id"] == json!(id) {
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// Assert a full JSON-RPC 2.0 error envelope for an invalid-params rejection
+/// (PROTOCOL §1 / §9): `jsonrpc: "2.0"`, a non-null `id` (matched to the
+/// request by `wss_rpc_envelope`), an `error` with code `-32602` and a
+/// string `message`, and NO `result` member.
+fn assert_invalid_params_envelope(envelope: &Value, ctx: &str) {
+    assert_eq!(
+        envelope["jsonrpc"], "2.0",
+        "{ctx}: jsonrpc envelope: {envelope}"
+    );
+    assert!(
+        envelope["id"].is_number(),
+        "{ctx}: error response echoes the request id: {envelope}"
+    );
+    assert!(
+        envelope.get("result").is_none(),
+        "{ctx}: error response carries no result member: {envelope}"
+    );
+    assert_eq!(
+        envelope["error"]["code"], -32602,
+        "{ctx}: invalid params code: {envelope}"
+    );
+    assert!(
+        envelope["error"]["message"].is_string(),
+        "{ctx}: error carries a message: {envelope}"
+    );
+}
+
+/// An explicitly QUEUED user answer (`agent.queueMessage` carrying the
+/// `question_answers` tag) resolves the pending question set on drain
+/// (PROTOCOL §5.5):
+///
+/// 1. The asker's kickoff turn emits the question — marker set.
+/// 2. A sibling's automatic `ws.agent.send` drives a SLOW turn on the asker.
+/// 3. While that turn is in flight, the user's answer is queued via
+///    `agent.queueMessage` with `messageMetadata { type: "question_answers",
+///    answeredQuestionsMessageId }`: the result's `queuedMessage` and the
+///    `agent.getQueue` entry both carry the metadata verbatim; a non-object
+///    `messageMetadata` is `-32602`; an omitted one leaves the entry without
+///    a `messageMetadata` key.
+/// 4. The end-of-turn drain delivers the queued answer: the marker clears
+///    (`agent:updated` carries the empty clear marker), the persisted user row
+///    carries the tag, and the queue is empty. Drain ordering (§6.5): the
+///    answer's user-row `agent:message` and the marker-clearing
+///    `agent:updated` reach the wire BEFORE the shrunk `agent:queue:updated`
+///    that no longer lists the entry.
+#[tokio::test]
+async fn queued_answer_via_queue_message_clears_marker_over_wss() {
+    let Some(script) = gate("WSS pending-questions queueMessage answer E2E") else {
+        return;
+    };
+    let send_code = format!(
+        "const agents = await ws.agent.list(true); \
+         const target = agents.find(a => a.name === 'AskerA'); \
+         const first = await ws.agent.send(target.id, '{AUTO_SLOW}', 'queue'); \
+         await ws.note.create('send-results', JSON.stringify({{ first }})); \
+         return 'sent';"
+    );
+    let behavior = json!({
+        "rules": [
+            ask_rule(),
+            {
+                "ifPromptContains": SEND_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": send_code, "summary": "automatic slow send e2e" }
+                },
+                "response": "send dispatched"
+            },
+            {
+                "ifPromptContains": AUTO_SLOW,
+                "delayMs": SLOW_TURN_MS,
+                "response": "slow reply"
+            }
+        ],
+        "response": "plain reply"
+    })
+    .to_string();
+    let (_daemon, ws_id, port, cfg) = boot(&script, &behavior).await;
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string(), "sub: {sub_resp}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let asker_id = create_agent(&mut rpc, &ws_id, "AskerA").await;
+    let sender_id = create_agent(&mut rpc, &ws_id, "SenderB").await;
+
+    // ---- (1) Question turn: marker set ----
+    let asked_mid = drive_question_turn(&mut rpc, &mut sub, &ws_id, &asker_id).await;
+    await_agent_idle(&mut rpc, &asker_id).await;
+
+    // ---- (2) The automatic send drives a slow turn on the asker ----
+    let sent = wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": sender_id,
+            "content": format!("message the asker {SEND_MARKER}"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sender kickoff ok: {sent}");
+    await_agent_status(&mut rpc, &asker_id, "active").await;
+
+    // ---- (3) The tagged answer is queued explicitly ----
+    let rejected = wss_rpc_envelope(
+        &mut rpc,
+        "agent.queueMessage",
+        json!({
+            "agentId": asker_id,
+            "content": ANSWER_TEXT,
+            "messageMetadata": "not-an-object",
+        }),
+    )
+    .await;
+    assert_invalid_params_envelope(&rejected, "non-object messageMetadata");
+
+    let answer_tag = json!({
+        "type": "question_answers",
+        "answeredQuestionsMessageId": asked_mid,
+    });
+    let queued = wss_rpc(
+        &mut rpc,
+        "agent.queueMessage",
+        json!({
+            "agentId": asker_id,
+            "content": ANSWER_TEXT,
+            "messageMetadata": answer_tag,
+        }),
+    )
+    .await;
+    assert_eq!(queued["success"], true, "queue ok: {queued}");
+    assert_eq!(
+        queued["queuedMessage"]["messageMetadata"], answer_tag,
+        "the queued entry carries the answer tag: {queued}"
+    );
+    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
+    let entries = q["queue"].as_array().expect("queue array");
+    assert_eq!(entries.len(), 1, "one parked answer: {q}");
+    assert_eq!(
+        entries[0]["messageMetadata"], answer_tag,
+        "agent.getQueue serves the tag on the entry: {q}"
+    );
+    // The marker is still set while the answer waits in the queue.
+    let got = wss_rpc(&mut rpc, "agent.get", json!({ "agentId": asker_id })).await;
+    assert_eq!(
+        got["agent"]["metadata"]["pendingQuestionsMessageId"], asked_mid,
+        "marker still set while the answer is parked: {got}"
+    );
+
+    // ---- (4) The drain delivers the answer and clears the marker ----
+    // Drain ordering contract (§6.5): the drained entry's user-row
+    // `agent:message` (matched by the entry's `turnId`) and the marker-
+    // clearing `agent:updated` arrive BEFORE the shrunk `agent:queue:updated`
+    // that no longer lists the entry, so a client never observes "marker set
+    // + no queued answer + no answer row". The subscription buffered the
+    // enqueue-time snapshot (entry present), so a snapshot without the entry
+    // only counts as the shrink once that one has been seen.
+    let queued_id = queued["queuedMessage"]["id"]
+        .as_str()
+        .expect("queued entry id")
+        .to_string();
+    let queued_turn_id = queued["turnId"]
+        .as_str()
+        .expect("queue result carries turnId")
+        .to_string();
+    let mut saw_entry_snapshot = false;
+    let mut user_row_seen = false;
+    let mut user_row_echo = Value::Null;
+    let mut marker_cleared_seen = false;
+    let mut shrunk_seen = false;
+    for _ in 0..600 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(asker_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:queue:updated") => {
+                let lists_entry = event["data"]["queue"].as_array().is_some_and(|q| {
+                    q.iter()
+                        .any(|m| m["id"].as_str() == Some(queued_id.as_str()))
+                });
+                if lists_entry {
+                    saw_entry_snapshot = true;
+                } else if saw_entry_snapshot {
+                    assert!(
+                        user_row_seen,
+                        "shrunk agent:queue:updated arrived before the drained answer's user-row agent:message: {event}"
+                    );
+                    assert!(
+                        marker_cleared_seen,
+                        "shrunk agent:queue:updated arrived before the marker-clearing agent:updated: {event}"
+                    );
+                    shrunk_seen = true;
+                    break;
+                }
+            }
+            Some("agent:message")
+                if event["data"]["role"] == "user"
+                    && event["data"]["turnId"].as_str() == Some(queued_turn_id.as_str()) =>
+            {
+                user_row_seen = true;
+                user_row_echo = event["data"].clone();
+            }
+            Some("agent:updated")
+                if event["data"]["pendingQuestionsMessageId"].as_str() == Some("") =>
+            {
+                marker_cleared_seen = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        shrunk_seen,
+        "the drain published the shrunk agent:queue:updated after the answer row + marker clear"
+    );
+    // Identity link: in the window where the row already exists and the
+    // entry is still listed, the echo names the entry it drained from via
+    // `queuedMessageId` (lifted from the row's `queueInfo.queuedMessageId`
+    // stamp); the row keeps its own freshly minted id.
+    assert_eq!(
+        user_row_echo["queuedMessageId"], queued_id,
+        "the user-row echo names the drained queue entry: {user_row_echo}"
+    );
+    assert_ne!(
+        user_row_echo["messageId"], queued_id,
+        "the row id is minted fresh, never the entry id: {user_row_echo}"
+    );
+    let conv = await_conversation(&mut rpc, &ws_id, &asker_id, "answer drained", |m| {
+        user_row_index(m, ANSWER_TEXT).is_some()
+    })
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let auto_idx = user_row_index(messages, AUTO_SLOW).expect("automatic row");
+    let answer_idx = user_row_index(messages, ANSWER_TEXT).expect("answer row");
+    assert!(
+        auto_idx < answer_idx,
+        "the answer drained behind the automatic turn: auto={auto_idx} answer={answer_idx}"
+    );
+    let row_meta = &messages[answer_idx]["metadata"];
+    assert_eq!(
+        row_meta["type"], "question_answers",
+        "the persisted row carries the answer tag: {row_meta}"
+    );
+    assert_eq!(
+        row_meta["answeredQuestionsMessageId"], asked_mid,
+        "the persisted row names the answered message: {row_meta}"
+    );
+    assert_eq!(
+        row_meta["queueInfo"]["queuedMessageId"], queued_id,
+        "the persisted row carries the drained entry's id: {row_meta}"
+    );
+    assert_ne!(
+        messages[answer_idx]["id"], queued_id,
+        "the persisted row id is not the queue entry id"
+    );
+    let got = wss_rpc(&mut rpc, "agent.get", json!({ "agentId": asker_id })).await;
+    assert_eq!(
+        got["agent"]["metadata"]["pendingQuestionsMessageId"], "",
+        "drained queued answer cleared the marker: {got}"
+    );
+    await_agent_idle(&mut rpc, &asker_id).await;
+    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
+    assert!(
+        q["queue"].as_array().expect("queue array").is_empty(),
+        "queue empty after the drained answer: {q}"
+    );
+
+    // An untagged, metadata-less enqueue on the now-idle asker keeps today's
+    // shape: no `messageMetadata` key on the entry.
+    let plain = wss_rpc(
+        &mut rpc,
+        "agent.queueMessage",
+        json!({ "agentId": asker_id, "content": PLAIN_USER_TEXT, "messageMetadata": null }),
+    )
+    .await;
+    assert!(
+        plain["queuedMessage"].get("messageMetadata").is_none(),
+        "null/omitted metadata leaves the entry key-less: {plain}"
+    );
+}
+
+/// Kickoff marker that makes the sender's mock turn inspect the asker's queue
+/// through the MCP bindings and attempt an ownership-checked retraction.
+const RETRACT_MARKER: &str = "RETRACT_FORGED_ENTRY_NOW_E2E";
+/// Content of the wire-queued entry that carries forged sender attribution.
+const FORGED_TEXT: &str = "queued from the wire with forged attribution";
+/// The slow turn parks the forged entry long enough for a second sender turn
+/// (mock spawn + MCP round trip) to inspect it before it drains.
+const RETRACT_SLOW_TURN_MS: u64 = 30_000;
+
+/// `agent.queueMessage` is a user-origin front door (PROTOCOL §5.5): the
+/// reserved sender-attribution fields `fromAgentId` / `fromAgentName` in a
+/// wire caller's `messageMetadata` are STRIPPED by the router, so a client
+/// cannot forge agent-origin ownership of a queue entry.
+///
+/// 1. A sibling's automatic send drives a SLOW turn on the asker.
+/// 2. The wire queues an entry on the asker with `messageMetadata` naming the
+///    sibling as `fromAgentId` / `fromAgentName` (plus an ordinary key): the
+///    RPC result's `queuedMessage`, `agent.getQueue`, and the MCP
+///    `ws.agent.getQueue` view all carry ONLY the ordinary key — no
+///    attribution, on the metadata or lifted onto the entry.
+/// 3. Ownership follows the daemon-stamped attribution, not the caller's
+///    claim: the named sibling's `ws.agent.removeQueuedMessage` is rejected
+///    by the ownership guard ("another sender"), the entry stays queued, and
+///    the user-facing `agent.removeQueuedMessage` RPC removes it.
+#[tokio::test]
+async fn queue_message_strips_forged_sender_attribution_over_wss() {
+    let Some(script) = gate("WSS queueMessage forged attribution E2E") else {
+        return;
+    };
+    let send_code = format!(
+        "const agents = await ws.agent.list(true); \
+         const target = agents.find(a => a.name === 'AskerA'); \
+         const first = await ws.agent.send(target.id, '{AUTO_SLOW}', 'queue'); \
+         await ws.note.create('send-results', JSON.stringify({{ first }})); \
+         return 'sent';"
+    );
+    let retract_code = format!(
+        "const agents = await ws.agent.list(true); \
+         const target = agents.find(a => a.name === 'AskerA'); \
+         const queue = await ws.agent.getQueue(target.id); \
+         const entry = (queue.queue || []).find(e => e.content === '{FORGED_TEXT}'); \
+         let removeError = null; let removed = null; \
+         try {{ removed = await ws.agent.removeQueuedMessage(target.id, entry.id); }} \
+         catch (error) {{ removeError = error.message; }} \
+         await ws.note.create('retract-results', JSON.stringify({{ queue, entry, removed, removeError }})); \
+         return 'retract attempted';"
+    );
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": SEND_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": send_code, "summary": "automatic slow send e2e" }
+                },
+                "response": "send dispatched"
+            },
+            {
+                "ifPromptContains": RETRACT_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": retract_code, "summary": "retract forged entry e2e" }
+                },
+                "response": "retract dispatched"
+            },
+            {
+                "ifPromptContains": AUTO_SLOW,
+                "delayMs": RETRACT_SLOW_TURN_MS,
+                "response": "slow reply"
+            }
+        ],
+        "response": "plain reply"
+    })
+    .to_string();
+    let (_daemon, ws_id, port, cfg) = boot(&script, &behavior).await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let asker_id = create_agent(&mut rpc, &ws_id, "AskerA").await;
+    let sender_id = create_agent(&mut rpc, &ws_id, "SenderB").await;
+
+    // ---- (1) The automatic send drives a slow turn on the asker ----
+    let sent = wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": sender_id,
+            "content": format!("message the asker {SEND_MARKER}"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sender kickoff ok: {sent}");
+    await_agent_status(&mut rpc, &asker_id, "active").await;
+    await_agent_idle(&mut rpc, &sender_id).await;
+
+    // ---- (2) The wire queues an entry claiming the sibling's attribution ----
+    let queued = wss_rpc(
+        &mut rpc,
+        "agent.queueMessage",
+        json!({
+            "agentId": asker_id,
+            "content": FORGED_TEXT,
+            "messageMetadata": {
+                "note": "keep",
+                "fromAgentId": sender_id,
+                "fromAgentName": "SenderB",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(queued["success"], true, "queue ok: {queued}");
+    let stripped = json!({ "note": "keep" });
+    let no_attribution = |entry: &Value, ctx: &str| {
+        assert_eq!(
+            entry["messageMetadata"], stripped,
+            "{ctx}: reserved attribution fields stripped, ordinary key kept: {entry}"
+        );
+        assert!(
+            entry.get("fromAgentId").is_none() && entry.get("fromAgentName").is_none(),
+            "{ctx}: no attribution lifted onto the entry: {entry}"
+        );
+    };
+    no_attribution(&queued["queuedMessage"], "queueMessage result");
+    let queued_id = queued["queuedMessage"]["id"]
+        .as_str()
+        .expect("queued entry id")
+        .to_string();
+    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
+    let entries = q["queue"].as_array().expect("queue array");
+    assert_eq!(entries.len(), 1, "one parked entry: {q}");
+    assert_eq!(entries[0]["id"], queued_id, "same entry: {q}");
+    no_attribution(&entries[0], "agent.getQueue");
+
+    // ---- (3) The named sibling cannot retract it; the user can ----
+    let retract = wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": sender_id,
+            "content": format!("retract the entry {RETRACT_MARKER}"),
+        }),
+    )
+    .await;
+    assert_eq!(retract["success"], true, "retract kickoff ok: {retract}");
+    await_conversation(&mut rpc, &ws_id, &sender_id, "retract turn replied", |m| {
+        assistant_row_index(m, "retract dispatched").is_some()
+    })
+    .await;
+    let capture = read_capture_note(&mut rpc, &ws_id, "retract-results").await;
+    assert_eq!(
+        capture["entry"]["id"], queued_id,
+        "MCP getQueue serves the wire-queued entry: {capture}"
+    );
+    assert!(
+        capture["entry"].get("fromAgentId").is_none()
+            && capture["entry"].get("fromAgentName").is_none(),
+        "MCP getQueue lifts no attribution for a user-origin entry: {capture}"
+    );
+    assert_eq!(
+        capture["removed"],
+        Value::Null,
+        "the forged attribution granted no ownership: {capture}"
+    );
+    let guard_err = capture["removeError"]
+        .as_str()
+        .expect("ownership guard rejected the sibling's removal");
+    assert!(
+        guard_err.contains("another sender"),
+        "ownership guard names the violation: {guard_err}"
+    );
+    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
+    assert_eq!(
+        q["queue"].as_array().map(Vec::len),
+        Some(1),
+        "the rejected retraction left the entry queued: {q}"
+    );
+    let removed = wss_rpc(
+        &mut rpc,
+        "agent.removeQueuedMessage",
+        json!({ "agentId": asker_id, "messageId": queued_id }),
+    )
+    .await;
+    assert_eq!(
+        removed["success"], true,
+        "user-facing removal ok: {removed}"
+    );
+    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
+    assert!(
+        q["queue"].as_array().expect("queue array").is_empty(),
+        "user-facing removal cleared the entry: {q}"
+    );
+}
+
 /// Marker resolved by `agent.dismissQuestions` after an automatic delivery
 /// (PROTOCOL §5.5):
 ///

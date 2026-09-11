@@ -176,6 +176,7 @@ impl WorkspaceMcpServer {
             self.turn_attachments.clone(),
             effective_features.clone(),
             self.is_sub_agent,
+            self.workspace_api_timeout,
             pending.clone(),
         );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
@@ -626,6 +627,10 @@ fn stamp_and_collect(items: &mut [Value], known: &HashSet<String>) -> Vec<TurnAt
 /// `pub` (re-exported as `intent_acp::make_workspace_host_for_bridge`) so
 /// the background hook scheduler in `intent-services` applies the same
 /// sub-agent gate to hooks owned by background/delegated sessions.
+/// `eval_budget` is the wall-clock budget of the enclosing eval (the hook
+/// runner's per-run timeout); bindings that bound a wait by the eval budget
+/// (`ws.script.run`) derive their ceiling from it, so every caller must pass
+/// its real budget.
 pub fn make_workspace_host_for_bridge(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -633,6 +638,7 @@ pub fn make_workspace_host_for_bridge(
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: AgentFeaturesSettings,
     is_sub_agent: bool,
+    eval_budget: Duration,
 ) -> HostFn {
     make_workspace_host_with_pending(
         api,
@@ -641,6 +647,7 @@ pub fn make_workspace_host_for_bridge(
         turn_attachments,
         agent_features,
         is_sub_agent,
+        eval_budget,
         None,
     )
 }
@@ -650,7 +657,9 @@ pub fn make_workspace_host_for_bridge(
 /// result carries `__mcpContentItems` gets its resource items nonce-stamped
 /// and collected immediately, so `dispatch_workspace_api` registers them at
 /// the tool result regardless of what the agent's JS returns. Private —
-/// only the `workspace_api` dispatch wires a collector.
+/// only the `workspace_api` dispatch wires a collector. `eval_budget` is the
+/// wall-clock budget of the enclosing eval, threaded to the bindings.
+#[allow(clippy::too_many_arguments)]
 fn make_workspace_host_with_pending(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -658,6 +667,7 @@ fn make_workspace_host_with_pending(
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: AgentFeaturesSettings,
     is_sub_agent: bool,
+    eval_budget: Duration,
     pending: Option<PendingAttachments>,
 ) -> HostFn {
     let features = Arc::new(agent_features);
@@ -686,6 +696,7 @@ fn make_workspace_host_with_pending(
                 registry,
                 &features,
                 is_sub_agent,
+                eval_budget,
                 arg,
             )
             .await;
@@ -742,6 +753,7 @@ pub(super) const SUB_AGENT_CREATE_TOP_LEVEL_DENIED: &str =
 /// [`super::bindings::try_dispatch`], which owns the per-namespace method →
 /// trait mapping. Sub-agent `app.question.*` frames and methods gated by a
 /// disabled `[agentFeatures]` toggle are denied before dispatch.
+#[allow(clippy::too_many_arguments)]
 async fn workspace_host_dispatch(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -749,6 +761,7 @@ async fn workspace_host_dispatch(
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: &AgentFeaturesSettings,
     is_sub_agent: bool,
+    eval_budget: Duration,
     arg: Value,
 ) -> std::result::Result<Value, String> {
     let method = arg
@@ -817,6 +830,7 @@ async fn workspace_host_dispatch(
         turn_attachments.as_ref(),
         agent_features,
         is_sub_agent,
+        eval_budget,
         method,
         &args,
     )
