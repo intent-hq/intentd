@@ -2595,6 +2595,84 @@ async fn update_note_with_version_and_children_is_all_or_nothing() {
     );
 }
 
+/// A failure *inside* the body of `update_note_with_version_and_children`
+/// — after the parent UPDATE, its snapshot, and the first child have already
+/// executed — rolls all of them back: the second child's duplicate
+/// `(id, workspace_id)` INSERT fails, and afterwards the parent still holds
+/// its pre-write content and rev with no extra snapshot, the child row and
+/// its snapshot are absent, and the write pool is usable for the next write.
+#[tokio::test]
+async fn update_note_with_version_and_children_rolls_back_on_mid_body_child_error() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let mut parent = task_note(&ws_id, "Parent", None);
+    parent.content = "body".to_string();
+    let author = version_author();
+    let ts = now_iso();
+    store
+        .insert_note_with_version(&parent, &author, &ts)
+        .await
+        .expect("insert parent");
+
+    let mut child = task_note(&ws_id, "Child", None);
+    child.parent_id = Some(parent.id.clone());
+    child.content = "child body".to_string();
+    parent.content = "rewritten parent".to_string();
+    let result = store
+        .update_note_with_version_and_children(
+            &parent,
+            Some(0),
+            &[child.clone(), child.clone()],
+            &author,
+            &ts,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(intent_core::Error::Internal(_))),
+        "duplicate child insert fails the body: {result:?}"
+    );
+
+    let stored = store
+        .get_note(&ws_id, &parent.id)
+        .await
+        .expect("get parent");
+    assert_eq!((stored.content.as_str(), stored.rev), ("body", 0));
+    assert_eq!(
+        store
+            .list_note_versions(&ws_id, &parent.id)
+            .await
+            .expect("versions")
+            .len(),
+        1,
+        "parent snapshot rolled back"
+    );
+    assert!(matches!(
+        store.get_note(&ws_id, &child.id).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    assert_eq!(
+        newest_version(&store, &ws_id, &child.id).await,
+        None,
+        "first child's snapshot rolled back"
+    );
+    assert_eq!(
+        store.write_pool().size(),
+        1,
+        "connection returned to the pool"
+    );
+
+    let (rev, v) = store
+        .update_note_with_version(&parent, Some(0), &author, &ts)
+        .await
+        .expect("pool usable after rollback");
+    assert_eq!((rev, v), (1, 2));
+}
+
 /// Regression for monorepo#680 at the `update_note_with_comment` site: a
 /// `RAISE(ROLLBACK)` trigger on the note UPDATE fails the body *and*
 /// auto-rolls the transaction back, so the explicit ROLLBACK fails and the

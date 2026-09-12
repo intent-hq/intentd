@@ -139,6 +139,7 @@ struct Fixture {
     _ws: WsApiServer,
     port: u16,
     cfg: Arc<ClientConfig>,
+    store: Store,
     _dir: TempDir,
 }
 
@@ -151,7 +152,7 @@ async fn boot() -> Fixture {
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
-    let services = Services::new(store)
+    let services = Services::new(store.clone())
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(common::registry_with_default_provider(&dir))
         .with_event_bus(bus.clone());
@@ -172,6 +173,7 @@ async fn boot() -> Fixture {
         _ws: ws,
         port,
         cfg,
+        store,
         _dir: TempDir(dir),
     }
 }
@@ -374,4 +376,143 @@ async fn note_set_content_stale_expected_version_merges_over_wss() {
         stale_meta["error"]["data"]["current"]["rev"],
         json!(set_rev)
     );
+}
+
+/// Assert the full `-32005` error envelope for a `note.setContent` that did
+/// not write (docs/protocol/09-error-codes.md §9): `id` echoed, `jsonrpc`
+/// `"2.0"`, no `result`, `error.message` `"Conflict"`, `error.data.code`
+/// `"conflict"`, and `error.data.current` carrying the untouched entity.
+fn assert_conflict_envelope(v: &Value, id: i64, content: &str, rev: i64) {
+    assert_eq!(v["id"], json!(id), "{v}");
+    assert_eq!(v["jsonrpc"], json!("2.0"), "{v}");
+    assert!(v.get("result").is_none(), "no result on conflict: {v}");
+    assert_eq!(v["error"]["code"], json!(-32005), "{v}");
+    assert_eq!(v["error"]["message"], json!("Conflict"), "{v}");
+    assert_eq!(v["error"]["data"]["code"], json!("conflict"), "{v}");
+    assert_eq!(v["error"]["data"]["current"]["content"], json!(content));
+    assert_eq!(v["error"]["data"]["current"]["rev"], json!(rev));
+}
+
+/// The two `note.setContent` paths that do NOT merge share one wire contract
+/// (§5.2, §9): an `expectedVersion` above the current rev is rejected
+/// immediately, and a read-merge-persist loop whose every attempt misses its
+/// gate (a `RAISE(IGNORE)` trigger on the note row) is rejected after the
+/// bounded retries. Both return the identical `-32005` envelope carrying the
+/// untouched entity, persist nothing, and leave the daemon able to accept the
+/// next write on the same connection.
+#[tokio::test]
+async fn note_set_content_future_rev_and_retry_exhaustion_conflict_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+
+    let created = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({ "title": "setContent conflict e2e", "path": "." }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"].as_str().unwrap().to_string();
+    let note = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Conflict me", "content": "body" }),
+    )
+    .await;
+    let note_id = note["note"]["id"].as_str().expect("note id").to_string();
+    assert_eq!(note["note"]["rev"], json!(0));
+
+    // A rev this note never served: Conflict without a write.
+    let future = wss_rpc_raw(
+        &mut rpc,
+        3,
+        "note.setContent",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "content": "body future",
+            "expectedVersion": 7,
+        }),
+    )
+    .await;
+    assert_conflict_envelope(&future, 3, "body", 0);
+
+    // Every gated UPDATE misses: the bounded loop ends in the same Conflict.
+    sqlx::raw_sql(
+        "CREATE TABLE cas_misses(n INTEGER);
+         INSERT INTO cas_misses VALUES (0);
+         CREATE TRIGGER force_cas_miss BEFORE UPDATE ON note BEGIN
+             UPDATE cas_misses SET n = n + 1;
+             SELECT RAISE(IGNORE);
+         END;",
+    )
+    .execute(fx.store.write_pool())
+    .await
+    .expect("arm trigger");
+    let exhausted = wss_rpc_raw(
+        &mut rpc,
+        4,
+        "note.setContent",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "content": "body attempted",
+            "expectedVersion": 0,
+        }),
+    )
+    .await;
+    assert_conflict_envelope(&exhausted, 4, "body", 0);
+    assert_eq!(
+        exhausted["error"], future["error"],
+        "identical error payloads"
+    );
+    let misses: i64 = sqlx::query_scalar("SELECT n FROM cas_misses")
+        .fetch_one(fx.store.read_pool())
+        .await
+        .expect("count misses");
+    assert_eq!(misses, 5, "retry budget: exactly five gated attempts");
+
+    let after = wss_rpc(
+        &mut rpc,
+        5,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    assert_eq!(after["note"]["content"], json!("body"));
+    assert_eq!(after["note"]["rev"], json!(0));
+    let versions = wss_rpc(
+        &mut rpc,
+        6,
+        "note.listVersions",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    assert_eq!(
+        versions.as_array().map(Vec::len),
+        Some(1),
+        "only the creation snapshot: {versions}"
+    );
+
+    // Same connection, trigger gone: the next write lands at rev 1.
+    sqlx::query("DROP TRIGGER force_cas_miss")
+        .execute(fx.store.write_pool())
+        .await
+        .expect("disarm trigger");
+    let accepted = wss_rpc(
+        &mut rpc,
+        7,
+        "note.setContent",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "content": "body accepted",
+            "expectedVersion": 0,
+        }),
+    )
+    .await;
+    assert_eq!(accepted["ok"], json!(true));
+    assert_eq!(accepted["newContent"], json!("body accepted"));
+    assert_eq!(accepted["rev"], json!(1));
 }

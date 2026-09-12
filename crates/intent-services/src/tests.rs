@@ -2497,6 +2497,158 @@ async fn set_content_future_expected_version_conflicts_without_writing() {
     );
 }
 
+/// The read-merge-persist loop is bounded: when every attempt's gated UPDATE
+/// misses (a `RAISE(IGNORE)` trigger makes the note row unconditionally
+/// unmatchable, counting each attempt), `note.setContent` stops after exactly
+/// [`crate::SET_CONTENT_MAX_ATTEMPTS`] misses and surfaces the last
+/// `Conflict` — same shape as the future-rev case — with no content write
+/// and no snapshot appended. Once the trigger is gone the same write lands,
+/// so exhaustion leaves the write pool usable.
+#[tokio::test]
+async fn set_content_retry_exhaustion_conflicts_without_writing() {
+    let (_tmp, svc, ws, id) = setup_versioned("body").await;
+    sqlx::raw_sql(
+        "CREATE TABLE cas_misses(n INTEGER);
+         INSERT INTO cas_misses VALUES (0);
+         CREATE TRIGGER force_cas_miss BEFORE UPDATE ON note BEGIN
+             UPDATE cas_misses SET n = n + 1;
+             SELECT RAISE(IGNORE);
+         END;",
+    )
+    .execute(svc.store.write_pool())
+    .await
+    .expect("arm trigger");
+
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        svc.set_note_content(
+            ws.clone(),
+            id.clone(),
+            "body attempted".into(),
+            false,
+            Some(0),
+            None,
+        ),
+    )
+    .await
+    .expect("bounded loop terminates");
+    match r {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], serde_json::json!(0));
+            assert_eq!(current["content"], serde_json::json!("body"));
+        }
+        other => panic!("exhausted retries must be Conflict, got {other:?}"),
+    }
+    let misses: i64 = sqlx::query_scalar("SELECT n FROM cas_misses")
+        .fetch_one(svc.store.read_pool())
+        .await
+        .expect("count misses");
+    assert_eq!(
+        usize::try_from(misses).expect("non-negative miss count"),
+        crate::SET_CONTENT_MAX_ATTEMPTS,
+        "exactly one gated UPDATE per attempt"
+    );
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!((stored.content.as_str(), stored.rev), ("body", 0));
+    assert_eq!(
+        svc.store
+            .list_note_versions(&ws, &id)
+            .await
+            .expect("versions")
+            .len(),
+        1,
+        "no snapshot appended by a missed attempt"
+    );
+
+    sqlx::query("DROP TRIGGER force_cas_miss")
+        .execute(svc.store.write_pool())
+        .await
+        .expect("disarm trigger");
+    let ok = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "body accepted".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("pool usable after exhaustion");
+    assert_eq!((ok.new_content.as_str(), ok.rev), ("body accepted", 1));
+}
+
+/// Legacy history (snapshots from before migration 0120 carry `rev = NULL`)
+/// transitions to recoverable revisions on its own: while no snapshot for the
+/// writer's rev exists, a stale `expectedVersion` is the documented
+/// last-writer-wins replace, and each such write records a snapshot at its
+/// new rev — so the first rev a writer reads *after* the transition merges.
+#[tokio::test]
+async fn set_content_null_history_transitions_to_recoverable_revs() {
+    let (_tmp, svc, ws, id) = setup_versioned("legacy body").await;
+    sqlx::query("UPDATE note_version SET rev = NULL")
+        .execute(svc.store.write_pool())
+        .await
+        .expect("age the history");
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(&ws, &id, 0)
+            .await
+            .expect("lookup"),
+        None,
+        "legacy snapshot is not a base"
+    );
+
+    let first = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "legacy body agent".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("lww write");
+    assert_eq!(first.rev, 1);
+    let second = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "legacy body user".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("second lww write");
+    assert_eq!(
+        (second.new_content.as_str(), second.rev),
+        ("legacy body user", 2),
+        "rev 0 still has no base: replace, not merge"
+    );
+
+    // Rev 1 was snapshotted by the first write, so a writer based on it merges.
+    let merged = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "legacy body agent again".into(),
+            false,
+            Some(1),
+            None,
+        )
+        .await
+        .expect("merge onto recoverable base");
+    assert_eq!(merged.rev, 3);
+    assert!(
+        merged.new_content.contains("user") && merged.new_content.contains("again"),
+        "both intents survive: {:?}",
+        merged.new_content
+    );
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "legacy transition").await;
+}
+
 /// Conflict stays where it belongs (AC 6): the non-merging conditional writes
 /// — `note.update` (metadata arm), `note.updateMetadata`, `note.delete` —
 /// still surface a stale `expectedVersion` as `Conflict` (`-32005`).
