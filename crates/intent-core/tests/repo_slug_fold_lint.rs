@@ -34,7 +34,7 @@ const FOLD_CALLS: &[&str] = &[
 ];
 const SLUG_COMPONENTS: &[&str] = &["owner", "repo", "repository", "slug"];
 const OPT_OUT_MARKER: &str = "// repo-slug-fold: allow";
-const CFG_TEST: &str = "#[cfg(test)]";
+const CFG_TEST_TOKENS: &[&str] = &["#", "[", "cfg", "(", "test", ")", "]"];
 const EXEMPT_FILE: &[&str] = &["crates", "intent-core", "src", "repo_ref.rs"];
 const EXCERPT_CHARS: usize = 120;
 
@@ -53,23 +53,53 @@ enum Marker {
     WithoutReason,
 }
 
+/// A real `//` line comment found by the lexer (never one nested inside a
+/// block comment or a string literal).
+struct LineComment {
+    line: usize,
+    /// Only whitespace precedes the `//` on its line.
+    standalone: bool,
+    text: String,
+}
+
+/// Source text with comments/literals blanked, plus the line comments the
+/// lexer passed over on the way.
+struct Stripped {
+    text: String,
+    line_comments: Vec<LineComment>,
+}
+
+/// Marker state of one line comment's text: `Absent` unless the comment is
+/// exactly the marker token (not a longer word such as `allowance`),
+/// optionally followed by a separator and reason.
+fn classify_marker(comment: &str) -> Marker {
+    let Some(rest) = comment.strip_prefix(OPT_OUT_MARKER) else {
+        return Marker::Absent;
+    };
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Marker::Absent;
+    }
+    let reason = rest.trim().trim_start_matches(['—', '-', ':']).trim();
+    if reason.is_empty() {
+        Marker::WithoutReason
+    } else {
+        Marker::WithReason
+    }
+}
+
 /// Opt-out marker state per line; index 0 is a placeholder so the vector is
-/// addressed by 1-based line number.
-fn markers_by_line(src: &str) -> Vec<Marker> {
-    let mut out = vec![Marker::Absent];
-    for line in src.lines() {
-        let marker = match line.trim_start().strip_prefix(OPT_OUT_MARKER) {
-            None => Marker::Absent,
-            Some(rest) => {
-                let reason = rest.trim().trim_start_matches(['—', '-', ':']).trim();
-                if reason.is_empty() {
-                    Marker::WithoutReason
-                } else {
-                    Marker::WithReason
-                }
-            }
-        };
-        out.push(marker);
+/// addressed by 1-based line number. Only a standalone `//` line comment can
+/// carry the marker.
+fn markers_by_line(src: &str, line_comments: &[LineComment]) -> Vec<Marker> {
+    let mut out = vec![Marker::Absent; src.lines().count() + 1];
+    for comment in line_comments.iter().filter(|c| c.standalone) {
+        if let Some(slot) = out.get_mut(comment.line) {
+            *slot = classify_marker(&comment.text);
+        }
     }
     out
 }
@@ -103,19 +133,40 @@ fn raw_string_hashes(chars: &[char], i: usize) -> Option<usize> {
 
 /// Replaces every comment, string literal, and char literal with spaces
 /// (newlines preserved) so neither their contents nor their delimiters take
-/// part in statement splitting or identifier matching.
-fn blank_literals_and_comments(src: &str) -> String {
+/// part in statement splitting or identifier matching. Every `//` line
+/// comment the lexer consumes is also reported, since only those may carry
+/// the opt-out marker.
+fn blank_literals_and_comments(src: &str) -> Stripped {
     let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
+    let mut line_comments = Vec::new();
+    // Line bookkeeping is advanced lazily, only when a `//` comment is met,
+    // so newlines swallowed by the block-comment and string loops still count.
+    let mut line = 1usize;
+    let mut line_start = 0usize;
+    let mut counted_upto = 0usize;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
         let next = chars.get(i + 1).copied();
         if c == '/' && next == Some('/') {
+            let start = i;
+            for (offset, ch) in chars[counted_upto..start].iter().enumerate() {
+                if *ch == '\n' {
+                    line += 1;
+                    line_start = counted_upto + offset + 1;
+                }
+            }
+            counted_upto = start;
             while i < chars.len() && chars[i] != '\n' {
                 out.push(' ');
                 i += 1;
             }
+            line_comments.push(LineComment {
+                line,
+                standalone: chars[line_start..start].iter().all(|c| c.is_whitespace()),
+                text: chars[start..i].iter().collect(),
+            });
         } else if c == '/' && next == Some('*') {
             let mut depth = 0usize;
             while i < chars.len() {
@@ -200,7 +251,32 @@ fn blank_literals_and_comments(src: &str) -> String {
             i += 1;
         }
     }
-    out
+    Stripped {
+        text: out,
+        line_comments,
+    }
+}
+
+/// Whether the `#[cfg(test)]` token sequence starts at `i`, ignoring any
+/// whitespace between tokens (a blanked `/* comment */` inside the attribute
+/// leaves spaces behind, and `# [cfg(test)]` is legal Rust).
+fn starts_with_cfg_test(chars: &[char], i: usize) -> bool {
+    if chars.get(i) != Some(&'#') {
+        return false;
+    }
+    let mut j = i;
+    for token in CFG_TEST_TOKENS {
+        while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+            j += 1;
+        }
+        for want in token.chars() {
+            if chars.get(j) != Some(&want) {
+                return false;
+            }
+            j += 1;
+        }
+    }
+    true
 }
 
 /// Blanks every `#[cfg(test)]` attribute together with the item that follows
@@ -209,11 +285,10 @@ fn blank_literals_and_comments(src: &str) -> String {
 /// attribute cannot hide inside a string or comment.
 fn blank_cfg_test_items(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
-    let marker: Vec<char> = CFG_TEST.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < chars.len() {
-        if !chars[i..].starts_with(&marker) {
+        if !starts_with_cfg_test(&chars, i) {
             out.push(chars[i]);
             i += 1;
             continue;
@@ -328,8 +403,9 @@ fn excerpt(text: &str) -> String {
 /// Scans one Rust source file's text and returns every flagged statement
 /// that is not suppressed by a reasoned opt-out marker.
 fn scan_source(src: &str) -> Vec<Hit> {
-    let markers = markers_by_line(src);
-    let blanked = blank_cfg_test_items(&blank_literals_and_comments(src));
+    let stripped = blank_literals_and_comments(src);
+    let markers = markers_by_line(src, &stripped.line_comments);
+    let blanked = blank_cfg_test_items(&stripped.text);
     split_statements(&blanked)
         .into_iter()
         .filter(|s| is_flagged(&s.text))
@@ -702,6 +778,64 @@ fn opt_out_marker_must_sit_immediately_above_the_statement() {
     let hits = scan_source(src);
     assert_eq!(hit_lines(src), vec![4]);
     assert!(!hits[0].marker_without_reason);
+}
+
+#[test]
+fn opt_out_marker_counts_only_as_a_standalone_line_comment() {
+    // Inside a block comment: not a line comment at all.
+    let in_block = "fn slugify(repo_name: &str) -> String {\n    /*\n    // repo-slug-fold: allow — example */\n    repo_name.to_lowercase()\n}\n";
+    let hits = scan_source(in_block);
+    assert_eq!(hit_lines(in_block), vec![4], "{hits:?}");
+    assert!(!hits[0].marker_without_reason);
+
+    // Inside a string literal that spans lines.
+    let in_string = "fn slugify(repo_name: &str) -> String {\n    let _doc = \"\n    // repo-slug-fold: allow — example\";\n    repo_name.to_lowercase()\n}\n";
+    assert_eq!(hit_lines(in_string), vec![4]);
+
+    // Trailing on a code line: not standalone.
+    let trailing = "fn slugify(repo_name: &str) -> String {\n    let _n = 1; // repo-slug-fold: allow — example\n    repo_name.to_lowercase()\n}\n";
+    let hits = scan_source(trailing);
+    assert_eq!(hit_lines(trailing), vec![3], "{hits:?}");
+    assert!(!hits[0].marker_without_reason);
+}
+
+#[test]
+fn opt_out_marker_must_match_the_whole_token() {
+    for marker in [
+        "// repo-slug-fold: allowance",
+        "// repo-slug-fold: allow_me — reason",
+        "// repo-slug-fold: allows — reason",
+    ] {
+        let src = format!(
+            "fn slugify(repo_name: &str) -> String {{\n    {marker}\n    repo_name.to_lowercase()\n}}\n"
+        );
+        let hits = scan_source(&src);
+        assert_eq!(hit_lines(&src), vec![3], "{marker:?}: {hits:?}");
+        assert!(!hits[0].marker_without_reason, "{marker:?}");
+    }
+}
+
+#[test]
+fn cfg_test_attribute_matches_across_comments_and_whitespace() {
+    let src = r"
+#[cfg(/* tests only */ test)]
+fn helper(owner: &str) -> String {
+    owner.to_ascii_lowercase()
+}
+
+# [ cfg ( test ) ]
+mod tests {
+    fn folds(owner: &str, repo: &str) -> bool {
+        owner.to_lowercase() == repo.to_lowercase()
+    }
+}
+
+#[cfg(not(test))]
+fn real(owner: &str) -> String {
+    owner.to_lowercase()
+}
+";
+    assert_eq!(hit_lines(src), vec![line_of(src, "fn real(owner") + 1]);
 }
 
 #[test]
