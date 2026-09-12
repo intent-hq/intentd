@@ -34,6 +34,8 @@ use tokio::task::JoinHandle;
 pub(super) struct RootWatch {
     inner: Arc<Mutex<Inner>>,
     task: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    root: PathBuf,
 }
 
 #[derive(Default)]
@@ -70,14 +72,26 @@ impl RootWatch {
     /// is the ancestor watch (the correct sync point for creation detection),
     /// not the recursive watch on the intended root, which only exists after
     /// promotion. Panics on timeout so a wedged registration is diagnosed
-    /// here rather than as a downstream "no event" failure.
+    /// here rather than as a downstream "no event" failure — and immediately
+    /// once the watch loop has ended without storing a watch (every
+    /// registration attempt failed and was logged; under full-suite
+    /// parallelism that is inotify instance exhaustion,
+    /// intent-hq/intent#4852), since nothing will establish it later.
     #[cfg(test)]
     pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
         while self.watched().is_none() {
             assert!(
+                !self.task.as_ref().is_some_and(JoinHandle::is_finished),
+                "watch loop for {} ended without establishing a watch (registration failed; see WARN logs); {}",
+                self.root.display(),
+                super::shared_watch::os_watch_limits()
+            );
+            assert!(
                 tokio::time::Instant::now() < deadline,
-                "watch registration did not establish within {timeout:?}"
+                "watch registration for {} did not establish within {timeout:?}; {}",
+                self.root.display(),
+                super::shared_watch::os_watch_limits()
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
@@ -98,6 +112,8 @@ pub(super) fn watch_root(
 ) -> RootWatch {
     let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(on_change);
     let inner = Arc::new(Mutex::new(Inner::default()));
+    #[cfg(test)]
+    let intended_root = root.clone();
     let task = tokio::spawn(watch_loop(
         root,
         filename_matches,
@@ -107,6 +123,8 @@ pub(super) fn watch_root(
     RootWatch {
         inner,
         task: Some(task),
+        #[cfg(test)]
+        root: intended_root,
     }
 }
 

@@ -42,10 +42,14 @@ pub(crate) static WATCHER_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::
 /// has to outlast a worst-case full-suite parallel `cargo test` stall — OS
 /// watch registration plus fsevents delivery under load (monorepo#1630) —
 /// never a passing run. Mirrors `script_ops`' `LIVENESS` (monorepo#515).
+/// It must also expire BEFORE nextest's 180s slow-test kill
+/// (`.config/nextest.toml`, monorepo#1562): a longer wait is never observed —
+/// the run reports a bare timeout instead of the assertion naming the stalled
+/// step (intent-hq/intent#4845 / #4852).
 /// Negative assertions (things that must NOT happen) keep their own short
 /// bounds; do not use this constant for them.
 #[cfg(test)]
-pub(crate) const LIVENESS: std::time::Duration = std::time::Duration::from_secs(300);
+pub(crate) const LIVENESS: std::time::Duration = std::time::Duration::from_secs(150);
 
 #[cfg(test)]
 mod bus_tests;

@@ -115,16 +115,28 @@ impl SpecialistsWatcher {
         }
     }
 
-    /// Await the user-tier root watch actually being established. Its
-    /// registration is deferred off the caller's thread (monorepo#1572), so
-    /// tests must wait for it before mutating that directory. The project tier
-    /// rides the shared stream and needs no separate sync point — subscribing is
-    /// synchronous bookkeeping.
+    /// Await the user-tier root watch and every project-tier shared watch
+    /// actually being established. Both registrations are deferred off the
+    /// caller's thread (monorepo#1572) — subscribing to the shared stream is
+    /// synchronous bookkeeping, but the OS `watch()` behind it is not — so
+    /// tests must wait for both before mutating either tier
+    /// (intent-hq/intent#4852). Panics with a diagnostic on a dead watch or on
+    /// `timeout`.
     #[cfg(test)]
     #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: Duration) {
         for watch in &self._user_watchers {
             watch.wait_established(timeout).await;
+        }
+        let probes: Vec<_> = self
+            .workspace_watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(TierWatch::probe)
+            .collect();
+        for probe in &probes {
+            probe.wait_live(timeout).await;
         }
     }
 
