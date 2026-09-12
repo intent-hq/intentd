@@ -92,7 +92,15 @@ fn compose_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
 ///   repo's `.claude/settings*.json` and `CLAUDE.md` no longer load. The
 ///   `user` tier is deliberately kept: `~/.claude/settings.json` carries
 ///   `apiKeyHelper` / `env` auth routing, and dropping it would break
-///   completions for anyone authenticating that way.
+///   completions for anyone authenticating that way;
+/// - `strictMcpConfig: true` reaches the SDK through the same spread and
+///   spawns the CLI with `--strict-mcp-config`. `--tools ""` only removes the
+///   built-in tools and `--setting-sources` only governs `settings*.json`;
+///   user-scope MCP servers live in `~/.claude.json`, which neither flag
+///   touches, so without this the CLI would still connect them and attach
+///   their tool schemas. The adapter never sets it on its own, and it only
+///   passes `--mcp-config` for a non-empty `mcpServers` map (the one-shot
+///   sends none), so strict mode means zero MCP servers.
 pub(crate) fn one_shot_session_shape(
     provider_id: &str,
     prompt: &str,
@@ -107,6 +115,7 @@ pub(crate) fn one_shot_session_shape(
             "options": {
                 "tools": [],
                 "settingSources": ["user"],
+                "strictMcpConfig": true,
             }
         }
     });
@@ -815,8 +824,9 @@ rl.on('line', (line) => {
     /// intent-hq/intent#4587: the claude-code one-shot is a slimmed utility
     /// session — the caller's system prompt replaces the `claude_code` preset
     /// via a string `_meta.systemPrompt`, the built-in tools are disabled
-    /// mechanically, the project/local setting tiers are dropped, and the
-    /// turn carries the bare prompt (no duplicated `System:` composition).
+    /// mechanically, the project/local setting tiers are dropped, ambient
+    /// MCP servers are excluded, and the turn carries the bare prompt (no
+    /// duplicated `System:` composition).
     #[cfg(unix)]
     #[tokio::test]
     async fn complete_once_claude_code_sends_slimmed_session_meta() {
@@ -826,7 +836,13 @@ rl.on('line', (line) => {
             seen["sessionNew"]["_meta"],
             serde_json::json!({
                 "systemPrompt": "be terse",
-                "claudeCode": { "options": { "tools": [], "settingSources": ["user"] } },
+                "claudeCode": {
+                    "options": {
+                        "tools": [],
+                        "settingSources": ["user"],
+                        "strictMcpConfig": true,
+                    }
+                },
             })
         );
         assert_eq!(seen["sessionNew"]["mcpServers"], serde_json::json!([]));

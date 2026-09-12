@@ -6375,8 +6375,9 @@ async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
     // intent-hq/intent#4587: over the real WSS transport, a claude-code
     // `agent.completeOnce` opens the ephemeral session with a slimming
     // `_meta` — the caller's `systemPrompt` as a STRING (replaces the
-    // `claude_code` preset), `tools: []`, `settingSources: ["user"]` — and
-    // the turn carries the bare prompt (no `System:` composition). The mock
+    // `claude_code` preset), `tools: []`, `settingSources: ["user"]`,
+    // `strictMcpConfig: true` — and the turn carries the bare prompt (no
+    // `System:` composition). The mock
     // fixture records the `session/new` `_meta` verbatim through its
     // `MOCK_AGENT_SESSION_LOG` seam; a prompt-content rule proves the turn
     // shape through the returned `{ text }`.
@@ -6435,7 +6436,13 @@ async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
         calls[0]["meta"],
         serde_json::json!({
             "systemPrompt": "be terse",
-            "claudeCode": { "options": { "tools": [], "settingSources": ["user"] } },
+            "claudeCode": {
+                "options": {
+                    "tools": [],
+                    "settingSources": ["user"],
+                    "strictMcpConfig": true,
+                }
+            },
         }),
         "claude-code session/new `_meta` on the wire"
     );
