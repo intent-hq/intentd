@@ -2291,6 +2291,26 @@ mod tests {
             "https://github.com/acme/other.git"
         ));
         assert!(!origin_url_matches("/tmp/Acme/Widget", "/tmp/acme/widget"));
+        // An `@` in a path or a local path never folds into the GitHub slot,
+        // on either side of the comparison (mirrors the reader-side set in
+        // `origin_is_github_slot_recognizes_github_urls`).
+        for foreign in [
+            "https://example.invalid/a@github.com/acme/widget.git",
+            "/tmp/a@github.com:acme/widget.git",
+            "https://github.com.evil.example/acme/widget",
+            "./a@github.com:acme/widget.git",
+            "file:///tmp/a@github.com:acme/widget.git",
+        ] {
+            assert!(
+                !origin_url_matches("https://github.com/acme/widget.git", foreign),
+                "{foreign}"
+            );
+            assert!(
+                !origin_url_matches(foreign, "https://github.com/acme/widget.git"),
+                "{foreign}"
+            );
+            assert!(origin_url_matches(foreign, foreign), "{foreign}");
+        }
     }
 
     /// [`github_slug`] isolates the URL authority before stripping userinfo,
