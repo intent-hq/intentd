@@ -90,33 +90,42 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
     }
 }
 
+/// The expected list is derived structurally (contiguous from 1, one entry per
+/// `migrations/*.sql` file) rather than spelled out literally, so adding a
+/// migration never requires editing this test while gaps, duplicates, and files
+/// the `sqlx::migrate!` macro silently skipped still fail.
 #[tokio::test]
 async fn migration_status_reports_current_after_open() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let status = store.migration_status().await.expect("migration status");
     assert!(status.is_current(), "fresh open must apply all migrations");
+    let count = i64::try_from(status.expected.len()).expect("migration count fits in i64");
+    let contiguous: Vec<i64> = (1..=count).collect();
     assert_eq!(
-        status.expected,
-        vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112, 113, 114, 115, 116, 117, 118, 119
-        ]
+        status.expected, contiguous,
+        "embedded migration versions must be contiguous from 1 (no gaps or duplicates)"
     );
     assert_eq!(
-        status.applied,
-        vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112, 113, 114, 115, 116, 117, 118, 119
-        ]
+        status.applied, status.expected,
+        "fresh open must apply exactly the embedded migrations"
+    );
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let sql_files = std::fs::read_dir(&dir)
+        .expect("read migrations dir")
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".sql")
+        })
+        .count();
+    assert_eq!(
+        status.expected.len(),
+        sql_files,
+        "every *.sql file in {dir:?} must be embedded by sqlx::migrate!"
     );
 }
 
