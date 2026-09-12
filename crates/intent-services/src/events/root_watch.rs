@@ -13,7 +13,8 @@
 //! intent-hq/monorepo#1572), which stalled daemon startup before the UDS
 //! socket was bound. Every registration is therefore performed on a detached
 //! OS thread — not the blocking pool, which the runtime waits for on shutdown
-//! — and failures are logged rather than returned.
+//! — and failures are logged rather than returned, then retried with capped
+//! backoff (see [`promote_loop`]).
 //!
 //! Event filtering also lives here: an event is forwarded when any of its
 //! paths falls under the canonical root and either matches the caller's
@@ -28,6 +29,8 @@ use std::sync::{Arc, Mutex};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+
+use super::shared_watch::{os_watch_limits, CREATE_RETRY_CAP, CREATE_RETRY_INITIAL};
 
 /// A watch on a single intended root that may not exist yet.
 /// Dropping this tears down the watcher and any pending promotion task.
@@ -73,10 +76,10 @@ impl RootWatch {
     /// not the recursive watch on the intended root, which only exists after
     /// promotion. Panics on timeout so a wedged registration is diagnosed
     /// here rather than as a downstream "no event" failure — and immediately
-    /// once the watch loop has ended without storing a watch (every
-    /// registration attempt failed and was logged; under full-suite
-    /// parallelism that is inotify instance exhaustion,
-    /// intent-hq/intent#4852), since nothing will establish it later.
+    /// once the watch loop has ended without storing a watch (a registration
+    /// thread that never reported), since nothing will establish it later.
+    /// A registration that merely *failed* is retried by the loop
+    /// (intent-hq/intent#4852), so that case waits, up to `timeout`.
     #[cfg(test)]
     pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -85,13 +88,13 @@ impl RootWatch {
                 !self.task.as_ref().is_some_and(JoinHandle::is_finished),
                 "watch loop for {} ended without establishing a watch (registration failed; see WARN logs); {}",
                 self.root.display(),
-                super::shared_watch::os_watch_limits()
+                os_watch_limits()
             );
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "watch registration for {} did not establish within {timeout:?}; {}",
                 self.root.display(),
-                super::shared_watch::os_watch_limits()
+                os_watch_limits()
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
@@ -243,6 +246,14 @@ fn recursive_watcher(
 /// non-recursively until the root (or a nearer ancestor) appears, then
 /// promote to a recursive watch on the actual root. Storing the promoted
 /// watcher replaces — and thereby tears down — the ancestor watch.
+///
+/// A failed registration (recursive or ancestor) is retried with the same
+/// capped exponential backoff the shared hub uses for watcher creation
+/// (intent-hq/intent#3708) rather than abandoning the root: the dominant
+/// failure is transient — inotify instance exhaustion, `EMFILE` — and a
+/// watch given up on there stays dead for the process lifetime with only a
+/// WARN to show for it (intent-hq/intent#4852). Dropping the [`RootWatch`]
+/// aborts the loop, retries included.
 async fn promote_loop(
     root: PathBuf,
     filename_matches: fn(&Path) -> bool,
@@ -250,6 +261,7 @@ async fn promote_loop(
     inner: Arc<Mutex<Inner>>,
 ) {
     let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<()>();
+    let mut backoff = CREATE_RETRY_INITIAL;
     loop {
         if root.exists() {
             match spawn_recursive_watcher(root.clone(), filename_matches, Arc::clone(&on_change))
@@ -260,8 +272,13 @@ async fn promote_loop(
                     tracing::warn!(
                         root = %root.display(),
                         error = %e,
-                        "recursive watch on newly created root failed; leaving stale ancestor watch"
+                        retry_in = ?backoff,
+                        os_watch_limits = %os_watch_limits(),
+                        "recursive watch on existing root failed; retrying"
                     );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(CREATE_RETRY_CAP);
+                    continue;
                 }
                 None => return,
             }
@@ -299,9 +316,13 @@ async fn promote_loop(
                     root = %root.display(),
                     ancestor = %ancestor.display(),
                     error = %e,
-                    "ancestor watch failed; root creation will not be detected"
+                    retry_in = ?backoff,
+                    os_watch_limits = %os_watch_limits(),
+                    "ancestor watch failed; retrying"
                 );
-                return;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(CREATE_RETRY_CAP);
+                continue;
             }
             None => return,
         }

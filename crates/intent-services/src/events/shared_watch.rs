@@ -658,11 +658,13 @@ impl SharedWatchHub {
 }
 
 /// First delay before retrying a failed watcher creation; doubles per failure.
-const CREATE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Shared with [`super::root_watch`]'s registration retry so both watch
+/// families recover from the same transient failure on the same schedule.
+pub(super) const CREATE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Ceiling for the creation-retry backoff, so a persistent failure (fd
 /// exhaustion, intent-hq/intent#3708) keeps probing about once a minute.
-const CREATE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+pub(super) const CREATE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Start a group's registrar: a DETACHED OS thread that builds the shared
 /// watcher and then serves `watch`/`unwatch` commands. Detached rather than
