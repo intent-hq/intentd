@@ -127,7 +127,7 @@ mod tests {
     /// were reached at all — the caller-context guards must reject before the
     /// service layer sees the call.
     #[derive(Default)]
-    #[allow(clippy::struct_field_names)]
+    #[expect(clippy::struct_field_names)]
     struct SpyApi {
         cancel_called: AtomicBool,
         schedule_called: AtomicBool,

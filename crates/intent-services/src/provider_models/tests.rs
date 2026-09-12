@@ -1621,7 +1621,7 @@ fn grok_outcome_rows_win_over_failed_exit() {
 // Holds CHILD_SPAWN_SERIAL across the spawn/await on purpose: the guard must
 // cover the whole child-spawning body so these fake-CLI execs never run
 // concurrently and starve one another.
-#[allow(clippy::await_holding_lock)]
+#[expect(clippy::await_holding_lock)]
 async fn opencode_models_cli_child_path_includes_binary_dir() {
     use std::os::unix::fs::PermissionsExt;
     // A fake opencode whose success is gated on its own parent dir being on
@@ -1653,7 +1653,7 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
+#[expect(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn grok_models_cli_child_path_includes_binary_dir() {
     use std::os::unix::fs::PermissionsExt;
     // Same enhanced-path contract as the opencode CLI spawn: the fake grok
@@ -1679,7 +1679,7 @@ async fn grok_models_cli_child_path_includes_binary_dir() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
+#[expect(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn grok_cli_timeout_flows_into_attributed_warning() {
     use std::os::unix::fs::PermissionsExt;
     // A wedged `grok models` must be cut short and the timeout reason must
@@ -2076,7 +2076,7 @@ async fn probe_rpc_error_survives_dead_child() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
+#[expect(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     use std::os::unix::fs::PermissionsExt;
     // A wedged `opencode models` must be reaped when the timeout elapses and
@@ -2129,7 +2129,7 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
+#[expect(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn opencode_timeout_flows_into_attributed_warning() {
     use std::os::unix::fs::PermissionsExt;
     // The timeout reason must surface through the fetch result attribution
@@ -2191,7 +2191,7 @@ fn parse_param_count_billions_handles_dense_and_moe_names() {
 
 #[test]
 // Small test constants: float→int casts are exact and saturating.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn fits_within_ram_applies_the_seventy_percent_threshold() {
     // A 20B dense model: ~20e9 * 0.6 + 1GiB headroom ≈ 12.99 GB. Comfortably
     // under 70% of 32 GiB (~22.4 GB).
@@ -2207,7 +2207,7 @@ fn fits_within_ram_applies_the_seventy_percent_threshold() {
 
 #[test]
 // Small test constants: float↔int casts are exact and saturating.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss

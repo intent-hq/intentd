@@ -440,7 +440,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
 /// setting was ignored at boot and the listener stayed down until manual toggle.
 #[tokio::test]
 // Port numbers are far below 2^53: loss-free in f64.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();

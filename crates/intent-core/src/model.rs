@@ -8,6 +8,18 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
+use crate::repo_ref::RepoRef;
+
+/// Builds a [`RepoRef`] from an optional owner/name pair: `Some` only when
+/// both halves are present and non-empty.
+fn repo_ref_from_parts(owner: Option<&str>, name: Option<&str>) -> Option<RepoRef> {
+    match (owner, name) {
+        (Some(owner), Some(name)) if !owner.is_empty() && !name.is_empty() => {
+            Some(RepoRef::new(owner, name))
+        }
+        _ => None,
+    }
+}
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the `PascalCase` variant names (`Active`/`Inactive`/`Archived`/
@@ -172,7 +184,7 @@ pub enum WorkspaceDisplayStatus {
 /// Workspace entity (§9.1).
 // The bool fields mirror the protocol's wire shape; grouping them would
 // change the serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -339,6 +351,19 @@ impl Workspace {
         .into_iter()
         .flatten()
         .find(|p| !p.is_empty())
+    }
+
+    /// The workspace's forge repository as a case-insensitive [`RepoRef`]
+    /// (`repositoryOwner` / `repositoryName`). Compare and key on this rather
+    /// than the raw fields: two workspaces whose slugs differ only in ASCII
+    /// case name the same repository. `None` when either half is missing or
+    /// empty.
+    #[must_use]
+    pub fn repo(&self) -> Option<RepoRef> {
+        repo_ref_from_parts(
+            self.repository_owner.as_deref(),
+            self.repository_name.as_deref(),
+        )
     }
 }
 
@@ -537,7 +562,7 @@ pub struct ContextUsage {
 }
 
 // serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -1076,7 +1101,7 @@ pub struct WorkspaceUpdate {
 /// Deserialize a JSON `null` as `Some(None)` (explicit clear) and a missing
 /// field as `None` (no change), so `Option<Option<T>>` on [`WorkspaceUpdate`]
 /// can distinguish the two. A present non-null value maps to `Some(Some(v))`.
-#[allow(clippy::option_option)] // the nesting IS the absent-vs-null distinction
+#[expect(clippy::option_option)] // the nesting IS the absent-vs-null distinction
 fn deserialize_optional_field<'de, T, D>(
     deserializer: D,
 ) -> std::result::Result<Option<Option<T>>, D::Error>
@@ -2837,7 +2862,7 @@ pub const WORKSPACE_STATUS_MESSAGE_MAX_LENGTH: usize = 500;
 /// (not persisted, §19.2). `provider` is immutable once set on first real use.
 // The bool fields mirror the TS wire shape; grouping them would change the
 // serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSession {
@@ -3290,7 +3315,7 @@ pub struct AgentMetadata {
 /// iOS coverflow reads.
 // The bool fields mirror the TS wire shape; grouping them would change the
 // serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLite {
@@ -3943,7 +3968,7 @@ pub struct FileStatus {
 /// The bools mirror the wire contract 1:1 (each an independent flag on the
 /// `git.status` result), so folding them into enums would diverge the model
 /// from the protocol shape.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitStatus {
@@ -4302,6 +4327,17 @@ pub struct PrMonitor {
     pub updated_at: String,
 }
 
+impl PrMonitor {
+    /// The monitored repository as a case-insensitive [`RepoRef`]
+    /// (`repoOwner` / `repoName`). Compare and key on this rather than the
+    /// raw fields: monitors whose slugs differ only in ASCII case watch the
+    /// same repository.
+    #[must_use]
+    pub fn repo(&self) -> RepoRef {
+        RepoRef::new(self.repo_owner.as_str(), self.repo_name.as_str())
+    }
+}
+
 /// How a [`WorkspaceGitRoot`] came to be tracked. Wire/DB words are the
 /// lowercase variant names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4359,6 +4395,17 @@ pub struct WorkspaceGitRoot {
     pub pull_requests: Option<Vec<PullRequestInfo>>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl WorkspaceGitRoot {
+    /// The root's detected forge repository as a case-insensitive [`RepoRef`]
+    /// (`repoOwner` / `repoName`). Compare and key on this rather than the
+    /// raw fields: roots whose slugs differ only in ASCII case name the same
+    /// repository. `None` when either half is missing or empty.
+    #[must_use]
+    pub fn repo(&self) -> Option<RepoRef> {
+        repo_ref_from_parts(self.repo_owner.as_deref(), self.repo_name.as_deref())
+    }
 }
 
 /// Host identification a client supplies about *its own* device in
@@ -4687,6 +4734,105 @@ mod tests {
         assert_eq!(ws.effective_path(), Some("/repo"));
         ws.repository_path = Some(String::new());
         assert_eq!(ws.effective_path(), None);
+    }
+
+    /// [`Workspace::repo`]: case-variant `repositoryOwner` / `repositoryName`
+    /// fold to one [`RepoRef`] identity; `None` when either half is missing or
+    /// empty.
+    #[test]
+    fn workspace_repo_folds_case_and_requires_both_halves() {
+        let mut ws = chief_workspace();
+        assert_eq!(ws.repo(), None);
+
+        ws.repository_owner = Some("Intent-HQ".to_string());
+        assert_eq!(ws.repo(), None);
+        ws.repository_name = Some(String::new());
+        assert_eq!(ws.repo(), None);
+
+        ws.repository_name = Some("IntentD".to_string());
+        let upper = ws.repo().expect("both halves present");
+        assert_eq!(upper, RepoRef::new("intent-hq", "intentd"));
+        assert_eq!(upper.owner, "Intent-HQ");
+        assert_eq!(upper.name, "IntentD");
+
+        let mut lower = ws.clone();
+        lower.repository_owner = Some("intent-hq".to_string());
+        lower.repository_name = Some("intentd".to_string());
+        assert_eq!(lower.repo(), ws.repo());
+
+        ws.repository_owner = Some(String::new());
+        assert_eq!(ws.repo(), None);
+        ws.repository_owner = None;
+        assert_eq!(ws.repo(), None);
+    }
+
+    fn git_root_with_repo(owner: Option<&str>, name: Option<&str>) -> WorkspaceGitRoot {
+        WorkspaceGitRoot {
+            id: WorkspaceGitRootId::from("root-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            path: "/repo".to_string(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: owner.map(str::to_string),
+            repo_name: name.map(str::to_string),
+            registered_by_agent_ids: Vec::new(),
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+        }
+    }
+
+    /// [`WorkspaceGitRoot::repo`]: same contract as [`Workspace::repo`] —
+    /// case-variant slugs are one identity, and a missing or empty half
+    /// yields `None`.
+    #[test]
+    fn workspace_git_root_repo_folds_case_and_requires_both_halves() {
+        assert_eq!(
+            git_root_with_repo(Some("Intent-HQ"), Some("IntentD")).repo(),
+            git_root_with_repo(Some("intent-hq"), Some("intentd")).repo()
+        );
+        assert_eq!(
+            git_root_with_repo(Some("Intent-HQ"), Some("IntentD")).repo(),
+            Some(RepoRef::new("INTENT-HQ", "INTENTD"))
+        );
+        assert_eq!(git_root_with_repo(None, None).repo(), None);
+        assert_eq!(git_root_with_repo(Some("intent-hq"), None).repo(), None);
+        assert_eq!(git_root_with_repo(None, Some("intentd")).repo(), None);
+        assert_eq!(git_root_with_repo(Some(""), Some("intentd")).repo(), None);
+        assert_eq!(git_root_with_repo(Some("intent-hq"), Some("")).repo(), None);
+    }
+
+    /// [`PrMonitor::repo`] equals a case-variant [`RepoRef`] while keeping
+    /// the stored casing on the fields.
+    #[test]
+    fn pr_monitor_repo_equals_case_variant_repo_ref() {
+        let monitor = PrMonitor {
+            monitor_id: PrMonitorId::from("m-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "Intent-HQ".to_string(),
+            repo_name: "IntentD".to_string(),
+            pr_number: 7,
+            state: PrMonitorState::Active,
+            last_snapshot: None,
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+        };
+        let repo = monitor.repo();
+        assert_eq!(repo, RepoRef::new("intent-hq", "intentd"));
+        assert_eq!(repo.identity_key(), "intent-hq/intentd");
+        assert_eq!(repo.owner, "Intent-HQ");
+        assert_eq!(repo.name, "IntentD");
+        assert_ne!(repo, RepoRef::new("other-org", "intentd"));
     }
 
     /// [`note_list_slim_row`] projection (§5.2, monorepo#3573): `content` is

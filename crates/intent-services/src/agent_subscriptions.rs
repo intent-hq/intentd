@@ -455,7 +455,7 @@ impl Services {
     ///   to hear monitoring-idle advisories (PR #1686 review). The ask path
     ///   (`register_completion_watch_strict_durable`) never adopts through
     ///   here, so it cannot re-narrow a full watch.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn insert_watch_in_memory(
         &self,
         parent_workspace_id: &WorkspaceId,

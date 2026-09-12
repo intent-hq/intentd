@@ -1672,7 +1672,7 @@ fn pid_is_alive(pid: u32) -> bool {
 /// call, never on a hot path. Best-effort throughout: pids that have since
 /// exited are silently skipped, never an error.
 async fn sample_process_tree(root: u32) -> (f32, u64) {
-    #[allow(unused_mut)]
+    #[cfg_attr(not(unix), expect(unused_mut))]
     let mut pids: Vec<u32> = vec![root];
     #[cfg(unix)]
     pids.extend(

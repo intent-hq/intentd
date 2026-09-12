@@ -1005,7 +1005,7 @@ where
     panic!("agent session never settled to idle; last: {last}");
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// DEAD-IDLE (monorepo#764): the child is `SIGKILLed` out-of-band while the
 /// agent sits idle after a completed turn. The proactive child-exit watcher
 /// reaps the handle (one WARN, no events, status untouched), and the next

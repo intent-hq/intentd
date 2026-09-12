@@ -35208,7 +35208,7 @@ async fn assign_agent_occupancy_guard_and_idempotent_reassign() {
 // agent.watch / agent.unwatch (monorepo#1229): explicit watches
 // ===========================================================================
 
-#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+#[expect(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// `agent.watch` registers a `wake_on_attention` watch; like every ungrouped
 /// watch it is deliver-once — the `agent:idle` wake retires it, and a second
 /// idle with no re-arm delivers nothing.
@@ -36053,7 +36053,7 @@ async fn agent_watch_attention_fanout_excludes_parent() {
     );
 }
 
-#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+#[expect(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// monorepo#3443: the attention fan-out reaches EVERY active completion
 /// watch, not just explicit `agent.watch` registrations — a watcher holding
 /// only an auto-registered (wakeOrCreate/delegate SUB-1 shape,
@@ -36108,7 +36108,7 @@ async fn attention_fanout_reaches_auto_registered_watch() {
     assert!(!watches[0].wake_on_attention, "attention flag unchanged");
 }
 
-#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+#[expect(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// monorepo#3443: an auto-registered GROUPED watch (`wake_on_attention:
 /// false`, `group_id` set — the `after_all` delegation shape) also receives
 /// the attention wake, with the grouped settlement-promise wording.
@@ -36357,7 +36357,7 @@ async fn agent_watch_unwatch_validation_and_removal() {
     ));
 }
 
-#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+#[expect(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// Restart durability: an explicit watch survives daemon restart with its
 /// `wake_on_attention` flag intact.
 #[tokio::test]
@@ -37586,6 +37586,52 @@ async fn agent_snapshot_prs_terminal_state_anywhere_suppresses_stale_open_duplic
         svc.agent_state_snapshot_line(&agent).await,
         None,
         "all-suppressed pools keep the snapshot trivial"
+    );
+}
+
+/// The `(repo, number)` dedup key is the case-insensitive `RepoRef` identity:
+/// a git root recorded as `Intent-HQ/IntentD` and a workspace recorded as
+/// `intent-hq/intentd` are one repository, so the root's merged #1
+/// suppresses the workspace's stale open #1 and the workspace's open #2
+/// wins over the root's case-variant duplicate (label keeps the workspace
+/// casing).
+#[tokio::test]
+async fn agent_snapshot_prs_dedups_case_variant_repo_slugs() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Watcher").await;
+
+    let mut row = svc.store().get_workspace(&ws).await.expect("workspace");
+    row.repository_owner = Some("intent-hq".into());
+    row.repository_name = Some("intentd".into());
+    row.pull_requests = Some(vec![
+        tracked_pr(1, PullRequestStatus::Open, Some(true), Some("clean"), None),
+        tracked_pr(2, PullRequestStatus::Open, Some(true), Some("clean"), None),
+    ]);
+    svc.store().update_workspace(&row).await.expect("update ws");
+
+    let root = tracked_git_root(
+        &ws,
+        "/roots/same-repo-other-case",
+        Some("Intent-HQ"),
+        Some("IntentD"),
+        vec![
+            tracked_pr(1, PullRequestStatus::Merged, None, None, None),
+            tracked_pr(2, PullRequestStatus::Open, Some(true), Some("dirty"), None),
+        ],
+    );
+    svc.store()
+        .upsert_workspace_git_root(&root)
+        .await
+        .expect("upsert root");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["prs"],
+        json!({ "mergeable": ["intent-hq/intentd#2"] }),
+        "case-variant pools dedupe as one repository: {v}"
     );
 }
 

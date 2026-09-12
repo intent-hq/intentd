@@ -23,6 +23,7 @@ use intent_core::{
     MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED,
     SLIM_PAGE_BUDGET_BYTES,
 };
+use intent_sourcecontrol::RepoRef;
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
@@ -263,44 +264,46 @@ impl AgentSnapshotPrs {
 }
 
 /// Group tracked PR pools into the snapshot's `prs` object. `pools` yields
-/// `(owner, name, prs)` per repo; a pool with a blank (empty/whitespace)
-/// owner or name is skipped entirely — no meaningful label can be formed —
-/// matching the identity-less-root skip upstream. A merged/closed entry in
-/// ANY pool suppresses that `(repo, number)` entirely: the freshest terminal
-/// state wins over a stale open duplicate regardless of which pool carries
-/// it. Among surviving open duplicates the workspace pool (yielded first)
-/// wins the grouping. Returns `None` when no open PR survives (the field is
-/// then omitted).
+/// `(repo, prs)` per repo; a pool with a blank (empty/whitespace) owner or
+/// name is skipped entirely — no meaningful label can be formed — matching
+/// the identity-less-root skip upstream. A merged/closed entry in ANY pool
+/// suppresses that `(repo, number)` entirely: the freshest terminal state
+/// wins over a stale open duplicate regardless of which pool carries it.
+/// Among surviving open duplicates the workspace pool (yielded first) wins
+/// the grouping. The repo half of the key is the case-insensitive
+/// [`RepoRef`] identity, so case-variant pools of one repository dedupe
+/// together. Returns `None` when no open PR survives (the field is then
+/// omitted).
 fn grouped_open_prs<'a>(
-    pools: impl IntoIterator<Item = (&'a str, &'a str, &'a [PullRequestInfo])>,
+    pools: impl IntoIterator<Item = (RepoRef, &'a [PullRequestInfo])>,
 ) -> Option<AgentSnapshotPrs> {
-    let pools: Vec<(&str, &str, &[PullRequestInfo])> = pools
+    let pools: Vec<(RepoRef, &[PullRequestInfo])> = pools
         .into_iter()
-        .filter(|(owner, name, _)| !owner.trim().is_empty() && !name.trim().is_empty())
+        .filter(|(repo, _)| !repo.owner.trim().is_empty() && !repo.name.trim().is_empty())
         .collect();
     // Seed the seen-set with every merged/closed key so a terminal state in
     // any pool suppresses stale open duplicates of the same PR.
-    let mut seen: HashSet<(&str, &str, u64)> = HashSet::new();
-    for &(owner, name, prs) in &pools {
-        for pr in prs {
+    let mut seen: HashSet<(RepoRef, u64)> = HashSet::new();
+    for (repo, prs) in &pools {
+        for pr in *prs {
             if matches!(
                 pr.status,
                 PullRequestStatus::Merged | PullRequestStatus::Closed
             ) {
-                seen.insert((owner, name, pr.number));
+                seen.insert((repo.clone(), pr.number));
             }
         }
     }
     let mut groups = AgentSnapshotPrs::default();
-    for &(owner, name, prs) in &pools {
-        for pr in prs {
-            if !seen.insert((owner, name, pr.number)) {
+    for (repo, prs) in &pools {
+        for pr in *prs {
+            if !seen.insert((repo.clone(), pr.number)) {
                 continue;
             }
             if let Some(group) = groups.group_for(pr) {
                 group.push(crate::harness::latest().pr_monitor_label(
-                    owner,
-                    name,
+                    &repo.owner,
+                    &repo.name,
                     pr.number.cast_signed(),
                 ));
             }
@@ -310,7 +313,7 @@ fn grouped_open_prs<'a>(
 }
 
 // serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
@@ -968,7 +971,7 @@ fn ensure_provider_runnable(
 /// flag still rehydrate.
 // The independent bool flags ARE the durable payload shape; grouping them
 // would break persisted-payload rehydration.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
@@ -3028,7 +3031,7 @@ impl Services {
     /// the slot's stream stamp, so unlike persisted rows it advances across
     /// successive reads of the same turn — deliberate: the row IS the
     /// liveness signal, and the id is the stable reconciliation key.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn agent_get_conversation_op(
         &self,
         agent_id: AgentId,
@@ -3571,7 +3574,7 @@ impl Services {
     /// upsert the created session without a follow-up `agent.get` round-trip.
     /// This is a superset of the earlier `{ id, name }` shape, so existing
     /// callers that only read `agent.id` / `agent.name` stay green.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn agent_create_op(
         &self,
         workspace_id: WorkspaceId,
@@ -10771,23 +10774,15 @@ impl Services {
                 Vec::new()
             }
         };
-        let mut pools: Vec<(&str, &str, &[PullRequestInfo])> = Vec::new();
+        let mut pools: Vec<(RepoRef, &[PullRequestInfo])> = Vec::new();
         if let Some(ws) = &workspace {
-            if let (Some(owner), Some(name), Some(prs)) = (
-                ws.repository_owner.as_deref(),
-                ws.repository_name.as_deref(),
-                ws.pull_requests.as_deref(),
-            ) {
-                pools.push((owner, name, prs));
+            if let (Some(repo), Some(prs)) = (ws.repo(), ws.pull_requests.as_deref()) {
+                pools.push((repo, prs));
             }
         }
         for root in &roots {
-            if let (Some(owner), Some(name), Some(prs)) = (
-                root.repo_owner.as_deref(),
-                root.repo_name.as_deref(),
-                root.pull_requests.as_deref(),
-            ) {
-                pools.push((owner, name, prs));
+            if let (Some(repo), Some(prs)) = (root.repo(), root.pull_requests.as_deref()) {
+                pools.push((repo, prs));
             }
         }
         grouped_open_prs(pools)
@@ -12817,7 +12812,7 @@ impl Services {
     /// entry. The archived-workspace drain gate delivers post-archive
     /// user-origin entries instead of parking them (intent-hq/intent#3883),
     /// and a drained user-origin entry keeps its originator's semantics.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message(
         &self,
         agent_id: &AgentId,
@@ -12846,7 +12841,7 @@ impl Services {
     /// delivery uses this so a restart retry adopts the already-persisted queue
     /// entry instead of creating a duplicate terminal wake. `origin` is stored
     /// as the entry's `user_origin` flag (see [`Services::enqueue_message`]).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message_with_id(
         &self,
         agent_id: &AgentId,
@@ -12973,7 +12968,7 @@ impl Services {
     /// persist/publish the updated queue, and kick delivery (wakes an idle
     /// agent; a busy agent picks the entry up at its next drain). Returns
     /// `true` iff a held entry existed for the key.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) async fn release_held_message(
         &self,
         agent_id: &AgentId,

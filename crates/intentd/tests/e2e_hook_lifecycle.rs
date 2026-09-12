@@ -466,7 +466,7 @@ async fn await_conversation_contains<S>(
     }
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Full background-hook lifecycle over the real WSS wire (see module docs).
 #[tokio::test]
 async fn hook_lifecycle_over_wss() {

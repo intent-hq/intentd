@@ -379,7 +379,7 @@ async fn merge_squash_creates_single_commit_on_trunk() {
     let _ = handle.await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 #[tokio::test]
 async fn undo_push_rewinds_remote_branch() {
     let base_guard = tmp_base("undo-push");

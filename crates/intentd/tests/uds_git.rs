@@ -1377,7 +1377,7 @@ async fn uds_git_get_branches_round_trip() {
     let _ = server.await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Over-the-wire `git.pull` slice: the workspace-create auto-pull (PROTOCOL
 /// §5.6). Path-based like `git.getBranches` — the repo does NOT need to be a
 /// registered workspace. Covers the checked-out fast-forward pull (with a

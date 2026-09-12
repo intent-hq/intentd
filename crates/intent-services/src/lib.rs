@@ -441,7 +441,7 @@ pub struct Services {
     /// `intent_providers::find_npx`; `Some(inner)` pins the result — including
     /// `Some(None)` to simulate a host without npx, which cannot be arranged
     /// hermetically through the real discovery.
-    #[allow(clippy::option_option)] // the nesting IS the no-override vs pinned distinction
+    #[expect(clippy::option_option)] // the nesting IS the no-override vs pinned distinction
     one_shot_npx: Option<Option<PathBuf>>,
     /// Test-only override (milliseconds) for the auto-commit message
     /// generation timeout. Production composition leaves this `None` and the
@@ -4400,10 +4400,9 @@ impl Services {
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
         use pr_ops::PrRefreshOutcome;
-        let (Some(owner), Some(name)) = (root.repo_owner.clone(), root.repo_name.clone()) else {
+        let Some(repo_ref) = root.repo() else {
             return Ok(PrRefreshOutcome::Skipped);
         };
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, name);
         // The live HEAD read is git I/O (roots may live on network/FUSE
         // mounts), so it runs on the blocking pool — never inline on the
         // runtime.
@@ -4647,10 +4646,9 @@ impl Services {
         if ws.is_remote || ws.archived {
             return Ok(PrRefreshOutcome::Skipped);
         }
-        let Ok((owner, repo)) = pr_ops::repo_of(&ws) else {
+        let Ok(repo_ref) = pr_ops::repo_of(&ws) else {
             return Ok(PrRefreshOutcome::Skipped);
         };
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         if let Some(number) = ws.pr_number {
             let pr = sc
@@ -7478,7 +7476,7 @@ impl Services {
     /// indefinitely; the retry replays the advisory-allowed delivery pass
     /// and the stable message id keeps every attempt idempotent. `grouped`
     /// (STAB-160 shape when `true`) only picks the wake's trailer wording.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn deliver_monitoring_idle_advisory(
         &self,
         child_id: &AgentId,
@@ -9338,18 +9336,20 @@ async fn sibling_workspace_or_throw(
 }
 
 /// Normalized GitHub `(owner, name)` for sibling matching: both parts
-/// non-empty, lowercased (GitHub owner/repo names are case-insensitive), with a
-/// trailing `.git` stripped from the lowercased name so `INTENT.GIT` matches
-/// `intent`. `None` when the workspace has no complete GitHub identity
-/// (local-only repo, or not yet backfilled).
+/// non-empty, case-folded through the [`intent_sourcecontrol::RepoRef`]
+/// identity (GitHub owner/repo names are case-insensitive), with a trailing
+/// `.git` stripped from the folded name so `INTENT.GIT` matches `intent`.
+/// `None` when the workspace has no complete GitHub identity (local-only
+/// repo, or not yet backfilled).
 fn github_repository_identity(ws: &Workspace) -> Option<(String, String)> {
-    let owner = ws.repository_owner.as_deref()?.trim().to_ascii_lowercase();
-    let name = ws.repository_name.as_deref()?.trim().to_ascii_lowercase();
-    let name = name.strip_suffix(".git").unwrap_or(&name);
+    let (owner, name) = ws.repo()?.identity_parts();
+    let owner = owner.trim();
+    let name = name.trim();
+    let name = name.strip_suffix(".git").unwrap_or(name);
     if owner.is_empty() || name.is_empty() {
         return None;
     }
-    Some((owner, name.to_string()))
+    Some((owner.to_string(), name.to_string()))
 }
 
 fn nonempty_repository_path(ws: &Workspace) -> Option<&str> {
@@ -12856,7 +12856,7 @@ pub(crate) fn event_completion_report(data: &serde_json::Value) -> Option<&str> 
 /// `agent:failed` / `agent:deleted`). Returned so the seal callers share the
 /// delivery pass's probes instead of re-probing (monorepo#1281).
 #[derive(Clone, Copy, Debug, Default)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub(crate) struct CompletionIdleClassification {
     /// Queue/busy interim (monorepo#1281/#1297): ready-to-send entries remain
     /// or a worker turn is in flight — the agent's delegating turn is not
@@ -13825,7 +13825,7 @@ impl Services {
     /// `createPrerequisite` and `convertBlocks`. `caller_agent_id` attributes
     /// the emitted `task:created` to the acting agent when the creation is
     /// agent-driven.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn create_child_task_note(
         &self,
         workspace_id: &WorkspaceId,
@@ -14014,7 +14014,7 @@ impl Services {
                         {
                             // Settings schema bounds the port to u16 range;
                             // the float→int cast saturates anyway.
-                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             let port = new_port as u16;
                             // Check if listener is running
                             if let Some(current_port) = control.ws_listener_port().await {
@@ -17283,13 +17283,17 @@ impl WorkspaceApi for Services {
                     // or STAB-64-derived above) is ignored with a warn —
                     // deriving another repository's branch names onto this
                     // checkout would silently check out unrelated content or
-                    // fail the create on an unresolvable `baseRef`.
+                    // fail the create on an unresolvable `baseRef`. Each
+                    // known part is compared under `RepoRef` identity (the
+                    // other part held to the link's own) so a missing part
+                    // never counts as a mismatch.
                     let pr_link = pr_link.filter(|link| {
+                        let link_ref = intent_sourcecontrol::RepoRef::new(&link.owner, &link.repo);
                         let owner_mismatch = input.repository_owner.as_deref().is_some_and(|o| {
-                            !o.is_empty() && !o.eq_ignore_ascii_case(&link.owner)
+                            !o.is_empty() && intent_sourcecontrol::RepoRef::new(o, &link.repo) != link_ref
                         });
                         let name_mismatch = input.repository_name.as_deref().is_some_and(|n| {
-                            !n.is_empty() && !n.eq_ignore_ascii_case(&link.repo)
+                            !n.is_empty() && intent_sourcecontrol::RepoRef::new(&link.owner, n) != link_ref
                         });
                         if owner_mismatch || name_mismatch {
                             tracing::warn!(
@@ -21553,14 +21557,14 @@ impl WorkspaceApi for Services {
             if !old_content.is_empty() {
                 // Note sizes are far below 2^53 (loss-free in f64); the rounded
                 // percentage is in [0, 100] so the float→int cast is exact.
-                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_precision_loss)]
                 let old_len = old_content.chars().count() as f64;
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(clippy::cast_precision_loss)]
                 let new_len = content.chars().count() as f64;
                 let reduction = (old_len - new_len) / old_len * 100.0;
                 if reduction > 50.0 && !confirm_replacement {
                     // The rounded percentage is in (50, 100]: exact in i64.
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_possible_truncation)]
                     let reduction_pct = reduction.round() as i64;
                     return Err(Error::Internal(format!(
                         "⚠️ CONTENT REDUCTION DETECTED: Your new content ({} chars) is {}% shorter than the existing content ({} chars).\n\nThis will REPLACE the entire note. If you intended to:\n- ADD content: Use note.add instead\n- EDIT a section: Use note.edit instead\n- PROCEED with replacement: Call note.setContent again with confirmReplacement=true",
@@ -21861,7 +21865,7 @@ impl WorkspaceApi for Services {
             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             // Asset sizes are far below 2^53 (loss-free in f64); the rounded
             // KiB count fits i64, and the float→int cast saturates anyway.
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
             let size_kb = ((data.len() as f64) / 1024.0).round() as i64;
             let mime_type = note_ops::mime_from_extension(&asset_id);
             Ok(ReadAssetResult {
@@ -22138,7 +22142,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         workspace_id: WorkspaceId,
@@ -22262,7 +22265,7 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::similar_names)] // stats/status are both the natural domain names
+    #[expect(clippy::similar_names)] // stats/status are both the natural domain names
     fn task_list(
         &self,
         workspace_id: WorkspaceId,
@@ -22943,7 +22946,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_add(
         &self,
         workspace_id: WorkspaceId,
@@ -23372,7 +23374,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_respond(
         &self,
         workspace_id: WorkspaceId,
@@ -25003,7 +25004,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         workspace_id: WorkspaceId,
@@ -27069,10 +27069,9 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         Box::pin(async move {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let repo_ref = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc
                 .get_pr(&repo_ref, number)
                 .await
@@ -27132,13 +27131,15 @@ impl WorkspaceApi for Services {
             // Cross-repo override (`{ repo: "owner/name" }`) wins over the
             // workspace repo; either way the resolved repo is echoed in the
             // result so a wrong-repo read is detectable.
-            let (owner, repo) = match repo {
-                Some(slug) => pr_ops::parse_repo_slug(&slug)?,
+            let repo_ref = match repo {
+                Some(slug) => {
+                    let (owner, repo) = pr_ops::parse_repo_slug(&slug)?;
+                    intent_sourcecontrol::RepoRef::new(owner, repo)
+                }
                 None => pr_ops::repo_of(&ws)?,
             };
-            let repo_slug = format!("{owner}/{repo}");
+            let repo_slug = format!("{}/{}", repo_ref.owner, repo_ref.name);
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
                 intent_sourcecontrol::Error::NotFound(_) => {
                     Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
@@ -27287,7 +27288,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_pulls_list(
         &self,
         owner: String,
@@ -27329,7 +27329,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_pulls_search(
         &self,
         owner: String,
@@ -27511,7 +27510,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_issues_list(
         &self,
         owner: String,
@@ -27553,7 +27551,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_issues_search(
         &self,
         owner: String,
@@ -29792,7 +29789,7 @@ impl Services {
     /// Run the requested action's step sequence, accumulating per-step status.
     /// A failing step short-circuits with `success:false`; on success the
     /// recomputed metrics + refreshed git-status are emitted.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn ac_run_pipeline(
         &self,
         workspace_id: &WorkspaceId,
@@ -30085,10 +30082,9 @@ impl Services {
         if let Some(number) = ws.pr_number {
             return Ok((number, ws.pr_url.clone().unwrap_or_default()));
         }
-        let (owner, repo) = pr_ops::repo_of(&ws)
+        let repo_ref = pr_ops::repo_of(&ws)
             .map_err(|_| Error::Internal("No remote configured for this repository".to_string()))?;
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         let branch = ws.branch.clone();
         let target_branch = target
@@ -30139,9 +30135,8 @@ impl Services {
         let mut ws = self.store.get_workspace(&workspace_id).await.map_err(|_| {
             Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
         })?;
-        let (owner, repo) = pr_ops::repo_of(&ws)?;
+        let repo_ref = pr_ops::repo_of(&ws)?;
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
         let options = intent_sourcecontrol::MergeOptions {
             commit_title,
             commit_message,
@@ -30593,7 +30588,7 @@ impl Services {
     /// (locally via `update-ref`, or on the remote via a refspec push), rebasing
     /// onto trunk first when the branch is behind. Mirrors the TS local-trunk /
     /// remote-trunk merge flow incl. the squash strategy and auto-rebase.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn ac_merge(
         &self,
         workspace_id: &WorkspaceId,
@@ -30930,7 +30925,7 @@ impl Services {
     /// trunk when it exists, else a local `update-ref` of `refs/heads/<trunk>`.
     /// `token` is the caller-resolved GitHub token (the merge flow resolves it
     /// once via [`Self::ac_git_token`] and threads it through).
-    #[allow(clippy::unused_self)] // instance method for parity with the other ac_* steps
+    #[expect(clippy::unused_self)] // instance method for parity with the other ac_* steps
     fn ac_advance_trunk(
         &self,
         worktree: &Path,

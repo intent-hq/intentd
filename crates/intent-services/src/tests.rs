@@ -10398,7 +10398,7 @@ mod change_event_parity {
         assert!(none.is_err(), "chief list must not publish a reseed event");
     }
 
-    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+    #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Self-heal for workspaces damaged by the pre-#110 global-note-identity
     /// bug: on `note.list` with no `id='spec'` note but exactly one top-level,
     /// non-task note titled "Spec", the stray is *adopted* — its `note.id` is
@@ -12617,7 +12617,7 @@ mod pr {
     use crate::Services;
 
     // Test stub: one independent bool per scripted scenario.
-    #[allow(clippy::struct_excessive_bools)]
+    #[expect(clippy::struct_excessive_bools)]
     #[derive(Default)]
     struct StubForge {
         fail_threads: bool,
@@ -14427,7 +14427,7 @@ mod pr {
         assert_eq!(evs.len(), 1);
     }
 
-    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+    #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     #[tokio::test]
     async fn refresh_all_pauses_between_workspaces() {
         // Inter-workspace pause (intent-hq/monorepo#703): the sweep sleeps
@@ -27518,7 +27518,7 @@ mod file_ops_service {
         }
     }
 
-    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+    #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Containment integration test: delegate an agent with isolation=cow, perform a
     /// file write through the agent-scoped ops path (`caller_agent_id` → `resolve_root`),
     /// and assert the write landed in the sandbox and the user's directory is untouched.
@@ -27722,7 +27722,7 @@ mod file_ops_service {
         let _ = fs::remove_dir_all(&test_root);
     }
 
-    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+    #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Wire-contract test: agent.delegate returns effectiveIsolation "pending"
     /// when an eligible `CoW` provisioning kicks off (monorepo#871 — the clone
     /// runs in a background task, off the delegate critical path). The settled

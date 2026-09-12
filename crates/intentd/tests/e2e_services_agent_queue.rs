@@ -93,7 +93,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
     (Arc::new(services), ws, tmp)
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 #[tokio::test]
 async fn agent_queue_add_get_remove_lifecycle() {
     let (services, ws, _tmp) = setup().await;

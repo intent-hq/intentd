@@ -74,7 +74,7 @@ fn resolve(terminal_id: &str) -> Result<PtyId> {
 /// initialize, while an explicit caller value is preserved. On POSIX, an omitted
 /// command launches zsh/bash with `-l` so login profiles are loaded; explicit
 /// commands and Windows defaults are unchanged.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn create(
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
@@ -321,7 +321,7 @@ pub(crate) fn get_buffer(
 /// `isExecutingCommand` is the child's liveness (the spawned process is the
 /// running command). `daemon_boot_id` is the daemon's per-process boot id, so
 /// clients can tell which daemon lifetime a (possibly empty) list belongs to.
-#[allow(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
+#[expect(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
 pub(crate) fn list(
     pty: &PtyHost,
     workspace_id: &WorkspaceId,

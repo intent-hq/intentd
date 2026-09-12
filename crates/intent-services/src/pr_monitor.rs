@@ -124,16 +124,14 @@ pub(crate) fn pr_monitor_fetches_per_tick(
 }
 
 /// The distinct `(owner, repo, pr)` identity a sweep dedupes fetches on.
-/// Forge slugs are case-insensitive, so the key folds case (matching the
-/// store's `COLLATE NOCASE` identity) and case-variant siblings share a fetch.
+/// Forge slugs are case-insensitive, so the key is the [`RepoRef`] identity
+/// ([`RepoRef::identity_parts`], matching the store's `COLLATE NOCASE`
+/// identity) and case-variant siblings share a fetch.
 type PrKey = (String, String, i64);
 
 fn pr_key(m: &PrMonitor) -> PrKey {
-    (
-        m.repo_owner.to_ascii_lowercase(),
-        m.repo_name.to_ascii_lowercase(),
-        m.pr_number,
-    )
+    let (owner, name) = m.repo().identity_parts();
+    (owner, name, m.pr_number)
 }
 
 /// One active monitor as the due-sweep sees it: its staleness anchor (parsed
@@ -1436,7 +1434,7 @@ impl Services {
             return Ok(false);
         }
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
+        let repo_ref = monitor.repo();
         let shared =
             match fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number.cast_unsigned())
                 .await
@@ -1574,7 +1572,7 @@ impl Services {
                     continue;
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
+                    let repo_ref = monitor.repo();
                     // The timeout is defense in depth above the client-level
                     // network timeouts: a fetch that pends indefinitely maps
                     // to an error (recorded as `lastError` below) instead of
@@ -2208,7 +2206,8 @@ impl Services {
             pr_ops::parse_repo_slug(&slug)
         } else {
             let ws = self.store.get_workspace(workspace_id).await?;
-            pr_ops::repo_of(&ws)
+            let RepoRef { owner, name } = pr_ops::repo_of(&ws)?;
+            Ok((owner, name))
         }
     }
 
@@ -2515,7 +2514,7 @@ mod tests {
 
     /// Mutable forge state one test can advance between polls.
     #[derive(Clone)]
-    #[allow(clippy::struct_excessive_bools)]
+    #[expect(clippy::struct_excessive_bools)]
     struct ForgeState {
         pr_state: PrState,
         draft: bool,

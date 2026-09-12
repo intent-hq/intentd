@@ -2355,7 +2355,7 @@ async fn wake_rows_serialized(
         .collect()
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#2528: the immediate `agent.reportToParent` wake over the real
 /// transport says "reported" (a report is not necessarily a completion) and
 /// keeps the parent's ungrouped completion watch armed across progress:
@@ -2626,7 +2626,6 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
     );
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Monitoring-idle advisory persistence (intent-hq/intent#4254): a child
 /// that goes idle while only externally monitoring (an active background
 /// hook here — the cheapest external wait to arrange hermetically; PR

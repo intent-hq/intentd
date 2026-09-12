@@ -465,7 +465,7 @@ pub fn create_transfer_bundle(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn build_bundle(
     ws: &Workspace,
     sandboxes: &[Sandbox],

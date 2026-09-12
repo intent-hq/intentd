@@ -1174,7 +1174,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `task.update`: atomic single-line edit with `expected` conflict check (§5.4).
     /// `caller_agent_id` attributes a write redirected to a linked task note
     /// (its `task:status-changed` / flipped-completion) to the calling agent.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn task_update(
         &self,
         workspace_id: WorkspaceId,
@@ -1261,7 +1261,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `caller_agent_id` attributes the resulting `task:created` /
     /// `task:status-changed` event to the invoking agent (the MCP front door
     /// passes it); `None` → system-attributed.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn mark_as_task(
         &self,
         workspace_id: WorkspaceId,
@@ -1508,7 +1508,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// turn's partial assistant message (streamed blocks so far) is appended
     /// as a trailing `inProgress: true` row (monorepo#3647); absent all
     /// optional params, behavior is byte-identical to before.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn agent_get_conversation(
         &self,
         agent_id: AgentId,
@@ -1736,7 +1736,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// Only `provider` currently lands on the persisted session; the other
     /// fields are accepted so the FE seam can bind to the wire shape ahead of
     /// full persistence.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn agent_create(
         &self,
         workspace_id: WorkspaceId,
@@ -1813,7 +1813,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// [`MessageOrigin::Automatic`], which enqueues instead of starting a
     /// turn while the target's workspace is archived. Pending questions gate
     /// neither origin.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn agent_send_message(
         &self,
         workspace_id: WorkspaceId,
@@ -1943,7 +1943,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `agent.sendMessage`. An explicit `model` must be a bare model id
     /// (compound `provider:model` ids reject `-32602` at the wire boundary,
     /// §5.5).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn agent_edit_and_regenerate(
         &self,
         workspace_id: WorkspaceId,
@@ -2875,7 +2875,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `<!--anchor:{id}:start/end-->` markers, so a client that inserted
     /// optimistic anchors under that id converges with the daemon's rewrite.
     /// Absent → the daemon mints a fresh UUID (backward compatible).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn comment_add(
         &self,
         workspace_id: WorkspaceId,
@@ -2953,7 +2953,7 @@ pub trait WorkspaceApi: Send + Sync {
     ///
     /// `author_type` is the optional wire `authorType` (`"user"` | `"agent"`);
     /// it defaults to `agent` for backward compatibility with agent/MCP callers.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn comment_respond(
         &self,
         workspace_id: WorkspaceId,
@@ -3359,7 +3359,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// root instead of the workspace worktree (monorepo#2053): an unknown id
     /// — or one registered to a different workspace — is `InvalidParams`
     /// (`-32602`). `None` preserves the primary-worktree behavior exactly.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         workspace_id: WorkspaceId,
@@ -3835,7 +3835,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.pulls.create`: open a PR with `head` sent **verbatim** (no
     /// `owner:branch` login prefix) — `{ pull }` (PROTOCOL §5.27).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn github_pulls_create(
         &self,
         owner: String,
@@ -3870,7 +3870,7 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `github.pulls.list`: `GET /repos/{owner}/{repo}/pulls` → `{ pulls, nextToken }`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn github_pulls_list(
         &self,
         owner: String,
@@ -3915,7 +3915,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.pulls.search`: `GET /search/issues` (`is:pr` + `@me`
     /// involvement + free-text `query`) → `{ pulls, nextToken }`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn github_pulls_search(
         &self,
         owner: String,
@@ -3952,7 +3952,6 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.pulls.merge`: `PUT /repos/{owner}/{repo}/pulls/{number}/merge`
     /// → `{ merged, message, sha? }`.
-    #[allow(clippy::too_many_arguments)]
     fn github_pulls_merge(
         &self,
         owner: String,
@@ -4045,7 +4044,6 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.issues.list`: `GET /repos/{owner}/{repo}/issues` (PRs filtered
     /// out) → `{ issues, nextToken }`.
-    #[allow(clippy::too_many_arguments)]
     fn github_issues_list(
         &self,
         owner: String,
@@ -4103,7 +4101,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.issues.search`: `GET /search/issues` (`is:issue` + free-text
     /// `query`) → `{ issues, nextToken }`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn github_issues_search(
         &self,
         owner: String,
@@ -5436,7 +5434,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `{ requestId, matches: MessageMatch[] }` inline, or
     /// `{ requestId, matches: [] }` (a prompt ack) when the result set is
     /// streamed via `search:result`/`search:done` (PROTOCOL §5.15 / §6.5).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn search_messages(
         &self,
         workspace_id: Option<WorkspaceId>,

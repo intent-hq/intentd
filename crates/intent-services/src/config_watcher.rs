@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn watcher_detects_rename_style_atomic_save() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()

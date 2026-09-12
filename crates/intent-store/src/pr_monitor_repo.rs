@@ -1,6 +1,9 @@
 //! PR-monitor repository: CRUD for agent-owned pull-request watches. Rows are
 //! written through by the centralized monitor loop and rehydrated at boot via
-//! [`Store::load_active_pr_monitors`].
+//! [`Store::load_active_pr_monitors`]. The `repo_owner` / `repo_name` identity
+//! is compared under `COLLATE NOCASE` (migration `0119`) — the SQL counterpart
+//! of the case-insensitive `RepoRef` identity in `intent-sourcecontrol` —
+//! while the stored casing is kept verbatim.
 
 use intent_core::{AgentId, PrMonitor, PrMonitorId, PrMonitorState, Result, WorkspaceId};
 use sqlx::sqlite::SqliteRow;

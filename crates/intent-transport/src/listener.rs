@@ -133,7 +133,7 @@ where
 ///
 /// Returns the underlying I/O error if binding or serving the local socket fails.
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn serve_uds_with_reverse<F>(
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
@@ -220,7 +220,7 @@ where
 /// Generic over the split stream halves so the Unix socket and Windows named
 /// pipe share one frame loop byte-for-byte.
 #[cfg(any(unix, windows))]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn handle_connection<R, W>(
     read_half: R,
     write_half: W,
@@ -425,7 +425,7 @@ where
 /// duplex pipe) — so other non-admin users cannot connect, though this is not
 /// a strict 0600 equivalent.
 #[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn serve_uds_with_reverse<F>(
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
@@ -533,7 +533,7 @@ where
 /// crate must expose it on every platform. Any attempt to serve reports an
 /// `Unsupported` error at runtime.
 #[cfg(not(any(unix, windows)))]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn serve_uds_with_reverse<F>(
     _api: Arc<dyn WorkspaceApi>,
     _bus: EventBus,

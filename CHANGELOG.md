@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.46] - 2026-09-12
+
+### 🐛 Bug Fixes
+
+- *(transfer)* Move CoW-copied sandbox submodules to the sandbox gitlinks ([#1810](https://github.com/intent-hq/intentd/pull/1810))
+- Route remaining repo-slug comparisons through RepoRef ([#1815](https://github.com/intent-hq/intentd/pull/1815))
+
+### 🧪 Testing
+
+- *(intentd)* PTY background-process-group job-control e2e harness ([#1816](https://github.com/intent-hq/intentd/pull/1816))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(lint)* Enable clippy::allow_attributes and migrate allows to expect ([#1813](https://github.com/intent-hq/intentd/pull/1813))
+
+
+## [0.9.45] - 2026-09-12
+
+### 🚀 Features
+
+- *(sourcecontrol)* Case-insensitive RepoRef identity ([#1809](https://github.com/intent-hq/intentd/pull/1809))
+
+### 🐛 Bug Fixes
+
+- *(intent-core)* Detach login-shell PATH capture from the controlling tty ([#1808](https://github.com/intent-hq/intentd/pull/1808))
+- *(services)* Slim the claude-code one-shot utility session ([#1801](https://github.com/intent-hq/intentd/pull/1801))
+
+### 🧪 Testing
+
+- *(store)* Derive expected migration list instead of hard-coding it ([#1805](https://github.com/intent-hq/intentd/pull/1805))
+
+
 ## [0.9.44] - 2026-09-12
 
 ### 🐛 Bug Fixes

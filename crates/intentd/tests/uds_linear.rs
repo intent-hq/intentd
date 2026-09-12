@@ -51,7 +51,7 @@ fn issue(identifier: &str) -> LinearIssueResult {
 /// `NotConfigured` (→ the daemon's "not configured" `-32603`); otherwise it
 /// records the typed `filter`/`query` it was called with and returns canned data.
 // Token recorders are `Option<Option<_>>`: never-called vs called-with-None.
-#[allow(clippy::option_option)]
+#[expect(clippy::option_option)]
 struct StubEngine {
     fail: bool,
     seen_filter: Arc<Mutex<Option<IssueFilter>>>,

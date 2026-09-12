@@ -382,7 +382,7 @@ async fn await_conversation_contains(
 }
 
 /// Poll `agent.getQueue` until the predicate holds (or panic at the deadline).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn await_queue<F>(
     rpc: &mut TlsWs,
     budget: Budget,

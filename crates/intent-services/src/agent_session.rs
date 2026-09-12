@@ -1119,7 +1119,7 @@ pub(crate) struct HarnessWakeOutcome {
     /// (the persisted-row event pair already carries the id); exercised by
     /// the wake-turn unit tests (hence the allow — the lib build has no
     /// reader).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub message_id: Option<String>,
     /// `true` when the turn's finalized transcript carried no meaningful
     /// content (see [`harness_wake_response_is_empty`]) — the incident
@@ -2725,7 +2725,7 @@ impl Services {
     /// id (monorepo#1022), stamped on the failure-arm `agent:failed` when
     /// present; bare callers (tests, harness paths) may pass `None` and the
     /// field is omitted.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     /// # Errors
     ///
     /// Returns `Error::Internal` if the `session/prompt` request fails or the transport drops mid-turn.

@@ -7,22 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Identifies a repository on a forge (host-agnostic).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepoRef {
-    pub owner: String,
-    pub name: String,
-}
-
-impl RepoRef {
-    /// Convenience constructor.
-    pub fn new(owner: impl Into<String>, name: impl Into<String>) -> Self {
-        Self {
-            owner: owner.into(),
-            name: name.into(),
-        }
-    }
-}
+/// Case-insensitive repository identity; defined in `intent-core` so every
+/// slug-holding crate shares one type, re-exported here at its historical path.
+pub use intent_core::RepoRef;
 
 /// Repository metadata (parity with the FE `GithubRepo`). Backs the
 /// `github.repos.list/search/get` browse surface. `url` carries GitHub's
@@ -390,7 +377,7 @@ pub struct AuthStatus {
 
 /// Capabilities a concrete host may or may not support (FE gates UI on these).
 // One bool per independent capability; the flat shape IS the wire contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScCapabilities {

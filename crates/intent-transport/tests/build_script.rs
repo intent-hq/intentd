@@ -1,3 +1,3 @@
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[path = "../build.rs"]
 mod build_script;
