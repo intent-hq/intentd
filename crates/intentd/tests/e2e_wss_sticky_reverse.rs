@@ -883,16 +883,25 @@ async fn heartbeat_abort_publishes_client_disconnected() {
     .await;
     assert!(ack.get("error").is_none(), "subscribe failed: {ack}");
 
-    // Hello with the capability, then never poll the socket again so no
-    // pong is ever answered; the reaper aborts the server task.
+    // Hello with the capability. The hello reply is the barrier for the
+    // connected state: the connection loop binds the identity onto its
+    // registry entry *before* it writes the reply (`conn.rs`), so once the
+    // reply has been read the registry holds a live, eligible target. It is
+    // observed here, directly, while the socket is still being polled
+    // (`wss_rpc` answers pings inline). Observing it only after the
+    // subscriber's `client:connected` frame instead races the reaper: under
+    // suite load that frame can arrive after the 200ms pong deadline has
+    // already aborted the silent connection (intent-hq/intent#4851).
     let silent = {
         let mut silent = connect(fx.port).await;
         let _ = wss_rpc(&mut silent, 1, "client.hello", hello("desktop-a", true)).await;
+        assert!(fx.registry.is_connected());
         silent
     };
+    // From here the socket is never polled again, so no pong is ever
+    // answered; the reaper aborts the server task.
     let ev = await_event(&mut sub, "client:connected", Duration::from_secs(2)).await;
     assert_eq!(ev["data"]["clientId"], "desktop-a");
-    assert!(fx.registry.is_connected());
 
     let ev = await_event(&mut sub, "client:disconnected", Duration::from_secs(5)).await;
     assert_eq!(
