@@ -917,7 +917,13 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `note.setContent`: full replace with the reduction guard (PROTOCOL §5.2).
-    /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
+    /// `expected_version` is the base `rev` the writer read: `None` or equal to
+    /// the current `rev` replaces as-is; a stale value three-way-merges
+    /// `diff(base → content)` onto the current text (honest last-writer-wins
+    /// when no snapshot survives for that rev) and only an exhausted
+    /// read-merge-persist retry loop surfaces `Conflict` (§5.2, §5.6). The
+    /// guard is measured against the base when one is recoverable. The result
+    /// carries the post-write `rev`.
     ///
     /// `caller_agent_id` attributes the captured note version to the invoking
     /// agent (the MCP front door passes it); `None` → user-authored.
