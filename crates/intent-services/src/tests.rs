@@ -22220,7 +22220,7 @@ mod rules {
     use super::{test_tempdir, workspace, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
-    struct TempTree(std::path::PathBuf, #[allow(dead_code)] tempfile::TempDir);
+    struct TempTree(std::path::PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     /// A worktree containing a `CLAUDE.md` workspace rule file.
     fn worktree() -> TempTree {
@@ -24087,7 +24087,7 @@ mod known_repo {
     async fn create_workspace_derives_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
-        struct TempRepo(PathBuf, #[allow(dead_code)] tempfile::TempDir);
+        struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -24339,7 +24339,7 @@ mod known_repo {
     async fn startup_prewarm_backfills_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
-        struct TempRepo(PathBuf, #[allow(dead_code)] tempfile::TempDir);
+        struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -24620,7 +24620,7 @@ mod worktree_provisioning {
     use intent_core::WorkspaceCreate;
 
     /// Temp directory tree swept on drop (see [`test_tempdir`]).
-    struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
         let guard = test_tempdir(&format!("{prefix}-"));
@@ -26802,7 +26802,7 @@ mod setup_lifecycle_events {
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
     /// Temp directory tree swept on drop (see [`test_tempdir`]).
-    struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
         let guard = test_tempdir(&format!("{prefix}-"));
@@ -29140,7 +29140,7 @@ mod clone_orchestration {
     use crate::{Error, EventBus, Services, SubscriptionFilter};
 
     /// Temp directory tree swept on drop (see [`test_tempdir`]).
-    struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
         let guard = test_tempdir(&format!("{prefix}-"));
@@ -30372,7 +30372,7 @@ mod repo_warm_cache {
     use crate::Services;
 
     /// Temp directory tree swept on drop (see [`test_tempdir`]).
-    struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
         let guard = test_tempdir(&format!("{prefix}-"));
@@ -38953,7 +38953,7 @@ mod local_changes {
     use crate::Services;
 
     /// Self-cleaning temp directory (see [`test_tempdir`]).
-    struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     impl TempDir {
         fn new() -> Self {

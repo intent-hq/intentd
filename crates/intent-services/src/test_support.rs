@@ -28,7 +28,8 @@ pub(crate) fn test_tempdir(prefix: &str) -> tempfile::TempDir {
 /// root. Use with `"/tmp"` when the dir must stay short enough for a UDS
 /// socket path (macOS caps them at ~104 bytes; `temp_dir()` resolves to a
 /// long `/var/folders/...` path).
-#[allow(dead_code)]
+// Mirrors `intentd/tests/common::test_tempdir_in`; no in-crate caller needs a short root yet.
+#[expect(dead_code)]
 pub(crate) fn test_tempdir_in(base: &str, prefix: &str) -> tempfile::TempDir {
     let mut dir = tempfile::Builder::new()
         .prefix(prefix)

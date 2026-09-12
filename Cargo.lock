@@ -2308,6 +2308,7 @@ dependencies = [
  "ignore",
  "intent-core",
  "serde",
+ "tempfile",
  "uuid",
 ]
 

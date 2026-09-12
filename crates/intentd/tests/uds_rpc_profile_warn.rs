@@ -190,7 +190,7 @@ async fn default_thresholds_stay_quiet_for_normal_traffic() {
     );
 }
 
-struct TempRepo(PathBuf, #[allow(dead_code)] tempfile::TempDir);
+struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
 /// Create a temporary git repo (initial commit on `main`) carrying the given
 /// `.intent/config.json` contents.

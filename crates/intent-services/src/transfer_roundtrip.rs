@@ -21,7 +21,7 @@ use crate::transfer_export::ExportState;
 use crate::Services;
 
 /// Temp directory swept on drop (see [`test_tempdir`]).
-struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
+struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 impl TempDir {
     fn new(prefix: &str) -> Self {
         let guard = test_tempdir(&format!("{prefix}-"));

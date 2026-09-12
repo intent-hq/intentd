@@ -9515,7 +9515,7 @@ async fn interrupt_send_during_turn_startup_queues_keep_alive() {
 // --- SP-B: spawn `agent_type` derived from the specialist's `agentType` -------
 
 /// Self-cleaning temp directory for hermetic specialist-file fixtures.
-struct TempSpecialistsDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
+struct TempSpecialistsDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
 impl TempSpecialistsDir {
     fn new() -> Self {
