@@ -1305,10 +1305,10 @@ impl ScriptManager {
     }
 
     /// Build the [`SpawnSpec`] for a run: login shell + `-c command`, workspace
-    /// scope, and the `FORCE_COLOR/TERM` + enhanced-PATH + commit-identity +
-    /// script env overlay, with an inherited `npm_config_prefix` scrubbed so
-    /// nvm's login-shell init succeeds. An explicit script env value is
-    /// preserved.
+    /// scope, and the `FORCE_COLOR/TERM` + `PAGER/GIT_PAGER=cat` +
+    /// enhanced-PATH + commit-identity + script env overlay, with an inherited
+    /// `npm_config_prefix` scrubbed so nvm's login-shell init succeeds. An
+    /// explicit script env value is preserved.
     fn build_spec(ws: &WorkspaceId, def: &Script, cwd: Option<&PathBuf>) -> SpawnSpec {
         let shell = default_shell();
         let mut spec = SpawnSpec::new(ws.as_str(), shell.clone());
@@ -1321,15 +1321,22 @@ impl ScriptManager {
     }
 }
 
-/// Build the env overlay for a spawned script/agent shell: `FORCE_COLOR/TERM`, an
-/// enhanced PATH (essential system dirs + homebrew + node/version-manager dirs),
-/// the commit-identity `GIT_*` vars resolved from `cwd`'s repository (so a
-/// `git commit` in the script uses the user's real identity —
-/// intent-hq/intent#4142; nothing is exported when no identity resolves, and
-/// a var already in the daemon's own env is inherited untouched), then the
-/// script's own `env` last so it can override. The enhanced PATH keeps
-/// git/node resolvable even when the daemon inherited a sparse Finder/launchd
-/// PATH or the login-shell init is degraded.
+/// Build the env overlay for a spawned script shell: `FORCE_COLOR/TERM`,
+/// `PAGER=cat` + `GIT_PAGER=cat` (the PTY has no keyboard, so a pager opened
+/// by a `PAGER`-honouring tool would hold the run open forever; `GIT_PAGER`
+/// also outranks a repo's `core.pager`), an enhanced PATH (essential system
+/// dirs + homebrew + node/version-manager dirs), the commit-identity `GIT_*`
+/// vars resolved from `cwd`'s repository (so a `git commit` in the script
+/// uses the user's real identity — intent-hq/intent#4142; nothing is exported
+/// when no identity resolves, and a var already in the daemon's own env is
+/// inherited untouched), then the script's own `env` last so it can override.
+/// The enhanced PATH keeps git/node resolvable even when the daemon inherited
+/// a sparse Finder/launchd PATH or the login-shell init is degraded.
+///
+/// Like every var here, the pager defaults are daemon-side defaults, not a
+/// hard guarantee: a tool-specific var the daemon inherited (e.g. `GH_PAGER`,
+/// `MANPAGER`) still takes precedence for that tool, and the login shell's
+/// startup files run after this overlay and may re-export any of it.
 fn spawn_env_overlay(
     cwd: Option<&std::path::Path>,
     def_env: Option<&std::collections::BTreeMap<String, String>>,
@@ -1337,6 +1344,8 @@ fn spawn_env_overlay(
     let mut env = vec![
         ("FORCE_COLOR".to_string(), "1".to_string()),
         ("TERM".to_string(), "xterm-256color".to_string()),
+        ("PAGER".to_string(), "cat".to_string()),
+        ("GIT_PAGER".to_string(), "cat".to_string()),
     ];
     if let Some(path) = enhanced_shell_path() {
         env.push(("PATH".to_string(), path));
@@ -1675,6 +1684,41 @@ mod tests {
         def_env.insert("MY_VAR".to_string(), "1".to_string());
         let env = spawn_env_overlay(None, Some(&def_env));
         assert_eq!(env.last(), Some(&("MY_VAR".to_string(), "1".to_string())));
+    }
+
+    /// The base overlay disables pagers (`PAGER`/`GIT_PAGER=cat`) for the
+    /// keyboard-less script PTY; an explicit script env value still wins
+    /// (applied last).
+    #[test]
+    fn spawn_overlay_disables_pagers_script_env_wins() {
+        let env = spawn_env_overlay(None, None);
+        for key in ["PAGER", "GIT_PAGER"] {
+            assert!(
+                env.iter().any(|(k, v)| k == key && v == "cat"),
+                "missing {key}=cat in {env:?}"
+            );
+        }
+
+        let mut def_env = std::collections::BTreeMap::new();
+        def_env.insert("PAGER".to_string(), "less".to_string());
+        def_env.insert("GIT_PAGER".to_string(), "delta".to_string());
+        let env = spawn_env_overlay(None, Some(&def_env));
+        let last = |key: &str| {
+            env.iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            last("PAGER"),
+            Some("less"),
+            "script env wins (applied last)"
+        );
+        assert_eq!(
+            last("GIT_PAGER"),
+            Some("delta"),
+            "script env wins (applied last)"
+        );
     }
 
     /// #4142: a script spawned inside a repo with a configured identity
@@ -3148,6 +3192,46 @@ mod tests {
             .await
             .expect("status");
         assert_eq!(st["status"], "exited");
+    }
+
+    /// A saved script runs in a PTY with no keyboard, so a pager launched by
+    /// `git` (or any `PAGER`-honouring tool) would hold the run open forever.
+    /// The spawn env exports `GIT_PAGER=cat`/`PAGER=cat`, which outrank
+    /// `core.pager`, so a `git log` with a stdin-blocking pager forced through
+    /// config still exits 0. The two vars are unset for the test's lifetime so
+    /// an inheriting harness cannot mask a missing overlay.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_git_log_with_blocking_config_pager_exits_cleanly() {
+        let _env =
+            crate::agent_manager::tests::EnvGuard::apply(&[("GIT_PAGER", None), ("PAGER", None)]);
+        let h = harness_with_worktree(true).await;
+        let workspace = h
+            .services
+            .store()
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace");
+        let root = crate::git_ops::worktree_path(&workspace).expect("worktree");
+        let repo = git2::Repository::init(&root).expect("init repo");
+        {
+            let sig = git2::Signature::now("Script Test", "script@example.com").expect("sig");
+            let tree_id = repo.index().expect("index").write_tree().expect("tree");
+            let tree = repo.find_tree(tree_id).expect("find tree");
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .expect("commit");
+        }
+        let mut sub = subscribe(&h);
+        // The forced pager drains git's output, then blocks: with no
+        // `GIT_PAGER` override the run would never reach `exited`.
+        let cmd = "git -c core.pager='sh -c \"cat >/dev/null; sleep 3600\"' log -1";
+        let id = create_simple(&h, "pager", cmd, ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let exited = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        assert_eq!(exited["data"]["exitCode"], 0, "got: {exited}");
     }
 
     /// Regression (monorepo#1155): a `resolve_cwd` failure after the running
