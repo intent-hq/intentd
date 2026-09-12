@@ -87,6 +87,12 @@ pub struct WsOptions {
     /// open deterministically (e.g. to register a same-client reconnect inside
     /// it) instead of racing it. `None` (production) parks nowhere.
     pub cleanup_gate: Option<watch::Receiver<bool>>,
+    /// Test-only seam: when set, the heartbeat reaper keeps pinging but does
+    /// not abort a connection whose pong deadline has elapsed until the
+    /// watched value becomes `true`. Lets a test observe a connection's
+    /// pre-abort state deterministically instead of racing the deadline.
+    /// `None` (production) reaps on the deadline.
+    pub heartbeat_gate: Option<watch::Receiver<bool>>,
 }
 
 impl Default for WsOptions {
@@ -102,6 +108,7 @@ impl Default for WsOptions {
             rpc_limiter: RpcLimiter::unlimited(),
             tunnel_limits: crate::tunnel::TunnelLimits::default(),
             cleanup_gate: None,
+            heartbeat_gate: None,
         }
     }
 }
@@ -175,6 +182,8 @@ pub(crate) struct WsInner {
     pub tunnel_limits: crate::tunnel::TunnelLimits,
     /// Test-only post-deregistration gate (from [`WsOptions::cleanup_gate`]).
     pub cleanup_gate: Option<watch::Receiver<bool>>,
+    /// Test-only reaper gate (from [`WsOptions::heartbeat_gate`]).
+    pub heartbeat_gate: Option<watch::Receiver<bool>>,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -226,6 +235,7 @@ impl WsApiServer {
             rpc_limiter: options.rpc_limiter,
             tunnel_limits: options.tunnel_limits,
             cleanup_gate: options.cleanup_gate,
+            heartbeat_gate: options.heartbeat_gate,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -265,6 +275,7 @@ impl WsApiServer {
             rpc_limiter: options.rpc_limiter,
             tunnel_limits: options.tunnel_limits,
             cleanup_gate: options.cleanup_gate,
+            heartbeat_gate: options.heartbeat_gate,
         };
         Self {
             inner: Arc::new(inner),
@@ -456,6 +467,7 @@ impl WsInner {
         loop {
             tick.tick().await;
             let now = mono_ms();
+            let reap = self.heartbeat_gate.as_ref().is_none_or(|g| *g.borrow());
             let snapshot: Vec<(u64, i64, mpsc::Sender<ConnCmd>, AbortHandle)> = {
                 let map = self.clients.lock().expect("ws clients poisoned");
                 map.iter()
@@ -470,7 +482,7 @@ impl WsInner {
                     .collect()
             };
             for (id, last_pong, cmd_tx, abort) in snapshot {
-                if now - last_pong > timeout_ms {
+                if reap && now - last_pong > timeout_ms {
                     abort.abort();
                     self.deregister(id);
                     tracing::debug!(client = id, "ws client heartbeat timeout; terminated");
