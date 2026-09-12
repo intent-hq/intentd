@@ -35600,6 +35600,63 @@ mod turn_token_usage {
         assert_eq!(ws.token_usage.unwrap().totals.output_tokens, 30);
     }
 
+    /// #3801: opencode (and the opencode-based unsloth) report the turn's
+    /// LAST-REQUEST counters exactly like codex — both seams fold them with
+    /// SUM keyed on the resolved provider id, so a second, smaller report
+    /// adds to the tally instead of replacing it (and records in full in
+    /// the hourly delta instead of clamping to zero).
+    #[tokio::test]
+    async fn opencode_and_unsloth_last_request_reports_sum_at_both_seams() {
+        for provider in ["opencode", "unsloth"] {
+            let h = harness().await;
+            let agent = AgentId::new();
+            let mut session = agent_session(&agent, &h.ws, "gemma-3-27b-it");
+            session.provider = Some(provider.into());
+            h.store
+                .insert_agent_session(&session)
+                .await
+                .expect("insert session");
+            let now = time::OffsetDateTime::now_utc();
+
+            // Turn 1: the final request of a tool loop cost 70/50.
+            // Turn 2: a short turn whose final request cost 30/20 — REPLACE
+            // would leave the tally at 30/20, cumulative subtraction would
+            // clamp the hourly delta to zero.
+            for (input, output) in [(70, 50), (30, 20)] {
+                h.services
+                    .record_turn_usage_stats(
+                        &agent,
+                        &h.ws,
+                        Some(&acp_usage(input, output, 0, 0)),
+                        Duration::from_secs(1),
+                        now,
+                        true,
+                    )
+                    .await;
+                h.services
+                    .persist_turn_token_usage(
+                        &agent,
+                        &h.ws,
+                        Some(&acp_usage(input, output, 0, 0)),
+                        None,
+                    )
+                    .await;
+            }
+
+            let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+            let usage = ws.token_usage.expect("usage persisted");
+            assert_eq!(usage.totals.input_tokens, 100, "{provider}: sum, not last");
+            assert_eq!(usage.totals.output_tokens, 70, "{provider}");
+            assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100, "{provider}");
+
+            let rows = h.store.list_usage_stats_hourly().await.expect("stats rows");
+            let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+            let output: u64 = rows.iter().map(|r| r.output_tokens).sum();
+            assert_eq!(input, 100, "{provider}: each report is its own delta");
+            assert_eq!(output, 70, "{provider}");
+        }
+    }
+
     /// #3795: a codex totals-only report (`totalTokens > 0`, every breakdown
     /// zero — the `fill_to_context_window()` synthesized shape) is NOT
     /// silently zero: the total lands as degraded input-attributed usage in
