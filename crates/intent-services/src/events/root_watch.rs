@@ -80,16 +80,23 @@ impl RootWatch {
     /// thread that never reported), since nothing will establish it later.
     /// A registration that merely *failed* is retried by the loop
     /// (intent-hq/intent#4852), so that case waits, up to `timeout`.
+    ///
+    /// The loop ends *normally* right after a successful store, so a finished
+    /// task is only a failure if `watched()` is still `None` when observed
+    /// after `is_finished()` — the store happens-before the task ends.
     #[cfg(test)]
     pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
         while self.watched().is_none() {
-            assert!(
-                !self.task.as_ref().is_some_and(JoinHandle::is_finished),
-                "watch loop for {} ended without establishing a watch (registration failed; see WARN logs); {}",
-                self.root.display(),
-                os_watch_limits()
-            );
+            if self.task.as_ref().is_some_and(JoinHandle::is_finished) {
+                assert!(
+                    self.watched().is_some(),
+                    "watch loop for {} ended without establishing a watch (registration failed; see WARN logs); {}",
+                    self.root.display(),
+                    os_watch_limits()
+                );
+                return;
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "watch registration for {} did not establish within {timeout:?}; {}",
