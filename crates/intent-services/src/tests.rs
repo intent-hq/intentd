@@ -33248,20 +33248,41 @@ mod last_activity_events {
     /// its own entry before the delete's sweep runs, so the sweep finds no
     /// handle to abort) — must not emit the spurious `{ idle }` event, and
     /// must still remove its own map entry.
+    ///
+    /// The interleaving is made explicit (intent#4846): the row delete is
+    /// awaited BEFORE `agent_activity_end` arms the timer. Arming first and
+    /// deleting second let the debounce window expire while the real store
+    /// delete was still in flight under package load, so the timer's
+    /// existence probe found the row and emitted the `{ idle }` this test
+    /// forbids. Deleting first produces the same fire-time state the guard
+    /// is for — entry still present, gen/count guards pass, row gone —
+    /// without the timer racing the delete's I/O.
     #[tokio::test]
     async fn idle_timer_firing_against_deleted_workspace_skips_emit() {
         let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
         let mut sub = subscribe(&h);
 
-        // Last in-flight session ends → idle flip scheduled.
+        // Session enters flight (emits the agent_running flip) while the row
+        // still exists.
         h.services.agent_activity_begin(&h.ws).await;
-        h.services.agent_activity_end(&h.ws);
 
         // Delete the row directly in the store, bypassing the services-layer
-        // sweep — the interleaving where the timer fires while the delete is
-        // mid-flight (entry still present, gen/count guards pass, row gone).
+        // sweep, and await it before the timer is armed: the fire is then
+        // guaranteed to observe the deleted row.
         h.store.delete_workspace(&h.ws).await.expect("row delete");
+
+        // Last in-flight session ends → idle flip scheduled against the
+        // already-deleted id.
+        h.services.agent_activity_end(&h.ws);
+        assert!(
+            h.services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "idle flip must be pending before the timer fires"
+        );
 
         // Bounded poll: the timer fires, hits the emit-time existence guard,
         // and must still sweep its map entry on the way out.
