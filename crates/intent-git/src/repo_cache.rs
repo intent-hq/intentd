@@ -211,6 +211,12 @@ fn cache_path_for(cache_root: &Path, owner: &str, repo: &str) -> PathBuf {
     cache_root.join(owner).join(repo)
 }
 
+/// Whether `entry` is a real directory — a symlink (to a directory or
+/// anywhere else) is not. `DirEntry::file_type` never follows symlinks.
+fn is_real_dir_entry(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|t| t.is_dir())
+}
+
 /// Adopt a pre-existing case-variant slot into the folded `cache_path`
 /// (case-sensitive filesystems only see this: a cache populated before the
 /// key was folded may sit at `<Owner>/<Repo>`). Runs only on a miss at the
@@ -218,11 +224,24 @@ fn cache_path_for(cache_root: &Path, owner: &str, repo: &str) -> PathBuf {
 /// [`RepoRef`] identity matches and renames it into place, then prunes the
 /// old owner dir if it emptied. Best effort — any failure leaves the miss
 /// in place and the caller clones fresh.
+///
+/// The scan is confined to real directories exactly two levels under
+/// `cache_root`: symlinked owner or repo entries are never followed (so
+/// nothing outside the cache can be moved into it), an owner entry is only
+/// descended when its name already matches `owner`, and a folded parent
+/// that resolves through a symlink is rejected (so the rename never writes
+/// outside the cache). The rename itself never clobbers content: the
+/// destination is re-checked right before, and `rename(2)` refuses to
+/// replace a non-empty directory or a non-directory, so at worst an empty
+/// directory that raced into place is replaced.
 fn adopt_case_variant_cache(cache_root: &Path, owner: &str, repo: &str, cache_path: &Path) {
     if cache_path.exists() {
         return;
     }
     let wanted = RepoRef::new(owner, repo);
+    let Some(parent) = cache_path.parent() else {
+        return;
+    };
     let Ok(owners) = std::fs::read_dir(cache_root) else {
         return;
     };
@@ -230,6 +249,9 @@ fn adopt_case_variant_cache(cache_root: &Path, owner: &str, repo: &str, cache_pa
         let Ok(owner_name) = owner_entry.file_name().into_string() else {
             continue;
         };
+        if !is_real_dir_entry(&owner_entry) || RepoRef::new(owner_name.as_str(), repo) != wanted {
+            continue;
+        }
         let Ok(repos) = std::fs::read_dir(owner_entry.path()) else {
             continue;
         };
@@ -239,17 +261,29 @@ fn adopt_case_variant_cache(cache_root: &Path, owner: &str, repo: &str, cache_pa
             };
             let candidate = repo_entry.path();
             if candidate == cache_path
+                || !is_real_dir_entry(&repo_entry)
                 || RepoRef::new(owner_name.as_str(), repo_name.as_str()) != wanted
-                || !candidate.is_dir()
             {
                 continue;
             }
-            let Some(parent) = cache_path.parent() else {
-                return;
-            };
-            if let Err(e) = std::fs::create_dir_all(parent)
-                .and_then(|()| std::fs::rename(&candidate, cache_path))
-            {
+            let adopted = (|| {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if !std::fs::symlink_metadata(parent)?.is_dir() {
+                    return Err(std::io::Error::other(
+                        "folded owner path is not a real directory",
+                    ));
+                }
+                if std::fs::symlink_metadata(cache_path).is_ok() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "folded slot appeared during adoption",
+                    ));
+                }
+                std::fs::rename(&candidate, cache_path)
+            })();
+            if let Err(e) = adopted {
                 tracing::warn!(
                     error = %e,
                     from = %candidate.display(),
@@ -1793,6 +1827,109 @@ mod tests {
                 "vacated raw-cased owner dir must be pruned"
             );
         }
+    }
+
+    /// Plant a fake legacy slot `<root>/<owner>/<repo>` holding one file.
+    fn plant_slot(root: &Path, owner: &str, repo: &str) -> PathBuf {
+        let dir = root.join(owner).join(repo);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker"), "keep").unwrap();
+        dir
+    }
+
+    /// Adoption confines its scan to real `<owner>/<repo>` directories:
+    /// unrelated owners and repos are left alone, and an already-populated
+    /// folded slot is never clobbered by a case variant sitting next to it.
+    #[test]
+    fn adoption_ignores_nonmatching_dirs_and_never_clobbers_folded_slot() {
+        let root = CacheRoot::new("adopt-nonmatch");
+        let folded = root.path().join("acme").join("widget");
+        let other_repo = plant_slot(root.path(), "Acme", "other");
+        let other_owner = plant_slot(root.path(), "other", "Widget");
+
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+        assert!(!folded.exists(), "no matching variant: nothing to adopt");
+        assert!(other_repo.join("marker").exists());
+        assert!(other_owner.join("marker").exists());
+
+        // A populated folded slot plus a case variant: the variant must stay
+        // put and the folded content must survive untouched.
+        std::fs::create_dir_all(&folded).unwrap();
+        std::fs::write(folded.join("marker"), "folded").unwrap();
+        let variant = plant_slot(root.path(), "Acme", "Widget");
+        if !variant.join("marker").exists() || variant == folded {
+            return; // case-insensitive filesystem: the two paths are one dir
+        }
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+        assert_eq!(
+            std::fs::read_to_string(folded.join("marker")).unwrap(),
+            "folded"
+        );
+        assert!(variant.join("marker").exists(), "variant must not move");
+    }
+
+    /// A symlinked owner entry is never descended: a directory outside the
+    /// cache must not be moved into the folded slot through it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adoption_does_not_follow_owner_symlink() {
+        let root = CacheRoot::new("adopt-owner-symlink");
+        let outside = CacheRoot::new("adopt-owner-symlink-outside");
+        let victim = plant_slot(outside.path(), "x", "Widget");
+        std::os::unix::fs::symlink(outside.path().join("x"), root.path().join("Acme")).unwrap();
+        let folded = root.path().join("acme").join("widget");
+
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+
+        assert!(!folded.exists(), "must not adopt through an owner symlink");
+        assert!(victim.join("marker").exists(), "outside dir must stay put");
+        assert!(root
+            .path()
+            .join("Acme")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink());
+    }
+
+    /// A symlinked repo entry is never adopted, even when its name matches.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adoption_does_not_follow_repo_symlink() {
+        let root = CacheRoot::new("adopt-repo-symlink");
+        let outside = CacheRoot::new("adopt-repo-symlink-outside");
+        let victim = plant_slot(outside.path(), "x", "y");
+        let legacy_owner = root.path().join("Acme");
+        std::fs::create_dir_all(&legacy_owner).unwrap();
+        let link = legacy_owner.join("Widget");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let folded = root.path().join("acme").join("widget");
+
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+
+        assert!(!folded.exists(), "must not adopt a repo symlink");
+        assert!(link.symlink_metadata().unwrap().is_symlink(), "link stays");
+        assert!(victim.join("marker").exists(), "outside dir must stay put");
+    }
+
+    /// A folded owner path that is itself a symlink is rejected: the rename
+    /// must never write outside the cache root. The legacy slot stays put.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adoption_rejects_symlinked_folded_owner() {
+        let root = CacheRoot::new("adopt-dest-symlink");
+        let outside = CacheRoot::new("adopt-dest-symlink-outside");
+        let legacy = plant_slot(root.path(), "Acme", "Widget");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("acme")).unwrap();
+        let folded = root.path().join("acme").join("widget");
+
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+
+        assert!(legacy.join("marker").exists(), "legacy slot must stay put");
+        assert!(
+            !outside.path().join("widget").exists(),
+            "nothing may be written through the folded owner symlink"
+        );
+        assert!(!folded.exists());
     }
 
     /// A cache that diverged from origin (local commit) is clobbered back to
