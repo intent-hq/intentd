@@ -664,6 +664,27 @@ fn provision_sandbox_from_bundle(
         });
     }
 
+    finish_sandbox_from_bundle(
+        sandbox_path,
+        bundle,
+        entry,
+        workspace_branch,
+        workspace_has_wip,
+    )
+}
+
+/// Second half of [`provision_sandbox_from_bundle`], on a sandbox directory
+/// that is already a clone (`CoW` or plain) of the checkout: fetch the
+/// sandbox branch from the bundle, check it out, reset the local workspace
+/// branch off the WIP sentinel, unwind the sandbox WIP snapshot, and finally
+/// bring the initialized submodules in line with the sandbox's own gitlinks.
+fn finish_sandbox_from_bundle(
+    sandbox_path: &Path,
+    bundle: &str,
+    entry: &crate::transfer_git::SandboxBundleRef,
+    workspace_branch: &str,
+    workspace_has_wip: bool,
+) -> Result<()> {
     run_git(sandbox_path, |cmd| {
         cmd.arg("fetch")
             .arg("--no-tags")
@@ -710,6 +731,34 @@ fn provision_sandbox_from_bundle(
         return Err(Error::Internal(
             "manifest records a sandbox WIP snapshot but the sandbox tip is not one".to_string(),
         ));
+    }
+
+    // A CoW clone carries the checkout's hydrated submodules, still at the
+    // gitlinks the workspace tip records; the sandbox branch may record
+    // others, which would leave every such submodule reading as modified
+    // (intent-hq/intent#4397). Move the initialized ones (recursively) to the
+    // gitlinks now in the sandbox index — the WIP unwind above restored the
+    // captured index, so this is the state the source sandbox described.
+    // `--no-fetch`: only commits already in the copied module repos count,
+    // and the restored submodule URLs may be unreachable on the target.
+    // Uninitialized gitlinks (the plain-clone path) are left alone, exactly
+    // as `submodule update` without `--init` does. Best-effort: a gitlink
+    // whose commit is not local keeps the checkout's tip, as before.
+    if let Err(e) = run_git(sandbox_path, |cmd| {
+        cmd.args([
+            "submodule",
+            "update",
+            "--no-fetch",
+            "--recursive",
+            "--quiet",
+        ])
+        .env("GIT_LFS_SKIP_SMUDGE", "1");
+    }) {
+        tracing::warn!(
+            sandbox = %sandbox_path.display(),
+            error = %e,
+            "materialize: could not move initialized submodules to the sandbox gitlinks"
+        );
     }
     Ok(())
 }
@@ -1603,6 +1652,109 @@ mod tests {
             "sandbox wip\n"
         );
         assert_no_config_mentions(&target.path().join(&ws.id.0), staging.to_str().unwrap());
+    }
+
+    /// Byte-for-byte copy of a directory tree — what a `CoW` clone of the
+    /// checkout produces on a filesystem that supports it (APFS on macOS),
+    /// including the hydrated submodule's worktree and `.git/modules`.
+    fn copy_dir_all(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).unwrap();
+        for entry in fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let to = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir_all(&entry.path(), &to);
+            } else {
+                fs::copy(entry.path(), &to).unwrap();
+            }
+        }
+    }
+
+    /// Regression for intent-hq/intent#4397: when the sandbox is a `CoW`
+    /// copy of the checkout (macOS), it inherits the hydrated submodule at
+    /// the checkout's gitlink, while its own branch records a different one
+    /// — so `sub` showed up as modified in the sandbox status although the
+    /// source sandbox had a clean gitlink. The provisioning tail must bring
+    /// the initialized submodule to the sandbox's recorded gitlink. On Linux
+    /// (no reflink on the test filesystem) `provision_sandbox_from_bundle`
+    /// takes the plain-clone path, so the `CoW` shape is reproduced with a
+    /// byte copy of the hydrated checkout.
+    #[test]
+    fn cow_copied_sandbox_syncs_hydrated_submodule_to_its_gitlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sup, _origin) = superproject_with_submodule(tmp.path());
+        let sub = sup.join("sub");
+        fgit(&sub, &["checkout", "-q", "main"]);
+        let recorded = fgit(&sub, &["rev-parse", "HEAD"]);
+        let sha = local_commit(&sub, "wip.txt");
+        assert_ne!(recorded, sha);
+
+        let ws = superproject_workspace(&sup);
+        let agent = AgentId::new();
+        let branch = format!("sb/{}", agent.0);
+        let sb_src = tmp.path().join("sandbox");
+        make_sandbox_clone(&sup, &sb_src, &branch);
+        let sb_tip = commit_file(&sb_src, "sb.txt", "sandbox work\n", "feat: sandbox commit");
+        fs::write(sb_src.join("sb-wip.txt"), "sandbox wip\n").unwrap();
+        let sb_fingerprint = status_fingerprint(&sb_src);
+        let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
+
+        let staging = tmp.path().join("staging");
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
+        assert_eq!(refs.submodules.len(), 1, "{refs:?}");
+        let entry = refs
+            .sandboxes
+            .iter()
+            .find(|e| e.agent_id == agent.0)
+            .unwrap();
+
+        // Materialize the checkout alone, then stand the sandbox up as a
+        // byte copy of it — the CoW shape — and run the provisioning tail.
+        let target = tempfile::tempdir().unwrap();
+        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
+            .unwrap();
+        assert_eq!(repo_head(&out.checkout_dir.join("sub")), sha);
+        let sandbox_path = target
+            .path()
+            .join(&ws.id.0)
+            .join("sandboxes")
+            .join(&agent.0)
+            .join("super");
+        copy_dir_all(&out.checkout_dir, &sandbox_path);
+        assert_eq!(
+            repo_head(&sandbox_path.join("sub")),
+            sha,
+            "copy inherits the hydrated tip"
+        );
+
+        finish_sandbox_from_bundle(
+            &sandbox_path,
+            bundle_path.to_str().unwrap(),
+            entry,
+            &refs.workspace_branch,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(head_branch(&sandbox_path), branch);
+        assert_eq!(repo_head(&sandbox_path), sb_tip, "WIP unwound");
+        assert_eq!(status_fingerprint(&sandbox_path), sb_fingerprint);
+        assert!(
+            sandbox_path.join("sub").join(".git").exists(),
+            "submodule stays initialized"
+        );
+        assert_eq!(
+            repo_head(&sandbox_path.join("sub")),
+            recorded,
+            "submodule sits at the gitlink the sandbox branch records"
+        );
+        assert_eq!(
+            repo_head(&out.checkout_dir.join("sub")),
+            sha,
+            "workspace checkout keeps its hydrated submodule"
+        );
     }
 
     /// (c) A corrupt submodule bundle fails the materialization with an
