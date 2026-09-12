@@ -675,9 +675,9 @@ fn provision_sandbox_from_bundle(
 /// Second half of [`provision_sandbox_from_bundle`], on a sandbox directory
 /// that is already a clone (`CoW` or plain) of the checkout: fetch the
 /// sandbox branch from the bundle, check it out, reset the local workspace
-/// branch off the WIP sentinel, bring the initialized submodules in line
-/// with the gitlinks the verified tip records, and finally unwind the
-/// sandbox WIP snapshot.
+/// branch off the WIP sentinel, bring the initialized submodules (nested
+/// ones included) in line with the gitlinks the verified tip records, and
+/// finally unwind the sandbox WIP snapshot.
 fn finish_sandbox_from_bundle(
     sandbox_path: &Path,
     bundle: &str,
@@ -741,14 +741,24 @@ fn finish_sandbox_from_bundle(
     // copy inherits, and a bare `update` honoring it would leave a
     // descendant in place. `--no-fetch`: only commits already in the copied
     // module repos count, and the restored submodule URLs may be unreachable
-    // on the target. Not recursive: the snapshot describes only the
-    // sandbox's own gitlinks; nested state stays as the checkout had it.
-    // Uninitialized gitlinks (the plain-clone path) are left alone, exactly
-    // as `submodule update` without `--init` does. Best-effort: a gitlink
+    // on the target. `--recursive`: the copy also carries hydrated NESTED
+    // submodules at the gitlinks the checkout's parent recorded; once the
+    // parent moves, each initialized nested checkout follows the gitlink
+    // the parent's new commit records (intent-hq/intent#4836), else the
+    // parent keeps reading as modified. Uninitialized gitlinks (the
+    // plain-clone path) are left alone at every level, exactly as
+    // `submodule update` without `--init` does. Best-effort: a gitlink
     // whose commit is not local keeps the checkout's tip, as before.
     if let Err(e) = run_git(sandbox_path, |cmd| {
-        cmd.args(["submodule", "update", "--checkout", "--no-fetch", "--quiet"])
-            .env("GIT_LFS_SKIP_SMUDGE", "1");
+        cmd.args([
+            "submodule",
+            "update",
+            "--checkout",
+            "--no-fetch",
+            "--recursive",
+            "--quiet",
+        ])
+        .env("GIT_LFS_SKIP_SMUDGE", "1");
     }) {
         tracing::warn!(
             sandbox = %sandbox_path.display(),
@@ -1680,6 +1690,8 @@ mod tests {
         sha: String,
         sb_tip: String,
         sb_fingerprint: Vec<(String, bool, bool, bool)>,
+        /// Manifest submodule paths, in bundle order.
+        submodule_paths: Vec<String>,
         checkout_dir: PathBuf,
         sandbox_path: PathBuf,
         _target: tempfile::TempDir,
@@ -1688,7 +1700,8 @@ mod tests {
 
     /// Shared driver for the intent-hq/intent#4397 `CoW` regressions: a
     /// superproject whose `sub` sits on an unpublished commit `sha` while
-    /// the tip records the seed commit, one sandbox (`prepare_sandbox`
+    /// the tip records `recorded` (the seed commit unless `prepare_super`
+    /// advanced it), one sandbox (`prepare_sandbox`
     /// shapes its submodule state; it is a plain clone with an
     /// uninitialized gitlink otherwise), exported and materialized as a
     /// checkout alone. The sandbox is then stood up as a byte copy of the
@@ -1704,7 +1717,7 @@ mod tests {
         prepare_super(&sup);
         let sub = sup.join("sub");
         fgit(&sub, &["checkout", "-q", "main"]);
-        let recorded = fgit(&sub, &["rev-parse", "HEAD"]);
+        let recorded = fgit(&sup, &["rev-parse", "HEAD:sub"]);
         let sha = local_commit(&sub, "wip.txt");
         assert_ne!(recorded, sha);
 
@@ -1723,7 +1736,12 @@ mod tests {
         let TransferBundle {
             bundle_path, refs, ..
         } = create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
-        assert_eq!(refs.submodules.len(), 1, "{refs:?}");
+        let submodule_paths: Vec<String> = refs.submodules.iter().map(|s| s.path.clone()).collect();
+        assert_eq!(
+            submodule_paths.first().map(String::as_str),
+            Some("sub"),
+            "{refs:?}"
+        );
         let entry = refs
             .sandboxes
             .iter()
@@ -1772,6 +1790,7 @@ mod tests {
             sha,
             sb_tip,
             sb_fingerprint,
+            submodule_paths,
             checkout_dir: out.checkout_dir,
             sandbox_path,
             _target: target,
@@ -1892,6 +1911,88 @@ mod tests {
             repo_head(&case.sandbox_path.join("sub")),
             case.recorded,
             "submodule sits at the gitlink the sandbox branch records"
+        );
+    }
+
+    /// Regression for intent-hq/intent#4836: the `CoW` copy also carries a
+    /// hydrated NESTED submodule (`sub/inner`) at the gitlink the checkout's
+    /// `sub` records. Once `sub` is moved to the commit the sandbox tip
+    /// records — one whose `inner` gitlink is older — `inner` must follow,
+    /// or `sub` keeps reading as modified (nested gitlink change) while the
+    /// source sandbox was clean. The recorded inner commit is the seed of
+    /// the copied module repository, so no fetch is needed.
+    #[test]
+    fn cow_copied_sandbox_normalizes_nested_submodule() {
+        let mut inner_seed = String::new();
+        let mut inner_tip = String::new();
+        let case = cow_copied_sandbox_case(
+            |sup| {
+                let root = sup.parent().unwrap();
+                let inner_src = root.join("inner-src");
+                finit_repo(&inner_src);
+                fgit(root, &["clone", "-q", "--bare", "inner-src", "inner.git"]);
+                let inner_origin = root.join("inner.git");
+                let sub = sup.join("sub");
+                fgit(&sub, &["checkout", "-q", "main"]);
+                fgit(
+                    &sub,
+                    &[
+                        "submodule",
+                        "add",
+                        "-q",
+                        inner_origin.to_str().unwrap(),
+                        "inner",
+                    ],
+                );
+                fgit(&sub, &["commit", "-q", "-m", "add inner"]);
+                // The superproject tip (and so the sandbox branch) records
+                // `sub` here, with `inner` at its seed commit.
+                fgit(sup, &["add", "sub"]);
+                fgit(sup, &["commit", "-q", "-m", "bump sub: add inner"]);
+                let inner = sub.join("inner");
+                inner_seed = fgit(&inner, &["rev-parse", "HEAD"]);
+                fgit(&inner, &["checkout", "-q", "-b", "feat/x"]);
+                inner_tip = local_commit(&inner, "deep.txt");
+                fgit(&sub, &["add", "inner"]);
+                fgit(&sub, &["commit", "-q", "-m", "bump inner"]);
+            },
+            |_, _| {},
+        );
+        assert_ne!(inner_seed, inner_tip);
+        assert_eq!(case.submodule_paths, ["sub", "sub/inner"]);
+        assert_eq!(
+            fgit(
+                &case.sandbox_path.join("sub"),
+                &["rev-parse", &format!("{}:inner", case.recorded)]
+            ),
+            inner_seed,
+            "the recorded outer gitlink records inner at its seed"
+        );
+        let checkout_inner = case.checkout_dir.join("sub").join("inner");
+        assert_eq!(
+            repo_head(&checkout_inner),
+            inner_tip,
+            "workspace checkout keeps its hydrated nested submodule"
+        );
+        let sandbox_inner = case.sandbox_path.join("sub").join("inner");
+        assert!(
+            sandbox_inner.join(".git").exists(),
+            "nested submodule stays initialized"
+        );
+        assert_eq!(status_fingerprint(&case.sandbox_path), case.sb_fingerprint);
+        assert_eq!(
+            fgit(&case.sandbox_path, &["status", "--porcelain"]),
+            "?? sb-wip.txt"
+        );
+        assert_eq!(
+            repo_head(&case.sandbox_path.join("sub")),
+            case.recorded,
+            "outer submodule sits at the gitlink the sandbox branch records"
+        );
+        assert_eq!(
+            repo_head(&sandbox_inner),
+            inner_seed,
+            "nested submodule sits at the gitlink the outer one records"
         );
     }
 
