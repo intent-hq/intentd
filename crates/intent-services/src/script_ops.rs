@@ -1532,16 +1532,129 @@ mod tests {
     /// below return as soon as the awaited event arrives, so this bound only
     /// has to outlast a worst-case multi-suite machine stall (login-shell
     /// spawn + exit-poll + bus delivery), never a passing run.
-    const LIVENESS: Duration = Duration::from_secs(300);
+    ///
+    /// Invariant (intent-hq/intentd#1822): every harness-bounded wait must
+    /// fail THROUGH the harness — its own diagnostic naming the stalled step,
+    /// then teardown — strictly before nextest's `slow-timeout` terminate
+    /// budget (`period × terminate-after` in `.config/nextest.toml`, 180s)
+    /// SIGKILLs the test. At 300s the bound could never fire: the kill landed
+    /// first, the run reported a bare "test timed out", and leaked script
+    /// children had to be reaped by hand. `LIVENESS + TEARDOWN_MARGIN` must
+    /// stay under that budget; `liveness_deadline_fits_inside_nextest_terminate_budget`
+    /// reads the real config and pins the ordering.
+    const LIVENESS: Duration = Duration::from_secs(150);
+    /// Headroom between a `LIVENESS` expiry and nextest's kill so the failing
+    /// wait's diagnostic and process teardown complete before the SIGKILL.
+    const TEARDOWN_MARGIN: Duration = Duration::from_secs(30);
     /// Service command lifetime long enough that a service under test cannot
     /// exit (and auto-restart, killing its PTY) mid-assertion under load
-    /// (monorepo#515). Strictly outlives `LIVENESS` so negative checks bounded
-    /// by it (e.g. the upsert orphan `kill -0` poll) can still hard-fail on a
-    /// leaked process instead of the command exiting first. Every test that
-    /// starts one stops or removes it.
+    /// (monorepo#515). Outlives `LIVENESS` so a negative check bounded by it
+    /// (e.g. the upsert orphan `kill -0` poll) observes a genuinely leaked
+    /// process rather than the command exiting on its own; the check itself
+    /// hard-fails via the `LIVENESS` deadline. Every test that starts one
+    /// stops or removes it.
     const SERVICE_CMD: &str = "sleep 3600";
 
     // ---- pure-helper tests (no PTY, no event bus) --------------------------
+
+    /// Parse a nextest duration literal (`"90s"`, `"2m"`, `"1h"`, `"500ms"`).
+    fn parse_nextest_duration(raw: &str) -> Duration {
+        let raw = raw.trim();
+        let split = raw
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or_else(|| panic!("duration {raw:?} has no unit suffix"));
+        let (num, unit) = raw.split_at(split);
+        let num: f64 = num
+            .parse()
+            .unwrap_or_else(|e| panic!("duration {raw:?} has a non-numeric magnitude: {e}"));
+        let secs = match unit.trim() {
+            "ms" => num / 1000.0,
+            "s" => num,
+            "m" => num * 60.0,
+            "h" => num * 3600.0,
+            other => panic!("duration {raw:?} has an unsupported unit {other:?}"),
+        };
+        Duration::from_secs_f64(secs)
+    }
+
+    /// Pins the ordering `LIVENESS` relies on (intent-hq/intentd#1822): a
+    /// stalled harness wait must expire, print its diagnostic, and tear down
+    /// before nextest's `slow-timeout` kill (`period × terminate-after`) from
+    /// the real `.config/nextest.toml`, so the two numbers cannot drift apart
+    /// silently. No `[[profile.default.overrides]]` entry sets `slow-timeout`
+    /// (none matches `intent-services` tests either), so the `[profile.default]`
+    /// budget is the one that applies; the test fails loudly if that changes so
+    /// it can be taught which override governs this crate.
+    #[test]
+    fn liveness_deadline_fits_inside_nextest_terminate_budget() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.config/nextest.toml");
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read nextest config {path}: {e} — LIVENESS is bounded by its slow-timeout"
+            )
+        });
+        let doc: toml_edit::DocumentMut = raw
+            .parse()
+            .unwrap_or_else(|e| panic!("cannot parse nextest config {path}: {e}"));
+        let profile = doc
+            .get("profile")
+            .and_then(|p| p.get("default"))
+            .unwrap_or_else(|| panic!("{path}: no [profile.default] table"));
+
+        let overrides_with_slow_timeout: Vec<String> = profile
+            .get("overrides")
+            .and_then(|o| o.as_array_of_tables())
+            .map(|tables| {
+                tables
+                    .iter()
+                    .filter(|t| t.contains_key("slow-timeout"))
+                    .map(|t| {
+                        t.get("filter")
+                            .and_then(|f| f.as_str())
+                            .unwrap_or("<no filter>")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            overrides_with_slow_timeout.is_empty(),
+            "{path}: [[profile.default.overrides]] entries now carry `slow-timeout` \
+             (filters: {overrides_with_slow_timeout:?}); extend this test to determine \
+             which override applies to intent-services tests before trusting the \
+             [profile.default] budget"
+        );
+
+        let slow = profile
+            .get("slow-timeout")
+            .unwrap_or_else(|| panic!("{path}: [profile.default] has no slow-timeout"));
+        let period = slow
+            .get("period")
+            .and_then(toml_edit::Item::as_str)
+            .map_or_else(
+                || panic!("{path}: slow-timeout.period is not a duration string"),
+                parse_nextest_duration,
+            );
+        let terminate_after = slow
+            .get("terminate-after")
+            .and_then(toml_edit::Item::as_integer)
+            .unwrap_or_else(|| panic!("{path}: slow-timeout.terminate-after is not an integer"));
+        let terminate_after = u32::try_from(terminate_after).expect("terminate-after fits in u32");
+        let budget = period * terminate_after;
+
+        assert!(
+            TEARDOWN_MARGIN >= Duration::from_secs(20),
+            "TEARDOWN_MARGIN ({TEARDOWN_MARGIN:?}) must leave at least 20s for the \
+             harness diagnostic and teardown"
+        );
+        assert!(
+            LIVENESS + TEARDOWN_MARGIN <= budget,
+            "LIVENESS ({LIVENESS:?}) + TEARDOWN_MARGIN ({TEARDOWN_MARGIN:?}) exceeds \
+             nextest's terminate budget {budget:?} (slow-timeout period {period:?} × \
+             terminate-after {terminate_after} in {path}); nextest would SIGKILL a \
+             stalled test before the harness deadline fires"
+        );
+    }
 
     #[test]
     fn clamp_line_count_clamps_extremes_and_uses_fallback() {
