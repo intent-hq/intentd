@@ -1684,7 +1684,8 @@ mod tests {
 
     /// Outcome of [`cow_copied_sandbox_case`], for the per-case assertions.
     struct CowCopiedSandbox {
-        /// Gitlink the superproject tip records for `sub` (the seed commit).
+        /// Gitlink the superproject tip records for `sub` — the seed commit
+        /// unless `prepare_super` advanced it.
         recorded: String,
         /// The unpublished local commit the workspace's `sub` sits on.
         sha: String,
