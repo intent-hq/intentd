@@ -727,38 +727,40 @@ fn finish_sandbox_from_bundle(
             entry.head_sha
         )));
     }
-    if entry.wip_commit_sha.is_some() && !unwind_wip(sandbox_path)? {
-        return Err(Error::Internal(
-            "manifest records a sandbox WIP snapshot but the sandbox tip is not one".to_string(),
-        ));
-    }
-
     // A CoW clone carries the checkout's hydrated submodules, still at the
-    // gitlinks the workspace tip records; the sandbox branch may record
-    // others, which would leave every such submodule reading as modified
-    // (intent-hq/intent#4397). Move the initialized ones (recursively) to the
-    // gitlinks now in the sandbox index — the WIP unwind above restored the
-    // captured index, so this is the state the source sandbox described.
-    // `--no-fetch`: only commits already in the copied module repos count,
-    // and the restored submodule URLs may be unreachable on the target.
+    // gitlinks the workspace tip records; the sandbox may have had others
+    // checked out, which would leave every such submodule reading as
+    // modified (intent-hq/intent#4397). Move the initialized ones to the
+    // gitlinks the verified tip records. This runs BEFORE the WIP unwind on
+    // purpose: the snapshot tree captured the source sandbox's *worktree*
+    // gitlinks (what was actually checked out), while the saved index it
+    // restores may deliberately record something else (an unstaged gitlink
+    // change), so normalizing against the restored index would clear that
+    // change. `--checkout`: hydration's `update --init` copies the
+    // `.gitmodules` strategy (`merge`/`rebase`/`none`) into the config the
+    // copy inherits, and a bare `update` honoring it would leave a
+    // descendant in place. `--no-fetch`: only commits already in the copied
+    // module repos count, and the restored submodule URLs may be unreachable
+    // on the target. Not recursive: the snapshot describes only the
+    // sandbox's own gitlinks; nested state stays as the checkout had it.
     // Uninitialized gitlinks (the plain-clone path) are left alone, exactly
     // as `submodule update` without `--init` does. Best-effort: a gitlink
     // whose commit is not local keeps the checkout's tip, as before.
     if let Err(e) = run_git(sandbox_path, |cmd| {
-        cmd.args([
-            "submodule",
-            "update",
-            "--no-fetch",
-            "--recursive",
-            "--quiet",
-        ])
-        .env("GIT_LFS_SKIP_SMUDGE", "1");
+        cmd.args(["submodule", "update", "--checkout", "--no-fetch", "--quiet"])
+            .env("GIT_LFS_SKIP_SMUDGE", "1");
     }) {
         tracing::warn!(
             sandbox = %sandbox_path.display(),
             error = %e,
             "materialize: could not move initialized submodules to the sandbox gitlinks"
         );
+    }
+
+    if entry.wip_commit_sha.is_some() && !unwind_wip(sandbox_path)? {
+        return Err(Error::Internal(
+            "manifest records a sandbox WIP snapshot but the sandbox tip is not one".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1670,19 +1672,36 @@ mod tests {
         }
     }
 
-    /// Regression for intent-hq/intent#4397: when the sandbox is a `CoW`
-    /// copy of the checkout (macOS), it inherits the hydrated submodule at
-    /// the checkout's gitlink, while its own branch records a different one
-    /// — so `sub` showed up as modified in the sandbox status although the
-    /// source sandbox had a clean gitlink. The provisioning tail must bring
-    /// the initialized submodule to the sandbox's recorded gitlink. On Linux
-    /// (no reflink on the test filesystem) `provision_sandbox_from_bundle`
-    /// takes the plain-clone path, so the `CoW` shape is reproduced with a
-    /// byte copy of the hydrated checkout.
-    #[test]
-    fn cow_copied_sandbox_syncs_hydrated_submodule_to_its_gitlink() {
+    /// Outcome of [`cow_copied_sandbox_case`], for the per-case assertions.
+    struct CowCopiedSandbox {
+        /// Gitlink the superproject tip records for `sub` (the seed commit).
+        recorded: String,
+        /// The unpublished local commit the workspace's `sub` sits on.
+        sha: String,
+        sb_tip: String,
+        sb_fingerprint: Vec<(String, bool, bool, bool)>,
+        checkout_dir: PathBuf,
+        sandbox_path: PathBuf,
+        _target: tempfile::TempDir,
+        _tmp: tempfile::TempDir,
+    }
+
+    /// Shared driver for the intent-hq/intent#4397 `CoW` regressions: a
+    /// superproject whose `sub` sits on an unpublished commit `sha` while
+    /// the tip records the seed commit, one sandbox (`prepare_sandbox`
+    /// shapes its submodule state; it is a plain clone with an
+    /// uninitialized gitlink otherwise), exported and materialized as a
+    /// checkout alone. The sandbox is then stood up as a byte copy of the
+    /// hydrated checkout — the shape a `clonefile` clone produces on APFS,
+    /// which `provision_sandbox_from_bundle` never takes on a Linux test
+    /// filesystem without reflink — and the provisioning tail is run on it.
+    fn cow_copied_sandbox_case(
+        prepare_super: impl FnOnce(&Path),
+        prepare_sandbox: impl FnOnce(&Path, &Path),
+    ) -> CowCopiedSandbox {
         let tmp = tempfile::tempdir().unwrap();
         let (sup, _origin) = superproject_with_submodule(tmp.path());
+        prepare_super(&sup);
         let sub = sup.join("sub");
         fgit(&sub, &["checkout", "-q", "main"]);
         let recorded = fgit(&sub, &["rev-parse", "HEAD"]);
@@ -1695,6 +1714,7 @@ mod tests {
         let sb_src = tmp.path().join("sandbox");
         make_sandbox_clone(&sup, &sb_src, &branch);
         let sb_tip = commit_file(&sb_src, "sb.txt", "sandbox work\n", "feat: sandbox commit");
+        prepare_sandbox(&sup, &sb_src);
         fs::write(sb_src.join("sb-wip.txt"), "sandbox wip\n").unwrap();
         let sb_fingerprint = status_fingerprint(&sb_src);
         let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
@@ -1710,8 +1730,6 @@ mod tests {
             .find(|e| e.agent_id == agent.0)
             .unwrap();
 
-        // Materialize the checkout alone, then stand the sandbox up as a
-        // byte copy of it — the CoW shape — and run the provisioning tail.
         let target = tempfile::tempdir().unwrap();
         let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
             .unwrap();
@@ -1740,20 +1758,140 @@ mod tests {
 
         assert_eq!(head_branch(&sandbox_path), branch);
         assert_eq!(repo_head(&sandbox_path), sb_tip, "WIP unwound");
-        assert_eq!(status_fingerprint(&sandbox_path), sb_fingerprint);
         assert!(
             sandbox_path.join("sub").join(".git").exists(),
             "submodule stays initialized"
         );
         assert_eq!(
-            repo_head(&sandbox_path.join("sub")),
-            recorded,
-            "submodule sits at the gitlink the sandbox branch records"
-        );
-        assert_eq!(
             repo_head(&out.checkout_dir.join("sub")),
             sha,
             "workspace checkout keeps its hydrated submodule"
+        );
+        CowCopiedSandbox {
+            recorded,
+            sha,
+            sb_tip,
+            sb_fingerprint,
+            checkout_dir: out.checkout_dir,
+            sandbox_path,
+            _target: target,
+            _tmp: tmp,
+        }
+    }
+
+    /// Initialize `sb_src/sub` at the workspace submodule's unpublished tip
+    /// without staging the gitlink: the source sandbox then has worktree
+    /// `sha` under an index still recording the seed commit (`M sub`).
+    fn init_sandbox_submodule_at_workspace_tip(sup: &Path, sb_src: &Path) {
+        fgit(
+            sb_src,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--quiet",
+            ],
+        );
+        let sb_sub = sb_src.join("sub");
+        fgit(
+            &sb_sub,
+            &["fetch", "-q", sup.join("sub").to_str().unwrap(), "main"],
+        );
+        fgit(&sb_sub, &["checkout", "-q", "-B", "main", "FETCH_HEAD"]);
+        assert_eq!(
+            fgit(sb_src, &["status", "--porcelain"]),
+            "M sub",
+            "unstaged gitlink change (trimmed)"
+        );
+    }
+
+    /// Regression for intent-hq/intent#4397: when the sandbox is a `CoW`
+    /// copy of the checkout (macOS), it inherits the hydrated submodule at
+    /// the checkout's gitlink, while its own branch records a different one
+    /// — so `sub` showed up as modified in the sandbox status although the
+    /// source sandbox had a clean gitlink. The provisioning tail must bring
+    /// the initialized submodule to the sandbox's recorded gitlink.
+    #[test]
+    fn cow_copied_sandbox_syncs_hydrated_submodule_to_its_gitlink() {
+        let case = cow_copied_sandbox_case(|_| {}, |_, _| {});
+        assert_eq!(status_fingerprint(&case.sandbox_path), case.sb_fingerprint);
+        assert_eq!(
+            repo_head(&case.sandbox_path.join("sub")),
+            case.recorded,
+            "submodule sits at the gitlink the sandbox branch records"
+        );
+    }
+
+    /// The normalization must target the gitlinks the source sandbox had
+    /// *checked out*, not the ones its saved index records: a source sandbox
+    /// with `sub` at the unpublished tip under an index still recording the
+    /// seed commit (an unstaged gitlink change, `M sub`) has to come back
+    /// exactly so — normalizing against the restored index would move `sub`
+    /// to the seed commit and silently clear that change.
+    #[test]
+    fn cow_copied_sandbox_keeps_unstaged_submodule_change() {
+        let case = cow_copied_sandbox_case(|_| {}, init_sandbox_submodule_at_workspace_tip);
+        assert!(
+            case.sb_fingerprint
+                .contains(&("sub".to_string(), false, true, false)),
+            "{:?}",
+            case.sb_fingerprint
+        );
+        assert_eq!(status_fingerprint(&case.sandbox_path), case.sb_fingerprint);
+        assert_eq!(
+            repo_head(&case.sandbox_path.join("sub")),
+            case.sha,
+            "submodule stays at the commit the source sandbox had checked out"
+        );
+        assert_eq!(
+            fgit(
+                &case.sandbox_path,
+                &["rev-parse", &format!("{}:sub", case.sb_tip)]
+            ),
+            case.recorded,
+            "the sandbox tip still records the seed gitlink"
+        );
+    }
+
+    /// `hydrate_submodule` runs `update --init`, which copies the
+    /// `.gitmodules` update strategy into the checkout config the `CoW` copy
+    /// inherits. With `update = merge` a bare `submodule update` merging the
+    /// (ancestor) recorded gitlink into the checked-out descendant is a
+    /// no-op that exits 0 — the mismatch from the issue would survive. The
+    /// normalization must force the checkout strategy.
+    #[test]
+    fn cow_copied_sandbox_normalizes_submodule_despite_merge_update_strategy() {
+        let case = cow_copied_sandbox_case(
+            |sup| {
+                fgit(
+                    sup,
+                    &[
+                        "config",
+                        "-f",
+                        ".gitmodules",
+                        "submodule.sub.update",
+                        "merge",
+                    ],
+                );
+                fgit(sup, &["commit", "-q", "-am", "sub: update=merge"]);
+            },
+            |_, _| {},
+        );
+        for repo in [&case.checkout_dir, &case.sandbox_path] {
+            assert_eq!(
+                fgit(repo, &["config", "--get", "submodule.sub.update"]),
+                "merge",
+                "{}: hydration copied the .gitmodules strategy into the config",
+                repo.display()
+            );
+        }
+        assert_eq!(status_fingerprint(&case.sandbox_path), case.sb_fingerprint);
+        assert_eq!(
+            repo_head(&case.sandbox_path.join("sub")),
+            case.recorded,
+            "submodule sits at the gitlink the sandbox branch records"
         );
     }
 
