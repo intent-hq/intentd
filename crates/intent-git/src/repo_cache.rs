@@ -202,11 +202,26 @@ fn forget_fresh(cache_path: &Path) {
     map.remove(cache_path);
 }
 
-/// The cache slot for `owner`/`repo`: `<cache_root>/<owner>/<repo>` with
-/// both segments case-folded per [`RepoRef::identity_parts`], so every
+/// Directory name of the repo cache under the workspaces root. Spell the
+/// cache root through [`cache_root_for`], never by joining this literal.
+pub const REPO_CACHE_DIR_NAME: &str = ".repo-cache";
+
+/// The canonical repo-cache root: `<workspaces_root>/.repo-cache`. Every
+/// production and test site that needs the cache root derives it here so
+/// a layout change lands in one place.
+#[must_use]
+pub fn cache_root_for(workspaces_root: &Path) -> PathBuf {
+    workspaces_root.join(REPO_CACHE_DIR_NAME)
+}
+
+/// THE cache slot derivation for `owner`/`repo`: `<cache_root>/<owner>/<repo>`
+/// with both segments case-folded per [`RepoRef::identity_parts`], so every
 /// casing of one slug resolves to (and locks on) the same path. Callers
-/// validate the raw segments first.
-fn cache_path_for(cache_root: &Path, owner: &str, repo: &str) -> PathBuf {
+/// validate the raw segments first. Tests must call this rather than join
+/// segments themselves, so a slot-layout change cannot desynchronize their
+/// expectations.
+#[must_use]
+pub fn cache_path_for(cache_root: &Path, owner: &str, repo: &str) -> PathBuf {
     let (owner, repo) = RepoRef::new(owner, repo).identity_parts();
     cache_root.join(owner).join(repo)
 }
@@ -1731,6 +1746,21 @@ mod tests {
             .target()
             .unwrap()
             .to_string()
+    }
+
+    /// The pub path helpers are the one spelling of the cache layout:
+    /// `cache_root_for` nests `.repo-cache` under the workspaces root and
+    /// `cache_path_for` folds mixed-case owner/repo into a single slot.
+    #[test]
+    fn path_helpers_fold_slugs_under_cache_root() {
+        let workspaces_root = Path::new("/srv/workspaces");
+        let cache_root = cache_root_for(workspaces_root);
+        assert_eq!(cache_root, workspaces_root.join(REPO_CACHE_DIR_NAME));
+
+        let slot = cache_path_for(&cache_root, "Intent-HQ", "IntentD");
+        assert_eq!(slot, cache_root.join("intent-hq").join("intentd"));
+        assert_eq!(slot, cache_path_for(&cache_root, "intent-hq", "intentd"));
+        assert!(slot.starts_with(&cache_root));
     }
 
     /// Cache miss → a fresh clone lands at `<root>/<owner>/<repo>` with the

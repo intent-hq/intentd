@@ -293,7 +293,7 @@ async fn list_cached_returns_branches_from_warm_cache() {
     }
     let fx = boot().await;
     let origin = make_origin_repo(&fx.workspaces_root.parent().unwrap().join("seed"));
-    let cache_root = fx.workspaces_root.join(".repo-cache");
+    let cache_root = intent_git::repo_cache::cache_root_for(&fx.workspaces_root);
     let cache_path = intent_git::repo_cache::ensure_cached_repo(
         &cache_root,
         &file_url(&origin),
