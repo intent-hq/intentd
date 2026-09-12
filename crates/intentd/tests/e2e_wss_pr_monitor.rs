@@ -1667,15 +1667,25 @@ async fn agent_get_surfaces_waiting_on_pr_monitors_over_wss() {
 #[tokio::test]
 async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
     let fx = boot().await;
+    // The sibling lives in a SECOND workspace on the same `o/r` repo: a
+    // workspace holds one active monitor per PR, and the sweep still groups
+    // siblings across workspaces.
+    let sibling_ws = WorkspaceId::new();
+    fx.services
+        .store()
+        .insert_workspace(&workspace(&sibling_ws))
+        .await
+        .expect("seed sibling workspace");
     let sibling_id = AgentId::from("agent-prmon-sibling");
     fx.services
         .store()
-        .insert_agent_session(&agent_session(&fx.ws_id, sibling_id.as_str()))
+        .insert_agent_session(&agent_session(&sibling_ws, sibling_id.as_str()))
         .await
         .expect("seed sibling agent");
 
-    // Two monitors on the SAME PR (a monitor is unique per (agent, repo, pr)),
-    // registered via the service surface the `ws.pr.monitor` binding calls.
+    // Two monitors on the SAME PR (a monitor is unique per (workspace, repo,
+    // pr)), registered via the service surface the `ws.pr.monitor` binding
+    // calls.
     let first = fx
         .services
         .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
@@ -1684,7 +1694,7 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
         .0;
     let second = fx
         .services
-        .pr_monitor_register(&fx.ws_id, &sibling_id, "o", "r", 42)
+        .pr_monitor_register(&sibling_ws, &sibling_id, "o", "r", 42)
         .await
         .expect("register sibling")
         .0;
@@ -1734,20 +1744,20 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
     );
 
     // Both siblings diffed the shared snapshot against their OWN baselines:
-    // `prMonitor.list` over the wire shows both rows pending (the hour-long
-    // debounce holds the wakes).
+    // `prMonitor.list` over the wire (workspace-scoped) shows each row
+    // pending (the hour-long debounce holds the wakes).
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
-    let listed = wss_rpc(
-        &mut rpc,
-        1,
-        "prMonitor.list",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    let rows = listed["monitors"].as_array().expect("monitors array");
-    assert_eq!(rows.len(), 2, "both monitors listed: {listed}");
-    for row in rows {
-        assert_eq!(row["hasPendingChanges"], true, "row pending: {row}");
+    for (id, ws) in [(1, &fx.ws_id), (5, &sibling_ws)] {
+        let listed = wss_rpc(
+            &mut rpc,
+            id,
+            "prMonitor.list",
+            json!({ "workspaceId": ws.as_str() }),
+        )
+        .await;
+        let rows = listed["monitors"].as_array().expect("monitors array");
+        assert_eq!(rows.len(), 1, "one monitor per workspace: {listed}");
+        assert_eq!(rows[0]["hasPendingChanges"], true, "row pending: {listed}");
     }
 
     // Flushing the first monitor delivers ITS owner's wake (and emits the
@@ -1775,20 +1785,21 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
         owner_messages(&fx).await.contains("[PR monitor o/r#42]"),
         "the flush delivers the owner's consolidated wake"
     );
-    let listed_after = wss_rpc(
-        &mut rpc,
-        4,
-        "prMonitor.list",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    for row in listed_after["monitors"].as_array().expect("monitors array") {
-        let expect_pending = row["monitorId"] != json!(first.monitor_id.as_str());
-        assert_eq!(
-            row["hasPendingChanges"],
-            json!(expect_pending),
-            "sibling pending state independent: {row}"
-        );
+    for (id, ws, expect_pending) in [(4, &fx.ws_id, false), (6, &sibling_ws, true)] {
+        let listed_after = wss_rpc(
+            &mut rpc,
+            id,
+            "prMonitor.list",
+            json!({ "workspaceId": ws.as_str() }),
+        )
+        .await;
+        for row in listed_after["monitors"].as_array().expect("monitors array") {
+            assert_eq!(
+                row["hasPendingChanges"],
+                json!(expect_pending),
+                "sibling pending state independent: {row}"
+            );
+        }
     }
 }
 
