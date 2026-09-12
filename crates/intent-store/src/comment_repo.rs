@@ -211,7 +211,13 @@ impl Store {
             // Same statement as `update_note_versioned` (no expected_version
             // gate): full-row replace scoped by (id, workspace_id) with the
             // store-owned `rev = rev + 1` bump.
-            let Some(new_rev) = crate::note_repo::exec_update_note(&mut *conn, note, None).await?
+            let Some(new_rev) = crate::note_repo::exec_update_note(
+                &mut *conn,
+                note,
+                None,
+                crate::note_repo::NoteUpdateScope::FullRow,
+            )
+            .await?
             else {
                 return Err(Error::NotFound(format!("note {}", note.id)));
             };

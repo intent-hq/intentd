@@ -90,8 +90,13 @@ impl Store {
             .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
 
         let result = async {
-            let Some(rev) =
-                crate::note_repo::exec_update_note(&mut *conn, note, expected_version).await?
+            let Some(rev) = crate::note_repo::exec_update_note(
+                &mut *conn,
+                note,
+                expected_version,
+                crate::note_repo::NoteUpdateScope::FullRow,
+            )
+            .await?
             else {
                 return Ok(None);
             };

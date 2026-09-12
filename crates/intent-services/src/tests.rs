@@ -2783,6 +2783,131 @@ async fn note_edit_lines_merges_onto_completed_user_save() {
     assert_eq!(result.total_lines_after, 3);
 }
 
+/// Race a metadata-only write against a user `note.setContent` that completes
+/// while the metadata write is parked on the write pool (same choreography as
+/// [`surgical_write_races_user_save`]): the metadata op reads rev 0 with the
+/// old content, the user's save lands at rev 1, then the metadata write
+/// proceeds without an `expectedVersion` gate. Returns the final stored note.
+async fn metadata_write_races_user_save(
+    op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, Result<()>>,
+) -> Note {
+    let (tmp, svc, ws, id) = setup_versioned("abc").await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = op(&svc, ws.clone(), id.clone());
+    let parked = poll_until(&mut fut, 20, || async {
+        svc.store.get_note(&ws, &id).await.expect("get note");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let saved = other_svc
+        .set_note_content(ws.clone(), id.clone(), "aXbc".into(), false, Some(0), None)
+        .await
+        .expect("user save");
+    assert_eq!(saved.rev, 1);
+    drop(held);
+
+    fut.await.expect("metadata write");
+    let stored = other.get_note(&ws, &id).await.expect("final note");
+    assert_eq!(
+        stored.rev, 2,
+        "metadata write lands on top of the user save"
+    );
+    assert_eq!(
+        stored.content, "aXbc",
+        "metadata-only write must not rewrite content it read before the user save"
+    );
+    // No snapshot for the metadata rev: the base lookup by the new rev falls
+    // back to the user's rev-1 snapshot, which is exactly the stored content.
+    assert_eq!(newest_version_rev(&other, &ws, &id).await, Some(1));
+    assert_eq!(
+        other
+            .get_note_version_content_by_rev(&ws, &id, stored.rev)
+            .await
+            .expect("lookup"),
+        Some(stored.content.clone()),
+        "base for the metadata rev is the persisted content"
+    );
+    stored
+}
+
+/// Regression (intentd#1817 re-verification): `note.updateMetadata` that read
+/// rev 0 no longer reverts a user `setContent` that landed at rev 1. Before
+/// the fix the write was a full-row `UPDATE` carrying the stale `abc`, so the
+/// acknowledged insertion vanished and rev 2 resolved to a base (`aXbc`) that
+/// no longer matched the row — a false base for every later merge.
+#[tokio::test]
+async fn note_update_metadata_preserves_completed_user_save() {
+    let stored = metadata_write_races_user_save(|svc, ws, id| {
+        Box::pin(async move {
+            svc.update_note_metadata(ws, id, Some("Renamed".into()), None, None, None)
+                .await
+                .map(|_| ())
+        })
+    })
+    .await;
+    assert_eq!(stored.title, "Renamed");
+}
+
+/// Same race for the metadata arm of `note.update` (title/tags without
+/// `content`).
+#[tokio::test]
+async fn note_update_metadata_arm_preserves_completed_user_save() {
+    let stored = metadata_write_races_user_save(|svc, ws, id| {
+        Box::pin(async move {
+            svc.update_note(
+                ws,
+                id,
+                NoteUpdateInput {
+                    tags: Some(vec!["t".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await;
+    assert_eq!(stored.tags, vec!["t".to_string()]);
+}
+
+/// Same race for a task-metadata write (`task.markAsTask`): the `task_json`
+/// column lands, the content does not move.
+#[tokio::test]
+async fn task_metadata_write_preserves_completed_user_save() {
+    use intent_core::TaskStatus;
+    let stored = metadata_write_races_user_save(|svc, ws, id| {
+        Box::pin(async move {
+            svc.mark_as_task(
+                ws,
+                id,
+                "not_started".into(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await;
+    assert_eq!(
+        stored.metadata.task.map(|t| t.status),
+        Some(TaskStatus::NotStarted)
+    );
+}
+
 /// Read-merge-persist loop converges under contention: four writers that all
 /// read rev 0 and insert a distinct line race through `set_note_content`
 /// concurrently; whichever lands first makes the others stale, and each

@@ -9331,7 +9331,9 @@ impl Services {
         apply_status_transition(&mut task, new_status, &now);
         note.metadata.task = Some(task);
         note.updated_at = now.clone();
-        store.update_note_versioned(&note, expected_version).await?;
+        store
+            .update_note_metadata_versioned(&note, expected_version)
+            .await?;
         // Mirror `notes.service.ts`: emit only when the status actually changed.
         let all = if previous_status == new_status {
             None
@@ -21504,7 +21506,11 @@ impl WorkspaceApi for Services {
                 persist_note_content(&store, &note, expected_version, &user_version_author())
                     .await?;
             } else {
-                store.update_note_versioned(&note, expected_version).await?;
+                // Metadata-scoped: leaves the stored content untouched even
+                // when a content write committed after the fetch above.
+                store
+                    .update_note_metadata_versioned(&note, expected_version)
+                    .await?;
             }
             if let Some(plan) = reanchor_plan {
                 plan.apply_orphaned(&store, &workspace_id).await?;
@@ -21945,7 +21951,9 @@ impl WorkspaceApi for Services {
             }
             let now = now_iso();
             note.updated_at = now.clone();
-            store.update_note_versioned(&note, expected_version).await?;
+            store
+                .update_note_metadata_versioned(&note, expected_version)
+                .await?;
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -22725,7 +22733,7 @@ impl WorkspaceApi for Services {
                 }
             }
             note.updated_at = now.clone();
-            store.update_note(&note).await?;
+            store.update_note_metadata(&note).await?;
             // A markAsTask that crosses the complete boundary records/removes
             // the caller's flipped-completion pair, exactly like
             // `task.updateNoteStatus` (a same-status re-mark is a no-op here).
@@ -22914,7 +22922,7 @@ impl WorkspaceApi for Services {
             }
             note.metadata.task = Some(task);
             note.updated_at = now_iso();
-            store.update_note(&note).await?;
+            store.update_note_metadata(&note).await?;
             // Metadata changed → subscribers refetch the note (§6.5), same as
             // every other task-metadata write.
             publish_event(
@@ -23105,7 +23113,7 @@ impl WorkspaceApi for Services {
             }
             note.metadata.task = Some(task);
             note.updated_at = now.clone();
-            store.update_note(&note).await?;
+            store.update_note_metadata(&note).await?;
             // TS parity (`assignAgentToTask`): the assignment write routes
             // through `updateNote` (→ `note:updated`) and the not_started →
             // in_progress transition through `updateTaskStatus`
@@ -23190,7 +23198,7 @@ impl WorkspaceApi for Services {
                 task.assigned_agent_ids.retain(|id| id != &agent_id);
                 note.metadata.task = Some(task);
                 note.updated_at = now.clone();
-                store.update_note(&note).await?;
+                store.update_note_metadata(&note).await?;
                 updated_count += 1;
             }
             Ok(TaskRemoveAgentFromAllTasksResult {

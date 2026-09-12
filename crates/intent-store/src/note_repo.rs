@@ -239,7 +239,49 @@ impl Store {
         note: &Note,
         expected_version: Option<i64>,
     ) -> Result<i64> {
-        match exec_update_note(self.write_pool(), note, expected_version).await? {
+        self.exec_note_update(note, expected_version, NoteUpdateScope::FullRow)
+            .await
+    }
+
+    /// Metadata-only update: rewrites every column *except* `content` and
+    /// `content_type`, so a writer that read the row before a concurrent
+    /// content write committed can never rewrite the stored content with its
+    /// stale copy (the metadata race in the intentd#1817 review). Unconditional
+    /// last-writer-wins bump of `rev`; a metadata write records no version
+    /// snapshot, and the base lookup for its rev falls back to the newest
+    /// content snapshot at or below it, which is the content the row still
+    /// holds. Returns the post-write `rev`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
+    pub async fn update_note_metadata(&self, note: &Note) -> Result<i64> {
+        self.update_note_metadata_versioned(note, None).await
+    }
+
+    /// [`Store::update_note_metadata`] optionally gated on `expected_version`,
+    /// with the same conflict / not-found classification as
+    /// [`Store::update_note_versioned`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
+    pub async fn update_note_metadata_versioned(
+        &self,
+        note: &Note,
+        expected_version: Option<i64>,
+    ) -> Result<i64> {
+        self.exec_note_update(note, expected_version, NoteUpdateScope::Metadata)
+            .await
+    }
+
+    async fn exec_note_update(
+        &self,
+        note: &Note,
+        expected_version: Option<i64>,
+        scope: NoteUpdateScope,
+    ) -> Result<i64> {
+        match exec_update_note(self.write_pool(), note, expected_version, scope).await? {
             Some(rev) => Ok(rev),
             None => Err(self.note_update_miss(note).await),
         }
@@ -698,16 +740,28 @@ impl Store {
     }
 }
 
-/// The one note UPDATE statement every content/metadata write runs (full-row
-/// replace scoped by `(id, workspace_id)` with the store-owned `rev = rev + 1`
-/// bump), against any executor so it can ride an open transaction alongside
-/// the version snapshot. `Some(rev)` is the post-write rev (`RETURNING rev`);
-/// `None` means no row matched — either the `expected_version` gate failed or
-/// the note is absent, which [`Store::note_update_miss`] tells apart.
+/// Which columns a note UPDATE rewrites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoteUpdateScope {
+    /// Every column but `id` / `workspace_id` — content writes.
+    FullRow,
+    /// Every column but `content` / `content_type` — metadata writes, which
+    /// must leave whatever content the row holds at write time untouched.
+    Metadata,
+}
+
+/// The one note UPDATE statement every content/metadata write runs (row
+/// replace over the columns `scope` selects, keyed by `(id, workspace_id)`,
+/// with the store-owned `rev = rev + 1` bump), against any executor so it can
+/// ride an open transaction alongside the version snapshot. `Some(rev)` is the
+/// post-write rev (`RETURNING rev`); `None` means no row matched — either the
+/// `expected_version` gate failed or the note is absent, which
+/// [`Store::note_update_miss`] tells apart.
 pub(crate) async fn exec_update_note<'e, E>(
     executor: E,
     note: &Note,
     expected_version: Option<i64>,
+    scope: NoteUpdateScope,
 ) -> Result<Option<i64>>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
@@ -719,19 +773,25 @@ where
         .as_ref()
         .map(encode_task_json)
         .transpose()?;
-    let mut sql = String::from(
-        "UPDATE note SET title=?, content=?, content_type=?, tags=?, \
-         is_pinned=?, is_archived=?, is_default=?, parent_id=?, visibility=?, task_json=?, \
-         created_at=?, updated_at=?, rev = rev + 1 WHERE id=? AND workspace_id=?",
+    let mut sql = String::from("UPDATE note SET title=?, ");
+    if scope == NoteUpdateScope::FullRow {
+        sql.push_str("content=?, content_type=?, ");
+    }
+    sql.push_str(
+        "tags=?, is_pinned=?, is_archived=?, is_default=?, parent_id=?, visibility=?, \
+         task_json=?, created_at=?, updated_at=?, rev = rev + 1 WHERE id=? AND workspace_id=?",
     );
     if expected_version.is_some() {
         sql.push_str(" AND rev=?");
     }
     sql.push_str(" RETURNING rev");
-    let mut query = sqlx::query(&sql)
-        .bind(&note.title)
-        .bind(&note.content)
-        .bind(enum_to_db(&note.content_type)?)
+    let mut query = sqlx::query(&sql).bind(&note.title);
+    if scope == NoteUpdateScope::FullRow {
+        query = query
+            .bind(&note.content)
+            .bind(enum_to_db(&note.content_type)?);
+    }
+    query = query
         .bind(tags_to_db(&note.tags)?)
         .bind(i64::from(note.is_pinned))
         .bind(i64::from(note.is_archived))
