@@ -814,23 +814,57 @@ mod tests {
     /// helpers exactly the way `gh auth setup-git` does on dev hosts
     /// (monorepo#3164). Written once per process and shared read-only by the
     /// tests in that process — under a per-test-process runner like nextest
-    /// each process writes its own pid-keyed dir. The dirs are not cleaned
-    /// up (a few bytes in the temp dir; a `Drop` guard cannot outlive the
-    /// `'static` sharing).
+    /// each process writes its own dir. The `'static` sharing outlives any
+    /// per-test `Drop` guard, so the `TempDir` is dropped from an `atexit`
+    /// handler ([`remove_poisoned_home`]) when the test process exits
+    /// instead; set `INTENTD_TEST_KEEP_TMP` (non-empty) to keep the dir
+    /// around for debugging.
     fn poisoned_home() -> &'static Path {
-        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        DIR.get_or_init(|| {
-            let dir = std::env::temp_dir().join(format!(
-                "intent-git-auth-poisoned-home-{}",
-                std::process::id()
-            ));
-            let poison = "[credential \"https://github.com\"]\n\thelper = \n\thelper = !/poisoned/gh auth git-credential\n";
-            std::fs::create_dir_all(dir.join("git")).expect("mkdir poisoned home");
-            std::fs::write(dir.join(".gitconfig"), poison).expect("write poisoned gitconfig");
-            std::fs::write(dir.join("git").join("config"), poison)
-                .expect("write poisoned xdg config");
-            dir
-        })
+        &POISONED_HOME
+            .get_or_init(|| {
+                let mut dir = tempfile::Builder::new()
+                    .prefix("intent-git-auth-poisoned-home-")
+                    .tempdir()
+                    .expect("mkdir poisoned home");
+                if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+                    dir.disable_cleanup(true);
+                }
+                let poison = "[credential \"https://github.com\"]\n\thelper = \n\thelper = !/poisoned/gh auth git-credential\n";
+                std::fs::create_dir_all(dir.path().join("git")).expect("mkdir poisoned xdg dir");
+                std::fs::write(dir.path().join(".gitconfig"), poison)
+                    .expect("write poisoned gitconfig");
+                std::fs::write(dir.path().join("git").join("config"), poison)
+                    .expect("write poisoned xdg config");
+                // SAFETY: `remove_poisoned_home` is a plain `extern "C" fn`
+                // with no arguments that touches only the static below.
+                unsafe {
+                    libc::atexit(remove_poisoned_home);
+                }
+                PoisonedHome {
+                    path: dir.path().to_path_buf(),
+                    dir: std::sync::Mutex::new(Some(dir)),
+                }
+            })
+            .path
+    }
+
+    /// The process-wide [`poisoned_home`] fixture: `path` stays borrowable
+    /// for `'static` while `dir` can be taken and dropped at exit.
+    struct PoisonedHome {
+        path: std::path::PathBuf,
+        dir: std::sync::Mutex<Option<tempfile::TempDir>>,
+    }
+
+    static POISONED_HOME: std::sync::OnceLock<PoisonedHome> = std::sync::OnceLock::new();
+
+    /// `atexit` handler removing the [`poisoned_home`] dir (the `TempDir`
+    /// honors `INTENTD_TEST_KEEP_TMP` via `disable_cleanup`).
+    extern "C" fn remove_poisoned_home() {
+        if let Some(home) = POISONED_HOME.get() {
+            if let Ok(mut dir) = home.dir.lock() {
+                drop(dir.take());
+            }
+        }
     }
 
     /// A `git` command reading config with `params` as the command-line scope
