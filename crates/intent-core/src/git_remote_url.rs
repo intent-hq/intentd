@@ -73,10 +73,14 @@ impl GitRemoteUrl {
         } else {
             // No scheme: only the scp-like `[user@]host:path` form qualifies.
             // A `/` or `\` before the first `:` marks a local path, and a
-            // single-letter authority is a DOS drive prefix (`C:\repos\...`).
+            // single-letter authority followed by a path separator is a DOS
+            // drive prefix (`C:\repos\...`, `c:/repos/...`). A single-letter
+            // host with a relative path (`g:acme/widget.git`) stays scp-like:
+            // that is a valid SSH host alias, and git treats it as a remote.
             let (authority, path) = trimmed.split_once(':')?;
-            let dos_drive =
-                authority.len() == 1 && authority.bytes().all(|b| b.is_ascii_alphabetic());
+            let dos_drive = authority.len() == 1
+                && authority.bytes().all(|b| b.is_ascii_alphabetic())
+                && path.starts_with(['/', '\\']);
             if authority.contains(['/', '\\']) || dos_drive {
                 return None;
             }
@@ -256,6 +260,42 @@ mod tests {
         assert_eq!(slug("https://gitlab.com/group/o/.git"), None);
     }
 
+    /// Accepted deltas against the deleted per-crate parsers (intentd#1836).
+    /// Each row is a URL the old `accept_changes::parse_owner_repo` /
+    /// `clone_ops::parse_owner_repo` mis-derived; the shared parser returns
+    /// the corrected value, and this test pins that correction so the change
+    /// is explicit rather than incidental.
+    #[test]
+    fn accepted_deltas_against_deleted_parsers() {
+        let widget = RepoRef::new("acme", "widget");
+        // Old: owner `22`, name `acme/widget` (port taken as the owner).
+        assert_eq!(
+            github("ssh://git@github.com:22/acme/widget.git"),
+            Some(widget.clone())
+        );
+        // Old: name `widget/extra`; a GitHub identity is exactly two segments.
+        // The host-agnostic cache slug still keys the last two, as before.
+        assert_eq!(github("https://github.com/acme/widget/extra"), None);
+        assert_eq!(
+            slug("https://github.com/acme/widget/extra"),
+            Some(RepoRef::new("widget", "extra"))
+        );
+        // Old: name `widget.git?ref=main` (query kept, `.git` not stripped).
+        assert_eq!(
+            github("https://github.com/acme/widget.git?ref=main"),
+            Some(widget.clone())
+        );
+        assert_eq!(
+            slug("https://github.com/acme/widget.git?ref=main"),
+            Some(widget)
+        );
+        // Unchanged: dotted repository names keep every dot but the suffix.
+        assert_eq!(
+            github("https://github.com/octo/molecules.gg.git"),
+            Some(RepoRef::new("octo", "molecules.gg"))
+        );
+    }
+
     /// The two probe URLs from intent-hq/intentd#1815 review thread
     /// r3996201879 plus every other foreign-host / local-path corpus entry:
     /// an `@` in the path never promotes the source to GitHub.
@@ -298,6 +338,7 @@ mod tests {
             "../a@github.com:acme/widget",
             "C:\\repos\\a@github.com:acme\\widget",
             "c:/repos/acme/widget",
+            "C:\\",
             "file://example.invalid/tmp/acme/widget.git",
             "file://",
             "file:///",
@@ -335,6 +376,11 @@ mod tests {
             slug("ssh://git@gitlab.com:2222/acme/widget"),
             Some(widget.clone())
         );
+        // A single-letter SSH host alias is a remote, not a DOS drive: the
+        // drive form needs a `\` or `/` right after the colon (see the
+        // `local_paths_and_unknown_schemes_parse_to_none` rows).
+        assert_eq!(slug("g:acme/widget.git"), Some(widget.clone()));
+        assert_eq!(github("g:acme/widget.git"), None);
         assert_eq!(slug("https://github.com/acme/widget.git"), Some(widget));
         assert_eq!(slug("https://gitlab.com/widget.git"), None);
         assert_eq!(slug("https://gitlab.com/"), None);
