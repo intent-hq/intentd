@@ -248,9 +248,17 @@ impl Services {
     /// (intent-hq/intent#4691): runs at boot and lazily on every keyed
     /// placement / `begin`. A failed sweep never fails the caller.
     pub async fn sweep_expired_attachment_idempotency_keys(&self) {
+        self.sweep_expired_attachment_idempotency_keys_before(&idempotency_retention_cutoff())
+            .await;
+    }
+
+    /// [`Self::sweep_expired_attachment_idempotency_keys`] at an explicit
+    /// cutoff, so a keyed operation's sweep, lookup, and bind all judge
+    /// expiry at the same instant.
+    async fn sweep_expired_attachment_idempotency_keys_before(&self, cutoff: &str) {
         match self
             .store
-            .sweep_expired_attachment_idempotency_keys(&idempotency_retention_cutoff())
+            .sweep_expired_attachment_idempotency_keys(cutoff)
             .await
         {
             Ok(0) => {}
@@ -321,18 +329,20 @@ impl Services {
                 .place_attachment_registered_inner(workspace_id, file_name, source, mime_type, None)
                 .await;
         };
-        self.sweep_expired_attachment_idempotency_keys().await;
+        // One cutoff for the sweep, the lookup, and the bind: a binding
+        // that crosses the retention boundary between them is judged
+        // expired consistently (the keyed insert replaces it in-transaction
+        // rather than tripping the primary key).
+        let cutoff = idempotency_retention_cutoff();
+        self.sweep_expired_attachment_idempotency_keys_before(&cutoff)
+            .await;
         let lock = self.idempotency_inflight_lock(&workspace_id, &keyed.key);
         let result = {
             let _guard = lock.lock().await;
             let bound = match &keyed.lookup_fingerprint {
                 Some(_) => {
                     self.store
-                        .get_attachment_by_idempotency_key(
-                            &workspace_id,
-                            &keyed.key,
-                            &idempotency_retention_cutoff(),
-                        )
+                        .get_attachment_by_idempotency_key(&workspace_id, &keyed.key, &cutoff)
                         .await
                 }
                 None => Ok(None),
@@ -352,7 +362,7 @@ impl Services {
                         file_name,
                         source,
                         mime_type,
-                        Some((keyed.key.as_str(), keyed.sha256.as_deref())),
+                        Some((keyed.key.as_str(), keyed.sha256.as_deref(), cutoff.as_str())),
                     )
                     .await
                 }
@@ -362,15 +372,16 @@ impl Services {
         result
     }
 
-    /// `idempotency` = `(key, sha256)`: the key is bound to
-    /// `(fileName, placed size, sha256)`.
+    /// `idempotency` = `(key, sha256, expired_before)`: the key is bound to
+    /// `(fileName, placed size, sha256)`, replacing a binding of the same
+    /// key created at/before `expired_before`.
     async fn place_attachment_registered_inner(
         &self,
         workspace_id: WorkspaceId,
         file_name: &str,
         source: &crate::file_ops::AttachmentSource<'_>,
         mime_type: Option<String>,
-        idempotency: Option<(&str, Option<&str>)>,
+        idempotency: Option<(&str, Option<&str>, &str)>,
     ) -> Result<serde_json::Value> {
         let store = &self.store;
         let root = crate::file_ops::resolve_root(store, &workspace_id, None).await;
@@ -413,11 +424,16 @@ impl Services {
             stored_path: result["path"].as_str().unwrap_or_default().to_string(),
         };
         let inserted = match idempotency {
-            Some((key, sha256)) => {
+            Some((key, sha256, expired_before)) => {
                 let placed_size = result["size"].as_u64().unwrap_or_default();
                 let fingerprint = attachment_fingerprint(file_name, placed_size, sha256);
                 store
-                    .insert_attachment_with_idempotency_key(&record, key, &fingerprint)
+                    .insert_attachment_with_idempotency_key(
+                        &record,
+                        key,
+                        &fingerprint,
+                        expired_before,
+                    )
                     .await
             }
             None => store.insert_attachment(&record).await,
@@ -515,14 +531,12 @@ impl Services {
 
         let fingerprint = attachment_fingerprint(&file_name, size_bytes, Some(&sha));
         if let Some(key) = &idempotency_key {
-            self.sweep_expired_attachment_idempotency_keys().await;
+            let cutoff = idempotency_retention_cutoff();
+            self.sweep_expired_attachment_idempotency_keys_before(&cutoff)
+                .await;
             if let Some((binding, _)) = self
                 .store
-                .get_attachment_by_idempotency_key(
-                    &workspace_id,
-                    key,
-                    &idempotency_retention_cutoff(),
-                )
+                .get_attachment_by_idempotency_key(&workspace_id, key, &cutoff)
                 .await?
             {
                 if binding.fingerprint != fingerprint {
@@ -1395,6 +1409,83 @@ mod tests {
             binding.fingerprint,
             super::attachment_fingerprint("status.txt", 0, None)
         );
+    }
+
+    /// Regression (#1841 review): an expired binding still present at bind
+    /// time — the sweep missed it (failed, or the binding crossed the
+    /// retention boundary between the sweep and the lookup) — must not turn
+    /// the fresh placement into a spurious "already bound". This drives the
+    /// post-lookup path directly with the binding back-dated past the
+    /// cutoff and no sweep: the file is placed, the key is rebound to the
+    /// new row, and the original row and file are untouched.
+    #[tokio::test]
+    async fn keyed_placement_replaces_expired_binding_the_sweep_missed() {
+        let ws = WorkspaceId("ws-up-keyed-expired".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let payload = b"boundary".to_vec();
+        let sha = sha256_hex(&payload);
+        let first = svc
+            .file_place_attachment(
+                ws.clone(),
+                "b.bin".to_string(),
+                Some(b64(&payload)),
+                None,
+                None,
+                Some("key-boundary".to_string()),
+            )
+            .await
+            .expect("first keyed place");
+        let first_id = first["attachmentId"].as_str().unwrap().to_string();
+        // Back-date the binding past retention; do NOT sweep.
+        sqlx::query("UPDATE attachment_idempotency_keys SET created_at = ? WHERE key = ?")
+            .bind(intent_core::iso_minutes_ago(8 * 24 * 60))
+            .bind("key-boundary")
+            .execute(svc.store().write_pool())
+            .await
+            .expect("back-date binding");
+        let cutoff = super::idempotency_retention_cutoff();
+        assert!(svc
+            .store()
+            .get_attachment_by_idempotency_key(&ws, "key-boundary", &cutoff)
+            .await
+            .expect("lookup")
+            .is_none());
+
+        let fresh = svc
+            .place_attachment_registered_inner(
+                ws.clone(),
+                "b.bin",
+                &crate::file_ops::AttachmentSource::Bytes(&payload),
+                None,
+                Some(("key-boundary", Some(sha.as_str()), cutoff.as_str())),
+            )
+            .await
+            .expect("fresh placement rebinding the expired key");
+        assert!(fresh.get("replayed").is_none(), "{fresh}");
+        assert_ne!(fresh["attachmentId"], serde_json::json!(first_id));
+        assert_eq!(fresh["fileName"], serde_json::json!("b-2.bin"));
+        assert!(checkout.0.join(".intent/attachments/b.bin").is_file());
+        assert!(checkout.0.join(".intent/attachments/b-2.bin").is_file());
+
+        let (binding, row) = svc
+            .store()
+            .get_attachment_by_idempotency_key(&ws, "key-boundary", &cutoff)
+            .await
+            .expect("lookup rebound")
+            .expect("rebound");
+        assert_eq!(serde_json::json!(row.id), fresh["attachmentId"]);
+        assert_eq!(
+            binding.fingerprint,
+            super::attachment_fingerprint("b.bin", payload.len() as u64, Some(&sha))
+        );
+        let original = svc
+            .file_get_attachment_info(first_id)
+            .await
+            .expect("original row survives");
+        assert_eq!(original["fileName"], serde_json::json!("b.bin"));
     }
 
     /// Regression (#1841 review): a keyed `begin` replay is activity. A

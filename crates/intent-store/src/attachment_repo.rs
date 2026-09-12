@@ -45,25 +45,47 @@ impl Store {
     /// Insert an attachment-registry row AND its idempotency-key binding in
     /// ONE write transaction, so the binding is exactly as durable as the
     /// placement. The binding's `created_at` is the record's `uploaded_at`.
-    /// A `(workspace_id, key)` already bound is `Error::InvalidParams` —
-    /// the caller is expected to look the key up first; the primary key is
-    /// the last line of defence against a double insert.
+    /// An EXPIRED binding of the same `(workspace_id, key)` — created
+    /// at/before `expired_before`, the same cutoff the caller's lookup used —
+    /// is replaced inside the transaction, so a binding that crosses the
+    /// retention boundary between the sweep and the lookup (or survives a
+    /// failed sweep) still yields the documented fresh placement rather
+    /// than a spurious "already bound"; the previous attachment row is left
+    /// untouched. A LIVE `(workspace_id, key)` binding is
+    /// `Error::InvalidParams` — the caller is expected to look the key up
+    /// first; the primary key is the last line of defence against a double
+    /// insert.
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidParams` when the key is already bound in the
-    /// workspace; `Error::Internal` if the database operation fails.
+    /// Returns `Error::InvalidParams` when the key is already bound (live)
+    /// in the workspace; `Error::Internal` if the database operation fails.
     pub async fn insert_attachment_with_idempotency_key(
         &self,
         a: &AttachmentRecord,
         key: &str,
         fingerprint: &str,
+        expired_before: &str,
     ) -> Result<()> {
         let pool = self.write_pool();
         let sql = format!("INSERT INTO attachments ({COLUMNS}) VALUES (?,?,?,?,?,?,?)");
         crate::with_write_txn_retry(|| async {
             let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("insert attachment (keyed) begin failed: {e}"))
+            })?;
+            sqlx::query(
+                "DELETE FROM attachment_idempotency_keys \
+                 WHERE workspace_id = ? AND key = ? AND created_at <= ?",
+            )
+            .bind(&a.workspace_id.0)
+            .bind(key)
+            .bind(expired_before)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "replace expired attachment idempotency key failed: {e}"
+                ))
             })?;
             sqlx::query(&sql)
                 .bind(&a.id)
