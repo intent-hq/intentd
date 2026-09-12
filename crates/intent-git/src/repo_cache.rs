@@ -1781,10 +1781,28 @@ mod tests {
 
         assert_eq!(path, path2);
         assert!(marker.exists(), "case-variant slug must not clone twice");
-        assert!(
-            !root.path().join("Intent-HQ").exists(),
-            "no raw-cased slot may be created"
+        // Assert the real entry names: on a case-insensitive filesystem a
+        // lookup of `Intent-HQ` would alias `intent-hq`, proving nothing.
+        assert_eq!(
+            dir_names(root.path()),
+            vec!["intent-hq".to_string()],
+            "only the folded owner dir may exist"
         );
+        assert_eq!(
+            dir_names(&root.path().join("intent-hq")),
+            vec!["intentd".to_string()],
+            "only the folded repo dir may exist"
+        );
+    }
+
+    /// Sorted entry names directly under `dir`.
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     /// A slot populated before the key was folded (`<Owner>/<Repo>` on a
@@ -1856,10 +1874,16 @@ mod tests {
         // put and the folded content must survive untouched.
         std::fs::create_dir_all(&folded).unwrap();
         std::fs::write(folded.join("marker"), "folded").unwrap();
-        let variant = plant_slot(root.path(), "Acme", "Widget");
-        if !variant.join("marker").exists() || variant == folded {
-            return; // case-insensitive filesystem: the two paths are one dir
+        if root
+            .path()
+            .join("Acme")
+            .join("Widget")
+            .join("marker")
+            .exists()
+        {
+            return; // case-insensitive filesystem: the two spellings alias
         }
+        let variant = plant_slot(root.path(), "Acme", "Widget");
         adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
         assert_eq!(
             std::fs::read_to_string(folded.join("marker")).unwrap(),
