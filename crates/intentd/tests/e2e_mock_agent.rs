@@ -94,7 +94,8 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
         return;
     }
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -242,7 +243,4 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }

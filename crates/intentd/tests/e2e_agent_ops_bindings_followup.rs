@@ -8,7 +8,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use intent_core::{
@@ -68,23 +67,18 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
     }
 }
 
-fn cleanup_db(db: &PathBuf) {
-    std::fs::remove_file(db).ok();
-    std::fs::remove_file(db.with_extension("db-wal")).ok();
-    std::fs::remove_file(db.with_extension("db-shm")).ok();
-}
-
-async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
-    let db =
-        std::env::temp_dir().join(format!("intentd-e2e-agent-ops-{}.db", uuid::Uuid::new_v4()));
-    let ws_root =
-        std::env::temp_dir().join(format!("itd-e2e-agent-ops-ws-{}", uuid::Uuid::new_v4()));
+/// Scratch layout: `<tmp>/intentd.db` plus the workspace checkout at
+/// `<tmp>/ws`; the returned guard removes both on drop.
+async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
+    let tmp = common::test_tempdir("intentd-e2e-agent-ops-");
+    let db = tmp.path().join("intentd.db");
+    let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(&ws_root).expect("create ws root");
 
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(ws_root.parent().unwrap().to_path_buf())
+        .with_workspaces_root(tmp.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(&ws_root))
         .with_event_bus(bus.clone());
 
@@ -94,12 +88,12 @@ async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
         .await
         .expect("insert ws");
 
-    (Arc::new(services), ws, ws_root, db)
+    (Arc::new(services), ws, tmp)
 }
 
 #[tokio::test]
 async fn agent_send_message_persists_without_manager() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     // Create target agent
     let target_val = services
@@ -140,13 +134,11 @@ async fn agent_send_message_persists_without_manager() {
     assert_eq!(result["queued"], false);
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn agent_send_to_task_delivers_to_assigned_agent() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     // Create a task note
     let task_note = services
@@ -223,13 +215,11 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
     assert_eq!(result["result"]["success"], true);
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn agent_cancel_subscriptions_idempotent() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     // Create an agent
     let agent_val = services
@@ -261,13 +251,11 @@ async fn agent_cancel_subscriptions_idempotent() {
     assert_eq!(result2["success"], true);
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn agent_wake_or_create_creates_for_unassigned_task() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     // Create a task note
     let task_note = services
@@ -321,13 +309,11 @@ async fn agent_wake_or_create_creates_for_unassigned_task() {
     assert!(!task.assigned_agents.is_empty());
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn agent_get_subscriptions_returns_empty_for_new_agent() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     // Create agent
     let agent_val = services
@@ -356,13 +342,11 @@ async fn agent_get_subscriptions_returns_empty_for_new_agent() {
     assert!(result["agentStatuses"].is_object());
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn agent_delegate_creates_new_agent_for_task() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     // Create a task note
     let task_note = services
@@ -416,6 +400,4 @@ async fn agent_delegate_creates_new_agent_for_task() {
     assert!(result["name"].is_string());
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }

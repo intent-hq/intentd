@@ -25,21 +25,20 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 /// Layout for one spawned daemon: a short base dir (macOS caps UDS paths at
-/// ~104 bytes) holding the data dir and a fake `$HOME`.
+/// ~104 bytes) holding the data dir and a fake `$HOME`. The base guard removes
+/// the whole tree on drop; keep it alive past the daemon guard.
 struct TestDirs {
-    base: PathBuf,
+    base: tempfile::TempDir,
     data_dir: PathBuf,
     home: PathBuf,
 }
 
 fn make_dirs() -> TestDirs {
-    let id = Uuid::new_v4().simple().to_string();
-    let base = PathBuf::from("/tmp").join(format!("itdh-{}", &id[..8]));
-    let data_dir = base.join("data");
-    let home = base.join("home");
+    let base = common::test_tempdir_in("/tmp", "itdh-");
+    let data_dir = base.path().join("data");
+    let home = base.path().join("home");
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     std::fs::create_dir_all(&home).expect("mkdir fake home");
     TestDirs {
@@ -121,7 +120,7 @@ async fn wait_for_log_marker(log: &Path, marker: &str) -> bool {
 async fn workspace_create_without_workspaces_dir_refuses_home_fallback() {
     let dirs = make_dirs();
     let socket = dirs.data_dir.join("intentd.sock");
-    let _daemon = common::DaemonGuard::new(spawn_daemon(&dirs, None), dirs.base.clone(), true);
+    let _daemon = common::DaemonGuard::process_only(spawn_daemon(&dirs, None));
     assert!(await_socket(&socket).await, "daemon did not start");
 
     // Drive workspace.create with NO INTENTD_WORKSPACES_DIR: resolving the
@@ -187,14 +186,10 @@ async fn workspace_create_without_workspaces_dir_refuses_home_fallback() {
 #[tokio::test]
 async fn workspace_create_with_workspaces_dir_provisions_under_temp_root() {
     let dirs = make_dirs();
-    let workspaces_dir = dirs.base.join("workspaces");
+    let workspaces_dir = dirs.base.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let socket = dirs.data_dir.join("intentd.sock");
-    let _daemon = common::DaemonGuard::new(
-        spawn_daemon(&dirs, Some(&workspaces_dir)),
-        dirs.base.clone(),
-        true,
-    );
+    let _daemon = common::DaemonGuard::process_only(spawn_daemon(&dirs, Some(&workspaces_dir)));
     assert!(await_socket(&socket).await, "daemon did not start");
 
     // Happy path: with INTENTD_WORKSPACES_DIR set the same create succeeds…

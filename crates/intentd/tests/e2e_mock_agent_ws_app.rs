@@ -97,7 +97,8 @@ fn gate() -> Option<String> {
 async fn chief_agent_ws_app_workspaces_list() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-ws-app-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -266,9 +267,6 @@ async fn chief_agent_ws_app_workspaces_list() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// Gap 2 (P2): Chief-workspace agent calls ws.app.proposal.show and the
@@ -278,10 +276,8 @@ async fn chief_agent_ws_app_workspaces_list() {
 async fn chief_agent_ws_app_proposal_resource_persisted() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-ws-app-prop-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-prop-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -441,9 +437,6 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// intent-hq/monorepo#511 regression class: a provider that collapses the MCP
@@ -454,10 +447,8 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
 async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-ws-app-collapse-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-collapse-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -613,9 +604,6 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     assert_eq!(parsed["payload"]["key"], "test.setting");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// §7.1 deterministic attach: a provider whose tool echo is GARBLED beyond
@@ -630,10 +618,8 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
 async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-ws-app-garble-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-garble-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -793,9 +779,6 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
     assert_eq!(parsed["payload"]["value"], "new-value");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// Regression e2e (monorepo#2637): the agent's JS DISCARDS the proposal
@@ -809,10 +792,8 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
 async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-ws-app-discard-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-discard-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -971,9 +952,6 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
     assert_eq!(parsed["payload"]["value"], "new-value");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// Regression e2e (intent-hq/intent#4491): the auggie provider titles a
@@ -990,10 +968,8 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
 async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-ws-app-auggie-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-auggie-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -1211,9 +1187,6 @@ async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
     assert_eq!(parsed["payload"]["value"], "new-value");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// Gap 3 (P3): Non-chief workspace agent calls ws.app.* and receives the
@@ -1222,10 +1195,8 @@ async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
 async fn non_chief_agent_ws_app_gating_error() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-ws-app-gate-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-gate-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -1382,7 +1353,4 @@ async fn non_chief_agent_ws_app_gating_error() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }

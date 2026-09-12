@@ -13,9 +13,8 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// Verify token generation and persistence via `AsyncTokenStore`.
 #[tokio::test]
 async fn token_generation_and_persistence() {
-    let tmp_dir = std::env::temp_dir().join(format!("intentd-token-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
-    let secrets_file = tmp_dir.join("secrets.json");
+    let tmp_dir = common::test_tempdir("intentd-token-");
+    let secrets_file = tmp_dir.path().join("secrets.json");
 
     let store_async = {
         let guard = ENV_LOCK.lock().unwrap();
@@ -40,16 +39,13 @@ async fn token_generation_and_persistence() {
         .await
         .expect("get_or_create");
     assert_eq!(token2, token1, "get_or_create returns existing token");
-
-    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 /// Verify token rotation (generate new, replace old).
 #[tokio::test]
 async fn token_rotation_replaces_old() {
-    let tmp_dir = std::env::temp_dir().join(format!("intentd-token-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
-    let secrets_file = tmp_dir.join("secrets.json");
+    let tmp_dir = common::test_tempdir("intentd-token-");
+    let secrets_file = tmp_dir.path().join("secrets.json");
 
     let store_async = {
         let guard = ENV_LOCK.lock().unwrap();
@@ -72,14 +68,13 @@ async fn token_rotation_replaces_old() {
     // Verify new token persisted
     let loaded = store_async.load_token().await;
     assert_eq!(loaded, Some(token2));
-
-    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 /// Verify `Config::resolve` correctly sets daemon paths.
 #[tokio::test]
 async fn config_paths_include_daemon_files() {
-    let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("intentd-cfg-");
+    let tmp_dir = tmp.path().to_path_buf();
 
     let config = {
         let guard = ENV_LOCK.lock().unwrap();
@@ -94,6 +89,4 @@ async fn config_paths_include_daemon_files() {
     assert_eq!(config.db_path, tmp_dir.join("intentd.db"));
     assert_eq!(config.socket_path, tmp_dir.join("intentd.sock"));
     assert_eq!(config.pid_path, tmp_dir.join("intentd.pid"));
-
-    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
