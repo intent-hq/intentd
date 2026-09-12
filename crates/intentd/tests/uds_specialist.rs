@@ -98,18 +98,18 @@ fn write_specialist(dir: &Path, id: &str, name: &str, desc: &str, prompt: &str) 
 }
 
 struct Harness {
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    server: Option<tokio::task::JoinHandle<()>>,
+    user_dir: PathBuf,
+    bundled_dir: PathBuf,
+    work_dir: PathBuf,
+    socket: PathBuf,
     _user: tempfile::TempDir,
     _bundled: tempfile::TempDir,
     _work: tempfile::TempDir,
     _tmp: TempDb,
     _ws_root: tempfile::TempDir,
-    user_dir: PathBuf,
-    bundled_dir: PathBuf,
-    work_dir: PathBuf,
-    socket: PathBuf,
     _sock_dir: tempfile::TempDir,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    server: Option<tokio::task::JoinHandle<()>>,
 }
 
 async fn start() -> Harness {
