@@ -12,8 +12,15 @@
 # a "no comment on #10" assertion is never satisfied by a run that posts
 # nothing at all.
 #
+# Requires `jq`: the stub gh applies the script's real graphql --jq filter to
+# raw GraphQL response fixtures, so a renamed field or wrong path in the
+# projection fails a scenario instead of silently posting or suppressing.
+#
 # Run directly: ./scripts/test-notify-fixed-issues.sh
 set -euo pipefail
+
+command -v jq >/dev/null 2>&1 \
+  || { echo "error: jq is required (the stub gh runs the script's --jq filter with it); install it, e.g. apt-get install jq / brew install jq" >&2; exit 1; }
 
 here=$(cd "$(dirname "$0")" && pwd)
 script="$here/notify-fixed-issues.sh"
@@ -21,13 +28,14 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/issues"
 
-# Stub gh, answering exactly what the real calls' --jq filters would leave:
+# Stub gh, sitting at the call boundary like the real binary:
 #   api graphql (no -F number)     -> the token-visibility preflight; succeeds
-#   api graphql -F number=N        -> $STUB_ISSUES_DIR/N verbatim (issue state,
-#                                     pageInfo.hasNextPage, then one
-#                                     "<pr> <state> <oid>" line per linked
-#                                     SOURCE_REPO PR); a missing file fails the
-#                                     call like an API error would
+#   api graphql -F number=N --jq F -> `jq -r F` over $STUB_ISSUES_DIR/N.json, a
+#                                     raw GraphQL response body in GitHub's
+#                                     shape (see `fixture`), exactly as gh
+#                                     would project it; a missing file fails
+#                                     the call like an API error would, and a
+#                                     call without --jq fails loudly
 #   api repos/*/issues/N/comments  -> no existing comments
 # Anything else (pr view, issue comment, ...) fails loudly: the fixture range
 # has no "(#N)" subjects, and a dry-run must never post.
@@ -36,12 +44,25 @@ cat >"$tmp/bin/gh" <<'EOF'
 set -euo pipefail
 case "$1 ${2:-}" in
   "api graphql")
-    number=""
+    number="" filter="" next_is_filter=false
     for a in "$@"; do
-      case "$a" in number=*) number="${a#number=}" ;; esac
+      if [[ "$next_is_filter" == true ]]; then
+        filter="$a"
+        next_is_filter=false
+        continue
+      fi
+      case "$a" in
+        number=*) number="${a#number=}" ;;
+        --jq) next_is_filter=true ;;
+        --jq=*) filter="${a#--jq=}" ;;
+      esac
     done
     [[ -n "$number" ]] || exit 0
-    cat "$STUB_ISSUES_DIR/$number"
+    if [[ -z "$filter" ]]; then
+      echo "stub gh: api graphql -F number=$number called without --jq" >&2
+      exit 1
+    fi
+    jq -r "$filter" "$STUB_ISSUES_DIR/$number.json"
     ;;
   "api repos/"*"/issues/"*"/comments")
     ;;
@@ -84,12 +105,35 @@ assert_contains() {
 assert_not_contains() {
   ! grep -qF -- "$2" "$1" || fail "$3: expected output to NOT contain: $2"
 }
-# fixture N STATE [linked-pr-line...]: writes the stub's answer for issue N;
-# FIXTURE_HAS_NEXT_PAGE (default false) is the pageInfo.hasNextPage line.
+# fixture N STATE [linked-pr...]: writes the raw GraphQL response body the
+# stub answers for issue N, in the shape the script's query selects:
+#   {data:{repository:{issue:{state, closedByPullRequestsReferences:
+#     {pageInfo:{hasNextPage}, nodes:[{repository:{nameWithOwner}, number,
+#      state, mergeCommit:{oid}|null}]}}}}}
+# Each linked-pr is "<number> <state> [<oid>]"; an empty oid yields a null
+# mergeCommit (unmerged PR). <number> may carry an "<owner/repo>#" prefix for
+# a PR outside SOURCE_REPO (default intent-hq/intentd). FIXTURE_HAS_NEXT_PAGE
+# (default false) is pageInfo.hasNextPage.
 fixture() {
-  local n="$1" state="$2"
+  local n="$1" state="$2" nodes='[]' pr pr_repo pr_number pr_state pr_oid
   shift 2
-  { printf '%s\n%s\n' "$state" "${FIXTURE_HAS_NEXT_PAGE:-false}"; printf '%s\n' "$@"; } >"$STUB_ISSUES_DIR/$n"
+  for pr in "$@"; do
+    read -r pr_number pr_state pr_oid <<<"$pr"
+    pr_repo="intent-hq/intentd"
+    if [[ "$pr_number" == *"#"* ]]; then
+      pr_repo="${pr_number%#*}"
+      pr_number="${pr_number##*#}"
+    fi
+    nodes=$(jq -c --arg repo "$pr_repo" --argjson number "$pr_number" \
+      --arg state "$pr_state" --arg oid "${pr_oid:-}" \
+      '. + [{repository: {nameWithOwner: $repo}, number: $number, state: $state,
+             mergeCommit: (if $oid == "" then null else {oid: $oid} end)}]' <<<"$nodes")
+  done
+  jq -n --arg state "$state" --argjson has_next "${FIXTURE_HAS_NEXT_PAGE:-false}" \
+    --argjson nodes "$nodes" \
+    '{data: {repository: {issue: {state: $state, closedByPullRequestsReferences:
+       {pageInfo: {hasNextPage: $has_next}, nodes: $nodes}}}}}' \
+    >"$STUB_ISSUES_DIR/$n.json"
 }
 # run SCENARIO EXPECTED_STATUS: runs a dry-run for intentd v1.2.3 over the
 # fixture range, capturing stdout (comment previews) and stderr (log).
@@ -121,7 +165,8 @@ assert_control() {
 fixture 11 CLOSED "88 MERGED $contained_sha"
 
 echo "scenario 1: mention-only reference to a closed issue stays silent"
-fixture 10 CLOSED
+# A merged PR on another repository is not a SOURCE_REPO fix.
+fixture 10 CLOSED "intent-hq/cloudlands-fe#300 MERGED $contained_sha"
 run s1 0
 assert_control s1
 assert_contains "$tmp/err.s1" "issue #10: no delivered linked fix PR on intent-hq/intentd; mention-only reference, staying silent" s1
@@ -139,7 +184,8 @@ assert_control s3
 assert_contains "$tmp/err.s3" "issue #10: issue is still open; staying silent" s3
 
 echo "scenario 4: closed issue with a merged, contained fix PR is commented on"
-fixture 10 CLOSED "77 MERGED $contained_sha"
+# An open PR on another repository does not hold back the SOURCE_REPO fix.
+fixture 10 CLOSED "77 MERGED $contained_sha" "intent-hq/cloudlands-fe#300 OPEN"
 run s4 0
 assert_contains "$tmp/out.s4" "$would_comment_10" s4
 assert_contains "$tmp/out.s4" "$would_comment_11" s4
@@ -164,7 +210,7 @@ assert_control s7
 assert_contains "$tmp/err.s7" "issue #10: no delivered linked fix PR on intent-hq/intentd; mention-only reference, staying silent" s7
 
 echo "scenario 8: gate enumeration failure skips the issue with a warning and exits 1"
-rm -f "$STUB_ISSUES_DIR/10"
+rm -f "$STUB_ISSUES_DIR/10.json"
 run s8 1
 assert_control s8
 assert_contains "$tmp/err.s8" "warning: issue #10: could not enumerate linked intent-hq/intentd fix PRs; completeness indeterminate, skipping" s8
