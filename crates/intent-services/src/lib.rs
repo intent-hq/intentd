@@ -102,6 +102,7 @@ mod line_attribution;
 mod linear_ops;
 mod model_catalog;
 mod nested_repos;
+mod note_merge;
 pub mod note_ops;
 mod one_shot_acp;
 pub mod pagination;
@@ -8734,15 +8735,19 @@ async fn resolve_note_version_author(
 }
 
 /// Append a full-snapshot version of `note`'s *current* (post-mutation) state,
-/// stamped with `author` and the note's `updated_at` (PROTOCOL §5.2
-/// version-history extensions). The store prunes to the newest 50 on append.
+/// stamped with `author`, the note's `updated_at` and `rev` — the note's
+/// post-write `rev` as returned by the store write (or `note.rev` right after
+/// an insert), so the snapshot is the recoverable base for a writer that later
+/// sends that rev (PROTOCOL §5.2 version-history extensions). The store
+/// prunes to the newest 50 on append.
 async fn capture_note_version(
     store: &Store,
     note: &Note,
     author: &NoteVersionAuthor,
+    rev: i64,
 ) -> Result<i64> {
     store
-        .append_note_version(note, author, &note.updated_at)
+        .append_note_version(note, author, &note.updated_at, rev)
         .await
 }
 
@@ -9268,7 +9273,7 @@ async fn ensure_spec_note(
     };
     store.insert_note(&note).await?;
     // Workspace-seed spec is daemon-internal; no caller agent applies.
-    capture_note_version(store, &note, &system_version_author()).await?;
+    capture_note_version(store, &note, &system_version_author(), note.rev).await?;
     publish_event(
         bus,
         note_change_event(
@@ -11313,7 +11318,7 @@ impl Services {
                 .update_note_versioned(&note, Some(note.rev))
                 .await
             {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(Error::Conflict { .. }) if attempt < MAX_ATTEMPTS => continue,
                 Err(e) => {
                     tracing::warn!(note = %note.id.0, task = %task_id.0, attempt, error = %e, "materialize linked checkboxes: update failed");
@@ -13783,13 +13788,13 @@ impl Services {
         }
         note.content = working;
         note.updated_at = now_iso();
-        store.update_note(&note).await?;
+        let rev = store.update_note(&note).await?;
         // TS parity: the reference pushes a version snapshot ("Converted
         // task blocks to linked Task Notes") as part of the conversion
         // save, so the newest stored version matches the fence-free
         // content that line-attribution/history consumers diff against.
         let author = resolve_note_version_author(store, caller_agent_id).await;
-        capture_note_version(store, &note, &author).await?;
+        capture_note_version(store, &note, &author, rev).await?;
         self.invalidate_crdt_note(&note.workspace_id, &note.id);
         self.schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
         // Emit `note:updated` for the rewritten parent so subscribers
@@ -21169,7 +21174,7 @@ impl WorkspaceApi for Services {
                     store.insert_note(&note).await?;
                     let author =
                         resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-                    capture_note_version(&store, &note, &author).await?;
+                    capture_note_version(&store, &note, &author, note.rev).await?;
                     services.schedule_line_attribution_recompute(
                         &note.workspace_id.clone(),
                         &note.id.clone(),
@@ -21256,14 +21261,14 @@ impl WorkspaceApi for Services {
                 }
             }
             note.updated_at = now_iso();
-            store.update_note_versioned(&note, expected_version).await?;
+            let rev = store.update_note_versioned(&note, expected_version).await?;
             if let Some(plan) = reanchor_plan {
                 plan.apply_orphaned(&store, &workspace_id).await?;
             }
             if content_changed {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
-                capture_note_version(&store, &note, &user_version_author()).await?;
+                capture_note_version(&store, &note, &user_version_author(), rev).await?;
                 services.schedule_line_attribution_recompute(
                     &note.workspace_id.clone(),
                     &note.id.clone(),
@@ -21327,10 +21332,10 @@ impl WorkspaceApi for Services {
             let new_content = std::mem::take(&mut plan.content);
             note.content = new_content.clone();
             note.updated_at = now_iso();
-            store.update_note(&note).await?;
+            let rev = store.update_note(&note).await?;
             plan.apply_orphaned(&store, &workspace_id).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author).await?;
+            capture_note_version(&store, &note, &author, rev).await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
@@ -21405,10 +21410,10 @@ impl WorkspaceApi for Services {
             let new_content = std::mem::take(&mut plan.content);
             note.content = new_content.clone();
             note.updated_at = now_iso();
-            store.update_note(&note).await?;
+            let rev = store.update_note(&note).await?;
             plan.apply_orphaned(&store, &workspace_id).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author).await?;
+            capture_note_version(&store, &note, &author, rev).await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
@@ -21482,10 +21487,10 @@ impl WorkspaceApi for Services {
             let new_content = std::mem::take(&mut plan.content);
             note.content = new_content.clone();
             note.updated_at = now_iso();
-            store.update_note(&note).await?;
+            let rev = store.update_note(&note).await?;
             plan.apply_orphaned(&store, &workspace_id).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author).await?;
+            capture_note_version(&store, &note, &author, rev).await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
@@ -21593,10 +21598,10 @@ impl WorkspaceApi for Services {
             note.content = clean.clone();
             let now = now_iso();
             note.updated_at = now.clone();
-            store.update_note_versioned(&note, expected_version).await?;
+            let rev = store.update_note_versioned(&note, expected_version).await?;
             plan.apply_orphaned(&store, &workspace_id).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author).await?;
+            capture_note_version(&store, &note, &author, rev).await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             let outcome = services
@@ -21971,9 +21976,9 @@ impl WorkspaceApi for Services {
             note.title = version.title;
             note.content = version.content;
             note.updated_at = now_iso();
-            store.update_note(&note).await?;
+            let rev = store.update_note(&note).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            let new_v = capture_note_version(&store, &note, &author).await?;
+            let new_v = capture_note_version(&store, &note, &author, rev).await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);

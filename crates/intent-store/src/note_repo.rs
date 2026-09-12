@@ -210,12 +210,12 @@ impl Store {
     /// `workspace_id`), or `NotFound`. Unconditional last-writer-wins bump of
     /// `rev`; `metadata.task` is stored opaquely as `task_json` TEXT. The write
     /// is scoped by the note's own `workspace_id` so same-id notes across
-    /// workspaces never collide.
+    /// workspaces never collide. Returns the post-write `rev`.
     ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
-    pub async fn update_note(&self, note: &Note) -> Result<()> {
+    pub async fn update_note(&self, note: &Note) -> Result<i64> {
         self.update_note_versioned(note, None).await
     }
 
@@ -227,7 +227,9 @@ impl Store {
     /// if the stored `rev` matches; on a 0-row result the row is re-read to
     /// distinguish a [`Error::Conflict`] (row present, carrying the current
     /// entity) from a [`Error::NotFound`] (row absent). When `None`, this is
-    /// the unconditional last-writer-wins bump. In all cases `rev` increments.
+    /// the unconditional last-writer-wins bump. In all cases `rev` increments;
+    /// the post-write `rev` is returned (`UPDATE … RETURNING rev`) so callers
+    /// can record it on the version snapshot without a second read.
     ///
     /// # Errors
     ///
@@ -236,7 +238,7 @@ impl Store {
         &self,
         note: &Note,
         expected_version: Option<i64>,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
         let task_json = note
             .metadata
@@ -252,6 +254,7 @@ impl Store {
         if expected_version.is_some() {
             sql.push_str(" AND rev=?");
         }
+        sql.push_str(" RETURNING rev");
         let mut query = sqlx::query(&sql)
             .bind(&note.title)
             .bind(&note.content)
@@ -270,11 +273,11 @@ impl Store {
         if let Some(rev) = expected_version {
             query = query.bind(rev);
         }
-        let res = query
-            .execute(self.write_pool())
+        let row = query
+            .fetch_optional(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
-        if res.rows_affected() == 0 {
+        let Some(row) = row else {
             // Re-read by composite key: a present row means the
             // `expected_version` gate failed (conflict); an absent row is a
             // genuine not-found.
@@ -287,8 +290,8 @@ impl Store {
                 Err(Error::NotFound(_)) => Err(Error::NotFound(format!("note {}", note.id))),
                 Err(e) => Err(e),
             };
-        }
-        Ok(())
+        };
+        col(&row, "rev")
     }
 
     /// Delete a note by (workspace, id), unconditional. `NotFound` if absent.

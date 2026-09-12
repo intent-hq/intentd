@@ -4367,6 +4367,59 @@ async fn note_add_stamps_user_author_when_caller_is_none() {
     assert_eq!(last.author.author_type, "user");
 }
 
+/// Every persisted content write snapshots the note at its post-write `rev`:
+/// the base a later writer sends as `expectedVersion` resolves, via
+/// `get_note_version_content_by_rev`, to exactly the content that write
+/// produced — for both the versioned (`setContent`) and unconditional
+/// (`add`) paths.
+#[tokio::test]
+async fn note_writes_record_post_write_rev_on_version_snapshot() {
+    let (_tmp, svc, ws, id) = setup("body").await;
+    let before = svc.store.get_note(&ws, &id).await.expect("get");
+    svc.set_note_content(ws.clone(), id.clone(), "replaced".into(), true, None, None)
+        .await
+        .expect("set content");
+    let after_set = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(after_set.rev, before.rev + 1);
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(&ws, &id, after_set.rev)
+            .await
+            .expect("lookup"),
+        Some("replaced".to_string())
+    );
+
+    svc.add_to_note(
+        ws.clone(),
+        id.clone(),
+        NoteAddInput {
+            content: "more".into(),
+            heading: None,
+            position: None,
+        },
+        None,
+    )
+    .await
+    .expect("add");
+    let after_add = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(after_add.rev, after_set.rev + 1);
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(&ws, &id, after_add.rev)
+            .await
+            .expect("lookup"),
+        Some(after_add.content.clone())
+    );
+    // The earlier base is still recoverable by its own rev.
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(&ws, &id, after_set.rev)
+            .await
+            .expect("lookup"),
+        Some("replaced".to_string())
+    );
+}
+
 #[tokio::test]
 async fn note_add_stamps_agent_author_with_session_name() {
     use intent_core::{AgentId, AgentSession, AgentStatus};
@@ -10500,7 +10553,7 @@ mod change_event_parity {
             author_type: "user".to_string(),
         };
         h.store
-            .append_note_version(&stray, &author, &stray_ts)
+            .append_note_version(&stray, &author, &stray_ts, stray.rev)
             .await
             .expect("v1");
 

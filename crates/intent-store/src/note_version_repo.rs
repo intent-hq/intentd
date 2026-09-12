@@ -17,8 +17,11 @@ pub(crate) const MAX_NOTE_VERSIONS: i64 = 50;
 
 impl Store {
     /// Append a full-snapshot version of `note` (its *current* content) and
-    /// prune to the newest [`MAX_NOTE_VERSIONS`]. Returns the new version
-    /// number (1-based, strictly increasing per note).
+    /// prune to the newest [`MAX_NOTE_VERSIONS`]. `rev` is the note's
+    /// post-write `rev` (the value the persisted row now carries), recorded
+    /// on the snapshot so [`Store::get_note_version_content_by_rev`] can
+    /// recover a writer's base. Returns the new version number (1-based,
+    /// strictly increasing per note).
     ///
     /// # Errors
     ///
@@ -28,6 +31,7 @@ impl Store {
         note: &Note,
         author: &NoteVersionAuthor,
         date: &str,
+        rev: i64,
     ) -> Result<i64> {
         // IMMEDIATE mode: acquires write lock upfront, avoiding the
         // DEFERRED-mode transaction-upgrade race that surfaces SQLITE_BUSY
@@ -60,7 +64,7 @@ impl Store {
 
             sqlx::query(
                 "INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, \
-                 author_type, title, content) VALUES (?,?,?,?,?,?,?,?,?)",
+                 author_type, title, content, rev) VALUES (?,?,?,?,?,?,?,?,?,?)",
             )
             .bind(&note.id.0)
             .bind(&note.workspace_id.0)
@@ -71,6 +75,7 @@ impl Store {
             .bind(&author.author_type)
             .bind(&note.title)
             .bind(&note.content)
+            .bind(rev)
             .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("insert note_version failed: {e}")))?;
@@ -148,6 +153,34 @@ impl Store {
             Some(r) => map_version_row(&r),
             None => Err(Error::NotFound(format!("note version {note_id}@{v}"))),
         }
+    }
+
+    /// Content of the version snapshot recorded when the note reached `rev`
+    /// (one lookup on `idx_note_version_rev`), or `None` when no snapshot
+    /// carries that rev — an unknown rev, a rev pruned past
+    /// [`MAX_NOTE_VERSIONS`], or a pre-migration row (`rev IS NULL`, which
+    /// never matches). This is the writer's base for a three-way merge.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_note_version_content_by_rev(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        rev: i64,
+    ) -> Result<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT content FROM note_version \
+             WHERE workspace_id = ? AND note_id = ? AND rev = ? \
+             ORDER BY v DESC LIMIT 1",
+        )
+        .bind(&workspace_id.0)
+        .bind(&note_id.0)
+        .bind(rev)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("get note_version by rev failed: {e}")))
     }
 }
 

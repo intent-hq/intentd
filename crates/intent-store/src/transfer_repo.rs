@@ -892,7 +892,7 @@ mod tests {
     const TRANSFERRED_COLUMNS: &str = "\
 workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id
 note: id, workspace_id, title, content, content_type, tags, is_pinned, is_archived, is_default, parent_id, visibility, task_json, created_at, updated_at, rev
-note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content
+note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content, rev
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
