@@ -21,6 +21,7 @@ fn input(ws: &WorkspaceId, tab_id: &str) -> BrowserTabInput {
         owner_agent_name: None,
         visibility: BrowserTabVisibility::default(),
         emulated_size: None,
+        displayed: None,
     }
 }
 

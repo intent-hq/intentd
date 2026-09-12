@@ -524,6 +524,9 @@ impl Store {
     /// `recentlyDeletedWorkspaces` parity, persisted across restarts).
     /// Also removes the workspace's `draft` rows explicitly — `draft` has no
     /// workspace FK (opaque keys, PROTOCOL §5.16), so no cascade applies.
+    /// The `browser_tab` rows cascade, and their process-local `displayed`
+    /// overlay entries are evicted once the cascade has committed (see
+    /// `browser_tab_repo`).
     ///
     /// Uses whole-transaction retry to eliminate `SQLITE_BUSY` (code 5) failures
     /// during lock upgrade under concurrent load (STAB-7).
@@ -535,11 +538,12 @@ impl Store {
         let pool = self.write_pool();
         let id = id.clone();
 
-        crate::with_write_txn_retry(|| async {
+        let tab_ids = crate::with_write_txn_retry(|| async {
             let mut tx = pool
                 .begin()
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace tx failed: {e}")))?;
+            let tab_ids = crate::browser_tab_repo::workspace_tab_ids(&mut tx, &id).await?;
             // Child-table cleanup first (defensive ordering); on the NotFound
             // early-return below the rollback undoes it.
             sqlx::query("DELETE FROM draft WHERE workspace_id = ?")
@@ -566,9 +570,12 @@ impl Store {
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace commit failed: {e}")))?;
-            Ok(())
+            Ok(tab_ids)
         })
-        .await
+        .await?;
+        self.browser_tab_displayed
+            .forget_all(tab_ids.iter().map(String::as_str));
+        Ok(())
     }
 
     /// Whether a workspace id was ever used — a live row exists **or** a

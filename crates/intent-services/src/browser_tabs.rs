@@ -308,7 +308,8 @@ impl Services {
 /// One `listTabs` entry from a registry row: the FE's field names
 /// (`tabId` / `workspaceId` / `url` / `requestedUrl?` / `title?` /
 /// `ownerAgentId` (`null` when unowned) / `ownerAgentName?` / `mode` +
-/// `width` / `height` when emulated / `visibility`) plus the registry's
+/// `width` / `height` when emulated / `visibility` / `displayed` — omitted
+/// only while the host has never reported it) plus the registry's
 /// `hostClientId` / `hostName?` / `hostConnected`.
 fn registry_tab_entry(tab: &BrowserTab, presence: &HashMap<ClientId, Option<String>>) -> Value {
     let mut entry = serde_json::Map::new();
@@ -336,6 +337,9 @@ fn registry_tab_entry(tab: &BrowserTab, presence: &HashMap<ClientId, Option<Stri
         }
     }
     entry.insert("visibility".into(), json!(tab.visibility));
+    if let Some(displayed) = tab.displayed {
+        entry.insert("displayed".into(), Value::Bool(displayed));
+    }
     entry.insert("hostClientId".into(), tab.host_client_id.0.clone().into());
     let host = presence.get(&tab.host_client_id);
     entry.insert("hostConnected".into(), Value::Bool(host.is_some()));
