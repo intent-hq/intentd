@@ -130,15 +130,17 @@ fn push_blank(out: &mut String, c: char) {
     out.push(if c == '\n' { '\n' } else { ' ' });
 }
 
-/// `Some(hashes)` when a raw string literal (`r"`, `r#"`, `br"`, …) starts at
-/// `i`; `None` otherwise.
+/// `Some(hashes)` when a raw string literal (`r"`, `r#"`, `br"`, `cr#"`, …)
+/// starts at `i`; `None` otherwise. Cooked `b"…"` / `c"…"` strings need no
+/// special case: their prefix letter is left as an inert identifier and the
+/// `"` branch consumes the body.
 fn raw_string_hashes(chars: &[char], i: usize) -> Option<usize> {
     let preceded_by_ident = i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
     if preceded_by_ident {
         return None;
     }
     let mut j = i;
-    if chars.get(j) == Some(&'b') {
+    if matches!(chars.get(j), Some('b' | 'c')) {
         j += 1;
     }
     if chars.get(j) != Some(&'r') {
@@ -764,6 +766,24 @@ fn describe(url: &str) -> String {
 }
 "#;
     assert_eq!(hit_lines(src), Vec::<usize>::new());
+}
+
+#[test]
+fn c_string_literals_are_stripped_like_other_strings() {
+    // Raw C string: a fold inside its body is not a hit.
+    let raw_false_positive =
+        "fn f(owner: &str) {\n    let _ = cr#\"\" owner.to_lowercase() \"\"#;\n}\n";
+    assert_eq!(hit_lines(raw_false_positive), Vec::<usize>::new());
+
+    // Raw C string ending in a quote: quote scanning must stay in sync so the
+    // live fold after it is still seen.
+    let raw_hidden_fold =
+        "fn f(owner: &str) {\n    let _ = cr#\"ends with a quote \"\"#;\n    owner.to_lowercase();\n}\n";
+    assert_eq!(hit_lines(raw_hidden_fold), vec![3]);
+
+    // Unhashed raw C string, and cooked C / byte strings.
+    let cooked = "fn f(owner: &str) {\n    let _ = cr\"owner.to_lowercase()\";\n    let _ = c\"owner.to_lowercase() \\\" \";\n    let _ = b\"owner.to_lowercase()\";\n    owner.to_lowercase();\n}\n";
+    assert_eq!(hit_lines(cooked), vec![5]);
 }
 
 #[test]
