@@ -12,7 +12,8 @@
 //!
 //! A line that legitimately needs the literal (e.g. asserting the on-disk
 //! directory name itself) may opt out with a trailing
-//! `// repo-cache-path: allow — <reason>`.
+//! `// repo-cache-path: allow — <reason>`; the marker must be the line's
+//! trailing comment and the reason is required.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -90,12 +91,43 @@ fn strip_ws(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-fn code_part(line: &str) -> &str {
-    line.split("//").next().unwrap_or(line)
+/// Splits a line into its code and trailing `//` comment. A `//` inside a
+/// string literal (e.g. `"https://x"`) does not start a comment.
+fn split_comment(line: &str) -> (&str, Option<&str>) {
+    let bytes = line.as_bytes();
+    let mut in_str = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_str => i += 1,
+            b'"' => in_str = !in_str,
+            b'/' if !in_str && bytes.get(i + 1) == Some(&b'/') => {
+                return (&line[..i], Some(&line[i..]));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (line, None)
+}
+
+/// The opt-out counts only as the line's trailing comment, starting with the
+/// marker and followed by a non-empty reason.
+fn has_allow_marker(comment: Option<&str>) -> bool {
+    let Some(rest) = comment
+        .map(str::trim_start)
+        .and_then(|c| c.strip_prefix(ALLOW_MARKER))
+    else {
+        return false;
+    };
+    let reason =
+        rest.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '—' | '-' | ':'));
+    !reason.trim().is_empty()
 }
 
 fn is_hand_rolled_repo_cache_path(line: &str, needle: &str) -> bool {
-    strip_ws(code_part(line)).contains(needle)
+    let (code, comment) = split_comment(line);
+    !has_allow_marker(comment) && strip_ws(code).contains(needle)
 }
 
 fn scan(root: &Path) -> Vec<String> {
@@ -104,9 +136,6 @@ fn scan(root: &Path) -> Vec<String> {
     for file in scanned_files(root) {
         let src = fs::read_to_string(&file).expect("read test source");
         for (i, line) in src.lines().enumerate() {
-            if line.contains(ALLOW_MARKER) {
-                continue;
-            }
             if is_hand_rolled_repo_cache_path(line, &needle) {
                 let rel = file.strip_prefix(root).unwrap_or(&file);
                 offenders.push(format!("{}:{}", rel.display(), i + 1));
@@ -138,4 +167,72 @@ fn test_code_uses_repo_cache_path_helpers() {
         if offenders.len() == 1 { "" } else { "s" },
         offenders.join("\n  "),
     );
+}
+
+#[test]
+fn classifier_flags_hand_rolled_joins() {
+    let n = needle();
+    assert!(is_hand_rolled_repo_cache_path(
+        &format!("let c = root.join({n});"),
+        &n
+    ));
+    assert!(is_hand_rolled_repo_cache_path(
+        &format!("let c = root.join( {n} );"),
+        &n
+    ));
+}
+
+#[test]
+fn classifier_ignores_the_literal_in_comments() {
+    let n = needle();
+    assert!(!is_hand_rolled_repo_cache_path(
+        &format!("let c = cache_root_for(root); // never join({n})"),
+        &n
+    ));
+    assert!(!is_hand_rolled_repo_cache_path(
+        &format!("// joins {n} by hand"),
+        &n
+    ));
+}
+
+#[test]
+fn classifier_sees_past_slashes_inside_string_literals() {
+    let n = needle();
+    assert!(is_hand_rolled_repo_cache_path(
+        &format!(r#"let url = "https://x"; let c = root.join({n});"#),
+        &n
+    ));
+    assert!(is_hand_rolled_repo_cache_path(
+        &format!(r#"let url = "file://\"//x"; let c = root.join({n});"#),
+        &n
+    ));
+}
+
+#[test]
+fn allow_marker_only_counts_as_trailing_comment_with_reason() {
+    let n = needle();
+    assert!(!is_hand_rolled_repo_cache_path(
+        &format!("let c = root.join({n}); {ALLOW_MARKER} — asserts the on-disk name"),
+        &n
+    ));
+    assert!(!is_hand_rolled_repo_cache_path(
+        &format!("let c = root.join({n}); {ALLOW_MARKER}: asserts the on-disk name"),
+        &n
+    ));
+    assert!(is_hand_rolled_repo_cache_path(
+        &format!("let c = root.join({n}); {ALLOW_MARKER}"),
+        &n
+    ));
+    assert!(is_hand_rolled_repo_cache_path(
+        &format!("let c = root.join({n}); {ALLOW_MARKER} — "),
+        &n
+    ));
+    assert!(is_hand_rolled_repo_cache_path(
+        &format!(r#"let s = "{ALLOW_MARKER} — x"; let c = root.join({n});"#),
+        &n
+    ));
+    assert!(is_hand_rolled_repo_cache_path(
+        &format!("let c = root.join({n}); // see {ALLOW_MARKER} — x"),
+        &n
+    ));
 }
