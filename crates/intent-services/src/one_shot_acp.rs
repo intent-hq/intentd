@@ -25,6 +25,12 @@
 //! (`configOptions[id="model"]`, the same mechanism the persistent agent
 //! path uses for claude-code and pi); a failed or unsupported attempt is
 //! logged and the completion proceeds on the adapter's default model.
+//!
+//! The caller may attach a provider-specific `session/new` `_meta` (the
+//! claude-code utility shape that replaces the preset system prompt and
+//! disables the built-in tools, see `complete_ops::one_shot_session_shape`);
+//! the runner sends it verbatim and omits the key entirely when none is given,
+//! so providers without a slimming shape see the exact request they always did.
 
 use std::time::Duration;
 
@@ -93,7 +99,9 @@ impl std::fmt::Display for OneShotError {
 /// `session/prompt` phase — setup uses the launch's npx-aware staged budgets,
 /// as before. `config_option_model`, when set, is applied best-effort after
 /// `session/new` via `session/set_config_option` (a failure never fails the
-/// completion). The child is reaped before returning on every path.
+/// completion). `session_meta`, when set, rides `session/new` as `_meta`
+/// verbatim (absent otherwise). The child is reaped before returning on
+/// every path.
 ///
 /// Reusing the caller's own timeout as the queue budget keeps the contract
 /// legible — you wait for a slot at most as long as you were willing to wait
@@ -104,6 +112,7 @@ pub(crate) async fn run_one_shot_acp(
     cmd: OneShotCommand,
     prompt: &str,
     config_option_model: Option<&str>,
+    session_meta: Option<Value>,
     prompt_timeout: Duration,
 ) -> Result<String, OneShotError> {
     run_one_shot_acp_in(
@@ -111,6 +120,7 @@ pub(crate) async fn run_one_shot_acp(
         cmd,
         prompt,
         config_option_model,
+        session_meta,
         prompt_timeout,
     )
     .await
@@ -127,6 +137,7 @@ pub(crate) async fn run_one_shot_acp_in(
     cmd: OneShotCommand,
     prompt: &str,
     config_option_model: Option<&str>,
+    session_meta: Option<Value>,
     prompt_timeout: Duration,
 ) -> Result<String, OneShotError> {
     let mut adapter = spawn_adapter_in(slots, &cmd, prompt_timeout)
@@ -146,6 +157,7 @@ pub(crate) async fn run_one_shot_acp_in(
         &cmd,
         prompt,
         config_option_model,
+        session_meta,
         prompt_timeout,
     )
     .await;
@@ -162,6 +174,7 @@ pub(crate) async fn run_one_shot_acp_in(
 /// best-effort model application → one `session/prompt` bounded by
 /// `prompt_timeout`, accumulating `agent_message_chunk` text while answering
 /// agent→client requests inline through every phase.
+#[allow(clippy::too_many_arguments)]
 async fn drive_one_shot(
     conn: &Connection,
     notifications: &mut mpsc::UnboundedReceiver<intent_acp::IncomingNotification>,
@@ -169,6 +182,7 @@ async fn drive_one_shot(
     cmd: &AcpAdapterCommand,
     prompt: &str,
     config_option_model: Option<&str>,
+    session_meta: Option<Value>,
     prompt_timeout: Duration,
 ) -> Result<String, OneShotError> {
     // Setup is serviced too: an adapter that sends
@@ -183,6 +197,7 @@ async fn drive_one_shot(
             setup_session(
                 conn,
                 cmd.working_dir(),
+                session_meta,
                 cmd.initialize_timeout(),
                 cmd.session_new_timeout(),
             ),
@@ -303,11 +318,12 @@ async fn apply_config_option_model(
     }
 }
 
-/// `initialize` then `session/new` with no MCP servers, returning the
-/// adapter's session id.
+/// `initialize` then `session/new` with no MCP servers (plus the caller's
+/// `_meta`, when given), returning the adapter's session id.
 async fn setup_session(
     conn: &Connection,
     cwd: std::path::PathBuf,
+    session_meta: Option<Value>,
     initialize_timeout: Duration,
     session_new_timeout: Duration,
 ) -> Result<String, OneShotError> {
@@ -315,10 +331,13 @@ async fn setup_session(
         .await
         .map_err(map_acp_error)?;
 
-    let session_params = json!({
+    let mut session_params = json!({
         "cwd": cwd.to_string_lossy(),
         "mcpServers": [],
     });
+    if let Some(meta) = session_meta {
+        session_params["_meta"] = meta;
+    }
     let result = conn
         .request_timeout("session/new", session_params, session_new_timeout)
         .await

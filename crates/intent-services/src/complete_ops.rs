@@ -42,10 +42,84 @@ use crate::Services;
 /// provider (and unset/undecidable settings) resolves the gate closed.
 const ACP_ONE_SHOT_PROVIDERS: &[&str] = &["claude-code", "codex", "pi"];
 
+/// System prompt for a claude-code one-shot whose caller supplied none. The
+/// adapter treats an absent (or empty) `_meta.systemPrompt` as "use the
+/// `claude_code` preset", which is exactly the agentic context a utility
+/// completion must not load, so the slot is always filled.
+const CLAUDE_CODE_UTILITY_SYSTEM_PROMPT: &str =
+    "You are a text-only utility answering a single request. Reply with the requested output and nothing else.";
+
 /// The typed `{ available: false, reason }` result for a provider that cannot
 /// serve a one-shot completion.
 fn unavailable(reason: impl std::fmt::Display) -> Value {
     json!({ "available": false, "reason": reason.to_string() })
+}
+
+/// `System: <system>\n\n<prompt>` — the FE streamChat composition used when a
+/// system prompt is supplied and the provider has no dedicated system-prompt
+/// channel; otherwise the raw prompt verbatim.
+fn compose_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
+    match system_prompt {
+        Some(s) => format!("System: {s}\n\n{prompt}"),
+        None => prompt.to_string(),
+    }
+}
+
+/// The turn text and `session/new` `_meta` for a one-shot on `provider_id`.
+///
+/// claude-code gets the slimmed utility session (intent-hq/intent#4587): the
+/// caller's system prompt (or [`CLAUDE_CODE_UTILITY_SYSTEM_PROMPT`]) goes out
+/// as a string `_meta.systemPrompt`, and `_meta.claudeCode.options` disables
+/// the built-in tools and drops the project/local setting tiers. The prompt
+/// then rides the turn alone — composing `System:` into the user text as
+/// well would say it twice. Every other provider keeps the composed prompt
+/// and no `_meta`, exactly as before.
+///
+/// Verified against the pinned `@agentclientprotocol/claude-agent-acp` 0.73.0
+/// (`dist/acp-agent.js`, `session/new`) and its `@anthropic-ai/claude-agent-sdk`
+/// 0.3.257:
+/// - a string `_meta.systemPrompt` is passed to the SDK as `systemPrompt`
+///   verbatim and REPLACES the `claude_code` preset (an object form would only
+///   append to it);
+/// - `_meta.claudeCode.options` is spread over the adapter's SDK options, so
+///   `tools: []` wins over the adapter's `{ preset: "claude_code" }` tools
+///   default and the SDK spawns the CLI with `--tools ""` (no built-in tools;
+///   the adapter documents `tools` as the preferred spelling of the legacy
+///   `disableBuiltInTools`) — no tool schemas in context and no tool calls
+///   possible, mechanically;
+/// - the same spread lets `settingSources` override the adapter's
+///   `["user", "project", "local"]` default (`--setting-sources=user`), so the
+///   repo's `.claude/settings*.json` and `CLAUDE.md` no longer load. The
+///   `user` tier is deliberately kept: `~/.claude/settings.json` carries
+///   `apiKeyHelper` / `env` auth routing, and dropping it would break
+///   completions for anyone authenticating that way;
+/// - `strictMcpConfig: true` reaches the SDK through the same spread and
+///   spawns the CLI with `--strict-mcp-config`. `--tools ""` only removes the
+///   built-in tools and `--setting-sources` only governs `settings*.json`;
+///   user-scope MCP servers live in `~/.claude.json`, which neither flag
+///   touches, so without this the CLI would still connect them and attach
+///   their tool schemas. The adapter never sets it on its own, and it only
+///   passes `--mcp-config` for a non-empty `mcpServers` map (the one-shot
+///   sends none), so strict mode means zero MCP servers.
+pub(crate) fn one_shot_session_shape(
+    provider_id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+) -> (String, Option<Value>) {
+    if provider_id != "claude-code" {
+        return (compose_prompt(prompt, system_prompt), None);
+    }
+    let meta = json!({
+        "systemPrompt": system_prompt.unwrap_or(CLAUDE_CODE_UTILITY_SYSTEM_PROMPT),
+        "claudeCode": {
+            "options": {
+                "tools": [],
+                "settingSources": ["user"],
+                "strictMcpConfig": true,
+            }
+        }
+    });
+    (prompt.to_string(), Some(meta))
 }
 
 /// Resolve the quick-action model for a one-shot completion the caller sent no
@@ -326,20 +400,28 @@ impl Services {
             }
             None => None,
         };
-        // `System: <system>\n\n<prompt>` mirrors the FE streamChat composition
-        // when a system prompt is supplied; otherwise the raw prompt is used
-        // verbatim. Shared by both routes.
-        let full_prompt = match system_prompt.as_deref().map(str::trim) {
-            Some(s) if !s.is_empty() => format!("System: {s}\n\n{prompt}"),
-            _ => prompt.clone(),
-        };
+        // A blank system prompt counts as none. The auggie CLI route composes
+        // it into the prompt text; the ACP route decides per provider
+        // (`one_shot_session_shape`).
+        let system_prompt = system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
         if run_provider != "auggie" {
             return self
-                .complete_once_via_acp(&run_provider, &full_prompt, model.as_deref(), cwd, timeout)
+                .complete_once_via_acp(
+                    &run_provider,
+                    &prompt,
+                    system_prompt,
+                    model.as_deref(),
+                    cwd,
+                    timeout,
+                )
                 .await;
         }
+        let full_prompt = compose_prompt(&prompt, system_prompt);
 
         // Binary resolution order (per spec Design): self.auggie_bin (test seam) →
         // context.auggiePath (user setting, EXCLUSIVE when set) → find_auggie().
@@ -386,7 +468,8 @@ impl Services {
         Ok(json!({ "text": text }))
     }
 
-    /// The non-auggie route: run `full_prompt` through an ephemeral ACP
+    /// The non-auggie route: run `prompt` (+ `system_prompt`, shaped per
+    /// provider by [`one_shot_session_shape`]) through an ephemeral ACP
     /// session on the provider's adapter. A provider with no one-shot support
     /// and one whose adapter cannot be resolved (no binary, no npx) both
     /// return `{ available: false, reason }`; a resolved adapter that then
@@ -395,7 +478,8 @@ impl Services {
     async fn complete_once_via_acp(
         &self,
         provider_id: &str,
-        full_prompt: &str,
+        prompt: &str,
+        system_prompt: Option<&str>,
         model: Option<&str>,
         cwd: Option<PathBuf>,
         timeout_ms: u64,
@@ -452,10 +536,13 @@ impl Services {
         } else {
             (cmd, None)
         };
+        let (turn_prompt, session_meta) =
+            one_shot_session_shape(provider_id, prompt, system_prompt);
         match run_one_shot_acp(
             cmd,
-            full_prompt,
+            &turn_prompt,
             config_option_model(provider, model),
+            session_meta,
             Duration::from_millis(timeout_ms),
         )
         .await
@@ -656,6 +743,167 @@ rl.on('line', (line) => {{
             v["text"], "slug-from-acp",
             "the ACP reply must come back cleaned, like the auggie route"
         );
+    }
+
+    /// Like [`fake_acp_adapter`], but the reply is a JSON object echoing the
+    /// `session/new` params and the `session/prompt` text the adapter saw, so
+    /// a test can assert the exact setup shape a provider route puts on the
+    /// wire.
+    #[cfg(unix)]
+    fn fake_acp_adapter_echoing_session(tag: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::tests::test_tempdir(&format!("intentd-complete-acp-echo-{tag}-"));
+        let script = dir.path().join("adapter.mjs");
+        std::fs::write(
+            &script,
+            r"import readline from 'node:readline';
+const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+const rl = readline.createInterface({ input: process.stdin, terminal: false });
+let sessionNew = null;
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') return send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+  if (msg.method === 'session/new') { sessionNew = msg.params; return send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } }); }
+  if (msg.method === 'session/prompt') {
+    const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text });
+    send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } },
+    });
+    send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+  }
+});
+",
+        )
+        .expect("write mock adapter");
+        let bin = dir.path().join("acp-adapter");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nexec node {:?} \"$@\"\n",
+                script.to_string_lossy()
+            ),
+        )
+        .expect("write adapter wrapper");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, bin)
+    }
+
+    /// Run `agent.completeOnce` on `provider` against the echoing adapter and
+    /// return the parsed `{ sessionNew, prompt }` the adapter observed.
+    #[cfg(unix)]
+    async fn observed_session(
+        provider: &str,
+        bin: &std::path::Path,
+        system_prompt: Option<&str>,
+    ) -> serde_json::Value {
+        let (_tmp, services) = services_with_settings(&[
+            ("model.defaultProvider", serde_json::json!(provider)),
+            (
+                "providers.paths",
+                serde_json::json!({ provider: bin.to_string_lossy() }),
+            ),
+        ])
+        .await;
+        let v = services
+            .agent_complete_once_op(
+                "summarize".into(),
+                system_prompt.map(str::to_string),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        serde_json::from_str(v["text"].as_str().expect("text reply")).expect("echo parses")
+    }
+
+    /// intent-hq/intent#4587: the claude-code one-shot is a slimmed utility
+    /// session — the caller's system prompt replaces the `claude_code` preset
+    /// via a string `_meta.systemPrompt`, the built-in tools are disabled
+    /// mechanically, the project/local setting tiers are dropped, ambient
+    /// MCP servers are excluded, and the turn carries the bare prompt (no
+    /// duplicated `System:` composition).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_claude_code_sends_slimmed_session_meta() {
+        let (_dir, bin) = fake_acp_adapter_echoing_session("claude");
+        let seen = observed_session("claude-code", &bin, Some("be terse")).await;
+        assert_eq!(
+            seen["sessionNew"]["_meta"],
+            serde_json::json!({
+                "systemPrompt": "be terse",
+                "claudeCode": {
+                    "options": {
+                        "tools": [],
+                        "settingSources": ["user"],
+                        "strictMcpConfig": true,
+                    }
+                },
+            })
+        );
+        assert_eq!(seen["sessionNew"]["mcpServers"], serde_json::json!([]));
+        assert_eq!(seen["prompt"], "summarize");
+    }
+
+    /// Without a caller system prompt the slot is still filled: an absent
+    /// `_meta.systemPrompt` would reinstate the preset.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_claude_code_fills_system_prompt_when_caller_sent_none() {
+        let (_dir, bin) = fake_acp_adapter_echoing_session("claude-default");
+        let seen = observed_session("claude-code", &bin, None).await;
+        assert_eq!(
+            seen["sessionNew"]["_meta"]["systemPrompt"],
+            CLAUDE_CODE_UTILITY_SYSTEM_PROMPT
+        );
+        assert_eq!(
+            seen["sessionNew"]["_meta"]["claudeCode"]["options"]["tools"],
+            serde_json::json!([])
+        );
+        assert_eq!(seen["prompt"], "summarize");
+    }
+
+    /// Other ACP providers are untouched: no `_meta` on `session/new`, and the
+    /// system prompt still rides the turn as the `System:` composition.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_non_claude_provider_keeps_plain_session_new() {
+        let (_dir, bin) = fake_acp_adapter_echoing_session("codex");
+        let seen = observed_session("codex", &bin, Some("be terse")).await;
+        assert!(
+            seen["sessionNew"].get("_meta").is_none(),
+            "codex must see no `_meta`, got: {}",
+            seen["sessionNew"]
+        );
+        assert_eq!(seen["sessionNew"]["mcpServers"], serde_json::json!([]));
+        assert_eq!(seen["prompt"], "System: be terse\n\nsummarize");
+    }
+
+    #[test]
+    fn one_shot_session_shape_per_provider() {
+        let (prompt, meta) = one_shot_session_shape("claude-code", "p", Some("s"));
+        assert_eq!(prompt, "p");
+        assert_eq!(meta.as_ref().unwrap()["systemPrompt"], "s");
+        let (prompt, meta) = one_shot_session_shape("claude-code", "p", None);
+        assert_eq!(prompt, "p");
+        assert_eq!(
+            meta.as_ref().unwrap()["systemPrompt"],
+            CLAUDE_CODE_UTILITY_SYSTEM_PROMPT
+        );
+        for provider in ["codex", "pi"] {
+            assert_eq!(
+                one_shot_session_shape(provider, "p", Some("s")),
+                ("System: s\n\np".to_string(), None)
+            );
+            assert_eq!(
+                one_shot_session_shape(provider, "p", None),
+                ("p".to_string(), None)
+            );
+        }
     }
 
     #[tokio::test]
