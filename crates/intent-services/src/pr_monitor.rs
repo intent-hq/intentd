@@ -480,10 +480,12 @@ impl PrMonitorRefusal {
             "monitorId": self.owner.monitor_id,
             "instruction": format!(
                 "{label} is already monitored in this workspace by agent {owner_display}; \
-                 one monitor per PR per workspace. That agent receives the PR's wakes — \
-                 coordinate with it via ws.agent.send instead of registering a second \
-                 monitor, or use ws.pr.snapshot for a one-shot read. Retry ws.pr.monitor \
-                 only after the owner cancels its monitor (ws.pr.unmonitor) or finishes."
+                 one monitor per PR per workspace. That agent receives the PR's wakes. \
+                 Instead of registering a second monitor, use ws.agent.send to ask the \
+                 owner either to relay the events you care about to you, or to relinquish \
+                 the monitor via ws.pr.unmonitor so you can register your own; for a \
+                 one-shot read of the PR's current state use ws.pr.snapshot. Retry \
+                 ws.pr.monitor only after the owner cancels its monitor or finishes."
             ),
         });
         if let Some(name) = &self.owner_agent_name {
@@ -3757,7 +3759,15 @@ mod tests {
         assert!(instruction.contains("o/r#42"), "{instruction}");
         assert!(instruction.contains("Owner (agent-prmon)"), "{instruction}");
         assert!(instruction.contains("ws.agent.send"), "{instruction}");
-        assert!(instruction.contains("ws.pr.snapshot"), "{instruction}");
+        assert!(instruction.contains("relay the events"), "{instruction}");
+        assert!(
+            instruction.contains("relinquish the monitor via ws.pr.unmonitor"),
+            "{instruction}"
+        );
+        assert!(
+            instruction.contains("one-shot read of the PR's current state use ws.pr.snapshot"),
+            "{instruction}"
+        );
         assert!(refused.get("monitor").is_none(), "{refused}");
         assert!(refused.get("requirements").is_none(), "{refused}");
 
