@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{PublishEvent, WorkspaceApi, WorkspaceId, WorkspaceStatus};
+use intent_core::{PublishEvent, RepoRef, Workspace, WorkspaceApi, WorkspaceId, WorkspaceStatus};
 use serde_json::{json, Value};
 
 use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_vec_str};
@@ -106,15 +106,8 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
                 continue;
             }
         }
-        if let Some(ref owner) = repository_owner {
-            if ws.repository_owner.as_deref() != Some(owner.as_str()) {
-                continue;
-            }
-        }
-        if let Some(ref name) = repository_name {
-            if ws.repository_name.as_deref() != Some(name.as_str()) {
-                continue;
-            }
+        if !repo_filter_matches(&ws, repository_owner.as_deref(), repository_name.as_deref()) {
+            continue;
         }
 
         // Tag filters
@@ -197,7 +190,26 @@ async fn get(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String>
     Ok(summarize_workspace(&workspace))
 }
 
-fn summarize_workspace(ws: &intent_core::Workspace) -> Value {
+/// Applies the `repositoryOwner` / `repositoryName` filters through [`RepoRef`]
+/// identity, so forge-slug casing (`Intent-HQ` vs `intent-hq`) never excludes a
+/// match. A half that is not filtered on is taken from the workspace row so the
+/// comparison stays a plain `RepoRef` equality.
+fn repo_filter_matches(ws: &Workspace, owner: Option<&str>, name: Option<&str>) -> bool {
+    match (owner, name) {
+        (None, None) => true,
+        (Some(owner), Some(name)) => ws.repo().as_ref() == Some(&RepoRef::new(owner, name)),
+        (Some(owner), None) => ws.repository_owner.as_deref().is_some_and(|row_owner| {
+            let row_name = ws.repository_name.as_deref().unwrap_or("");
+            RepoRef::new(owner, row_name) == RepoRef::new(row_owner, row_name)
+        }),
+        (None, Some(name)) => ws.repository_name.as_deref().is_some_and(|row_name| {
+            let row_owner = ws.repository_owner.as_deref().unwrap_or("");
+            RepoRef::new(row_owner, name) == RepoRef::new(row_owner, row_name)
+        }),
+    }
+}
+
+fn summarize_workspace(ws: &Workspace) -> Value {
     json!({
         "id": ws.id.as_str(),
         "title": if ws.title.is_empty() { "Untitled" } else { &ws.title },
@@ -1299,6 +1311,78 @@ mod tests {
         let workspaces = result.as_array().unwrap();
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].get("id").unwrap().as_str().unwrap(), "ws-1");
+    }
+
+    #[tokio::test]
+    async fn test_list_repository_filters_fold_slug_case() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            let mut ws_intent = make_workspace("ws-1", "intentd");
+            ws_intent.repository_owner = Some("intent-hq".to_string());
+            ws_intent.repository_name = Some("intentd".to_string());
+            workspaces.push(ws_intent);
+
+            let mut ws_other = make_workspace("ws-2", "other");
+            ws_other.repository_owner = Some("other-org".to_string());
+            ws_other.repository_name = Some("intentd".to_string());
+            workspaces.push(ws_other);
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief_id = WorkspaceId::chief();
+
+        let ids = |result: Value| -> Vec<String> {
+            result
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w.get("id").unwrap().as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // Case-variant owner matches.
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "list",
+            &json!({ "filter": { "repositoryOwner": "Intent-HQ" } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids(result), vec!["ws-1".to_string()]);
+
+        // Case-variant name matches (both rows share the name).
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "list",
+            &json!({ "filter": { "repositoryName": "IntentD" } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids(result), vec!["ws-1".to_string(), "ws-2".to_string()]);
+
+        // Both halves, case-variant, still narrow to the one repository.
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "list",
+            &json!({ "filter": { "repositoryOwner": "INTENT-HQ", "repositoryName": "IntentD" } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids(result), vec!["ws-1".to_string()]);
+
+        // A different owner still excludes.
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "list",
+            &json!({ "filter": { "repositoryOwner": "someone-else" } }),
+        )
+        .await
+        .unwrap();
+        assert!(ids(result).is_empty());
     }
 
     #[tokio::test]
