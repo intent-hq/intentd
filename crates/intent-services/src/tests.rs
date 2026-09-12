@@ -2582,22 +2582,25 @@ where
 /// text as its base and replayed the already-persisted insertion (observed
 /// `aXX!bcY`), and the delayed snapshot then landed with `rev = 1` after the
 /// rev-2/rev-3 rows, out of order.
+///
+/// The write is driven one poll at a time and the store (via a second
+/// connection) is sampled between polls; the invariant is asserted on every
+/// sample that shows rev 1 and once more after the write completes, so the
+/// test never depends on catching a particular window under load.
 #[tokio::test]
 async fn content_write_snapshot_is_visible_with_its_rev() {
     let (tmp, svc, ws, id) = setup_versioned("abc").await;
     let other = Store::open(&tmp.path).await.expect("open second store");
     let other_svc = Services::new(other.clone());
 
-    let mut first =
-        Box::pin(svc.set_note_content(ws.clone(), id.clone(), "aXbc".into(), false, Some(0), None));
-    let paused = poll_until(&mut first, 1000, || async {
-        let current = svc.store.get_note(&ws, &id).await.expect("get note");
+    let assert_rev1_has_snapshot = || async {
+        let current = other.get_note(&ws, &id).await.expect("get note");
         if current.rev != 1 {
             return false;
         }
         assert_eq!(current.content, "aXbc");
         assert_eq!(
-            svc.store
+            other
                 .get_note_version_content_by_rev(&ws, &id, 1)
                 .await
                 .expect("lookup"),
@@ -2605,14 +2608,29 @@ async fn content_write_snapshot_is_visible_with_its_rev() {
             "rev 1 is visible, so its snapshot must be too"
         );
         true
-    })
-    .await;
-    assert!(
-        paused,
-        "did not observe the committed content write mid-flight"
-    );
+    };
 
-    // A second writer that read rev 1 during the first write's tail.
+    let mut first =
+        Box::pin(svc.set_note_content(ws.clone(), id.clone(), "aXbc".into(), false, Some(0), None));
+    let mut samples_at_rev1 = 0;
+    let first = loop {
+        use std::future::Future;
+        let state =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx))).await;
+        if let std::task::Poll::Ready(done) = state {
+            break done.expect("first write");
+        }
+        if assert_rev1_has_snapshot().await {
+            samples_at_rev1 += 1;
+            if samples_at_rev1 >= 50 {
+                break first.await.expect("first write");
+            }
+        }
+    };
+    assert_eq!(first.rev, 1);
+    assert!(assert_rev1_has_snapshot().await);
+
+    // A second writer that read rev 1 after the first write committed.
     let next = other_svc
         .set_note_content(ws.clone(), id.clone(), "aXbcY".into(), false, Some(1), None)
         .await
@@ -2627,7 +2645,6 @@ async fn content_write_snapshot_is_visible_with_its_rev() {
     assert_eq!(merged.rev, 3);
     assert_eq!(merged.new_content, "aX!bcY");
 
-    assert_eq!(first.await.expect("first write").rev, 1);
     // History stays in rev order: the newest snapshot is the rev-3 write,
     // not a late rev-1 row.
     assert_eq!(newest_version_rev(&svc.store, &ws, &id).await, Some(3));
