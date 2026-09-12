@@ -144,6 +144,8 @@ mod workspace_status;
 pub mod workspace_vocabulary;
 
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod test_tracing;
 #[cfg(test)]
 mod tests;

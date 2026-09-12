@@ -47,7 +47,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,16 +65,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Owns the fixture's scratch directory and removes it on drop so a panicking
-/// test does not leak files under the system tempdir (matches the pattern
-/// used by `TempDir` in `uds_specialist.rs`).
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
     ws: WsApiServer,
     api: Arc<dyn WorkspaceApi>,
@@ -84,7 +73,7 @@ struct Fixture {
     /// test can poll `len()` until the closing client's guard has actually
     /// dropped, instead of waiting on an arbitrary sleep.
     registry: Arc<PrimaryReverseRegistry>,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
@@ -94,9 +83,8 @@ async fn boot() -> Fixture {
 /// [`boot`] with caller-supplied listener options (`base_port` and
 /// `bind_addresses` are always overridden to an ephemeral loopback port).
 async fn boot_with(opts: WsOptions) -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-sticky-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-sticky-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -120,7 +108,7 @@ async fn boot_with(opts: WsOptions) -> Fixture {
         api,
         port,
         registry,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 

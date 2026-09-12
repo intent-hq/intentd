@@ -17,7 +17,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,32 +33,27 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let log_path = self.data_dir.join("daemon.log");
+        let log_path = self.data_dir.path().join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-idleto-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-idleto-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -410,7 +405,8 @@ async fn idle_timeout_warns_and_continues_on_same_child_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({
         "silentUntilCancelTurns": 1,
@@ -427,7 +423,7 @@ async fn idle_timeout_warns_and_continues_on_same_child_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -619,7 +615,8 @@ async fn idle_timeout_tail_does_not_bleed_into_warning_turn_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({
         "silentUntilCancelTurns": 1,
@@ -637,7 +634,7 @@ async fn idle_timeout_tail_does_not_bleed_into_warning_turn_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -785,7 +782,8 @@ async fn idle_timeout_unresolved_cancel_tears_down_child_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let prompt_log = data_dir.join("prompt-log.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().to_string();
@@ -807,7 +805,7 @@ async fn idle_timeout_unresolved_cancel_tears_down_child_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -973,7 +971,8 @@ async fn delegated_child_idle_timeout_does_not_wake_parent_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let delegate_js = format!(
         "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'immediate', model: 'default', provider: 'mock' }});",
@@ -1022,7 +1021,7 @@ async fn delegated_child_idle_timeout_does_not_wake_parent_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -1222,7 +1221,8 @@ async fn idle_timeout_cap_fails_terminally_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({
         "silentUntilCancelTurns": 4,
@@ -1239,7 +1239,7 @@ async fn idle_timeout_cap_fails_terminally_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");

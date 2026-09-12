@@ -16,7 +16,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -48,13 +47,6 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
@@ -310,15 +302,14 @@ struct Fixture {
     port: u16,
     cfg: Arc<ClientConfig>,
     forge: Arc<RecordingForge>,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry the recording
 /// stub forge.
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-gh-repocfg-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-gh-repocfg-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -349,7 +340,7 @@ async fn boot() -> Fixture {
         port,
         cfg,
         forge,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 

@@ -44,10 +44,8 @@ async fn send(socket: &Path, frame: &str) -> Value {
 #[tokio::test]
 async fn chief_workspace_over_uds() {
     // Short UDS path (`SUN_LEN ~ 104B` on macOS).
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = Path::new("/tmp").join(format!("intentd-chief-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::env::set_var("INTENTD_DATA_DIR", &dir);
+    let dir = common::test_tempdir_in("/tmp", "intentd-chief-");
+    std::env::set_var("INTENTD_DATA_DIR", dir.path());
     let config = Config::resolve().expect("resolve config");
 
     // Open the store once so migration 0033 seeds the `__chief__` row before
@@ -269,5 +267,4 @@ async fn chief_workspace_over_uds() {
 
     let _ = tx.send(());
     let _ = server.await;
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -10,26 +10,25 @@ use uuid::Uuid;
 
 use crate::Store;
 
-/// A unique temp DB path cleaned up on drop (mirrors `crate::tests::TempDb`,
-/// which is private to that module).
+/// A unique temp DB path inside an RAII temp dir removed on drop (mirrors
+/// `crate::tests::TempDb`, which is private to that module); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: std::path::PathBuf,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("test-browser-tab-{}.db", Uuid::new_v4()));
-        Self { path }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let mut sidecar = self.path.clone().into_os_string();
-            sidecar.push(suffix);
-            let _ = std::fs::remove_file(&sidecar);
+        let mut dir = tempfile::Builder::new()
+            .prefix("test-browser-tab-")
+            .tempdir()
+            .expect("create test temp dir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
         }
+        let path = dir.path().join("store.db");
+        Self { _dir: dir, path }
     }
 }
 

@@ -24,7 +24,6 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 /// Mock `ServerControl` that always fails `start_ws_listener` to test rollback.
 struct FailingServerControl;
@@ -52,20 +51,14 @@ impl ServerControl for FailingServerControl {
 }
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-atomic-{}.db", Uuid::new_v4())),
-        }
-    }
-}
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = common::test_tempdir("intentd-atomic-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 

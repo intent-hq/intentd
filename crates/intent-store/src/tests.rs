@@ -16,24 +16,25 @@ use sqlx::Row;
 
 use crate::{AgentQueueRow, AutoVacuumActivation, EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
-/// A unique temp DB path that cleans up its `.db`/`-wal`/`-shm` files on drop.
+/// A unique temp DB path inside an RAII temp dir: the dir (and with it the
+/// `.db`/`-wal`/`-shm` files) is removed on drop, including on panic; set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("intentd-test-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let p = PathBuf::from(format!("{}{suffix}", self.path.display()));
-            let _ = std::fs::remove_file(p);
+        let mut dir = tempfile::Builder::new()
+            .prefix("intentd-test-")
+            .tempdir()
+            .expect("create test temp dir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
         }
+        let path = dir.path().join("store.db");
+        Self { _dir: dir, path }
     }
 }
 

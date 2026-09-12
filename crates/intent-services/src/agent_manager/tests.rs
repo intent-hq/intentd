@@ -29,6 +29,7 @@ use super::{
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
+use crate::test_support::test_tempdir;
 use crate::Services;
 
 /// `SQLite` db inside an RAII temp dir: the dir sweep (on drop, including on
@@ -42,13 +43,7 @@ struct TempDb {
 
 impl TempDb {
     fn new() -> Self {
-        let mut dir = tempfile::Builder::new()
-            .prefix("intentd-mgr-")
-            .tempdir()
-            .expect("create test tempdir");
-        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
-            dir.disable_cleanup(true);
-        }
+        let dir = test_tempdir("intentd-mgr-");
         let path = dir.path().join("mgr.db");
         Self { path, _dir: dir }
     }
@@ -3434,19 +3429,14 @@ fn pid_alive(pid: u32) -> bool {
 /// A self-cleaning temp git repo with one committed file modified in the workdir.
 struct TempRepo {
     dir: PathBuf,
-}
-
-impl Drop for TempRepo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
+    _guard: tempfile::TempDir,
 }
 
 /// Seed `a.txt`, commit it, then leave an unstaged modification (2 adds / 1 del).
 fn seed_repo() -> TempRepo {
     use git2::{Repository, Signature};
-    let dir = std::env::temp_dir().join(format!("intentd-ft-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let guard = test_tempdir("intentd-ft-");
+    let dir = guard.path().to_path_buf();
     let repo = Repository::init(&dir).unwrap();
     {
         let mut cfg = repo.config().unwrap();
@@ -3465,7 +3455,7 @@ fn seed_repo() -> TempRepo {
             .unwrap();
     }
     std::fs::write(dir.join("a.txt"), "line1\nCHANGED\nline3\nline4\n").unwrap();
-    TempRepo { dir }
+    TempRepo { dir, _guard: guard }
 }
 
 /// An agent `file:changed` runs the BE-internal review pipeline (§17.1): the
@@ -6068,10 +6058,10 @@ async fn stop_redelivery_flush_413_retry(
     queued: [(&str, Option<&str>); 2],
 ) -> StopRedeliveryFlush413 {
     let script = mock_agent_script();
-    let prompt_log =
-        std::env::temp_dir().join(format!("itd-413-{tag}-{}.log", uuid::Uuid::new_v4()));
+    let scratch = test_tempdir(&format!("itd-413-{tag}-"));
+    let prompt_log = scratch.path().join("prompts.log");
     let prompt_log_s = prompt_log.to_string_lossy().into_owned();
-    let attempt_file = std::env::temp_dir().join(format!("itd-413-{tag}-{}", uuid::Uuid::new_v4()));
+    let attempt_file = scratch.path().join("attempts");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
     // `advertiseLoadSession` keeps the retry on the RESUME path: a recreated
     // session replays the transcript (stopped row included) as history and
@@ -6199,8 +6189,6 @@ async fn stop_redelivery_flush_413_retry(
         .lines()
         .map(|l| serde_json::from_str(l).expect("prompt log line"))
         .collect();
-    let _ = std::fs::remove_file(&prompt_log);
-    let _ = std::fs::remove_file(&attempt_file);
     assert_eq!(
         prompts.len(),
         2,
@@ -9527,25 +9515,17 @@ async fn interrupt_send_during_turn_startup_queues_keep_alive() {
 // --- SP-B: spawn `agent_type` derived from the specialist's `agentType` -------
 
 /// Self-cleaning temp directory for hermetic specialist-file fixtures.
-struct TempSpecialistsDir(PathBuf);
+struct TempSpecialistsDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
 impl TempSpecialistsDir {
     fn new() -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("intentd-spb-specialists-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create specialists dir");
-        Self(dir)
+        let guard = test_tempdir("intentd-spb-specialists-");
+        Self(guard.path().to_path_buf(), guard)
     }
 
     /// Write `<id>.md` with the given raw markdown-with-frontmatter content.
     fn write(&self, id: &str, content: &str) {
         std::fs::write(self.0.join(format!("{id}.md")), content).expect("write specialist file");
-    }
-}
-
-impl Drop for TempSpecialistsDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -12871,7 +12851,8 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
 #[tokio::test]
 async fn pre_output_transport_failure_redrives_silently_once() {
     let script = mock_agent_script();
-    let attempt_file = std::env::temp_dir().join(format!("itd-764-once-{}", uuid::Uuid::new_v4()));
+    let scratch = test_tempdir("itd-764-once-");
+    let attempt_file = scratch.path().join("attempts");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
     let behavior = json!({
         "exitDuringPromptAttempts": 1,
@@ -12963,7 +12944,6 @@ async fn pre_output_transport_failure_redrives_silently_once() {
         messages.iter().any(|m| m.role == "assistant"),
         "the redriven turn completed with assistant output: {messages:?}"
     );
-    let _ = std::fs::remove_file(&attempt_file);
 }
 
 /// End-to-end auth-required prompt failure (intent-hq/intent#3941): a real
@@ -13138,7 +13118,8 @@ async fn worker_driven_streaming_failure_records_streak_exactly_once() {
 #[tokio::test]
 async fn second_pre_output_transport_failure_takes_terminal_path() {
     let script = mock_agent_script();
-    let attempt_file = std::env::temp_dir().join(format!("itd-764-twice-{}", uuid::Uuid::new_v4()));
+    let scratch = test_tempdir("itd-764-twice-");
+    let attempt_file = scratch.path().join("attempts");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
     let behavior = json!({
         "exitDuringPromptAttempts": 2,
@@ -13217,7 +13198,6 @@ async fn second_pre_output_transport_failure_takes_terminal_path() {
         stop_reason.contains("transport closed before output"),
         "stop_reason names the transport failure: {stop_reason}"
     );
-    let _ = std::fs::remove_file(&attempt_file);
 }
 
 /// Warn-and-continue: a prompt idle timeout injects a persisted user-role
@@ -13921,8 +13901,8 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.provider = Some("auggie".to_string());
-    let ws_dir = std::env::temp_dir().join(format!("intentd-rs-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&ws_dir).unwrap();
+    let ws_guard = test_tempdir("intentd-rs-");
+    let ws_dir = ws_guard.path().to_path_buf();
     let mut workspace = intent_core::Workspace {
         id: WorkspaceId::from("ws-rs"),
         title: "WS".to_string(),
@@ -13974,7 +13954,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
 
     // Switch to a non-existent path → fall back to temp.
     workspace.path = Some(
-        std::env::temp_dir()
+        std::env::temp_dir() // tmp-hygiene: allow — never created
             .join(format!("intentd-missing-{}", uuid::Uuid::new_v4()))
             .display()
             .to_string(),
@@ -13982,8 +13962,6 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
     let resolved =
         resolve_spawn(&session, Some(&workspace), &settings, None).expect("falls back to temp");
     assert_eq!(resolved.cwd, std::env::temp_dir());
-
-    let _ = std::fs::remove_dir_all(&ws_dir);
 }
 
 /// The chief workspace (no worktree on disk) spawns in the dedicated
@@ -13998,13 +13976,14 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
     let chief = intent_core::chief_workspace();
 
     // Fresh (not-yet-created) chief cwd root → created on demand and used.
-    let data_dir = std::env::temp_dir().join(format!("intentd-chief-{}", uuid::Uuid::new_v4()));
+    let data_guard = test_tempdir("intentd-chief-");
+    let data_dir = data_guard.path().to_path_buf();
     let chief_root = intent_core::chief_cwd_root(&data_dir);
     assert!(!chief_root.exists(), "fresh data dir: root must not exist");
     let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&chief_root))
         .expect("chief resolves");
     assert_eq!(resolved.cwd, chief_root);
-    assert_ne!(resolved.cwd, PathBuf::from("/tmp"), "never /tmp");
+    assert_ne!(resolved.cwd, PathBuf::from("/tmp"), "never /tmp"); // tmp-hygiene: allow (literal)
     assert!(chief_root.is_dir(), "chief cwd created on demand");
     let entries = std::fs::read_dir(&chief_root).unwrap().count();
     assert_eq!(entries, 0, "dedicated chief cwd is empty");
@@ -14027,8 +14006,6 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
     let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&blocked_root))
         .expect("chief resolves despite blocked root");
     assert_eq!(resolved.cwd, std::env::temp_dir());
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// A workspace with only `repository_path` on disk (an `isNewRepo`
@@ -14039,8 +14016,8 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.provider = Some("auggie".to_string());
-    let repo_dir = std::env::temp_dir().join(format!("intentd-rs-repo-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&repo_dir).unwrap();
+    let repo_guard = test_tempdir("intentd-rs-repo-");
+    let repo_dir = repo_guard.path().to_path_buf();
     let mut workspace = intent_core::Workspace {
         id: WorkspaceId::from("ws-repo-fb"),
         title: "WS".to_string(),
@@ -14092,8 +14069,8 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     assert_ne!(resolved.cwd, std::env::temp_dir(), "never the temp dir");
 
     // `worktree_path` still wins over `repository_path` when both exist.
-    let wt_dir = std::env::temp_dir().join(format!("intentd-rs-wt-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&wt_dir).unwrap();
+    let wt_guard = test_tempdir("intentd-rs-wt-");
+    let wt_dir = wt_guard.path().to_path_buf();
     workspace.worktree_path = Some(wt_dir.display().to_string());
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("worktree_path still wins");
@@ -14102,7 +14079,7 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     // A stale (non-directory) `path` must not suppress a live candidate
     // further down the chain — each entry is `is_dir()`-checked individually.
     workspace.path = Some(
-        std::env::temp_dir()
+        std::env::temp_dir() // tmp-hygiene: allow — never created
             .join(format!("intentd-stale-path-{}", uuid::Uuid::new_v4()))
             .display()
             .to_string(),
@@ -14115,7 +14092,7 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     // A missing repository_path directory falls through to the temp dir.
     workspace.worktree_path = None;
     workspace.repository_path = Some(
-        std::env::temp_dir()
+        std::env::temp_dir() // tmp-hygiene: allow — never created
             .join(format!("intentd-missing-{}", uuid::Uuid::new_v4()))
             .display()
             .to_string(),
@@ -14123,9 +14100,6 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     let resolved =
         resolve_spawn(&session, Some(&workspace), &settings, None).expect("falls back to temp");
     assert_eq!(resolved.cwd, std::env::temp_dir());
-
-    let _ = std::fs::remove_dir_all(&repo_dir);
-    let _ = std::fs::remove_dir_all(&wt_dir);
 }
 
 // --- Prompt block shape helpers ----------------------------------------------
@@ -14794,7 +14768,8 @@ fn text_prompt_produces_one_acp_text_content_block() {
 /// the workspace path and returns its declared `agentType`.
 #[tokio::test]
 async fn derive_agent_type_uses_workspace_project_specialists_dir() {
-    let ws_dir = std::env::temp_dir().join(format!("intentd-dat-{}", uuid::Uuid::new_v4()));
+    let ws_guard = test_tempdir("intentd-dat-");
+    let ws_dir = ws_guard.path().to_path_buf();
     let specialists_dir = ws_dir.join(".intent/specialists");
     std::fs::create_dir_all(&specialists_dir).unwrap();
     std::fs::write(
@@ -14890,8 +14865,6 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         derive_is_orchestrator(&services, &orch_session, Some(&repo_only)),
         "derive_is_orchestrator must fall back to repositoryPath"
     );
-
-    let _ = std::fs::remove_dir_all(&ws_dir);
 }
 
 // --- Context references → stdinContext builder (Fidelity B) ---------------
@@ -18995,8 +18968,8 @@ mod archived_flush_gates {
     #[tokio::test]
     async fn parked_archive_wake_rides_the_unarchiving_user_turn() {
         let script = mock_agent_script();
-        let prompt_log =
-            std::env::temp_dir().join(format!("itd-ua-flush-{}.log", uuid::Uuid::new_v4()));
+        let scratch = test_tempdir("itd-ua-flush-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -19092,7 +19065,6 @@ mod archived_flush_gates {
         // ONE combined provider turn whose prompt carries the wake, the
         // user message, and the trailing one-shot unarchive notice.
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(prompts.len(), 1, "one combined turn: {prompts:?}");
         let text = &prompts[0];
         let w = text
@@ -19902,8 +19874,8 @@ mod flush_queued_messages_tests {
     #[tokio::test]
     async fn drain_flushes_two_ready_entries_into_one_combined_turn() {
         let script = mock_agent_script();
-        let prompt_log =
-            std::env::temp_dir().join(format!("itd-flush-on-{}.log", uuid::Uuid::new_v4()));
+        let scratch = test_tempdir("itd-flush-on-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -19955,7 +19927,6 @@ mod flush_queued_messages_tests {
 
         // ONE provider turn carrying the combined prompt.
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(prompts.len(), 1, "one combined turn: {prompts:?}");
         let text = &prompts[0];
         assert!(
@@ -20002,8 +19973,8 @@ mod flush_queued_messages_tests {
     #[tokio::test]
     async fn setting_off_keeps_one_turn_per_message() {
         let script = mock_agent_script();
-        let prompt_log =
-            std::env::temp_dir().join(format!("itd-flush-off-{}.log", uuid::Uuid::new_v4()));
+        let scratch = test_tempdir("itd-flush-off-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -20069,7 +20040,6 @@ mod flush_queued_messages_tests {
         .expect("both turns complete");
 
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(
             prompts.len(),
             2,
@@ -20090,8 +20060,8 @@ mod flush_queued_messages_tests {
     #[tokio::test]
     async fn system_only_batches_system_entries_and_leaves_user_entry_for_solo_fifo_drain() {
         let script = mock_agent_script();
-        let prompt_log =
-            std::env::temp_dir().join(format!("itd-flush-systemonly-{}.log", uuid::Uuid::new_v4()));
+        let scratch = test_tempdir("itd-flush-systemonly-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -20170,7 +20140,6 @@ mod flush_queued_messages_tests {
         .expect("both the combined system turn and the solo user turn complete");
 
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(
             prompts.len(),
             2,
@@ -20201,10 +20170,8 @@ mod flush_queued_messages_tests {
     #[tokio::test]
     async fn system_only_single_system_entry_drains_solo() {
         let script = mock_agent_script();
-        let prompt_log = std::env::temp_dir().join(format!(
-            "itd-flush-systemonly-solo-{}.log",
-            uuid::Uuid::new_v4()
-        ));
+        let scratch = test_tempdir("itd-flush-systemonly-solo-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -20262,7 +20229,6 @@ mod flush_queued_messages_tests {
         .expect("solo turn completes");
 
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(prompts.len(), 1, "single solo turn: {prompts:?}");
         assert!(
             !prompts[0].contains("queued messages while you were working"),

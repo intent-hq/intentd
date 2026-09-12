@@ -23,23 +23,16 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+impl TempDb {
+    fn new() -> Self {
+        let dir = common::test_tempdir("intentd-spec-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -107,18 +100,18 @@ fn write_specialist(dir: &Path, id: &str, name: &str, desc: &str, prompt: &str) 
 }
 
 struct Harness {
-    _user: TempDir,
-    _bundled: TempDir,
-    _work: TempDir,
-    _tmp: TempDb,
-    _ws_root: tempfile::TempDir,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    server: Option<tokio::task::JoinHandle<()>>,
     user_dir: PathBuf,
     bundled_dir: PathBuf,
     work_dir: PathBuf,
     socket: PathBuf,
+    _user: tempfile::TempDir,
+    _bundled: tempfile::TempDir,
+    _work: tempfile::TempDir,
+    _tmp: TempDb,
+    _ws_root: tempfile::TempDir,
     _sock_dir: tempfile::TempDir,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    server: Option<tokio::task::JoinHandle<()>>,
 }
 
 async fn start() -> Harness {
@@ -133,26 +126,23 @@ async fn start_with_settings(config_toml: &str) -> Harness {
 }
 
 async fn start_with_config(config_toml: Option<&str>) -> Harness {
-    let tag = Uuid::new_v4();
-    let user = TempDir(std::env::temp_dir().join(format!("intentd-spec-user-{tag}")));
-    let bundled = TempDir(std::env::temp_dir().join(format!("intentd-spec-bundled-{tag}")));
-    let work = TempDir(std::env::temp_dir().join(format!("intentd-spec-work-{tag}")));
-    std::fs::create_dir_all(&user.0).unwrap();
-    std::fs::create_dir_all(&bundled.0).unwrap();
-    std::fs::create_dir_all(&work.0).unwrap();
-    let tmp = TempDb {
-        path: std::env::temp_dir().join(format!("intentd-spec-{tag}.db")),
-    };
+    let user = common::test_tempdir("intentd-spec-user-");
+    let bundled = common::test_tempdir("intentd-spec-bundled-");
+    let work = common::test_tempdir("intentd-spec-work-");
+    let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let mut services = Services::new(store)
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone())
-        .with_specialist_dirs(Some(user.0.clone()), Some(bundled.0.clone()));
+        .with_specialist_dirs(
+            Some(user.path().to_path_buf()),
+            Some(bundled.path().to_path_buf()),
+        );
     if let Some(toml) = config_toml {
         // The config file lives inside the work temp dir so it is swept with it.
-        let config_path = work.0.join("config.toml");
+        let config_path = work.path().join("config.toml");
         std::fs::write(&config_path, toml).unwrap();
         let registry = intent_services::SettingsRegistry::load(&config_path).expect("load config");
         services = services.with_settings_registry(Arc::new(registry));
@@ -173,9 +163,9 @@ async fn start_with_config(config_toml: Option<&str>) -> Harness {
         }
     });
     Harness {
-        user_dir: user.0.clone(),
-        bundled_dir: bundled.0.clone(),
-        work_dir: work.0.clone(),
+        user_dir: user.path().to_path_buf(),
+        bundled_dir: bundled.path().to_path_buf(),
+        work_dir: work.path().to_path_buf(),
         _user: user,
         _bundled: bundled,
         _work: work,

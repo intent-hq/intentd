@@ -17,25 +17,18 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 mod common;
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-repo-cfg-{}.db", Uuid::new_v4())),
-        }
-    }
-}
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = common::test_tempdir("intentd-repo-cfg-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -88,17 +81,12 @@ async fn call(
     resp
 }
 
-struct TempRepo(PathBuf);
-impl Drop for TempRepo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
 /// Utility: create a temporary git repo with a .intent/config.json file.
 fn create_test_repo_with_config(config: &str) -> TempRepo {
-    let repo_path = std::env::temp_dir().join(format!("repo-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&repo_path).unwrap();
+    let repo_dir = common::test_tempdir("repo-");
+    let repo_path = repo_dir.path().to_path_buf();
 
     // Initialize a git repo with explicit default branch
     let status = std::process::Command::new("git")
@@ -148,7 +136,7 @@ fn create_test_repo_with_config(config: &str) -> TempRepo {
         .expect("git commit spawn failed");
     assert!(status.status.success(), "git commit command failed");
 
-    TempRepo(repo_path)
+    TempRepo(repo_path, repo_dir)
 }
 
 /// `DoD` test (a): workspace.create with repo branchPrefix and no request prefix -> branch carries prefix.

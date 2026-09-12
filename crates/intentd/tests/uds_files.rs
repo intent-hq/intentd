@@ -89,11 +89,10 @@ async fn send(socket: &Path, frame: &str) -> Value {
 
 #[tokio::test]
 async fn uds_file_tree_returns_root_entries() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-files-{}", &short[..8]));
-    let data_dir = base.join("data");
+    let base = common::test_tempdir_in("/tmp", "intentd-files-");
+    let data_dir = base.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let repo = base.join("repo");
+    let repo = base.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     // Canonicalize so the within-workspace prefix check matches (macOS /tmp is a
     // symlink into /private/var).
@@ -169,24 +168,22 @@ async fn uds_file_tree_returns_root_entries() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 async fn boot(
     repo_name: &str,
 ) -> (
-    std::path::PathBuf,
+    tempfile::TempDir,
     std::path::PathBuf,
     tokio::task::JoinHandle<()>,
     tokio::sync::oneshot::Sender<()>,
     Config,
     tempfile::TempDir,
 ) {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-{}-{}", repo_name, &short[..8]));
-    let data_dir = base.join("data");
+    let base = common::test_tempdir_in("/tmp", &format!("intentd-{repo_name}-"));
+    let data_dir = base.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let repo = base.join("repo");
+    let repo = base.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     let repo = std::fs::canonicalize(&repo).unwrap();
 
@@ -229,7 +226,7 @@ async fn boot(
 
 #[tokio::test]
 async fn uds_file_exists_reports_type_and_absent() {
-    let (base, repo, server, tx, config, _ws_root) = boot("exists").await;
+    let (_base, repo, server, tx, config, _ws_root) = boot("exists").await;
     std::fs::write(repo.join("hello.txt"), "hi\n").unwrap();
     std::fs::create_dir_all(repo.join("subdir")).unwrap();
 
@@ -273,12 +270,11 @@ async fn uds_file_exists_reports_type_and_absent() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 #[tokio::test]
 async fn uds_file_stat_returns_legacy_shape() {
-    let (base, repo, server, tx, config, _ws_root) = boot("stat").await;
+    let (_base, repo, server, tx, config, _ws_root) = boot("stat").await;
     std::fs::write(repo.join("hello.txt"), "hello").unwrap();
 
     let resp = send(
@@ -315,5 +311,4 @@ async fn uds_file_stat_returns_legacy_shape() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }

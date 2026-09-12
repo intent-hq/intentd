@@ -16,7 +16,7 @@
 mod common;
 
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,15 +33,11 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-reap-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-reap-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -277,7 +273,8 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let ws_id = "ws-reap-test";
 
@@ -315,7 +312,7 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
     // if the test panics before the graceful path runs.
     cmd.process_group(0);
     let child = cmd.spawn().expect("spawn intentd serve");
-    let mut daemon = DaemonGuard::new(child, data_dir.clone(), true);
+    let mut daemon = DaemonGuard::process_only(child);
     if !await_uds(&socket).await {
         if let Ok(log) = std::fs::read_to_string(data_dir.join("daemon.log")) {
             eprintln!("Daemon log:\n{log}");

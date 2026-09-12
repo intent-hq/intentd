@@ -21,7 +21,6 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 /// Mock `ServerControl` that captures port from `start_ws_listener` calls
 /// and tracks tailcat tunnel start/stop for the `server.tunnel.*` hooks.
@@ -127,20 +126,19 @@ impl ServerControl for MockPortServerControl {
 }
 
 struct TempDb {
+    dir: tempfile::TempDir,
     path: PathBuf,
 }
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-port-{}.db", Uuid::new_v4())),
-        }
+        let dir = common::test_tempdir("intentd-port-");
+        let path = dir.path().join("intentd.db");
+        Self { dir, path }
     }
-}
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+
+    /// A UDS socket path inside the guarded dir, swept with the db.
+    fn socket_path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(format!("{name}.sock"))
     }
 }
 
@@ -212,7 +210,7 @@ async fn port_setting_crud() {
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("port-{}.sock", Uuid::new_v4().simple()));
+    let socket_path = tmpdb.socket_path("port");
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -302,7 +300,7 @@ async fn port_change_restarts_listener() {
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("port-r-{}.sock", Uuid::new_v4().simple()));
+    let socket_path = tmpdb.socket_path("port-r");
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -367,7 +365,7 @@ async fn port_bind_failure_friendly_error() {
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("port-e-{}.sock", Uuid::new_v4().simple()));
+    let socket_path = tmpdb.socket_path("port-e");
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -448,7 +446,7 @@ async fn setup_uds(
     services.attach_server_control(mock_control);
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("{tag}-{}.sock", Uuid::new_v4().simple()));
+    let socket_path = tmpdb.socket_path(tag);
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {

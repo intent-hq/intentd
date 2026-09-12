@@ -11,7 +11,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,28 +28,23 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-actdebounce-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-actdebounce-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -237,7 +232,8 @@ async fn wss_event_opt(
 }
 
 async fn boot(mock_script: &str, behavior: &str) -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = scratch_dir("data");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
@@ -248,7 +244,7 @@ async fn boot(mock_script: &str, behavior: &str) -> (Daemon, u16, Arc<ClientConf
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -290,7 +286,7 @@ async fn workspace_activity_changed_debounce() {
     let (daemon, port, cfg) = boot(&script, &behavior).await;
 
     // Bootstrap workspace via UDS.
-    let socket = daemon.data_dir.join("intentd.sock");
+    let socket = daemon.data_dir.path().join("intentd.sock");
     let create = uds_rpc(
         &socket,
         2,

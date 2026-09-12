@@ -21,6 +21,7 @@ image = { version = "0.25.6", default-features = false, features = ["png", "jpeg
 flate2 = "1.1.9"
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { workspace = true }
 uuid = { workspace = true }
 

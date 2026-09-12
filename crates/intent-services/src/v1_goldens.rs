@@ -87,23 +87,18 @@ fn workspace(id: &WorkspaceId) -> Workspace {
     }
 }
 
+/// `SQLite` db (plus its `.config.toml` sibling) inside an RAII temp dir; the
+/// dir sweep on drop also covers the `-wal`/`-shm` sidecars.
 struct TempDb {
     path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("intentd-goldens-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm", ".config.toml"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = crate::test_support::test_tempdir("intentd-goldens-");
+        let path = dir.path().join("goldens.db");
+        Self { path, _dir: dir }
     }
 }
 

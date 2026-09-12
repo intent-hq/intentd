@@ -13,22 +13,18 @@ use tokio::time::timeout;
 use super::bus::{Delivery, EventBus, LagWarnThrottle, BROADCAST_CAPACITY, LAG_WARN_INTERVAL};
 use super::filter::SubscriptionFilter;
 
+/// `SQLite` db inside an RAII temp dir; the dir sweep on drop also covers the
+/// `-wal`/`-shm` sidecars.
 struct TempDb {
     path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("intentd-bus-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = crate::test_support::test_tempdir("intentd-bus-");
+        let path = dir.path().join("bus.db");
+        Self { path, _dir: dir }
     }
 }
 
