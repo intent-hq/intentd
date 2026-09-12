@@ -2784,6 +2784,40 @@ async fn note_edit_lines_merges_onto_completed_user_save() {
     assert_eq!(result.total_lines_after, 3);
 }
 
+/// Regression (intentd#1817 re-verification, finding 1): `comment.add`'s
+/// anchor rewrite that read rev 0 no longer overwrites a user `setContent`
+/// that landed at rev 1 — the rewrite is gated on the rev it read, and the
+/// retry re-anchors on the user's text (`TYPED` survives, the markers wrap
+/// `gamma`, the comment row exists and `noteRev` is the rev that landed).
+#[tokio::test]
+async fn comment_add_reanchors_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| {
+            svc.comment_add(
+                ws,
+                id,
+                "gamma".into(),
+                "gamma".into(),
+                "Review".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        },
+    )
+    .await;
+    assert!(result.anchored);
+    assert_eq!(result.note_rev, 2);
+    let markers = format!(
+        "alpha TYPED\nbeta\n<!--anchor:{id}:start-->gamma<!--anchor:{id}:end-->",
+        id = result.comment_id
+    );
+    assert_eq!(stored.content, markers);
+}
 
 /// Regression (intentd#1817 re-verification, finding 2): a note insert and
 /// its initial snapshot commit in ONE transaction, so the instant a fresh

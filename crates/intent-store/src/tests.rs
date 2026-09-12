@@ -2294,7 +2294,7 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
     note.content = "with <!--anchor:c1:start-->markers<!--anchor:c1:end-->".to_string();
     let c1 = sample_comment(&note.id, "c1", "c1");
     let rev = store
-        .update_note_with_comment(&note, &c1, &author)
+        .update_note_with_comment(&note, Some(0), &c1, &author)
         .await
         .expect("atomic update+insert");
     assert_eq!(rev, 1);
@@ -2313,7 +2313,7 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
     note.content = "rewrite-that-must-roll-back".to_string();
     let dup = sample_comment(&note.id, "c1", "c1");
     assert!(store
-        .update_note_with_comment(&note, &dup, &author)
+        .update_note_with_comment(&note, None, &dup, &author)
         .await
         .is_err());
     let after_fail = store.get_note(&ws_id, &note.id).await.expect("get note");
@@ -2324,11 +2324,33 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
         Some((1, stored.content.clone()))
     );
 
+    // Stale `expected_version` (row is at rev 1) → Conflict carrying the
+    // current entity; neither the rewrite nor the comment persists.
+    let c3 = sample_comment(&note.id, "c3", "c3");
+    match store
+        .update_note_with_comment(&note, Some(0), &c3, &author)
+        .await
+    {
+        Err(intent_core::Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 1);
+            assert_eq!(current["content"], stored.content);
+        }
+        other => panic!("expected Conflict for stale expected_version, got {other:?}"),
+    }
+    assert!(store.get_comment("c3").await.is_err());
+    assert_eq!(
+        newest_version(&store, &ws_id, &note.id).await,
+        Some((1, stored.content.clone()))
+    );
+
     // Absent note row → NotFound, and the comment must not persist.
     let mut ghost = note.clone();
     ghost.id = NoteId::new();
     let c2 = sample_comment(&ghost.id, "c2", "c2");
-    match store.update_note_with_comment(&ghost, &c2, &author).await {
+    match store
+        .update_note_with_comment(&ghost, None, &c2, &author)
+        .await
+    {
         Err(intent_core::Error::NotFound(_)) => {}
         other => panic!("expected NotFound for absent note, got {other:?}"),
     }
@@ -2504,7 +2526,7 @@ async fn update_note_with_comment_detaches_conn_on_failed_body_error_rollback() 
     note.content = "rewrite-that-must-roll-back".to_string();
     let c1 = sample_comment(&note.id, "c1", "c1");
     let err = store
-        .update_note_with_comment(&note, &c1, &version_author())
+        .update_note_with_comment(&note, None, &c1, &version_author())
         .await
         .expect_err("UPDATE must fail on the rollback trigger");
     assert!(
@@ -2527,7 +2549,7 @@ async fn update_note_with_comment_detaches_conn_on_failed_body_error_rollback() 
         .await
         .expect("drop trap trigger");
     let rev = store
-        .update_note_with_comment(&note, &c1, &version_author())
+        .update_note_with_comment(&note, None, &c1, &version_author())
         .await
         .expect("update after detach");
     assert_eq!(rev, 1);

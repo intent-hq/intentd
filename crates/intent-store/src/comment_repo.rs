@@ -172,22 +172,25 @@ impl Store {
     }
 
     /// Atomically persist a `comment.add`: the anchor-marker note rewrite
-    /// (the same full-row UPDATE + unconditional `rev` bump as
-    /// [`Store::update_note`]), its version snapshot under the bumped rev
-    /// (stamped with `author`, as [`Store::update_note_with_version`]
-    /// records it) and the comment INSERT run in ONE transaction, so a
-    /// failure between them can never leave anchor markers embedded in the
-    /// note with no comment row (monorepo#638), and no reader can observe the
-    /// new rev before its snapshot. Returns the post-rewrite note `rev` so the
-    /// caller can echo the authoritative value. `NotFound` if the note row is
-    /// absent; nothing persists on any error.
+    /// (the same full-row UPDATE + `rev` bump as
+    /// [`Store::update_note_with_version`], gated on `expected_version` when
+    /// `Some`), its version snapshot under the bumped rev (stamped with
+    /// `author`) and the comment INSERT run in ONE transaction, so a failure
+    /// between them can never leave anchor markers embedded in the note with
+    /// no comment row (monorepo#638), no reader can observe the new rev
+    /// before its snapshot, and a rewrite built on a rev another writer has
+    /// since replaced never overwrites that write (it conflicts, so the
+    /// caller can re-read and re-anchor). Returns the post-rewrite note `rev`
+    /// so the caller can echo the authoritative value; nothing persists on
+    /// any error.
     ///
     /// # Errors
     ///
-    /// Returns `Error::NotFound` if the note row is absent; `Error::InvalidInput` on a duplicate comment id; `Error::Internal` if encoding fields or the transaction fails.
+    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note row is absent; `Error::InvalidInput` on a duplicate comment id; `Error::Internal` if encoding fields or the transaction fails.
     pub async fn update_note_with_comment(
         &self,
         note: &Note,
+        expected_version: Option<i64>,
         c: &Comment,
         author: &NoteVersionAuthor,
     ) -> Result<i64> {
@@ -208,18 +211,19 @@ impl Store {
 
         // Execute the transaction body; rollback explicitly on error.
         let result = async {
-            // Same statement as `update_note_versioned` (no expected_version
-            // gate): full-row replace scoped by (id, workspace_id) with the
-            // store-owned `rev = rev + 1` bump.
+            // Same statement as `update_note_versioned`: full-row replace
+            // scoped by (id, workspace_id) with the store-owned `rev = rev + 1`
+            // bump, gated on `expected_version`. A miss (gate failed or note
+            // absent) is told apart after the rollback.
             let Some(new_rev) = crate::note_repo::exec_update_note(
                 &mut *conn,
                 note,
-                None,
+                expected_version,
                 crate::note_repo::NoteUpdateScope::FullRow,
             )
             .await?
             else {
-                return Err(Error::NotFound(format!("note {}", note.id)));
+                return Ok(None);
             };
             crate::note_version_repo::insert_note_version(
                 &mut conn,
@@ -266,7 +270,7 @@ impl Store {
                     }
                 })?;
 
-            Ok(new_rev)
+            Ok(Some(new_rev))
         }
         .await;
 
@@ -274,7 +278,12 @@ impl Store {
         // failure, if the COMMIT itself fails — monorepo#638) or roll back
         // the failed body (monorepo#680), so the sole write-pool connection
         // is never returned holding an open transaction.
-        crate::commit_with_rollback_guard(conn, result, "commit note+comment tx failed").await
+        match crate::commit_with_rollback_guard(conn, result, "commit note+comment tx failed")
+            .await?
+        {
+            Some(new_rev) => Ok(new_rev),
+            None => Err(self.note_update_miss(note).await),
+        }
     }
 
     /// Fetch a single comment by id, or `NotFound`.

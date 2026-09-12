@@ -23287,7 +23287,33 @@ impl WorkspaceApi for Services {
                         }
                         None => uuid::Uuid::new_v4().to_string(),
                     };
+                    // The comment's author/type is the only provenance the
+                    // add carries: it stamps the anchor rewrite's snapshot.
+                    let comment_author = author.unwrap_or_else(|| {
+                        match author_type {
+                            AuthorType::User => "User",
+                            AuthorType::Agent => "Agent",
+                        }
+                        .to_string()
+                    });
+                    let version_author = match author_type {
+                        AuthorType::User => user_version_author(),
+                        AuthorType::Agent => NoteVersionAuthor {
+                            id: comment_author.clone(),
+                            name: comment_author.clone(),
+                            author_type: "agent".to_string(),
+                        },
+                    };
+                    // Read-anchor-persist loop: the anchor rewrite is gated
+                    // on the rev it read, so a save that lands in between
+                    // (`Conflict`) is re-read and re-anchored on the next
+                    // attempt instead of overwritten; the last attempt's
+                    // `Conflict` propagates unchanged, like `note.setContent`.
+                    let mut attempt = 0;
+                    let (note, line, anchored_text, note_rev) = loop {
+                    attempt += 1;
                     let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+                    let read_rev = note.rev;
                     // Self-heal phantom debris (Round 15): scrub UUID-format
                     // markers whose id has no live comment row before
                     // matching. The cleaned content persists only as part of
@@ -23340,14 +23366,8 @@ impl WorkspaceApi for Services {
                         thread_id: comment_id.clone(),
                         note_id: Some(note_id.clone()),
                         kind: parse_comment_type(kind.as_deref()),
-                        content: comment,
-                        author: author.unwrap_or_else(|| {
-                            match author_type {
-                                AuthorType::User => "User",
-                                AuthorType::Agent => "Agent",
-                            }
-                            .to_string()
-                        }),
+                        content: comment.clone(),
+                        author: comment_author.clone(),
                         author_type,
                         status: CommentStatus::Open,
                         parent_id: None,
@@ -23375,39 +23395,41 @@ impl WorkspaceApi for Services {
                         created_at: now.clone(),
                         updated_at: now,
                     };
-                    // The anchor rewrite is a persisted content write: it is
-                    // snapshotted under the post-rewrite rev so a writer
-                    // holding that rev can recover its base. The comment's
-                    // author/type is the only provenance the add carries.
-                    let version_author = match new_comment.author_type {
-                        AuthorType::User => user_version_author(),
-                        AuthorType::Agent => NoteVersionAuthor {
-                            id: new_comment.author.clone(),
-                            name: new_comment.author.clone(),
-                            author_type: "agent".to_string(),
-                        },
-                    };
-                    // The anchor-marker note rewrite + its version snapshot +
-                    // comment INSERT commit atomically: a failure can never
-                    // leave markers embedded with no comment row
-                    // (monorepo#638), nor the new rev visible without its
-                    // snapshot. The returned rev is the authoritative
-                    // post-rewrite value echoed to clients. Duplicate-id
-                    // detection rides the INSERT's PK constraint inside that
-                    // same transaction (no TOCTOU pre-check), so a colliding
-                    // client-supplied `commentId` is InvalidParams even when
-                    // two adds race.
-                    let note_rev = match store
-                        .update_note_with_comment(&note, &new_comment, &version_author)
+                    // The anchor-marker note rewrite (gated on `read_rev`) +
+                    // its version snapshot + comment INSERT commit
+                    // atomically: a failure can never leave markers embedded
+                    // with no comment row (monorepo#638), nor the new rev
+                    // visible without its snapshot. The returned rev is the
+                    // authoritative post-rewrite value echoed to clients.
+                    // Duplicate-id detection rides the INSERT's PK constraint
+                    // inside that same transaction (no TOCTOU pre-check), so
+                    // a colliding client-supplied `commentId` is InvalidParams
+                    // even when two adds race.
+                    match store
+                        .update_note_with_comment(
+                            &note,
+                            Some(read_rev),
+                            &new_comment,
+                            &version_author,
+                        )
                         .await
                     {
-                        Ok(rev) => rev,
+                        Ok(rev) => break (note, line, anchored_text, rev),
+                        Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {
+                            tracing::debug!(
+                                note = %note_id.0,
+                                attempt,
+                                read_rev,
+                                "comment.add: note changed under the anchor rewrite; re-anchoring"
+                            );
+                        }
                         Err(Error::InvalidInput(_)) if client_supplied_id => {
                             return Err(Error::InvalidParams(format!(
                                 "Invalid 'commentId': {comment_id}. A comment with this id already exists."
                             )))
                         }
                         Err(e) => return Err(e),
+                    }
                     };
                     services.schedule_line_attribution_recompute(
                         &note.workspace_id.clone(),
