@@ -11,7 +11,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,17 +27,13 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-scrst-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-scrst-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path) -> Child {
@@ -249,9 +245,9 @@ fn stop(mut child: Child) {
 
 /// A minimal committed git repo for `workspace.create` (the store row is what
 /// `script.*` needs; `skipWorktree` keeps provisioning out of the test).
-fn create_test_repo() -> PathBuf {
-    let repo_path = std::env::temp_dir().join(format!("scrst-repo-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&repo_path).expect("create temp repo dir");
+fn create_test_repo() -> tempfile::TempDir {
+    let repo = common::test_tempdir("scrst-repo-");
+    let repo_path = repo.path().to_path_buf();
     let git = |args: &[&str]| {
         let status = Command::new("git")
             .args(args)
@@ -267,7 +263,7 @@ fn create_test_repo() -> PathBuf {
     std::fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
     git(&["add", "."]);
     git(&["commit", "-m", "initial commit"]);
-    repo_path
+    repo
 }
 
 /// The `restarting` status (monorepo#1318) is observable over the wire, in
@@ -280,8 +276,10 @@ fn create_test_repo() -> PathBuf {
 ///    `restarting` (counter reset to 0) → `running`.
 #[tokio::test]
 async fn restarting_status_is_observable_over_wss() {
-    let data_dir = scratch_dir("data");
-    let repo_path = create_test_repo();
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let repo_guard = create_test_repo();
+    let repo_path = repo_guard.path().to_path_buf();
     let (child, port, cfg) = boot(&data_dir).await;
 
     // SUBSCRIBER conn — create the workspace and subscribe to script:* BEFORE
@@ -384,6 +382,4 @@ async fn restarting_status_is_observable_over_wss() {
     drop(rpc);
     drop(sub);
     stop(child);
-    let _ = std::fs::remove_dir_all(&repo_path);
-    let _ = std::fs::remove_dir_all(&data_dir);
 }

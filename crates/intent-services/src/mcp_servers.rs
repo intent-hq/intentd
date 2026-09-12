@@ -56,8 +56,10 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
 /// Consecutive ping failures before the monitor restarts a server (parity: 3).
 const MAX_FAILURES: u32 = 3;
 /// Grace window between SIGTERM and SIGKILL when reaping (PTY-host parity).
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_millis(500);
 /// Poll cadence while waiting for a reaped child to exit.
+#[cfg(unix)]
 const REAP_POLL: Duration = Duration::from_millis(25);
 
 /// Epoch milliseconds (the `startedAt` shape in PROTOCOL §5.22's example).
@@ -310,9 +312,11 @@ enum ToolTarget {
 
 /// Transport-specific runtime half of a tracked server entry.
 enum ServerRuntime {
-    /// A spawned stdio child + its JSON-RPC stdio connection.
+    /// A spawned stdio child + its JSON-RPC stdio connection. The child is
+    /// boxed: `tokio::process::Child` is large on Windows, which would make
+    /// the data-less `Remote` variant pay for it (`clippy::large_enum_variant`).
     Stdio {
-        child: Child,
+        child: Box<Child>,
         pid: Option<u32>,
         conn: Arc<Connection>,
     },
@@ -470,7 +474,7 @@ impl McpHub {
                 let rs = RunningServer {
                     config,
                     runtime: ServerRuntime::Stdio {
-                        child,
+                        child: Box::new(child),
                         pid,
                         conn: Arc::new(conn),
                     },
@@ -3623,7 +3627,7 @@ mod tests {
         let rs = RunningServer {
             config: stdio_cfg(id, "sleep"),
             runtime: ServerRuntime::Stdio {
-                child,
+                child: Box::new(child),
                 pid: None,
                 conn: Arc::new(conn),
             },

@@ -24,23 +24,18 @@ mod tests {
     use crate::sandbox_ops::{provision_sandbox, ProvisionConfig, ProvisionOutcome};
     use crate::Services;
 
+    /// `SQLite` db inside an RAII temp dir; the dir sweep on drop also covers
+    /// the `-wal`/`-shm` sidecars.
     struct TempDb {
         path: PathBuf,
+        _dir: tempfile::TempDir,
     }
 
     impl TempDb {
         fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("completion-test-{}.db", uuid::Uuid::new_v4()));
-            Self { path }
-        }
-    }
-
-    impl Drop for TempDb {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-            }
+            let dir = crate::test_support::test_tempdir("completion-test-");
+            let path = dir.path().join("completion.db");
+            Self { path, _dir: dir }
         }
     }
 

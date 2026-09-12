@@ -18,18 +18,15 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -91,9 +88,8 @@ async fn rpc_with_params(socket: &PathBuf, method: &str, params: Value) -> Value
 #[tokio::test]
 async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     // Keep the data dir short so `data_dir/intentd.sock` fits within SUN_LEN.
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let pidfile = data_dir.join("intentd.pid");
 
@@ -226,7 +222,6 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     // UDS analog of a clean port release with no EADDRINUSE.
     let restart = Daemon {
         child: spawn_daemon(&data_dir),
-        data_dir: data_dir.clone(),
     };
     assert!(
         await_socket(&socket).await,
@@ -260,13 +255,11 @@ async fn await_file_watch(socket: &PathBuf, pred: impl Fn(&Value) -> bool) -> Va
 async fn system_status_surfaces_file_watch_coverage_and_degradation() {
     // Healthy daemon: once the registry is up, fileWatch is present with a
     // zero failed count (the hermetic boot has no workspaces, so zero roots).
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdw-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdw-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let healthy = Daemon {
         child: spawn_daemon(&data_dir),
-        data_dir: data_dir.clone(),
     };
     assert!(await_socket(&socket).await, "healthy daemon did not start");
     let resp = await_file_watch(&socket, Value::is_object).await;
@@ -282,13 +275,11 @@ async fn system_status_surfaces_file_watch_coverage_and_degradation() {
 
     // Degraded daemon: every watcher creation fails (test seam), so watching
     // a workspace must surface as failed roots rather than a silent WARN.
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdd-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdd-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let degraded = Daemon {
         child: spawn_daemon_with_env(&data_dir, &[("INTENTD_TEST_FAIL_WATCHER_CREATION", "1")]),
-        data_dir: data_dir.clone(),
     };
     assert!(await_socket(&socket).await, "degraded daemon did not start");
 

@@ -158,6 +158,13 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
   the UDS suites are a useful reference for shaping new tests, but they do **not** replace
   the WSS e2e requirement; the WSS path has its own concerns (TLS upgrade, bearer auth,
   origin allow-list, fingerprint pinning, heartbeat) that only the WSS harness covers.
+- **Scratch dirs** — create them with `common::test_tempdir(prefix)` /
+  `common::test_tempdir_in("/tmp", prefix)` (or `test_support::test_tempdir` inside
+  `intent-services`), declared before any guard that kills a daemon child: the `TempDir`
+  sweeps on drop (including on panic) and `INTENTD_TEST_KEEP_TMP=1` keeps it for
+  debugging. `tmp_hygiene_guard.rs` fails the suite on any raw `PathBuf::from("/tmp")` /
+  `Path::new("/tmp")` / `temp_dir().join(..)` in test code unless the line ends with
+  `// tmp-hygiene: allow — <reason>` (pure path arithmetic only).
 
 ### Asserting the protocol contract
 

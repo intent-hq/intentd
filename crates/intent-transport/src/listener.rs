@@ -74,6 +74,10 @@ pub(crate) fn derive_pipe_name(resolved_socket_path: &str) -> String {
 /// Resolve `socket_path` to absolute form and derive the pipe name it maps to.
 /// Public so local clients (the `intentd` CLI) connect to the exact same pipe
 /// the listener binds, without re-implementing the resolution.
+///
+/// # Errors
+///
+/// Returns the I/O error from resolving `socket_path` to an absolute path.
 #[cfg(windows)]
 pub fn pipe_name_for_socket_path(socket_path: &Path) -> std::io::Result<String> {
     let absolute = std::path::absolute(socket_path)?;
@@ -424,6 +428,10 @@ where
 /// Administrators, and read-only to Everyone (who therefore cannot open a
 /// duplex pipe) — so other non-admin users cannot connect, though this is not
 /// a strict 0600 equivalent.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if creating or serving the named pipe fails.
 #[cfg(windows)]
 #[expect(clippy::too_many_arguments)]
 pub async fn serve_uds_with_reverse<F>(
@@ -520,7 +528,7 @@ where
                     },
                 }
             }
-            _ = &mut shutdown => break,
+            () = &mut shutdown => break,
         }
     }
 

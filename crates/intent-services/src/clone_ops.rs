@@ -40,6 +40,7 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Grace period between SIGTERM and SIGKILL when reaping a timed-out clone,
 /// mirroring `host_exec`'s `TERM_GRACE` so the whole process group (git-remote-
 /// https / git-fetch-pack / git-index-pack) settles before we escalate.
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
 /// Bound on the stderr tail retained by [`stream_stderr`] for error messages.

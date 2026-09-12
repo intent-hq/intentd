@@ -37,7 +37,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -54,15 +53,11 @@ impl Drop for Daemon {
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-atomic-rb-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-atomic-rb-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -230,7 +225,8 @@ where
 /// and returns the failing key in the error response (per AGENTS.md testing gate).
 #[tokio::test]
 async fn mixed_batch_rollback_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     // Start daemon with both UDS and TCP (server.wsApi.enabled=true in config.toml)
     let child = spawn_serve(&data_dir, "both", &env);
@@ -345,7 +341,8 @@ async fn mixed_batch_rollback_over_wss() {
 /// as unknown — same wire contract as UDS (`legacy_workspace_overrides_discards_and_strips_on_boot`).
 #[tokio::test]
 async fn retired_workspace_overrides_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -435,7 +432,8 @@ async fn retired_workspace_overrides_over_wss() {
 /// unannotated definitions omit the key entirely.
 #[tokio::test]
 async fn agent_features_token_impact_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -558,7 +556,8 @@ fn model_default_values(changes: &Value) -> Vec<Value> {
 /// `model.default` in the batch is never overridden.
 #[tokio::test]
 async fn provider_switch_reresolves_default_model_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Warm the grok catalog cache pre-boot (grok's catalog version key is
     // constant/empty, so the seeded entry is current on any host).
     std::fs::write(
@@ -715,7 +714,8 @@ async fn provider_switch_reresolves_default_model_over_wss() {
 /// and out-of-range values reject with `-32602`.
 #[tokio::test]
 async fn workspace_api_settings_round_trip_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -880,7 +880,8 @@ async fn workspace_api_settings_round_trip_over_wss() {
 /// documented `result` / `error` shape).
 #[tokio::test]
 async fn model_default_reasoning_effort_round_trips_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -983,7 +984,8 @@ async fn model_default_reasoning_effort_round_trips_over_wss() {
 /// `-32602` (PROTOCOL §9).
 #[tokio::test]
 async fn agents_resume_interrupted_on_start_round_trips_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -1094,7 +1096,8 @@ async fn agent_memory_knobs_over_wss() {
     // The static bound `SettingsFile` enforces when parsing config.toml. The
     // catalog bound may sit below it (this machine's RAM) but never above.
     const PARSE_BOUND_MB: f64 = 1_024_000.0;
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -1243,7 +1246,8 @@ fn stored_secret(secrets_file: &Path, account: &str) -> Option<String> {
 async fn redaction_placeholder_round_trip_keeps_secret_over_wss() {
     const PLACEHOLDER: &str = "********";
     const SECRET: &str = "lin_api_original_0123456789";
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_file_str = secrets_file.to_string_lossy().into_owned();
     let env: [(&str, &str); 3] = [
@@ -1391,7 +1395,8 @@ async fn redaction_placeholder_round_trip_keeps_secret_over_wss() {
 /// not applied and no secret is written.
 #[tokio::test]
 async fn redaction_placeholder_without_secret_rejects_batch_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_file_str = secrets_file.to_string_lossy().into_owned();
     let env: [(&str, &str); 3] = [

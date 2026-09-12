@@ -14,7 +14,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -51,13 +50,6 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
@@ -431,7 +423,7 @@ struct Fixture {
     forge: StubForge,
     ws_id: WorkspaceId,
     agent_id: AgentId,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 fn workspace(id: &WorkspaceId) -> Workspace {
@@ -536,9 +528,8 @@ fn agent_session(ws: &WorkspaceId, id: &str) -> AgentSession {
 /// debounce is parked at an hour so a detected change stays pending until the
 /// test flushes it over the wire.
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-pr-monitor-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-pr-monitor-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -584,7 +575,7 @@ async fn boot() -> Fixture {
         forge,
         ws_id,
         agent_id,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 

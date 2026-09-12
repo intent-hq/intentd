@@ -23,8 +23,10 @@ use intent_core::{
 };
 use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
 use intent_store::Store;
+#[cfg(unix)]
+use intent_transport::serve_uds;
 use intent_transport::{
-    ensure_tls_certificate, serve_uds, AsyncTokenStore, FileWatchStatus, PrimaryReverseRegistry,
+    ensure_tls_certificate, AsyncTokenStore, FileWatchStatus, PrimaryReverseRegistry,
     SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions, MAX_INBOUND_MESSAGE_BYTES,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -218,6 +220,7 @@ struct Server {
     port: u16,
     cfg: Arc<ClientConfig>,
     api: Arc<dyn WorkspaceApi>,
+    #[cfg_attr(not(unix), expect(dead_code))]
     bus: EventBus,
     store: Store,
     registry: Arc<intent_services::SettingsRegistry>,
@@ -10806,8 +10809,8 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
 
     // workspace.findRepositories returns { repositories: string[] }. Seed a
     // scratch dir with a fake `.git` folder so the scan produces a match.
-    let scratch =
-        std::env::temp_dir().join(format!("itd-find-repos-{}", uuid::Uuid::new_v4().simple()));
+    let scratch_guard = common::test_tempdir("itd-find-repos-");
+    let scratch = scratch_guard.path().to_path_buf();
     let repo_a = scratch.join("repo-a");
     std::fs::create_dir_all(repo_a.join(".git")).expect("mkdir repo-a/.git");
     std::fs::create_dir_all(scratch.join("plain")).expect("mkdir plain");
@@ -10829,7 +10832,6 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
             .any(|r| r.as_str() == Some(repo_a.to_str().unwrap())),
         "repo-a must be in {repos:?}"
     );
-    let _ = std::fs::remove_dir_all(&scratch);
 
     // workspace.findRepositories without `directory` → -32602.
     let find_missing = wss_call(
@@ -10850,8 +10852,9 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
         .status()
         .is_ok_and(|s| s.success())
     {
-        let init_path =
-            std::env::temp_dir().join(format!("itd-init-{}", uuid::Uuid::new_v4().simple()));
+        // The RPC creates `init_path` itself; only its parent pre-exists.
+        let init_guard = common::test_tempdir("itd-init-");
+        let init_path = init_guard.path().join("repo");
         let init = wss_call(
             srv.port,
             srv.cfg.clone(),
@@ -10865,7 +10868,6 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
         assert!(init_path.join(".git").exists(), ".git directory seeded");
         assert!(init_path.join("README.md").exists(), "README seeded");
         assert!(init_path.join(".gitignore").exists(), ".gitignore seeded");
-        let _ = std::fs::remove_dir_all(&init_path);
     }
 
     // workspace.initializeRepository without `path` → -32602.
@@ -13357,7 +13359,9 @@ async fn wss_file_ops_unknown_workspace_fail_closed() {
     let w = fixture_workspace(&pathless);
     srv.store.insert_workspace(&w).await.expect("insert ws");
 
-    let escape = std::env::temp_dir().join(format!("intentd-wss-escape-{}", uuid::Uuid::new_v4()));
+    // `escape` is never created: the guarded parent exists, the file must not.
+    let escape_guard = common::test_tempdir("intentd-wss-escape-");
+    let escape = escape_guard.path().join("escape.txt");
     let escape_s = escape.to_string_lossy().into_owned();
 
     for ws_id in ["ws-does-not-exist", pathless.0.as_str()] {

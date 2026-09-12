@@ -37,28 +37,23 @@ use crate::agent_subscriptions::GroupPersistOp;
 use crate::Services;
 use intent_core::MAX_DELEGATION_DEPTH;
 
+/// `SQLite` db (plus its `.config.toml` sibling) inside an RAII temp dir; the
+/// dir sweep on drop also covers the `-wal`/`-shm` sidecars.
 pub(super) struct TempDb {
     pub(super) path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     pub(super) fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("intentd-agentops-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
+        let dir = crate::test_support::test_tempdir("intentd-agentops-");
+        let path = dir.path().join("agentops.db");
+        Self { path, _dir: dir }
     }
 }
 
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm", ".config.toml"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
-    }
-}
-
-/// A settings registry (backed by a config file next to the temp db, removed
-/// by [`TempDb`]'s drop) seeding a configured default provider: since
+/// A settings registry (backed by a config file next to the temp db, swept
+/// with [`TempDb`]'s dir) seeding a configured default provider: since
 /// monorepo#3044 there is no positional fallback, so ops that resolve a
 /// provider need `model.defaultProvider` set. The `providers.paths` override
 /// points auggie at a deterministic executable so availability checks
@@ -13314,7 +13309,7 @@ async fn fetch_session_stats_child_path_includes_binary_dir() {
 
 #[tokio::test]
 async fn auggie_fetches_return_none_for_unresolvable_binary() {
-    let missing = std::env::temp_dir()
+    let missing = std::env::temp_dir() // tmp-hygiene: allow — never created
         .join(format!("intentd-missing-{}", uuid::Uuid::new_v4()))
         .join("auggie");
     assert!(fetch_auggie_models_rich(Some(missing.clone()))
@@ -28702,26 +28697,59 @@ async fn held_entry_excluded_from_drain_until_release() {
 
 /// The per-entry release timer flushes the hold at `holdUntil`: the entry
 /// becomes ready-to-send without any manual release call.
+///
+/// Both wall-clock races are kept out of the assertions:
+/// - The "held before the deadline" check runs against a FAR deadline; the
+///   enqueue awaits a persisted write-through, which under load can outlast a
+///   short hold, so a short deadline would already have passed here. The
+///   same-key upsert then shortens the deadline in place and re-arms the
+///   timer.
+/// - The flush is observed directly — the `holdKind` marker disappearing
+///   from the queue snapshot — rather than via `has_ready_to_send`.
+///   Readiness derives from `is_held()`, which compares `holdUntil` against
+///   the wall clock, so it flips true the instant the deadline passes,
+///   possibly before the spawned timer task has run `flush_expired_hold`;
+///   dequeuing at that point would race the flush and see the marker still
+///   set. Only the marker clearing proves the timer ran.
 #[tokio::test]
 async fn hold_timer_flush_makes_entry_ready() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "TimerFlush").await;
 
-    let soon = intent_core::iso_ms_from_now(150);
-    svc.enqueue_held_message(&id, "debounced".into(), None, "debounce", &soon, "child-1")
+    let far = intent_core::iso_ms_from_now(60_000);
+    let (held, _) = svc
+        .enqueue_held_message(&id, "debounced".into(), None, "debounce", &far, "child-1")
         .await;
     assert!(!svc.has_ready_to_send(&id), "held before the deadline");
 
-    // Wait past the deadline for the spawned timer to flush the hold.
+    // Same-key upsert: shorten the deadline and re-arm the release timer.
+    let soon = intent_core::iso_ms_from_now(150);
+    let (refreshed, _) = svc
+        .enqueue_held_message(&id, "debounced".into(), None, "debounce", &soon, "child-1")
+        .await;
+    assert_eq!(refreshed.id, held.id, "upsert keeps the entry id");
+
+    // Wait for the spawned timer to flush the hold: the marker clears in
+    // the queue snapshot. The deadline is a liveness bound only.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while !svc.has_ready_to_send(&id) {
+    loop {
+        let snapshot = svc.queue_snapshot(&id);
+        let entry = snapshot
+            .iter()
+            .find(|e| e["id"] == json!(held.id))
+            .expect("held entry stays queued");
+        if entry["holdKind"].is_null() {
+            break;
+        }
         assert!(
             tokio::time::Instant::now() < deadline,
             "timer flush did not release the hold in time"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    assert!(svc.has_ready_to_send(&id), "flushed entry is ready");
     let drained = svc.dequeue_message(&id).expect("flushed entry drains");
+    assert_eq!(drained.id, held.id);
     assert!(drained.hold_kind.is_none(), "flush cleared the marker");
     assert_eq!(drained.content, "debounced");
 }
@@ -30554,9 +30582,9 @@ async fn fake_provisioned_sandbox(
     svc: &Services,
     ws: &WorkspaceId,
     aid: &AgentId,
-) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("intentd-orphan-sandbox-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("create sandbox dir");
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let guard = crate::test_support::test_tempdir("intentd-orphan-sandbox-");
+    let dir = guard.path().to_path_buf();
     std::fs::write(dir.join("file.txt"), "x").expect("write sandbox file");
     let sandbox = intent_store::Sandbox {
         id: uuid::Uuid::new_v4().to_string(),
@@ -30575,7 +30603,7 @@ async fn fake_provisioned_sandbox(
         .insert_sandbox(&sandbox)
         .await
         .expect("insert sandbox record");
-    dir
+    (guard, dir)
 }
 
 #[tokio::test]
@@ -30586,7 +30614,7 @@ async fn settle_provisioned_sandbox_discards_when_session_missing() {
     // removed and no sandbox:cow:created event fires.
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let aid = create_agent(&svc, &ws, "Doomed").await;
-    let dir = fake_provisioned_sandbox(&svc, &ws, &aid).await;
+    let (_sandbox_dir, dir) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
     svc.store()
         .delete_agent_session(&ws, &aid)
         .await
@@ -30640,7 +30668,7 @@ async fn settle_provisioned_sandbox_discards_when_session_soft_deleted() {
         .update_agent_session(&ws, &session)
         .await
         .expect("flag deleted");
-    let dir = fake_provisioned_sandbox(&svc, &ws, &aid).await;
+    let (_sandbox_dir, dir) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
 
     svc.settle_provisioned_sandbox(
         &ws,
@@ -30677,7 +30705,7 @@ async fn settle_provisioned_sandbox_attaches_fields_for_live_session() {
     // Control: with a live session, settlement persists the sandbox fields.
     let (_t, svc, ws) = setup().await;
     let aid = create_agent(&svc, &ws, "Live").await;
-    let dir = fake_provisioned_sandbox(&svc, &ws, &aid).await;
+    let (_sandbox_dir, dir) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
 
     svc.settle_provisioned_sandbox(
         &ws,
@@ -30713,7 +30741,6 @@ async fn settle_provisioned_sandbox_attaches_fields_for_live_session() {
         Some(format!("sb/{}", aid.0).as_str()),
         "live session gains the sandbox branch"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// monorepo#958: the bounded `agent.get`/`agent.list` projection (metadata-only

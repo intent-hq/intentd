@@ -14,7 +14,7 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,31 +31,23 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn scratch_dir(tag: &str) -> TempDir {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-progress-e2e-{tag}-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
-    TempDir(dir)
+fn scratch_dir(tag: &str) -> tempfile::TempDir {
+    common::test_tempdir(&format!("intentd-progress-e2e-{tag}-"))
 }
 
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
     let dir = scratch_dir("home");
-    let store = Store::open(&dir.0.join("intentd.db")).await.expect("store");
+    let store = Store::open(&dir.path().join("intentd.db"))
+        .await
+        .expect("store");
     let bus = EventBus::new(store.clone());
-    let workspaces_root = dir.0.join("workspaces");
+    let workspaces_root = dir.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
     let services = Services::new(store)
         .with_workspaces_root(workspaces_root)
@@ -121,14 +113,14 @@ fn run_git(args: &[&str], dir: &Path) {
 }
 
 /// Init a small local repo with one commit; returns its guard.
-fn seed_repo(tag: &str) -> TempDir {
+fn seed_repo(tag: &str) -> tempfile::TempDir {
     let dir = scratch_dir(tag);
-    run_git(&["init", "-q", "-b", "main"], &dir.0);
-    run_git(&["config", "user.name", "Test"], &dir.0);
-    run_git(&["config", "user.email", "test@example.com"], &dir.0);
-    std::fs::write(dir.0.join("README.md"), "hello\n").unwrap();
-    run_git(&["add", "README.md"], &dir.0);
-    run_git(&["commit", "-q", "-m", "init"], &dir.0);
+    run_git(&["init", "-q", "-b", "main"], dir.path());
+    run_git(&["config", "user.name", "Test"], dir.path());
+    run_git(&["config", "user.email", "test@example.com"], dir.path());
+    std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+    run_git(&["add", "README.md"], dir.path());
+    run_git(&["commit", "-q", "-m", "init"], dir.path());
     dir
 }
 
@@ -253,7 +245,7 @@ async fn workspace_create_progress_id_streams_milestones_over_wss() {
         "workspace.create",
         json!({
             "title": "Progress E2E",
-            "repositoryPath": repo.0.to_string_lossy(),
+            "repositoryPath": repo.path().to_string_lossy(),
             "progressId": "prog-e2e-wt-1",
         }),
     )
@@ -310,7 +302,7 @@ async fn workspace_create_progress_id_failure_emits_done_ok_false_over_wss() {
         "workspace.create",
         json!({
             "githubUrl": format!("file://{missing}"),
-            "clonePath": target.0.join("checkout").to_string_lossy(),
+            "clonePath": target.path().join("checkout").to_string_lossy(),
             "progressId": "prog-e2e-fail-1",
         }),
     )
@@ -351,7 +343,7 @@ async fn workspace_create_without_progress_id_stays_silent_over_wss() {
         "workspace.create",
         json!({
             "title": "Legacy Silent",
-            "repositoryPath": repo.0.to_string_lossy(),
+            "repositoryPath": repo.path().to_string_lossy(),
         }),
     )
     .await;

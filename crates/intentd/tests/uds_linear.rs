@@ -3,6 +3,8 @@
 //! injected so the slice never touches the network (no `LINEAR_API_KEY`, no
 //! GraphQL call) and the filter/param plumbing is asserted deterministically.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::{Path, PathBuf};

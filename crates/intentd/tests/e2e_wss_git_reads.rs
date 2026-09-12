@@ -35,6 +35,8 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 
 struct Daemon {
     child: Child,
+    _data_dir_guard: tempfile::TempDir,
+    _scratch_guard: tempfile::TempDir,
     data_dir: PathBuf,
     scratch: PathBuf,
 }
@@ -43,16 +45,11 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-        let _ = std::fs::remove_dir_all(&self.scratch);
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-gitr-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-gitr-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -245,8 +242,10 @@ fn make_source_repo(dir: &Path) -> PathBuf {
 }
 
 async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = scratch_dir("data");
-    let scratch = scratch_dir("scratch");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let scratch_guard = scratch_dir("scratch");
+    let scratch = scratch_guard.path().to_path_buf();
     let root_s = workspaces_root.to_string_lossy().to_string();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -256,6 +255,8 @@ async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
+        _scratch_guard: scratch_guard,
         data_dir: data_dir.clone(),
         scratch,
     };
@@ -313,7 +314,8 @@ async fn git_numstat_working_tree_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-numstat");
+    let root_guard = scratch_dir("root-numstat");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
     let mut ws = connect_ws(port, cfg).await;
@@ -358,7 +360,6 @@ async fn git_numstat_working_tree_over_wss() {
     .await;
     assert_eq!(resp["result"], json!([]), "staged=true empty: {resp}");
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -369,7 +370,8 @@ async fn git_numstat_branch_range_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-numstat-range");
+    let root_guard = scratch_dir("root-numstat-range");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
     let mut ws = connect_ws(port, cfg).await;
@@ -397,7 +399,6 @@ async fn git_numstat_branch_range_over_wss() {
     assert_eq!(entry["additions"], json!(1));
     assert_eq!(entry["deletions"], json!(0));
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -409,7 +410,8 @@ async fn git_branch_diff_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-branch-diff");
+    let root_guard = scratch_dir("root-branch-diff");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
     let mut ws = connect_ws(port, cfg).await;
@@ -447,7 +449,6 @@ async fn git_branch_diff_over_wss() {
     assert!(resp.get("result").is_none(), "missing base: {resp}");
     assert_eq!(resp["error"]["code"], json!(-32602));
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -458,7 +459,8 @@ async fn git_get_remote_url_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-remote-url");
+    let root_guard = scratch_dir("root-remote-url");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
     let mut ws = connect_ws(port, cfg).await;
@@ -513,7 +515,6 @@ async fn git_get_remote_url_over_wss() {
     .await;
     assert_eq!(resp["error"]["code"], json!(-32602));
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -525,7 +526,8 @@ async fn git_get_config_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-get-config");
+    let root_guard = scratch_dir("root-get-config");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
     let mut ws = connect_ws(port, cfg).await;
@@ -590,7 +592,6 @@ async fn git_get_config_over_wss() {
     let nonrepo_resp = wss_rpc(&mut ws, 8, "git.getConfig", json!({ "workspaceId": ws_id })).await;
     assert_eq!(nonrepo_resp["result"]["config"], json!(""));
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -604,7 +605,8 @@ async fn git_status_files_capped_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-status-cap");
+    let root_guard = scratch_dir("root-status-cap");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
     let mut ws = connect_ws(port, cfg).await;
@@ -643,7 +645,6 @@ async fn git_status_files_capped_over_wss() {
     assert_eq!(files[0]["path"], json!("tracked.txt"));
     assert_eq!(files[0]["status"], json!("M"));
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -656,7 +657,8 @@ async fn git_status_upstream_fields_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-status-upstream");
+    let root_guard = scratch_dir("root-status-upstream");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
     let mut ws = connect_ws(port, cfg).await;
@@ -700,7 +702,6 @@ async fn git_status_upstream_fields_over_wss() {
     assert_eq!(result["unpushedCount"], json!(1), "{result:?}");
     assert_eq!(result["ahead"], json!(1));
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -713,7 +714,8 @@ async fn git_status_rename_is_single_r_entry_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-status-rename");
+    let root_guard = scratch_dir("root-status-rename");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
     let mut ws = connect_ws(port, cfg).await;
@@ -761,6 +763,5 @@ async fn git_status_rename_is_single_r_entry_over_wss() {
         resp["result"]
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }

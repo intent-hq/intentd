@@ -43,7 +43,6 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -66,15 +65,11 @@ impl Drop for Daemon {
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-flush-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-flush-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -653,7 +648,8 @@ async fn flush_combines_queued_messages_into_one_turn_over_wss() {
     let Some(script) = gate("WSS queued-message flush E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut setup = setup_busy_agent_with_two_queued(&data_dir, &script).await;
 
     // Two terminal stream:ends: the kick-off turn, then the ONE combined
@@ -835,7 +831,8 @@ async fn flush_disabled_drains_queue_one_turn_per_message_over_wss() {
     let Some(script) = gate("WSS queued-message flush-disabled E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     seed_flush_mode(&data_dir, "off");
     let mut setup = setup_busy_agent_with_two_queued(&data_dir, &script).await;
 
@@ -946,7 +943,8 @@ async fn flush_system_only_excludes_queue_message_entries_over_wss() {
     let Some(script) = gate("WSS queued-message flush systemOnly E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     seed_flush_mode(&data_dir, "systemOnly");
     let mut setup = setup_busy_agent_with_two_queued(&data_dir, &script).await;
 

@@ -33,7 +33,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
@@ -64,7 +63,6 @@ impl Drop for Daemon {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -236,11 +234,8 @@ where
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-redrive-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-redrive-")
 }
 
 fn gate(test: &str) -> Option<String> {
@@ -376,7 +371,8 @@ async fn truncated_turn_redriven_and_no_premature_wake_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_and_task_note(&data_dir).await;
 
     let report_js = "return await ws.agent.reportToParent('recovered after redrive');";
@@ -585,7 +581,8 @@ async fn redrive_cap_exhaustion_falls_through_to_annotated_idle_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_and_task_note(&data_dir).await;
 
     let behavior = json!({

@@ -27,10 +27,11 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use intent_acp::session::{self, ContentBlock};
 use intent_acp::transport::{Connection, ConnectionHooks, IncomingRequest};
 use intent_acp::{
-    AcpError, AcpResult, ClientRequestHandler, EventSink, FileService, IncomingNotification,
-    MappedUpdate, PermissionOutcome, PermissionPolicy, PermissionRegistry, SinkEvent,
-    TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo,
+    AcpError, ClientRequestHandler, EventSink, FileService, IncomingNotification, MappedUpdate,
+    PermissionOutcome, PermissionPolicy, PermissionRegistry, SinkEvent, TerminalHost,
 };
+#[cfg(unix)]
+use intent_acp::{AcpResult, TerminalCreateParams, TerminalExitInfo, TerminalOutputInfo};
 use intent_core::{AgentId, BoxFuture, WorkspaceId};
 
 /// Marker substituted into a fixture for an oversized stderr line (> the
@@ -421,6 +422,7 @@ fn build(
 
 /// Like [`build`] but also wires a client-served terminal host so `terminal/*`
 /// requests run on the real PTY host (§6.7).
+#[cfg(unix)]
 fn build_with_terminal(
     fixture: &str,
     policy: PermissionPolicy,
@@ -803,15 +805,18 @@ async fn concurrent_sends_do_not_interleave() {
 
 /// A client-served terminal host backed by the real unified PTY host, exercising
 /// the `TerminalHost` adapter contract end-to-end (§6.7).
+#[cfg(unix)]
 struct PtyTermHost {
     pty: Arc<intent_pty::PtyHost>,
 }
 
+#[cfg(unix)]
 fn term_resolve(terminal_id: &str) -> AcpResult<intent_pty::PtyId> {
     intent_pty::PtyId::parse(terminal_id)
         .ok_or_else(|| AcpError::Terminal(format!("unknown terminal {terminal_id}")))
 }
 
+#[cfg(unix)]
 impl TerminalHost for PtyTermHost {
     fn create(&self, params: TerminalCreateParams) -> BoxFuture<'_, AcpResult<String>> {
         let pty = self.pty.clone();

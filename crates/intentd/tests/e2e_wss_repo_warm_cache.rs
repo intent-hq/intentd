@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use intent_core::{Result as CoreResult, WorkspaceApi};
+use intent_core::{RepoRef, Result as CoreResult, WorkspaceApi};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 use intent_transport::{
@@ -124,25 +124,17 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
     cfg: Arc<ClientConfig>,
     root: PathBuf,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-warm-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-warm-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -168,7 +160,7 @@ async fn boot() -> Fixture {
         port,
         cfg,
         root: workspaces_root,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -238,6 +230,14 @@ fn owner_repo_of(dir: &std::path::Path) -> (String, String) {
     (owner, repo)
 }
 
+/// The on-disk cache slot for `owner`/`repo`: the daemon case-folds both
+/// segments (`RepoRef::identity_parts`) while the RPC result echoes the raw
+/// case, so the raw pair must be folded before joining.
+fn cache_slot(root: &std::path::Path, owner: &str, repo: &str) -> PathBuf {
+    let (owner, repo) = RepoRef::new(owner, repo).identity_parts();
+    root.join(".repo-cache").join(owner).join(repo)
+}
+
 /// Poll `repo.warmCache` until the detached warm completes: an accepted
 /// re-warm proves the in-flight flag cleared; the populated cache slot
 /// proves the ensure ran.
@@ -248,10 +248,11 @@ async fn wait_for_warm_completion(ws: &mut TlsWs, root: &std::path::Path, url: &
         let v = wss_rpc(ws, id, "repo.warmCache", json!({ "githubUrl": url })).await;
         id += 1;
         if let Some(result) = v.get("result").filter(|r| !r.is_null()) {
-            let cache = root
-                .join(".repo-cache")
-                .join(result["owner"].as_str().unwrap())
-                .join(result["repo"].as_str().unwrap());
+            let cache = cache_slot(
+                root,
+                result["owner"].as_str().unwrap(),
+                result["repo"].as_str().unwrap(),
+            );
             assert!(cache.join(".git").exists(), "repo cache populated");
             return;
         }
@@ -277,7 +278,14 @@ async fn repo_warm_cache_starts_and_populates_cache_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(&fx).await;
 
-    let repo_dir = fx.root.parent().unwrap().join("warm-fixture-src");
+    // Mixed-case owner/repo segments: the daemon echoes them raw but stores
+    // the cache at the case-folded slot.
+    let repo_dir = fx
+        .root
+        .parent()
+        .unwrap()
+        .join("Warm-Owner")
+        .join("Warm-Fixture-Src");
     seed_repo(&repo_dir);
     let (owner, repo) = owner_repo_of(&repo_dir);
     let url = format!("file://{}", repo_dir.to_string_lossy());
@@ -302,15 +310,20 @@ async fn repo_warm_cache_busy_rejection_envelope_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(&fx).await;
 
-    let repo_dir = fx.root.parent().unwrap().join("warm-busy-src");
+    let repo_dir = fx
+        .root
+        .parent()
+        .unwrap()
+        .join("Warm-Owner")
+        .join("Warm-Busy-Src");
     seed_repo(&repo_dir);
     let (owner, repo) = owner_repo_of(&repo_dir);
     let url = format!("file://{}", repo_dir.to_string_lossy());
 
     // Hold the per-repo cache lock (same in-process lock map as the daemon
-    // services) so the accepted warm's ensure parks and the in-flight window
-    // is deterministic.
-    let cache_path = fx.root.join(".repo-cache").join(&owner).join(&repo);
+    // services, keyed by the case-folded slot) so the accepted warm's ensure
+    // parks and the in-flight window is deterministic.
+    let cache_path = cache_slot(&fx.root, &owner, &repo);
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
     let lock_holder = tokio::spawn(async move {

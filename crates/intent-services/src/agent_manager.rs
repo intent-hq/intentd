@@ -1919,6 +1919,7 @@ const INTENTD_MCP_BRIDGE_ADDR_ENV: &str = "INTENTD_MCP_BRIDGE_ADDR";
 
 /// Bundled pi extension source (MCP bridge client + tool registration),
 /// embedded at build time and written to a per-agent temp file at spawn.
+#[cfg(unix)]
 const PI_MCP_EXTENSION_SOURCE: &str = include_str!("pi_mcp_extension.ts");
 
 /// Per-agent pi-extension MCP delivery files: the bundled extension plus a
@@ -2005,6 +2006,7 @@ fn pi_extension_delivery(
 
 /// Single-quote a string for inert interpolation into a `sh` script: quotes
 /// suppress all expansion, and embedded `'` uses the standard `'\''` escape.
+#[cfg(unix)]
 fn sh_squote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -8321,6 +8323,7 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
 /// Non-unix fallback: no process groups, so fall back to killing the direct
 /// child (`kill_on_drop` remains the safety net on drop).
 #[cfg(not(unix))]
+#[expect(clippy::unused_async)] // signature mirrors the unix variant so call sites stay identical
 async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) {
     let _ = child.start_kill();
 }
@@ -13610,7 +13613,7 @@ mod dead_child_respawn_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod legacy_feature_freeze_tests {
     //! Lazy legacy feature freeze (intent-hq/monorepo#2459, H2 scope
     //! addition): a pre-0096 session whose `harness_features` is NULL gets
@@ -14044,7 +14047,7 @@ mod v1_turn_envelope_goldens {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod thought_level_tests {
     //! Generic reasoning-effort application (PROTOCOL §5.5): the session's
     //! `reasoningEffort` reaches the provider through whatever

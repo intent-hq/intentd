@@ -654,7 +654,8 @@ pub(crate) struct PtyTerminalHost {
 
 impl PtyTerminalHost {
     /// Wire the adapter over the shared host (argv-only terminal spawn).
-    #[cfg(test)]
+    /// Only the unix-gated test module below calls it.
+    #[cfg(all(test, unix))]
     pub fn new(pty: Arc<PtyHost>, settings: Option<Arc<SettingsRegistry>>) -> Self {
         Self::with_shell_mode(pty, settings, false, None)
     }

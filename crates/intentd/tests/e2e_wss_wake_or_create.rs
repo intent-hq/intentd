@@ -28,7 +28,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,28 +43,23 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-woc-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-woc-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -334,14 +329,15 @@ async fn boot_daemon_with_task_env(
     title: &str,
     extra_env: &[(&str, &str)],
 ) -> (Daemon, String, String, u16, String) {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_task(&data_dir, title).await;
     let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     env.extend_from_slice(extra_env);
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");

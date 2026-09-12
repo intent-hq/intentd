@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,15 +27,11 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-spec-chg-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-spec-chg-{prefix}-"))
 }
 
 /// Spawn `intentd serve` with a hermetic HOME so the user-tier specialists
@@ -308,7 +304,8 @@ fn specialist_md(name: &str, body: &str) -> String {
 /// a first daemon and the emission asserted against a restarted one.
 #[tokio::test]
 async fn specialist_file_change_emits_specialists_changed_over_wss() {
-    let data_dir = scratch_dir("data");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let home_dir = data_dir.join("home");
     std::fs::create_dir_all(&home_dir).expect("mkdir hermetic home");
     // On-disk workspace checkout whose project tier the watcher will cover.
@@ -339,7 +336,7 @@ async fn specialist_file_change_emits_specialists_changed_over_wss() {
 
     // Boot #2: the specialists watcher now covers the workspace's project tier.
     let (child, port, cfg) = boot(&data_dir, &home_dir).await;
-    let _guard = common::DaemonGuard::new(child, data_dir.clone(), true);
+    let _guard = common::DaemonGuard::process_only(child);
 
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_res = wss_rpc(

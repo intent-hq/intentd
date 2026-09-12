@@ -26,7 +26,7 @@
 mod common;
 
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,13 +41,12 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
 struct Daemon {
     child: std::process::Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
@@ -62,8 +61,8 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         if std::thread::panicking() {
             eprintln!("\n=== DAEMON CLEANUP (test panicked) ===");
-            eprintln!("Data dir: {}", self.data_dir.display());
-            let log_path = self.data_dir.join("daemon.log");
+            eprintln!("Data dir: {}", self.data_dir.path().display());
+            let log_path = self.data_dir.path().join("daemon.log");
             if let Ok(log) = std::fs::read_to_string(&log_path) {
                 let lines: Vec<_> = log.lines().rev().take(40).collect();
                 eprintln!("Last 40 lines of daemon.log:");
@@ -72,7 +71,6 @@ impl Drop for Daemon {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -244,11 +242,8 @@ where
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-unblk-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-unblk-")
 }
 
 fn gate(test: &str) -> Option<String> {
@@ -385,7 +380,8 @@ async fn unblocked_section_reaches_parent_wake_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_and_task_notes(&data_dir).await;
 
     // The unblocked-wake section is gated behind `agentFeatures.taskGraph`
@@ -443,7 +439,7 @@ async fn unblocked_section_reaches_parent_wake_over_wss() {
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -582,7 +578,8 @@ const VF_VERIFIER_MARK: &str = "UNBLK_VF_VERIFIER_TURN";
 /// completion wake reaches the parent (idle 3). The daemon handle is
 /// returned so a failing assertion still dumps `daemon.log` on drop.
 async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemon, Vec<Value>) {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_and_task_notes(&data_dir).await;
 
     // Seed the toggle explicitly (it defaults on, so the disabled flow needs
@@ -669,7 +666,7 @@ async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemo
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");

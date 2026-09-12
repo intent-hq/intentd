@@ -89,8 +89,8 @@ async fn auggie_context_engine_real_retrieve_e2e() {
     // Wire a Services over a temp store with a workspace pointing at that
     // worktree, backed by the *real* auggie engine. Under Option A `retrieve()`
     // degrades instantly, so `search.codebase` must be served by ripgrep.
-    let db_path =
-        std::env::temp_dir().join(format!("intentd-auggie-e2e-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-auggie-e2e-");
+    let db_path = db_dir.path().join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
     let ws = WorkspaceId::new();
     store
@@ -144,8 +144,6 @@ async fn auggie_context_engine_real_retrieve_e2e() {
         matches.len(),
         matches.first()
     );
-
-    let _ = std::fs::remove_file(&db_path);
 }
 
 /// Build a minimal active workspace whose worktree points at `worktree` so

@@ -21,29 +21,27 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use uuid::Uuid;
-
 /// Artificial watcher-init delay: far longer than any plausible daemon boot,
 /// so a daemon that still binds behind watcher init cannot pass by being fast.
 const WATCHER_DELAY: Duration = Duration::from_secs(120);
 
 /// Layout for the spawned daemon: a short base dir (macOS caps UDS paths at
-/// ~104 bytes) holding the data dir and a hermetic workspaces root.
+/// ~104 bytes) holding the data dir and a hermetic workspaces root. The base
+/// guard removes the whole tree on drop; keep it alive past the daemon guard.
 struct TestDirs {
-    base: PathBuf,
+    _base: tempfile::TempDir,
     data_dir: PathBuf,
     workspaces: PathBuf,
 }
 
 fn make_dirs() -> TestDirs {
-    let id = Uuid::new_v4().simple().to_string();
-    let base = PathBuf::from("/tmp").join(format!("itd-so-{}", &id[..8]));
-    let data_dir = base.join("data");
-    let workspaces = base.join("workspaces");
+    let base = common::test_tempdir_in("/tmp", "itd-so-");
+    let data_dir = base.path().join("data");
+    let workspaces = base.path().join("workspaces");
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     std::fs::create_dir_all(&workspaces).expect("mkdir workspaces root");
     TestDirs {
-        base,
+        _base: base,
         data_dir,
         workspaces,
     }
@@ -104,7 +102,7 @@ async fn listeners_bind_before_slow_watcher_init() {
     let log_path = dirs.data_dir.join("daemon.log");
 
     let started = Instant::now();
-    let mut daemon = common::DaemonGuard::new(spawn_daemon(&dirs), dirs.base.clone(), true);
+    let mut daemon = common::DaemonGuard::process_only(spawn_daemon(&dirs));
     common::await_daemon_listening(daemon.child_mut(), &socket, &log_path).await;
 
     // `system.status` must answer over the freshly bound socket, not merely

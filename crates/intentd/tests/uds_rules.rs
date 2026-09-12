@@ -4,6 +4,8 @@
 //! file-sourced (`CLAUDE.md`) entry, and that an edit surfaces via
 //! `settings:changed` carrying the `endUserRules` payload (no extra fetch).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;
@@ -22,23 +24,16 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+impl TempDb {
+    fn new() -> Self {
+        let dir = common::test_tempdir("intentd-rules-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -143,17 +138,14 @@ async fn wait_for_subscriber_count(bus: &EventBus, target: usize) {
 
 #[tokio::test]
 async fn rules_round_trip_overrides_files_and_event() {
-    let work = TempDir(std::env::temp_dir().join(format!("intentd-rules-{}", Uuid::new_v4())));
-    std::fs::create_dir_all(&work.0).unwrap();
-    std::fs::write(work.0.join("CLAUDE.md"), "ALWAYS run the linter.").unwrap();
+    let work = common::test_tempdir("intentd-rules-");
+    std::fs::write(work.path().join("CLAUDE.md"), "ALWAYS run the linter.").unwrap();
 
-    let tmp = TempDb {
-        path: std::env::temp_dir().join(format!("intentd-rules-{}.db", Uuid::new_v4())),
-    };
+    let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store
-        .insert_workspace(&sample_ws(&ws, &work.0))
+        .insert_workspace(&sample_ws(&ws, work.path()))
         .await
         .expect("insert workspace");
     let bus = EventBus::new(store.clone());

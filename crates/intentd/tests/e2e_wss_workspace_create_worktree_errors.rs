@@ -8,7 +8,7 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -24,23 +24,15 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-wt-err-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-wt-err-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -59,7 +51,7 @@ async fn boot() -> Fixture {
     Fixture {
         _ws: ws,
         port,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -95,8 +87,7 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
 }
 
 /// Helper to initialize a git repository with one commit using the git CLI.
-fn init_git_repo(path: &PathBuf) -> String {
-    std::fs::create_dir_all(path).unwrap();
+fn init_git_repo(path: &Path) -> String {
     std::process::Command::new("git")
         .args(["init"])
         .current_dir(path)
@@ -137,10 +128,8 @@ async fn workspace_create_branch_already_checked_out_returns_invalid_params() {
     let mut rpc = connect(fx.port).await;
 
     // Create a local git repository with one commit.
-    let repo_dir =
-        std::env::temp_dir().join(format!("wt-err-repo-{}", uuid::Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&repo_dir).unwrap();
-    let branch_name = init_git_repo(&repo_dir);
+    let repo_dir = common::test_tempdir("wt-err-repo-");
+    let branch_name = init_git_repo(repo_dir.path());
 
     // Attempt to create a workspace on the same branch that's already checked
     // out in the main working tree (the repository's current HEAD).
@@ -149,7 +138,7 @@ async fn workspace_create_branch_already_checked_out_returns_invalid_params() {
         1,
         "workspace.create",
         json!({
-            "repositoryPath": repo_dir.to_string_lossy(),
+            "repositoryPath": repo_dir.path().to_string_lossy(),
             "branch": branch_name,
         }),
     )
@@ -170,8 +159,6 @@ async fn workspace_create_branch_already_checked_out_returns_invalid_params() {
         msg.contains(&branch_name),
         "expected branch name in message, got: {msg}"
     );
-
-    let _ = std::fs::remove_dir_all(&repo_dir);
 }
 
 #[tokio::test]
@@ -180,10 +167,8 @@ async fn workspace_create_unresolvable_base_ref_returns_invalid_params_with_data
     let mut rpc = connect(fx.port).await;
 
     // Create a local git repository with one commit.
-    let repo_dir =
-        std::env::temp_dir().join(format!("wt-err-repo-{}", uuid::Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&repo_dir).unwrap();
-    init_git_repo(&repo_dir);
+    let repo_dir = common::test_tempdir("wt-err-repo-");
+    init_git_repo(repo_dir.path());
 
     // Attempt to create a workspace from a base ref that does not exist.
     let resp = wss_rpc_raw(
@@ -191,7 +176,7 @@ async fn workspace_create_unresolvable_base_ref_returns_invalid_params_with_data
         1,
         "workspace.create",
         json!({
-            "repositoryPath": repo_dir.to_string_lossy(),
+            "repositoryPath": repo_dir.path().to_string_lossy(),
             "branch": "feature-from-bogus-ref",
             "baseRef": "no-such-ref",
         }),
@@ -215,6 +200,4 @@ async fn workspace_create_unresolvable_base_ref_returns_invalid_params_with_data
         json!({ "code": "base-ref-unresolvable", "baseRef": "no-such-ref" }),
         "expected structured error.data, got: {resp}"
     );
-
-    let _ = std::fs::remove_dir_all(&repo_dir);
 }
