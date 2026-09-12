@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.47] - 2026-09-12
+
+### 🐛 Bug Fixes
+
+- *(transfer)* Recurse into nested submodules when normalizing CoW sandboxes ([#1818](https://github.com/intent-hq/intentd/pull/1818))
+- *(script)* Export PAGER=cat GIT_PAGER=cat to saved-script PTYs ([#1822](https://github.com/intent-hq/intentd/pull/1822))
+
+### 🧪 Testing
+
+- *(services)* Deflake timing tests under host load ([#1826](https://github.com/intent-hq/intentd/pull/1826))
+- *(core)* Lint raw repo-slug case folding outside RepoRef ([#1821](https://github.com/intent-hq/intentd/pull/1821))
+
+
 ## [0.9.46] - 2026-09-12
 
 ### 🐛 Bug Fixes
