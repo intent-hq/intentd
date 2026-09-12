@@ -23,6 +23,7 @@ use intent_core::{
     MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED,
     SLIM_PAGE_BUDGET_BYTES,
 };
+use intent_sourcecontrol::RepoRef;
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
@@ -269,8 +270,10 @@ impl AgentSnapshotPrs {
 /// ANY pool suppresses that `(repo, number)` entirely: the freshest terminal
 /// state wins over a stale open duplicate regardless of which pool carries
 /// it. Among surviving open duplicates the workspace pool (yielded first)
-/// wins the grouping. Returns `None` when no open PR survives (the field is
-/// then omitted).
+/// wins the grouping. The repo half of the key is the case-insensitive
+/// [`RepoRef`] identity, so case-variant pools of one repository dedupe
+/// together. Returns `None` when no open PR survives (the field is then
+/// omitted).
 fn grouped_open_prs<'a>(
     pools: impl IntoIterator<Item = (&'a str, &'a str, &'a [PullRequestInfo])>,
 ) -> Option<AgentSnapshotPrs> {
@@ -280,21 +283,21 @@ fn grouped_open_prs<'a>(
         .collect();
     // Seed the seen-set with every merged/closed key so a terminal state in
     // any pool suppresses stale open duplicates of the same PR.
-    let mut seen: HashSet<(&str, &str, u64)> = HashSet::new();
+    let mut seen: HashSet<(RepoRef, u64)> = HashSet::new();
     for &(owner, name, prs) in &pools {
         for pr in prs {
             if matches!(
                 pr.status,
                 PullRequestStatus::Merged | PullRequestStatus::Closed
             ) {
-                seen.insert((owner, name, pr.number));
+                seen.insert((RepoRef::new(owner, name), pr.number));
             }
         }
     }
     let mut groups = AgentSnapshotPrs::default();
     for &(owner, name, prs) in &pools {
         for pr in prs {
-            if !seen.insert((owner, name, pr.number)) {
+            if !seen.insert((RepoRef::new(owner, name), pr.number)) {
                 continue;
             }
             if let Some(group) = groups.group_for(pr) {

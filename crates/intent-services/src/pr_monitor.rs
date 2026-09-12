@@ -124,16 +124,14 @@ pub(crate) fn pr_monitor_fetches_per_tick(
 }
 
 /// The distinct `(owner, repo, pr)` identity a sweep dedupes fetches on.
-/// Forge slugs are case-insensitive, so the key folds case (matching the
-/// store's `COLLATE NOCASE` identity) and case-variant siblings share a fetch.
+/// Forge slugs are case-insensitive, so the key is the [`RepoRef`] identity
+/// ([`RepoRef::identity_parts`], matching the store's `COLLATE NOCASE`
+/// identity) and case-variant siblings share a fetch.
 type PrKey = (String, String, i64);
 
 fn pr_key(m: &PrMonitor) -> PrKey {
-    (
-        m.repo_owner.to_ascii_lowercase(),
-        m.repo_name.to_ascii_lowercase(),
-        m.pr_number,
-    )
+    let (owner, name) = RepoRef::new(&m.repo_owner, &m.repo_name).identity_parts();
+    (owner, name, m.pr_number)
 }
 
 /// One active monitor as the due-sweep sees it: its staleness anchor (parsed

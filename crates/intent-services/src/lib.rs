@@ -9336,13 +9336,15 @@ async fn sibling_workspace_or_throw(
 }
 
 /// Normalized GitHub `(owner, name)` for sibling matching: both parts
-/// non-empty, lowercased (GitHub owner/repo names are case-insensitive), with a
-/// trailing `.git` stripped from the lowercased name so `INTENT.GIT` matches
-/// `intent`. `None` when the workspace has no complete GitHub identity
-/// (local-only repo, or not yet backfilled).
+/// non-empty, case-folded through the [`intent_sourcecontrol::RepoRef`]
+/// identity (GitHub owner/repo names are case-insensitive), with a trailing
+/// `.git` stripped from the folded name so `INTENT.GIT` matches `intent`.
+/// `None` when the workspace has no complete GitHub identity (local-only
+/// repo, or not yet backfilled).
 fn github_repository_identity(ws: &Workspace) -> Option<(String, String)> {
-    let owner = ws.repository_owner.as_deref()?.trim().to_ascii_lowercase();
-    let name = ws.repository_name.as_deref()?.trim().to_ascii_lowercase();
+    let owner = ws.repository_owner.as_deref()?.trim();
+    let name = ws.repository_name.as_deref()?.trim();
+    let (owner, name) = intent_sourcecontrol::RepoRef::new(owner, name).identity_parts();
     let name = name.strip_suffix(".git").unwrap_or(&name);
     if owner.is_empty() || name.is_empty() {
         return None;
@@ -17281,13 +17283,17 @@ impl WorkspaceApi for Services {
                     // or STAB-64-derived above) is ignored with a warn —
                     // deriving another repository's branch names onto this
                     // checkout would silently check out unrelated content or
-                    // fail the create on an unresolvable `baseRef`.
+                    // fail the create on an unresolvable `baseRef`. Each
+                    // known part is compared under `RepoRef` identity (the
+                    // other part held to the link's own) so a missing part
+                    // never counts as a mismatch.
                     let pr_link = pr_link.filter(|link| {
+                        let link_ref = intent_sourcecontrol::RepoRef::new(&link.owner, &link.repo);
                         let owner_mismatch = input.repository_owner.as_deref().is_some_and(|o| {
-                            !o.is_empty() && !o.eq_ignore_ascii_case(&link.owner)
+                            !o.is_empty() && intent_sourcecontrol::RepoRef::new(o, &link.repo) != link_ref
                         });
                         let name_mismatch = input.repository_name.as_deref().is_some_and(|n| {
-                            !n.is_empty() && !n.eq_ignore_ascii_case(&link.repo)
+                            !n.is_empty() && intent_sourcecontrol::RepoRef::new(&link.owner, n) != link_ref
                         });
                         if owner_mismatch || name_mismatch {
                             tracing::warn!(
