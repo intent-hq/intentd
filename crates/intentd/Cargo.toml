@@ -77,6 +77,9 @@ ctor = "1.0.10"
 tempfile = "3"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.45" }
+# `e2e_pty_job_control.rs` boots the daemon inside a real PTY session as a
+# member of a background process group (intent-hq/intent#4231 hazard class).
+portable-pty = { workspace = true }
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }
