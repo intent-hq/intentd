@@ -419,8 +419,9 @@ fn ensure_blocking_with_ttl(
             // The cache is keyed by the case-folded `<owner>/<repo>` segments
             // only, so two different hosts (or two `file://` sources) carrying
             // the same owner/repo pair must never serve each other's content. A cache
-            // whose `origin` differs from the requested URL is stale, not a
-            // hit — wipe and re-clone from the requested URL.
+            // whose `origin` names a different source than the requested URL
+            // (see [`origin_url_matches`]) is stale, not a hit — wipe and
+            // re-clone from the requested URL.
             tracing::warn!(
                 path = %cache_path.display(),
                 "repo cache origin does not match the requested URL; re-cloning"
@@ -438,9 +439,10 @@ fn ensure_blocking_with_ttl(
     Ok(())
 }
 
-/// Whether the cache's `origin` remote points at exactly `github_url`. Any
-/// failure to read it (unopenable repo, missing remote) counts as a mismatch
-/// — the caller self-heals by re-cloning.
+/// Whether the cache's `origin` remote names the same source as `github_url`
+/// (see [`origin_url_matches`]). Any failure to read it (unopenable repo,
+/// missing remote) counts as a mismatch — the caller self-heals by
+/// re-cloning.
 fn origin_matches(cache_path: &Path, github_url: &str) -> bool {
     let Ok(repo) = Repository::open(cache_path) else {
         return false;
@@ -448,17 +450,45 @@ fn origin_matches(cache_path: &Path, github_url: &str) -> bool {
     let Ok(remote) = repo.find_remote("origin") else {
         return false;
     };
-    remote.url().ok() == Some(github_url)
+    remote
+        .url()
+        .ok()
+        .is_some_and(|origin| origin_url_matches(origin, github_url))
+}
+
+/// Whether a cached slot's `origin` URL and a requested URL name the same
+/// source. Two GitHub URLs (per [`github_slug`]) compare by identity — host
+/// case-insensitive, owner/repo under [`RepoRef`] equality — because every
+/// casing of one slug shares a single folded slot, so a case-variant request
+/// must reuse it rather than wipe and re-clone. Anything else (another host,
+/// a `file://` or local-path source) compares byte-for-byte, so two sources
+/// that merely share an owner/repo pair never serve each other's content.
+fn origin_url_matches(origin: &str, requested: &str) -> bool {
+    if origin == requested {
+        return true;
+    }
+    matches!(
+        (github_slug(origin), github_slug(requested)),
+        (Some(cached), Some(wanted)) if cached == wanted
+    )
 }
 
 /// Whether `url` is a GitHub URL for exactly `owner`/`repo` — the check the
 /// GitHub-scoped [`list_cached_branches`] reader uses to confirm a cached
-/// slot's `origin`. Accepts the HTTPS/SSH URL and scp-like forms, an optional
-/// `.git` suffix, userinfo, and a port; the host compares case-insensitively
-/// and owner/repo under [`RepoRef`] equality (GitHub slugs are
-/// case-insensitive). Anything not on `github.com` — another host or a local
-/// path — is not a GitHub slot.
+/// slot's `origin`. Owner/repo compare under [`RepoRef`] equality (GitHub
+/// slugs are case-insensitive); the accepted URL forms are those of
+/// [`github_slug`].
 fn origin_is_github_slot(url: &str, owner: &str, repo: &str) -> bool {
+    github_slug(url).is_some_and(|slug| slug == RepoRef::new(owner, repo))
+}
+
+/// The `owner`/`repo` slug a GitHub URL names, or `None` when `url` is not a
+/// `github.com` URL. Accepts the HTTPS/SSH URL and scp-like forms, an
+/// optional `.git` suffix, userinfo, and a port; the host compares
+/// case-insensitively. Anything not on `github.com` — another host or a
+/// local path — is not a GitHub URL. The returned slug keeps the URL's
+/// casing; compare it under [`RepoRef`] equality.
+fn github_slug(url: &str) -> Option<RepoRef> {
     let trimmed = url.trim().trim_end_matches('/');
     let (rest, scp_like) = match trimmed.split_once("://") {
         Some((scheme, rest)) => {
@@ -466,7 +496,7 @@ fn origin_is_github_slot(url: &str, owner: &str, repo: &str) -> bool {
                 .iter()
                 .any(|s| scheme.eq_ignore_ascii_case(s));
             if !known {
-                return false;
+                return None;
             }
             (rest, false)
         }
@@ -475,29 +505,21 @@ fn origin_is_github_slot(url: &str, owner: &str, repo: &str) -> bool {
     };
     let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
     let (authority, path) = if scp_like {
-        match rest.split_once(':') {
-            Some(pair) => pair,
-            None => return false,
-        }
+        rest.split_once(':')?
     } else {
-        match rest.split_once('/') {
-            Some(pair) => pair,
-            None => return false,
-        }
+        rest.split_once('/')?
     };
     let host = authority.split(':').next().unwrap_or(authority);
     if !host.eq_ignore_ascii_case("github.com") {
-        return false;
+        return None;
     }
     let mut segments = path.split('/').filter(|s| !s.is_empty());
-    let (Some(o), Some(r)) = (segments.next(), segments.next()) else {
-        return false;
-    };
+    let (o, r) = (segments.next()?, segments.next()?);
     if segments.next().is_some() {
-        return false;
+        return None;
     }
     let r = r.strip_suffix(".git").unwrap_or(r);
-    RepoRef::new(o, r) == RepoRef::new(owner, repo)
+    Some(RepoRef::new(o, r))
 }
 
 /// Refresh an existing cache: fetch + prune, re-resolve the remote's default
@@ -2130,6 +2152,130 @@ mod tests {
             "host B\n"
         );
         assert_eq!(head_sha(&path), head_sha(origin_b.path()));
+    }
+
+    /// Seed a cache slot from a local origin, then point its `origin` remote
+    /// at `origin_url` so the write-side origin check sees a URL it never
+    /// fetches from. Returns the slot path and a marker planted in `.git`
+    /// that only survives when the slot is reused.
+    async fn seeded_slot_with_origin(tag: &str, origin_url: &str) -> (CacheRoot, PathBuf, PathBuf) {
+        let origin = init_repo(&format!("repocache-origin-{tag}"));
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new(tag);
+        let path = ensure_cached_repo(
+            root.path(),
+            &file_url(origin.path()),
+            "acme",
+            "widget",
+            None,
+        )
+        .await
+        .unwrap();
+        Repository::open(&path)
+            .unwrap()
+            .remote_set_url("origin", origin_url)
+            .unwrap();
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+        (root, path, marker)
+    }
+
+    /// All casings of one GitHub slug share the folded slot, so a request
+    /// whose URL differs from the slot's `origin` only in case (host or
+    /// slug, `.git` optional) is a hit: within the freshness TTL the ensure
+    /// takes the `fresh` skip and never escalates to `Step("re-clone")`.
+    #[tokio::test]
+    async fn case_variant_github_url_reuses_slot_without_reclone() {
+        let (_root, path, marker) =
+            seeded_slot_with_origin("origincase", "https://github.com/Acme/Widget.git").await;
+
+        for requested in [
+            "https://github.com/acme/widget.git",
+            "https://GitHub.com/ACME/WIDGET",
+        ] {
+            let (cb, events) = event_collector();
+            ensure_blocking_with_ttl(&path, requested, None, Some(&cb), Duration::from_secs(600))
+                .unwrap();
+            let steps: Vec<&str> = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|ev| match ev {
+                    CacheEnsureEvent::Step(s) => Some(*s),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(steps, vec!["fresh"], "{requested}: {steps:?}");
+            assert!(
+                marker.exists(),
+                "{requested}: case-variant URL must not re-clone"
+            );
+        }
+    }
+
+    /// The write-side origin check folds only GitHub slug identity: a
+    /// foreign host or a different slug on github.com is still a mismatch,
+    /// and non-GitHub (`file://`, local path) origins compare byte-for-byte
+    /// so a case-variant local source stays isolated.
+    #[tokio::test]
+    async fn origin_matches_isolates_foreign_and_local_origins() {
+        let (_root, path, _marker) =
+            seeded_slot_with_origin("originforeign", "https://github.com/Acme/Widget.git").await;
+        assert!(origin_matches(&path, "https://github.com/acme/widget"));
+        assert!(origin_matches(&path, "git@github.com:acme/widget.git"));
+        for requested in [
+            "https://gitlab.com/acme/widget.git",
+            "https://ghe.example.com/Acme/Widget.git",
+            "https://github.com/other/widget.git",
+            "https://github.com/acme/other.git",
+            "https://github.com/acme/widget/extra",
+            "file:///tmp/acme/widget",
+        ] {
+            assert!(!origin_matches(&path, requested), "{requested}");
+        }
+
+        let local = "file:///tmp/Acme/Widget";
+        Repository::open(&path)
+            .unwrap()
+            .remote_set_url("origin", local)
+            .unwrap();
+        assert!(origin_matches(&path, local));
+        assert!(
+            !origin_matches(&path, "file:///tmp/acme/widget"),
+            "local origins never fold case"
+        );
+        assert!(!origin_matches(&path, "https://github.com/Acme/Widget.git"));
+    }
+
+    /// [`origin_url_matches`] is pure: GitHub URLs match by folded slug
+    /// across URL forms; everything else requires byte equality.
+    #[test]
+    fn origin_url_matches_folds_github_slugs_only() {
+        assert!(origin_url_matches(
+            "https://github.com/Acme/Widget.git",
+            "https://github.com/acme/widget.git"
+        ));
+        assert!(origin_url_matches(
+            "https://github.com/acme/widget.git",
+            "https://GITHUB.COM/acme/widget"
+        ));
+        assert!(origin_url_matches(
+            "https://gitlab.com/acme/widget.git",
+            "https://gitlab.com/acme/widget.git"
+        ));
+        assert!(!origin_url_matches(
+            "https://gitlab.com/Acme/Widget.git",
+            "https://gitlab.com/acme/widget.git"
+        ));
+        assert!(!origin_url_matches(
+            "https://github.com/acme/widget.git",
+            "https://gitlab.com/acme/widget.git"
+        ));
+        assert!(!origin_url_matches(
+            "https://github.com/acme/widget.git",
+            "https://github.com/acme/other.git"
+        ));
+        assert!(!origin_url_matches("/tmp/Acme/Widget", "/tmp/acme/widget"));
     }
 
     /// Untracked pollution in the cache work tree (e.g. leftovers from a
