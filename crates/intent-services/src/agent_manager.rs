@@ -2242,6 +2242,17 @@ pub struct AgentManager {
     /// session row would close this; not done here to keep parity with the
     /// existing replaceMessages semantics.
     force_recreate: Arc<Mutex<HashSet<AgentId>>>,
+    /// The provider id [`AgentManager::ensure_started`] resolved for an
+    /// agent's most recent spawn attempt that failed AFTER resolution (child
+    /// spawn or ACP session setup), cleared when a later attempt succeeds.
+    /// Read by the spawn-failure publisher so a quota-stamped `agent:failed`
+    /// names the provider whose `session/new` was actually rejected.
+    /// `last_turn_provider` is the wrong source there: an `agent.setModel`
+    /// switch commits the new identity only once the new child is up
+    /// (`maybe_persist_model_change_notice` runs after `start_session`), so
+    /// during a failed startup on B it still names A — the previous provider,
+    /// and the one the client should be steered TOWARD, not away from.
+    spawn_attempt_provider: Arc<Mutex<HashMap<AgentId, String>>>,
     /// Agents fenced off from the lazy-spawn paths because a batch teardown
     /// ([`AgentManager::stop_many`]) is in flight and their session rows are
     /// about to be cascade-deleted (`workspace.delete`). While an agent is in
@@ -2344,6 +2355,7 @@ impl AgentManager {
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
             stop_redelivery: Arc::new(Mutex::new(HashMap::new())),
             force_recreate: Arc::new(Mutex::new(HashSet::new())),
+            spawn_attempt_provider: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
@@ -7753,6 +7765,14 @@ impl AgentManager {
         // Commit identity for `git commit` run by the agent's own tools
         // (intent-hq/intent#4142) — ungated: identity is not a secret.
         inject_git_identity_env(&mut opts.extra_env, opts.cwd);
+        // Record the identity this attempt runs under BEFORE anything below
+        // can fail: a spawn or session-setup failure is attributed to the
+        // provider that was actually tried, not to whatever the last committed
+        // turn ran on. Cleared on success at the end of this method.
+        self.spawn_attempt_provider
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), resolved.provider.id.to_string());
         if !self.contains(agent_id) {
             // Derive the agent type from the session's specialist `agentType`
             // frontmatter (SP-B); falls back to the default interactive type so
@@ -7805,6 +7825,7 @@ impl AgentManager {
         // never blocks the turn.
         self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
             .await;
+        self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         Ok(acp_session_id)
     }
 
@@ -10965,6 +10986,21 @@ mod quota_failure_stamp_tests {
     }
 }
 
+/// Where a quota-classified terminal failure takes its `providerId` from —
+/// the provider whose allowance actually ran out depends on WHICH step failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailedProviderSource {
+    /// A turn that RAN failed (prompt rejected): the identity the failing
+    /// turn committed (`last_turn_provider`, session row as fallback — see
+    /// [`crate::agent_session::session_provider_id`]).
+    CommittedTurn,
+    /// The spawn / ACP session setup itself failed: the provider
+    /// [`AgentManager::ensure_started`] resolved for the attempt
+    /// (`spawn_attempt_provider`). Never `last_turn_provider`, which during a
+    /// failed startup still names the PREVIOUS identity after a switch.
+    SpawnAttempt,
+}
+
 /// Publish the terminal `agent:failed` + `agent:stream:end` event pair for a
 /// failure the streaming path did NOT already surface. The error message
 /// deliberately excludes recent stderr to avoid leaking secrets (API keys,
@@ -10975,6 +11011,7 @@ async fn publish_terminal_failure_events(
     workspace_id: &WorkspaceId,
     error_msg: &str,
     turn_id: Option<&str>,
+    provider_source: FailedProviderSource,
 ) {
     use intent_core::events::{AGENT_FAILED, AGENT_STREAM_END};
 
@@ -11000,9 +11037,19 @@ async fn publish_terminal_failure_events(
     // persist failure), and the message-level classifier is the only surface
     // left. The provider read is deliberately inside the branch: a terminal
     // failure that is not a quota rejection costs exactly what it did before.
+    // A spawn-attempt record is consumed (not just read) here: the terminal
+    // publisher runs once per failed spawn, and a record that outlived its
+    // attempt must not be able to label an unrelated later failure.
     if intent_acp::message_is_quota_exceeded(error_msg) {
-        let provider_id =
-            crate::agent_session::session_provider_id(&mgr.services, workspace_id, agent_id).await;
+        let provider_id = match provider_source {
+            FailedProviderSource::CommittedTurn => {
+                crate::agent_session::session_provider_id(&mgr.services, workspace_id, agent_id)
+                    .await
+            }
+            FailedProviderSource::SpawnAttempt => {
+                mgr.spawn_attempt_provider.lock().unwrap().remove(agent_id)
+            }
+        };
         stamp_quota_failure(&mut failed_data, provider_id.as_deref());
     }
     crate::agent_session::trace_stream_lifecycle(
@@ -11491,6 +11538,7 @@ async fn handle_terminal_spawn_failure(
         workspace_id,
         &error_text,
         options.turn_id.as_deref(),
+        FailedProviderSource::SpawnAttempt,
     )
     .await;
     publish_error_status_and_requeue(
@@ -11536,6 +11584,7 @@ async fn handle_drain_persist_failure(
         workspace_id,
         &error_text,
         options.turn_id.as_deref(),
+        FailedProviderSource::CommittedTurn,
     )
     .await;
     publish_error_status_and_requeue(
@@ -11885,6 +11934,7 @@ async fn handle_terminal_turn_failure(
             workspace_id,
             &error_text,
             options.turn_id.as_deref(),
+            FailedProviderSource::CommittedTurn,
         )
         .await;
     }

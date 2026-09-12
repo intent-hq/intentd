@@ -8160,9 +8160,17 @@ async fn set_model_cross_provider_rejects_unavailable_provider() {
 #[tokio::test]
 async fn set_model_same_provider_is_not_gated_by_availability() {
     let (_t, svc, ws) = setup().await;
+    // Make the provider unavailable EXPLICITLY (disabled in settings) rather
+    // than relying on it being uninstalled: the installed-probe scans the
+    // host PATH, so a host that happens to carry the binary would otherwise
+    // pass this test vacuously with the gate applied.
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.enabled".into(), json!({ "opencode": false }))])
+        .expect("disable opencode");
     let id = create_agent(&svc, &ws, "SameProvider").await;
-    // Park the session on a provider that is NOT available on this host,
-    // through the narrow writer that owns the `provider` column.
+    // Park the session on the now-unavailable provider, through the narrow
+    // writer that owns the `provider` column.
     svc.store()
         .set_agent_session_model(
             &ws,
@@ -8184,6 +8192,61 @@ async fn set_model_same_provider_is_not_gated_by_availability() {
     let after = svc.agent_get_session_op(id).await.expect("get after");
     assert_eq!(after.model.as_deref(), Some("opencode-go/kimi-k4"));
     assert_eq!(after.provider.as_deref(), Some("opencode"));
+}
+
+/// The same-provider exemption compares the session's EFFECTIVE provider, not
+/// the raw column: a session persisted under the legacy `acp` alias runs
+/// auggie (`provider_config` normalizes it, exactly as the spawn path and the
+/// model-ownership check do), so an explicit `providerId: "auggie"` is a
+/// same-provider model change and must stay ungated even while auggie is
+/// disabled. Comparing the raw `"acp"` against `"auggie"` would misread it as
+/// a cross-provider switch and reject it.
+#[tokio::test]
+async fn set_model_same_provider_via_legacy_alias_is_not_gated() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "AliasSame").await;
+    let mut session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    session.provider = Some("acp".into());
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("persist legacy alias");
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.enabled".into(), json!({ "auggie": false }))])
+        .expect("disable auggie");
+    svc.agent_set_model_op(id.clone(), "opus4.7".into(), Some("auggie".into()))
+        .await
+        .expect("explicit providerId naming the alias's effective provider stays ungated");
+    let after = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(after.model.as_deref(), Some("opus4.7"));
+    assert_eq!(after.provider.as_deref(), Some("auggie"));
+}
+
+/// Same exemption for a NULL `provider` column: the session's effective
+/// provider is the settings-derived default (auggie in this fixture), so an
+/// explicit `providerId: "auggie"` does not move the session and must stay
+/// ungated while auggie is disabled.
+#[tokio::test]
+async fn set_model_same_provider_via_default_fallback_is_not_gated() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "NullSame").await;
+    let mut session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    session.provider = None;
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("persist NULL provider");
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.enabled".into(), json!({ "auggie": false }))])
+        .expect("disable auggie");
+    svc.agent_set_model_op(id.clone(), "opus4.7".into(), Some("auggie".into()))
+        .await
+        .expect("explicit providerId naming the default provider stays ungated");
+    let after = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(after.model.as_deref(), Some("opus4.7"));
+    assert_eq!(after.provider.as_deref(), Some("auggie"));
 }
 
 /// `agent.setModel` leaves session.provider unchanged when no explicit

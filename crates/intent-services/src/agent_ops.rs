@@ -4230,7 +4230,24 @@ impl Services {
             // precedence is unchanged: a request naming a model the target
             // provider does not own is still rejected for THAT reason,
             // installed or not.
-            if session.provider.as_deref().filter(|p| !p.is_empty()) != Some(pid.as_str()) {
+            //
+            // "Current" is the session's EFFECTIVE provider — the one the next
+            // spawn would actually run — not the raw column: a legacy alias
+            // (`acp`/`default`/`augment`) normalizes through `provider_config`
+            // exactly as `resolve_spawn` and the ownership check above do, and
+            // a NULL column resolves to the settings-derived default. Comparing
+            // the raw column would treat an explicit `providerId` naming that
+            // same effective provider as a cross-provider switch and gate a
+            // same-provider model change — the very exemption above.
+            let current_effective = session
+                .provider
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(|p| intent_providers::provider_config(p).id.to_string())
+                .or_else(|| {
+                    crate::agent_session::derived_default_provider(&self.effective_settings())
+                });
+            if current_effective.as_deref() != Some(pid.as_str()) {
                 ensure_provider_available(
                     "agent.setModel",
                     &pid,

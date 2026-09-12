@@ -1252,11 +1252,17 @@ pub(crate) fn resolve_provider_id(
         })
 }
 
-/// Resolve the provider id an agent session is actually running on, for
-/// event annotation: the session's persisted `provider` column with the
-/// settings-derived default as the fallback (the same precedence
-/// [`resolve_provider_id`] applies at spawn time), so the reported id matches
-/// the binary the failing turn used.
+/// Resolve the provider id the agent's failing TURN ran on, for event
+/// annotation: `last_turn_provider` (the identity the turn committed) with
+/// the session's persisted `provider` column — under the same precedence
+/// [`resolve_provider_id`] applies at spawn time — as the fallback, so the
+/// reported id matches the binary the failing turn used.
+///
+/// Only for a turn that actually ran. A failure during spawn / ACP session
+/// setup happens BEFORE the new identity commits, so `last_turn_provider`
+/// still names the previous provider there; that publisher reads the
+/// attempt's resolved provider instead
+/// (`agent_manager::FailedProviderSource::SpawnAttempt`).
 ///
 /// Best-effort and non-fatal by construction: a store error or an
 /// unresolvable provider yields `None` and the caller simply omits the field.

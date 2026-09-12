@@ -446,6 +446,151 @@ async fn failed_event_data(test: &str, agent_name: &str, error_data: &str) -> Op
     panic!("no agent:failed event observed for {test}");
 }
 
+/// Seed a workspace plus an idle `mock` agent whose `last_turn_provider`
+/// still names a DIFFERENT, registered provider — the persisted state after
+/// `agent.setModel` moved the session from `auggie` onto `mock`: the switch
+/// commits the new identity to `last_turn_provider` only once the new child
+/// is up, so until then the column still names the previous provider.
+async fn seed_switched_session(data_dir: &Path) -> (String, String) {
+    use intent_core::{now_iso, AgentId, AgentSession, WorkspaceId};
+    use intent_store::Store;
+    let db_path = data_dir.join("intentd.db");
+    let store = Store::open(&db_path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace_seed(&ws))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from(format!("agent-{}", Uuid::new_v4()).as_str());
+    let ts = now_iso();
+    let session: AgentSession = serde_json::from_value(json!({
+        "id": agent_id.0,
+        "workspaceId": ws.0,
+        "name": "WSS-QUOTA-STARTUP",
+        "nameExplicitlySet": true,
+        "model": "default", "provider": "mock",
+        "status": "idle",
+        "isActive": false,
+        "createdAt": ts,
+        "updatedAt": ts,
+    }))
+    .expect("seed session from wire shape");
+    store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+    store
+        .set_agent_session_last_turn_model(&ws, &agent_id, Some("sonnet4.5"), "auggie")
+        .await
+        .expect("seed stale last_turn_provider");
+    (ws.0, agent_id.0)
+}
+
+/// QUOTA-4: a quota rejection during ACP session SETUP (`session/new`, before
+/// any prompt) stamps the provider whose allowance actually ran out — the one
+/// the spawn attempt resolved — not the stale `last_turn_provider`.
+///
+/// After `agent.setModel` moves a session from A onto B, `last_turn_provider`
+/// keeps naming A until B's first turn commits. If B's allowance is already
+/// spent, its `session/new` is rejected before that commit; a publisher that
+/// read `last_turn_provider` there would stamp `providerId: A` — the provider
+/// the client should be steered TOWARD, not away from. The mock rejects every
+/// `session/new` with the same bridge-wrapped 429 as QUOTA-1.
+#[tokio::test]
+async fn startup_quota_failure_names_the_attempted_provider_over_wss() {
+    let test = "WSS startup quota-exceeded attribution E2E";
+    let Some(script) = gate(test) else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let (ws_id, agent_id) = seed_switched_session(&data_dir).await;
+    let behavior = json!({
+        "sessionNewRpcError": {
+            "code": -32603,
+            "message": "Internal error",
+            "data": QUOTA_429_BODY,
+        },
+        "response": "unused — session setup is rejected",
+    })
+    .to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "2000"),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "drive a startup failure" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    let mut data = None;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        if event["type"] == "agent:failed" {
+            data = Some(event["data"].clone());
+            break;
+        }
+    }
+    let data = data.unwrap_or_else(|| panic!("no agent:failed event observed for {test}"));
+
+    assert_base_failure_shape(&data, "startup quota");
+    // Precondition: the failure really came from session setup, not a prompt.
+    let error = data["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("session/new"),
+        "the failure is the session-setup rejection: {error}"
+    );
+    assert_eq!(
+        data["errorCode"], "quota-exceeded",
+        "startup quota rejection stamps the machine-readable errorCode: {data}"
+    );
+    assert_eq!(
+        data["providerId"], "mock",
+        "providerId names the provider whose session/new was rejected, \
+         not the stale last_turn_provider: {data}"
+    );
+}
+
 /// Assert the fields that exist on EVERY `agent:failed`, quota or not: the
 /// stamp is additive, so nothing here may shift when `errorCode` appears.
 fn assert_base_failure_shape(data: &Value, agent_name_hint: &str) {
