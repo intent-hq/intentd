@@ -1323,15 +1323,20 @@ impl ScriptManager {
 
 /// Build the env overlay for a spawned script shell: `FORCE_COLOR/TERM`,
 /// `PAGER=cat` + `GIT_PAGER=cat` (the PTY has no keyboard, so a pager opened
-/// by `git`/`gh`/`man` would hold the run open forever; `GIT_PAGER` also
-/// outranks a repo's `core.pager`), an enhanced PATH (essential system dirs +
-/// homebrew + node/version-manager dirs), the commit-identity `GIT_*` vars
-/// resolved from `cwd`'s repository (so a `git commit` in the script uses the
-/// user's real identity — intent-hq/intent#4142; nothing is exported when no
-/// identity resolves, and a var already in the daemon's own env is inherited
-/// untouched), then the script's own `env` last so it can override. The
-/// enhanced PATH keeps git/node resolvable even when the daemon inherited a
-/// sparse Finder/launchd PATH or the login-shell init is degraded.
+/// by a `PAGER`-honouring tool would hold the run open forever; `GIT_PAGER`
+/// also outranks a repo's `core.pager`), an enhanced PATH (essential system
+/// dirs + homebrew + node/version-manager dirs), the commit-identity `GIT_*`
+/// vars resolved from `cwd`'s repository (so a `git commit` in the script
+/// uses the user's real identity — intent-hq/intent#4142; nothing is exported
+/// when no identity resolves, and a var already in the daemon's own env is
+/// inherited untouched), then the script's own `env` last so it can override.
+/// The enhanced PATH keeps git/node resolvable even when the daemon inherited
+/// a sparse Finder/launchd PATH or the login-shell init is degraded.
+///
+/// Like every var here, the pager defaults are daemon-side defaults, not a
+/// hard guarantee: a tool-specific var the daemon inherited (e.g. `GH_PAGER`,
+/// `MANPAGER`) still takes precedence for that tool, and the login shell's
+/// startup files run after this overlay and may re-export any of it.
 fn spawn_env_overlay(
     cwd: Option<&std::path::Path>,
     def_env: Option<&std::collections::BTreeMap<String, String>>,
