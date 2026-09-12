@@ -252,8 +252,9 @@ async fn import_notes(store: &Store, dir: &Path, summary: &mut ImportSummary) {
     }
     for (note, &ok) in notes.iter().zip(&applied) {
         if ok && note.parent_id.is_some() {
-            if let Err(e) = store.update_note(note).await {
-                summary.skip(format!("note {} parent link failed: {e}", note.id));
+            match store.update_note(note).await {
+                Ok(rev) => snapshot_imported_note(store, note, rev).await,
+                Err(e) => summary.skip(format!("note {} parent link failed: {e}", note.id)),
             }
         }
     }
@@ -261,18 +262,30 @@ async fn import_notes(store: &Store, dir: &Path, summary: &mut ImportSummary) {
 
 /// Upsert a note by `(workspace_id, id)`; `Ok(true)` when it already existed
 /// (updated). Note identity is composite (`(id, workspace_id)`, migration
-/// 0030), so the same `id` in different workspaces is a distinct row.
+/// 0030), so the same `id` in different workspaces is a distinct row. Each
+/// persisted write snapshots the note at its post-write `rev` so the rev a
+/// client later loads is a recoverable merge base.
 async fn upsert_note(store: &Store, note: &Note) -> anyhow::Result<bool> {
     match store.get_note(&note.workspace_id, &note.id).await {
         Ok(_) => {
-            store.update_note(note).await?;
+            let rev = store.update_note(note).await?;
+            snapshot_imported_note(store, note, rev).await;
             Ok(true)
         }
         Err(Error::NotFound(_)) => {
             store.insert_note(note).await?;
+            snapshot_imported_note(store, note, note.rev).await;
             Ok(false)
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Best-effort post-write version snapshot for an imported note; a failure is
+/// logged and never fails the import (the note row itself already landed).
+async fn snapshot_imported_note(store: &Store, note: &Note, rev: i64) {
+    if let Err(e) = intent_services::capture_system_note_version(store, note, rev).await {
+        tracing::warn!(note_id = %note.id, rev, error = %e, "imported note version snapshot failed");
     }
 }
 
@@ -560,6 +573,59 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// Every imported note write (insert, re-import update, parent-link
+    /// write) snapshots the note at its post-write `rev`, so the rev a client
+    /// loads after an import resolves to the persisted content as a merge
+    /// base.
+    #[tokio::test]
+    async fn import_writes_record_post_write_rev_on_version_snapshot() {
+        async fn assert_snapshot_at_current_rev(store: &Store, ws: &WorkspaceId, id: &str) {
+            let note = store.get_note(ws, &NoteId::from(id)).await.unwrap();
+            let newest_rev: Option<i64> = sqlx::query_scalar(
+                "SELECT rev FROM note_version WHERE workspace_id = ? AND note_id = ? \
+                 ORDER BY v DESC LIMIT 1",
+            )
+            .bind(&ws.0)
+            .bind(&note.id.0)
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+            assert_eq!(newest_rev, Some(note.rev), "{id}: newest snapshot rev");
+            assert_eq!(
+                store
+                    .get_note_version_content_by_rev(ws, &note.id, note.rev)
+                    .await
+                    .unwrap(),
+                Some(note.content),
+                "{id}: base lookup by rev"
+            );
+        }
+
+        let source = write_fixture();
+        let (store, _db_dir) = open_store().await;
+        let ws = WorkspaceId::from("ws-1");
+
+        // First run: inserts (+ the child's parent-link update).
+        run(&store, source.path()).await.expect("first import");
+        assert_snapshot_at_current_rev(&store, &ws, "note-parent").await;
+        assert_snapshot_at_current_rev(&store, &ws, "note-child").await;
+        let child_rev = store
+            .get_note(&ws, &NoteId::from("note-child"))
+            .await
+            .unwrap()
+            .rev;
+
+        // Second run: the update path bumps rev and snapshots again.
+        run(&store, source.path()).await.expect("second import");
+        let child = store
+            .get_note(&ws, &NoteId::from("note-child"))
+            .await
+            .unwrap();
+        assert!(child.rev > child_rev, "re-import bumps rev: {child:?}");
+        assert_snapshot_at_current_rev(&store, &ws, "note-parent").await;
+        assert_snapshot_at_current_rev(&store, &ws, "note-child").await;
     }
 
     #[tokio::test]

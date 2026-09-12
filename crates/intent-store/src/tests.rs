@@ -1156,8 +1156,11 @@ async fn note_version_append_list_get_and_prune() {
 /// Every content write records the note's post-write `rev` on its
 /// `note_version` row: `update_note` / `update_note_versioned` return the
 /// bumped `rev` (`RETURNING rev`), `append_note_version` stores it, and
-/// `get_note_version_content_by_rev` recovers the snapshot for that rev —
-/// `None` for an unknown rev, a pruned rev, or a pre-migration `NULL` rev.
+/// `get_note_version_content_by_rev` recovers the content as of that rev —
+/// the exact snapshot for a content rev, the preceding content snapshot for a
+/// metadata-only rev bump, `None` for a rev older than the oldest retained
+/// snapshot (pruned or predating the note); pre-migration `NULL` rows never
+/// match.
 #[tokio::test]
 async fn note_version_records_rev_and_looks_up_base_by_rev() {
     let tmp = TempDb::new();
@@ -1225,13 +1228,13 @@ async fn note_version_records_rev_and_looks_up_base_by_rev() {
         .await
         .expect("append v3");
 
-    // Base lookup by (workspace, note, rev) returns the content recorded at
-    // that rev; an unknown rev is `None`.
+    // Base lookup by (workspace, note, rev): a content rev is an exact hit.
     let by_rev = |rev: i64| store.get_note_version_content_by_rev(&ws_id, &note.id, rev);
     assert_eq!(by_rev(0).await.expect("rev 0"), Some("base".to_string()));
     assert_eq!(by_rev(1).await.expect("rev 1"), Some("one".to_string()));
     assert_eq!(by_rev(2).await.expect("rev 2"), Some("two".to_string()));
-    assert_eq!(by_rev(3).await.expect("rev 3"), None);
+    // A rev older than the oldest snapshot has no base.
+    assert_eq!(by_rev(-1).await.expect("rev -1"), None);
     // Scoped by workspace: another workspace id never matches.
     assert_eq!(
         store
@@ -1241,14 +1244,28 @@ async fn note_version_records_rev_and_looks_up_base_by_rev() {
         None
     );
 
+    // A metadata-only write bumps rev without a snapshot (2 → 3): the
+    // content as of rev 3 is the last content-write snapshot at or below it.
+    note.is_pinned = true;
+    let rev3 = store.update_note(&note).await.expect("metadata update");
+    assert_eq!(rev3, 3);
+    assert_eq!(
+        by_rev(3).await.expect("metadata-only rev 3"),
+        Some("two".to_string())
+    );
+
     // A pre-migration row (`rev IS NULL`) never matches a base lookup even
-    // when `v` lines up with a rev a writer might send.
+    // when `v` lines up with a rev a writer might send: with rev 1's snapshot
+    // NULLed out, the lookup falls back to the newest non-NULL rev below it.
     sqlx::query("UPDATE note_version SET rev = NULL WHERE note_id = ? AND v = 2")
         .bind(&note.id.0)
         .execute(store.write_pool())
         .await
         .expect("null out rev");
-    assert_eq!(by_rev(1).await.expect("rev 1 after NULL"), None);
+    assert_eq!(
+        by_rev(1).await.expect("rev 1 after NULL"),
+        Some("base".to_string())
+    );
 
     // Once the rev's snapshot is pruned past MAX_NOTE_VERSIONS the base is
     // gone: `None`, not an error.
@@ -1262,6 +1279,7 @@ async fn note_version_records_rev_and_looks_up_base_by_rev() {
     }
     assert_eq!(by_rev(0).await.expect("pruned rev 0"), None);
     assert_eq!(by_rev(2).await.expect("pruned rev 2"), None);
+    assert_eq!(by_rev(3).await.expect("pruned rev 3"), None);
     let latest = store.get_note(&ws_id, &note.id).await.expect("get").rev;
     assert_eq!(
         by_rev(latest).await.expect("latest rev"),

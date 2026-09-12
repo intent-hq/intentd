@@ -4367,27 +4367,82 @@ async fn note_add_stamps_user_author_when_caller_is_none() {
     assert_eq!(last.author.author_type, "user");
 }
 
+/// `rev` of the newest `note_version` row for `(ws, id)`, by version number.
+async fn newest_version_rev(store: &Store, ws: &WorkspaceId, id: &NoteId) -> Option<i64> {
+    sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT rev FROM note_version WHERE workspace_id = ?1 AND note_id = ?2 \
+         ORDER BY v DESC LIMIT 1",
+    )
+    .bind(ws.as_str())
+    .bind(id.as_str())
+    .fetch_one(store.read_pool())
+    .await
+    .expect("newest version row")
+}
+
+/// The post-write invariant every persisted content write must uphold: the
+/// newest `note_version` row carries the note's current `rev`, and the base
+/// lookup by that rev yields exactly the persisted content.
+async fn assert_snapshot_at_current_rev(svc: &Services, ws: &WorkspaceId, id: &NoteId, path: &str) {
+    let note = svc.store.get_note(ws, id).await.expect("get note");
+    assert_eq!(
+        newest_version_rev(&svc.store, ws, id).await,
+        Some(note.rev),
+        "{path}: newest note_version row must carry the post-write rev"
+    );
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(ws, id, note.rev)
+            .await
+            .expect("lookup"),
+        Some(note.content),
+        "{path}: base lookup by rev must yield the persisted content"
+    );
+}
+
 /// Every persisted content write snapshots the note at its post-write `rev`:
 /// the base a later writer sends as `expectedVersion` resolves, via
 /// `get_note_version_content_by_rev`, to exactly the content that write
-/// produced — for both the versioned (`setContent`) and unconditional
-/// (`add`) paths.
+/// produced. Covers every `note.*` content path (create / setContent / add /
+/// edit / editLines / update / restoreVersion), the direct `task.*` content
+/// writes (`updateStatus`, `update`, `createPrerequisite`, and linked-checkbox
+/// materialization from `updateNoteStatus`), the `comment.add` anchor rewrite
+/// and the `primitive.*` append.
 #[tokio::test]
 async fn note_writes_record_post_write_rev_on_version_snapshot() {
-    let (_tmp, svc, ws, id) = setup("body").await;
-    let before = svc.store.get_note(&ws, &id).await.expect("get");
-    svc.set_note_content(ws.clone(), id.clone(), "replaced".into(), true, None, None)
+    let (_tmp, svc, ws, id) = setup("body\n- [ ] alpha\n- [ ] beta").await;
+
+    let created = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Fresh".into(),
+                content: Some("fresh body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
         .await
-        .expect("set content");
+        .expect("create")
+        .note;
+    assert_snapshot_at_current_rev(&svc, &ws, &created.id, "note.create").await;
+
+    let before = svc.store.get_note(&ws, &id).await.expect("get");
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "replaced\n- [ ] alpha\n- [ ] beta".into(),
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect("set content");
     let after_set = svc.store.get_note(&ws, &id).await.expect("get");
     assert_eq!(after_set.rev, before.rev + 1);
-    assert_eq!(
-        svc.store
-            .get_note_version_content_by_rev(&ws, &id, after_set.rev)
-            .await
-            .expect("lookup"),
-        Some("replaced".to_string())
-    );
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.setContent").await;
 
     svc.add_to_note(
         ws.clone(),
@@ -4401,23 +4456,153 @@ async fn note_writes_record_post_write_rev_on_version_snapshot() {
     )
     .await
     .expect("add");
-    let after_add = svc.store.get_note(&ws, &id).await.expect("get");
-    assert_eq!(after_add.rev, after_set.rev + 1);
-    assert_eq!(
-        svc.store
-            .get_note_version_content_by_rev(&ws, &id, after_add.rev)
-            .await
-            .expect("lookup"),
-        Some(after_add.content.clone())
-    );
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.add").await;
     // The earlier base is still recoverable by its own rev.
     assert_eq!(
         svc.store
             .get_note_version_content_by_rev(&ws, &id, after_set.rev)
             .await
             .expect("lookup"),
-        Some("replaced".to_string())
+        Some(after_set.content.clone())
     );
+
+    svc.edit_note(
+        ws.clone(),
+        id.clone(),
+        NoteEditInput {
+            old: "replaced".into(),
+            new: "edited".into(),
+        },
+        None,
+    )
+    .await
+    .expect("edit");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.edit").await;
+
+    svc.edit_note_lines(
+        ws.clone(),
+        id.clone(),
+        NoteEditLinesInput {
+            start: 1,
+            end: 1,
+            content: "lines".into(),
+        },
+        None,
+    )
+    .await
+    .expect("editLines");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.editLines").await;
+
+    svc.update_note(
+        ws.clone(),
+        id.clone(),
+        NoteUpdateInput {
+            content: Some("updated\n- [ ] alpha\n- [ ] beta".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.update").await;
+
+    svc.restore_note_version(ws.clone(), id.clone(), 1, None)
+        .await
+        .expect("restore");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.restoreVersion").await;
+
+    svc.task_update_status(ws.clone(), id.clone(), "alpha".into(), "done".into(), None)
+        .await
+        .expect("task.updateStatus");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "task.updateStatus").await;
+
+    svc.task_update(
+        ws.clone(),
+        id.clone(),
+        3,
+        Some("beta renamed".into()),
+        Some("in-progress".into()),
+        None,
+        None,
+    )
+    .await
+    .expect("task.update");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "task.update").await;
+
+    svc.comment_add(
+        ws.clone(),
+        id.clone(),
+        "beta renamed".into(),
+        "renamed".into(),
+        "note".into(),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("comment.add");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "comment.add").await;
+
+    svc.primitive_add_cli(
+        ws.clone(),
+        id.clone(),
+        "cargo test".into(),
+        "run tests".into(),
+        None,
+    )
+    .await
+    .expect("primitive.addCli");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "primitive.addCli").await;
+
+    // Task paths: a child task note is created, and flipping its status
+    // materializes the linked checkbox onto the parent.
+    svc.mark_as_task(
+        ws.clone(),
+        id.clone(),
+        "not_started".into(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
+    let child = svc
+        .create_prerequisite(
+            ws.clone(),
+            id.clone(),
+            "Child".into(),
+            Some("child body".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("createPrerequisite")
+        .prerequisite_note_id;
+    assert_snapshot_at_current_rev(&svc, &ws, &child, "task.createPrerequisite").await;
+
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        format!("- [ ] [Child](intent://local/task/{})", child.as_str()),
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect("link child");
+    let linked_rev = svc.store.get_note(&ws, &id).await.expect("get").rev;
+    svc.task_update_note_status(ws.clone(), child.clone(), "complete".into(), None, None)
+        .await
+        .expect("updateNoteStatus");
+    let materialized = svc.store.get_note(&ws, &id).await.expect("get");
+    assert!(
+        materialized.rev > linked_rev && materialized.content.starts_with("- [x]"),
+        "materialization must have rewritten the parent: {materialized:?}"
+    );
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "linked-checkbox materialization").await;
 }
 
 #[tokio::test]
@@ -9914,6 +10099,67 @@ mod change_event_parity {
                 .expect("read source override"),
             Some(false),
             "source override untouched by duplication"
+        );
+    }
+
+    /// Every note `workspace.duplicate` copies is snapshotted at its
+    /// post-insert `rev`, so the rev a client loads from the duplicate is a
+    /// recoverable merge base.
+    #[tokio::test]
+    async fn workspace_duplicate_copied_notes_record_post_write_rev_on_version_snapshot() {
+        use intent_core::WorkspaceCreate;
+        let h = harness().await;
+        let source = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Rev dup source".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        h.services
+            .create_note(
+                source.id.clone(),
+                NoteCreate {
+                    title: "Copied".into(),
+                    content: Some("copied body".into()),
+                    tags: None,
+                    parent_id: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("create note");
+
+        let dup = h
+            .services
+            .duplicate_workspace(source.id.clone(), None)
+            .await
+            .expect("duplicate");
+        let copied = h
+            .store
+            .list_notes(&dup.id)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|n| n.title == "Copied")
+            .expect("copied note present");
+        assert_eq!(
+            crate::tests::newest_version_rev(&h.store, &dup.id, &copied.id).await,
+            Some(copied.rev),
+            "newest note_version row must carry the copied note's rev"
+        );
+        assert_eq!(
+            h.store
+                .get_note_version_content_by_rev(&dup.id, &copied.id, copied.rev)
+                .await
+                .expect("lookup"),
+            Some("copied body".to_string())
         );
     }
 

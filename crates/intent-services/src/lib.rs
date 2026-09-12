@@ -8683,7 +8683,8 @@ async fn fetch_note(store: &Store, workspace_id: &WorkspaceId, note_id: &NoteId)
 }
 
 /// Author stamp for daemon-internal note-version writes (the workspace-seed
-/// spec note snapshot). All user- and agent-originated writes resolve the
+/// spec note snapshot, `workspace.duplicate` note copies, linked-checkbox
+/// materialization). All user- and agent-originated writes resolve the
 /// author from the caller instead (see [`resolve_note_version_author`]).
 fn system_version_author() -> NoteVersionAuthor {
     NoteVersionAuthor {
@@ -8749,6 +8750,18 @@ async fn capture_note_version(
     store
         .append_note_version(note, author, &note.updated_at, rev)
         .await
+}
+
+/// [`capture_note_version`] with the daemon-internal system author, for
+/// noninteractive note writes that live outside this crate (the `intentd`
+/// importers). Imported notes are loaded by clients like any other, so their
+/// post-write `rev` must be a recoverable base too.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the version append fails.
+pub async fn capture_system_note_version(store: &Store, note: &Note, rev: i64) -> Result<i64> {
+    capture_note_version(store, note, &system_version_author(), rev).await
 }
 
 /// Comment anchor recovery pass, called by every note-content mutation before
@@ -9528,7 +9541,8 @@ async fn append_primitive(
     let new_content = primitive_ops::append_block(&note.content, primitive, block_type);
     note.content = new_content.clone();
     note.updated_at = now_iso();
-    store.update_note(&note).await?;
+    let rev = store.update_note(&note).await?;
+    capture_note_version(store, &note, &user_version_author(), rev).await?;
     publish_event(
         bus,
         note_change_event(
@@ -11313,17 +11327,22 @@ impl Services {
             };
             note.content = content;
             note.updated_at = now_iso();
-            match self
+            let rev = match self
                 .store
                 .update_note_versioned(&note, Some(note.rev))
                 .await
             {
-                Ok(_) => {}
+                Ok(rev) => rev,
                 Err(Error::Conflict { .. }) if attempt < MAX_ATTEMPTS => continue,
                 Err(e) => {
                     tracing::warn!(note = %note.id.0, task = %task_id.0, attempt, error = %e, "materialize linked checkboxes: update failed");
                     return;
                 }
+            };
+            if let Err(e) =
+                capture_note_version(&self.store, &note, &system_version_author(), rev).await
+            {
+                tracing::warn!(note = %note.id.0, task = %task_id.0, error = %e, "materialize linked checkboxes: version snapshot failed");
             }
             self.invalidate_crdt_note(workspace_id, &note.id);
             self.schedule_line_attribution_recompute(workspace_id, &note.id);
@@ -13865,6 +13884,8 @@ impl Services {
             updated_at: now,
         };
         self.store.insert_note(&note).await?;
+        let author = resolve_note_version_author(&self.store, caller_agent_id).await;
+        capture_note_version(&self.store, &note, &author, note.rev).await?;
         // Emit `note:created` so task-channel subscribers (spec UI) pick up
         // the new child task note live (TS parity: `createPrerequisiteNote`
         // routes through `createNote`, which emits `note:created`).
@@ -20337,12 +20358,30 @@ impl WorkspaceApi for Services {
                             rev: 0,
                             updated_at: now.clone(),
                         };
-                        if let Err(e) = store.insert_note(&clone).await {
-                            tracing::warn!(
-                                workspace = %ws.id.as_str(),
-                                error = %e,
-                                "workspace.duplicate: failed to copy note"
-                            );
+                        match store.insert_note(&clone).await {
+                            Ok(()) => {
+                                if let Err(e) = capture_note_version(
+                                    &store,
+                                    &clone,
+                                    &system_version_author(),
+                                    clone.rev,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        workspace = %ws.id.as_str(),
+                                        error = %e,
+                                        "workspace.duplicate: failed to snapshot copied note"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    workspace = %ws.id.as_str(),
+                                    error = %e,
+                                    "workspace.duplicate: failed to copy note"
+                                );
+                            }
                         }
                     }
                 }
@@ -22102,7 +22141,9 @@ impl WorkspaceApi for Services {
             let updated = note_ops::apply_task_status(&note.content, &normalized, checkbox)?;
             note.content = updated;
             note.updated_at = now_iso();
-            store.update_note(&note).await?;
+            let rev = store.update_note(&note).await?;
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            capture_note_version(&store, &note, &author, rev).await?;
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
@@ -22230,7 +22271,9 @@ impl WorkspaceApi for Services {
             if write_parent {
                 note.content = update.content;
                 note.updated_at = now_iso();
-                store.update_note(&note).await?;
+                let rev = store.update_note(&note).await?;
+                let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+                capture_note_version(&store, &note, &author, rev).await?;
                 publish_event(
                     bus.as_ref(),
                     note_change_event(
@@ -23142,6 +23185,19 @@ impl WorkspaceApi for Services {
                         }
                         Err(e) => return Err(e),
                     };
+                    // The anchor rewrite is a persisted content write: snapshot
+                    // it under the post-rewrite rev so a writer holding that
+                    // rev can recover its base. The comment's author/type is
+                    // the only provenance the add carries.
+                    let version_author = match new_comment.author_type {
+                        AuthorType::User => user_version_author(),
+                        AuthorType::Agent => NoteVersionAuthor {
+                            id: new_comment.author.clone(),
+                            name: new_comment.author.clone(),
+                            author_type: "agent".to_string(),
+                        },
+                    };
+                    capture_note_version(&store, &note, &version_author, note_rev).await?;
                     services.invalidate_crdt_note(&note.workspace_id, &note.id);
                     services.schedule_line_attribution_recompute(
                         &note.workspace_id.clone(),

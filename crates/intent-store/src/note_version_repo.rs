@@ -155,11 +155,17 @@ impl Store {
         }
     }
 
-    /// Content of the version snapshot recorded when the note reached `rev`
-    /// (one lookup on `idx_note_version_rev`), or `None` when no snapshot
-    /// carries that rev — an unknown rev, a rev pruned past
-    /// [`MAX_NOTE_VERSIONS`], or a pre-migration row (`rev IS NULL`, which
-    /// never matches). This is the writer's base for a three-way merge.
+    /// The note's content *as of* `rev`: the content of the newest snapshot
+    /// whose recorded `rev` is `<= rev` (one range scan on
+    /// `idx_note_version_rev`). Every content write snapshots at its
+    /// post-write rev, while metadata-only writes bump `rev` without a
+    /// snapshot, so the content at rev N is the last content-write snapshot
+    /// at or below N — an exact hit for a content rev, the preceding content
+    /// for a metadata-only rev. `None` when no such snapshot exists: a rev
+    /// older than the oldest retained snapshot (pruned past
+    /// [`MAX_NOTE_VERSIONS`] or predating the note) — pre-migration rows
+    /// (`rev IS NULL`) never match. This is the writer's base for a
+    /// three-way merge.
     ///
     /// # Errors
     ///
@@ -172,8 +178,8 @@ impl Store {
     ) -> Result<Option<String>> {
         sqlx::query_scalar(
             "SELECT content FROM note_version \
-             WHERE workspace_id = ? AND note_id = ? AND rev = ? \
-             ORDER BY v DESC LIMIT 1",
+             WHERE workspace_id = ? AND note_id = ? AND rev IS NOT NULL AND rev <= ? \
+             ORDER BY rev DESC, v DESC LIMIT 1",
         )
         .bind(&workspace_id.0)
         .bind(&note_id.0)
