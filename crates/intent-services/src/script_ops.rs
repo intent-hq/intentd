@@ -1998,6 +1998,19 @@ mod tests {
         _worktree: Option<WorktreeDir>,
     }
 
+    /// Reap every PTY the test started, on normal and panicking unwinds
+    /// alike, so a stalled wait that fails through the `LIVENESS` deadline
+    /// cannot leak the script's process group past the test
+    /// (intent-hq/intentd#1822 left `git`/`sh`/`sleep 3600` behind). Drop is
+    /// synchronous and runs while the test runtime is unwinding, so this uses
+    /// the no-await SIGKILL sweep; it also latches the host closed, which
+    /// refuses a supervisor respawn racing the sweep.
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.services.pty().kill_all_sync();
+        }
+    }
+
     async fn harness() -> Harness {
         harness_with_worktree(false).await
     }
@@ -2056,39 +2069,62 @@ mod tests {
         .await
     }
 
+    /// Wait for the next `script:state` event satisfying `pred`. On timeout
+    /// the panic names the deadline and the last `script:state` event seen
+    /// (the status the run stalled at), so a harness failure is diagnosable
+    /// from the test output rather than only from nextest's slow-timeout kill.
     async fn await_state<F>(sub: &mut Subscription, timeout: Duration, mut pred: F) -> Value
     where
         F: FnMut(&Value) -> bool,
     {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut seen = 0usize;
+        let mut last_state: Option<Value> = None;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let batch = tokio::time::timeout(remaining, sub.recv())
-                .await
-                .expect("event delivered before deadline")
-                .expect("subscription open");
-            for ev in &batch {
+            let Ok(batch) = tokio::time::timeout(remaining, sub.recv()).await else {
+                panic!(
+                    "await_state timed out after {timeout:?}: {seen} script:* event(s) seen, \
+                     none matched the predicate; last script:state event: {}",
+                    last_state
+                        .as_ref()
+                        .map_or_else(|| "<none>".to_string(), Value::to_string)
+                );
+            };
+            for ev in &batch.expect("subscription open") {
                 let v = serde_json::to_value(ev).expect("serialize");
-                if v["type"] == "script:state" && pred(&v) {
-                    return v;
+                seen += 1;
+                if v["type"] == "script:state" {
+                    if pred(&v) {
+                        return v;
+                    }
+                    last_state = Some(v);
                 }
             }
         }
     }
 
+    /// Wait for the `script:changed` event carrying `action`; the timeout
+    /// panic names the action and the last `script:*` event seen.
     async fn await_script_change(sub: &mut Subscription, action: &str) -> Value {
         let deadline = tokio::time::Instant::now() + LIVENESS;
+        let mut last: Option<Value> = None;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let batch = tokio::time::timeout(remaining, sub.recv())
-                .await
-                .expect("script change delivered before liveness deadline")
-                .expect("subscription open");
-            for ev in &batch {
+            let Ok(batch) = tokio::time::timeout(remaining, sub.recv()).await else {
+                panic!(
+                    "await_script_change timed out after {LIVENESS:?} waiting for \
+                     script:changed action={action:?}; last script:* event: {}",
+                    last.as_ref()
+                        .map_or_else(|| "<none>".to_string(), Value::to_string)
+                );
+            };
+            for ev in &batch.expect("subscription open") {
                 let value = serde_json::to_value(ev).expect("serialize");
                 if value["type"] == "script:changed" && value["data"]["action"] == action {
                     return value;
                 }
+                last = Some(value);
             }
         }
     }
@@ -2831,7 +2867,7 @@ mod tests {
     #[tokio::test]
     async fn auto_restart_backoff_window_reports_restarting() {
         let mut h = harness().await;
-        h.services = h.services.with_script_too_fast_ms(0);
+        h.services = h.services.clone().with_script_too_fast_ms(0);
         let park = Arc::new(SupervisePark::default());
         let services = h.services.clone().with_script_supervise_park(park.clone());
         let mut sub = subscribe(&h);
@@ -3209,7 +3245,7 @@ mod tests {
     #[tokio::test]
     async fn stop_all_during_respawn_window_refuses_registration_and_reaps() {
         let mut h = harness().await;
-        h.services = h.services.with_script_too_fast_ms(0);
+        h.services = h.services.clone().with_script_too_fast_ms(0);
         let park = Arc::new(SupervisePark::default());
         let services = h.services.clone().with_script_supervise_park(park.clone());
         let mut sub = subscribe(&h);
@@ -3345,6 +3381,47 @@ mod tests {
             .expect("start");
         let exited = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
         assert_eq!(exited["data"]["exitCode"], 0, "got: {exited}");
+    }
+
+    /// Whether the process group led by `pgid` still has any member (a zombie
+    /// leader counts until reaped), via `kill -0 -- -<pgid>`.
+    fn pgroup_alive(pgid: i64) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", "--", &format!("-{pgid}")])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run kill -0")
+            .success()
+    }
+
+    /// Dropping the `Harness` reaps every script PTY it started
+    /// (intent-hq/intentd#1822): a running service's whole process group is
+    /// gone shortly after the drop, and the supervisor's respawn is refused,
+    /// so a test that panics mid-wait cannot leak `sleep 3600` past nextest.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn harness_drop_kills_tracked_script_process_groups() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id)
+            .await
+            .expect("start");
+        let running = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let pid = running["data"]["pid"].as_i64().expect("pid");
+        assert!(pgroup_alive(pid), "service group {pid} alive before drop");
+
+        drop(h);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while pgroup_alive(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "service process group {pid} survived harness drop"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Regression (monorepo#1155): a `resolve_cwd` failure after the running
