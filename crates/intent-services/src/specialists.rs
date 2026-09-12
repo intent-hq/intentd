@@ -435,7 +435,7 @@ fn fold_role_directive(state: &mut RoleResolution, content: &str) {
 /// stays frozen). Consumed only by the cross-version goldens
 /// (`v1_1_goldens`, `harness::tests`), which compare frontmatter modulo this
 /// set — hence the allow: the lib build has no reader.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) const PICKER_METADATA_KEYS: &[&str] = &["role", "icon", TEAM_AGENTS_KEY, ALIASES_KEY];
 
 /// Strictly validate a wire `role` value (`specialist.create`/`edit` specs):
@@ -1559,7 +1559,7 @@ impl SpecialistsService {
     /// `specialist.list` → `{ specialists: SpecialistDef[] }`, the resolved
     /// catalog ([`Self::collect_catalog`]); `workspace_path` adds the project
     /// tier.
-    #[allow(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
+    #[expect(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
     pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
         let mut acc = self.collect_catalog(workspace_path);
         // Ralph remains in the pinned v1 doctrine for existing sessions, but
@@ -1621,7 +1621,6 @@ impl SpecialistsService {
     /// back to the auto-generated one (same policy as
     /// [`Self::resolve_role_reminder`]); empty values resolve to `None`.
     /// Returns `None` when the specialist is unknown.
-    #[allow(clippy::type_complexity)]
     pub(crate) fn resolve_prompt_injection(
         &self,
         id: &str,

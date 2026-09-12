@@ -1074,7 +1074,7 @@ fn assert_success_envelope(resp: &Value, id: i64) {
     assert!(resp["result"].is_object(), "{resp}");
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// The `agents` memory knobs as clients actually receive them (monorepo#2109):
 /// `agents.memoryBudgetMb` advertises a machine-derived `max`, and
 /// `agents.idleReapMinutes` advertises the shipped 10-minute default.
@@ -1089,7 +1089,7 @@ fn assert_success_envelope(resp: &Value, id: i64) {
 /// i.e. the catalog advertising a value the write path refuses.
 #[tokio::test]
 // The advertised max is a small whole-valued float: casts are exact.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn agent_memory_knobs_over_wss() {
     // The static bound `SettingsFile` enforces when parsing config.toml. The
     // catalog bound may sit below it (this machine's RAM) but never above.

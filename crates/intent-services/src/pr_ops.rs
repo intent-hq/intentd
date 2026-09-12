@@ -796,7 +796,7 @@ pub struct MergeRequirementsThreads {
 /// rollups.
 // The bool fields mirror the wire checklist shape; grouping them would
 // change the serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeRequirements {

@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn missing_root_watches_nearest_ancestor_non_recursively() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -466,7 +466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn root_created_later_promotes_and_detects_subsequent_changes() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -509,7 +509,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn directory_only_deletion_is_forwarded() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -541,7 +541,7 @@ mod tests {
     /// indefinitely (macOS `FSEvents`), so `watch_root` must return without
     /// performing it — the watch is established from a spawned task instead.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn existing_root_registration_does_not_block_the_caller() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -579,7 +579,7 @@ mod tests {
     /// so a change landing in the window must still be flushed once the
     /// watch is established — otherwise it is absorbed as pre-existing.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn existing_root_flushes_changes_that_land_before_registration() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()

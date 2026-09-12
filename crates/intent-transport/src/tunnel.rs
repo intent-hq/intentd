@@ -370,7 +370,6 @@ pub(crate) async fn run_tunnel_connection<S>(
 
 /// Handle one decoded client frame on the connection loop. Returns `false`
 /// when the connection must end (client protocol violation or a dead socket).
-#[allow(clippy::too_many_arguments)]
 async fn handle_frame<S>(
     frame: Frame,
     sink: &mut SplitSink<WebSocketStream<S>, Message>,

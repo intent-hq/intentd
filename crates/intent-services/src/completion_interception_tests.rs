@@ -792,7 +792,6 @@ mod tests {
     /// Provision a sandbox with one clean commit and strand it `merge_pending`,
     /// returning `(test_root, repo_path, sandbox_path, ws, services, bus)`.
     /// Returns `None` when `CoW` is unsupported (test should skip).
-    #[allow(clippy::type_complexity)]
     async fn setup_merge_pending_sandbox(
         store: &Store,
         name: &str,

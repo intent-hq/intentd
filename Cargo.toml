@@ -11,9 +11,16 @@ license = "Apache-2.0"
 
 # Pedantic ratchet: `clippy::pedantic` is enabled workspace-wide at `warn` (enforced by
 # the `-D warnings` gate). The burndown is complete — new findings are fixed or given a
-# per-site `#[allow]` with a one-line justification. PERMANENT allows stay, with rationale.
+# per-site `#[expect]` (not `#[allow]`) with a one-line justification. An expectation
+# that no longer fires is reported as `unfulfilled_lint_expectations` and fails the gate,
+# so stale suppressions are deleted rather than accumulated. `allow_attributes` rejects
+# new outer `#[allow]`s on every platform, including inside `cfg_attr`; only the
+# crate-level `#![allow]` in test support stays. Expectations that hold on some
+# targets only are gated with `cfg_attr(<cond>, expect(...))`.
+# PERMANENT allows stay, with rationale.
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+allow_attributes = "warn"
 # PERMANENT: splitting hundreds of long functions is a risky mass refactor, not a warnings pass.
 too_many_lines = "allow"
 # PERMANENT: fixing means boxing futures broadly; a perf/architecture decision, out of scope.

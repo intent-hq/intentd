@@ -2930,7 +2930,7 @@ mod fd_limit {
     #[cfg(target_os = "macos")]
     pub(crate) const PLATFORM_CAP: Option<u64> = Some(10240);
     #[cfg(not(target_os = "macos"))]
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(not(unix), expect(dead_code))]
     pub(crate) const PLATFORM_CAP: Option<u64> = None;
 
     /// Soft limit in effect after the startup raise (or the untouched value
@@ -2954,7 +2954,7 @@ mod fd_limit {
     /// kernel refuses `RLIM_INFINITY` for `RLIMIT_NOFILE` (EPERM above
     /// `fs.nr_open`), so the hard limit is always finite there. That branch
     /// is macOS-without-cap territory only, and macOS always has a cap.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(all(not(unix), not(test)), expect(dead_code))]
     pub(crate) fn target_soft(soft: u64, hard: Option<u64>, cap: Option<u64>) -> Option<u64> {
         let target = match (hard, cap) {
             (Some(hard), Some(cap)) => hard.min(cap),
@@ -3043,7 +3043,7 @@ mod fd_limit {
 
     /// `rlim_t` is `u64` on the tier-1 Unix targets but not universally.
     #[cfg(unix)]
-    #[allow(clippy::unnecessary_cast)]
+    #[expect(clippy::unnecessary_cast)]
     fn to_u64(v: libc::rlim_t) -> u64 {
         v as u64
     }
@@ -3447,7 +3447,7 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
             0 => CHILD_TREE_WARN_FALLBACK_BYTES,
             // RAM sizes are far below 2^53 (loss-free in f64); the fraction
             // is in (0, 1) and the float→int cast saturates anyway.
-            #[allow(
+            #[expect(
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss
@@ -3850,7 +3850,7 @@ impl intent_core::ServerControl for DaemonControl {
                 // Settings schema bounds the port to u16 range; the
                 // float→int cast saturates anyway.
                 .map(|p| {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let p = p as u16;
                     p
                 });
@@ -5328,7 +5328,7 @@ async fn cmd_settings_list(config: &Config) -> anyhow::Result<()> {
 
 /// Print one setting (`settings.get` output shape) from the already-fetched
 /// `settings.get` result: value, type, default, origin, description.
-#[allow(clippy::unnecessary_wraps)] // keeps the uniform Result shape of the print_setting_* family
+#[expect(clippy::unnecessary_wraps)] // keeps the uniform Result shape of the print_setting_* family
 fn print_setting_get(name: &str, result: &Value) -> anyhow::Result<()> {
     let value = display_setting_value(result.get("value").unwrap_or(&Value::Null));
     println!("{name} = {value}");

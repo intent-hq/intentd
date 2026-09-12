@@ -190,7 +190,7 @@ pub(crate) fn prompt_meta_usage_bill(meta: &Meta) -> Option<(Usage, Option<Usage
     .cached_read_tokens(bill.cached_read_tokens)
     .cached_write_tokens(bill.cache_creation_tokens);
     let cost = cost_ticks.map(|ticks| UsageCost {
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         amount: ticks as f64 / USD_TICKS_PER_USD,
         currency: "USD".to_string(),
     });

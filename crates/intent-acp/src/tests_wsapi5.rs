@@ -25,7 +25,7 @@ use crate::WorkspaceMcpServer;
 type AgentCommitCall = (String, Option<String>, bool, Option<String>);
 
 // `status_message_state` is `Option<Option<_>>`: no-override vs landed value.
-#[allow(clippy::option_option)]
+#[expect(clippy::option_option)]
 #[derive(Default)]
 struct FakeApi {
     agent_commit_calls: Mutex<Vec<AgentCommitCall>>,
@@ -270,7 +270,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         _id: WorkspaceId,

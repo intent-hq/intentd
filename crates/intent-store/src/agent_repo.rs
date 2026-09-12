@@ -1741,7 +1741,6 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
-    #[allow(clippy::type_complexity)]
     pub async fn get_agent_session_token_usage(
         &self,
         workspace_id: &WorkspaceId,
@@ -3671,7 +3670,7 @@ impl Store {
     /// Shared body of [`Store::append_agent_message_with_id`] (one-shot) and
     /// [`Store::append_agent_message_prestaged`] (`prestaged` — adopt rows
     /// staged mid-turn under `id` and reconcile stale ones).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn append_agent_message_inner(
         &self,
         agent_id: &AgentId,
@@ -8067,7 +8066,7 @@ mod tests {
         assert!(rows[0].3.is_none(), "baseline untouched on CAS loss");
     }
 
-    #[allow(clippy::similar_names)] // snap(shot)/swap future are both domain terms
+    #[expect(clippy::similar_names)] // snap(shot)/swap future are both domain terms
     /// Stress loop for the `BEGIN IMMEDIATE` conversion (monorepo#783,
     /// mirroring the #738 verification loop shape): each iteration races
     /// `replace_acp_session_id` (fold + id swap) against a concurrent
@@ -14427,7 +14426,7 @@ mod tests {
     /// confined to exactly-tied ranks, and full equivalence when no LIMIT
     /// splits the tie group.
     #[tokio::test]
-    #[allow(clippy::float_cmp)] // rank ties are byte-identical bm25 values by construction
+    #[expect(clippy::float_cmp)] // rank ties are byte-identical bm25 values by construction
     async fn search_messages_fts_rowid_tiebreak_divergence_after_import() {
         let tmp = TempDb::new("test-fts-rowid-tiebreak-divergence");
         let store = Store::open(&tmp).await.expect("create test store");

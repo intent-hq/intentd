@@ -439,7 +439,7 @@ pub struct Services {
     /// `intent_providers::find_npx`; `Some(inner)` pins the result — including
     /// `Some(None)` to simulate a host without npx, which cannot be arranged
     /// hermetically through the real discovery.
-    #[allow(clippy::option_option)] // the nesting IS the no-override vs pinned distinction
+    #[expect(clippy::option_option)] // the nesting IS the no-override vs pinned distinction
     one_shot_npx: Option<Option<PathBuf>>,
     /// Test-only override (milliseconds) for the auto-commit message
     /// generation timeout. Production composition leaves this `None` and the
@@ -7476,7 +7476,7 @@ impl Services {
     /// indefinitely; the retry replays the advisory-allowed delivery pass
     /// and the stable message id keeps every attempt idempotent. `grouped`
     /// (STAB-160 shape when `true`) only picks the wake's trailer wording.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn deliver_monitoring_idle_advisory(
         &self,
         child_id: &AgentId,
@@ -12856,7 +12856,7 @@ pub(crate) fn event_completion_report(data: &serde_json::Value) -> Option<&str> 
 /// `agent:failed` / `agent:deleted`). Returned so the seal callers share the
 /// delivery pass's probes instead of re-probing (monorepo#1281).
 #[derive(Clone, Copy, Debug, Default)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub(crate) struct CompletionIdleClassification {
     /// Queue/busy interim (monorepo#1281/#1297): ready-to-send entries remain
     /// or a worker turn is in flight — the agent's delegating turn is not
@@ -13825,7 +13825,7 @@ impl Services {
     /// `createPrerequisite` and `convertBlocks`. `caller_agent_id` attributes
     /// the emitted `task:created` to the acting agent when the creation is
     /// agent-driven.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn create_child_task_note(
         &self,
         workspace_id: &WorkspaceId,
@@ -14014,7 +14014,7 @@ impl Services {
                         {
                             // Settings schema bounds the port to u16 range;
                             // the float→int cast saturates anyway.
-                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             let port = new_port as u16;
                             // Check if listener is running
                             if let Some(current_port) = control.ws_listener_port().await {
@@ -21557,14 +21557,14 @@ impl WorkspaceApi for Services {
             if !old_content.is_empty() {
                 // Note sizes are far below 2^53 (loss-free in f64); the rounded
                 // percentage is in [0, 100] so the float→int cast is exact.
-                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_precision_loss)]
                 let old_len = old_content.chars().count() as f64;
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(clippy::cast_precision_loss)]
                 let new_len = content.chars().count() as f64;
                 let reduction = (old_len - new_len) / old_len * 100.0;
                 if reduction > 50.0 && !confirm_replacement {
                     // The rounded percentage is in (50, 100]: exact in i64.
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_possible_truncation)]
                     let reduction_pct = reduction.round() as i64;
                     return Err(Error::Internal(format!(
                         "⚠️ CONTENT REDUCTION DETECTED: Your new content ({} chars) is {}% shorter than the existing content ({} chars).\n\nThis will REPLACE the entire note. If you intended to:\n- ADD content: Use note.add instead\n- EDIT a section: Use note.edit instead\n- PROCEED with replacement: Call note.setContent again with confirmReplacement=true",
@@ -21865,7 +21865,7 @@ impl WorkspaceApi for Services {
             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             // Asset sizes are far below 2^53 (loss-free in f64); the rounded
             // KiB count fits i64, and the float→int cast saturates anyway.
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
             let size_kb = ((data.len() as f64) / 1024.0).round() as i64;
             let mime_type = note_ops::mime_from_extension(&asset_id);
             Ok(ReadAssetResult {
@@ -22142,7 +22142,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         workspace_id: WorkspaceId,
@@ -22266,7 +22265,7 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::similar_names)] // stats/status are both the natural domain names
+    #[expect(clippy::similar_names)] // stats/status are both the natural domain names
     fn task_list(
         &self,
         workspace_id: WorkspaceId,
@@ -22947,7 +22946,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_add(
         &self,
         workspace_id: WorkspaceId,
@@ -23376,7 +23374,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_respond(
         &self,
         workspace_id: WorkspaceId,
@@ -25007,7 +25004,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         workspace_id: WorkspaceId,
@@ -27291,7 +27287,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_pulls_list(
         &self,
         owner: String,
@@ -27333,7 +27328,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_pulls_search(
         &self,
         owner: String,
@@ -27515,7 +27509,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_issues_list(
         &self,
         owner: String,
@@ -27557,7 +27550,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_issues_search(
         &self,
         owner: String,
@@ -29796,7 +29788,7 @@ impl Services {
     /// Run the requested action's step sequence, accumulating per-step status.
     /// A failing step short-circuits with `success:false`; on success the
     /// recomputed metrics + refreshed git-status are emitted.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn ac_run_pipeline(
         &self,
         workspace_id: &WorkspaceId,
@@ -30597,7 +30589,7 @@ impl Services {
     /// (locally via `update-ref`, or on the remote via a refspec push), rebasing
     /// onto trunk first when the branch is behind. Mirrors the TS local-trunk /
     /// remote-trunk merge flow incl. the squash strategy and auto-rebase.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn ac_merge(
         &self,
         workspace_id: &WorkspaceId,
@@ -30934,7 +30926,7 @@ impl Services {
     /// trunk when it exists, else a local `update-ref` of `refs/heads/<trunk>`.
     /// `token` is the caller-resolved GitHub token (the merge flow resolves it
     /// once via [`Self::ac_git_token`] and threads it through).
-    #[allow(clippy::unused_self)] // instance method for parity with the other ac_* steps
+    #[expect(clippy::unused_self)] // instance method for parity with the other ac_* steps
     fn ac_advance_trunk(
         &self,
         worktree: &Path,

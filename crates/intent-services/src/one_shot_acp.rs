@@ -174,7 +174,7 @@ pub(crate) async fn run_one_shot_acp_in(
 /// best-effort model application → one `session/prompt` bounded by
 /// `prompt_timeout`, accumulating `agent_message_chunk` text while answering
 /// agent→client requests inline through every phase.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn drive_one_shot(
     conn: &Connection,
     notifications: &mut mpsc::UnboundedReceiver<intent_acp::IncomingNotification>,

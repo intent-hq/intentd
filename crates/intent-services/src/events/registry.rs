@@ -283,7 +283,7 @@ fn start_git_metadata_watch(
 
 /// Start (or replace) the file + `.git` metadata watches for one workspace.
 /// `suffix` distinguishes the triggering transition in the logs.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn start_watches(
     hub: &Arc<SharedWatchHub>,
     common_watches: &Arc<GitCommonDirWatches>,
@@ -334,7 +334,7 @@ fn archived_delta(ev: &Event) -> Option<bool> {
 }
 
 /// Follow workspace lifecycle events, registering/deregistering watch roots.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn lifecycle_loop(
     hub: Arc<SharedWatchHub>,
     common_watches: Arc<GitCommonDirWatches>,
@@ -895,7 +895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn boot_time_workspace_is_watched() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -919,7 +919,7 @@ mod tests {
     /// `repositoryPath` that exists at daemon start must be watched, not
     /// silently skipped on every restart.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn boot_time_repository_only_workspace_is_watched() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -945,7 +945,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn workspace_created_after_start_gains_watching_and_deletion_stops_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -995,7 +995,7 @@ mod tests {
     /// and `workspace:setup:completed` starts the watchers, after which
     /// events flow normally.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn created_workspace_defers_watching_until_setup_completes() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1043,7 +1043,7 @@ mod tests {
     /// `workspace:created`, so the deferral is just the event round-trip:
     /// watchers start promptly and events flow.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn no_script_completion_starts_watching_promptly() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1075,7 +1075,7 @@ mod tests {
     /// event, hung script), the watchers must start anyway once the backstop
     /// elapses.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn backstop_starts_watchers_when_setup_completion_never_arrives() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1104,7 +1104,7 @@ mod tests {
     /// A delete during the setup window discards the pending entry: neither
     /// the (late) completion nor the backstop may start watchers for it.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn delete_while_pending_discards_the_deferred_start() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1142,7 +1142,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn workspace_opened_resolves_path_via_services() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1184,7 +1184,7 @@ mod tests {
     /// paths only — a leak here would attribute one workspace's edits to the
     /// other.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn workspaces_sharing_a_consolidated_root_receive_only_their_own_file_events() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1238,7 +1238,7 @@ mod tests {
     /// directory on macOS, one global group on Linux — see
     /// `shared_watch::group_key`), so sibling workspaces ride ONE stream.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn many_workspaces_share_a_single_stream_per_parent_directory() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1272,7 +1272,7 @@ mod tests {
     /// specific here is that the stream itself stays up for the sibling, so
     /// exclusion can only come from the demux table.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn archiving_one_workspace_leaves_its_shared_stream_co_tenant_watched() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1328,7 +1328,7 @@ mod tests {
     /// Before the fix only `workspace:deleted`/`workspace:closed` deregistered,
     /// so every archived workspace leaked its `FSEvents` streams until restart.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn archived_workspace_stops_watching_and_unarchive_resumes_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1444,7 +1444,7 @@ mod tests {
     /// and common-dir ref changes stop triggering it; unarchiving re-registers
     /// it and triggers resume.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn archived_worktree_workspace_releases_common_dir_watch_and_unarchive_rearms_it() {
         use git2::{Repository, Signature};
         use intent_core::events::CHANGES_GIT_STATUS;
@@ -1600,7 +1600,7 @@ mod tests {
     /// guard drop must not remove the successor's registration (per-guard
     /// identity token). Ref changes must keep triggering after replacement.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn replacing_worktree_watcher_keeps_common_dir_registration_alive() {
         use git2::{Repository, Signature};
         use intent_core::events::CHANGES_GIT_STATUS;
@@ -1687,7 +1687,7 @@ mod tests {
     /// A `workspace:updated` with no `archived` key (title rename, status
     /// message, …) must not disturb the watch roots.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn unrelated_workspace_update_leaves_watching_intact() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1720,7 +1720,7 @@ mod tests {
     /// must get a `changes:git-status` refresh even though no `.git` event was
     /// observed during the unwatched window.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn unarchive_triggers_git_status_catch_up_refresh() {
         use git2::{Repository, Signature};
         use intent_core::events::CHANGES_GIT_STATUS;
@@ -1781,7 +1781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn git_workspace_created_after_start_gains_metadata_watch_and_deletion_stops_it() {
         use git2::{Repository, Signature};
         use intent_core::events::CHANGES_GIT_STATUS;

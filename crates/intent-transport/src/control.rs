@@ -23,7 +23,7 @@ use crate::protocol::PROTOCOL_VERSION;
 /// is not stored here; it is applied when the snapshot is rendered to JSON.
 // The bools (`uds`, `tcp`, `has_display`, `update_supported`) are independent
 // wire-facing status flags, not an encoded state machine.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct SystemStatus {
     /// Derived listen mode: `both` while the TCP listener (secure WSS, or

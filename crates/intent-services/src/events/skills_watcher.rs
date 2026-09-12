@@ -106,7 +106,7 @@ impl SkillsWatcher {
     /// ride the shared stream and need no separate sync point — subscribing is
     /// synchronous bookkeeping.
     #[cfg(test)]
-    #[allow(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
+    #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: Duration) {
         for watch in &self._user_watchers {
             watch.wait_established(timeout).await;
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn workspace_added_after_start_gains_watching_and_removal_stops_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -585,7 +585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn resume_catch_up_survives_a_discovery_cache_refresh_while_suspended() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()

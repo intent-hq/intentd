@@ -313,7 +313,7 @@ fn grouped_open_prs<'a>(
 }
 
 // serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
@@ -971,7 +971,7 @@ fn ensure_provider_runnable(
 /// flag still rehydrate.
 // The independent bool flags ARE the durable payload shape; grouping them
 // would break persisted-payload rehydration.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
@@ -3031,7 +3031,7 @@ impl Services {
     /// the slot's stream stamp, so unlike persisted rows it advances across
     /// successive reads of the same turn — deliberate: the row IS the
     /// liveness signal, and the id is the stable reconciliation key.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn agent_get_conversation_op(
         &self,
         agent_id: AgentId,
@@ -3574,7 +3574,7 @@ impl Services {
     /// upsert the created session without a follow-up `agent.get` round-trip.
     /// This is a superset of the earlier `{ id, name }` shape, so existing
     /// callers that only read `agent.id` / `agent.name` stay green.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn agent_create_op(
         &self,
         workspace_id: WorkspaceId,
@@ -12820,7 +12820,7 @@ impl Services {
     /// entry. The archived-workspace drain gate delivers post-archive
     /// user-origin entries instead of parking them (intent-hq/intent#3883),
     /// and a drained user-origin entry keeps its originator's semantics.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message(
         &self,
         agent_id: &AgentId,
@@ -12849,7 +12849,7 @@ impl Services {
     /// delivery uses this so a restart retry adopts the already-persisted queue
     /// entry instead of creating a duplicate terminal wake. `origin` is stored
     /// as the entry's `user_origin` flag (see [`Services::enqueue_message`]).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message_with_id(
         &self,
         agent_id: &AgentId,
@@ -12976,7 +12976,7 @@ impl Services {
     /// persist/publish the updated queue, and kick delivery (wakes an idle
     /// agent; a busy agent picks the entry up at its next drain). Returns
     /// `true` iff a held entry existed for the key.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) async fn release_held_message(
         &self,
         agent_id: &AgentId,

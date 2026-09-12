@@ -4293,7 +4293,7 @@ fn opt_string_map(
 /// Used by the `event.*` `limit` / `minutesAgo` knobs, whose defaults are
 /// applied in the service layer (`value || default`).
 // Whole-valued floats from JSON clients; float→int casts saturate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn opt_int(params: &Map<String, Value>, name: &str) -> Option<i64> {
     match params.get(name) {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
@@ -4380,7 +4380,7 @@ fn parse_confirm(params: &Map<String, Value>) -> bool {
 /// for parity with the other paginated reads we fall back to top-level `limit`
 /// and `nextToken` when no `page` object is present.
 // Whole-valued floats from JSON clients; float→int casts saturate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn parse_page_params(params: &Map<String, Value>) -> (Option<i64>, Option<String>) {
     if let Some(Value::Object(page)) = params.get("page") {
         let limit = page
@@ -4425,7 +4425,7 @@ fn normalize_acceptance_criteria(params: &Map<String, Value>) -> Vec<String> {
 /// Loosely parse an integer from a JSON number or leading-int string
 /// (`parseInt`-like), returning `None` when no integer is present.
 // Whole-valued floats from JSON clients; float→int casts saturate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn parse_int_loose(value: Option<&Value>) -> Option<i64> {
     match value {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),

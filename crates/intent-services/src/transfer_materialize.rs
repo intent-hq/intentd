@@ -53,7 +53,7 @@ pub(crate) struct MaterializedGit {
     /// at bundle time — missing directory or unbundlable branch). Nothing
     /// was provisioned for them; [`MaterializedGit::apply`] drops their rows.
     /// Set by materialization; read by tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub skipped_agent_ids: Vec<String>,
 }
 
@@ -613,7 +613,6 @@ pub(crate) fn git_stdout(
 /// The sandbox's local copy of the workspace branch is reset off the WIP
 /// sentinel (the clone happened while the checkout was still at the sentinel
 /// tip; only the workspace checkout gets the later unwind).
-#[allow(clippy::too_many_arguments)]
 fn provision_sandbox_from_bundle(
     checkout_dir: &Path,
     bundle: &str,

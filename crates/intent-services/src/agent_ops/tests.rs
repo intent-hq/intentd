@@ -35214,7 +35214,7 @@ async fn assign_agent_occupancy_guard_and_idempotent_reassign() {
 // agent.watch / agent.unwatch (monorepo#1229): explicit watches
 // ===========================================================================
 
-#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+#[expect(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// `agent.watch` registers a `wake_on_attention` watch; like every ungrouped
 /// watch it is deliver-once — the `agent:idle` wake retires it, and a second
 /// idle with no re-arm delivers nothing.
@@ -36059,7 +36059,7 @@ async fn agent_watch_attention_fanout_excludes_parent() {
     );
 }
 
-#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+#[expect(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// monorepo#3443: the attention fan-out reaches EVERY active completion
 /// watch, not just explicit `agent.watch` registrations — a watcher holding
 /// only an auto-registered (wakeOrCreate/delegate SUB-1 shape,
@@ -36114,7 +36114,7 @@ async fn attention_fanout_reaches_auto_registered_watch() {
     assert!(!watches[0].wake_on_attention, "attention flag unchanged");
 }
 
-#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+#[expect(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// monorepo#3443: an auto-registered GROUPED watch (`wake_on_attention:
 /// false`, `group_id` set — the `after_all` delegation shape) also receives
 /// the attention wake, with the grouped settlement-promise wording.
@@ -36363,7 +36363,7 @@ async fn agent_watch_unwatch_validation_and_removal() {
     ));
 }
 
-#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+#[expect(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// Restart durability: an explicit watch survives daemon restart with its
 /// `wake_on_attention` flag intact.
 #[tokio::test]

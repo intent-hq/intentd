@@ -2513,7 +2513,7 @@ mod tests {
 
     /// Mutable forge state one test can advance between polls.
     #[derive(Clone)]
-    #[allow(clippy::struct_excessive_bools)]
+    #[expect(clippy::struct_excessive_bools)]
     struct ForgeState {
         pr_state: PrState,
         draft: bool,

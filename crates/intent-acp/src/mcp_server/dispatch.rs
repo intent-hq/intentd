@@ -351,7 +351,7 @@ impl WorkspaceMcpServer {
                 .filter(|n| n.is_finite() && *n >= 0.0)
                 .map_or(DEFAULT_MAX_OUTPUT_CHARS, |n| {
                     // Guarded finite + non-negative; float→int casts saturate.
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let n = n as usize;
                     n
                 }),
@@ -659,7 +659,7 @@ pub fn make_workspace_host_for_bridge(
 /// the tool result regardless of what the agent's JS returns. Private —
 /// only the `workspace_api` dispatch wires a collector. `eval_budget` is the
 /// wall-clock budget of the enclosing eval, threaded to the bindings.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn make_workspace_host_with_pending(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -753,7 +753,7 @@ pub(super) const SUB_AGENT_CREATE_TOP_LEVEL_DENIED: &str =
 /// [`super::bindings::try_dispatch`], which owns the per-namespace method →
 /// trait mapping. Sub-agent `app.question.*` frames and methods gated by a
 /// disabled `[agentFeatures]` toggle are denied before dispatch.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn workspace_host_dispatch(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,

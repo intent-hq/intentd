@@ -156,7 +156,7 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
 /// prettyHostname, hasDisplay, locality, displayServer? }`. `displayServer` is
 /// omitted when no display server is detected. Pure (inputs injected) so it is
 /// unit-testable.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn host_status_json(
     os: &str,
     arch: &str,
@@ -771,11 +771,7 @@ async fn read_setting_string(api: &dyn WorkspaceApi, path: &str) -> Option<Strin
 /// non-whole / out-of-`u32`-range values, or when the lookup itself fails.
 /// `settings.get` reports `Number` settings as floats (`8192.0`), so the value
 /// is read via `as_f64` — `as_u64` would always be `None` on the wire shape.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::float_cmp
-)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn read_setting_u32(api: &dyn WorkspaceApi, path: &str) -> Option<u32> {
     let payload = api.settings_get(path.to_string()).await.ok()?;
     let n = payload.get("value")?.as_f64()?;
@@ -1046,7 +1042,7 @@ impl std::error::Error for OpenInEditorError {}
 /// silent failure. On a remote connection the intent is dispatched to the
 /// connected frontend as an FE-served reverse RPC (`host.openInEditor`) so the
 /// editor opens on the user's laptop (mirroring `host.openExternal`).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn open_in_editor(
     editor_id: &str,
     path: &str,

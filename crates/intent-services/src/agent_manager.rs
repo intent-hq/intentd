@@ -5236,7 +5236,7 @@ impl AgentManager {
     /// `list_busy` (both maps mutated under the `busy` lock, busy → `agent_ws`
     /// order). Returns `None` when the agent was not busy, otherwise the
     /// removed `agent_ws` entry.
-    #[allow(clippy::option_option)] // outer = was-busy, inner = the removed entry
+    #[expect(clippy::option_option)] // outer = was-busy, inner = the removed entry
     fn release_slot_sync(&self, agent_id: &AgentId) -> Option<Option<WorkspaceId>> {
         let mut busy = self.busy.lock().unwrap();
         if !busy.remove(agent_id) {
@@ -5519,7 +5519,7 @@ impl AgentManager {
     /// the `agent.retry` Error-clear (see [`AgentManager::persist_retry_status`])
     /// persists a non-active status without any turn having run, so it passes
     /// `false` and must not bump `lastActivity` (§10.1 turn-boundary policy).
-    #[allow(clippy::option_option)] // the nesting IS the untouched/clear/set tri-state
+    #[expect(clippy::option_option)] // the nesting IS the untouched/clear/set tri-state
     async fn persist_status_with_stop_reason(
         &self,
         agent_id: &AgentId,
@@ -7989,7 +7989,7 @@ impl AgentManager {
     /// sweep: `try_claim` check-and-claims into `reap_claims` under the
     /// `busy` lock, `release` drops the claim and records the id for the
     /// post-sweep drain kick ([`Self::kick_released`]).
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn reap_claim_fns(
         &self,
     ) -> (
@@ -8286,7 +8286,7 @@ const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 #[cfg(unix)]
 const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
 
-#[allow(clippy::similar_names)] // pid/pgid are the POSIX terms
+#[expect(clippy::similar_names)] // pid/pgid are the POSIX terms
 /// Terminate a spawned provider's WHOLE process tree (§5.6). The child is its
 /// own process-group leader (`process_group(0)` at spawn), so `killpg(pgid,…)`
 /// reaches every descendant — `kill_on_drop` alone only reaps the direct child,
@@ -8325,7 +8325,7 @@ async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) {
     let _ = child.start_kill();
 }
 
-#[allow(clippy::similar_names)] // pid/pgid are the POSIX terms
+#[expect(clippy::similar_names)] // pid/pgid are the POSIX terms
 /// Parallel shutdown kill sweep: terminate MANY provider process trees under
 /// ONE shared grace window. Every group is `SIGTERMed` up-front, then a single
 /// [`PROCESS_GROUP_TERM_GRACE`] window covers the whole batch, then every
@@ -10479,7 +10479,7 @@ async fn prepare_flush_turn(
 /// queue entry's `user_origin` flag): only those appends schedule the
 /// debounced `lastActivity` event (§10.1) — internal wakes, agent-to-agent
 /// deliveries and system-injected turns are not workspace-ordering activity.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn persist_user(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -10657,7 +10657,7 @@ fn spawn_backoff_from(env_val: Option<&str>) -> (Vec<u64>, bool) {
 /// rather than pulling in a `rand` dependency.
 // Intentional lossy float math: the mantissa mask keeps `r` exact in f64,
 // delays are far below 2^53, and the final float→int cast saturates.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
@@ -14408,7 +14408,7 @@ mod rebuild_spawn_opts_tests {
 }
 
 #[cfg(all(test, unix))]
-#[allow(clippy::used_underscore_binding)] // tests read the RAII `_extension` field; underscore documents production intent
+#[expect(clippy::used_underscore_binding)] // tests read the RAII `_extension` field; underscore documents production intent
 mod pi_extension_delivery_tests {
     //! Unit tests for the pi-extension MCP delivery spawn assembly: the two
     //! per-agent temp files (bundled extension + 0755 wrapper), the two spawn
