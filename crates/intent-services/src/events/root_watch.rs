@@ -570,8 +570,9 @@ mod tests {
     /// deterministically: `exists()` needs only search permission on the
     /// parent, but `inotify_add_watch` needs read permission on the
     /// directory itself, so every attempt fails with `EACCES` until the mode
-    /// is restored.
-    #[cfg(unix)]
+    /// is restored. Linux only: `FSEvents` on macOS has no such read check and
+    /// registers the unreadable root successfully.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[expect(clippy::await_holding_lock)]
     async fn failed_promotion_keeps_ancestor_watch_and_recovers() {

@@ -1041,42 +1041,50 @@ async fn user_negation_overrides_default_pattern() {
 /// deadline: after delayed setup consumes part of it, a never-arriving event
 /// fails within what is left, not after a fresh full wait. This is what keeps
 /// the watcher tests' worst case below nextest's slow-test kill
-/// (intent-hq/intent#4845 / #4852).
+/// (intent-hq/intent#4845 / #4852). Runs on tokio's paused clock so the
+/// timing assertions are virtual-time facts (to the timer's 1ms tick), not
+/// wall-clock bounds that host load could push past.
 #[tokio::test]
 async fn budget_bounds_delayed_setup_plus_missing_event_to_one_deadline() {
     let db = TempDb::new();
     let store = Store::open(&db.path).await.expect("open store");
     let bus = EventBus::new(store);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
+    tokio::time::pause();
 
     let total = Duration::from_millis(600);
+    let setup = Duration::from_millis(400);
+    let remainder = total.saturating_sub(setup);
+    let tick = Duration::from_millis(2);
     let budget = TestBudget::new(total);
     let started = Instant::now();
     // Delayed registration: consumes most of the budget before the event wait.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(setup).await;
+    assert!(budget.remaining().abs_diff(remainder) <= tick);
 
     let event_wait = Instant::now();
     let ev = next_for(&mut sub, "never/arrives.txt", None, budget.remaining()).await;
     assert!(ev.is_none(), "no event was ever published");
     assert!(
-        event_wait.elapsed() < total,
+        event_wait.elapsed().abs_diff(remainder) <= tick,
         "the event wait must take only the budget's remainder, not a fresh {total:?}: took {:?}",
         event_wait.elapsed()
     );
     assert!(
-        started.elapsed() < total + Duration::from_millis(200),
+        started.elapsed().abs_diff(total) <= tick,
         "setup plus event wait must end at the shared deadline: took {:?}",
         started.elapsed()
     );
     assert!(budget.remaining().is_zero(), "budget must be spent");
-    // A wait started after the budget is spent returns at once.
+    // A wait started after the budget is spent returns without advancing
+    // the clock at all.
     let late = Instant::now();
     assert!(
         next_for(&mut sub, "never/arrives.txt", None, budget.remaining())
             .await
             .is_none()
     );
-    assert!(late.elapsed() < Duration::from_millis(100));
+    assert_eq!(late.elapsed(), Duration::ZERO);
 }
 
 #[tokio::test]
