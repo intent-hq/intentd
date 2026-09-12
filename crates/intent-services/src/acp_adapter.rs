@@ -522,6 +522,7 @@ fn stderr_tail(stderr: &[String]) -> Option<String> {
 
 /// Grace window between SIGTERM and SIGKILL when reaping an adapter child
 /// (mirrors `host_exec::TERM_GRACE` / `mcp_servers::reap`).
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
 /// Kill the adapter child and reap it. Signals the whole process group (the

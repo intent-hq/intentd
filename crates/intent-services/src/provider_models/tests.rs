@@ -11,7 +11,9 @@ use super::parse::{
 use super::parse::{
     is_auth_required_error, parse_acp_models, parse_codex_acp_models, parse_opencode_models,
 };
-use super::probe::{exit_attribution, ProbeError};
+#[cfg(unix)]
+use super::probe::exit_attribution;
+use super::probe::ProbeError;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
