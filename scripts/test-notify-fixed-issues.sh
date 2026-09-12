@@ -84,11 +84,12 @@ assert_contains() {
 assert_not_contains() {
   ! grep -qF -- "$2" "$1" || fail "$3: expected output to NOT contain: $2"
 }
-# fixture N STATE [linked-pr-line...]: writes the stub's answer for issue N.
+# fixture N STATE [linked-pr-line...]: writes the stub's answer for issue N;
+# FIXTURE_HAS_NEXT_PAGE (default false) is the pageInfo.hasNextPage line.
 fixture() {
   local n="$1" state="$2"
   shift 2
-  { printf '%s\nfalse\n' "$state"; printf '%s\n' "$@"; } >"$STUB_ISSUES_DIR/$n"
+  { printf '%s\n%s\n' "$state" "${FIXTURE_HAS_NEXT_PAGE:-false}"; printf '%s\n' "$@"; } >"$STUB_ISSUES_DIR/$n"
 }
 # run SCENARIO EXPECTED_STATUS: runs a dry-run for intentd v1.2.3 over the
 # fixture range, capturing stdout (comment previews) and stderr (log).
@@ -167,5 +168,20 @@ rm -f "$STUB_ISSUES_DIR/10"
 run s8 1
 assert_control s8
 assert_contains "$tmp/err.s8" "warning: issue #10: could not enumerate linked intent-hq/intentd fix PRs; completeness indeterminate, skipping" s8
+
+truncated_warning="warning: issue #10: more than 100 linked PRs (result truncated); completeness indeterminate, skipping"
+
+echo "scenario 9: truncated linked-PR list on a closed issue is indeterminate and exits 1"
+FIXTURE_HAS_NEXT_PAGE=true fixture 10 CLOSED "77 MERGED $contained_sha"
+run s9 1
+assert_control s9
+assert_contains "$tmp/err.s9" "$truncated_warning" s9
+
+echo "scenario 10: truncated linked-PR list on an open issue is indeterminate and exits 1"
+FIXTURE_HAS_NEXT_PAGE=true fixture 10 OPEN "77 MERGED $contained_sha"
+run s10 1
+assert_control s10
+assert_contains "$tmp/err.s10" "$truncated_warning" s10
+assert_not_contains "$tmp/err.s10" "issue #10: issue is still open; staying silent" s10
 
 echo "OK: all scenarios passed"
