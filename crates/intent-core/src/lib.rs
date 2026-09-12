@@ -28,6 +28,7 @@ pub mod ids;
 pub mod model;
 pub mod path_utils;
 pub mod replay_preview;
+pub mod repo_ref;
 pub mod secrets;
 pub mod server_control;
 pub mod settings_file;
@@ -110,6 +111,7 @@ pub use model::{
     BrowserTabVisibility,
 };
 pub use path_utils::prewarm_login_shell_path;
+pub use repo_ref::RepoRef;
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
 pub use server_control::ServerControl;
 pub use settings_file::{

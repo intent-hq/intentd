@@ -1,9 +1,13 @@
 //! Hidden, daemon-managed cache of read-only GitHub clones.
 //!
 //! Layout: `<cache_root>/<owner>/<repo>` — a normal clone with the remote's
-//! default branch checked out. The caller passes the cache root (e.g.
-//! `<workspaces_root>/.repo-cache`, dot-prefixed so it stays invisible to
-//! users and recent-repo derivation); this module never reads config.
+//! default branch checked out. The `<owner>/<repo>` key is the case-folded
+//! [`RepoRef`] identity (ASCII lowercase), so case-variant slugs of one
+//! repository (`Intent-HQ/IntentD`, `intent-hq/intentd`) share a single
+//! slot even on a case-sensitive filesystem. The caller passes the cache
+//! root (e.g. `<workspaces_root>/.repo-cache`, dot-prefixed so it stays
+//! invisible to users and recent-repo derivation); this module never reads
+//! config.
 //!
 //! [`ensure_cached_repo`] is the single entry point: it serializes callers on
 //! a per-repo async lock, then either clones fresh (cache miss) or refreshes
@@ -30,7 +34,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use git2::Repository;
-use intent_core::{Error, Result};
+use intent_core::{Error, RepoRef, Result};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::auth::{token_helper_config, TOKEN_ENV};
@@ -198,10 +202,114 @@ fn forget_fresh(cache_path: &Path) {
     map.remove(cache_path);
 }
 
-/// Ensure `<cache_root>/<owner>/<repo>` holds a fresh cached clone of
-/// `github_url` and return that path.
+/// The cache slot for `owner`/`repo`: `<cache_root>/<owner>/<repo>` with
+/// both segments case-folded per [`RepoRef::identity_parts`], so every
+/// casing of one slug resolves to (and locks on) the same path. Callers
+/// validate the raw segments first.
+fn cache_path_for(cache_root: &Path, owner: &str, repo: &str) -> PathBuf {
+    let (owner, repo) = RepoRef::new(owner, repo).identity_parts();
+    cache_root.join(owner).join(repo)
+}
+
+/// Whether `entry` is a real directory — a symlink (to a directory or
+/// anywhere else) is not. `DirEntry::file_type` never follows symlinks.
+fn is_real_dir_entry(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|t| t.is_dir())
+}
+
+/// Adopt a pre-existing case-variant slot into the folded `cache_path`
+/// (case-sensitive filesystems only see this: a cache populated before the
+/// key was folded may sit at `<Owner>/<Repo>`). Runs only on a miss at the
+/// folded path; scans `cache_root` for an `<o>/<r>` directory whose
+/// [`RepoRef`] identity matches and renames it into place, then prunes the
+/// old owner dir if it emptied. Best effort — any failure leaves the miss
+/// in place and the caller clones fresh.
 ///
-/// - Cache miss: full clone into the cache path.
+/// The scan is confined to real directories exactly two levels under
+/// `cache_root`: symlinked owner or repo entries are never followed (so
+/// nothing outside the cache can be moved into it), an owner entry is only
+/// descended when its name already matches `owner`, and a folded parent
+/// that resolves through a symlink is rejected (so the rename never writes
+/// outside the cache). The rename itself never clobbers content: the
+/// destination is re-checked right before, and `rename(2)` refuses to
+/// replace a non-empty directory or a non-directory, so at worst an empty
+/// directory that raced into place is replaced.
+fn adopt_case_variant_cache(cache_root: &Path, owner: &str, repo: &str, cache_path: &Path) {
+    if cache_path.exists() {
+        return;
+    }
+    let wanted = RepoRef::new(owner, repo);
+    let Some(parent) = cache_path.parent() else {
+        return;
+    };
+    let Ok(owners) = std::fs::read_dir(cache_root) else {
+        return;
+    };
+    for owner_entry in owners.flatten() {
+        let Ok(owner_name) = owner_entry.file_name().into_string() else {
+            continue;
+        };
+        if !is_real_dir_entry(&owner_entry) || RepoRef::new(owner_name.as_str(), repo) != wanted {
+            continue;
+        }
+        let Ok(repos) = std::fs::read_dir(owner_entry.path()) else {
+            continue;
+        };
+        for repo_entry in repos.flatten() {
+            let Ok(repo_name) = repo_entry.file_name().into_string() else {
+                continue;
+            };
+            let candidate = repo_entry.path();
+            if candidate == cache_path
+                || !is_real_dir_entry(&repo_entry)
+                || RepoRef::new(owner_name.as_str(), repo_name.as_str()) != wanted
+            {
+                continue;
+            }
+            let adopted = (|| {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if !std::fs::symlink_metadata(parent)?.is_dir() {
+                    return Err(std::io::Error::other(
+                        "folded owner path is not a real directory",
+                    ));
+                }
+                if std::fs::symlink_metadata(cache_path).is_ok() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "folded slot appeared during adoption",
+                    ));
+                }
+                std::fs::rename(&candidate, cache_path)
+            })();
+            if let Err(e) = adopted {
+                tracing::warn!(
+                    error = %e,
+                    from = %candidate.display(),
+                    to = %cache_path.display(),
+                    "repo cache case-variant slot could not be adopted; cloning fresh"
+                );
+                return;
+            }
+            tracing::info!(
+                from = %candidate.display(),
+                to = %cache_path.display(),
+                "adopted case-variant repo cache slot"
+            );
+            // Prune the vacated owner dir only when it is now empty.
+            let _ = std::fs::remove_dir(owner_entry.path());
+            return;
+        }
+    }
+}
+
+/// Ensure `<cache_root>/<owner>/<repo>` (case-folded, see
+/// [`cache_path_for`]) holds a fresh cached clone of `github_url` and return
+/// that path.
+///
+/// - Cache miss: full clone into the cache path. A pre-existing case-variant
+///   slot is adopted by rename first (see [`adopt_case_variant_cache`]).
 /// - Cache hit: `git fetch --prune origin` + hard reset of the remote default
 ///   branch. Any anomaly self-heals by deleting the cache dir and re-cloning —
 ///   refresh never fails the flow.
@@ -243,15 +351,19 @@ pub async fn ensure_cached_repo_with_progress(
 ) -> Result<PathBuf> {
     validate_segment("owner", owner)?;
     validate_segment("repo", repo)?;
-    let cache_path = cache_root.join(owner).join(repo);
+    let cache_path = cache_path_for(cache_root, owner, repo);
 
     let lock = lock_for(&cache_path);
     let _guard = lock.lock().await;
 
     let path = cache_path.clone();
+    let root = cache_root.to_path_buf();
+    let owner = owner.to_string();
+    let repo = repo.to_string();
     let url = github_url.to_string();
     let token = token.map(str::to_owned);
     tokio::task::spawn_blocking(move || {
+        adopt_case_variant_cache(&root, &owner, &repo, &path);
         ensure_blocking(&path, &url, token.as_deref(), progress.as_ref())
     })
     .await
@@ -304,11 +416,12 @@ fn ensure_blocking_with_ttl(
                 }
             }
         } else {
-            // The cache is keyed by `<owner>/<repo>` segments only, so two
-            // different hosts (or two `file://` sources) carrying the same
-            // owner/repo pair must never serve each other's content. A cache
-            // whose `origin` differs from the requested URL is stale, not a
-            // hit — wipe and re-clone from the requested URL.
+            // The cache is keyed by the case-folded `<owner>/<repo>` segments
+            // only, so two different hosts (or two `file://` sources) carrying
+            // the same owner/repo pair must never serve each other's content. A cache
+            // whose `origin` names a different source than the requested URL
+            // (see [`origin_url_matches`]) is stale, not a hit — wipe and
+            // re-clone from the requested URL.
             tracing::warn!(
                 path = %cache_path.display(),
                 "repo cache origin does not match the requested URL; re-cloning"
@@ -326,9 +439,10 @@ fn ensure_blocking_with_ttl(
     Ok(())
 }
 
-/// Whether the cache's `origin` remote points at exactly `github_url`. Any
-/// failure to read it (unopenable repo, missing remote) counts as a mismatch
-/// — the caller self-heals by re-cloning.
+/// Whether the cache's `origin` remote names the same source as `github_url`
+/// (see [`origin_url_matches`]). Any failure to read it (unopenable repo,
+/// missing remote) counts as a mismatch — the caller self-heals by
+/// re-cloning.
 fn origin_matches(cache_path: &Path, github_url: &str) -> bool {
     let Ok(repo) = Repository::open(cache_path) else {
         return false;
@@ -336,55 +450,89 @@ fn origin_matches(cache_path: &Path, github_url: &str) -> bool {
     let Ok(remote) = repo.find_remote("origin") else {
         return false;
     };
-    remote.url().ok() == Some(github_url)
+    remote
+        .url()
+        .ok()
+        .is_some_and(|origin| origin_url_matches(origin, github_url))
+}
+
+/// Whether a cached slot's `origin` URL and a requested URL name the same
+/// source. Two GitHub URLs (per [`github_slug`]) compare by identity — host
+/// case-insensitive, owner/repo under [`RepoRef`] equality — because every
+/// casing of one slug shares a single folded slot, so a case-variant request
+/// must reuse it rather than wipe and re-clone. Anything else (another host,
+/// a `file://` or local-path source) compares byte-for-byte, so two sources
+/// that merely share an owner/repo pair never serve each other's content.
+fn origin_url_matches(origin: &str, requested: &str) -> bool {
+    if origin == requested {
+        return true;
+    }
+    matches!(
+        (github_slug(origin), github_slug(requested)),
+        (Some(cached), Some(wanted)) if cached == wanted
+    )
 }
 
 /// Whether `url` is a GitHub URL for exactly `owner`/`repo` — the check the
 /// GitHub-scoped [`list_cached_branches`] reader uses to confirm a cached
-/// slot's `origin`. Accepts the HTTPS/SSH URL and scp-like forms, an optional
-/// `.git` suffix, userinfo, and a port; host, owner, and repo compare
-/// case-insensitively (GitHub slugs are case-insensitive). Anything not on
-/// `github.com` — another host or a local path — is not a GitHub slot.
+/// slot's `origin`. Owner/repo compare under [`RepoRef`] equality (GitHub
+/// slugs are case-insensitive); the accepted URL forms are those of
+/// [`github_slug`].
 fn origin_is_github_slot(url: &str, owner: &str, repo: &str) -> bool {
+    github_slug(url).is_some_and(|slug| slug == RepoRef::new(owner, repo))
+}
+
+/// The `owner`/`repo` slug a GitHub URL names, or `None` when `url` is not a
+/// `github.com` URL. Accepts the HTTPS/SSH URL and scp-like forms, an
+/// optional `.git` suffix, userinfo, and a port; the host compares
+/// case-insensitively. Anything not on `github.com` — another host or a
+/// local path — is not a GitHub URL. The returned slug keeps the URL's
+/// casing; compare it under [`RepoRef`] equality.
+///
+/// The authority is isolated before userinfo is stripped: for a scheme URL
+/// it is the span between `://` and the first `/`, and for the scp-like
+/// form the span before the first `:`, which must contain no `/`. An `@`
+/// in the path (`https://example.invalid/a@github.com/acme/widget`) or in a
+/// local path (`/tmp/a@github.com:acme/widget`) therefore never turns a
+/// foreign source into a GitHub URL.
+fn github_slug(url: &str) -> Option<RepoRef> {
     let trimmed = url.trim().trim_end_matches('/');
-    let (rest, scp_like) = match trimmed.split_once("://") {
-        Some((scheme, rest)) => {
-            let known = ["https", "http", "ssh", "git"]
-                .iter()
-                .any(|s| scheme.eq_ignore_ascii_case(s));
-            if !known {
-                return false;
-            }
-            (rest, false)
+    let (authority, path) = if let Some((scheme, rest)) = trimmed.split_once("://") {
+        let known = ["https", "http", "ssh", "git"]
+            .iter()
+            .any(|s| scheme.eq_ignore_ascii_case(s));
+        if !known {
+            return None;
         }
-        // No scheme: only the scp-like `user@host:owner/repo` form qualifies.
-        None => (trimmed, true),
-    };
-    let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
-    let (authority, path) = if scp_like {
-        match rest.split_once(':') {
-            Some(pair) => pair,
-            None => return false,
+        let end = rest.find(['/', '?', '#'])?;
+        let (authority, path) = rest.split_at(end);
+        if !path.starts_with('/') {
+            return None;
         }
+        let path = path.split(['?', '#']).next().unwrap_or(path);
+        (authority, path)
     } else {
-        match rest.split_once('/') {
-            Some(pair) => pair,
-            None => return false,
+        // No scheme: only the scp-like `user@host:owner/repo` form
+        // qualifies, and git itself treats anything with a `/` before the
+        // first `:` (absolute, `./`, `../` paths) as a local path.
+        let (authority, path) = trimmed.split_once(':')?;
+        if authority.contains('/') {
+            return None;
         }
+        (authority, path)
     };
-    let host = authority.split(':').next().unwrap_or(authority);
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host_port.split(':').next().unwrap_or(host_port);
     if !host.eq_ignore_ascii_case("github.com") {
-        return false;
+        return None;
     }
     let mut segments = path.split('/').filter(|s| !s.is_empty());
-    let (Some(o), Some(r)) = (segments.next(), segments.next()) else {
-        return false;
-    };
+    let (o, r) = (segments.next()?, segments.next()?);
     if segments.next().is_some() {
-        return false;
+        return None;
     }
     let r = r.strip_suffix(".git").unwrap_or(r);
-    o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo)
+    Some(RepoRef::new(o, r))
 }
 
 /// Refresh an existing cache: fetch + prune, re-resolve the remote's default
@@ -629,7 +777,8 @@ pub struct CachedBranches {
 }
 
 /// List branches from the cached clone at `<cache_root>/<owner>/<repo>`
-/// without touching the network. A cache miss (missing dir or an unopenable
+/// (case-folded, see [`cache_path_for`]) without touching the network. A
+/// cache miss (missing dir or an unopenable
 /// repo) is a graceful `Ok(None)`, never an error. Briefly holds the
 /// per-repo cache lock so a concurrent [`ensure_cached_repo`] refresh or
 /// re-clone is never observed mid-mutation — but only via `try_lock`: when
@@ -641,8 +790,8 @@ pub struct CachedBranches {
 /// trustworthy) folds to the same graceful miss — a deliberate trade-off
 /// favoring promptness over a hit during that briefer window.
 ///
-/// The cache is keyed by `<owner>/<repo>` segments only, while creation
-/// accepts GitHub-style URLs from any host and treats same-named origins as
+/// The cache is keyed by the case-folded `<owner>/<repo>` segments only, while
+/// creation accepts GitHub-style URLs from any host and treats same-named origins as
 /// distinct (see [`ensure_cached_repo`]'s origin check). This GitHub-scoped
 /// reader therefore verifies the slot's `origin` actually points at
 /// `github.com/<owner>/<repo>`; a slot occupied by another host's clone (or
@@ -658,7 +807,7 @@ pub async fn list_cached_branches(
 ) -> Result<Option<CachedBranches>> {
     validate_segment("owner", owner)?;
     validate_segment("repo", repo)?;
-    let cache_path = cache_root.join(owner).join(repo);
+    let cache_path = cache_path_for(cache_root, owner, repo);
 
     let lock = lock_for(&cache_path);
     let Ok(_guard) = lock.try_lock() else {
@@ -1643,6 +1792,205 @@ mod tests {
         assert_eq!(head_sha(&path), head_sha(origin.path()));
     }
 
+    /// Case-variant slugs of one repository resolve to ONE folded slot: the
+    /// second ensure lands on the same path and refreshes (marker survives)
+    /// instead of cloning a parallel `<Owner>/<Repo>` copy.
+    #[tokio::test]
+    async fn case_variant_slugs_share_one_cache_slot() {
+        let origin = init_repo("repocache-origin-casefold");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("casefold");
+        let url = file_url(origin.path());
+
+        let path = ensure_cached_repo(root.path(), &url, "Intent-HQ", "IntentD", None)
+            .await
+            .unwrap();
+        assert_eq!(path, root.path().join("intent-hq").join("intentd"));
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        forget_fresh(&path);
+        let path2 = ensure_cached_repo(root.path(), &url, "intent-hq", "intentd", None)
+            .await
+            .unwrap();
+
+        assert_eq!(path, path2);
+        assert!(marker.exists(), "case-variant slug must not clone twice");
+        // Assert the real entry names: on a case-insensitive filesystem a
+        // lookup of `Intent-HQ` would alias `intent-hq`, proving nothing.
+        assert_eq!(
+            dir_names(root.path()),
+            vec!["intent-hq".to_string()],
+            "only the folded owner dir may exist"
+        );
+        assert_eq!(
+            dir_names(&root.path().join("intent-hq")),
+            vec!["intentd".to_string()],
+            "only the folded repo dir may exist"
+        );
+    }
+
+    /// Sorted entry names directly under `dir`.
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A slot populated before the key was folded (`<Owner>/<Repo>` on a
+    /// case-sensitive filesystem) is adopted by rename on the next ensure —
+    /// the clone is reused (marker survives), not re-cloned, and the vacated
+    /// owner dir is pruned.
+    #[tokio::test]
+    async fn preexisting_case_variant_slot_is_adopted_by_rename() {
+        let origin = init_repo("repocache-origin-adopt");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("adopt");
+        let url = file_url(origin.path());
+
+        let folded = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let marker = folded.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        // Move the slot to a raw-cased location, as a pre-fold cache would sit.
+        let legacy_owner = root.path().join("Acme");
+        std::fs::rename(root.path().join("acme"), &legacy_owner).unwrap();
+        std::fs::rename(legacy_owner.join("widget"), legacy_owner.join("Widget")).unwrap();
+        let case_sensitive_fs = !folded.exists();
+
+        forget_fresh(&folded);
+        let path = ensure_cached_repo(root.path(), &url, "Acme", "Widget", None)
+            .await
+            .unwrap();
+
+        assert_eq!(path, folded);
+        assert!(
+            marker.exists(),
+            "adoption must reuse the clone, not re-clone"
+        );
+        assert_eq!(head_sha(&path), head_sha(origin.path()));
+        if case_sensitive_fs {
+            assert!(
+                !legacy_owner.exists(),
+                "vacated raw-cased owner dir must be pruned"
+            );
+        }
+    }
+
+    /// Plant a fake legacy slot `<root>/<owner>/<repo>` holding one file.
+    fn plant_slot(root: &Path, owner: &str, repo: &str) -> PathBuf {
+        let dir = root.join(owner).join(repo);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker"), "keep").unwrap();
+        dir
+    }
+
+    /// Adoption confines its scan to real `<owner>/<repo>` directories:
+    /// unrelated owners and repos are left alone, and an already-populated
+    /// folded slot is never clobbered by a case variant sitting next to it.
+    #[test]
+    fn adoption_ignores_nonmatching_dirs_and_never_clobbers_folded_slot() {
+        let root = CacheRoot::new("adopt-nonmatch");
+        let folded = root.path().join("acme").join("widget");
+        let other_repo = plant_slot(root.path(), "Acme", "other");
+        let other_owner = plant_slot(root.path(), "other", "Widget");
+
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+        assert!(!folded.exists(), "no matching variant: nothing to adopt");
+        assert!(other_repo.join("marker").exists());
+        assert!(other_owner.join("marker").exists());
+
+        // A populated folded slot plus a case variant: the variant must stay
+        // put and the folded content must survive untouched.
+        std::fs::create_dir_all(&folded).unwrap();
+        std::fs::write(folded.join("marker"), "folded").unwrap();
+        if root
+            .path()
+            .join("Acme")
+            .join("Widget")
+            .join("marker")
+            .exists()
+        {
+            return; // case-insensitive filesystem: the two spellings alias
+        }
+        let variant = plant_slot(root.path(), "Acme", "Widget");
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+        assert_eq!(
+            std::fs::read_to_string(folded.join("marker")).unwrap(),
+            "folded"
+        );
+        assert!(variant.join("marker").exists(), "variant must not move");
+    }
+
+    /// A symlinked owner entry is never descended: a directory outside the
+    /// cache must not be moved into the folded slot through it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adoption_does_not_follow_owner_symlink() {
+        let root = CacheRoot::new("adopt-owner-symlink");
+        let outside = CacheRoot::new("adopt-owner-symlink-outside");
+        let victim = plant_slot(outside.path(), "x", "Widget");
+        std::os::unix::fs::symlink(outside.path().join("x"), root.path().join("Acme")).unwrap();
+        let folded = root.path().join("acme").join("widget");
+
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+
+        assert!(!folded.exists(), "must not adopt through an owner symlink");
+        assert!(victim.join("marker").exists(), "outside dir must stay put");
+        assert!(root
+            .path()
+            .join("Acme")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink());
+    }
+
+    /// A symlinked repo entry is never adopted, even when its name matches.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adoption_does_not_follow_repo_symlink() {
+        let root = CacheRoot::new("adopt-repo-symlink");
+        let outside = CacheRoot::new("adopt-repo-symlink-outside");
+        let victim = plant_slot(outside.path(), "x", "y");
+        let legacy_owner = root.path().join("Acme");
+        std::fs::create_dir_all(&legacy_owner).unwrap();
+        let link = legacy_owner.join("Widget");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let folded = root.path().join("acme").join("widget");
+
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+
+        assert!(!folded.exists(), "must not adopt a repo symlink");
+        assert!(link.symlink_metadata().unwrap().is_symlink(), "link stays");
+        assert!(victim.join("marker").exists(), "outside dir must stay put");
+    }
+
+    /// A folded owner path that is itself a symlink is rejected: the rename
+    /// must never write outside the cache root. The legacy slot stays put.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adoption_rejects_symlinked_folded_owner() {
+        let root = CacheRoot::new("adopt-dest-symlink");
+        let outside = CacheRoot::new("adopt-dest-symlink-outside");
+        let legacy = plant_slot(root.path(), "Acme", "Widget");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("acme")).unwrap();
+        let folded = root.path().join("acme").join("widget");
+
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+
+        assert!(legacy.join("marker").exists(), "legacy slot must stay put");
+        assert!(
+            !outside.path().join("widget").exists(),
+            "nothing may be written through the folded owner symlink"
+        );
+        assert!(!folded.exists());
+    }
+
     /// A cache that diverged from origin (local commit) is clobbered back to
     /// the origin tip by the refresh's hard reset — still no re-clone.
     #[tokio::test]
@@ -1817,6 +2165,181 @@ mod tests {
             "host B\n"
         );
         assert_eq!(head_sha(&path), head_sha(origin_b.path()));
+    }
+
+    /// Seed a cache slot from a local origin, then point its `origin` remote
+    /// at `origin_url` so the write-side origin check sees a URL it never
+    /// fetches from. Returns the slot path and a marker planted in `.git`
+    /// that only survives when the slot is reused.
+    async fn seeded_slot_with_origin(tag: &str, origin_url: &str) -> (CacheRoot, PathBuf, PathBuf) {
+        let origin = init_repo(&format!("repocache-origin-{tag}"));
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new(tag);
+        let path = ensure_cached_repo(
+            root.path(),
+            &file_url(origin.path()),
+            "acme",
+            "widget",
+            None,
+        )
+        .await
+        .unwrap();
+        Repository::open(&path)
+            .unwrap()
+            .remote_set_url("origin", origin_url)
+            .unwrap();
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+        (root, path, marker)
+    }
+
+    /// All casings of one GitHub slug share the folded slot, so a request
+    /// whose URL differs from the slot's `origin` only in case (host or
+    /// slug, `.git` optional) is a hit: within the freshness TTL the ensure
+    /// takes the `fresh` skip and never escalates to `Step("re-clone")`.
+    #[tokio::test]
+    async fn case_variant_github_url_reuses_slot_without_reclone() {
+        let (_root, path, marker) =
+            seeded_slot_with_origin("origincase", "https://github.com/Acme/Widget.git").await;
+
+        for requested in [
+            "https://github.com/acme/widget.git",
+            "https://GitHub.com/ACME/WIDGET",
+        ] {
+            let (cb, events) = event_collector();
+            ensure_blocking_with_ttl(&path, requested, None, Some(&cb), Duration::from_secs(600))
+                .unwrap();
+            let steps: Vec<&str> = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|ev| match ev {
+                    CacheEnsureEvent::Step(s) => Some(*s),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(steps, vec!["fresh"], "{requested}: {steps:?}");
+            assert!(
+                marker.exists(),
+                "{requested}: case-variant URL must not re-clone"
+            );
+        }
+    }
+
+    /// The write-side origin check folds only GitHub slug identity: a
+    /// foreign host or a different slug on github.com is still a mismatch,
+    /// and non-GitHub (`file://`, local path) origins compare byte-for-byte
+    /// so a case-variant local source stays isolated.
+    #[tokio::test]
+    async fn origin_matches_isolates_foreign_and_local_origins() {
+        let (_root, path, _marker) =
+            seeded_slot_with_origin("originforeign", "https://github.com/Acme/Widget.git").await;
+        assert!(origin_matches(&path, "https://github.com/acme/widget"));
+        assert!(origin_matches(&path, "git@github.com:acme/widget.git"));
+        for requested in [
+            "https://gitlab.com/acme/widget.git",
+            "https://ghe.example.com/Acme/Widget.git",
+            "https://github.com/other/widget.git",
+            "https://github.com/acme/other.git",
+            "https://github.com/acme/widget/extra",
+            "file:///tmp/acme/widget",
+            "https://example.invalid/a@github.com/acme/widget.git",
+            "/tmp/a@github.com:acme/widget.git",
+        ] {
+            assert!(!origin_matches(&path, requested), "{requested}");
+        }
+
+        let local = "file:///tmp/Acme/Widget";
+        Repository::open(&path)
+            .unwrap()
+            .remote_set_url("origin", local)
+            .unwrap();
+        assert!(origin_matches(&path, local));
+        assert!(
+            !origin_matches(&path, "file:///tmp/acme/widget"),
+            "local origins never fold case"
+        );
+        assert!(!origin_matches(&path, "https://github.com/Acme/Widget.git"));
+    }
+
+    /// [`origin_url_matches`] is pure: GitHub URLs match by folded slug
+    /// across URL forms; everything else requires byte equality.
+    #[test]
+    fn origin_url_matches_folds_github_slugs_only() {
+        assert!(origin_url_matches(
+            "https://github.com/Acme/Widget.git",
+            "https://github.com/acme/widget.git"
+        ));
+        assert!(origin_url_matches(
+            "https://github.com/acme/widget.git",
+            "https://GITHUB.COM/acme/widget"
+        ));
+        assert!(origin_url_matches(
+            "https://gitlab.com/acme/widget.git",
+            "https://gitlab.com/acme/widget.git"
+        ));
+        assert!(!origin_url_matches(
+            "https://gitlab.com/Acme/Widget.git",
+            "https://gitlab.com/acme/widget.git"
+        ));
+        assert!(!origin_url_matches(
+            "https://github.com/acme/widget.git",
+            "https://gitlab.com/acme/widget.git"
+        ));
+        assert!(!origin_url_matches(
+            "https://github.com/acme/widget.git",
+            "https://github.com/acme/other.git"
+        ));
+        assert!(!origin_url_matches("/tmp/Acme/Widget", "/tmp/acme/widget"));
+        // An `@` in a path or a local path never folds into the GitHub slot,
+        // on either side of the comparison (mirrors the reader-side set in
+        // `origin_is_github_slot_recognizes_github_urls`).
+        for foreign in [
+            "https://example.invalid/a@github.com/acme/widget.git",
+            "/tmp/a@github.com:acme/widget.git",
+            "https://github.com.evil.example/acme/widget",
+            "./a@github.com:acme/widget.git",
+            "file:///tmp/a@github.com:acme/widget.git",
+        ] {
+            assert!(
+                !origin_url_matches("https://github.com/acme/widget.git", foreign),
+                "{foreign}"
+            );
+            assert!(
+                !origin_url_matches(foreign, "https://github.com/acme/widget.git"),
+                "{foreign}"
+            );
+            assert!(origin_url_matches(foreign, foreign), "{foreign}");
+        }
+    }
+
+    /// [`github_slug`] isolates the URL authority before stripping userinfo,
+    /// so an `@` in a path never promotes a foreign or local source to a
+    /// GitHub URL; the scp-like form requires no `/` before its first `:`.
+    #[test]
+    fn github_slug_isolates_authority_before_userinfo() {
+        let widget = RepoRef::new("acme", "widget");
+        for url in [
+            "ssh://git@github.com:22/acme/widget.git",
+            "git@github.com:acme/widget.git",
+            "https://oauth2:tok@github.com/acme/widget.git",
+            "https://x@github.com/acme/widget.git?ref=main#frag",
+            "https://user@example.invalid@github.com/acme/widget",
+        ] {
+            assert_eq!(github_slug(url), Some(widget.clone()), "{url}");
+        }
+        for url in [
+            "https://example.invalid/a@github.com/acme/widget.git",
+            "/tmp/a@github.com:acme/widget.git",
+            "https://github.com.evil.example/acme/widget",
+            "./a@github.com:acme/widget.git",
+            "../a@github.com:acme/widget",
+            "C:\\repos\\a@github.com:acme\\widget",
+            "file:///tmp/a@github.com:acme/widget.git",
+            "https://github.com?x=a@github.com/acme/widget",
+        ] {
+            assert_eq!(github_slug(url), None, "{url}");
+        }
     }
 
     /// Untracked pollution in the cache work tree (e.g. leftovers from a
@@ -2109,8 +2632,9 @@ mod tests {
     }
 
     /// [`origin_is_github_slot`] URL-form coverage: HTTPS/SSH/scp-like
-    /// github.com origins for the slug match (case-insensitively, `.git`
-    /// optional); other hosts, schemes, slugs, and path shapes do not.
+    /// github.com origins for the slug match (case-insensitively on both the
+    /// URL and the requested owner/repo, `.git` optional); other hosts,
+    /// schemes, slugs, and path shapes do not.
     #[test]
     fn origin_is_github_slot_recognizes_github_urls() {
         for url in [
@@ -2124,6 +2648,7 @@ mod tests {
             "git@github.com:acme/widget.git",
         ] {
             assert!(origin_is_github_slot(url, "acme", "widget"), "{url}");
+            assert!(origin_is_github_slot(url, "ACME", "Widget"), "{url}");
         }
         for url in [
             "https://gitlab.com/acme/widget.git",
@@ -2136,6 +2661,8 @@ mod tests {
             "https://github.com/widget.git",
             "https://github.com.evil.com/acme/widget.git",
             "git@gitlab.com:acme/widget.git",
+            "https://example.invalid/a@github.com/acme/widget.git",
+            "/tmp/a@github.com:acme/widget.git",
         ] {
             assert!(!origin_is_github_slot(url, "acme", "widget"), "{url}");
         }

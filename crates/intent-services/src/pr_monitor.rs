@@ -130,7 +130,7 @@ pub(crate) fn pr_monitor_fetches_per_tick(
 type PrKey = (String, String, i64);
 
 fn pr_key(m: &PrMonitor) -> PrKey {
-    let (owner, name) = RepoRef::new(&m.repo_owner, &m.repo_name).identity_parts();
+    let (owner, name) = m.repo().identity_parts();
     (owner, name, m.pr_number)
 }
 
@@ -1434,7 +1434,7 @@ impl Services {
             return Ok(false);
         }
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
+        let repo_ref = monitor.repo();
         let shared =
             match fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number.cast_unsigned())
                 .await
@@ -1572,7 +1572,7 @@ impl Services {
                     continue;
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
+                    let repo_ref = monitor.repo();
                     // The timeout is defense in depth above the client-level
                     // network timeouts: a fetch that pends indefinitely maps
                     // to an error (recorded as `lastError` below) instead of
@@ -2206,7 +2206,8 @@ impl Services {
             pr_ops::parse_repo_slug(&slug)
         } else {
             let ws = self.store.get_workspace(workspace_id).await?;
-            pr_ops::repo_of(&ws)
+            let RepoRef { owner, name } = pr_ops::repo_of(&ws)?;
+            Ok((owner, name))
         }
     }
 

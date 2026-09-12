@@ -4398,10 +4398,9 @@ impl Services {
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
         use pr_ops::PrRefreshOutcome;
-        let (Some(owner), Some(name)) = (root.repo_owner.clone(), root.repo_name.clone()) else {
+        let Some(repo_ref) = root.repo() else {
             return Ok(PrRefreshOutcome::Skipped);
         };
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, name);
         // The live HEAD read is git I/O (roots may live on network/FUSE
         // mounts), so it runs on the blocking pool — never inline on the
         // runtime.
@@ -4645,10 +4644,9 @@ impl Services {
         if ws.is_remote || ws.archived {
             return Ok(PrRefreshOutcome::Skipped);
         }
-        let Ok((owner, repo)) = pr_ops::repo_of(&ws) else {
+        let Ok(repo_ref) = pr_ops::repo_of(&ws) else {
             return Ok(PrRefreshOutcome::Skipped);
         };
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         if let Some(number) = ws.pr_number {
             let pr = sc
@@ -9342,14 +9340,14 @@ async fn sibling_workspace_or_throw(
 /// `None` when the workspace has no complete GitHub identity (local-only
 /// repo, or not yet backfilled).
 fn github_repository_identity(ws: &Workspace) -> Option<(String, String)> {
-    let owner = ws.repository_owner.as_deref()?.trim();
-    let name = ws.repository_name.as_deref()?.trim();
-    let (owner, name) = intent_sourcecontrol::RepoRef::new(owner, name).identity_parts();
-    let name = name.strip_suffix(".git").unwrap_or(&name);
+    let (owner, name) = ws.repo()?.identity_parts();
+    let owner = owner.trim();
+    let name = name.trim();
+    let name = name.strip_suffix(".git").unwrap_or(name);
     if owner.is_empty() || name.is_empty() {
         return None;
     }
-    Some((owner, name.to_string()))
+    Some((owner.to_string(), name.to_string()))
 }
 
 fn nonempty_repository_path(ws: &Workspace) -> Option<&str> {
@@ -27069,10 +27067,9 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         Box::pin(async move {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let repo_ref = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc
                 .get_pr(&repo_ref, number)
                 .await
@@ -27132,13 +27129,15 @@ impl WorkspaceApi for Services {
             // Cross-repo override (`{ repo: "owner/name" }`) wins over the
             // workspace repo; either way the resolved repo is echoed in the
             // result so a wrong-repo read is detectable.
-            let (owner, repo) = match repo {
-                Some(slug) => pr_ops::parse_repo_slug(&slug)?,
+            let repo_ref = match repo {
+                Some(slug) => {
+                    let (owner, repo) = pr_ops::parse_repo_slug(&slug)?;
+                    intent_sourcecontrol::RepoRef::new(owner, repo)
+                }
                 None => pr_ops::repo_of(&ws)?,
             };
-            let repo_slug = format!("{owner}/{repo}");
+            let repo_slug = format!("{}/{}", repo_ref.owner, repo_ref.name);
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
                 intent_sourcecontrol::Error::NotFound(_) => {
                     Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
@@ -30081,10 +30080,9 @@ impl Services {
         if let Some(number) = ws.pr_number {
             return Ok((number, ws.pr_url.clone().unwrap_or_default()));
         }
-        let (owner, repo) = pr_ops::repo_of(&ws)
+        let repo_ref = pr_ops::repo_of(&ws)
             .map_err(|_| Error::Internal("No remote configured for this repository".to_string()))?;
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         let branch = ws.branch.clone();
         let target_branch = target
@@ -30135,9 +30133,8 @@ impl Services {
         let mut ws = self.store.get_workspace(&workspace_id).await.map_err(|_| {
             Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
         })?;
-        let (owner, repo) = pr_ops::repo_of(&ws)?;
+        let repo_ref = pr_ops::repo_of(&ws)?;
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
         let options = intent_sourcecontrol::MergeOptions {
             commit_title,
             commit_message,
