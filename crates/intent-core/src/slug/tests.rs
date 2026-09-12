@@ -72,6 +72,12 @@ fn context_mentions_are_stripped() {
 #[test]
 fn mixed_case_context_mentions_are_stripped() {
     assert_eq!(
+        strip_context_mentions("@File[x] @CONTEXT[y] fix auth"),
+        "  fix auth"
+    );
+    // Without case-insensitive matching this would extract `billing-add`.
+    assert_eq!(extract_local_slug("@File[add billing]"), None);
+    assert_eq!(
         extract_local_slug("fix auth @File[src/auth.rs] @CONTEXT[some stuff]").as_deref(),
         Some("auth-fix")
     );
