@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.46] - 2026-09-12
+
+### 🐛 Bug Fixes
+
+- *(transfer)* Move CoW-copied sandbox submodules to the sandbox gitlinks ([#1810](https://github.com/intent-hq/intentd/pull/1810))
+- Route remaining repo-slug comparisons through RepoRef ([#1815](https://github.com/intent-hq/intentd/pull/1815))
+
+### 🧪 Testing
+
+- *(intentd)* PTY background-process-group job-control e2e harness ([#1816](https://github.com/intent-hq/intentd/pull/1816))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(lint)* Enable clippy::allow_attributes and migrate allows to expect ([#1813](https://github.com/intent-hq/intentd/pull/1813))
+
+
 ## [0.9.45] - 2026-09-12
 
 ### 🚀 Features
