@@ -37,7 +37,7 @@ use intent_core::{
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
-    ProjectType, PullRequestInfo, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
+    ProjectType, PullRequestInfo, ReadAssetResult, RepoRef, SaveAssetResult, ScriptCreateParams,
     SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
     TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
@@ -2856,10 +2856,12 @@ impl Services {
         }
     }
 
-    /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
-    /// `github.com`. Rejects URLs with hosts like `github.com.evil.com`.
-    fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
+    /// Parse a GitHub URL into the [`RepoRef`] it names, only if the host is
+    /// exactly `github.com`. Rejects URLs with hosts like `github.com.evil.com`.
+    /// The ref keeps the URL's casing; compare it under `RepoRef` equality.
+    fn parse_github_owner_repo(url: &str) -> Option<RepoRef> {
         let trimmed = url.trim();
+        let to_ref = |(owner, name): (String, String)| RepoRef::new(owner, name);
 
         // HTTPS: extract host from scheme://host/... form.
         if let Some(rest) = trimmed
@@ -2872,7 +2874,7 @@ impl Services {
                 return None;
             }
             let path = &rest[host_end..];
-            return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
+            return clone_ops::parse_owner_repo(&format!("https://github.com{path}")).map(to_ref);
         }
 
         // SSH URL: ssh://[user@]host[:port]/owner/repo(.git) form.
@@ -2893,7 +2895,7 @@ impl Services {
                 return None;
             }
             let path = &rest[host_end..];
-            return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
+            return clone_ops::parse_owner_repo(&format!("https://github.com{path}")).map(to_ref);
         }
 
         // SSH scp-like: git@host:path form. Extract host before the colon.
@@ -2905,7 +2907,7 @@ impl Services {
                     return None;
                 }
                 let path = &after_at[colon_idx + 1..];
-                return clone_ops::parse_owner_repo(&format!("git@github.com:{path}"));
+                return clone_ops::parse_owner_repo(&format!("git@github.com:{path}")).map(to_ref);
             }
         }
 
@@ -3003,7 +3005,7 @@ impl Services {
         })
         .await
         .map_err(|error| Error::Internal(format!("repository metadata probe failed: {error}")))?;
-        let Some((owner, name)) = metadata else {
+        let Some(RepoRef { owner, name }) = metadata else {
             return Ok(());
         };
 
@@ -4189,7 +4191,9 @@ impl Services {
                 .and_then(std::result::Result::ok)
                 .flatten()
                 .and_then(|url| Self::parse_github_owner_repo(&url))
-                .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+                .map_or((None, None), |RepoRef { owner, name }| {
+                    (Some(owner), Some(name))
+                });
                 // Stamp the root's HEAD at registration time (fail-soft:
                 // unreadable HEAD ⇒ NULL, backfilled by a later sweep pass).
                 let registered_commit_sha = Self::read_git_root_head_sha(&canonical).await;
@@ -10369,6 +10373,7 @@ fn write_workspace_metadata_file(root: &Path, ws: &Workspace) -> Result<()> {
 /// `"repo"` fallback.
 pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
     let mut slug = String::new();
+    // repo-slug-fold: allow — folder-name slugifier, not repo identity
     for c in repo_name.chars().flat_map(char::to_lowercase) {
         if slug.len() >= 50 {
             break;
@@ -17052,8 +17057,10 @@ impl WorkspaceApi for Services {
                                 // trusts them), so only a strict `github.com`
                                 // URL seeds them; the host-agnostic pair above
                                 // keys the cache slot only.
-                                if let Some((gh_owner, gh_name)) =
-                                    Self::parse_github_owner_repo(url)
+                                if let Some(RepoRef {
+                                    owner: gh_owner,
+                                    name: gh_name,
+                                }) = Self::parse_github_owner_repo(url)
                                 {
                                     if input.repository_owner.is_none() {
                                         input.repository_owner = Some(gh_owner);
@@ -17149,7 +17156,9 @@ impl WorkspaceApi for Services {
                             // Strict `github.com` host only: persisted owner/name
                             // are trusted as GitHub identity by the
                             // `crossWorkspace.*` sibling predicate.
-                            if let Some((owner, name)) = Self::parse_github_owner_repo(url) {
+                            if let Some(RepoRef { owner, name }) =
+                                Self::parse_github_owner_repo(url)
+                            {
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
                                 }
@@ -17234,8 +17243,8 @@ impl WorkspaceApi for Services {
                         .repository_owner
                         .as_deref().is_none_or(str::is_empty)
                     {
-                        if let Some((owner, _)) = origin_derived.as_ref() {
-                            input.repository_owner = Some(owner.clone());
+                        if let Some(repo) = origin_derived.as_ref() {
+                            input.repository_owner = Some(repo.owner.clone());
                         }
                     }
                     // Apply derived name when caller left it blank; fall back to
@@ -17244,8 +17253,8 @@ impl WorkspaceApi for Services {
                         .repository_name
                         .as_deref().is_none_or(str::is_empty)
                     {
-                        if let Some((_, name)) = origin_derived {
-                            input.repository_name = Some(name);
+                        if let Some(repo) = origin_derived {
+                            input.repository_name = Some(repo.name);
                         } else if let Some(name) = input
                             .repository_path
                             .as_deref()
@@ -23972,7 +23981,9 @@ impl WorkspaceApi for Services {
                     .and_then(std::result::Result::ok)
                     .flatten()
                     .and_then(|url| Self::parse_github_owner_repo(&url))
-                    .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+                    .map_or((None, None), |RepoRef { owner, name }| {
+                        (Some(owner), Some(name))
+                    });
             // Stamp the root's HEAD at registration time (fail-soft:
             // unreadable HEAD ⇒ NULL; the store merge never overwrites an
             // existing value on re-registration).
