@@ -9766,11 +9766,28 @@ async fn append_primitive(
     block_type: &str,
     primitive_id: &str,
 ) -> Result<serde_json::Value> {
-    let mut note = fetch_note_peer(store, workspace_id, note_id).await?;
-    let new_content = primitive_ops::append_block(&note.content, primitive, block_type);
-    note.content = new_content.clone();
-    note.updated_at = now_iso();
-    persist_note_content(store, &note, None, &user_version_author()).await?;
+    let note = fetch_note_peer(store, workspace_id, note_id).await?;
+    let incoming = primitive_ops::append_block(&note.content, primitive, block_type);
+    let read_rev = note.rev;
+    let author = user_version_author();
+    let MergedContentWrite {
+        note,
+        content: new_content,
+        ..
+    } = persist_merged_content(
+        store,
+        workspace_id,
+        note_id,
+        ContentWrite {
+            seed: Some(note),
+            incoming: &incoming,
+            expected_version: Some(read_rev),
+            policy: ContentWritePolicy::Surgical,
+            author: &author,
+            op: "primitive.append",
+        },
+    )
+    .await?;
     publish_event(
         bus,
         note_change_event(
@@ -13799,7 +13816,7 @@ impl Services {
         caller_agent_id: Option<&AgentId>,
     ) -> Result<TaskConvertBlocksResult> {
         let store = &self.store;
-        let mut note = fetch_note_peer(store, &workspace_id, &note_id).await?;
+        let note = fetch_note_peer(store, &workspace_id, &note_id).await?;
         if note.content.is_empty() {
             return Ok(TaskConvertBlocksResult {
                 ok: true,
@@ -14025,14 +14042,29 @@ impl Services {
                 warnings,
             });
         }
-        note.content = working;
-        note.updated_at = now_iso();
         // TS parity: the reference pushes a version snapshot ("Converted
         // task blocks to linked Task Notes") as part of the conversion
         // save, so the newest stored version matches the fence-free
         // content that line-attribution/history consumers diff against.
+        // The write is gated on the rev read above: a save that landed
+        // while the children were being created is merged into, not
+        // overwritten.
         let author = resolve_note_version_author(store, caller_agent_id).await;
-        persist_note_content(store, &note, None, &author).await?;
+        let read_rev = note.rev;
+        let MergedContentWrite { note, .. } = persist_merged_content(
+            store,
+            &workspace_id,
+            &note_id,
+            ContentWrite {
+                seed: Some(note),
+                incoming: &working,
+                expected_version: Some(read_rev),
+                policy: ContentWritePolicy::Surgical,
+                author: &author,
+                op: "task.convertBlocks",
+            },
+        )
+        .await?;
         self.schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
         // Emit `note:updated` for the rewritten parent so subscribers
         // refresh the fence-free content live (TS parity: the reference
@@ -22310,7 +22342,7 @@ impl WorkspaceApi for Services {
             let checkbox = note_ops::checkbox_for(&status).ok_or_else(|| {
                 Error::Internal("Status must be 'done', 'todo', or 'in-progress'".to_string())
             })?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let normalized = task_text.trim().to_string();
             let linked = match note_ops::linked_task_for_text(&note.content, &normalized) {
                 Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
@@ -22350,10 +22382,22 @@ impl WorkspaceApi for Services {
                 });
             }
             let updated = note_ops::apply_task_status(&note.content, &normalized, checkbox)?;
-            note.content = updated;
-            note.updated_at = now_iso();
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            persist_note_content(&store, &note, None, &author).await?;
+            let read_rev = note.rev;
+            let MergedContentWrite { note, .. } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: Some(note),
+                    incoming: &updated,
+                    expected_version: Some(read_rev),
+                    policy: ContentWritePolicy::Surgical,
+                    author: &author,
+                    op: "task.updateStatus",
+                },
+            )
+            .await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
@@ -22478,10 +22522,23 @@ impl WorkspaceApi for Services {
                 }
             };
             if write_parent {
-                note.content = update.content;
-                note.updated_at = now_iso();
                 let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-                persist_note_content(&store, &note, None, &author).await?;
+                let read_rev = note.rev;
+                let merged = persist_merged_content(
+                    &store,
+                    &workspace_id,
+                    &note_id,
+                    ContentWrite {
+                        seed: Some(note),
+                        incoming: &update.content,
+                        expected_version: Some(read_rev),
+                        policy: ContentWritePolicy::Surgical,
+                        author: &author,
+                        op: "task.update",
+                    },
+                )
+                .await?;
+                note = merged.note;
                 publish_event(
                     bus.as_ref(),
                     note_change_event(

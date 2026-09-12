@@ -2819,6 +2819,116 @@ async fn comment_add_reanchors_onto_completed_user_save() {
     assert_eq!(stored.content, markers);
 }
 
+/// Same race for `primitive.addCli`: the appended block merges onto the
+/// user's save.
+#[tokio::test]
+async fn primitive_append_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| svc.primitive_add_cli(ws, id, "cargo test".into(), "run".into(), None),
+    )
+    .await;
+    assert!(stored.content.starts_with("alpha TYPED\nbeta\ngamma"));
+    assert!(stored.content.contains("ws-block:cli"));
+    assert!(stored.content.contains("cargo test"));
+    assert_eq!(result["content"], stored.content);
+}
+
+/// Same race for `task.updateStatus` on a plain (unlinked) checkbox line:
+/// the status flip merges onto the user's save.
+#[tokio::test]
+async fn task_update_status_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "- [ ] alpha\nbeta\ngamma",
+        "- [ ] alpha\nbeta TYPED\ngamma",
+        |svc, ws, id| svc.task_update_status(ws, id, "alpha".into(), "done".into(), None),
+    )
+    .await;
+    assert!(result.ok);
+    assert_eq!(stored.content, "- [x] alpha\nbeta TYPED\ngamma");
+}
+
+/// Same race for `task.update` on a plain checkbox line: the line edit
+/// merges onto the user's save.
+#[tokio::test]
+async fn task_update_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "- [ ] alpha\nbeta\ngamma",
+        "- [ ] alpha\nbeta TYPED\ngamma",
+        |svc, ws, id| {
+            svc.task_update(
+                ws,
+                id,
+                1,
+                Some("alpha AGENT".into()),
+                Some("in-progress".into()),
+                None,
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(result.new_text, "alpha AGENT");
+    assert_eq!(stored.content, "- [/] alpha AGENT\nbeta TYPED\ngamma");
+}
+
+/// Same race for `task.convertBlocks`: the op reads rev 0, creates the child
+/// task note, and its parent rewrite (fence → link) merges onto a save that
+/// landed at rev 1 in between. The save is a store-level versioned write
+/// (`setContent` would itself auto-convert the fence, so it cannot stand in
+/// for a plain user edit here).
+#[tokio::test]
+async fn convert_blocks_merges_onto_completed_user_save() {
+    let base = "intro\n\n@@@task\n# Do it\nbody\n@@@\n";
+    let (tmp, svc, ws, id) = setup_versioned(base).await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = svc.convert_task_blocks(ws.clone(), id.clone(), None);
+    let parked = poll_until(&mut fut, 20, || async { false }).await;
+    assert!(!parked);
+
+    let mut user = other.get_note(&ws, &id).await.expect("get note");
+    user.content = "intro TYPED\n\n@@@task\n# Do it\nbody\n@@@\n".into();
+    user.updated_at = now_iso();
+    let (rev, _) = other
+        .update_note_with_version(
+            &user,
+            Some(0),
+            &crate::user_version_author(),
+            &user.updated_at,
+        )
+        .await
+        .expect("user save");
+    assert_eq!(rev, 1);
+    drop(held);
+
+    let result = fut.await.expect("convert blocks");
+    assert_eq!(result.converted_count, 1);
+    let stored = other.get_note(&ws, &id).await.expect("final note");
+    assert_eq!(stored.rev, 2);
+    assert_eq!(
+        stored.content,
+        format!(
+            "intro TYPED\n\n- [ ] [Do it](intent://local/task/{})\n",
+            result.created_note_ids[0]
+        )
+    );
+    assert_eq!(
+        other
+            .get_note_version_content_by_rev(&ws, &id, 2)
+            .await
+            .expect("lookup"),
+        Some(stored.content.clone())
+    );
+}
+
 /// Regression (intentd#1817 re-verification, finding 2): a note insert and
 /// its initial snapshot commit in ONE transaction, so the instant a fresh
 /// note is readable its rev 0 is a recoverable merge base. Before the fix
@@ -2921,6 +3031,7 @@ async fn note_create_snapshot_is_visible_with_the_row() {
         "history stays in rev order: no late rev-0 row after the rev-2 write"
     );
 }
+
 /// Race a metadata-only write against a user `note.setContent` that completes
 /// while the metadata write is parked on the write pool (same choreography as
 /// [`surgical_write_races_user_save`]): the metadata op reads rev 0 with the
