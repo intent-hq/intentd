@@ -112,6 +112,73 @@ impl Store {
         }
     }
 
+    /// Persist a parent-note content write together with the child-note
+    /// inserts the new content refers to, in ONE transaction: the gated
+    /// UPDATE + snapshot of [`Store::update_note_with_version`] for `note`
+    /// (gated on `expected_version` when `Some`), then for each of `children`
+    /// the row insert + initial snapshot of [`Store::insert_note_with_version`]
+    /// (at each child's `rev`, stamped with its `updated_at`). Children exist
+    /// only if the parent write lands: a CAS miss commits nothing, so a
+    /// caller that re-derives its work from the fresh parent never leaves
+    /// orphaned or duplicate children behind (`task.convertBlocks` racing a
+    /// save that already converted the same block). Returns `(rev, v)` for
+    /// the parent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the parent does not exist in the workspace; `Error::Internal` if encoding fields or a statement fails (including a duplicate child `(id, workspace_id)`).
+    pub async fn update_note_with_version_and_children(
+        &self,
+        note: &Note,
+        expected_version: Option<i64>,
+        children: &[Note],
+        author: &NoteVersionAuthor,
+        date: &str,
+    ) -> Result<(i64, i64)> {
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
+
+        // The gated parent UPDATE runs first so a miss leaves the body with
+        // nothing written before the (no-op) commit.
+        let result = async {
+            let Some(rev) = crate::note_repo::exec_update_note(
+                &mut *conn,
+                note,
+                expected_version,
+                crate::note_repo::NoteUpdateScope::FullRow,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            let v = insert_note_version(&mut conn, note, author, date, rev).await?;
+            for child in children {
+                crate::note_repo::exec_insert_note(&mut *conn, child).await?;
+                insert_note_version(&mut conn, child, author, &child.updated_at, child.rev).await?;
+            }
+            Ok(Some((rev, v)))
+        }
+        .await;
+
+        match crate::commit_with_rollback_guard(
+            conn,
+            result,
+            "commit note write + children tx failed",
+        )
+        .await?
+        {
+            Some(written) => Ok(written),
+            None => Err(self.note_update_miss(note).await),
+        }
+    }
+
     /// Insert a note row and its initial version snapshot (at `note.rev`) in
     /// ONE transaction, the insert-side counterpart of
     /// [`Store::update_note_with_version`]: the row is never visible while

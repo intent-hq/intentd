@@ -2495,6 +2495,106 @@ async fn insert_note_with_version_commits_row_and_snapshot_together() {
     );
 }
 
+/// `update_note_with_version_and_children` commits the gated parent write,
+/// its snapshot, and every child row + initial snapshot together: on success
+/// all are visible with recoverable bases; on a stale gate it is a `Conflict`
+/// that persists nothing — no parent bump, no snapshot, and no child rows.
+#[tokio::test]
+async fn update_note_with_version_and_children_is_all_or_nothing() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let mut parent = task_note(&ws_id, "Parent", None);
+    parent.content = "base".to_string();
+    store.insert_note(&parent).await.expect("insert parent");
+    let author = version_author();
+    let ts = now_iso();
+
+    let mut child = task_note(&ws_id, "Child", None);
+    child.parent_id = Some(parent.id.clone());
+    child.content = "child body".to_string();
+    parent.content = format!("- [ ] [Child](intent://local/task/{})", child.id.0);
+    let (rev, v) = store
+        .update_note_with_version_and_children(
+            &parent,
+            Some(0),
+            std::slice::from_ref(&child),
+            &author,
+            &ts,
+        )
+        .await
+        .expect("gated write with child");
+    assert_eq!((rev, v), (1, 1));
+    let stored = store
+        .get_note(&ws_id, &parent.id)
+        .await
+        .expect("get parent");
+    assert_eq!(
+        (stored.rev, stored.content.as_str()),
+        (1, parent.content.as_str())
+    );
+    assert_eq!(
+        newest_version(&store, &ws_id, &parent.id).await,
+        Some((1, parent.content.clone()))
+    );
+    let stored_child = store.get_note(&ws_id, &child.id).await.expect("get child");
+    assert_eq!(
+        (stored_child.rev, stored_child.content.as_str()),
+        (0, "child body")
+    );
+    assert_eq!(
+        store
+            .get_note_version_content_by_rev(&ws_id, &child.id, 0)
+            .await
+            .expect("lookup"),
+        Some("child body".to_string())
+    );
+
+    // Stale gate: Conflict; neither the parent nor the second child persists.
+    let mut ghost_child = task_note(&ws_id, "Ghost", None);
+    ghost_child.parent_id = Some(parent.id.clone());
+    ghost_child.content = "never".to_string();
+    parent.content = "stale rewrite".to_string();
+    match store
+        .update_note_with_version_and_children(
+            &parent,
+            Some(0),
+            std::slice::from_ref(&ghost_child),
+            &author,
+            &ts,
+        )
+        .await
+    {
+        Err(intent_core::Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 1);
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    let stored = store
+        .get_note(&ws_id, &parent.id)
+        .await
+        .expect("get parent");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(
+        newest_version(&store, &ws_id, &parent.id).await,
+        Some((1, stored.content.clone()))
+    );
+    assert!(matches!(
+        store.get_note(&ws_id, &ghost_child.id).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    assert_eq!(newest_version(&store, &ws_id, &ghost_child.id).await, None);
+    assert_eq!(
+        store.write_pool().size(),
+        1,
+        "connection returned to the pool"
+    );
+}
+
 /// Regression for monorepo#680 at the `update_note_with_comment` site: a
 /// `RAISE(ROLLBACK)` trigger on the note UPDATE fails the body *and*
 /// auto-rolls the transaction back, so the explicit ROLLBACK fails and the

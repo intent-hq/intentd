@@ -2873,13 +2873,12 @@ async fn task_update_merges_onto_completed_user_save() {
     assert_eq!(stored.content, "- [/] alpha AGENT\nbeta TYPED\ngamma");
 }
 
-/// Same race for `task.convertBlocks`: the op reads rev 0, creates the child
-/// task note, and its parent rewrite (fence → link) merges onto a save that
-/// landed at rev 1 in between. The save is a store-level versioned write
-/// (`setContent` would itself auto-convert the fence, so it cannot stand in
-/// for a plain user edit here).
+/// Same race for `task.convertBlocks` against a plain user edit: the op
+/// reads rev 0 and a store-level versioned save lands at rev 1 in between.
+/// The conversion re-derives from the fresh content (the fence is still
+/// there) and lands at rev 2 with `TYPED` intact and exactly one child.
 #[tokio::test]
-async fn convert_blocks_merges_onto_completed_user_save() {
+async fn convert_blocks_rederives_onto_completed_user_save() {
     let base = "intro\n\n@@@task\n# Do it\nbody\n@@@\n";
     let (tmp, svc, ws, id) = setup_versioned(base).await;
     let other = Store::open(&tmp.path).await.expect("open second store");
@@ -2891,7 +2890,13 @@ async fn convert_blocks_merges_onto_completed_user_save() {
         .await
         .expect("hold write conn");
     let mut fut = svc.convert_task_blocks(ws.clone(), id.clone(), None);
-    let parked = poll_until(&mut fut, 20, || async { false }).await;
+    // Yield between polls so the op's reads complete and it parks on the
+    // held write connection, not on an in-flight read.
+    let parked = poll_until(&mut fut, 100, || async {
+        other.get_note(&ws, &id).await.expect("yield read");
+        false
+    })
+    .await;
     assert!(!parked);
 
     let mut user = other.get_note(&ws, &id).await.expect("get note");
@@ -2923,6 +2928,98 @@ async fn convert_blocks_merges_onto_completed_user_save() {
     assert_eq!(
         other
             .get_note_version_content_by_rev(&ws, &id, 2)
+            .await
+            .expect("lookup"),
+        Some(stored.content.clone())
+    );
+    let children: Vec<Note> = other
+        .list_notes(&ws)
+        .await
+        .expect("list notes")
+        .into_iter()
+        .filter(|n| n.parent_id.as_ref() == Some(&id))
+        .collect();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].id.0, result.created_note_ids[0]);
+}
+
+/// Regression (intentd#1817 re-verification, round 4): `task.convertBlocks`
+/// racing a real `note.setContent` that carries the same `@@@task` fence.
+/// The converter is parked after its rev-0 read; the user save lands
+/// (`TYPED`) and auto-converts the fence once (child #1, link at rev 2).
+/// Before the fix the parked converter then created a SECOND child and
+/// three-way-merged its own link onto the user's: two children, and the two
+/// generated UUIDs char-interleaved into one corrupt link. Now the
+/// converter's gated write misses, it re-derives from the fresh content —
+/// no fence remains, nothing to convert — and no child is ever persisted for
+/// the failed attempt: one child, the parent text clean, `TYPED` intact, and
+/// the newest snapshot matches the row.
+#[tokio::test]
+async fn convert_blocks_racing_real_user_save_converts_once() {
+    let base = "intro\n\n@@@task\n# Do it\nbody\n@@@\n";
+    let (tmp, svc, ws, id) = setup_versioned(base).await;
+    let other = Services::new(Store::open(&tmp.path).await.expect("open second store"));
+
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = svc.convert_task_blocks(ws.clone(), id.clone(), None);
+    let parked = poll_until(&mut fut, 100, || async {
+        other.store.get_note(&ws, &id).await.expect("yield read");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let user = other
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "intro TYPED\n\n@@@task\n# Do it\nbody\n@@@\n".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("user save");
+    assert_eq!(user.converted_count, 1);
+    drop(held);
+
+    let result = fut.await.expect("convert blocks");
+
+    let stored = other.store.get_note(&ws, &id).await.expect("final note");
+    let children: Vec<Note> = other
+        .store
+        .list_notes(&ws)
+        .await
+        .expect("list notes")
+        .into_iter()
+        .filter(|n| n.parent_id.as_ref() == Some(&id))
+        .collect();
+    assert_eq!(
+        children.len(),
+        1,
+        "one task block must not create duplicate tasks (parent: {:?})",
+        stored.content
+    );
+    assert_eq!(children[0].id.0, user.created_task_note_ids[0]);
+    assert_eq!(
+        stored.content,
+        format!(
+            "intro TYPED\n\n- [ ] [Do it](intent://local/task/{})\n",
+            children[0].id.0
+        )
+    );
+    assert_eq!(stored.rev, 2);
+    assert_eq!(result.converted_count, 0);
+    assert!(result.created_note_ids.is_empty());
+    assert_eq!(
+        other
+            .store
+            .get_note_version_content_by_rev(&ws, &id, stored.rev)
             .await
             .expect("lookup"),
         Some(stored.content.clone())

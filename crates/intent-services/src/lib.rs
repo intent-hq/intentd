@@ -11630,6 +11630,44 @@ fn redirected_task_status(word: &str, current: TaskStatus) -> Option<TaskStatus>
     (next != current).then_some(next)
 }
 
+/// Build (without persisting) a child task note nested under `parent_id`,
+/// marked a task with `status` (and optional `peer_order` /
+/// `estimated_effort`) at `rev` 0. Shared by `createPrerequisite` (which
+/// persists it on its own) and `convertBlocks` (which commits it in the same
+/// transaction as the parent rewrite that links to it).
+fn build_child_task_note(
+    workspace_id: &WorkspaceId,
+    parent_id: &NoteId,
+    title_raw: &str,
+    content: String,
+    status: TaskStatus,
+    peer_order: Option<i64>,
+    estimated_effort: Option<String>,
+) -> Note {
+    let now = now_iso();
+    let mut task_meta = fresh_task_metadata(status, &now, peer_order);
+    task_meta.estimated_effort = estimated_effort;
+    Note {
+        id: NoteId::new(),
+        workspace_id: workspace_id.clone(),
+        title: note_ops::strip_markdown_formatting(title_raw),
+        content,
+        content_type: ContentType::Markdown,
+        tags: Vec::new(),
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: Some(parent_id.clone()),
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata {
+            task: Some(task_meta),
+        },
+        created_at: now.clone(),
+        rev: 0,
+        updated_at: now,
+    }
+}
+
 /// Build a `task:created` event with the payload
 /// `{ noteId, noteTitle, status, createdAt, agentId? }` (PROTOCOL §6.5).
 /// Emitted once per note becoming a task, on every creation path. Mirrors
@@ -13809,6 +13847,17 @@ impl Services {
     /// `None`) and the note-write auto-conversion (which forwards the outer
     /// mutation's caller) attribute the resulting "Converted task blocks"
     /// version snapshot to the acting agent when applicable.
+    ///
+    /// The conversion is derived from one read of the parent and committed
+    /// in one store transaction gated on exactly that rev
+    /// ([`Store::update_note_with_version_and_children`]): the new child
+    /// task notes exist only if the parent rewrite (fence → link) lands. A
+    /// save that landed in between — including one that already converted
+    /// the same fence (`note.setContent` auto-converts) — makes the gate
+    /// miss, and the loop re-derives from the fresh content instead of
+    /// merging: a block already converted is no longer a fence, so no work
+    /// remains for it, and generated ids never pass through the three-way
+    /// merge (which would char-interleave two different ids for one block).
     async fn convert_task_blocks_op(
         &self,
         workspace_id: WorkspaceId,
@@ -13816,64 +13865,68 @@ impl Services {
         caller_agent_id: Option<&AgentId>,
     ) -> Result<TaskConvertBlocksResult> {
         let store = &self.store;
-        let note = fetch_note_peer(store, &workspace_id, &note_id).await?;
-        if note.content.is_empty() {
-            return Ok(TaskConvertBlocksResult {
-                ok: true,
-                converted_count: 0,
-                created_note_ids: Vec::new(),
-                created_tasks: Vec::new(),
-                warnings: Vec::new(),
-            });
-        }
-        // Mirror the TS guard: only parse when a `@@@task` fence exists.
-        let parsed = if note_ops::has_task_blocks(&note.content) {
-            note_ops::extract_task_blocks(&note.content)
-        } else {
-            note_ops::TaskBlocksResult {
-                tasks: Vec::new(),
-                content_without_blocks: note.content.clone(),
+        let author = resolve_note_version_author(store, caller_agent_id).await;
+        let mut attempt = 0;
+        let (note, parsed, mut warnings, created, block_note_ids) = loop {
+            attempt += 1;
+            let mut note = fetch_note_peer(store, &workspace_id, &note_id).await?;
+            if note.content.is_empty() {
+                return Ok(TaskConvertBlocksResult {
+                    ok: true,
+                    converted_count: 0,
+                    created_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
+                });
             }
-        };
-        // Idempotency: map existing child note titles (normalized) → id.
-        let all = store.list_notes(&workspace_id).await?;
-        let mut existing_by_title: std::collections::HashMap<String, NoteId> = all
-            .iter()
-            .filter(|n| n.parent_id.as_ref() == Some(&note.id))
-            .map(|n| (n.title.trim().to_lowercase(), n.id.clone()))
-            .collect();
-
-        // Start from the placeholder-substituted content; each valid block
-        // is `<!-- task-block-placeholder-{i} -->` to be replaced below.
-        let mut working = parsed.content_without_blocks.clone();
-        let mut warnings: Vec<String> = Vec::new();
-        let mut created_note_ids: Vec<String> = Vec::new();
-        let mut created_tasks: Vec<CreatedTaskEntry> = Vec::new();
-        let mut block_note_ids: Vec<NoteId> = Vec::with_capacity(parsed.tasks.len());
-        let mut peer_order = 100i64;
-        for (i, task) in parsed.tasks.iter().enumerate() {
-            let body = if task.content.is_empty() {
-                format!("# {}\n\nCreated as a prerequisite task.", task.title)
+            // Mirror the TS guard: only parse when a `@@@task` fence exists.
+            let parsed = if note_ops::has_task_blocks(&note.content) {
+                note_ops::extract_task_blocks(&note.content)
             } else {
-                format!("# {}\n\n{}", task.title, task.content)
-            };
-            let normalized = task.title.trim().to_lowercase();
-            let task_note_id = if let Some(existing_id) = existing_by_title.get(&normalized) {
-                // Reused child: `effort=` only applies at creation — it
-                // never overwrites a possibly user-edited estimate on the
-                // existing note — so an explicit attribute is surfaced as
-                // dropped rather than silently ignored.
-                if task.effort.is_some() {
-                    warnings.push(format!(
-                        "task block {}: effort= ignored — a task note with this \
-                         title already exists and its estimate is preserved",
-                        task_block_label(task)
-                    ));
+                note_ops::TaskBlocksResult {
+                    tasks: Vec::new(),
+                    content_without_blocks: note.content.clone(),
                 }
-                existing_id.clone()
-            } else {
-                let child = self
-                    .create_child_task_note(
+            };
+            // Idempotency: map existing child note titles (normalized) → id.
+            let all = store.list_notes(&workspace_id).await?;
+            let mut existing_by_title: std::collections::HashMap<String, NoteId> = all
+                .iter()
+                .filter(|n| n.parent_id.as_ref() == Some(&note.id))
+                .map(|n| (n.title.trim().to_lowercase(), n.id.clone()))
+                .collect();
+
+            // Start from the placeholder-substituted content; each valid
+            // block is `<!-- task-block-placeholder-{i} -->` to be replaced
+            // below. New children are built here and persisted with the
+            // parent rewrite.
+            let mut working = parsed.content_without_blocks.clone();
+            let mut warnings: Vec<String> = Vec::new();
+            let mut created: Vec<(Note, CreatedTaskEntry)> = Vec::new();
+            let mut block_note_ids: Vec<NoteId> = Vec::with_capacity(parsed.tasks.len());
+            let mut peer_order = 100i64;
+            for (i, task) in parsed.tasks.iter().enumerate() {
+                let body = if task.content.is_empty() {
+                    format!("# {}\n\nCreated as a prerequisite task.", task.title)
+                } else {
+                    format!("# {}\n\n{}", task.title, task.content)
+                };
+                let normalized = task.title.trim().to_lowercase();
+                let task_note_id = if let Some(existing_id) = existing_by_title.get(&normalized) {
+                    // Reused child: `effort=` only applies at creation — it
+                    // never overwrites a possibly user-edited estimate on the
+                    // existing note — so an explicit attribute is surfaced
+                    // as dropped rather than silently ignored.
+                    if task.effort.is_some() {
+                        warnings.push(format!(
+                            "task block {}: effort= ignored — a task note with this \
+                             title already exists and its estimate is preserved",
+                            task_block_label(task)
+                        ));
+                    }
+                    existing_id.clone()
+                } else {
+                    let child = build_child_task_note(
                         &workspace_id,
                         &note.id,
                         &task.title,
@@ -13881,26 +13934,87 @@ impl Services {
                         TaskStatus::NotStarted,
                         Some(peer_order),
                         task.effort.clone(),
-                        caller_agent_id,
-                    )
-                    .await?;
-                existing_by_title.insert(normalized, child.id.clone());
-                created_note_ids.push(child.id.0.clone());
-                created_tasks.push(CreatedTaskEntry {
-                    key: task.key.clone(),
-                    title: task.title.clone(),
-                    note_id: child.id.0.clone(),
+                    );
+                    existing_by_title.insert(normalized, child.id.clone());
+                    let id = child.id.clone();
+                    created.push((
+                        child,
+                        CreatedTaskEntry {
+                            key: task.key.clone(),
+                            title: task.title.clone(),
+                            note_id: id.0.clone(),
+                        },
+                    ));
+                    id
+                };
+                let placeholder = format!("<!-- task-block-placeholder-{i} -->");
+                let linked = format!(
+                    "- [ ] [{}](intent://local/task/{})",
+                    task.title, task_note_id.0
+                );
+                working = working.replace(&placeholder, &linked);
+                block_note_ids.push(task_note_id);
+                peer_order += 100;
+            }
+
+            if working == note.content && created.is_empty() {
+                // Nothing to convert: surface header issues only.
+                for task in &parsed.tasks {
+                    for issue in &task.issues {
+                        warnings.push(format!("task block {}: {issue}", task_block_label(task)));
+                    }
+                }
+                return Ok(TaskConvertBlocksResult {
+                    ok: true,
+                    converted_count: 0,
+                    created_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings,
                 });
-                child.id
-            };
-            let placeholder = format!("<!-- task-block-placeholder-{i} -->");
-            let linked = format!(
-                "- [ ] [{}](intent://local/task/{})",
-                task.title, task_note_id.0
-            );
-            working = working.replace(&placeholder, &linked);
-            block_note_ids.push(task_note_id);
-            peer_order += 100;
+            }
+            // TS parity: the reference pushes a version snapshot ("Converted
+            // task blocks to linked Task Notes") as part of the conversion
+            // save, so the newest stored version matches the fence-free
+            // content that line-attribution/history consumers diff against.
+            let read_rev = note.rev;
+            let mut plan = reanchor_note_comments(store, &workspace_id, &note_id, working).await?;
+            note.content = std::mem::take(&mut plan.content);
+            note.updated_at = now_iso();
+            let children: Vec<Note> = created.iter().map(|(child, _)| child.clone()).collect();
+            match store
+                .update_note_with_version_and_children(
+                    &note,
+                    Some(read_rev),
+                    &children,
+                    &author,
+                    &note.updated_at,
+                )
+                .await
+            {
+                Ok((rev, _)) => {
+                    tracing::debug!(
+                        note = %note_id.0,
+                        op = "task.convertBlocks",
+                        attempt,
+                        read_rev,
+                        rev,
+                        created = created.len(),
+                        "task blocks converted"
+                    );
+                    plan.apply_orphaned(store, &workspace_id).await?;
+                    break (note, parsed, warnings, created, block_note_ids);
+                }
+                Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
+                Err(e) => return Err(e),
+            }
+        };
+        let mut created_note_ids: Vec<String> = Vec::with_capacity(created.len());
+        let mut created_tasks: Vec<CreatedTaskEntry> = Vec::with_capacity(created.len());
+        for (child, entry) in created {
+            self.emit_child_task_created(&child, TaskStatus::NotStarted, caller_agent_id)
+                .await;
+            created_note_ids.push(entry.note_id.clone());
+            created_tasks.push(entry);
         }
 
         // Convert-with-warnings: bad header attributes or relation references
@@ -14032,40 +14146,7 @@ impl Services {
             }
         }
 
-        let content_changed = working != note.content;
-        if !content_changed && created_note_ids.is_empty() {
-            return Ok(TaskConvertBlocksResult {
-                ok: true,
-                converted_count: 0,
-                created_note_ids: Vec::new(),
-                created_tasks: Vec::new(),
-                warnings,
-            });
-        }
-        // TS parity: the reference pushes a version snapshot ("Converted
-        // task blocks to linked Task Notes") as part of the conversion
-        // save, so the newest stored version matches the fence-free
-        // content that line-attribution/history consumers diff against.
-        // The write is gated on the rev read above: a save that landed
-        // while the children were being created is merged into, not
-        // overwritten.
-        let author = resolve_note_version_author(store, caller_agent_id).await;
-        let read_rev = note.rev;
-        let MergedContentWrite { note, .. } = persist_merged_content(
-            store,
-            &workspace_id,
-            &note_id,
-            ContentWrite {
-                seed: Some(note),
-                incoming: &working,
-                expected_version: Some(read_rev),
-                policy: ContentWritePolicy::Surgical,
-                author: &author,
-                op: "task.convertBlocks",
-            },
-        )
-        .await?;
-        self.schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
+        self.schedule_line_attribution_recompute(&note.workspace_id, &note.id);
         // Emit `note:updated` for the rewritten parent so subscribers
         // refresh the fence-free content live (TS parity: the reference
         // emits `note:updated` after saving the converted note).
@@ -14095,10 +14176,11 @@ impl Services {
     }
 
     /// Create a child task note nested under `parent_id`, marking it a task with
-    /// `status` (and optional `peer_order` / `estimated_effort`). Shared by
-    /// `createPrerequisite` and `convertBlocks`. `caller_agent_id` attributes
-    /// the emitted `task:created` to the acting agent when the creation is
-    /// agent-driven.
+    /// `status` (and optional `peer_order` / `estimated_effort`), for
+    /// `createPrerequisite`. `caller_agent_id` attributes the version snapshot
+    /// and the emitted `task:created` to the acting agent when the creation
+    /// is agent-driven. `convertBlocks` builds its children with
+    /// [`build_child_task_note`] and persists them with the parent rewrite.
     #[expect(clippy::too_many_arguments)]
     async fn create_child_task_note(
         &self,
@@ -14111,33 +14193,34 @@ impl Services {
         estimated_effort: Option<String>,
         caller_agent_id: Option<&AgentId>,
     ) -> Result<Note> {
-        let now = now_iso();
-        let mut task_meta = fresh_task_metadata(status, &now, peer_order);
-        task_meta.estimated_effort = estimated_effort;
-        let note = Note {
-            id: NoteId::new(),
-            workspace_id: workspace_id.clone(),
-            title: note_ops::strip_markdown_formatting(title_raw),
+        let note = build_child_task_note(
+            workspace_id,
+            parent_id,
+            title_raw,
             content,
-            content_type: ContentType::Markdown,
-            tags: Vec::new(),
-            is_pinned: false,
-            is_archived: false,
-            is_default: false,
-            parent_id: Some(parent_id.clone()),
-            visibility: NoteVisibility::Workspace,
-            metadata: NoteMetadata {
-                task: Some(task_meta),
-            },
-            created_at: now.clone(),
-            rev: 0,
-            updated_at: now,
-        };
+            status,
+            peer_order,
+            estimated_effort,
+        );
         let author = resolve_note_version_author(&self.store, caller_agent_id).await;
         persist_new_note(&self.store, &note, &author).await?;
-        // Emit `note:created` so task-channel subscribers (spec UI) pick up
-        // the new child task note live (TS parity: `createPrerequisiteNote`
-        // routes through `createNote`, which emits `note:created`).
+        self.emit_child_task_created(&note, status, caller_agent_id)
+            .await;
+        Ok(note)
+    }
+
+    /// Emit the creation events for a persisted child task note:
+    /// `note:created` so task-channel subscribers (spec UI) pick up the new
+    /// child live (TS parity: `createPrerequisiteNote` routes through
+    /// `createNote`, which emits `note:created`), then `task:created` (§6.5)
+    /// since the note is born a task — feed/task subscribers see the new task
+    /// without inferring task-ness from the `note:created` payload.
+    async fn emit_child_task_created(
+        &self,
+        note: &Note,
+        status: TaskStatus,
+        caller_agent_id: Option<&AgentId>,
+    ) {
         publish_event(
             self.event_bus.as_ref(),
             note_change_event(
@@ -14149,9 +14232,6 @@ impl Services {
             ),
         )
         .await;
-        // The note is born a task, so the creation also emits `task:created`
-        // (§6.5) — feed/task subscribers see the new task without inferring
-        // task-ness from the `note:created` payload.
         let agent = resolve_event_agent(&self.store, caller_agent_id).await;
         publish_event(
             self.event_bus.as_ref(),
@@ -14165,7 +14245,6 @@ impl Services {
             ),
         )
         .await;
-        Ok(note)
     }
 
     /// Deliver a store-adapter search result (§5.15 / §6.5). Small sets (or any
