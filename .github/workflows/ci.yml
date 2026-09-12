@@ -1158,12 +1158,14 @@ jobs:
           dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/bin/intentd$'
           dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/lib/systemd/user/intentd\.service$'
 
-  # Release-script regression tests: runs the stubbed-gh harness for
+  # Release-script regression tests: runs the stubbed-gh harnesses for
   # scripts/aggregate-channel-notes.sh (an idempotent re-promotion must
   # rebuild the aggregate from the notes-base marker, and a legacy body
-  # without a marker is left untouched — never collapsed to one section).
-  # Seconds-long like the other utility jobs, so it runs directly on
-  # ubuntu-latest.
+  # without a marker is left untouched — never collapsed to one section)
+  # and scripts/notify-fixed-issues.sh (a mention-only reference or an open
+  # issue never earns a release comment; a closed issue with a delivered
+  # linked fix PR does). Seconds-long like the other utility jobs, so it
+  # runs directly on ubuntu-latest.
   release-scripts:
     runs-on: ubuntu-latest
     # Runs on push and same-repo PRs; skipped on fork PRs (see the
@@ -1174,6 +1176,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Test aggregate-channel-notes.sh
         run: ./scripts/test-aggregate-channel-notes.sh
+      - name: Test notify-fixed-issues.sh
+        run: ./scripts/test-notify-fixed-issues.sh
 
   # Single required status check for branch protection: fans in check, build,
   # coverage-e2e, coverage-all, pr-title, conflict-markers, deb-packaging,
