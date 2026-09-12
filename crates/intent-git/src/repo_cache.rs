@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use git2::Repository;
-use intent_core::{Error, RepoRef, Result};
+use intent_core::{Error, GitRemoteUrl, RepoRef, Result};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::auth::{token_helper_config, TOKEN_ENV};
@@ -457,18 +457,19 @@ fn origin_matches(cache_path: &Path, github_url: &str) -> bool {
 }
 
 /// Whether a cached slot's `origin` URL and a requested URL name the same
-/// source. Two GitHub URLs (per [`github_slug`]) compare by identity — host
-/// case-insensitive, owner/repo under [`RepoRef`] equality — because every
-/// casing of one slug shares a single folded slot, so a case-variant request
-/// must reuse it rather than wipe and re-clone. Anything else (another host,
-/// a `file://` or local-path source) compares byte-for-byte, so two sources
-/// that merely share an owner/repo pair never serve each other's content.
+/// source. Two GitHub URLs (per [`GitRemoteUrl::github_repo`]) compare by
+/// identity — host case-insensitive, owner/repo under [`RepoRef`] equality —
+/// because every casing of one slug shares a single folded slot, so a
+/// case-variant request must reuse it rather than wipe and re-clone. Anything
+/// else (another host, a `file://` or local-path source) compares
+/// byte-for-byte, so two sources that merely share an owner/repo pair never
+/// serve each other's content.
 fn origin_url_matches(origin: &str, requested: &str) -> bool {
     if origin == requested {
         return true;
     }
     matches!(
-        (github_slug(origin), github_slug(requested)),
+        (github_repo(origin), github_repo(requested)),
         (Some(cached), Some(wanted)) if cached == wanted
     )
 }
@@ -477,62 +478,15 @@ fn origin_url_matches(origin: &str, requested: &str) -> bool {
 /// GitHub-scoped [`list_cached_branches`] reader uses to confirm a cached
 /// slot's `origin`. Owner/repo compare under [`RepoRef`] equality (GitHub
 /// slugs are case-insensitive); the accepted URL forms are those of
-/// [`github_slug`].
+/// [`GitRemoteUrl::github_repo`].
 fn origin_is_github_slot(url: &str, owner: &str, repo: &str) -> bool {
-    github_slug(url).is_some_and(|slug| slug == RepoRef::new(owner, repo))
+    github_repo(url).is_some_and(|slug| slug == RepoRef::new(owner, repo))
 }
 
-/// The `owner`/`repo` slug a GitHub URL names, or `None` when `url` is not a
-/// `github.com` URL. Accepts the HTTPS/SSH URL and scp-like forms, an
-/// optional `.git` suffix, userinfo, and a port; the host compares
-/// case-insensitively. Anything not on `github.com` — another host or a
-/// local path — is not a GitHub URL. The returned slug keeps the URL's
-/// casing; compare it under [`RepoRef`] equality.
-///
-/// The authority is isolated before userinfo is stripped: for a scheme URL
-/// it is the span between `://` and the first `/`, and for the scp-like
-/// form the span before the first `:`, which must contain no `/`. An `@`
-/// in the path (`https://example.invalid/a@github.com/acme/widget`) or in a
-/// local path (`/tmp/a@github.com:acme/widget`) therefore never turns a
-/// foreign source into a GitHub URL.
-fn github_slug(url: &str) -> Option<RepoRef> {
-    let trimmed = url.trim().trim_end_matches('/');
-    let (authority, path) = if let Some((scheme, rest)) = trimmed.split_once("://") {
-        let known = ["https", "http", "ssh", "git"]
-            .iter()
-            .any(|s| scheme.eq_ignore_ascii_case(s));
-        if !known {
-            return None;
-        }
-        let end = rest.find(['/', '?', '#'])?;
-        let (authority, path) = rest.split_at(end);
-        if !path.starts_with('/') {
-            return None;
-        }
-        let path = path.split(['?', '#']).next().unwrap_or(path);
-        (authority, path)
-    } else {
-        // No scheme: only the scp-like `user@host:owner/repo` form
-        // qualifies, and git itself treats anything with a `/` before the
-        // first `:` (absolute, `./`, `../` paths) as a local path.
-        let (authority, path) = trimmed.split_once(':')?;
-        if authority.contains('/') {
-            return None;
-        }
-        (authority, path)
-    };
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = host_port.split(':').next().unwrap_or(host_port);
-    if !host.eq_ignore_ascii_case("github.com") {
-        return None;
-    }
-    let mut segments = path.split('/').filter(|s| !s.is_empty());
-    let (o, r) = (segments.next()?, segments.next()?);
-    if segments.next().is_some() {
-        return None;
-    }
-    let r = r.strip_suffix(".git").unwrap_or(r);
-    Some(RepoRef::new(o, r))
+/// The GitHub `owner`/`repo` a remote URL names, via the one owned parser in
+/// intent-core; `None` for any non-GitHub host or local path.
+fn github_repo(url: &str) -> Option<RepoRef> {
+    GitRemoteUrl::parse(url).and_then(|u| u.github_repo())
 }
 
 /// Refresh an existing cache: fetch + prune, re-resolve the remote's default
@@ -2310,35 +2264,6 @@ mod tests {
                 "{foreign}"
             );
             assert!(origin_url_matches(foreign, foreign), "{foreign}");
-        }
-    }
-
-    /// [`github_slug`] isolates the URL authority before stripping userinfo,
-    /// so an `@` in a path never promotes a foreign or local source to a
-    /// GitHub URL; the scp-like form requires no `/` before its first `:`.
-    #[test]
-    fn github_slug_isolates_authority_before_userinfo() {
-        let widget = RepoRef::new("acme", "widget");
-        for url in [
-            "ssh://git@github.com:22/acme/widget.git",
-            "git@github.com:acme/widget.git",
-            "https://oauth2:tok@github.com/acme/widget.git",
-            "https://x@github.com/acme/widget.git?ref=main#frag",
-            "https://user@example.invalid@github.com/acme/widget",
-        ] {
-            assert_eq!(github_slug(url), Some(widget.clone()), "{url}");
-        }
-        for url in [
-            "https://example.invalid/a@github.com/acme/widget.git",
-            "/tmp/a@github.com:acme/widget.git",
-            "https://github.com.evil.example/acme/widget",
-            "./a@github.com:acme/widget.git",
-            "../a@github.com:acme/widget",
-            "C:\\repos\\a@github.com:acme\\widget",
-            "file:///tmp/a@github.com:acme/widget.git",
-            "https://github.com?x=a@github.com/acme/widget",
-        ] {
-            assert_eq!(github_slug(url), None, "{url}");
         }
     }
 
