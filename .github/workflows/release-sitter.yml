@@ -50,7 +50,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
       - name: Parse and validate tag
@@ -118,7 +118,7 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
       # Provision the toolchain with bare rustup instead of a toolchain
@@ -251,7 +251,7 @@ jobs:
       VERSION: ${{ needs.plan.outputs.version }}
       PRERELEASE: ${{ needs.plan.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
       - name: Download artifacts
@@ -347,7 +347,7 @@ jobs:
       # one-line installer scripts (sitter-latest only; no sidecars).
       SITTER_ASSET_REGEX: ^(intentd-[a-z0-9_]+-[a-z0-9-]+\.(tar\.xz|tar\.gz|zip)|intentd_([^_]+_)?(amd64|arm64)\.deb|install\.(sh|ps1))(\.sha256)?$
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
       - name: Check mirror token
@@ -417,7 +417,7 @@ jobs:
     env:
       VERSION: ${{ needs.plan.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
       - name: Download artifacts
@@ -444,7 +444,7 @@ jobs:
           cp intentd.rb "$(brew --repository scratch/sitter)/Formula/intentd.rb"
           brew style --formula scratch/sitter/intentd \
             || echo "::warning::brew style reported offenses on intentd.rb (non-blocking)"
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
         with:
           repository: intent-hq/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -484,7 +484,7 @@ jobs:
       TAG: ${{ needs.plan.outputs.tag }}
       VERSION: ${{ needs.plan.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
       - name: Download linux artifacts

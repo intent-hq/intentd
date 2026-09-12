@@ -61,7 +61,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ inputs.plan }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
       - name: Determine tag
