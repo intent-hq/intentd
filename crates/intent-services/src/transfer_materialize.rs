@@ -676,7 +676,8 @@ fn provision_sandbox_from_bundle(
 /// that is already a clone (`CoW` or plain) of the checkout: fetch the
 /// sandbox branch from the bundle, check it out, reset the local workspace
 /// branch off the WIP sentinel, bring the initialized submodules (nested
-/// ones included) in line with the gitlinks the verified tip records, and
+/// ones included) in line with the gitlinks the verified tip records, drop
+/// the copied submodule worktrees that tip does not track at all, and
 /// finally unwind the sandbox WIP snapshot.
 fn finish_sandbox_from_bundle(
     sandbox_path: &Path,
@@ -685,6 +686,15 @@ fn finish_sandbox_from_bundle(
     workspace_branch: &str,
     workspace_has_wip: bool,
 ) -> Result<()> {
+    // Still at the checkout's tip here: the gitlinks it records (nested
+    // ones included) are the submodule worktrees a CoW copy may carry. An
+    // incomplete inventory prunes nothing.
+    let copied_gitlinks: Vec<String> = tracked_paths_recursive(sandbox_path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(path, is_gitlink)| is_gitlink.then_some(path))
+        .collect();
+
     run_git(sandbox_path, |cmd| {
         cmd.arg("fetch")
             .arg("--no-tags")
@@ -766,6 +776,7 @@ fn finish_sandbox_from_bundle(
             "materialize: could not move initialized submodules to the sandbox gitlinks"
         );
     }
+    prune_untracked_submodule_worktrees(sandbox_path, &copied_gitlinks);
 
     if entry.wip_commit_sha.is_some() && !unwind_wip(sandbox_path)? {
         return Err(Error::Internal(
@@ -773,6 +784,121 @@ fn finish_sandbox_from_bundle(
         ));
     }
     Ok(())
+}
+
+/// `root/rel` when every component of `rel` is a real directory on disk —
+/// `None` when `rel` is not a plain relative path, a component is missing
+/// or not a directory, or any component is a symlink. The guard that keeps
+/// the filesystem operations below from following a symlink the tracked
+/// tree (or a dirty worktree) placed in the way out of `root`.
+fn dir_within_no_symlinks(root: &Path, rel: &str) -> Option<PathBuf> {
+    check_relative_components(rel).ok()?;
+    let mut dir = root.to_path_buf();
+    for component in rel.split('/') {
+        dir.push(component);
+        let meta = std::fs::symlink_metadata(&dir).ok()?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return None;
+        }
+    }
+    Some(dir)
+}
+
+/// Every path the repository at `repo` tracks at HEAD — blobs, trees and
+/// gitlinks — as `(repo-relative forward-slash path, is_gitlink)`, recursing
+/// into each gitlink whose worktree is initialized (`<path>/.git` exists,
+/// reached without following a symlink) so nested submodules come back as
+/// `sub/inner`. `None` when any repository along the way cannot be listed:
+/// callers prune against this inventory, so an incomplete one must not
+/// pass for "tracks nothing there".
+fn tracked_paths_recursive(repo: &Path) -> Option<Vec<(String, bool)>> {
+    let listing = match git_stdout(repo, |cmd| {
+        cmd.args(["ls-tree", "-r", "-t", "-z", "HEAD"]);
+    }) {
+        Ok(listing) => listing,
+        Err(e) => {
+            tracing::warn!(
+                repo = %repo.display(),
+                error = %e,
+                "materialize: could not list the tracked paths at HEAD"
+            );
+            return None;
+        }
+    };
+    let mut paths = Vec::new();
+    for record in listing.split('\0').filter(|r| !r.is_empty()) {
+        // `<mode> <type> <sha>\t<path>`
+        let Some((meta, path)) = record.split_once('\t') else {
+            continue;
+        };
+        let is_gitlink = meta.starts_with("160000 ");
+        paths.push((path.to_string(), is_gitlink));
+        if !is_gitlink {
+            continue;
+        }
+        let Some(dir) = dir_within_no_symlinks(repo, path) else {
+            continue;
+        };
+        if dir.join(".git").symlink_metadata().is_ok() {
+            for (nested, nested_is_gitlink) in tracked_paths_recursive(&dir)? {
+                paths.push((format!("{path}/{nested}"), nested_is_gitlink));
+            }
+        }
+    }
+    Some(paths)
+}
+
+/// Remove the copied submodule worktrees the sandbox has no place for: each
+/// of `copied_gitlinks` (gitlinks the checkout's tip recorded, nested ones
+/// as `sub/inner`) whose path the sandbox — at its verified tip, with the
+/// initialized submodules already moved to the gitlinks that tip records —
+/// tracks under no mode at all (intent-hq/intent#4838). `git checkout`
+/// cannot rmdir such a directory (it is a non-empty submodule worktree), so
+/// it would linger as untracked content and its parent would read as
+/// modified although the source sandbox was clean. Strictly scoped: a path
+/// the tip does track (gitlink, tree or blob) is never touched, nor is a
+/// directory without a `.git` entry, nor anything reached through a
+/// symlink (a tip that tracks `sub` as a symlink must not turn `sub/inner`
+/// into a removal outside the sandbox); the module repository under
+/// `.git/modules/…` stays. Fails closed: when the sandbox tree cannot be
+/// listed in full nothing is removed. Best-effort like the step before it.
+fn prune_untracked_submodule_worktrees(sandbox_path: &Path, copied_gitlinks: &[String]) {
+    if copied_gitlinks.is_empty() {
+        return;
+    }
+    let Some(tracked) = tracked_paths_recursive(sandbox_path) else {
+        tracing::warn!(
+            sandbox = %sandbox_path.display(),
+            "materialize: sandbox tree not fully listed; leaving copied submodule worktrees in place"
+        );
+        return;
+    };
+    let tracked: std::collections::HashSet<String> =
+        tracked.into_iter().map(|(path, _)| path).collect();
+    for rel in copied_gitlinks {
+        if tracked.contains(rel) {
+            continue;
+        }
+        let Some(dir) = dir_within_no_symlinks(sandbox_path, rel) else {
+            continue;
+        };
+        if dir.join(".git").symlink_metadata().is_err() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::info!(
+                sandbox = %sandbox_path.display(),
+                path = %rel,
+                "materialize: removed copied submodule worktree the sandbox tip does not track"
+            ),
+            Err(e) => tracing::warn!(
+                sandbox = %sandbox_path.display(),
+                path = %rel,
+                error = %e,
+                "materialize: could not remove copied submodule worktree the sandbox tip does not track"
+            ),
+        }
+    }
 }
 
 /// Remove everything a failed materialization created: each created
@@ -1702,12 +1828,13 @@ mod tests {
     /// Shared driver for the intent-hq/intent#4397 `CoW` regressions: a
     /// superproject whose `sub` sits on an unpublished commit `sha` while
     /// the tip records `recorded` (the seed commit unless `prepare_super`
-    /// advanced it), one sandbox (`prepare_sandbox`
-    /// shapes its submodule state; it is a plain clone with an
-    /// uninitialized gitlink otherwise), exported and materialized as a
-    /// checkout alone. The sandbox is then stood up as a byte copy of the
-    /// hydrated checkout — the shape a `clonefile` clone produces on APFS,
-    /// which `provision_sandbox_from_bundle` never takes on a Linux test
+    /// advanced it), one sandbox (`prepare_sandbox` shapes its branch and
+    /// submodule state before the sandbox commit; it is a plain clone of
+    /// the superproject tip with an uninitialized gitlink otherwise),
+    /// exported and materialized as a checkout alone. The sandbox is then
+    /// stood up as a byte copy of the hydrated checkout — the shape a
+    /// `clonefile` clone produces on APFS, which
+    /// `provision_sandbox_from_bundle` never takes on a Linux test
     /// filesystem without reflink — and the provisioning tail is run on it.
     fn cow_copied_sandbox_case(
         prepare_super: impl FnOnce(&Path),
@@ -1727,8 +1854,9 @@ mod tests {
         let branch = format!("sb/{}", agent.0);
         let sb_src = tmp.path().join("sandbox");
         make_sandbox_clone(&sup, &sb_src, &branch);
-        let sb_tip = commit_file(&sb_src, "sb.txt", "sandbox work\n", "feat: sandbox commit");
         prepare_sandbox(&sup, &sb_src);
+        let sb_tip = commit_file(&sb_src, "sb.txt", "sandbox work\n", "feat: sandbox commit");
+        let sandbox_records_sub = !fgit(&sb_src, &["ls-tree", &sb_tip, "--", "sub"]).is_empty();
         fs::write(sb_src.join("sb-wip.txt"), "sandbox wip\n").unwrap();
         let sb_fingerprint = status_fingerprint(&sb_src);
         let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
@@ -1777,9 +1905,10 @@ mod tests {
 
         assert_eq!(head_branch(&sandbox_path), branch);
         assert_eq!(repo_head(&sandbox_path), sb_tip, "WIP unwound");
-        assert!(
+        assert_eq!(
             sandbox_path.join("sub").join(".git").exists(),
-            "submodule stays initialized"
+            sandbox_records_sub,
+            "submodule stays initialized iff the sandbox tip records it"
         );
         assert_eq!(
             repo_head(&out.checkout_dir.join("sub")),
@@ -1995,6 +2124,223 @@ mod tests {
             inner_seed,
             "nested submodule sits at the gitlink the outer one records"
         );
+    }
+
+    /// Regression for intent-hq/intent#4838: the sandbox branch was cut
+    /// BEFORE the workspace added `sub`, so its tip has no gitlink there
+    /// while the `CoW` copy carries the hydrated worktree. `git checkout`
+    /// cannot rmdir the non-empty directory, leaving it as untracked content
+    /// of a sandbox whose source was clean; the provisioning tail must
+    /// remove it. Nothing else the sandbox tip does not track is touched.
+    #[test]
+    fn cow_copied_sandbox_prunes_submodule_worktree_absent_at_its_tip() {
+        let case = cow_copied_sandbox_case(
+            |_| {},
+            |_, sb_src| {
+                // Rewind the sandbox branch to the seed commit, before
+                // `add submodule`; the uninitialized gitlink dir goes away.
+                fgit(sb_src, &["reset", "-q", "--hard", "HEAD~1"]);
+                assert!(fgit(sb_src, &["ls-tree", "HEAD", "--", "sub"]).is_empty());
+                assert!(!sb_src.join("sub").exists());
+                fs::write(sb_src.join("keep.txt"), "untracked, stays\n").unwrap();
+            },
+        );
+        assert_eq!(case.submodule_paths, ["sub"]);
+        assert!(
+            fgit(&case.sandbox_path, &["ls-tree", &case.sb_tip, "--", "sub"]).is_empty(),
+            "the sandbox tip records no gitlink at sub"
+        );
+        assert!(
+            !case.sandbox_path.join("sub").exists(),
+            "copied submodule worktree removed from the sandbox"
+        );
+        assert_eq!(
+            fs::read_to_string(case.sandbox_path.join("keep.txt")).unwrap(),
+            "untracked, stays\n"
+        );
+        assert_eq!(status_fingerprint(&case.sandbox_path), case.sb_fingerprint);
+        assert_eq!(
+            fgit(&case.sandbox_path, &["status", "--porcelain"]),
+            "?? keep.txt\n?? sb-wip.txt"
+        );
+        assert_eq!(
+            repo_head(&case.checkout_dir.join("sub")),
+            case.sha,
+            "workspace checkout keeps its hydrated submodule"
+        );
+    }
+
+    /// intent-hq/intent#4838, one level down: `sub` gained `inner` only in
+    /// commits the sandbox tip does not record (it still records `sub` at
+    /// the seed, which has no `inner` gitlink), yet the `CoW` copy carries
+    /// the hydrated `sub/inner`. Once `sub` is moved to the seed the nested
+    /// worktree is left behind as untracked content and `sub` reads as
+    /// modified; the provisioning tail must remove `sub/inner` while
+    /// keeping `sub` itself, which the sandbox tip does record.
+    #[test]
+    fn cow_copied_sandbox_prunes_nested_submodule_worktree_absent_at_its_tip() {
+        let mut inner_tip = String::new();
+        let case = cow_copied_sandbox_case(
+            |sup| {
+                let root = sup.parent().unwrap();
+                let inner_src = root.join("inner-src");
+                finit_repo(&inner_src);
+                fgit(root, &["clone", "-q", "--bare", "inner-src", "inner.git"]);
+                let inner_origin = root.join("inner.git");
+                let sub = sup.join("sub");
+                fgit(&sub, &["checkout", "-q", "main"]);
+                fgit(
+                    &sub,
+                    &[
+                        "submodule",
+                        "add",
+                        "-q",
+                        inner_origin.to_str().unwrap(),
+                        "inner",
+                    ],
+                );
+                fgit(&sub, &["commit", "-q", "-m", "add inner"]);
+                // The superproject tip is NOT bumped: it (and so the
+                // sandbox branch) keeps recording `sub` at the seed, which
+                // has no `inner`. An unpublished inner commit gets it
+                // bundled and hydrated on the target.
+                let inner = sub.join("inner");
+                fgit(&inner, &["checkout", "-q", "-b", "feat/x"]);
+                inner_tip = local_commit(&inner, "deep.txt");
+                fgit(&sub, &["add", "inner"]);
+                fgit(&sub, &["commit", "-q", "-m", "bump inner"]);
+            },
+            |_, _| {},
+        );
+        assert_eq!(case.submodule_paths, ["sub", "sub/inner"]);
+        assert!(
+            fgit(
+                &case.sandbox_path.join("sub"),
+                &["ls-tree", &case.recorded, "--", "inner"]
+            )
+            .is_empty(),
+            "the recorded outer gitlink has no inner gitlink"
+        );
+        assert_eq!(
+            repo_head(&case.checkout_dir.join("sub").join("inner")),
+            inner_tip,
+            "workspace checkout keeps its hydrated nested submodule"
+        );
+        assert!(
+            !case.sandbox_path.join("sub").join("inner").exists(),
+            "copied nested submodule worktree removed from the sandbox"
+        );
+        assert_eq!(status_fingerprint(&case.sandbox_path), case.sb_fingerprint);
+        assert_eq!(
+            fgit(&case.sandbox_path, &["status", "--porcelain"]),
+            "?? sb-wip.txt"
+        );
+        assert_eq!(
+            fgit(&case.sandbox_path.join("sub"), &["status", "--porcelain"]),
+            ""
+        );
+        assert_eq!(
+            repo_head(&case.sandbox_path.join("sub")),
+            case.recorded,
+            "outer submodule sits at the gitlink the sandbox branch records"
+        );
+    }
+
+    /// The pruning step never follows a symlink: the copied tip had gitlinks
+    /// `sub` and `sub/inner`, the sandbox tip tracks `sub` as a symlink to a
+    /// directory outside the sandbox that holds an `inner/.git`. `sub` is
+    /// tracked (kept) and `sub/inner` is not, yet the outside directory must
+    /// survive — `remove_dir_all` through the symlink would delete it.
+    #[cfg(unix)]
+    #[test]
+    fn prune_untracked_submodule_worktrees_never_follows_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside_inner = tmp.path().join("outside").join("inner");
+        fs::create_dir_all(&outside_inner).unwrap();
+        fs::write(outside_inner.join(".git"), "gitdir: nowhere\n").unwrap();
+        fs::write(outside_inner.join("deep.txt"), "keep\n").unwrap();
+        let sandbox = tmp.path().join("sandbox");
+        finit_repo(&sandbox);
+        std::os::unix::fs::symlink("../outside", sandbox.join("sub")).unwrap();
+        fgit(&sandbox, &["add", "sub"]);
+        fgit(&sandbox, &["commit", "-q", "-m", "sub is a symlink"]);
+        assert!(fgit(&sandbox, &["ls-tree", "HEAD", "--", "sub"]).starts_with("120000 "));
+
+        let tracked = tracked_paths_recursive(&sandbox).unwrap();
+        assert!(tracked.iter().any(|(p, _)| p == "sub"));
+        assert!(
+            !tracked.iter().any(|(p, _)| p == "sub/inner"),
+            "inventory does not descend through a symlink"
+        );
+
+        prune_untracked_submodule_worktrees(
+            &sandbox,
+            &["sub".to_string(), "sub/inner".to_string()],
+        );
+        assert!(
+            outside_inner.join(".git").is_file() && outside_inner.join("deep.txt").is_file(),
+            "nothing outside the sandbox is removed"
+        );
+        assert!(sandbox
+            .join("sub")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// Fail closed: when the sandbox tree cannot be listed the inventory is
+    /// `None` and pruning removes nothing, even though every candidate
+    /// would otherwise qualify (untracked, carries a `.git` entry).
+    #[test]
+    fn prune_untracked_submodule_worktrees_keeps_everything_when_listing_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = tmp.path().join("not-a-repo");
+        fs::create_dir_all(sandbox.join("sub")).unwrap();
+        fs::write(sandbox.join("sub").join(".git"), "gitdir: nowhere\n").unwrap();
+        assert!(tracked_paths_recursive(&sandbox).is_none());
+
+        prune_untracked_submodule_worktrees(&sandbox, &["sub".to_string()]);
+        assert!(
+            sandbox.join("sub").join(".git").is_file(),
+            "candidate survives"
+        );
+    }
+
+    /// Fail closed one level down: the sandbox tip tracks `sub` as an
+    /// initialized gitlink whose repository cannot be listed (broken
+    /// `.git` file), so `sub/inner` cannot be proven untracked. The whole
+    /// inventory is `None` and nothing is removed — neither `sub/inner` nor
+    /// `sub`.
+    #[test]
+    fn prune_untracked_submodule_worktrees_keeps_everything_when_nested_listing_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub_src = tmp.path().join("sub-src");
+        finit_repo(&sub_src);
+        let sandbox = tmp.path().join("sandbox");
+        finit_repo(&sandbox);
+        fgit(
+            &sandbox,
+            &["submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"],
+        );
+        fgit(&sandbox, &["commit", "-q", "-m", "add sub"]);
+        assert!(tracked_paths_recursive(&sandbox).is_some());
+
+        let sub = sandbox.join("sub");
+        fs::write(sub.join(".git"), "gitdir: /nonexistent/gitdir\n").unwrap();
+        fs::create_dir_all(sub.join("inner")).unwrap();
+        fs::write(sub.join("inner").join(".git"), "gitdir: nowhere\n").unwrap();
+        assert!(tracked_paths_recursive(&sandbox).is_none());
+
+        prune_untracked_submodule_worktrees(
+            &sandbox,
+            &["sub".to_string(), "sub/inner".to_string()],
+        );
+        assert!(
+            sub.join("inner").join(".git").is_file(),
+            "nested candidate survives"
+        );
+        assert!(sub.join(".git").is_file());
     }
 
     /// (c) A corrupt submodule bundle fails the materialization with an
