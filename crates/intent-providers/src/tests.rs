@@ -99,11 +99,12 @@ fn registry_field_parity() {
     // (anthropics/claude-code#53933), grok's `search_tool` truncates at
     // 2,048 chars (MCP tools never appear in the tool list), and droid's
     // remote Statsig `mcp_tool_search` flag gates 200-char deferred summaries
-    // (defensive). Cortex also defers ALL MCP tools to a names-only reminder,
-    // but it has no MCP delivery channel yet, so flagging it is deferred to
-    // intent-hq/monorepo#3303. Evidence per entry lives in config.rs. Every
-    // other provider keeps the full tool description byte-identical to before.
-    let flagged = ["claude-code", "droid", "grok"];
+    // (defensive). Cortex defers ALL MCP tools to a names-only reminder
+    // (`settings.toolSearch` default ON) and now receives the bridge via
+    // `session/new` `mcpServers` (intent-hq/intent#3303). Evidence per entry
+    // lives in config.rs. Every other provider keeps the full tool
+    // description byte-identical to before.
+    let flagged = ["claude-code", "cortex", "droid", "grok"];
     for p in ACP_PROVIDERS {
         assert_eq!(
             p.truncates_tool_descriptions,
@@ -134,6 +135,23 @@ fn registry_field_parity() {
     // escape hatch — a feature code would be unconditionally gated).
     assert_eq!(cortex.requires_env_var, Some("INTENTD_ENABLE_CORTEX"));
     assert_eq!(cortex.requires_feature_code, None);
+    // The cortex-acp adapter has no MCP CLI flag or env config; its
+    // `session/new` handler consumes `mcpServers` (intent-hq/intent#3303), so
+    // the per-agent workspace bridge rides the ACP session setup — the same
+    // channel `create_agent` stashes on the handle for claude-code/codex.
+    assert!(
+        cortex.supports_session_mcp_servers,
+        "cortex must receive the workspace_api bridge via session/new mcpServers"
+    );
+    assert!(!cortex.supports_mcp_config && cortex.mcp_config_flag.is_none());
+    assert!(!cortex.mcp_via_pi_extension);
+    // Bridge delivery and the compact-description flag move together: the
+    // full ws.* reference rides the first-turn prepend.
+    assert!(cortex.truncates_tool_descriptions);
+    assert_eq!(
+        cortex.injection_mechanism,
+        InjectionMechanism::FirstTurnPrepend
+    );
 
     let oc = find_provider("opencode").unwrap();
     assert_eq!(oc.base_args, &["acp"]);
@@ -239,14 +257,22 @@ fn cortex_and_droid_gate_on_enable_env_vars() {
     }
 }
 
-/// Exactly claude-code, codex, droid, and grok consume MCP servers from the
-/// ACP `session/new` / `session/load` `mcpServers` field; every other
-/// provider receives MCP config out-of-band (auggie `--mcp-config`, opencode
-/// env config) or not at all. Asserted over the full registry so a newly
-/// added provider can't accidentally opt in without updating this partition.
+/// Exactly claude-code, codex, cortex, droid, grok, and antigravity consume
+/// MCP servers from the ACP `session/new` / `session/load` `mcpServers`
+/// field; every other provider receives MCP config out-of-band (auggie
+/// `--mcp-config`, opencode env config) or not at all. Asserted over the full
+/// registry so a newly added provider can't accidentally opt in without
+/// updating this partition.
 #[test]
 fn session_mcp_servers_partition() {
-    let opted_in = ["claude-code", "codex", "droid", "grok", "antigravity"];
+    let opted_in = [
+        "claude-code",
+        "codex",
+        "cortex",
+        "droid",
+        "grok",
+        "antigravity",
+    ];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(

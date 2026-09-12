@@ -156,7 +156,7 @@ pub struct ProviderConfig {
     pub supports_mcp_config: bool,
     /// Whether the provider consumes MCP servers from the ACP `session/new` /
     /// `session/load` request's `mcpServers` field (claude-code, codex,
-    /// droid, grok).
+    /// cortex, droid, grok, antigravity).
     pub supports_session_mcp_servers: bool,
     /// Whether MCP delivery rides a bundled pi extension: `create_agent`
     /// writes the embedded extension plus a wrapper script that execs the
@@ -468,15 +468,23 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // MOCK_AGENT_SCRIPT_PATH gate).
         requires_env_var: Some("INTENTD_ENABLE_CORTEX"),
         short_name: "Cortex",
+        // MCP delivery rides the ACP session setup (intent-hq/intent#3303):
+        // the cortex-acp adapter exposes no MCP CLI flag or env config, but
+        // its `session/new` handler consumes the request's `mcpServers` and
+        // registers each entry (stdio `command`/`args`/`env`, or `url`) with
+        // the cortex process under an `intent-<name>` key, cleaning up when
+        // the session ends. Snowflake's native `cortex acp serve` is the same
+        // ACP shape, so the typed `mcpServers` field is the one channel both
+        // runtimes share — the per-agent workspace bridge is stashed on the
+        // handle by `create_agent` exactly like claude-code / codex.
+        supports_session_mcp_servers: true,
         // Cortex defers ALL MCP tools by default (`settings.toolSearch !==
         // false` — default ON): a names-only reminder ("Schemas are NOT
         // loaded in your context") replaces description text unless the
-        // model calls `tool_search`. However, this entry has NO MCP delivery
-        // channel yet (no `supports_mcp_config` / `supports_session_mcp_servers`
-        // / env config / pi extension), so the workspace bridge never reaches
-        // cortex sessions — flipping `truncates_tool_descriptions` here would
-        // inject the full ws.* reference for tools cortex cannot call. Flip it
-        // together with bridge delivery: intent-hq/monorepo#3303.
+        // model calls `tool_search`. Now that the bridge reaches cortex
+        // sessions, serve the compact `workspace_api` description and carry
+        // the full ws.* reference in the first-turn prepend.
+        truncates_tool_descriptions: true,
         ..ProviderConfig::empty("cortex", "Snowflake Cortex", "cortex-acp")
     },
     ProviderConfig {
