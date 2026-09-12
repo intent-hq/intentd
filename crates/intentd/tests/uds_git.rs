@@ -1,6 +1,8 @@
 //! Over-the-wire git write-ops slice: drive `git.status`, `git.agentCommit`, and
 //! `git.commit` against a real worktree through the daemon over a temp UDS.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::Path;

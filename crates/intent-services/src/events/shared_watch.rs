@@ -1212,6 +1212,7 @@ mod tests {
     /// The resolution fallback is per path, not per event: one path of a
     /// multi-path event matching raw must not suppress resolution for a sibling
     /// path that only reaches its sink after canonicalization.
+    #[cfg(unix)]
     #[test]
     fn a_raw_match_does_not_suppress_resolution_for_sibling_paths() {
         use notify::event::{EventKind, ModifyKind, RenameMode};

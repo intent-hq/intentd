@@ -5,6 +5,8 @@
 //! Covers mixed batches (server.* + non-server keys), single-key failures, and
 //! successful batches (no rollback).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

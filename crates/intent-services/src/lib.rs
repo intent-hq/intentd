@@ -3939,8 +3939,9 @@ impl Services {
 
     /// Override the auto-commit message generation timeout (defaults to the
     /// ~30s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
-    /// the timeout-fallback path completes in milliseconds.
-    #[cfg(test)]
+    /// the timeout-fallback path completes in milliseconds. Its only callers
+    /// spawn a fake CLI via a shell script, so they (and it) are unix-only.
+    #[cfg(all(test, unix))]
     pub(crate) fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
         self.auto_commit_timeout_ms = Some(ms);
         self

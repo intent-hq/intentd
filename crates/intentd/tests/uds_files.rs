@@ -2,6 +2,8 @@
 //! `file.stat` against a real workspace root through the daemon over a temp
 //! UDS and assert the exact response shapes each method promises.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::Path;

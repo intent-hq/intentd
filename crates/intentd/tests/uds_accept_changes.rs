@@ -2,6 +2,8 @@
 //! (undo-commit / undo-push / reset-to-trunk / rebase-onto-trunk / merge): drive
 //! each action against a real worktree through the daemon over a temp UDS.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::{Path, PathBuf};

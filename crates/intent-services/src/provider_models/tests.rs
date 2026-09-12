@@ -11,7 +11,9 @@ use super::parse::{
 use super::parse::{
     is_auth_required_error, parse_acp_models, parse_codex_acp_models, parse_opencode_models,
 };
-use super::probe::{exit_attribution, ProbeError};
+#[cfg(unix)]
+use super::probe::exit_attribution;
+use super::probe::ProbeError;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -601,6 +603,7 @@ async fn antigravity_auth_accepts_valid_empty_catalog_and_detects_browser_guard(
 /// timeout); under full-suite parallel load an unserialized child can be
 /// starved past its budget, flaking the probe. `unwrap_or_else(into_inner)`
 /// recovers from a poisoned lock so one panicking test does not cascade.
+#[cfg(unix)]
 static CHILD_SPAWN_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Recorded (trimmed) response from

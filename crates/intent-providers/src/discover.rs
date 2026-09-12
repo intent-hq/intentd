@@ -469,7 +469,7 @@ fn find_auggie_candidates_with_home_and_dirs(
 
 /// [`find_provider_binary`] with an explicit `home` for every user-local tier
 /// (test seam — avoids mutating process-global `HOME` in parallel tests).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn find_provider_binary_with_home(
     provider_id: &str,
     command: &str,

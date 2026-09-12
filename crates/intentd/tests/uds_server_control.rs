@@ -5,6 +5,8 @@
 //! toggle works on a UDS-only boot; that requires a real composition-root daemon
 //! and is covered by `e2e_wss_runtime_control.rs` (see the placeholder test below).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

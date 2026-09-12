@@ -514,7 +514,7 @@ mod tests {
             #[cfg(unix)]
             status: ExitStatus::from_raw(status_code << 8),
             #[cfg(windows)]
-            status: ExitStatus::from_raw(status_code as u32),
+            status: ExitStatus::from_raw(status_code.cast_unsigned()),
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }

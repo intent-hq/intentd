@@ -6,6 +6,8 @@
 //! real keychain) and a mock node MCP stdio server fixture (skipped if node is
 //! unavailable).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

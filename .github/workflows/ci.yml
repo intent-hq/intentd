@@ -603,8 +603,8 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
-          # clippy is needed by the macOS lint step below; installing it
-          # matrix-wide keeps this step unconditional (negligible on Windows).
+          # clippy is needed by the target-gated lint step below, which runs
+          # on both the macOS and the Windows matrix entries.
           components: clippy
       # Ephemeral GitHub-hosted runners have no persistent target dir, so
       # use the GH cache there instead (mirrors the `check` job's
@@ -621,19 +621,22 @@ jobs:
       - name: Check (PR compilation proof)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name != 'push'
         run: cargo check --workspace --target ${{ matrix.target }}
-      # Clippy over macOS-gated code (intent-hq/monorepo#3285): the `check`
-      # job lints on Linux, where `#[cfg(target_os = "macos")]` code is never
-      # compiled, so warnings in macOS-only files land silently and break
-      # `make check` on every macOS dev box. Linting here (PRs only, same
-      # invocation as the check job) closes the gap. It runs on this runner
-      # rather than as a Linux cross-target run because `cargo clippy
-      # --target aarch64-apple-darwin` still executes the native build
+      # Clippy over target-gated code (intent-hq/monorepo#3285 for macOS,
+      # intent-hq/intentd#1813 for Windows): the `check` job lints on Linux,
+      # where `#[cfg(target_os = "macos")]` / `#[cfg(windows)]` /
+      # `#[cfg(not(unix))]` code is never compiled, so warnings in
+      # target-only code (including outer `#[allow]`s that only expand there
+      # and trip `clippy::allow_attributes`) land silently and break
+      # `make check` on every macOS or Windows dev box. Linting here (PRs
+      # only, same invocation as the check job) closes the gap. It runs on
+      # the native runners rather than as Linux cross-target runs because
+      # `cargo clippy --target <triple>` still executes the native build
       # scripts (libz-sys and friends try-compile C for the target even when
-      # pkg-config resolves a system lib), which would require a full darwin
-      # cross C toolchain on Linux; the native runner needs nothing extra and
-      # shares this job's warm target dir.
-      - name: Clippy (macOS-gated code)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'pull_request' && runner.os == 'macOS'
+      # pkg-config resolves a system lib), which would require a full
+      # darwin / MSVC cross C toolchain on Linux; the native runners need
+      # nothing extra and share this job's warm target dir.
+      - name: Clippy (target-gated code)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'pull_request' && (runner.os == 'macOS' || runner.os == 'Windows')
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Build (release)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'

@@ -5,6 +5,8 @@
 //! presence-only. Uses a dummy bag literal so tests can assert its absence
 //! from every response frame.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

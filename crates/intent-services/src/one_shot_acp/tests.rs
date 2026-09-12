@@ -5,7 +5,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{run_one_shot_acp, run_one_shot_acp_in, OneShotCommand, OneShotError};
+#[cfg(unix)]
+use super::run_one_shot_acp_in;
+use super::{run_one_shot_acp, OneShotCommand, OneShotError};
+#[cfg(unix)]
 use crate::acp_adapter::AdapterSlots;
 
 /// Write `body` as an executable-by-node mock adapter script and return a

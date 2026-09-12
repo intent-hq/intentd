@@ -694,6 +694,7 @@ impl Supervisor {
                         next_check_at = self.schedule_next_check();
                     }
                     event = signals.recv() => {
+                        #[cfg_attr(not(unix), expect(clippy::infallible_destructuring_match, reason = "only the shutdown arm exists off unix"))]
                         let signal = match event {
                             // `intentd restart` (SIGHUP): stop the child
                             // gracefully and respawn it on the current
@@ -809,6 +810,7 @@ impl Supervisor {
     /// semantics): picks up whatever `sitter channel --redownload`
     /// force-installed, keeping the current version when `state.json`
     /// names nothing installed.
+    #[cfg(unix)]
     fn refresh_version_from_state(&self, current_version: &mut String) {
         let state = state::load(&self.paths.state_path);
         match state
@@ -847,6 +849,10 @@ impl Supervisor {
     ) -> FailedStartCheck {
         let check = self.check();
         tokio::pin!(check);
+        #[cfg_attr(
+            not(unix),
+            expect(clippy::never_loop, reason = "only the shutdown arm exists off unix")
+        )]
         let outcome = loop {
             tokio::select! {
                 outcome = &mut check => break outcome,
@@ -1165,6 +1171,10 @@ struct Signals;
 
 #[cfg(not(unix))]
 impl Signals {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "mirrors the fallible unix constructor signature"
+    )]
     fn new() -> io::Result<Self> {
         Ok(Self)
     }
