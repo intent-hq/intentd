@@ -1532,16 +1532,129 @@ mod tests {
     /// below return as soon as the awaited event arrives, so this bound only
     /// has to outlast a worst-case multi-suite machine stall (login-shell
     /// spawn + exit-poll + bus delivery), never a passing run.
-    const LIVENESS: Duration = Duration::from_secs(300);
+    ///
+    /// Invariant (intent-hq/intentd#1822): every harness-bounded wait must
+    /// fail THROUGH the harness — its own diagnostic naming the stalled step,
+    /// then teardown — strictly before nextest's `slow-timeout` terminate
+    /// budget (`period × terminate-after` in `.config/nextest.toml`, 180s)
+    /// SIGKILLs the test. At 300s the bound could never fire: the kill landed
+    /// first, the run reported a bare "test timed out", and leaked script
+    /// children had to be reaped by hand. `LIVENESS + TEARDOWN_MARGIN` must
+    /// stay under that budget; `liveness_deadline_fits_inside_nextest_terminate_budget`
+    /// reads the real config and pins the ordering.
+    const LIVENESS: Duration = Duration::from_secs(150);
+    /// Headroom between a `LIVENESS` expiry and nextest's kill so the failing
+    /// wait's diagnostic and process teardown complete before the SIGKILL.
+    const TEARDOWN_MARGIN: Duration = Duration::from_secs(30);
     /// Service command lifetime long enough that a service under test cannot
     /// exit (and auto-restart, killing its PTY) mid-assertion under load
-    /// (monorepo#515). Strictly outlives `LIVENESS` so negative checks bounded
-    /// by it (e.g. the upsert orphan `kill -0` poll) can still hard-fail on a
-    /// leaked process instead of the command exiting first. Every test that
-    /// starts one stops or removes it.
+    /// (monorepo#515). Outlives `LIVENESS` so a negative check bounded by it
+    /// (e.g. the upsert orphan `kill -0` poll) observes a genuinely leaked
+    /// process rather than the command exiting on its own; the check itself
+    /// hard-fails via the `LIVENESS` deadline. Every test that starts one
+    /// stops or removes it.
     const SERVICE_CMD: &str = "sleep 3600";
 
     // ---- pure-helper tests (no PTY, no event bus) --------------------------
+
+    /// Parse a nextest duration literal (`"90s"`, `"2m"`, `"1h"`, `"500ms"`).
+    fn parse_nextest_duration(raw: &str) -> Duration {
+        let raw = raw.trim();
+        let split = raw
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or_else(|| panic!("duration {raw:?} has no unit suffix"));
+        let (num, unit) = raw.split_at(split);
+        let num: f64 = num
+            .parse()
+            .unwrap_or_else(|e| panic!("duration {raw:?} has a non-numeric magnitude: {e}"));
+        let secs = match unit.trim() {
+            "ms" => num / 1000.0,
+            "s" => num,
+            "m" => num * 60.0,
+            "h" => num * 3600.0,
+            other => panic!("duration {raw:?} has an unsupported unit {other:?}"),
+        };
+        Duration::from_secs_f64(secs)
+    }
+
+    /// Pins the ordering `LIVENESS` relies on (intent-hq/intentd#1822): a
+    /// stalled harness wait must expire, print its diagnostic, and tear down
+    /// before nextest's `slow-timeout` kill (`period × terminate-after`) from
+    /// the real `.config/nextest.toml`, so the two numbers cannot drift apart
+    /// silently. No `[[profile.default.overrides]]` entry sets `slow-timeout`
+    /// (none matches `intent-services` tests either), so the `[profile.default]`
+    /// budget is the one that applies; the test fails loudly if that changes so
+    /// it can be taught which override governs this crate.
+    #[test]
+    fn liveness_deadline_fits_inside_nextest_terminate_budget() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.config/nextest.toml");
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read nextest config {path}: {e} — LIVENESS is bounded by its slow-timeout"
+            )
+        });
+        let doc: toml_edit::DocumentMut = raw
+            .parse()
+            .unwrap_or_else(|e| panic!("cannot parse nextest config {path}: {e}"));
+        let profile = doc
+            .get("profile")
+            .and_then(|p| p.get("default"))
+            .unwrap_or_else(|| panic!("{path}: no [profile.default] table"));
+
+        let overrides_with_slow_timeout: Vec<String> = profile
+            .get("overrides")
+            .and_then(|o| o.as_array_of_tables())
+            .map(|tables| {
+                tables
+                    .iter()
+                    .filter(|t| t.contains_key("slow-timeout"))
+                    .map(|t| {
+                        t.get("filter")
+                            .and_then(|f| f.as_str())
+                            .unwrap_or("<no filter>")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            overrides_with_slow_timeout.is_empty(),
+            "{path}: [[profile.default.overrides]] entries now carry `slow-timeout` \
+             (filters: {overrides_with_slow_timeout:?}); extend this test to determine \
+             which override applies to intent-services tests before trusting the \
+             [profile.default] budget"
+        );
+
+        let slow = profile
+            .get("slow-timeout")
+            .unwrap_or_else(|| panic!("{path}: [profile.default] has no slow-timeout"));
+        let period = slow
+            .get("period")
+            .and_then(toml_edit::Item::as_str)
+            .map_or_else(
+                || panic!("{path}: slow-timeout.period is not a duration string"),
+                parse_nextest_duration,
+            );
+        let terminate_after = slow
+            .get("terminate-after")
+            .and_then(toml_edit::Item::as_integer)
+            .unwrap_or_else(|| panic!("{path}: slow-timeout.terminate-after is not an integer"));
+        let terminate_after = u32::try_from(terminate_after).expect("terminate-after fits in u32");
+        let budget = period * terminate_after;
+
+        assert!(
+            TEARDOWN_MARGIN >= Duration::from_secs(20),
+            "TEARDOWN_MARGIN ({TEARDOWN_MARGIN:?}) must leave at least 20s for the \
+             harness diagnostic and teardown"
+        );
+        assert!(
+            LIVENESS + TEARDOWN_MARGIN <= budget,
+            "LIVENESS ({LIVENESS:?}) + TEARDOWN_MARGIN ({TEARDOWN_MARGIN:?}) exceeds \
+             nextest's terminate budget {budget:?} (slow-timeout period {period:?} × \
+             terminate-after {terminate_after} in {path}); nextest would SIGKILL a \
+             stalled test before the harness deadline fires"
+        );
+    }
 
     #[test]
     fn clamp_line_count_clamps_extremes_and_uses_fallback() {
@@ -1885,6 +1998,19 @@ mod tests {
         _worktree: Option<WorktreeDir>,
     }
 
+    /// Reap every PTY the test started, on normal and panicking unwinds
+    /// alike, so a stalled wait that fails through the `LIVENESS` deadline
+    /// cannot leak the script's process group past the test
+    /// (intent-hq/intentd#1822 left `git`/`sh`/`sleep 3600` behind). Drop is
+    /// synchronous and runs while the test runtime is unwinding, so this uses
+    /// the no-await SIGKILL sweep; it also latches the host closed, which
+    /// refuses a supervisor respawn racing the sweep.
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.services.pty().kill_all_sync();
+        }
+    }
+
     async fn harness() -> Harness {
         harness_with_worktree(false).await
     }
@@ -1943,39 +2069,62 @@ mod tests {
         .await
     }
 
+    /// Wait for the next `script:state` event satisfying `pred`. On timeout
+    /// the panic names the deadline and the last `script:state` event seen
+    /// (the status the run stalled at), so a harness failure is diagnosable
+    /// from the test output rather than only from nextest's slow-timeout kill.
     async fn await_state<F>(sub: &mut Subscription, timeout: Duration, mut pred: F) -> Value
     where
         F: FnMut(&Value) -> bool,
     {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut seen = 0usize;
+        let mut last_state: Option<Value> = None;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let batch = tokio::time::timeout(remaining, sub.recv())
-                .await
-                .expect("event delivered before deadline")
-                .expect("subscription open");
-            for ev in &batch {
+            let Ok(batch) = tokio::time::timeout(remaining, sub.recv()).await else {
+                panic!(
+                    "await_state timed out after {timeout:?}: {seen} script:* event(s) seen, \
+                     none matched the predicate; last script:state event: {}",
+                    last_state
+                        .as_ref()
+                        .map_or_else(|| "<none>".to_string(), Value::to_string)
+                );
+            };
+            for ev in &batch.expect("subscription open") {
                 let v = serde_json::to_value(ev).expect("serialize");
-                if v["type"] == "script:state" && pred(&v) {
-                    return v;
+                seen += 1;
+                if v["type"] == "script:state" {
+                    if pred(&v) {
+                        return v;
+                    }
+                    last_state = Some(v);
                 }
             }
         }
     }
 
+    /// Wait for the `script:changed` event carrying `action`; the timeout
+    /// panic names the action and the last `script:*` event seen.
     async fn await_script_change(sub: &mut Subscription, action: &str) -> Value {
         let deadline = tokio::time::Instant::now() + LIVENESS;
+        let mut last: Option<Value> = None;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let batch = tokio::time::timeout(remaining, sub.recv())
-                .await
-                .expect("script change delivered before liveness deadline")
-                .expect("subscription open");
-            for ev in &batch {
+            let Ok(batch) = tokio::time::timeout(remaining, sub.recv()).await else {
+                panic!(
+                    "await_script_change timed out after {LIVENESS:?} waiting for \
+                     script:changed action={action:?}; last script:* event: {}",
+                    last.as_ref()
+                        .map_or_else(|| "<none>".to_string(), Value::to_string)
+                );
+            };
+            for ev in &batch.expect("subscription open") {
                 let value = serde_json::to_value(ev).expect("serialize");
                 if value["type"] == "script:changed" && value["data"]["action"] == action {
                     return value;
                 }
+                last = Some(value);
             }
         }
     }
@@ -2718,7 +2867,7 @@ mod tests {
     #[tokio::test]
     async fn auto_restart_backoff_window_reports_restarting() {
         let mut h = harness().await;
-        h.services = h.services.with_script_too_fast_ms(0);
+        h.services = h.services.clone().with_script_too_fast_ms(0);
         let park = Arc::new(SupervisePark::default());
         let services = h.services.clone().with_script_supervise_park(park.clone());
         let mut sub = subscribe(&h);
@@ -3096,7 +3245,7 @@ mod tests {
     #[tokio::test]
     async fn stop_all_during_respawn_window_refuses_registration_and_reaps() {
         let mut h = harness().await;
-        h.services = h.services.with_script_too_fast_ms(0);
+        h.services = h.services.clone().with_script_too_fast_ms(0);
         let park = Arc::new(SupervisePark::default());
         let services = h.services.clone().with_script_supervise_park(park.clone());
         let mut sub = subscribe(&h);
@@ -3232,6 +3381,48 @@ mod tests {
             .expect("start");
         let exited = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
         assert_eq!(exited["data"]["exitCode"], 0, "got: {exited}");
+    }
+
+    /// Whether the process group led by `pgid` still has any member (a zombie
+    /// leader counts until reaped), via `kill -0 -- -<pgid>`.
+    #[cfg(unix)]
+    fn pgroup_alive(pgid: i64) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", "--", &format!("-{pgid}")])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run kill -0")
+            .success()
+    }
+
+    /// Dropping the `Harness` reaps every script PTY it started
+    /// (intent-hq/intentd#1822): a running service's whole process group is
+    /// gone shortly after the drop, and the supervisor's respawn is refused,
+    /// so a test that panics mid-wait cannot leak `sleep 3600` past nextest.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn harness_drop_kills_tracked_script_process_groups() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id)
+            .await
+            .expect("start");
+        let running = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let pid = running["data"]["pid"].as_i64().expect("pid");
+        assert!(pgroup_alive(pid), "service group {pid} alive before drop");
+
+        drop(h);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while pgroup_alive(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "service process group {pid} survived harness drop"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Regression (monorepo#1155): a `resolve_cwd` failure after the running
