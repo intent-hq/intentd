@@ -49,56 +49,62 @@ impl Store {
             .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
 
         // Execute the transaction body; rollback explicitly on error.
-        let result = async {
-            let next_v: i64 = sqlx::query(
-                "SELECT COALESCE(MAX(v), 0) + 1 AS v FROM note_version \
-                 WHERE note_id = ? AND workspace_id = ?",
-            )
-            .bind(&note.id.0)
-            .bind(&note.workspace_id.0)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("next note_version failed: {e}")))?
-            .try_get("v")
-            .map_err(|e| Error::Internal(format!("column v: {e}")))?;
-
-            sqlx::query(
-                "INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, \
-                 author_type, title, content, rev) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            )
-            .bind(&note.id.0)
-            .bind(&note.workspace_id.0)
-            .bind(next_v)
-            .bind(date)
-            .bind(&author.id)
-            .bind(&author.name)
-            .bind(&author.author_type)
-            .bind(&note.title)
-            .bind(&note.content)
-            .bind(rev)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("insert note_version failed: {e}")))?;
-
-            sqlx::query(
-                "DELETE FROM note_version WHERE note_id = ? AND workspace_id = ? AND v <= ?",
-            )
-            .bind(&note.id.0)
-            .bind(&note.workspace_id.0)
-            .bind(next_v - MAX_NOTE_VERSIONS)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("prune note_version failed: {e}")))?;
-
-            Ok(next_v)
-        }
-        .await;
+        let result = insert_note_version(&mut conn, note, author, date, rev).await;
 
         // COMMIT on success (with rollback, and detach+close on double
         // failure, if the COMMIT itself fails — monorepo#657) or roll back
         // the failed body (monorepo#680), so the sole write-pool connection
         // is never returned holding an open transaction.
         crate::commit_with_rollback_guard(conn, result, "commit note_version tx failed").await
+    }
+
+    /// Persist a note content write and its version snapshot in ONE
+    /// transaction: the same conditional UPDATE as
+    /// [`Store::update_note_versioned`] (gated on `expected_version` when
+    /// `Some`) followed by the snapshot [`Store::append_note_version`] would
+    /// record for the bumped rev. Committing them together means no reader can
+    /// observe the new `rev` on the note row while
+    /// [`Store::get_note_version_content_by_rev`] still resolves that rev to
+    /// the previous content, and a snapshot can never land after a later
+    /// write's, out of rev order. Returns `(rev, v)`: the post-write rev and
+    /// the new version number.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or a statement fails.
+    pub async fn update_note_with_version(
+        &self,
+        note: &Note,
+        expected_version: Option<i64>,
+        author: &NoteVersionAuthor,
+        date: &str,
+    ) -> Result<(i64, i64)> {
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
+
+        let result = async {
+            let Some(rev) =
+                crate::note_repo::exec_update_note(&mut *conn, note, expected_version).await?
+            else {
+                return Ok(None);
+            };
+            let v = insert_note_version(&mut conn, note, author, date, rev).await?;
+            Ok(Some((rev, v)))
+        }
+        .await;
+
+        match crate::commit_with_rollback_guard(conn, result, "commit note write tx failed").await?
+        {
+            Some(written) => Ok(written),
+            None => Err(self.note_update_miss(note).await),
+        }
     }
 
     /// List a note's stored versions ascending by `v`, without content blobs
@@ -188,6 +194,58 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("get note_version by rev failed: {e}")))
     }
+}
+
+/// Snapshot body shared by [`Store::append_note_version`] and
+/// [`Store::update_note_with_version`]: inside the caller's open transaction,
+/// allocate the next `v`, insert the full-content row stamped with `rev`, and
+/// prune to the newest [`MAX_NOTE_VERSIONS`]. Returns the new `v`.
+pub(crate) async fn insert_note_version(
+    conn: &mut sqlx::SqliteConnection,
+    note: &Note,
+    author: &NoteVersionAuthor,
+    date: &str,
+    rev: i64,
+) -> Result<i64> {
+    let next_v: i64 = sqlx::query(
+        "SELECT COALESCE(MAX(v), 0) + 1 AS v FROM note_version \
+         WHERE note_id = ? AND workspace_id = ?",
+    )
+    .bind(&note.id.0)
+    .bind(&note.workspace_id.0)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| Error::Internal(format!("next note_version failed: {e}")))?
+    .try_get("v")
+    .map_err(|e| Error::Internal(format!("column v: {e}")))?;
+
+    sqlx::query(
+        "INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, \
+         author_type, title, content, rev) VALUES (?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&note.id.0)
+    .bind(&note.workspace_id.0)
+    .bind(next_v)
+    .bind(date)
+    .bind(&author.id)
+    .bind(&author.name)
+    .bind(&author.author_type)
+    .bind(&note.title)
+    .bind(&note.content)
+    .bind(rev)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| Error::Internal(format!("insert note_version failed: {e}")))?;
+
+    sqlx::query("DELETE FROM note_version WHERE note_id = ? AND workspace_id = ? AND v <= ?")
+        .bind(&note.id.0)
+        .bind(&note.workspace_id.0)
+        .bind(next_v - MAX_NOTE_VERSIONS)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("prune note_version failed: {e}")))?;
+
+    Ok(next_v)
 }
 
 fn col<'r, T>(row: &'r SqliteRow, name: &str) -> Result<T>
