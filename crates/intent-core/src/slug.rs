@@ -152,13 +152,12 @@ fn strip_context_mentions(prompt: &str) -> String {
     out
 }
 
-/// Case-insensitive `strip_prefix` for ASCII mention kinds.
+/// Case-insensitive `strip_prefix` for ASCII mention kinds. Splits with a
+/// boundary check so a multi-byte char inside the first `prefix.len()` bytes
+/// yields `None` instead of panicking.
 fn lowercase_strip<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
+    let (head, rest) = s.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
 }
 
 #[cfg(test)]

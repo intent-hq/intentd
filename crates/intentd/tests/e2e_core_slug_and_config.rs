@@ -57,6 +57,49 @@ async fn workspace_id_derived_from_initial_agent_prompt() {
     let _ = std::fs::remove_dir_all(&ws_root);
 }
 
+/// Regression (intent-hq/intent#4801): a prompt with an `@` followed by a
+/// multi-byte char used to panic inside the slug heuristic's mention stripping,
+/// taking `workspace.create` down with an internal error.
+#[tokio::test]
+async fn workspace_create_survives_multibyte_char_after_at_in_prompt() {
+    let db = std::env::temp_dir().join(format!("intentd-e2e-core-{}.db", uuid::Uuid::new_v4()));
+    let ws_root = std::env::temp_dir().join(format!("itd-e2e-ws-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws_root).expect("create ws root");
+    let store = Store::open(&db).await.expect("open store");
+    let services = Services::new(store.clone())
+        .with_workspaces_root(ws_root.clone())
+        .with_settings_registry(common::registry_with_default_provider(&ws_root));
+
+    let result = services
+        .create_workspace(
+            WorkspaceCreate {
+                title: None,
+                initial_agent: Some(WorkspaceCreateInitialAgent {
+                    prompt: Some("@foo — bar baz".to_string()),
+                    name: Some("Test Agent".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some(format!("idem-{}", uuid::Uuid::new_v4())),
+        )
+        .await
+        .expect("create workspace must not fail on a multi-byte char after '@'");
+
+    assert_eq!(
+        result.workspace.id.0.as_str(),
+        "foo-bar",
+        "workspace id should be derived from the prompt with the em dash dropped"
+    );
+
+    drop(services);
+    drop(store);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let _ = std::fs::remove_dir_all(&ws_root);
+}
+
 /// Create a workspace with no prompt and verify the ID is a random slug
 /// (adjective-animal from `generate_workspace_slug`).
 #[tokio::test]
