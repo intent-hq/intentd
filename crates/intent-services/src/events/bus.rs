@@ -294,9 +294,33 @@ impl Drop for Subscription {
 /// event is dropped at shutdown.
 async fn writer_task(
     store: Store,
-    mut rx: mpsc::Receiver<WriterRequest>,
+    rx: mpsc::Receiver<WriterRequest>,
     broadcast_tx: broadcast::Sender<Arc<Event>>,
 ) {
+    writer_loop(
+        move |events: Arc<[NewEvent]>| {
+            let store = store.clone();
+            async move { store.insert_events(&events).await }
+        },
+        rx,
+        broadcast_tx,
+    )
+    .await;
+}
+
+/// Receive/drain/flush core of [`writer_task`], generic over the batch insert
+/// so tests can drive it under a paused clock with a no-I/O insert (the same
+/// shape as [`flush_prepared`]). The loop contains no timer wait: an idle
+/// publish flushes as soon as it is received. The prepared batch is shared as
+/// an `Arc<[NewEvent]>` so each retry attempt's future owns its input.
+pub(crate) async fn writer_loop<F, Fut>(
+    insert: F,
+    mut rx: mpsc::Receiver<WriterRequest>,
+    broadcast_tx: broadcast::Sender<Arc<Event>>,
+) where
+    F: Fn(Arc<[NewEvent]>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Event>>>,
+{
     let mut pending: Vec<WriterRequest> = Vec::with_capacity(WRITER_BATCH_SIZE);
 
     loop {
@@ -315,7 +339,7 @@ async fn writer_task(
                 Err(_) => break,
             }
         }
-        flush_batch(&store, &mut pending, &broadcast_tx).await;
+        flush_batch(&insert, &mut pending, &broadcast_tx).await;
     }
 }
 
@@ -324,16 +348,19 @@ async fn writer_task(
 /// ([`TOOL_CALL_PERSIST_CAP_BYTES`]); the broadcast (and the publisher's
 /// returned event) keeps the original full payload so live consumers (§7.1
 /// tool-block synthesis) are unaffected.
-async fn flush_batch(
-    store: &Store,
+async fn flush_batch<F, Fut>(
+    insert: &F,
     pending: &mut Vec<WriterRequest>,
     broadcast_tx: &broadcast::Sender<Arc<Event>>,
-) {
-    let events: Vec<NewEvent> = pending
+) where
+    F: Fn(Arc<[NewEvent]>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Event>>>,
+{
+    let events: Arc<[NewEvent]> = pending
         .iter()
         .map(|(ev, _)| truncate_tool_call_for_persist(ev).unwrap_or_else(|| ev.clone()))
         .collect();
-    flush_prepared(|| store.insert_events(&events), pending, broadcast_tx).await;
+    flush_prepared(|| insert(Arc::clone(&events)), pending, broadcast_tx).await;
 }
 
 /// Insert-retry + resolve/broadcast core of [`flush_batch`], generic over the
