@@ -495,9 +495,10 @@ fn parse_github_pr_or_issue_url(url: &str) -> Option<(String, Option<u64>)> {
     Some((repo_url, (segment == "pull").then_some(n)))
 }
 
-/// Parse a GitHub URL (https, www, or git@ form) into lowercase
-/// `(owner, repo)` (TS `parseGithubOwnerRepo`).
-fn parse_github_owner_repo(github_url: &str) -> Option<(String, String)> {
+/// Parse a GitHub URL (https, www, or git@ form) into the [`RepoRef`] it
+/// names (TS `parseGithubOwnerRepo`). The ref keeps the URL's casing;
+/// compare it under `RepoRef` equality, which folds forge-slug case.
+fn parse_github_owner_repo(github_url: &str) -> Option<RepoRef> {
     let t = github_url.trim();
     let stripped = strip_prefix_ci(t, "https://www.github.com/")
         .or_else(|| strip_prefix_ci(t, "http://www.github.com/"))
@@ -509,7 +510,15 @@ fn parse_github_owner_repo(github_url: &str) -> Option<(String, String)> {
     let mut segs = stripped.split('/').filter(|s| !s.is_empty());
     let owner = segs.next()?;
     let repo = segs.next()?;
-    Some((owner.to_lowercase(), repo.to_lowercase()))
+    Some(RepoRef::new(owner, repo))
+}
+
+/// Whether a repository name (a workspace row's `repositoryName` or a
+/// checkout folder name) names the same repository as `wanted.name`, under
+/// [`RepoRef`] identity. The owner half is pinned to `wanted.owner` on both
+/// sides so the comparison stays a plain `RepoRef` equality on the name.
+fn repo_name_matches(wanted: &RepoRef, candidate: &str) -> bool {
+    RepoRef::new(wanted.owner.as_str(), strip_git_suffix(candidate)) == *wanted
 }
 
 /// Port of the TS `normalizeWorkspaceCreateFields`: derive the editable
@@ -666,7 +675,7 @@ async fn lookup_known_repo_local_path(
     api: &Arc<dyn WorkspaceApi>,
     github_url: &str,
 ) -> Option<String> {
-    let (owner, repo) = parse_github_owner_repo(github_url)?;
+    let wanted = parse_github_owner_repo(github_url)?;
     let workspaces = api.list_workspaces(true).await.ok()?;
 
     let mut strict = Vec::new();
@@ -684,28 +693,25 @@ async fn lookup_known_repo_local_path(
         if path.contains("/.clones/") || path.contains("\\.clones\\") {
             continue;
         }
-        let entry_owner = ws
-            .repository_owner
-            .as_deref()
-            .filter(|o| !o.is_empty())
-            .map(str::to_lowercase);
-        let entry_name = ws
-            .repository_name
-            .as_deref()
-            .filter(|n| !n.is_empty())
-            .map(|n| strip_git_suffix(&n.to_lowercase()).to_string());
-        let entry_basename = path
-            .rsplit(['/', '\\'])
-            .next()
-            .map(|b| strip_git_suffix(&b.to_lowercase()).to_string());
+        let entry_owner = ws.repository_owner.as_deref().filter(|o| !o.is_empty());
+        let entry_name = ws.repository_name.as_deref().filter(|n| !n.is_empty());
+        let entry_basename = path.rsplit(['/', '\\']).next();
 
-        if entry_name.as_deref() == Some(repo.as_str()) {
-            if entry_owner.as_deref() == Some(owner.as_str()) {
+        if entry_name.is_some_and(|n| repo_name_matches(&wanted, n)) {
+            // Strict tier: the row's full slug under `RepoRef` identity
+            // (`ws.repo()` is `None` for ownerless rows, which fall through
+            // to the name-only tier).
+            let row = ws
+                .repo()
+                .map(|r| RepoRef::new(r.owner.as_str(), strip_git_suffix(&r.name)));
+            if row.as_ref() == Some(&wanted) {
                 strict.push(path.to_string());
             } else if entry_owner.is_none() {
                 name_only.push(path.to_string());
             }
-        } else if entry_basename.as_deref() == Some(repo.as_str()) && entry_owner.is_none() {
+        } else if entry_owner.is_none()
+            && entry_basename.is_some_and(|b| repo_name_matches(&wanted, b))
+        {
             basename_only.push(path.to_string());
         }
     }
@@ -1385,6 +1391,62 @@ mod tests {
         assert!(ids(result).is_empty());
     }
 
+    /// `repo_filter_matches` over the full partial-filter matrix — neither /
+    /// owner-only / name-only / both — against fully-slugged, ownerless,
+    /// nameless, and slugless rows. A row missing the filtered half never
+    /// matches; a half that is not filtered on never excludes.
+    #[test]
+    fn test_repo_filter_matches_partial_filter_matrix() {
+        let full = make_workspace("full", "full");
+        let mut ownerless = make_workspace("ownerless", "ownerless");
+        ownerless.repository_owner = None;
+        let mut nameless = make_workspace("nameless", "nameless");
+        nameless.repository_name = None;
+        let mut slugless = make_workspace("slugless", "slugless");
+        slugless.repository_owner = None;
+        slugless.repository_name = None;
+        let mut empty_owner = make_workspace("empty-owner", "empty-owner");
+        empty_owner.repository_owner = Some(String::new());
+
+        // (row, neither, owner-only, name-only, both)
+        let matrix = [
+            (&full, true, true, true, true),
+            (&ownerless, true, false, true, false),
+            (&nameless, true, true, false, false),
+            (&slugless, true, false, false, false),
+            (&empty_owner, true, false, true, false),
+        ];
+        for (ws, neither, owner_only, name_only, both) in matrix {
+            let id = &ws.title;
+            assert_eq!(
+                repo_filter_matches(ws, None, None),
+                neither,
+                "{id}: neither"
+            );
+            assert_eq!(
+                repo_filter_matches(ws, Some("OWNER"), None),
+                owner_only,
+                "{id}: owner-only"
+            );
+            assert_eq!(
+                repo_filter_matches(ws, None, Some("Repo")),
+                name_only,
+                "{id}: name-only"
+            );
+            assert_eq!(
+                repo_filter_matches(ws, Some("Owner"), Some("REPO")),
+                both,
+                "{id}: both"
+            );
+        }
+
+        // A mismatching half excludes regardless of the other half.
+        assert!(!repo_filter_matches(&full, Some("other"), None));
+        assert!(!repo_filter_matches(&full, None, Some("other")));
+        assert!(!repo_filter_matches(&full, Some("owner"), Some("other")));
+        assert!(!repo_filter_matches(&full, Some("other"), Some("repo")));
+    }
+
     #[tokio::test]
     async fn test_list_sort_by_title() {
         let fake = Arc::new(FakeApi::default());
@@ -1925,6 +1987,123 @@ mod tests {
         let fields = preview_fields(&proposal);
         assert!(fields.get("repoPath").is_none());
         assert!(fields.get("clonePath").is_none());
+    }
+
+    /// The strict tier compares the row's full slug under `RepoRef`
+    /// identity: a case-variant owner AND name (with a `.git` suffix on the
+    /// row) still hydrates from the known workspace.
+    #[tokio::test]
+    async fn test_lookup_strict_tier_matches_case_variant_owner_and_name() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            let mut ws = make_workspace("ws-1", "Existing");
+            ws.repository_owner = Some("Intent-HQ".to_string());
+            ws.repository_name = Some("IntentD.git".to_string());
+            ws.repository_path = Some("/checkouts/IntentD".to_string());
+            workspaces.push(ws);
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        for url in [
+            "https://github.com/intent-hq/intentd",
+            "https://GITHUB.COM/INTENT-HQ/INTENTD.git",
+            "git@github.com:Intent-hq/intentd.git",
+        ] {
+            assert_eq!(
+                lookup_known_repo_local_path(&api, url).await.as_deref(),
+                Some("/checkouts/IntentD"),
+                "{url}"
+            );
+        }
+        // A different owner with the same name is not a strict match, and
+        // the owner-bearing row never falls back to the name-only tier.
+        assert_eq!(
+            lookup_known_repo_local_path(&api, "https://github.com/someone-else/intentd").await,
+            None
+        );
+    }
+
+    /// Ownerless rows match through the name tier (then the path-basename
+    /// tier) under `RepoRef` folding of the name; the strict tier wins over
+    /// both and ambiguity within a tier yields `None`.
+    #[tokio::test]
+    async fn test_lookup_ownerless_tiers_fold_case_and_respect_priority() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            let mut by_name = make_workspace("ws-1", "ByName");
+            by_name.repository_owner = None;
+            by_name.repository_name = Some("Widget.GIT".to_string());
+            by_name.repository_path = Some("/checkouts/named".to_string());
+            let mut by_basename = make_workspace("ws-2", "ByBasename");
+            by_basename.repository_owner = None;
+            by_basename.repository_name = None;
+            by_basename.repository_path = Some("/checkouts/WIDGET".to_string());
+            workspaces.push(by_name);
+            workspaces.push(by_basename);
+        }
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+
+        // Name tier beats the basename tier.
+        assert_eq!(
+            lookup_known_repo_local_path(&api, "https://github.com/acme/widget")
+                .await
+                .as_deref(),
+            Some("/checkouts/named")
+        );
+
+        // With the name row gone, the case-variant basename row is found.
+        fake.workspaces.lock().unwrap().remove(0);
+        assert_eq!(
+            lookup_known_repo_local_path(&api, "https://github.com/Acme/Widget")
+                .await
+                .as_deref(),
+            Some("/checkouts/WIDGET")
+        );
+
+        // A strict (owner-bearing) row wins over the ownerless tiers.
+        {
+            let mut ws = make_workspace("ws-3", "Strict");
+            ws.repository_owner = Some("ACME".to_string());
+            ws.repository_name = Some("widget".to_string());
+            ws.repository_path = Some("/checkouts/strict".to_string());
+            fake.workspaces.lock().unwrap().push(ws);
+        }
+        assert_eq!(
+            lookup_known_repo_local_path(&api, "https://github.com/acme/widget")
+                .await
+                .as_deref(),
+            Some("/checkouts/strict")
+        );
+
+        // Two distinct strict paths (case-variant slugs) are ambiguous.
+        {
+            let mut ws = make_workspace("ws-4", "Strict2");
+            ws.repository_owner = Some("acme".to_string());
+            ws.repository_name = Some("WIDGET".to_string());
+            ws.repository_path = Some("/checkouts/strict-2".to_string());
+            fake.workspaces.lock().unwrap().push(ws);
+        }
+        assert_eq!(
+            lookup_known_repo_local_path(&api, "https://github.com/acme/widget").await,
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_github_owner_repo_keeps_casing_and_folds_identity() {
+        let parsed =
+            parse_github_owner_repo("https://www.GitHub.com/Intent-HQ/IntentD.git").unwrap();
+        assert_eq!(parsed.owner, "Intent-HQ");
+        assert_eq!(parsed.name, "IntentD");
+        assert_eq!(parsed, RepoRef::new("intent-hq", "intentd"));
+        assert_eq!(
+            parse_github_owner_repo("git@github.com:o/r.git").unwrap(),
+            RepoRef::new("O", "R")
+        );
+        assert_ne!(parsed, RepoRef::new("intent-hq", "other"));
+        assert!(parse_github_owner_repo("https://github.com/only-owner").is_none());
     }
 
     #[tokio::test]
