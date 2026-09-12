@@ -12,17 +12,20 @@
 # issue. Only the release (tag build) workflow comments; channel promotions
 # post nothing.
 #
-# Completeness gate ("stay silent until complete"): before posting, the
-# issue's linked fix PRs (GraphQL closedByPullRequestsReferences on the
-# ISSUES_REPO issue) are filtered to SOURCE_REPO, and the comment is posted
-# only when none are open and every merged one's merge commit is contained
-# in <to-ref>. Otherwise the issue is skipped with a log line — a later
-# release whose range re-references the issue will carry the comment. When
-# completeness cannot be determined (API error, token cannot see SOURCE_REPO
-# PRs), the issue is skipped with a warning: never post a possibly-false
-# claim. Issues with no SOURCE_REPO-linked fix PRs at all (commit-message-only
-# references) fall back to the range-scan evidence and post — best effort,
-# "at the time of writing".
+# Completeness gate ("stay silent until complete"): the range scan is only a
+# cheap pre-filter; the gate decides. Before posting, the issue's state and
+# its linked fix PRs (GraphQL closedByPullRequestsReferences on the
+# ISSUES_REPO issue — the closing-keyword links that "Fixes ISSUES_REPO#N"
+# produces) are read, the PRs are filtered to SOURCE_REPO, and the comment is
+# posted only when the issue is CLOSED, at least one linked SOURCE_REPO PR is
+# merged with its merge commit contained in <to-ref>, none are open, and
+# every merged one is contained in <to-ref>. Otherwise the issue is skipped
+# with a log line — a later release whose range re-references the issue will
+# carry the comment. A mention-only reference (a commit or PR body that names
+# the issue without closing it, so the issue has no delivered SOURCE_REPO
+# closing PR) never posts. When completeness cannot be determined (API error,
+# token cannot see SOURCE_REPO PRs, >100 linked PRs), the issue is skipped
+# with a warning: never post a possibly-false claim.
 #
 # Idempotent: each comment embeds a hidden marker
 # (<!-- release-notifier: <component> vX.Y.Z -->) and issues that already
@@ -204,6 +207,7 @@ ${marker}"
 linked_prs_query='query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
+      state
       closedByPullRequestsReferences(first: 100, includeClosedPrs: true) {
         pageInfo { hasNextPage }
         nodes { repository { nameWithOwner } number state mergeCommit { oid } }
@@ -233,25 +237,35 @@ while IFS= read -r n; do
     failed=1
     continue
   fi
-  # Completeness gate: enumerate the issue's linked fix PRs on SOURCE_REPO.
-  # Post only when none are open and every merged one's merge commit is
-  # contained in TO_REF; an empty set falls back to the range-scan evidence
-  # that put the issue on the list. Enumeration failure (API error, issue
+  # Completeness gate: read the issue's state and enumerate its linked fix
+  # PRs on SOURCE_REPO. Post only when the issue is closed, none of the PRs
+  # are open, every merged one's merge commit is contained in TO_REF, and at
+  # least one is — an empty set means the range only mentioned the issue,
+  # which is no evidence of a fix. Enumeration failure (API error, issue
   # number actually a PR, ...) is indeterminate => skip with a warning.
-  # The jq filter emits pageInfo.hasNextPage as the first line, then one
-  # "<number> <state> <oid>" line per SOURCE_REPO-linked PR.
+  # The jq filter emits the issue state as the first line and
+  # pageInfo.hasNextPage as the second, then one "<number> <state> <oid>"
+  # line per SOURCE_REPO-linked PR.
   if ! linked=$(gh_issues api graphql \
     -f query="$linked_prs_query" \
     -f owner="${ISSUES_REPO%/*}" -f repo="${ISSUES_REPO#*/}" -F number="$n" \
-    --jq ".data.repository.issue.closedByPullRequestsReferences
-      | (.pageInfo.hasNextPage | tostring),
-        (.nodes[]
-          | select(.repository.nameWithOwner == \"${SOURCE_REPO}\")
-          | \"\(.number) \(.state) \(.mergeCommit.oid // \"\")\")" 2>/dev/null); then
+    --jq ".data.repository.issue
+      | .state,
+        (.closedByPullRequestsReferences
+          | (.pageInfo.hasNextPage | tostring),
+            (.nodes[]
+              | select(.repository.nameWithOwner == \"${SOURCE_REPO}\")
+              | \"\(.number) \(.state) \(.mergeCommit.oid // \"\")\"))" 2>/dev/null); then
     echo "warning: issue #$n: could not enumerate linked ${SOURCE_REPO} fix PRs; completeness indeterminate, skipping" >&2
     failed=1
     continue
   fi
+  if [[ "$(head -n1 <<<"$linked")" != "CLOSED" ]]; then
+    echo "issue #$n: issue is still open; staying silent" >&2
+    skipped=$((skipped + 1))
+    continue
+  fi
+  linked=$(tail -n +2 <<<"$linked")
   # A truncated connection (>100 linked PRs) could hide an open or
   # unreleased SOURCE_REPO PR beyond the first page: indeterminate => skip.
   if [[ "$(head -n1 <<<"$linked")" != "false" ]]; then
@@ -261,6 +275,7 @@ while IFS= read -r n; do
   fi
   linked=$(tail -n +2 <<<"$linked")
   incomplete=""
+  delivered=false
   while read -r pr state oid; do
     [[ -n "$pr" ]] || continue
     case "$state" in
@@ -274,6 +289,8 @@ while IFS= read -r n; do
         if [[ -z "$oid" ]] || ! git cat-file -e "$oid" 2>/dev/null \
           || ! git merge-base --is-ancestor "$oid" "$TO_REF"; then
           incomplete="merged fix PR ${SOURCE_REPO}#${pr} is not contained in ${TO_REF}"
+        else
+          delivered=true
         fi
         ;;
       *)
@@ -284,6 +301,11 @@ while IFS= read -r n; do
   done <<<"$linked"
   if [[ -n "$incomplete" ]]; then
     echo "issue #$n: $incomplete; staying silent (a later release will pick it up)" >&2
+    skipped=$((skipped + 1))
+    continue
+  fi
+  if [[ "$delivered" != true ]]; then
+    echo "issue #$n: no delivered linked fix PR on ${SOURCE_REPO}; mention-only reference, staying silent" >&2
     skipped=$((skipped + 1))
     continue
   fi
@@ -300,9 +322,9 @@ while IFS= read -r n; do
 done <<<"$issue_nums"
 
 if [[ "$DRY_RUN" == true ]]; then
-  echo "dry-run: nothing posted (skipped $skipped already-notified or incomplete issue(s))" >&2
+  echo "dry-run: nothing posted (skipped $skipped already-notified, open, incomplete, or mention-only issue(s))" >&2
 else
-  echo "posted $posted comment(s), skipped $skipped already-notified or incomplete issue(s)" >&2
+  echo "posted $posted comment(s), skipped $skipped already-notified, open, incomplete, or mention-only issue(s)" >&2
 fi
 if [[ "$failed" -ne 0 ]]; then
   # Callers run this fail-soft (continue-on-error), and a notification
