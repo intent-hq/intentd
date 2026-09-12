@@ -601,8 +601,24 @@ async fn issues_get_returns_issue_with_author_and_timestamps() {
     .await;
     assert_eq!(env["error"]["code"], json!(-32602), "envelope: {env}");
 
+    // Mixed-case addressing reaches the engine with its casing intact.
+    let r3 = wss_rpc(
+        &mut ws,
+        3,
+        "github.issues.get",
+        json!({ "owner": "Intent-HQ", "repo": "IntentD", "number": 9 }),
+    )
+    .await;
+    assert_eq!(r3["issue"]["number"], 9);
+
+    // `RepoRef` equality is case-insensitive, so compare the recorded fields
+    // directly to prove the addressing was forwarded verbatim.
     let gets = fx.forge.issue_gets.lock().unwrap();
-    assert_eq!(*gets, vec![(RepoRef::new("o", "r"), 7)]);
+    let recorded: Vec<(&str, &str, u64)> = gets
+        .iter()
+        .map(|(repo, number)| (repo.owner.as_str(), repo.name.as_str(), *number))
+        .collect();
+    assert_eq!(recorded, vec![("o", "r", 7), ("Intent-HQ", "IntentD", 9)]);
 }
 
 /// `github.issues.search` rejects the PR-only `review-requested` filter with
