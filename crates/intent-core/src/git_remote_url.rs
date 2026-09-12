@@ -9,11 +9,13 @@ const KNOWN_SCHEMES: [&str; 4] = ["https", "http", "ssh", "git"];
 
 /// A parsed git remote URL: the authority's host plus the repository path.
 ///
-/// Two syntaxes are accepted — a scheme URL (`https://`, `http://`, `ssh://`,
-/// `git://`, compared ASCII-case-insensitively) and the scp-like
-/// `[user@]host:path` form. Local paths (`/`, `./`, `../`, `C:\`), `file://`,
-/// unknown schemes, and any input whose authority cannot be isolated parse to
-/// `None`.
+/// Three syntaxes are accepted — a scheme URL (`https://`, `http://`, `ssh://`,
+/// `git://`, compared ASCII-case-insensitively), the scp-like
+/// `[user@]host:path` form, and `file://` with an empty or `localhost`
+/// authority (host `""` / `localhost`, path kept verbatim — never GitHub, but
+/// [`Self::repo_slug`] still keys a cache slot from it). Bare local paths
+/// (`/`, `./`, `../`, `C:\`), unknown schemes, and any input whose authority
+/// cannot be isolated parse to `None`.
 ///
 /// # Authority isolation
 ///
@@ -35,12 +37,28 @@ pub struct GitRemoteUrl {
 }
 
 impl GitRemoteUrl {
-    /// Parse a remote URL. Returns `None` for local paths, `file://`, unknown
+    /// Parse a remote URL. Returns `None` for bare local paths, unknown
     /// schemes, and any input without an isolable authority and a path.
+    /// `file://` parses only with an empty or `localhost` authority; its path
+    /// is kept as-is (no userinfo, port, query or fragment handling).
     #[must_use]
     pub fn parse(url: &str) -> Option<Self> {
         let trimmed = url.trim();
         let (authority, path) = if let Some((scheme, rest)) = trimmed.split_once("://") {
+            if scheme.eq_ignore_ascii_case("file") {
+                let (host, path) = rest.split_at(rest.find('/')?);
+                if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
+                    return None;
+                }
+                let path = path.trim_end_matches('/');
+                if path.is_empty() {
+                    return None;
+                }
+                return Some(Self {
+                    host: host.to_string(),
+                    path: path.to_string(),
+                });
+            }
             if !KNOWN_SCHEMES.iter().any(|s| scheme.eq_ignore_ascii_case(s)) {
                 return None;
             }
@@ -216,7 +234,7 @@ mod tests {
         }
     }
 
-    /// Local paths, `file://`, unknown schemes and inputs without an isolable
+    /// Bare local paths, unknown schemes and inputs without an isolable
     /// authority do not parse at all.
     #[test]
     fn local_paths_and_unknown_schemes_parse_to_none() {
@@ -227,7 +245,10 @@ mod tests {
             "../a@github.com:acme/widget",
             "C:\\repos\\a@github.com:acme\\widget",
             "c:/repos/acme/widget",
-            "file:///tmp/a@github.com:acme/widget.git",
+            "file://example.invalid/tmp/acme/widget.git",
+            "file://",
+            "file:///",
+            "file://localhost",
             "ftp://github.com/acme/widget",
             "https://github.com?x=a@github.com/acme/widget",
             "https://github.com",
@@ -264,6 +285,38 @@ mod tests {
         assert_eq!(slug("https://github.com/acme/widget.git"), Some(widget));
         assert_eq!(slug("https://gitlab.com/widget.git"), None);
         assert_eq!(slug("https://gitlab.com/"), None);
+    }
+
+    /// `file://` remotes parse (empty or `localhost` authority, path kept
+    /// verbatim) so the host-agnostic slug can key a cache slot, while the
+    /// strict GitHub identity stays `None` even when the path carries an
+    /// `@github.com:` lookalike.
+    #[test]
+    fn file_urls_yield_repo_slug_but_never_github() {
+        let widget = RepoRef::new("acme", "widget");
+        for url in [
+            "file:///tmp/acme/widget.git",
+            "file:///tmp/acme/widget/",
+            "file://localhost/tmp/acme/widget.git",
+            "FILE:///tmp/acme/widget",
+        ] {
+            assert_eq!(slug(url), Some(widget.clone()), "{url}");
+            assert_eq!(github(url), None, "{url}");
+        }
+
+        let u = GitRemoteUrl::parse("file:///tmp/a@github.com:acme/widget.git").unwrap();
+        assert_eq!(u.host(), "");
+        assert_eq!(u.path(), "/tmp/a@github.com:acme/widget.git");
+        assert_eq!(u.github_repo(), None);
+        assert_eq!(
+            u.repo_slug(),
+            Some(RepoRef::new("a@github.com:acme", "widget"))
+        );
+
+        let u = GitRemoteUrl::parse("file://localhost/tmp/acme/widget").unwrap();
+        assert_eq!(u.host(), "localhost");
+        assert_eq!(u.path(), "/tmp/acme/widget");
+        assert_eq!(slug("file:///widget.git"), None);
     }
 
     #[test]
