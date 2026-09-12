@@ -109,8 +109,9 @@ impl GitRemoteUrl {
 
     /// The GitHub repository this remote names, if the host is exactly
     /// `github.com` or `www.github.com` (ASCII-case-insensitive) and the path
-    /// has exactly two non-empty segments. A `.git` suffix is stripped from
-    /// the name; owner and name keep the caller's casing.
+    /// has exactly two non-empty segments. The name goes through
+    /// [`repo_ref_from_segments`]: a `.git` suffix is stripped and a name that
+    /// is empty afterwards is rejected; owner and name keep the caller's casing.
     #[must_use]
     pub fn github_repo(&self) -> Option<RepoRef> {
         let is_github = ["github.com", "www.github.com"]
@@ -124,23 +125,40 @@ impl GitRemoteUrl {
         if segments.next().is_some() {
             return None;
         }
-        Some(RepoRef::new(owner, strip_git_suffix(name)))
+        repo_ref_from_segments(owner, name)
     }
 
     /// Host-agnostic `owner/name` from the last two non-empty path segments,
-    /// with the same `.git` suffix rule as [`Self::github_repo`]. Suitable for
-    /// cache-slot keys where the forge does not matter.
+    /// with the same [`repo_ref_from_segments`] suffix rule as
+    /// [`Self::github_repo`]. Suitable for cache-slot keys where the forge
+    /// does not matter.
     #[must_use]
     pub fn repo_slug(&self) -> Option<RepoRef> {
         let mut segments: Vec<&str> = self.segments().collect();
         let name = segments.pop()?;
         let owner = segments.pop()?;
-        Some(RepoRef::new(owner, strip_git_suffix(name)))
+        repo_ref_from_segments(owner, name)
     }
 
     fn segments(&self) -> impl Iterator<Item = &str> {
         self.path.split('/').filter(|s| !s.is_empty())
     }
+}
+
+/// The one segment→[`RepoRef`] step shared by [`GitRemoteUrl::github_repo`]
+/// and [`GitRemoteUrl::repo_slug`], so the two answers cannot diverge. A
+/// trailing `.git` is stripped from the name ASCII-case-insensitively (`.GIT`,
+/// `.Git` — GitHub reserves the suffix regardless of case, and the former ACP
+/// parser already accepted it); a name that is empty afterwards
+/// (`https://github.com/o/.git`) yields `None` rather than a half-formed ref.
+/// The owner is never rewritten, but a bare `.git` owner is rejected by the
+/// same emptiness test.
+fn repo_ref_from_segments(owner: &str, name: &str) -> Option<RepoRef> {
+    let name = strip_git_suffix(name);
+    if strip_git_suffix(owner).is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(RepoRef::new(owner, name))
 }
 
 /// Drop `userinfo@` from an already-isolated authority. `None` when nothing
@@ -159,8 +177,15 @@ fn strip_numeric_port(host_port: &str) -> &str {
     }
 }
 
+/// Strip a trailing `.git` ASCII-case-insensitively. The suffix is pure ASCII,
+/// so a case-insensitive byte match guarantees the cut lands on a char boundary.
 fn strip_git_suffix(name: &str) -> &str {
-    name.strip_suffix(".git").unwrap_or(name)
+    match name.len().checked_sub(".git".len()) {
+        Some(cut) if name.is_char_boundary(cut) && name[cut..].eq_ignore_ascii_case(".git") => {
+            &name[..cut]
+        }
+        _ => name,
+    }
 }
 
 #[cfg(test)]
@@ -198,9 +223,37 @@ mod tests {
             "git://github.com/acme/widget.git",
             "ssh://github.com/acme/widget.git",
             "  https://github.com/acme/widget.git  ",
+            "https://github.com/acme/widget.Git",
+            "https://github.com/acme/widget.GIT",
         ] {
             assert_eq!(github(url), Some(widget.clone()), "{url}");
         }
+        assert_eq!(
+            github("git@GitHub.com:Acme/Widget.GIT"),
+            Some(RepoRef::new("Acme", "Widget"))
+        );
+    }
+
+    /// A name that is empty once `.git` is stripped is not a repository:
+    /// `https://github.com/o/.git` must never yield `RepoRef { o, "" }` from
+    /// either accessor (the former `accept_changes` / `clone_ops` parsers rejected
+    /// it, and the slug feeds persisted identity and cache-slot keys).
+    #[test]
+    fn empty_name_after_git_strip_is_rejected() {
+        for url in [
+            "https://github.com/o/.git",
+            "https://github.com/o/.GIT",
+            "git@github.com:o/.git",
+            "ssh://git@github.com/o/.git",
+            "https://github.com/.git/widget",
+            "https://github.com/.git",
+            "https://github.com/o/.git/",
+        ] {
+            assert_eq!(github(url), None, "github_repo {url}");
+            assert_eq!(slug(url), None, "repo_slug {url}");
+        }
+        assert_eq!(slug("file:///tmp/o/.git"), None);
+        assert_eq!(slug("https://gitlab.com/group/o/.git"), None);
     }
 
     /// The two probe URLs from intent-hq/intentd#1815 review thread
