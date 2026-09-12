@@ -37595,6 +37595,52 @@ async fn agent_snapshot_prs_terminal_state_anywhere_suppresses_stale_open_duplic
     );
 }
 
+/// The `(repo, number)` dedup key is the case-insensitive `RepoRef` identity:
+/// a git root recorded as `Intent-HQ/IntentD` and a workspace recorded as
+/// `intent-hq/intentd` are one repository, so the root's merged #1
+/// suppresses the workspace's stale open #1 and the workspace's open #2
+/// wins over the root's case-variant duplicate (label keeps the workspace
+/// casing).
+#[tokio::test]
+async fn agent_snapshot_prs_dedups_case_variant_repo_slugs() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Watcher").await;
+
+    let mut row = svc.store().get_workspace(&ws).await.expect("workspace");
+    row.repository_owner = Some("intent-hq".into());
+    row.repository_name = Some("intentd".into());
+    row.pull_requests = Some(vec![
+        tracked_pr(1, PullRequestStatus::Open, Some(true), Some("clean"), None),
+        tracked_pr(2, PullRequestStatus::Open, Some(true), Some("clean"), None),
+    ]);
+    svc.store().update_workspace(&row).await.expect("update ws");
+
+    let root = tracked_git_root(
+        &ws,
+        "/roots/same-repo-other-case",
+        Some("Intent-HQ"),
+        Some("IntentD"),
+        vec![
+            tracked_pr(1, PullRequestStatus::Merged, None, None, None),
+            tracked_pr(2, PullRequestStatus::Open, Some(true), Some("dirty"), None),
+        ],
+    );
+    svc.store()
+        .upsert_workspace_git_root(&root)
+        .await
+        .expect("upsert root");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["prs"],
+        json!({ "mergeable": ["intent-hq/intentd#2"] }),
+        "case-variant pools dedupe as one repository: {v}"
+    );
+}
+
 /// A pool with a blank (empty/whitespace) repo owner or name is skipped the
 /// same as a missing one — no malformed labels like `/r#1` — while pools
 /// with a real identity still contribute.
