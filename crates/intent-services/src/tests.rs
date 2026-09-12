@@ -19425,12 +19425,18 @@ mod file_tracking {
 
     /// `parse_github_owner_repo` accepts the `ssh://` URL form (with
     /// optional user and numeric port) alongside https and scp-like remotes,
-    /// and keeps the strict `github.com` host check for all three
-    /// (monorepo#2053 review).
+    /// keeps the strict `github.com` host check for all three
+    /// (monorepo#2053 review), and returns the typed `RepoRef`.
     #[test]
     fn parse_github_owner_repo_handles_ssh_url_form() {
         let parse = Services::parse_github_owner_repo;
-        let ok = Some(("intent-hq".to_string(), "intentd".to_string()));
+        let ok = Some(intent_core::RepoRef::new("intent-hq", "intentd"));
+
+        // The ref keeps the URL's casing (`RepoRef` equality folds it).
+        let parsed = parse("https://github.com/Intent-HQ/IntentD.git").expect("parses");
+        assert_eq!(parsed.owner, "Intent-HQ");
+        assert_eq!(parsed.name, "IntentD");
+        assert_eq!(Some(parsed), ok);
 
         // ssh:// forms.
         assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git"), ok);
