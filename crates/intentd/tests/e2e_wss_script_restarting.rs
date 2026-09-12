@@ -340,7 +340,10 @@ async fn restarting_status_is_observable_over_wss() {
     .await;
     assert_eq!(started["ok"], json!(true));
     // A status read issued right after the `script.start` reply never observes
-    // the pre-launch `idle` (intent-hq/intent#4858).
+    // the pre-launch `idle` (intent-hq/intent#4858). Only the negative is
+    // asserted: the service exits on its own after three seconds, so a slow
+    // round trip may legitimately read a later state — the subscribed stream
+    // below checks the launch/restart sequence.
     let status = wss_rpc(
         &mut rpc,
         14,
@@ -348,8 +351,8 @@ async fn restarting_status_is_observable_over_wss() {
         json!({ "workspaceId": ws_id, "scriptId": "restarting-1" }),
     )
     .await;
-    assert!(
-        status["status"] == "starting" || status["status"] == "running",
+    assert_ne!(
+        status["status"], "idle",
         "status after start reply: {status}"
     );
 
