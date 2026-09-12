@@ -488,28 +488,41 @@ fn origin_is_github_slot(url: &str, owner: &str, repo: &str) -> bool {
 /// case-insensitively. Anything not on `github.com` — another host or a
 /// local path — is not a GitHub URL. The returned slug keeps the URL's
 /// casing; compare it under [`RepoRef`] equality.
+///
+/// The authority is isolated before userinfo is stripped: for a scheme URL
+/// it is the span between `://` and the first `/`, and for the scp-like
+/// form the span before the first `:`, which must contain no `/`. An `@`
+/// in the path (`https://example.invalid/a@github.com/acme/widget`) or in a
+/// local path (`/tmp/a@github.com:acme/widget`) therefore never turns a
+/// foreign source into a GitHub URL.
 fn github_slug(url: &str) -> Option<RepoRef> {
     let trimmed = url.trim().trim_end_matches('/');
-    let (rest, scp_like) = match trimmed.split_once("://") {
-        Some((scheme, rest)) => {
-            let known = ["https", "http", "ssh", "git"]
-                .iter()
-                .any(|s| scheme.eq_ignore_ascii_case(s));
-            if !known {
-                return None;
-            }
-            (rest, false)
+    let (authority, path) = if let Some((scheme, rest)) = trimmed.split_once("://") {
+        let known = ["https", "http", "ssh", "git"]
+            .iter()
+            .any(|s| scheme.eq_ignore_ascii_case(s));
+        if !known {
+            return None;
         }
-        // No scheme: only the scp-like `user@host:owner/repo` form qualifies.
-        None => (trimmed, true),
-    };
-    let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
-    let (authority, path) = if scp_like {
-        rest.split_once(':')?
+        let end = rest.find(['/', '?', '#'])?;
+        let (authority, path) = rest.split_at(end);
+        if !path.starts_with('/') {
+            return None;
+        }
+        let path = path.split(['?', '#']).next().unwrap_or(path);
+        (authority, path)
     } else {
-        rest.split_once('/')?
+        // No scheme: only the scp-like `user@host:owner/repo` form
+        // qualifies, and git itself treats anything with a `/` before the
+        // first `:` (absolute, `./`, `../` paths) as a local path.
+        let (authority, path) = trimmed.split_once(':')?;
+        if authority.contains('/') {
+            return None;
+        }
+        (authority, path)
     };
-    let host = authority.split(':').next().unwrap_or(authority);
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host_port.split(':').next().unwrap_or(host_port);
     if !host.eq_ignore_ascii_case("github.com") {
         return None;
     }
@@ -2230,6 +2243,8 @@ mod tests {
             "https://github.com/acme/other.git",
             "https://github.com/acme/widget/extra",
             "file:///tmp/acme/widget",
+            "https://example.invalid/a@github.com/acme/widget.git",
+            "/tmp/a@github.com:acme/widget.git",
         ] {
             assert!(!origin_matches(&path, requested), "{requested}");
         }
@@ -2276,6 +2291,35 @@ mod tests {
             "https://github.com/acme/other.git"
         ));
         assert!(!origin_url_matches("/tmp/Acme/Widget", "/tmp/acme/widget"));
+    }
+
+    /// [`github_slug`] isolates the URL authority before stripping userinfo,
+    /// so an `@` in a path never promotes a foreign or local source to a
+    /// GitHub URL; the scp-like form requires no `/` before its first `:`.
+    #[test]
+    fn github_slug_isolates_authority_before_userinfo() {
+        let widget = RepoRef::new("acme", "widget");
+        for url in [
+            "ssh://git@github.com:22/acme/widget.git",
+            "git@github.com:acme/widget.git",
+            "https://oauth2:tok@github.com/acme/widget.git",
+            "https://x@github.com/acme/widget.git?ref=main#frag",
+            "https://user@example.invalid@github.com/acme/widget",
+        ] {
+            assert_eq!(github_slug(url), Some(widget.clone()), "{url}");
+        }
+        for url in [
+            "https://example.invalid/a@github.com/acme/widget.git",
+            "/tmp/a@github.com:acme/widget.git",
+            "https://github.com.evil.example/acme/widget",
+            "./a@github.com:acme/widget.git",
+            "../a@github.com:acme/widget",
+            "C:\\repos\\a@github.com:acme\\widget",
+            "file:///tmp/a@github.com:acme/widget.git",
+            "https://github.com?x=a@github.com/acme/widget",
+        ] {
+            assert_eq!(github_slug(url), None, "{url}");
+        }
     }
 
     /// Untracked pollution in the cache work tree (e.g. leftovers from a
@@ -2597,6 +2641,8 @@ mod tests {
             "https://github.com/widget.git",
             "https://github.com.evil.com/acme/widget.git",
             "git@gitlab.com:acme/widget.git",
+            "https://example.invalid/a@github.com/acme/widget.git",
+            "/tmp/a@github.com:acme/widget.git",
         ] {
             assert!(!origin_is_github_slot(url, "acme", "widget"), "{url}");
         }
