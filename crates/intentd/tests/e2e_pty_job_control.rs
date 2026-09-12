@@ -38,7 +38,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nix::sys::signal::{killpg, SigHandler, Signal};
+use nix::sys::signal::{kill, killpg, SigHandler, Signal};
+use nix::sys::wait::{waitpid, WaitPidFlag};
 use nix::unistd::Pid;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
@@ -67,6 +68,14 @@ const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Poll cadence for the `/proc` scan.
 const SCAN_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Bound on the teardown sweep for adopted orphans; they reparent within
+/// milliseconds of their parent's death, so this is margin, not expectation.
+const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn self_pid() -> i32 {
+    i32::try_from(std::process::id()).expect("pid fits")
+}
 
 /// One `/proc/<pid>/stat` row: the fields after `(comm)` are
 /// `state ppid pgrp session tty_nr tpgid …`.
@@ -160,7 +169,7 @@ fn fixture_script() -> Option<&'static str> {
         eprintln!("skipping PTY job-control E2E: /bin/bash not present");
         return None;
     }
-    let self_pid = i32::try_from(std::process::id()).expect("pid fits");
+    let self_pid = self_pid();
     if read_stat(self_pid).is_none() {
         eprintln!(
             "skipping PTY job-control E2E: {PROC_ROOT}/{self_pid}/stat unreadable \
@@ -267,7 +276,8 @@ fn tail(path: &Path, lines: usize) -> String {
 
 /// Everything the harness owns; `Drop` tears the whole PTY session down
 /// (job group, driver group, every remaining session member or daemon
-/// descendant) before the tempdir is removed, on success and on panic alike.
+/// descendant, and every orphan the subreaper handed us) before the tempdir
+/// is removed, on success and on panic alike.
 struct Harness {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     _master: Box<dyn MasterPty + Send>,
@@ -384,22 +394,70 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         // Snapshot first: once the daemon is killed its detached children
-        // (the `setsid` capture shell) reparent to init and fall out of
-        // `tracked()`, so a later scan would miss them.
-        let victims: Vec<i32> = self
-            .tracked(&scan_procs())
-            .into_iter()
-            .map(|p| p.pid)
-            .collect();
+        // (the `setsid` capture shell) fall out of `tracked()`, so a later
+        // scan would miss them.
+        let victims: Vec<ProcStat> = self.tracked(&scan_procs()).into_iter().cloned().collect();
         if let Some(pgid) = self.job_pgid {
             let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
         }
         let _ = killpg(Pid::from_raw(self.driver_pid), Signal::SIGKILL);
         let _ = self.child.kill();
-        for pid in victims {
-            let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+        for p in &victims {
+            let _ = kill(Pid::from_raw(p.pid), Signal::SIGKILL);
         }
         let _ = self.child.wait();
+        // Anything that outlived its parent before the snapshot — a detached
+        // capture shell whose daemon already exited — is unreachable by
+        // ancestry or session, but the subreaper made it our child.
+        let sessions: HashSet<i32> = std::iter::once(self.driver_pid)
+            .chain(victims.iter().map(|p| p.session))
+            .collect();
+        reap_adopted(&[self.driver_pid], &sessions, Instant::now() + REAP_TIMEOUT);
+    }
+}
+
+/// Make this process the reaper of its orphaned descendants
+/// (`prctl(PR_SET_CHILD_SUBREAPER)`), so a grandchild whose parent has
+/// already exited reparents to the test instead of init and stays reachable
+/// from `Drop`. Process-wide and idempotent.
+fn become_child_subreaper() {
+    nix::sys::prctl::set_child_subreaper(true).expect("prctl(PR_SET_CHILD_SUBREAPER)");
+}
+
+/// Kill and reap every process the subreaper handed us (`ppid == self`,
+/// except `keep`) and every live member of `sessions`. Orphans reparent
+/// asynchronously after their parent dies, so the scan repeats until nothing
+/// live matches or `deadline` passes. Zombies we own are reaped so they leave
+/// `/proc`. Returns the pids killed.
+fn reap_adopted(keep: &[i32], sessions: &HashSet<i32>, deadline: Instant) -> Vec<i32> {
+    let me = self_pid();
+    let mut killed = Vec::new();
+    loop {
+        let mut live = false;
+        for p in scan_procs() {
+            if p.pid == me || keep.contains(&p.pid) {
+                continue;
+            }
+            let adopted = p.ppid == me;
+            if !adopted && !sessions.contains(&p.session) {
+                continue;
+            }
+            if p.state == 'Z' {
+                if adopted {
+                    let _ = waitpid(Pid::from_raw(p.pid), Some(WaitPidFlag::WNOHANG));
+                }
+                continue;
+            }
+            live = true;
+            let _ = kill(Pid::from_raw(p.pid), Signal::SIGKILL);
+            if !killed.contains(&p.pid) {
+                killed.push(p.pid);
+            }
+        }
+        if !live || Instant::now() >= deadline {
+            return killed;
+        }
+        std::thread::sleep(SCAN_INTERVAL);
     }
 }
 
@@ -448,6 +506,10 @@ fn spawn_driver(dir: tempfile::TempDir, fixture: &str) -> Harness {
     cmd.env("SHELL", "/bin/bash");
     cmd.env("HOME", &home);
     cmd.env("INTENTD_PTY_CAPTURE_LOG", data_dir.join("capture.log"));
+
+    // Before the first spawn: orphans of the session (a capture shell whose
+    // daemon parent died first) must reparent to us, not init, for `Drop`.
+    become_child_subreaper();
 
     let stop_signals = [Signal::SIGTTIN, Signal::SIGTTOU, Signal::SIGTSTP];
     // SAFETY: only the disposition is changed (no handler function is
@@ -719,5 +781,70 @@ mod helper_tests {
         assert!(capture_layout_violation(&with_tty, 4100)
             .unwrap()
             .contains("controlling tty"));
+    }
+
+    fn poll_until(what: &str, mut ok: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ok() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(SCAN_INTERVAL);
+        }
+    }
+
+    /// The P2 leak: a detached grandchild whose parent died before teardown
+    /// is reachable neither by ancestry nor by session. As subreaper we
+    /// inherit it, and `reap_adopted` must kill *and* reap it — even while it
+    /// sits stopped, the state the leaked capture shell was found in.
+    #[test]
+    fn reap_adopted_kills_and_reaps_orphan_inherited_as_subreaper() {
+        if read_stat(self_pid()).is_none() {
+            eprintln!("skipping: procfs unavailable");
+            return;
+        }
+        become_child_subreaper();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("orphan.pid");
+        // Job control is off in `bash -c`, so the background child is not a
+        // group leader and `setsid` execs `sleep` in place: `$!` is its pid.
+        let mut parent = Command::new("/bin/bash")
+            .arg("-c")
+            .arg(r#"setsid sleep 300 & echo $! > "$0"; wait"#)
+            .arg(&pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn parent");
+        let parent_pid = i32::try_from(parent.id()).expect("pid fits");
+        let mut orphan = 0;
+        poll_until("grandchild pid file", || {
+            orphan = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            orphan != 0
+        });
+        poll_until("grandchild to become a detached sleep", || {
+            read_stat(orphan).is_some_and(|p| p.comm == "sleep" && p.session == orphan)
+        });
+        assert_eq!(read_stat(orphan).unwrap().ppid, parent_pid);
+
+        parent.kill().expect("kill parent");
+        parent.wait().expect("reap parent");
+        poll_until("orphan adoption", || {
+            read_stat(orphan).is_some_and(|p| p.ppid == self_pid())
+        });
+        kill(Pid::from_raw(orphan), Signal::SIGSTOP).expect("stop orphan");
+        poll_until("orphan to stop", || {
+            read_stat(orphan).is_some_and(|p| p.state == 'T')
+        });
+
+        let killed = reap_adopted(&[], &HashSet::new(), Instant::now() + REAP_TIMEOUT);
+        assert!(killed.contains(&orphan), "orphan not killed: {killed:?}");
+        assert_eq!(
+            read_stat(orphan).map(|p| (p.state, p.ppid)),
+            None,
+            "orphan still in /proc after reap"
+        );
     }
 }
