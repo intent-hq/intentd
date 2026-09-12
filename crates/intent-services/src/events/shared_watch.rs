@@ -620,6 +620,22 @@ impl SharedWatchHub {
             .map(|r| r.registration.settled())
     }
 
+    /// Human-readable registration state of one root for test diagnostics:
+    /// `pending` / `live` / `failed`, or `unwatched` when nothing watches it.
+    #[cfg(test)]
+    pub(super) fn root_registration_state(&self, root: &Path) -> &'static str {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(e) => e.into_inner(),
+        };
+        state
+            .groups
+            .values()
+            .find_map(|g| g.roots.get(&root))
+            .map_or("unwatched", |r| r.registration.describe())
+    }
+
     /// Await every currently-requested root being registered with the OS.
     /// Registration is deferred off the caller's thread (monorepo#1572), so
     /// tests that drive the hub indirectly (through the registry) need this
