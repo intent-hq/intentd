@@ -35,13 +35,22 @@
 # reproducible. Mechanism not pinned; serialization removes the load condition.
 #
 # The WSS MCP e2e binaries (e2e_wss_mcp_servers, e2e_wss_mcp_oauth_refresh)
-# also run isolated: each test spawns a real daemon plus node mock-MCP
-# fixtures, and the daemon-side HTTP probe runs against hardcoded production
-# handshake/probe timeouts (10s/15s, mcp_servers.rs) with no test seam. Under
-# full-suite parallel load the localhost fixture/daemon starve past those
-# bounds and the probe reports error/timeout instead of connected/running
-# (monorepo#4231); isolation removes the load condition, same as the
-# daemon-spawning binaries above.
+# also run isolated. Their monorepo#4231 failures (probe reporting
+# error/timeout instead of connected/running) were originally attributed to
+# full-suite parallel load, but the deterministic cause was the daemon's
+# login-shell PATH capture (`$SHELL -ilc …` at boot): started in a background
+# process group of a PTY-backed local gate, the interactive shell stopped its
+# whole process group via tty job control (SIGTTIN), freezing the daemon and
+# the node mock-MCP fixture sharing its group until the probe timed out.
+# Fixed in intentd#1808 by detaching the capture from the controlling tty
+# (setsid); e2e_pty_job_control is the regression guard for that hazard class
+# and runs isolated with the other daemon-spawning binaries because it boots a
+# real daemon inside a PTY. Isolation is KEPT for the MCP binaries as load
+# protection: each test spawns a real daemon plus node mock-MCP fixtures, and
+# the daemon-side HTTP probe runs against hardcoded production handshake/probe
+# timeouts (10s/15s, mcp_servers.rs) with no test seam, so under full-suite
+# parallel load the localhost fixture/daemon can still starve past those
+# bounds.
 #
 # e2e_wss_pool_contention_stress also runs isolated: its tests assert
 # read-latency bounds (workspace.list / note.list mid-write-storm), which
@@ -91,7 +100,7 @@ slow-timeout = { period = "90s", terminate-after = 2 }
 timing-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary_id(=intentd::e2e_wss_delegation_group_persist) | binary_id(=intentd::e2e_wss_interrupted_agents) | binary_id(=intentd::e2e_wss_resolve_interrupted) | binary_id(=intentd::e2e_wss_serve_resume_all) | binary_id(=intentd::e2e_wss_pool_contention_stress) | binary_id(=intentd::e2e_wss_mcp_servers) | binary_id(=intentd::e2e_wss_mcp_oauth_refresh)'
+filter = 'binary_id(=intentd::e2e_wss_delegation_group_persist) | binary_id(=intentd::e2e_wss_interrupted_agents) | binary_id(=intentd::e2e_wss_resolve_interrupted) | binary_id(=intentd::e2e_wss_serve_resume_all) | binary_id(=intentd::e2e_wss_pool_contention_stress) | binary_id(=intentd::e2e_wss_mcp_servers) | binary_id(=intentd::e2e_wss_mcp_oauth_refresh) | binary_id(=intentd::e2e_pty_job_control)'
 threads-required = 'num-test-threads'
 priority = 100
 
