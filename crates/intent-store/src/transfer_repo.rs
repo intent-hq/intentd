@@ -9,7 +9,7 @@
 //! secrets, `known_repo`, usage stats, idempotency keys, clients).
 
 use intent_core::transfer::TransferTableStat;
-use intent_core::{Error, Result, WorkspaceId};
+use intent_core::{Error, Result, TokenUsageTotals, WorkspaceId};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 
 use crate::Store;
@@ -54,6 +54,10 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ),
     (
         "agent_message_payload",
+        "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
+    ),
+    (
+        "agent_usage_cell",
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
     ),
     (
@@ -384,6 +388,15 @@ impl Store {
         for (table, _) in TRANSFER_TABLES {
             schemas.insert(*table, self.table_columns(table).await?);
         }
+        let imported_agent_ids: Vec<&str> = rows
+            .iter()
+            .find(|(table, _)| table == "agent_session")
+            .into_iter()
+            .flat_map(|(_, objects)| objects)
+            .filter_map(|object| object.get("id").and_then(serde_json::Value::as_str))
+            .collect();
+        let imported_agent_ids_json = serde_json::to_string(&imported_agent_ids)
+            .map_err(|e| Error::Internal(format!("transfer import agent ids: {e}")))?;
 
         let mut tx = self
             .write_pool()
@@ -428,6 +441,114 @@ impl Store {
                 })?;
                 inserted += 1;
             }
+        }
+        if !imported_agent_ids.is_empty() {
+            sqlx::query(
+                "UPDATE agent_message SET \
+                 usage_model=COALESCE(NULLIF(usage_model,''), \
+                   COALESCE(NULLIF((SELECT resolved_model FROM agent_session \
+                                    WHERE id=agent_message.agent_id),''), \
+                            NULLIF((SELECT model FROM agent_session \
+                                    WHERE id=agent_message.agent_id),''), 'unknown')), \
+                 usage_origin=COALESCE(usage_origin, CASE \
+                   WHEN role='assistant' THEN 'agent' \
+                   WHEN role='user' AND CASE WHEN json_valid(metadata) \
+                     THEN COALESCE(NULLIF(json_extract(metadata,'$.fromAgentId'),''),'') \
+                     ELSE '' END <> '' THEN 'agent' \
+                   WHEN role='user' THEN 'human' ELSE 'excluded' END) \
+                 WHERE agent_id IN (SELECT value FROM json_each(?)) \
+                 AND (NULLIF(usage_model,'') IS NULL OR usage_origin IS NULL)",
+            )
+            .bind(&imported_agent_ids_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("materialize imported provenance failed: {e}")))?;
+
+            let session_rows = sqlx::query(
+                "SELECT s.id, COALESCE(NULLIF(s.resolved_model,''), NULLIF(s.model,''), 'unknown') AS model, \
+                 s.token_usage, s.token_usage_baseline FROM agent_session s \
+                 WHERE s.id IN (SELECT value FROM json_each(?)) \
+                 AND NOT EXISTS (SELECT 1 FROM agent_usage_cell c WHERE c.agent_id=s.id)",
+            )
+            .bind(&imported_agent_ids_json)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("read imported usage snapshots failed: {e}")))?;
+            for row in session_rows {
+                let snapshot = row
+                    .get::<Option<String>, _>("token_usage")
+                    .and_then(|raw| serde_json::from_str::<TokenUsageTotals>(&raw).ok());
+                let baseline = row
+                    .get::<Option<String>, _>("token_usage_baseline")
+                    .and_then(|raw| serde_json::from_str::<TokenUsageTotals>(&raw).ok());
+                if snapshot.is_none() && baseline.is_none() {
+                    continue;
+                }
+                let snapshot = snapshot.unwrap_or_default();
+                let baseline = baseline.unwrap_or_default();
+                let mut costs = std::collections::BTreeMap::<String, f64>::new();
+                for cost in [baseline.cost.as_ref(), snapshot.cost.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    *costs.entry(cost.currency.clone()).or_default() += cost.amount;
+                }
+                let costs_json = serde_json::to_string(&costs).map_err(|e| {
+                    Error::Internal(format!("encode imported usage costs failed: {e}"))
+                })?;
+                let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+                sqlx::query(
+                    "INSERT INTO agent_usage_cell (agent_id, model, input_tokens, output_tokens, \
+                     cache_read_tokens, cache_creation_tokens, thought_tokens, costs_json) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(agent_id, model) DO NOTHING",
+                )
+                .bind(row.get::<String, _>("id"))
+                .bind(row.get::<String, _>("model"))
+                .bind(to_i64(
+                    baseline.input_tokens.saturating_add(snapshot.input_tokens),
+                ))
+                .bind(to_i64(
+                    baseline
+                        .output_tokens
+                        .saturating_add(snapshot.output_tokens),
+                ))
+                .bind(to_i64(
+                    baseline
+                        .cache_read_tokens
+                        .saturating_add(snapshot.cache_read_tokens),
+                ))
+                .bind(to_i64(
+                    baseline
+                        .cache_creation_tokens
+                        .saturating_add(snapshot.cache_creation_tokens),
+                ))
+                .bind(to_i64(
+                    baseline
+                        .thought_tokens
+                        .saturating_add(snapshot.thought_tokens),
+                ))
+                .bind(costs_json)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("materialize imported usage failed: {e}")))?;
+            }
+            sqlx::query(
+                "INSERT INTO agent_usage_cell \
+                 (agent_id, model, human_messages, agent_messages) \
+                 SELECT agent_id, COALESCE(NULLIF(usage_model,''),'unknown'), \
+                   SUM(CASE WHEN usage_origin='human' THEN 1 ELSE 0 END), \
+                   SUM(CASE WHEN role='assistant' OR usage_origin='agent' THEN 1 ELSE 0 END) \
+                 FROM agent_message WHERE agent_id IN (SELECT value FROM json_each(?)) \
+                 AND role IN ('user','assistant') \
+                 GROUP BY agent_id, COALESCE(NULLIF(usage_model,''),'unknown') \
+                 ON CONFLICT(agent_id, model) DO UPDATE SET \
+                   human_messages=excluded.human_messages, \
+                   agent_messages=excluded.agent_messages",
+            )
+            .bind(&imported_agent_ids_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("materialize imported counts failed: {e}")))?;
         }
         tx.commit()
             .await
@@ -581,7 +702,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::{TRANSFER_EXCLUDED_TABLES, TRANSFER_TABLES};
     use crate::Store;
-    use intent_core::WorkspaceId;
+    use intent_core::{AgentId, TokenUsageTotals, WorkspaceId};
     use std::fmt::Write as _;
     use uuid::Uuid;
 
@@ -636,9 +757,10 @@ mod tests {
             format!("INSERT INTO note_line_attribution (note_id, workspace_id, computed_at, attributions_json) VALUES ('n1', '{ws}', '{t}', '[]')"),
             format!("INSERT INTO comment (id, thread_id, note_id, workspace_id, kind, content, author, author_type, anchor_json, created_at, updated_at) VALUES ('c-{ws}', 'th', 'n1', '{ws}', 'comment', 'hi', 'u', 'user', '{{}}', '{t}', '{t}')"),
             format!("INSERT INTO draft (workspace_id, agent_id, client_id, text, updated_at) VALUES ('{ws}', '{agent}', '{client}', 'd', '{t}')"),
-            format!("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('m-{ws}', '{agent}', 1, 'user', '[]', '{t}')"),
+            format!("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at, usage_model, usage_origin) VALUES ('m-{ws}', '{agent}', 1, 'user', '[]', '{t}', 'test-model', 'human')"),
             format!("INSERT INTO agent_message_payload (message_id, agent_id, block_ordinal, kind, encoding, body) VALUES ('m-{ws}', '{agent}', 0, 'tool_result_output', 'none', X'227822')"),
             format!("INSERT INTO agent_message_payload (message_id, agent_id, block_ordinal, kind, encoding, body) VALUES ('m-{ws}', '{agent}', 1, 'tool_use_input_replay', 'none', X'7b2274657874223a2278222c226f726967696e616c4368617273223a317d')"),
+            format!("INSERT INTO agent_usage_cell (agent_id, model, human_messages) VALUES ('{agent}', 'test-model', 1)"),
             format!("INSERT INTO agent_queue (id, agent_id, position, payload, created_at) VALUES ('q-{ws}', '{agent}', 0, '{{}}', '{t}')"),
             format!("INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) VALUES ('{agent}', '{ws}', 'working', '{t}')"),
             format!("INSERT INTO agent_flipped_completion (agent_id, workspace_id, task_note_id, recorded_at) VALUES ('{agent}', '{ws}', 'n1', '{t}')"),
@@ -769,6 +891,171 @@ mod tests {
         assert_eq!(exported, re_exported, "round-trip must be lossless");
     }
 
+    #[tokio::test]
+    async fn transfer_import_materializes_legacy_usage_and_message_counts() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.expect("open target");
+        let t = "2026-01-01T00:00:00Z";
+        let ws_id = WorkspaceId("ws-legacy-transfer".to_string());
+        let agent_id = AgentId("agent-legacy-transfer".to_string());
+        let snapshot = TokenUsageTotals {
+            input_tokens: 70,
+            ..Default::default()
+        };
+        let rows = vec![
+            (
+                "workspace".to_string(),
+                vec![serde_json::json!({
+                    "id": &ws_id.0, "title": "Legacy", "branch": "main",
+                    "created_at": t, "updated_at": t
+                })],
+            ),
+            (
+                "agent_session".to_string(),
+                vec![serde_json::json!({
+                    "id": &agent_id.0, "workspace_id": &ws_id.0, "name": "Legacy",
+                    "status": "idle", "model": "legacy-model",
+                    "token_usage": serde_json::to_string(&snapshot).unwrap(),
+                    "created_at": t, "updated_at": t
+                })],
+            ),
+            (
+                "agent_message".to_string(),
+                vec![
+                    serde_json::json!({
+                        "id": "m-human", "agent_id": &agent_id.0, "seq": 0,
+                        "role": "user", "content": "[]", "created_at": t
+                    }),
+                    serde_json::json!({
+                        "id": "m-assistant", "agent_id": &agent_id.0, "seq": 1,
+                        "role": "assistant", "content": "[]", "created_at": t
+                    }),
+                    serde_json::json!({
+                        "id": "m-automatic", "agent_id": &agent_id.0, "seq": 2,
+                        "role": "user", "content": "[]",
+                        "metadata": "{\"fromAgentId\":\"agent-source\"}", "created_at": t
+                    }),
+                    serde_json::json!({
+                        "id": "m-system", "agent_id": &agent_id.0, "seq": 3,
+                        "role": "system", "content": "[]", "created_at": t
+                    }),
+                ],
+            ),
+        ];
+        assert!(
+            rows.iter().all(|(table, _)| table != "agent_usage_cell"),
+            "pre-0115 archive has no materialized usage cells"
+        );
+        store
+            .transfer_import_rows(&rows)
+            .await
+            .expect("import archive");
+
+        let imported_usage = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("read imported legacy usage");
+        assert_eq!(imported_usage[0].5.len(), 1);
+        assert_eq!(imported_usage[0].5[0].model, "legacy-model");
+        assert_eq!(
+            imported_usage[0].5[0].reported_totals.input_tokens, 70,
+            "legacy session snapshot seeds its missing usage cell"
+        );
+
+        store
+            .set_agent_session_token_usage(
+                &ws_id,
+                &agent_id,
+                &TokenUsageTotals {
+                    input_tokens: 100,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("continue imported session");
+        store
+            .append_agent_message(&agent_id, "user", &serde_json::json!([]), t)
+            .await
+            .expect("append after import");
+
+        for _ in 0..2 {
+            let usage = store
+                .get_workspace_agent_usage_data(&ws_id)
+                .await
+                .expect("reconcile imported usage");
+            assert_eq!(usage[0].5.len(), 1);
+            assert_eq!(usage[0].5[0].model, "legacy-model");
+            assert_eq!(usage[0].5[0].reported_totals.input_tokens, 100);
+            assert_eq!(
+                (usage[0].5[0].human_messages, usage[0].5[0].agent_messages),
+                (2, 2),
+                "legacy and appended rows count exactly once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_round_trip_does_not_seed_current_model_when_modern_cells_exist() {
+        let src_db = TempDb::new();
+        let src = Store::open(&src_db.path).await.expect("open source");
+        let t = "2026-01-01T00:00:00Z";
+        let ws_id = WorkspaceId("ws-modern-model-switch".to_string());
+        let agent_id = AgentId("agent-modern-model-switch".to_string());
+        run(
+            &src,
+            format!(
+                "INSERT INTO workspace (id, title, branch, created_at, updated_at) \
+                 VALUES ('{}', 'Modern', 'main', '{t}', '{t}')",
+                ws_id.0
+            ),
+        )
+        .await;
+        run(
+            &src,
+            format!(
+                "INSERT INTO agent_session \
+                 (id, workspace_id, name, status, model, created_at, updated_at) \
+                 VALUES ('{}', '{}', 'Modern', 'idle', 'model-a', '{t}', '{t}')",
+                agent_id.0, ws_id.0
+            ),
+        )
+        .await;
+        src.set_agent_session_token_usage(
+            &ws_id,
+            &agent_id,
+            &TokenUsageTotals {
+                input_tokens: 70,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("persist model-a usage");
+        src.set_agent_session_model(&ws_id, &agent_id, "model-b", None, t)
+            .await
+            .expect("switch model without a new turn");
+
+        let exported = src.transfer_export_rows(&ws_id).await.expect("export");
+        let exported_cells = exported
+            .iter()
+            .find(|(table, _)| table == "agent_usage_cell")
+            .expect("usage-cell table");
+        assert_eq!(exported_cells.1.len(), 1, "modern archive carries one cell");
+
+        let dst_db = TempDb::new();
+        let dst = Store::open(&dst_db.path).await.expect("open target");
+        dst.transfer_import_rows(&exported).await.expect("import");
+        let usage = dst
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("read imported usage");
+        let cells: Vec<_> = usage[0]
+            .5
+            .iter()
+            .map(|cell| (cell.model.as_str(), cell.reported_totals.input_tokens))
+            .collect();
+        assert_eq!(cells, [("model-a", 70)]);
+    }
+
     /// The import transaction is atomic: a batch whose LAST table row
     /// violates the schema leaves nothing behind — not even the earlier
     /// valid workspace row.
@@ -897,8 +1184,9 @@ note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
 agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes
-agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails
+agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails, usage_model, usage_origin
 agent_message_payload: message_id, agent_id, block_ordinal, kind, encoding, body
+agent_usage_cell: agent_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, thought_tokens, costs_json, human_messages, agent_messages
 agent_queue: id, agent_id, position, payload, created_at, turn_id
 interrupted_agent: agent_id, workspace_id, prev_status, interrupted_at, resolution, resolved_at, reason
 agent_flipped_completion: agent_id, workspace_id, task_note_id, recorded_at

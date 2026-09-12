@@ -24,12 +24,32 @@ use tokio::time::{timeout, Duration};
 use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
     is_cancel_transport_closed, recommended_memory_budget_bytes, resolve_npx_only, resolve_spawn,
-    text_prompt, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, ResolvedSpawn,
-    TreeMemoryProbe, DEFAULT_AGENT_TYPE, PROVISIONAL_AGENT_BYTES,
+    text_prompt, usage_message_origin, AgentHandle, AgentManager, BusEventSink, KillFn,
+    ProcessRegistry, ResolvedSpawn, TreeMemoryProbe, DEFAULT_AGENT_TYPE, PROVISIONAL_AGENT_BYTES,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
 use crate::Services;
+
+#[test]
+fn usage_origin_uses_trusted_delivery_origin_before_opaque_metadata() {
+    use intent_core::MessageOrigin;
+    use intent_store::UsageMessageOrigin;
+
+    let attributed = json!({"fromAgentId":"agent-sender"});
+    assert_eq!(
+        usage_message_origin(MessageOrigin::Automatic, Some(&attributed)),
+        UsageMessageOrigin::Agent
+    );
+    assert_eq!(
+        usage_message_origin(MessageOrigin::User, Some(&attributed)),
+        UsageMessageOrigin::Human
+    );
+    assert_eq!(
+        usage_message_origin(MessageOrigin::Automatic, None),
+        UsageMessageOrigin::Excluded
+    );
+}
 
 /// `SQLite` db inside an RAII temp dir: the dir sweep (on drop, including on
 /// panic) also covers `-wal`/`-shm` sidecars, and a background task that
