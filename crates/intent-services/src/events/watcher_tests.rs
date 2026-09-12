@@ -15,7 +15,7 @@ use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
 use super::shared_watch::SharedWatchHub;
 use super::watcher::{flush_due, Action, FileWatcher};
-use super::LIVENESS;
+use super::{TestBudget, LIVENESS};
 
 /// Self-cleaning temp directory (watched workspace root); see
 /// [`crate::test_support::test_tempdir`].
@@ -1006,6 +1006,10 @@ async fn runtime_info_exclude_negation_rescues_prefiltered_path() {
 
 #[tokio::test]
 async fn user_negation_overrides_default_pattern() {
+    // Registration recovery and the event wait share ONE liveness budget so
+    // the test always fails with a diagnostic before nextest's 180s kill
+    // (intent-hq/intent#4845).
+    let budget = TestBudget::liveness();
     let db = TempDb::new();
     let store = Store::open(&db.path).await.expect("open store");
     let bus = EventBus::new(store);
@@ -1023,14 +1027,56 @@ async fn user_negation_overrides_default_pattern() {
         WorkspaceId::from("ws-gi"),
         &dir.path.clone(),
     );
-    watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(budget.remaining()).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("dist/bundle.js"), b"js").expect("write negated");
-    let ev = next_for(&mut sub, "dist/bundle.js", None, LIVENESS)
+    let ev = next_for(&mut sub, "dist/bundle.js", None, budget.remaining())
         .await
         .expect("negated default must emit");
     assert_eq!(ev.data["relativePath"], "dist/bundle.js");
+}
+
+/// Setup and event waits drawn from one [`TestBudget`] spend a single
+/// deadline: after delayed setup consumes part of it, a never-arriving event
+/// fails within what is left, not after a fresh full wait. This is what keeps
+/// the watcher tests' worst case below nextest's slow-test kill
+/// (intent-hq/intent#4845 / #4852).
+#[tokio::test]
+async fn budget_bounds_delayed_setup_plus_missing_event_to_one_deadline() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let total = Duration::from_millis(600);
+    let budget = TestBudget::new(total);
+    let started = Instant::now();
+    // Delayed registration: consumes most of the budget before the event wait.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let event_wait = Instant::now();
+    let ev = next_for(&mut sub, "never/arrives.txt", None, budget.remaining()).await;
+    assert!(ev.is_none(), "no event was ever published");
+    assert!(
+        event_wait.elapsed() < total,
+        "the event wait must take only the budget's remainder, not a fresh {total:?}: took {:?}",
+        event_wait.elapsed()
+    );
+    assert!(
+        started.elapsed() < total + Duration::from_millis(200),
+        "setup plus event wait must end at the shared deadline: took {:?}",
+        started.elapsed()
+    );
+    assert!(budget.remaining().is_zero(), "budget must be spent");
+    // A wait started after the budget is spent returns at once.
+    let late = Instant::now();
+    assert!(
+        next_for(&mut sub, "never/arrives.txt", None, budget.remaining())
+            .await
+            .is_none()
+    );
+    assert!(late.elapsed() < Duration::from_millis(100));
 }
 
 #[tokio::test]

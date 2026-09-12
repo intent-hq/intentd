@@ -48,8 +48,41 @@ pub(crate) static WATCHER_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::
 /// step (intent-hq/intent#4845 / #4852).
 /// Negative assertions (things that must NOT happen) keep their own short
 /// bounds; do not use this constant for them.
+///
+/// A test with more than one liveness wait must draw them all from one
+/// [`TestBudget`]: two fresh `LIVENESS` waits back to back (registration
+/// recovery, then a lost event) would outlive the kill again.
 #[cfg(test)]
 pub(crate) const LIVENESS: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// One deadline shared by every wait in a test. Hand `remaining()` to each
+/// wait in turn — setup (watch establishment, registration recovery) and the
+/// event wait then spend a single [`LIVENESS`] between them, and a wait that
+/// starts after the budget is spent fails immediately with its own
+/// diagnostic rather than taking a fresh full timeout.
+#[cfg(test)]
+pub(crate) struct TestBudget {
+    deadline: tokio::time::Instant,
+}
+
+#[cfg(test)]
+impl TestBudget {
+    pub(crate) fn liveness() -> Self {
+        Self::new(LIVENESS)
+    }
+
+    pub(crate) fn new(total: std::time::Duration) -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + total,
+        }
+    }
+
+    /// Time left in the budget; zero once spent.
+    pub(crate) fn remaining(&self) -> std::time::Duration {
+        self.deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+}
 
 #[cfg(test)]
 mod bus_tests;
