@@ -10,15 +10,27 @@
 //! The heuristic is deliberately small:
 //!
 //! - Skipped: `crates/intent-core/src/repo_ref.rs`, any file named `tests.rs`
-//!   or under a `tests/` directory, and any `#[cfg(test)]` item (brace depth
-//!   is tracked from the attribute to the end of the following item). The
-//!   attribute is matched as the token sequence `# [ cfg ( test ) ]` with any
-//!   whitespace between tokens, after comments are blanked — so `#[cfg( test )]`
-//!   and `#[cfg(/* c */ test)]` are skipped, while `#[cfg(not(test))]` and
-//!   `#[cfg(all(test, …))]` are scanned like ordinary code.
+//!   or under a `tests/` directory, and any `#[cfg(test)]` item, attribute to
+//!   end of item. An item introduced by `const` / `static` / `type` / `use`
+//!   (any `const` other than `const fn`) ends at the first `;` at brace depth
+//!   0, so a `const` initializer with its own blocks is skipped whole; one
+//!   introduced by `fn` / `mod` / `impl` / `struct` / `enum` / `union` /
+//!   `trait` / `macro_rules` ends at the `}` closing its body, or at a `;` at
+//!   depth 0 seen first (`mod tests;`, `struct X;`, a trait method
+//!   signature). Anything else falls back to the first balanced `}` or `;`.
+//!   The attribute is matched as the token sequence `# [ cfg ( test ) ]` with
+//!   any whitespace between tokens, after comments are blanked — so
+//!   `#[cfg( test )]` and `#[cfg(/* c */ test)]` are skipped, while
+//!   `#[cfg(not(test))]` and `#[cfg(all(test, …))]` are scanned like ordinary
+//!   code.
 //! - String literals and comments are blanked first, so `"github.com"` and doc
 //!   comments never count. A "statement" is the text between `;` / `{` / `}`
-//!   boundaries.
+//!   boundaries, except that a block expression used as an operand — its `}`
+//!   followed by `.`, `?`, or `else` — is chained: the text before its `{`
+//!   and the text after its `}` form one statement (`let repo = if c { a }
+//!   else { b }.to_lowercase()`, `match x { … }.to_lowercase()`, `unsafe { … }
+//!   .eq_ignore_ascii_case(..)`), while the block bodies stay their own
+//!   statements.
 //! - A statement is flagged when it contains a fold call (`to_lowercase`,
 //!   `to_ascii_lowercase`, `eq_ignore_ascii_case`, `make_ascii_lowercase`)
 //!   AND a slug identifier: an identifier token with an underscore-delimited
@@ -303,10 +315,100 @@ fn starts_with_cfg_test(chars: &[char], i: usize) -> bool {
     true
 }
 
-/// Blanks every `#[cfg(test)]` attribute together with the item that follows
-/// it: the item ends at the `}` that closes its first `{`, or at a `;` seen
-/// before any brace (`mod tests;`). Runs on already-blanked text, so the
-/// attribute cannot hide inside a string or comment.
+/// Items whose body is a brace block; they end at the `}` closing it (or at a
+/// `;` at depth 0 seen first).
+const BODY_ITEM_KEYWORDS: &[&str] = &[
+    "fn",
+    "mod",
+    "impl",
+    "struct",
+    "enum",
+    "union",
+    "trait",
+    "macro_rules",
+];
+/// Items that end at the first `;` at depth 0, whatever blocks their
+/// initializer contains.
+const SEMICOLON_ITEM_KEYWORDS: &[&str] = &["const", "static", "type", "use"];
+/// Qualifiers that turn `const` into `const fn` / `const unsafe fn` / ….
+const FN_QUALIFIERS: &[&str] = &["fn", "unsafe", "extern", "async"];
+
+fn skip_whitespace(chars: &[char], mut j: usize) -> usize {
+    while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+        j += 1;
+    }
+    j
+}
+
+/// Index just past the delimiter group (`(…)` or `[…]`) opening at `j`.
+fn skip_group(chars: &[char], mut j: usize, open: char, close: char) -> usize {
+    let mut depth = 0usize;
+    while let Some(&c) = chars.get(j) {
+        j += 1;
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+    j
+}
+
+/// `(word, index past it)` for the identifier starting at `j`, if any.
+fn word_at(chars: &[char], j: usize) -> Option<(String, usize)> {
+    let mut k = j;
+    while chars
+        .get(k)
+        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+    {
+        k += 1;
+    }
+    (k > j).then(|| (chars[j..k].iter().collect(), k))
+}
+
+/// Whether the item introduced after the attribute(s) starting at `j` ends at
+/// a `;` at brace depth 0 rather than at the `}` closing its body. Looks past
+/// further attributes and qualifiers (`pub(crate)`, `unsafe`, …) to the item
+/// keyword; an unrecognized item is treated as body-terminated.
+fn cfg_test_item_ends_at_semicolon(chars: &[char], mut j: usize) -> bool {
+    loop {
+        j = skip_whitespace(chars, j);
+        match chars.get(j) {
+            Some('#') => {
+                j += 1;
+                if chars.get(j) == Some(&'!') {
+                    j += 1;
+                }
+                j = skip_group(chars, j, '[', ']');
+            }
+            Some('(') => j = skip_group(chars, j, '(', ')'),
+            Some(c) if c.is_ascii_alphabetic() || *c == '_' => {
+                let (word, next) = word_at(chars, j).expect("identifier start");
+                j = next;
+                if BODY_ITEM_KEYWORDS.contains(&word.as_str()) {
+                    return false;
+                }
+                if word == "const" {
+                    let after = skip_whitespace(chars, j);
+                    return !word_at(chars, after)
+                        .is_some_and(|(w, _)| FN_QUALIFIERS.contains(&w.as_str()));
+                }
+                if SEMICOLON_ITEM_KEYWORDS.contains(&word.as_str()) {
+                    return true;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Blanks every `#[cfg(test)]` attribute together with the whole item that
+/// follows it (see the module doc for where each kind of item ends). Runs on
+/// already-blanked text, so the attribute cannot hide inside a string or
+/// comment.
 fn blank_cfg_test_items(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
@@ -317,6 +419,7 @@ fn blank_cfg_test_items(text: &str) -> String {
             i += 1;
             continue;
         }
+        let ends_at_semicolon = cfg_test_item_ends_at_semicolon(&chars, i);
         let mut depth = 0usize;
         while i < chars.len() {
             let c = chars[i];
@@ -326,7 +429,7 @@ fn blank_cfg_test_items(text: &str) -> String {
                 '{' => depth += 1,
                 '}' => {
                     depth = depth.saturating_sub(1);
-                    if depth == 0 {
+                    if depth == 0 && !ends_at_semicolon {
                         break;
                     }
                 }
@@ -343,37 +446,65 @@ struct Statement {
     text: String,
 }
 
+/// Whether the `}` just before `j` is followed by `.`, `?`, or `else`, i.e.
+/// the block is an operand and the enclosing statement continues after it.
+fn block_is_operand(chars: &[char], j: usize) -> bool {
+    let j = skip_whitespace(chars, j);
+    match chars.get(j) {
+        Some('.' | '?') => true,
+        Some(_) => word_at(chars, j).is_some_and(|(w, _)| w == "else"),
+        None => false,
+    }
+}
+
 /// Splits blanked source at `;` / `{` / `}`; each statement records the line
-/// of its first non-whitespace character.
+/// of its first non-whitespace character. The text before a `{` is held back
+/// until the matching `}`: when that `}` is followed by `.`, `?`, or `else`
+/// the held text resumes as the current statement (so an operand block chains
+/// with what surrounds it), otherwise it is emitted as it stood. Statements
+/// come back in source order.
 fn split_statements(text: &str) -> Vec<Statement> {
+    let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
     let mut line = 1usize;
     let mut current = String::new();
-    let mut start_line = None;
-    for c in text.chars() {
-        if matches!(c, ';' | '{' | '}') {
-            if let Some(l) = start_line.take() {
-                out.push(Statement {
-                    line: l,
-                    text: std::mem::take(&mut current),
-                });
+    let mut start_line: Option<usize> = None;
+    let mut held: Vec<Option<Statement>> = Vec::new();
+    let take = |current: &mut String, start_line: &mut Option<usize>| {
+        let text = std::mem::take(current);
+        start_line.take().map(|line| Statement { line, text })
+    };
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            ';' => out.extend(take(&mut current, &mut start_line)),
+            '{' => held.push(take(&mut current, &mut start_line)),
+            '}' => {
+                out.extend(take(&mut current, &mut start_line));
+                if let Some(prefix) = held.pop().flatten() {
+                    if block_is_operand(&chars, i + 1) {
+                        current = prefix.text;
+                        current.push(' ');
+                        start_line = Some(prefix.line);
+                    } else {
+                        out.push(prefix);
+                    }
+                }
             }
-            current.clear();
-            continue;
+            '\n' => {
+                line += 1;
+                current.push(c);
+            }
+            _ => {
+                if !c.is_whitespace() && start_line.is_none() {
+                    start_line = Some(line);
+                }
+                current.push(c);
+            }
         }
-        if c == '\n' {
-            line += 1;
-        } else if !c.is_whitespace() && start_line.is_none() {
-            start_line = Some(line);
-        }
-        current.push(c);
     }
-    if let Some(l) = start_line {
-        out.push(Statement {
-            line: l,
-            text: current,
-        });
-    }
+    out.extend(take(&mut current, &mut start_line));
+    out.extend(held.into_iter().flatten());
+    out.sort_by_key(|s| s.line);
     out
 }
 
@@ -929,6 +1060,91 @@ fn real(owner: &str) -> String {
 }
 ";
     assert_eq!(hit_lines(src), vec![line_of(src, "fn real(owner") + 1]);
+}
+
+#[test]
+fn cfg_test_items_are_skipped_to_their_real_end() {
+    // A `const` initializer with its own balanced blocks is skipped whole
+    // (the fold in its second block is not a hit), and the live fn after it
+    // is still flagged.
+    let src = r"
+#[cfg(test)]
+const X: fn(&str) -> String = if cfg!(a) { |s| s.to_string() } else { |owner| owner.to_lowercase() };
+fn live(owner: &str) { owner.to_lowercase(); }
+";
+    assert_eq!(hit_lines(src), vec![line_of(src, "fn live(owner")]);
+
+    // A fn body with an early balanced block is skipped to the closing `}`.
+    let src = r"
+#[cfg(test)]
+fn t(owner: &str) { let _ = { 1 }; owner.to_lowercase(); }
+fn live(owner: &str) { owner.to_lowercase(); }
+";
+    assert_eq!(hit_lines(src), vec![line_of(src, "fn live(owner")]);
+
+    // Qualifiers and further attributes do not confuse the item keyword.
+    let src = r"
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) const fn t(owner: &str) -> String { let _ = { 1 }; owner.to_lowercase() }
+#[cfg(test)]
+pub static Y: fn(&str) -> String = if cfg!(a) { |s| s.to_string() } else { |owner| owner.to_lowercase() };
+#[cfg(test)]
+use self::{a, b};
+fn live(owner: &str) { owner.to_lowercase(); }
+";
+    assert_eq!(hit_lines(src), vec![line_of(src, "fn live(owner")]);
+
+    // Body items still end at a `;` seen first, and the mod fixture holds.
+    let src = r"
+#[cfg(test)]
+struct Marker;
+#[cfg(test)]
+mod t { fn folds(owner: &str) -> String { let _ = { 1 }; owner.to_lowercase() } }
+fn live(owner: &str) { owner.to_lowercase(); }
+";
+    assert_eq!(hit_lines(src), vec![line_of(src, "fn live(owner")]);
+}
+
+#[test]
+fn operand_blocks_chain_with_the_surrounding_statement() {
+    let src = r"
+fn f(c: bool, a: &str, b: &str, owner_ref: Kind, x: &str) {
+    let repo = if c { a } else { b }.to_lowercase();
+    let n = match owner_ref {
+        Kind::A => x,
+        Kind::B => a,
+    }.to_lowercase();
+    let s = unsafe { raw(x) }.eq_ignore_ascii_case(slug);
+    let t = { Some(x) }?.to_lowercase();
+}
+";
+    assert_eq!(
+        hit_lines(src),
+        vec![
+            line_of(src, "let repo = if c"),
+            line_of(src, "let n = match owner_ref"),
+            line_of(src, "let s = unsafe"),
+        ]
+    );
+
+    // A fold inside the block body is still its own statement.
+    let src = r"
+fn f(c: bool, owner: &str, b: &str) -> String {
+    let h = if c { owner.to_lowercase() } else { b.to_string() }.trim().to_string();
+    h
+}
+";
+    assert_eq!(hit_lines(src), vec![line_of(src, "let h = if c")]);
+
+    // No slug identifier anywhere: the chained statement is not flagged.
+    let src = r"
+fn f(c: bool, x: &str, y: &str) -> String {
+    let h = if c { x } else { y }.to_lowercase();
+    h
+}
+";
+    assert_eq!(hit_lines(src), Vec::<usize>::new());
 }
 
 #[test]
