@@ -687,8 +687,10 @@ fn finish_sandbox_from_bundle(
     workspace_has_wip: bool,
 ) -> Result<()> {
     // Still at the checkout's tip here: the gitlinks it records (nested
-    // ones included) are the submodule worktrees a CoW copy may carry.
+    // ones included) are the submodule worktrees a CoW copy may carry. An
+    // incomplete inventory prunes nothing.
     let copied_gitlinks: Vec<String> = tracked_paths_recursive(sandbox_path)
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|(path, is_gitlink)| is_gitlink.then_some(path))
         .collect();
@@ -784,12 +786,32 @@ fn finish_sandbox_from_bundle(
     Ok(())
 }
 
+/// `root/rel` when every component of `rel` is a real directory on disk —
+/// `None` when `rel` is not a plain relative path, a component is missing
+/// or not a directory, or any component is a symlink. The guard that keeps
+/// the filesystem operations below from following a symlink the tracked
+/// tree (or a dirty worktree) placed in the way out of `root`.
+fn dir_within_no_symlinks(root: &Path, rel: &str) -> Option<PathBuf> {
+    check_relative_components(rel).ok()?;
+    let mut dir = root.to_path_buf();
+    for component in rel.split('/') {
+        dir.push(component);
+        let meta = std::fs::symlink_metadata(&dir).ok()?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return None;
+        }
+    }
+    Some(dir)
+}
+
 /// Every path the repository at `repo` tracks at HEAD — blobs, trees and
 /// gitlinks — as `(repo-relative forward-slash path, is_gitlink)`, recursing
-/// into each gitlink whose worktree is initialized (`<path>/.git` exists) so
-/// nested submodules come back as `sub/inner`. Best-effort: a tree that
-/// cannot be listed contributes nothing.
-fn tracked_paths_recursive(repo: &Path) -> Vec<(String, bool)> {
+/// into each gitlink whose worktree is initialized (`<path>/.git` exists,
+/// reached without following a symlink) so nested submodules come back as
+/// `sub/inner`. `None` when any repository along the way cannot be listed:
+/// callers prune against this inventory, so an incomplete one must not
+/// pass for "tracks nothing there".
+fn tracked_paths_recursive(repo: &Path) -> Option<Vec<(String, bool)>> {
     let listing = match git_stdout(repo, |cmd| {
         cmd.args(["ls-tree", "-r", "-t", "-z", "HEAD"]);
     }) {
@@ -800,7 +822,7 @@ fn tracked_paths_recursive(repo: &Path) -> Vec<(String, bool)> {
                 error = %e,
                 "materialize: could not list the tracked paths at HEAD"
             );
-            return Vec::new();
+            return None;
         }
     };
     let mut paths = Vec::new();
@@ -811,13 +833,19 @@ fn tracked_paths_recursive(repo: &Path) -> Vec<(String, bool)> {
         };
         let is_gitlink = meta.starts_with("160000 ");
         paths.push((path.to_string(), is_gitlink));
-        if is_gitlink && repo.join(path).join(".git").exists() {
-            for (nested, nested_is_gitlink) in tracked_paths_recursive(&repo.join(path)) {
+        if !is_gitlink {
+            continue;
+        }
+        let Some(dir) = dir_within_no_symlinks(repo, path) else {
+            continue;
+        };
+        if dir.join(".git").symlink_metadata().is_ok() {
+            for (nested, nested_is_gitlink) in tracked_paths_recursive(&dir)? {
                 paths.push((format!("{path}/{nested}"), nested_is_gitlink));
             }
         }
     }
-    paths
+    Some(paths)
 }
 
 /// Remove the copied submodule worktrees the sandbox has no place for: each
@@ -829,22 +857,32 @@ fn tracked_paths_recursive(repo: &Path) -> Vec<(String, bool)> {
 /// it would linger as untracked content and its parent would read as
 /// modified although the source sandbox was clean. Strictly scoped: a path
 /// the tip does track (gitlink, tree or blob) is never touched, nor is a
-/// directory without a `.git` entry; the module repository under
-/// `.git/modules/…` stays. Best-effort like the step before it.
+/// directory without a `.git` entry, nor anything reached through a
+/// symlink (a tip that tracks `sub` as a symlink must not turn `sub/inner`
+/// into a removal outside the sandbox); the module repository under
+/// `.git/modules/…` stays. Fails closed: when the sandbox tree cannot be
+/// listed in full nothing is removed. Best-effort like the step before it.
 fn prune_untracked_submodule_worktrees(sandbox_path: &Path, copied_gitlinks: &[String]) {
     if copied_gitlinks.is_empty() {
         return;
     }
-    let tracked: std::collections::HashSet<String> = tracked_paths_recursive(sandbox_path)
-        .into_iter()
-        .map(|(path, _)| path)
-        .collect();
+    let Some(tracked) = tracked_paths_recursive(sandbox_path) else {
+        tracing::warn!(
+            sandbox = %sandbox_path.display(),
+            "materialize: sandbox tree not fully listed; leaving copied submodule worktrees in place"
+        );
+        return;
+    };
+    let tracked: std::collections::HashSet<String> =
+        tracked.into_iter().map(|(path, _)| path).collect();
     for rel in copied_gitlinks {
-        if tracked.contains(rel) || check_relative_components(rel).is_err() {
+        if tracked.contains(rel) {
             continue;
         }
-        let dir = sandbox_path.join(rel);
-        if !dir.join(".git").exists() {
+        let Some(dir) = dir_within_no_symlinks(sandbox_path, rel) else {
+            continue;
+        };
+        if dir.join(".git").symlink_metadata().is_err() {
             continue;
         }
         match std::fs::remove_dir_all(&dir) {
@@ -2206,6 +2244,103 @@ mod tests {
             case.recorded,
             "outer submodule sits at the gitlink the sandbox branch records"
         );
+    }
+
+    /// The pruning step never follows a symlink: the copied tip had gitlinks
+    /// `sub` and `sub/inner`, the sandbox tip tracks `sub` as a symlink to a
+    /// directory outside the sandbox that holds an `inner/.git`. `sub` is
+    /// tracked (kept) and `sub/inner` is not, yet the outside directory must
+    /// survive — `remove_dir_all` through the symlink would delete it.
+    #[cfg(unix)]
+    #[test]
+    fn prune_untracked_submodule_worktrees_never_follows_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside_inner = tmp.path().join("outside").join("inner");
+        fs::create_dir_all(&outside_inner).unwrap();
+        fs::write(outside_inner.join(".git"), "gitdir: nowhere\n").unwrap();
+        fs::write(outside_inner.join("deep.txt"), "keep\n").unwrap();
+        let sandbox = tmp.path().join("sandbox");
+        finit_repo(&sandbox);
+        std::os::unix::fs::symlink("../outside", sandbox.join("sub")).unwrap();
+        fgit(&sandbox, &["add", "sub"]);
+        fgit(&sandbox, &["commit", "-q", "-m", "sub is a symlink"]);
+        assert!(fgit(&sandbox, &["ls-tree", "HEAD", "--", "sub"]).starts_with("120000 "));
+
+        let tracked = tracked_paths_recursive(&sandbox).unwrap();
+        assert!(tracked.iter().any(|(p, _)| p == "sub"));
+        assert!(
+            !tracked.iter().any(|(p, _)| p == "sub/inner"),
+            "inventory does not descend through a symlink"
+        );
+
+        prune_untracked_submodule_worktrees(
+            &sandbox,
+            &["sub".to_string(), "sub/inner".to_string()],
+        );
+        assert!(
+            outside_inner.join(".git").is_file() && outside_inner.join("deep.txt").is_file(),
+            "nothing outside the sandbox is removed"
+        );
+        assert!(sandbox
+            .join("sub")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// Fail closed: when the sandbox tree cannot be listed the inventory is
+    /// `None` and pruning removes nothing, even though every candidate
+    /// would otherwise qualify (untracked, carries a `.git` entry).
+    #[test]
+    fn prune_untracked_submodule_worktrees_keeps_everything_when_listing_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = tmp.path().join("not-a-repo");
+        fs::create_dir_all(sandbox.join("sub")).unwrap();
+        fs::write(sandbox.join("sub").join(".git"), "gitdir: nowhere\n").unwrap();
+        assert!(tracked_paths_recursive(&sandbox).is_none());
+
+        prune_untracked_submodule_worktrees(&sandbox, &["sub".to_string()]);
+        assert!(
+            sandbox.join("sub").join(".git").is_file(),
+            "candidate survives"
+        );
+    }
+
+    /// Fail closed one level down: the sandbox tip tracks `sub` as an
+    /// initialized gitlink whose repository cannot be listed (broken
+    /// `.git` file), so `sub/inner` cannot be proven untracked. The whole
+    /// inventory is `None` and nothing is removed — neither `sub/inner` nor
+    /// `sub`.
+    #[test]
+    fn prune_untracked_submodule_worktrees_keeps_everything_when_nested_listing_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub_src = tmp.path().join("sub-src");
+        finit_repo(&sub_src);
+        let sandbox = tmp.path().join("sandbox");
+        finit_repo(&sandbox);
+        fgit(
+            &sandbox,
+            &["submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"],
+        );
+        fgit(&sandbox, &["commit", "-q", "-m", "add sub"]);
+        assert!(tracked_paths_recursive(&sandbox).is_some());
+
+        let sub = sandbox.join("sub");
+        fs::write(sub.join(".git"), "gitdir: /nonexistent/gitdir\n").unwrap();
+        fs::create_dir_all(sub.join("inner")).unwrap();
+        fs::write(sub.join("inner").join(".git"), "gitdir: nowhere\n").unwrap();
+        assert!(tracked_paths_recursive(&sandbox).is_none());
+
+        prune_untracked_submodule_worktrees(
+            &sandbox,
+            &["sub".to_string(), "sub/inner".to_string()],
+        );
+        assert!(
+            sub.join("inner").join(".git").is_file(),
+            "nested candidate survives"
+        );
+        assert!(sub.join(".git").is_file());
     }
 
     /// (c) A corrupt submodule bundle fails the materialization with an
