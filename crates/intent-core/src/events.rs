@@ -24,6 +24,13 @@ pub(crate) const FILE_RENAMED: &str = "file:renamed";
 // Agent lifecycle events.
 pub const AGENT_STARTED: &str = "agent:started";
 pub const AGENT_COMPLETED: &str = "agent:completed";
+// Terminal turn failure. Payload: `{ agentId, error, turnId? }`, plus — when
+// the failure classifies as a provider usage/quota rejection
+// (`intent_acp::is_quota_exceeded`) — the additive pair `errorCode:
+// "quota-exceeded"` and `providerId` (the provider whose allowance ran out,
+// omitted when it cannot be resolved). Both are ABSENT on every other
+// failure, never `false`/`null`: they exist so clients can offer "retry on
+// another provider" without pattern-matching the rendered `error` prose.
 pub const AGENT_FAILED: &str = "agent:failed";
 pub const AGENT_TOOL_CALL: &str = "agent:tool:call";
 pub const AGENT_MESSAGE: &str = "agent:message";

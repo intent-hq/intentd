@@ -6478,7 +6478,15 @@ async fn terminal_failure_events_carry_turn_id() {
     seed_agent(&mgr, &ws, &id).await;
 
     let mut sub = bus.subscribe(SubscriptionFilter::default());
-    super::publish_terminal_failure_events(&mgr, &id, &ws, "boom", Some("turn-tfe-1")).await;
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        "boom",
+        Some("turn-tfe-1"),
+        super::FailedProviderSource::CommittedTurn,
+    )
+    .await;
 
     let mut events = Vec::new();
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
@@ -6498,7 +6506,15 @@ async fn terminal_failure_events_carry_turn_id() {
 
     // Omit-when-absent: a None turn id leaves both payloads without the key.
     let mut sub = bus.subscribe(SubscriptionFilter::default());
-    super::publish_terminal_failure_events(&mgr, &id, &ws, "boom2", None).await;
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        "boom2",
+        None,
+        super::FailedProviderSource::CommittedTurn,
+    )
+    .await;
     let mut events = Vec::new();
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
@@ -6514,6 +6530,141 @@ async fn terminal_failure_events_carry_turn_id() {
             ev.data
         );
     }
+}
+
+/// Collect the `agent:failed` payload the terminal publisher emits for one
+/// quota-classified failure under the given provider source.
+async fn quota_failed_payload(
+    mgr: &AgentManager,
+    bus: &EventBus,
+    ws: &WorkspaceId,
+    id: &AgentId,
+    source: super::FailedProviderSource,
+) -> Value {
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    super::publish_terminal_failure_events(
+        mgr,
+        id,
+        ws,
+        "session/new failed: rate_limit_error: usage limit reached",
+        None,
+        source,
+    )
+    .await;
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    events
+        .iter()
+        .find(|e| e.event_type == "agent:failed")
+        .expect("agent:failed event")
+        .data
+        .clone()
+}
+
+/// A quota failure's `providerId` comes from the source matching the step
+/// that failed. The seeded state is the one an `agent.setModel` switch
+/// leaves behind until the new child is up: `last_turn_provider` still names
+/// the PREVIOUS provider. A failed TURN (`CommittedTurn`) is correctly
+/// attributed to it; a failed spawn / session setup (`SpawnAttempt`) must name
+/// the provider the attempt resolved instead, consume that record so it can
+/// never label a later unrelated failure, and — when no attempt was recorded
+/// — omit the field rather than fall back to the stale turn identity.
+#[tokio::test]
+async fn quota_failure_provider_follows_failed_step() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-qfp"), AgentId::from("a-qfp"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_agent_session_last_turn_model(&ws, &id, None, "auggie")
+        .await
+        .expect("seed previous provider as last_turn_provider");
+
+    let turn = quota_failed_payload(
+        &mgr,
+        &bus,
+        &ws,
+        &id,
+        super::FailedProviderSource::CommittedTurn,
+    )
+    .await;
+    assert_eq!(turn["errorCode"], json!("quota-exceeded"));
+    assert_eq!(turn["providerId"], json!("auggie"), "{turn}");
+
+    mgr.spawn_attempt_provider
+        .lock()
+        .unwrap()
+        .insert(id.clone(), "mock".to_string());
+    let spawn = quota_failed_payload(
+        &mgr,
+        &bus,
+        &ws,
+        &id,
+        super::FailedProviderSource::SpawnAttempt,
+    )
+    .await;
+    assert_eq!(spawn["errorCode"], json!("quota-exceeded"));
+    assert_eq!(spawn["providerId"], json!("mock"), "{spawn}");
+    assert!(
+        !mgr.spawn_attempt_provider.lock().unwrap().contains_key(&id),
+        "the attempt record is consumed by the publisher"
+    );
+
+    let unrecorded = quota_failed_payload(
+        &mgr,
+        &bus,
+        &ws,
+        &id,
+        super::FailedProviderSource::SpawnAttempt,
+    )
+    .await;
+    assert_eq!(unrecorded["errorCode"], json!("quota-exceeded"));
+    assert!(
+        unrecorded.get("providerId").is_none(),
+        "no attempt record: omit rather than stamp the stale turn provider: {unrecorded}"
+    );
+}
+
+/// No spawn-attempt record outlives its attempt: a spawn failure that is NOT
+/// a quota rejection still consumes it (the publisher runs once per failed
+/// attempt, quota or not), and a teardown that cancels an in-flight attempt
+/// (`stop` / `workspace.delete` → `detach`) drops it — so an agent that is
+/// never retried does not retain a per-agent entry.
+#[tokio::test]
+async fn spawn_attempt_provider_never_outlives_its_attempt() {
+    let (_tmp, mgr, _bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-sap"), AgentId::from("a-sap"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    mgr.spawn_attempt_provider
+        .lock()
+        .unwrap()
+        .insert(id.clone(), "mock".to_string());
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        "session/new failed: internal error",
+        None,
+        super::FailedProviderSource::SpawnAttempt,
+    )
+    .await;
+    assert!(
+        !mgr.spawn_attempt_provider.lock().unwrap().contains_key(&id),
+        "a non-quota spawn failure consumes the attempt record"
+    );
+
+    mgr.spawn_attempt_provider
+        .lock()
+        .unwrap()
+        .insert(id.clone(), "mock".to_string());
+    mgr.stop(&id).await;
+    assert!(
+        !mgr.spawn_attempt_provider.lock().unwrap().contains_key(&id),
+        "teardown drops the record of a cancelled attempt"
+    );
 }
 
 /// Durable-before-observable (monorepo#2009): the terminal-failure handlers

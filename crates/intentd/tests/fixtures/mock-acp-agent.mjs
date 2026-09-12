@@ -933,6 +933,15 @@ async function dispatch(msg) {
           return;
         }
       }
+      // Deterministic session-setup rejection: fail EVERY session/new with
+      // the configured JSON-RPC error object (e.g. a bridge-wrapped 429 whose
+      // upstream body lives in `data`), modelling a provider whose allowance
+      // is already spent when the daemon opens the session — before any
+      // prompt — so spawn-path failure attribution can be pinned.
+      if (behavior.sessionNewRpcError) {
+        log(`failing session/new with JSON-RPC error ${behavior.sessionNewRpcError.code}`);
+        return send({ jsonrpc: '2.0', id: msg.id, error: behavior.sessionNewRpcError });
+      }
       // Stash the session-setup-delivered MCP servers (STAB-156) so
       // `callWorkspaceTool` can reach the bridge without an `--mcp-config`.
       // Always overwritten (defaulting to []) so a later session/new that

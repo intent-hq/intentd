@@ -3300,6 +3300,10 @@ async fn wss_agent_set_model_provider_id_param() {
         Some(dir.path().to_path_buf()),
     )
     .await;
+    // Hermeticity (monorepo#3162): the cross-provider switch onto grok below
+    // runs the availability gate, so point discovery at a deterministic
+    // executable instead of depending on a real grok on the test host.
+    srv.set_setting("providers.paths", serde_json::json!({ "grok": "/bin/sh" }));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3397,6 +3401,30 @@ async fn wss_agent_set_model_provider_id_param() {
             .contains("agent.setModel: providerId must be a string"),
         "error must name the malformed param: {rejected}"
     );
+
+    // A cross-provider switch onto an UNAVAILABLE target is -32602 at the
+    // front door (the same availability bar as create/delegate), naming the
+    // target. Disabled in settings rather than "uninstalled" so the
+    // precondition does not depend on what the test host has on PATH.
+    srv.set_setting("providers.enabled", serde_json::json!({ "grok": false }));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":10,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast","providerId":"grok"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&rejected, 10);
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "switch onto a disabled provider must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent.setModel: provider \"grok\" (Grok Build) is not enabled"),
+        "availability rejection must name the target provider: {rejected}"
+    );
+    srv.set_setting("providers.enabled", serde_json::json!({}));
 
     // All rejections left the session untouched.
     let get_frame = format!(
