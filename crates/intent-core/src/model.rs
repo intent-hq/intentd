@@ -4086,15 +4086,20 @@ pub enum ScriptMode {
 }
 
 /// Runtime status of a script process (ported from the TS `ScriptStatus`,
-/// plus `restarting` — new in intentd, monorepo#1318). `restarting` covers the
-/// restart-in-flight window (the auto-restart backoff and the `script.restart`
-/// stop→start gap) so clients can distinguish it from a final exit; the
-/// respawn flips it back to `running`.
+/// plus `restarting` — new in intentd, monorepo#1318 — and `starting` —
+/// intent-hq/intent#4858). `restarting` covers the restart-in-flight window
+/// (the auto-restart backoff and the `script.restart` stop→start gap) so
+/// clients can distinguish it from a final exit; the respawn flips it back to
+/// `running`. `starting` covers the `script.start` launch window: it is set
+/// synchronously before `script.start` replies and holds until the spawn's
+/// `running` (or `exited` on a spawn failure), so a status read after `start`
+/// returns never observes the pre-launch `idle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptStatus {
     #[default]
     Idle,
+    Starting,
     Running,
     Restarting,
     Exited,
