@@ -60,7 +60,7 @@ pub use agent_repo::{
     ChildAgentCounts, MessageFtsMatch, PrunedToolField, PrunedToolPayload, ReplaceMessage,
     SessionMessageProjection, UserMessageIndexItem, PROJECTION_TEXT_BLOCK_CAP,
 };
-pub use attachment_repo::AttachmentRecord;
+pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;
 pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::NewDiff;

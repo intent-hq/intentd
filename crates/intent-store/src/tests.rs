@@ -4310,6 +4310,235 @@ async fn attachment_registry_round_trip() {
     );
 }
 
+/// Idempotency-key bindings (PROTOCOL §5.9 "Idempotent placement",
+/// intent-hq/intent#4691): the keyed insert lands the `attachments` row and
+/// the binding together; lookup is scoped per workspace (the same key in
+/// another workspace is unknown); a second insert under a bound key is
+/// rejected with nothing persisted; the binding survives a store reopen
+/// (daemon restart); bindings at/before the retention cutoff read as
+/// unknown and are removed by the sweep while the attachment row stays.
+#[tokio::test]
+async fn attachment_idempotency_key_binding_round_trip_isolation_expiry() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let other_ws = WorkspaceId::new();
+
+    let record = crate::AttachmentRecord {
+        id: "0193e001-0000-7000-8000-000000000011".to_string(),
+        workspace_id: ws.clone(),
+        file_name: "report.pdf".to_string(),
+        mime_type: Some("application/pdf".to_string()),
+        size: 12345,
+        uploaded_at: "2026-08-12T00:00:00Z".to_string(),
+        stored_path: ".intent/attachments/report.pdf".to_string(),
+    };
+    // A cutoff before `uploaded_at` keeps the binding live.
+    let cutoff = "2026-08-11T00:00:00Z";
+    store
+        .insert_attachment_with_idempotency_key(&record, "key-1", "fp-1", cutoff)
+        .await
+        .expect("keyed insert");
+    let (binding, loaded) = store
+        .get_attachment_by_idempotency_key(&ws, "key-1", cutoff)
+        .await
+        .expect("lookup")
+        .expect("bound");
+    assert_eq!(loaded, record);
+    assert_eq!(
+        binding,
+        crate::AttachmentIdempotencyBinding {
+            workspace_id: ws.clone(),
+            key: "key-1".to_string(),
+            attachment_id: record.id.clone(),
+            fingerprint: "fp-1".to_string(),
+            created_at: record.uploaded_at.clone(),
+        }
+    );
+    // The attachment row itself is a normal registry row.
+    assert_eq!(store.get_attachment(&record.id).await.expect("get"), record);
+
+    // Cross-workspace isolation: the same key is unknown elsewhere.
+    assert!(store
+        .get_attachment_by_idempotency_key(&other_ws, "key-1", cutoff)
+        .await
+        .expect("lookup other ws")
+        .is_none());
+    // Unknown key → None.
+    assert!(store
+        .get_attachment_by_idempotency_key(&ws, "key-nope", cutoff)
+        .await
+        .expect("lookup unknown")
+        .is_none());
+
+    // A second keyed insert under the same (workspace, key) is rejected and
+    // persists nothing — neither the binding nor the attachment row.
+    let dup = crate::AttachmentRecord {
+        id: "0193e001-0000-7000-8000-000000000012".to_string(),
+        ..record.clone()
+    };
+    let res = store
+        .insert_attachment_with_idempotency_key(&dup, "key-1", "fp-other", cutoff)
+        .await;
+    assert!(
+        matches!(res, Err(intent_core::Error::InvalidParams(_))),
+        "{res:?}"
+    );
+    assert!(matches!(
+        store.get_attachment(&dup.id).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    // The same key in ANOTHER workspace binds independently.
+    let elsewhere = crate::AttachmentRecord {
+        id: "0193e001-0000-7000-8000-000000000013".to_string(),
+        workspace_id: other_ws.clone(),
+        ..record.clone()
+    };
+    store
+        .insert_attachment_with_idempotency_key(&elsewhere, "key-1", "fp-1", cutoff)
+        .await
+        .expect("keyed insert other ws");
+
+    // Restart durability: reopen the store and the binding is still there.
+    drop(store);
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let (_, reloaded) = store
+        .get_attachment_by_idempotency_key(&ws, "key-1", cutoff)
+        .await
+        .expect("lookup after reopen")
+        .expect("bound after reopen");
+    assert_eq!(reloaded.id, record.id);
+
+    // Expiry: at/after the cutoff the binding reads as unknown even before
+    // the sweep; the sweep removes it (and only it — the row in the other
+    // workspace was created at the same instant, so it goes too, but a
+    // newer binding stays) while the attachment rows survive.
+    let at_cutoff = record.uploaded_at.as_str();
+    assert!(store
+        .get_attachment_by_idempotency_key(&ws, "key-1", at_cutoff)
+        .await
+        .expect("lookup at cutoff")
+        .is_none());
+    let newer = crate::AttachmentRecord {
+        id: "0193e001-0000-7000-8000-000000000014".to_string(),
+        uploaded_at: "2026-08-13T00:00:00Z".to_string(),
+        ..record.clone()
+    };
+    store
+        .insert_attachment_with_idempotency_key(&newer, "key-2", "fp-2", cutoff)
+        .await
+        .expect("keyed insert newer");
+    let removed = store
+        .sweep_expired_attachment_idempotency_keys(at_cutoff)
+        .await
+        .expect("sweep");
+    assert_eq!(removed, 2);
+    assert!(store
+        .get_attachment_by_idempotency_key(&ws, "key-1", cutoff)
+        .await
+        .expect("lookup swept")
+        .is_none());
+    assert!(store
+        .get_attachment_by_idempotency_key(&ws, "key-2", cutoff)
+        .await
+        .expect("lookup newer")
+        .is_some());
+    assert_eq!(
+        store
+            .get_attachment(&record.id)
+            .await
+            .expect("row survives"),
+        record
+    );
+    assert_eq!(
+        store
+            .sweep_expired_attachment_idempotency_keys(at_cutoff)
+            .await
+            .expect("sweep again"),
+        0
+    );
+}
+
+/// Regression (intentd#1841 review): a binding that crosses the retention
+/// boundary between the sweep and the keyed insert — or that a failed sweep
+/// left behind — is replaced by the keyed insert at the SAME cutoff instead
+/// of tripping the primary key: the new row + binding land, the key resolves
+/// to the new row, and the original attachment row is untouched. At a
+/// cutoff that still judges the binding live, the insert stays rejected.
+#[tokio::test]
+async fn attachment_idempotency_key_insert_replaces_expired_binding_at_cutoff() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+
+    let original = crate::AttachmentRecord {
+        id: "0193e001-0000-7000-8000-000000000021".to_string(),
+        workspace_id: ws.clone(),
+        file_name: "report.pdf".to_string(),
+        mime_type: Some("application/pdf".to_string()),
+        size: 500,
+        uploaded_at: "2026-08-12T00:00:00.500Z".to_string(),
+        stored_path: ".intent/attachments/report.pdf".to_string(),
+    };
+    let live_cutoff = "2026-08-12T00:00:00.400Z";
+    store
+        .insert_attachment_with_idempotency_key(&original, "key-x", "fp-x", live_cutoff)
+        .await
+        .expect("keyed insert");
+    // Sweep at the earlier cutoff: nothing removed (the binding is live).
+    assert_eq!(
+        store
+            .sweep_expired_attachment_idempotency_keys(live_cutoff)
+            .await
+            .expect("sweep"),
+        0
+    );
+
+    let replacement = crate::AttachmentRecord {
+        id: "0193e001-0000-7000-8000-000000000022".to_string(),
+        uploaded_at: "2026-08-19T00:00:01Z".to_string(),
+        stored_path: ".intent/attachments/report-2.pdf".to_string(),
+        ..original.clone()
+    };
+    // Still live at this cutoff → rejected, nothing persisted.
+    let res = store
+        .insert_attachment_with_idempotency_key(&replacement, "key-x", "fp-x", live_cutoff)
+        .await;
+    assert!(
+        matches!(res, Err(intent_core::Error::InvalidParams(_))),
+        "{res:?}"
+    );
+    assert!(matches!(
+        store.get_attachment(&replacement.id).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+
+    // The boundary crossed (lookup at this cutoff reads unknown): the keyed
+    // insert replaces the expired binding in its own transaction.
+    let expired_cutoff = "2026-08-12T00:00:00.600Z";
+    assert!(store
+        .get_attachment_by_idempotency_key(&ws, "key-x", expired_cutoff)
+        .await
+        .expect("lookup")
+        .is_none());
+    store
+        .insert_attachment_with_idempotency_key(&replacement, "key-x", "fp-x", expired_cutoff)
+        .await
+        .expect("keyed insert replaces expired binding");
+    let (binding, row) = store
+        .get_attachment_by_idempotency_key(&ws, "key-x", expired_cutoff)
+        .await
+        .expect("lookup rebound")
+        .expect("rebound");
+    assert_eq!(row, replacement);
+    assert_eq!(binding.attachment_id, replacement.id);
+    assert_eq!(binding.created_at, replacement.uploaded_at);
+    assert_eq!(
+        store.get_attachment(&original.id).await.expect("original"),
+        original
+    );
+}
+
 /// The P3-1.2b persistence-gap fields round-trip through insert → get →
 /// update → get: `completion_report(_timestamp)`, `delegation_depth`,
 /// `initial_message`, the JSON `context_references` / `image_blocks`, and

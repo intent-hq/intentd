@@ -1087,6 +1087,12 @@ pub struct Services {
     /// lazily by the next `begin`), and the client simply restarts the
     /// upload.
     attachment_uploads: Arc<Mutex<HashMap<String, attachment_upload::AttachmentUploadSession>>>,
+    /// Per-`(workspace, idempotencyKey)` in-flight guard for keyed attachment
+    /// placements (intent-hq/intent#4691): a same-key caller racing the
+    /// first placement waits on the key's lock and then replays the binding
+    /// instead of racing it to the store (whose primary key is the last line
+    /// of defence). Entries are dropped once no caller holds them.
+    attachment_idempotency_inflight: Arc<Mutex<attachment_upload::IdempotencyInflight>>,
     /// In-flight source-side exports (`workspace.export.*`, keyed by
     /// `exportId`): build state + sealed archive + WIP bookkeeping between
     /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
@@ -1264,6 +1270,7 @@ impl Services {
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
             attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
+            attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
@@ -9403,6 +9410,34 @@ fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// `file.getAttachmentInfo` result for one registry row (PROTOCOL §5.9):
+/// `{ attachmentId, fileName, mimeType?, size, uploadedAt, path, exists }`.
+/// `exists` reflects the file on disk NOW (the user may have deleted it
+/// out-of-band); resolved against the canonical workspace root, never a
+/// sandbox, with the same within-root containment guard as the copy path —
+/// a tampered `stored_path` must not probe file existence outside the store.
+async fn attachment_info_result(
+    store: &Store,
+    record: &intent_store::AttachmentRecord,
+) -> serde_json::Value {
+    let root = file_ops::resolve_root(store, &record.workspace_id, None).await;
+    let exists = !root.is_empty()
+        && file_ops::resolve_attachment_source(&root, &record.stored_path)
+            .is_ok_and(|p| p.is_file());
+    let mut result = serde_json::json!({
+        "attachmentId": record.id,
+        "fileName": record.file_name,
+        "size": record.size,
+        "uploadedAt": record.uploaded_at,
+        "path": record.stored_path,
+        "exists": exists,
+    });
+    if let Some(mime) = &record.mime_type {
+        result["mimeType"] = serde_json::json!(mime);
+    }
+    result
+}
+
 /// Whitespace-only strings collapse to `None` (TS truthy-string parity for
 /// caller-supplied identifiers/names in `workspace.create` /
 /// `initialAgent`).
@@ -15932,9 +15967,10 @@ impl WorkspaceApi for Services {
         data: Option<String>,
         source_path: Option<String>,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
         Box::pin(async move {
+            let idempotency_key = attachment_upload::validate_idempotency_key(idempotency_key)?;
             let decoded;
             let source = match (&data, &source_path) {
                 (Some(b64), None) => {
@@ -15966,61 +16002,42 @@ impl WorkspaceApi for Services {
                     ))
                 }
             };
-            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
-            if root.is_empty() {
-                return Err(Error::Internal(
-                    "workspace has no resolved filesystem root".to_string(),
-                ));
-            }
-            // The exclusion contract (monorepo#1948) rides on the default
-            // `.intent/.gitignore` (ignore everything except config.json), so
-            // make sure the directory + gitignore exist before placing.
-            // `place_attachment` additionally drops an ignore-all `.gitignore`
-            // inside `attachments/` to cover repos with a customized
-            // `.intent/.gitignore`.
-            repo_config::ensure_intent_dir(std::path::Path::new(&root)).await?;
-            let mut result =
-                file_ops::place_attachment(&root, &file_name, &source).map_err(|e| {
-                    // Surface placement failures in the daemon log so field
-                    // reports are diagnosable without a client-side trace
-                    // (monorepo#2144).
-                    tracing::warn!(
-                        workspace = %workspace_id.as_str(),
-                        file_name = %file_name,
-                        error = %e,
-                        "file.placeAttachment failed"
-                    );
-                    e
-                })?;
-            // Attachment registry (PROTOCOL §5.9): record the placed file
-            // under a daemon-minted UUID so agents can retrieve it later via
-            // `ws.file.getAttachment`, and return the registry fields
-            // additively (presence-detected; old clients unaffected).
-            let record = intent_store::AttachmentRecord {
-                id: new_uuid(),
+            // Payload identity for the idempotency lookup: the base64 arm
+            // hashes the decoded bytes; the sourcePath arm fingerprints on
+            // `(fileName, size)` only (a possibly huge local file is not
+            // re-read for a hash; b31e decision D). An unreadable source
+            // leaves the lookup fingerprint unset and lets placement
+            // classify it. The BOUND fingerprint takes its size from the
+            // placed bytes (see `KeyedPlacement`).
+            let idempotency = idempotency_key.map(|key| match &source {
+                file_ops::AttachmentSource::Bytes(bytes) => {
+                    let sha = attachment_upload::sha256_hex(bytes);
+                    attachment_upload::KeyedPlacement {
+                        key,
+                        lookup_fingerprint: Some(attachment_upload::attachment_fingerprint(
+                            &file_name,
+                            bytes.len() as u64,
+                            Some(&sha),
+                        )),
+                        sha256: Some(sha),
+                    }
+                }
+                file_ops::AttachmentSource::CopyFrom(src) => attachment_upload::KeyedPlacement {
+                    key,
+                    lookup_fingerprint: std::fs::metadata(src).ok().map(|md| {
+                        attachment_upload::attachment_fingerprint(&file_name, md.len(), None)
+                    }),
+                    sha256: None,
+                },
+            });
+            self.place_attachment_registered(
                 workspace_id,
-                file_name: result["fileName"]
-                    .as_str()
-                    .unwrap_or(&file_name)
-                    .to_string(),
-                mime_type: mime_type.filter(|m| !m.trim().is_empty()),
-                size: result["size"].as_i64().unwrap_or_default(),
-                uploaded_at: now_iso(),
-                stored_path: result["path"].as_str().unwrap_or_default().to_string(),
-            };
-            if let Err(e) = store.insert_attachment(&record).await {
-                // Don't leave a durable-but-unregistered file behind: a
-                // retry would place a collision-suffixed second copy that
-                // no attachmentId can ever retrieve.
-                let _ = std::fs::remove_file(std::path::Path::new(&root).join(&record.stored_path));
-                return Err(e);
-            }
-            result["attachmentId"] = serde_json::json!(record.id);
-            result["uploadedAt"] = serde_json::json!(record.uploaded_at);
-            if let Some(mime) = &record.mime_type {
-                result["mimeType"] = serde_json::json!(mime);
-            }
-            Ok(result)
+                &file_name,
+                &source,
+                mime_type,
+                idempotency,
+            )
+            .await
         })
     }
 
@@ -16031,6 +16048,7 @@ impl WorkspaceApi for Services {
         size_bytes: u64,
         sha256: String,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.file_attachment_upload_begin_op(
@@ -16039,6 +16057,7 @@ impl WorkspaceApi for Services {
                 size_bytes,
                 sha256,
                 mime_type,
+                idempotency_key,
             )
             .await
         })
@@ -16085,27 +16104,34 @@ impl WorkspaceApi for Services {
                     }
                     other => other,
                 })?;
-            // `exists` reflects the file on disk NOW (the user may have
-            // deleted it out-of-band); resolved against the canonical
-            // workspace root, never a sandbox, with the same within-root
-            // containment guard as the copy path — a tampered stored_path
-            // must not probe file existence outside the store.
-            let root = file_ops::resolve_root(&store, &record.workspace_id, None).await;
-            let exists = !root.is_empty()
-                && file_ops::resolve_attachment_source(&root, &record.stored_path)
-                    .is_ok_and(|p| p.is_file());
-            let mut result = serde_json::json!({
-                "attachmentId": record.id,
-                "fileName": record.file_name,
-                "size": record.size,
-                "uploadedAt": record.uploaded_at,
-                "path": record.stored_path,
-                "exists": exists,
-            });
-            if let Some(mime) = &record.mime_type {
-                result["mimeType"] = serde_json::json!(mime);
-            }
-            Ok(result)
+            Ok(attachment_info_result(&store, &record).await)
+        })
+    }
+
+    fn file_get_attachment_info_by_key(
+        &self,
+        workspace_id: WorkspaceId,
+        idempotency_key: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let key = attachment_upload::validate_idempotency_key(Some(idempotency_key))?
+                .unwrap_or_default();
+            let bound = store
+                .get_attachment_by_idempotency_key(
+                    &workspace_id,
+                    &key,
+                    &attachment_upload::idempotency_retention_cutoff(),
+                )
+                .await?;
+            let Some((_, record)) = bound else {
+                // Never committed, another workspace's key, or past
+                // retention — all read as unknown (fail closed).
+                return Err(Error::InvalidParams(format!(
+                    "unknown idempotency key: {key}"
+                )));
+            };
+            Ok(attachment_info_result(&store, &record).await)
         })
     }
 

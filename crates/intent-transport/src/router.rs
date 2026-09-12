@@ -3516,15 +3516,35 @@ async fn dispatch(
             let data = opt_str(params, "data");
             let source_path = opt_str(params, "sourcePath");
             let mime_type = opt_str(params, "mimeType");
-            api.file_place_attachment(ws, file_name, data, source_path, mime_type)
+            let idempotency_key = opt_str_strict(params, "idempotencyKey")?;
+            api.file_place_attachment(ws, file_name, data, source_path, mime_type, idempotency_key)
                 .await
                 .map_err(domain_to_rpc)
         }
         "file.getAttachmentInfo" => {
-            let attachment_id = require_str_param(params, "attachmentId")?;
-            api.file_get_attachment_info(attachment_id)
-                .await
-                .map_err(domain_to_rpc)
+            // Exactly one of `attachmentId` | (`workspaceId` + `idempotencyKey`)
+            // (intent-hq/intent#4691). Presence is decided on the raw params
+            // so a key arm never silently degrades to the id arm.
+            let has_id = params.get("attachmentId").is_some_and(|v| !v.is_null());
+            let has_key = params.get("idempotencyKey").is_some_and(|v| !v.is_null());
+            match (has_id, has_key) {
+                (true, false) => {
+                    let attachment_id = require_str_param(params, "attachmentId")?;
+                    api.file_get_attachment_info(attachment_id)
+                        .await
+                        .map_err(domain_to_rpc)
+                }
+                (false, true) => {
+                    let ws = require_ws_note(params)?;
+                    let idempotency_key = require_str_param(params, "idempotencyKey")?;
+                    api.file_get_attachment_info_by_key(ws, idempotency_key)
+                        .await
+                        .map_err(domain_to_rpc)
+                }
+                _ => Err(invalid_params(
+                    "exactly one of attachmentId or idempotencyKey (with workspaceId) is required",
+                )),
+            }
         }
         "file.attachmentUpload.begin" => {
             let ws = require_ws_note(params)?;
@@ -3532,9 +3552,17 @@ async fn dispatch(
             let size_bytes = require_u64(params, "sizeBytes")?;
             let sha256 = require_str_param(params, "sha256")?;
             let mime_type = opt_str(params, "mimeType");
-            api.file_attachment_upload_begin(ws, file_name, size_bytes, sha256, mime_type)
-                .await
-                .map_err(domain_to_rpc)
+            let idempotency_key = opt_str_strict(params, "idempotencyKey")?;
+            api.file_attachment_upload_begin(
+                ws,
+                file_name,
+                size_bytes,
+                sha256,
+                mime_type,
+                idempotency_key,
+            )
+            .await
+            .map_err(domain_to_rpc)
         }
         "file.attachmentUpload.chunk" => {
             let upload_id = require_str_param(params, "uploadId")?;
@@ -4273,6 +4301,18 @@ fn opt_bool_strict(params: &Map<String, Value>, name: &str) -> Result<Option<boo
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(_) => Err(invalid_params(format!("{name} must be a boolean"))),
+    }
+}
+
+/// Like [`opt_str`] but strict: absent/null → `None`, a string →
+/// `Some(..)`, anything else → `-32602`. Used where silently dropping a
+/// non-string would change semantics (e.g. an attachment `idempotencyKey`,
+/// whose absence means "not idempotent").
+fn opt_str_strict(params: &Map<String, Value>, name: &str) -> Result<Option<String>, RpcErr> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(invalid_params(format!("{name} must be a string"))),
     }
 }
 

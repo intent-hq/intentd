@@ -125,6 +125,13 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "per-daemon RPC replay-protection bookkeeping, not workspace state",
     ),
     (
+        "attachment_idempotency_keys",
+        "7-day lost-reply recovery bookkeeping for keyed attachment placements against \
+         THIS daemon (intent-hq/intent#4691); a client retrying against the target is \
+         talking to a different daemon, and the bound `attachments` rows transfer on \
+         their own",
+    ),
+    (
         "deleted_workspace_id",
         "source-local tombstones guarding workspace-id reuse, not live workspace state",
     ),

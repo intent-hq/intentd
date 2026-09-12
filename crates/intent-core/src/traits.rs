@@ -6190,7 +6190,13 @@ pub trait WorkspaceApi: Send + Sync {
     /// `uploadedAt` result fields (presence-detected; old clients unaffected)
     /// — so agents can retrieve it later via `ws.file.getAttachment`.
     /// `mime_type` is the optional client-supplied MIME type, recorded
-    /// verbatim.
+    /// verbatim. `idempotency_key` (optional, 1–128 chars, client-minted;
+    /// intent-hq/intent#4691) binds the placement per `(workspace, key)`:
+    /// a repeat with a live binding and the same payload identity replays
+    /// the ORIGINAL result plus `replayed: true` without placing anything,
+    /// a repeat with a different payload identity is
+    /// `Error::InvalidParams` ("already used with a different payload"),
+    /// and an absent key is byte-identical to the unkeyed behavior.
     fn file_place_attachment(
         &self,
         workspace_id: WorkspaceId,
@@ -6198,8 +6204,16 @@ pub trait WorkspaceApi: Send + Sync {
         data: Option<String>,
         source_path: Option<String>,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, file_name, data, source_path, mime_type);
+        let _ = (
+            workspace_id,
+            file_name,
+            data,
+            source_path,
+            mime_type,
+            idempotency_key,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_place_attachment not implemented".to_string(),
@@ -6212,6 +6226,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// §5.9). Validates the header — the workspace must exist, `file_name`
     /// non-empty, `size_bytes` positive and within the 1 GiB attachment cap,
     /// `sha256` 64 hex chars — and returns `{ uploadId, maxChunkBytes }`.
+    /// `idempotency_key` (optional; intent-hq/intent#4691) is carried to the
+    /// commit, which binds it like a keyed `file.placeAttachment`; a begin
+    /// whose key is already bound to a committed attachment is
+    /// `Error::InvalidParams` ("already committed; look it up"), so the
+    /// response stays shape-stable.
     fn file_attachment_upload_begin(
         &self,
         workspace_id: WorkspaceId,
@@ -6219,8 +6238,16 @@ pub trait WorkspaceApi: Send + Sync {
         size_bytes: u64,
         sha256: String,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, file_name, size_bytes, sha256, mime_type);
+        let _ = (
+            workspace_id,
+            file_name,
+            size_bytes,
+            sha256,
+            mime_type,
+            idempotency_key,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_attachment_upload_begin not implemented".to_string(),
@@ -6292,6 +6319,26 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_get_attachment_info not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.getAttachmentInfo { workspaceId, idempotencyKey }` arm
+    /// (PROTOCOL §5.9; intent-hq/intent#4691): resolve a live
+    /// `(workspace, idempotencyKey)` binding to the same result shape as the
+    /// `attachmentId` arm. A key with no live binding (never committed,
+    /// another workspace's, or past the 7-day retention) is
+    /// `Error::InvalidParams` ("unknown idempotency key") — the client's
+    /// "outcome unknown ⇒ safe to retry with the same key" signal.
+    fn file_get_attachment_info_by_key(
+        &self,
+        workspace_id: WorkspaceId,
+        idempotency_key: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, idempotency_key);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_get_attachment_info_by_key not implemented".to_string(),
             ))
         })
     }

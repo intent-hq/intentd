@@ -27186,6 +27186,7 @@ mod file_ops_service {
                 Some(format!("data:application/json;base64,{b64}")),
                 None,
                 Some("application/json".to_string()),
+                None,
             )
             .await
             .expect("place");
@@ -27227,6 +27228,7 @@ mod file_ops_service {
                 Some(base64::engine::general_purpose::STANDARD.encode(b"{}")),
                 None,
                 None,
+                None,
             )
             .await
             .expect("place config.json");
@@ -27250,6 +27252,7 @@ mod file_ops_service {
                 None,
                 Some(src.to_string_lossy().into_owned()),
                 None,
+                None,
             )
             .await
             .expect("place from sourcePath");
@@ -27267,7 +27270,14 @@ mod file_ops_service {
             (None, Some("relative/path.txt".to_string())),
         ] {
             let res = svc
-                .file_place_attachment(ws.clone(), "f.bin".to_string(), data, source_path, None)
+                .file_place_attachment(
+                    ws.clone(),
+                    "f.bin".to_string(),
+                    data,
+                    source_path,
+                    None,
+                    None,
+                )
                 .await;
             assert!(matches!(res, Err(Error::InvalidParams(_))), "{res:?}");
         }
@@ -27297,6 +27307,7 @@ mod file_ops_service {
                 Some(base64::engine::general_purpose::STANDARD.encode(b"hello")),
                 None,
                 Some("text/plain".to_string()),
+                None,
             )
             .await
             .expect("place");
@@ -27326,6 +27337,398 @@ mod file_ops_service {
         assert_eq!(info2["exists"], serde_json::json!(false));
     }
 
+    /// Idempotent `file.placeAttachment` (intent-hq/intent#4691): a same-key
+    /// retry with the same payload replays the ORIGINAL result plus
+    /// `replayed: true` and places nothing; a different payload under the
+    /// same key is `InvalidParams`; keys are per-workspace; the binding is
+    /// durable across a store reopen (daemon restart); `getAttachmentInfo`
+    /// resolves a key (unknown → `InvalidParams`); a binding older than the
+    /// 7-day retention is swept lazily and the retry places afresh; the
+    /// `sourcePath` arm fingerprints on `(fileName, size)` only; and an
+    /// absent key is byte-identical to today (no `replayed` marker).
+    #[tokio::test]
+    async fn file_place_attachment_idempotency_key_replay_conflict_restart_expiry() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let other_ws = WorkspaceId::new();
+        let dir_guard = test_tempdir("intentd-attidem-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
+        let other_guard = test_tempdir("intentd-attidem-other-");
+        let other_dir = std::fs::canonicalize(other_guard.path()).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let mut w2 = workspace(&other_ws);
+        w2.worktree_path = Some(other_dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w2).await.expect("other ws");
+        let svc = Services::new(store);
+
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let attachments = |root: &std::path::Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(root.join(".intent/attachments"))
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| n != ".gitignore")
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+
+        // Absent key: unchanged shape, no `replayed` marker.
+        let plain = svc
+            .file_place_attachment(
+                ws.clone(),
+                "plain.txt".to_string(),
+                Some(b64(b"plain")),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("plain place");
+        assert!(plain.get("replayed").is_none(), "{plain}");
+
+        // First keyed placement: same result shape as an unkeyed one.
+        let first = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                Some("text/plain".to_string()),
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("first keyed place");
+        assert!(first.get("replayed").is_none(), "{first}");
+        let first_id = first["attachmentId"].as_str().unwrap().to_string();
+        assert_eq!(
+            first["path"],
+            serde_json::json!(".intent/attachments/report.txt")
+        );
+        assert_eq!(attachments(&dir), vec!["plain.txt", "report.txt"]);
+
+        // Lost-reply replay: identical result + `replayed: true`, nothing new
+        // on disk, same registry row.
+        let replay = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                Some("text/plain".to_string()),
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("replay");
+        let mut expected = first.clone();
+        expected["replayed"] = serde_json::json!(true);
+        assert_eq!(replay, expected);
+        assert_eq!(attachments(&dir), vec!["plain.txt", "report.txt"]);
+
+        // Same key, different bytes → conflict (nothing placed).
+        let conflict = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v2")),
+                None,
+                None,
+                Some("key-A".to_string()),
+            )
+            .await;
+        match conflict {
+            Err(Error::InvalidParams(m)) => {
+                assert!(m.contains("different payload"), "{m}");
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        // Same key, same bytes, different fileName → also a conflict.
+        let renamed = svc
+            .file_place_attachment(
+                ws.clone(),
+                "renamed.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                None,
+                Some("key-A".to_string()),
+            )
+            .await;
+        assert!(
+            matches!(renamed, Err(Error::InvalidParams(_))),
+            "{renamed:?}"
+        );
+        assert_eq!(attachments(&dir), vec!["plain.txt", "report.txt"]);
+
+        // Cross-workspace isolation: the same key in another workspace is a
+        // fresh binding.
+        let other = svc
+            .file_place_attachment(
+                other_ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"other bytes")),
+                None,
+                None,
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("other ws place");
+        assert!(other.get("replayed").is_none(), "{other}");
+        assert_ne!(other["attachmentId"], first["attachmentId"]);
+
+        // Lookup by key: found (per workspace) / unknown.
+        let by_key = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-A".to_string())
+            .await
+            .expect("lookup by key");
+        assert_eq!(by_key["attachmentId"], serde_json::json!(first_id));
+        assert_eq!(by_key["fileName"], serde_json::json!("report.txt"));
+        assert_eq!(by_key["mimeType"], serde_json::json!("text/plain"));
+        assert_eq!(by_key["exists"], serde_json::json!(true));
+        let other_by_key = svc
+            .file_get_attachment_info_by_key(other_ws.clone(), "key-A".to_string())
+            .await
+            .expect("lookup other ws");
+        assert_eq!(other_by_key["attachmentId"], other["attachmentId"]);
+        let unknown = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-nope".to_string())
+            .await;
+        match unknown {
+            Err(Error::InvalidParams(m)) => {
+                assert!(m.contains("unknown idempotency key"), "{m}");
+            }
+            other => panic!("expected unknown key, got {other:?}"),
+        }
+
+        // Key validation: empty / padded / oversized keys are rejected.
+        for bad in ["", " key", "key ", &"k".repeat(129)] {
+            let res = svc
+                .file_place_attachment(
+                    ws.clone(),
+                    "v.txt".to_string(),
+                    Some(b64(b"v")),
+                    None,
+                    None,
+                    Some(bad.to_string()),
+                )
+                .await;
+            assert!(
+                matches!(res, Err(Error::InvalidParams(_))),
+                "{bad:?}: {res:?}"
+            );
+        }
+        let empty_lookup = svc
+            .file_get_attachment_info_by_key(ws.clone(), String::new())
+            .await;
+        assert!(matches!(empty_lookup, Err(Error::InvalidParams(_))));
+
+        // `sourcePath` arm: `(fileName, size)` fingerprint — same name and
+        // size replays even when the bytes differ; a different size conflicts.
+        let src = dir.join("src-a.bin");
+        std::fs::write(&src, b"AAAA").unwrap();
+        let sp_first = svc
+            .file_place_attachment(
+                ws.clone(),
+                "copied.bin".to_string(),
+                None,
+                Some(src.to_string_lossy().into_owned()),
+                None,
+                Some("key-SP".to_string()),
+            )
+            .await
+            .expect("sourcePath place");
+        std::fs::write(&src, b"BBBB").unwrap();
+        let sp_replay = svc
+            .file_place_attachment(
+                ws.clone(),
+                "copied.bin".to_string(),
+                None,
+                Some(src.to_string_lossy().into_owned()),
+                None,
+                Some("key-SP".to_string()),
+            )
+            .await
+            .expect("sourcePath replay");
+        assert_eq!(sp_replay["replayed"], serde_json::json!(true));
+        assert_eq!(sp_replay["attachmentId"], sp_first["attachmentId"]);
+        std::fs::write(&src, b"CCCCC").unwrap();
+        let sp_conflict = svc
+            .file_place_attachment(
+                ws.clone(),
+                "copied.bin".to_string(),
+                None,
+                Some(src.to_string_lossy().into_owned()),
+                None,
+                Some("key-SP".to_string()),
+            )
+            .await;
+        assert!(
+            matches!(sp_conflict, Err(Error::InvalidParams(_))),
+            "{sp_conflict:?}"
+        );
+        // A missing source under a key still classifies as the source error.
+        let sp_missing = svc
+            .file_place_attachment(
+                ws.clone(),
+                "gone.bin".to_string(),
+                None,
+                Some(dir.join("gone.bin").to_string_lossy().into_owned()),
+                None,
+                Some("key-GONE".to_string()),
+            )
+            .await;
+        match sp_missing {
+            Err(Error::InvalidParams(m)) => assert!(m.contains("does not exist"), "{m}"),
+            other => panic!("expected source error, got {other:?}"),
+        }
+
+        // Daemon restart: the binding lives in the store, so a reopened
+        // service stack replays it.
+        drop(svc);
+        let store = Store::open(&tmp.path).await.expect("reopen store");
+        let svc = Services::new(store);
+        let after_restart = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                Some("text/plain".to_string()),
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("replay after restart");
+        assert_eq!(after_restart, expected);
+        assert_eq!(
+            attachments(&dir),
+            vec!["copied.bin", "plain.txt", "report.txt"]
+        );
+
+        // Expiry: back-date the binding past the 7-day retention. The next
+        // keyed call sweeps it and places afresh (collision-suffixed, new
+        // id, no `replayed`); the key now resolves to the new row.
+        sqlx::query("UPDATE attachment_idempotency_keys SET created_at = ? WHERE key = ?")
+            .bind(intent_core::iso_minutes_ago(8 * 24 * 60))
+            .bind("key-A")
+            .execute(svc.store().write_pool())
+            .await
+            .expect("back-date binding");
+        let expired_lookup = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-A".to_string())
+            .await;
+        assert!(
+            matches!(expired_lookup, Err(Error::InvalidParams(_))),
+            "{expired_lookup:?}"
+        );
+        let fresh = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                Some("text/plain".to_string()),
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("place after expiry");
+        assert!(fresh.get("replayed").is_none(), "{fresh}");
+        assert_ne!(fresh["attachmentId"], serde_json::json!(first_id));
+        assert_eq!(fresh["fileName"], serde_json::json!("report-2.txt"));
+        let rebound = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-A".to_string())
+            .await
+            .expect("lookup rebound key");
+        assert_eq!(rebound["attachmentId"], fresh["attachmentId"]);
+        // The original row is untouched by the sweep.
+        let original = svc
+            .file_get_attachment_info(first_id)
+            .await
+            .expect("original row survives");
+        assert_eq!(original["fileName"], serde_json::json!("report.txt"));
+    }
+
+    /// Concurrent same-key placements (intent-hq/intent#4691) yield exactly
+    /// one registry row and one file: the per-`(workspace, key)` in-flight
+    /// guard serializes the callers, so one places and the rest replay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_place_attachment_idempotency_key_concurrent_callers_yield_one_row() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let dir_guard = test_tempdir("intentd-attidem-race-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let svc = std::sync::Arc::new(Services::new(store));
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"racing bytes");
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let svc = svc.clone();
+            let ws = ws.clone();
+            let b64 = b64.clone();
+            handles.push(tokio::spawn(async move {
+                svc.file_place_attachment(
+                    ws,
+                    "race.bin".to_string(),
+                    Some(b64),
+                    None,
+                    None,
+                    Some("key-race".to_string()),
+                )
+                .await
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.expect("join").expect("keyed place"));
+        }
+
+        let ids: std::collections::BTreeSet<String> = results
+            .iter()
+            .map(|r| r["attachmentId"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 1, "{results:?}");
+        let placed = results
+            .iter()
+            .filter(|r| r.get("replayed").is_none())
+            .count();
+        assert_eq!(placed, 1, "exactly one caller places: {results:?}");
+        assert!(
+            results
+                .iter()
+                .filter(|r| r["replayed"] == serde_json::json!(true))
+                .count()
+                == 7,
+            "{results:?}"
+        );
+        for r in &results {
+            assert_eq!(r["fileName"], serde_json::json!("race.bin"), "{r}");
+        }
+        let files: Vec<String> = std::fs::read_dir(dir.join(".intent/attachments"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != ".gitignore")
+            .collect();
+        assert_eq!(files, vec!["race.bin"]);
+        // The in-flight registry is drained once every caller has released.
+        assert!(svc
+            .attachment_idempotency_inflight
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
     /// `ws.file.getAttachment` backing op: copies the registered file into
     /// the caller's working directory (canonical here), skips identical
     /// re-copies, and keeps the two failure modes distinct — unknown id vs.
@@ -27353,6 +27756,7 @@ mod file_ops_service {
                 Some(base64::engine::general_purpose::STANDARD.encode(b"pdf bytes")),
                 None,
                 Some("application/pdf".to_string()),
+                None,
             )
             .await
             .expect("place");
@@ -27698,6 +28102,7 @@ mod file_ops_service {
                     ws_id.clone(),
                     "brief.md".to_string(),
                     Some(base64::engine::general_purpose::STANDARD.encode(b"# brief")),
+                    None,
                     None,
                     None,
                 )
