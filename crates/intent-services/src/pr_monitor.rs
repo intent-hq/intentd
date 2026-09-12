@@ -124,10 +124,16 @@ pub(crate) fn pr_monitor_fetches_per_tick(
 }
 
 /// The distinct `(owner, repo, pr)` identity a sweep dedupes fetches on.
+/// Forge slugs are case-insensitive, so the key folds case (matching the
+/// store's `COLLATE NOCASE` identity) and case-variant siblings share a fetch.
 type PrKey = (String, String, i64);
 
 fn pr_key(m: &PrMonitor) -> PrKey {
-    (m.repo_owner.clone(), m.repo_name.clone(), m.pr_number)
+    (
+        m.repo_owner.to_ascii_lowercase(),
+        m.repo_name.to_ascii_lowercase(),
+        m.pr_number,
+    )
 }
 
 /// One active monitor as the due-sweep sees it: its staleness anchor (parsed
@@ -3907,6 +3913,79 @@ mod tests {
                 .as_array()
                 .map(Vec::len),
             Some(1)
+        );
+    }
+
+    /// Forge repo slugs are case-insensitive: a `repo` override that differs
+    /// from the monitored slug only by case is the SAME PR — the owner's
+    /// re-register re-arms the existing row (no second monitor, stored
+    /// casing untouched), a sibling's register is refused naming the owner,
+    /// and the owner's `ws.pr.unmonitor` under the variant cancels the row.
+    #[tokio::test]
+    async fn repo_slug_case_variants_identify_the_same_monitor() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let first = register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+
+        let rearmed = svc
+            .pr_monitor_start_op(&ws, &owner, 42, Some("O/R".into()))
+            .await
+            .expect("owner re-register under a case variant");
+        assert_eq!(rearmed["ok"], json!(true), "{rearmed}");
+        assert_eq!(rearmed["monitor"]["monitorId"], json!(first.monitor_id));
+        assert_eq!(
+            rearmed["monitor"]["repo"],
+            json!("o/r"),
+            "the stored casing is what the row reports"
+        );
+        assert_eq!(
+            svc.pr_monitors_for_agent(&owner).await.unwrap().len(),
+            1,
+            "no second monitor"
+        );
+
+        let refused = svc
+            .pr_monitor_start_op(&ws, &sibling, 42, Some("O/r".into()))
+            .await
+            .expect("refusal is a payload");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(refused["ownerAgentId"], json!(owner.to_string()));
+        assert_eq!(refused["monitorId"], json!(first.monitor_id));
+
+        let stopped = svc
+            .pr_monitor_stop_op(&ws, &owner, 42, Some("o/R".into()))
+            .await
+            .expect("owner unmonitor under a case variant");
+        assert_eq!(stopped["monitor"]["monitorId"], json!(first.monitor_id));
+        assert_eq!(stopped["monitor"]["state"], json!("cancelled"));
+        assert!(svc
+            .store()
+            .find_active_pr_monitor_in_workspace(&ws, "o", "r", 42)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The sweep's per-PR fetch key folds slug case, so monitors on case
+    /// variants of one PR (two workspaces here — one workspace never holds
+    /// two) share a single forge fetch per tick.
+    #[tokio::test]
+    async fn case_variant_monitors_share_one_fetch_per_sweep() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        svc.pr_monitor_register(&ws, &owner, "o", "r", 42)
+            .await
+            .expect("register");
+        let (ws2, other) = sibling_workspace(&svc, "agent-elsewhere").await;
+        svc.pr_monitor_register(&ws2, &other, "O", "R", 42)
+            .await
+            .expect("register case variant");
+
+        let before = forge.fetches();
+        svc.poll_pr_monitors().await;
+        assert_eq!(
+            forge.fetches() - before,
+            1,
+            "one shared fetch for the case-variant pair"
         );
     }
 

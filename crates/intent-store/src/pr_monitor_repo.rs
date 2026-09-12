@@ -232,7 +232,8 @@ impl Store {
     }
 
     /// The ACTIVE monitor an agent already owns for `(owner, name, number)`,
-    /// if any — the idempotent re-register lookup.
+    /// if any — the idempotent re-register lookup. `owner` / `name` match
+    /// case-insensitively (forge slugs are case-insensitive; migration `0119`).
     ///
     /// # Errors
     ///
@@ -245,8 +246,9 @@ impl Store {
         pr_number: i64,
     ) -> Result<Option<PrMonitor>> {
         let sql = format!(
-            "SELECT {COLUMNS} FROM pr_monitor WHERE agent_id = ? AND repo_owner = ? \
-             AND repo_name = ? AND pr_number = ? AND state = 'active'"
+            "SELECT {COLUMNS} FROM pr_monitor WHERE agent_id = ? \
+             AND repo_owner = ? COLLATE NOCASE AND repo_name = ? COLLATE NOCASE \
+             AND pr_number = ? AND state = 'active'"
         );
         let row = sqlx::query(&sql)
             .bind(&agent_id.0)
@@ -263,7 +265,8 @@ impl Store {
     /// `(owner, name, number)`, if any — the workspace-scoped "who already
     /// monitors this PR" lookup (`idx_pr_monitor_workspace_identity` makes
     /// it at most one row). Owner-agnostic: compare `agent_id` to tell an
-    /// idempotent re-register from another agent's duplicate.
+    /// idempotent re-register from another agent's duplicate. `owner` /
+    /// `name` match case-insensitively.
     ///
     /// # Errors
     ///
@@ -276,8 +279,9 @@ impl Store {
         pr_number: i64,
     ) -> Result<Option<PrMonitor>> {
         let sql = format!(
-            "SELECT {COLUMNS} FROM pr_monitor WHERE workspace_id = ? AND repo_owner = ? \
-             AND repo_name = ? AND pr_number = ? AND state = 'active'"
+            "SELECT {COLUMNS} FROM pr_monitor WHERE workspace_id = ? \
+             AND repo_owner = ? COLLATE NOCASE AND repo_name = ? COLLATE NOCASE \
+             AND pr_number = ? AND state = 'active'"
         );
         let row = sqlx::query(&sql)
             .bind(&workspace_id.0)
@@ -1323,6 +1327,238 @@ mod tests {
                 .await
                 .expect("insert after migration"),
             "workspace index rejects a new duplicate"
+        );
+    }
+
+    /// Forge repo slugs are case-insensitive: both identity indexes and both
+    /// active-monitor lookups compare `repo_owner` / `repo_name` under
+    /// `COLLATE NOCASE` (migration `0119`), while the stored casing is kept
+    /// verbatim. A different repo that merely shares letters is still
+    /// distinct.
+    #[tokio::test]
+    async fn identity_indexes_and_lookups_ignore_repo_slug_case() {
+        let (_tmp, store, ws_id, owner) = store_with_owner().await;
+        let other = add_agent(&store, &ws_id).await;
+        let ts = now_iso();
+
+        let mut first = test_monitor(&ws_id, &owner, &ts);
+        first.repo_owner = "Intent-HQ".to_string();
+        first.repo_name = "IntentD".to_string();
+        assert!(store.insert_pr_monitor(&first).await.expect("insert owner"));
+
+        let found = store
+            .find_active_pr_monitor(&owner, "intent-hq", "intentd", 42)
+            .await
+            .expect("find per-agent")
+            .expect("per-agent lookup matches a case variant");
+        assert_eq!(found.monitor_id, first.monitor_id);
+        assert_eq!(found.repo_owner, "Intent-HQ", "stored casing preserved");
+        assert_eq!(found.repo_name, "IntentD", "stored casing preserved");
+        let found = store
+            .find_active_pr_monitor_in_workspace(&ws_id, "INTENT-HQ", "intentd", 42)
+            .await
+            .expect("find in workspace")
+            .expect("workspace lookup matches a case variant");
+        assert_eq!(found.monitor_id, first.monitor_id);
+
+        let mut same_agent = test_monitor(&ws_id, &owner, &ts);
+        same_agent.repo_owner = "intent-hq".to_string();
+        same_agent.repo_name = "intentd".to_string();
+        assert!(
+            !store
+                .insert_pr_monitor(&same_agent)
+                .await
+                .expect("same-agent case variant"),
+            "per-agent index rejects a case-variant duplicate"
+        );
+        let mut other_agent = test_monitor(&ws_id, &other, &ts);
+        other_agent.repo_owner = "intent-hq".to_string();
+        other_agent.repo_name = "INTENTD".to_string();
+        assert!(
+            !store
+                .insert_pr_monitor(&other_agent)
+                .await
+                .expect("other-agent case variant"),
+            "workspace index rejects another agent's case-variant duplicate"
+        );
+
+        let mut distinct = test_monitor(&ws_id, &other, &ts);
+        distinct.repo_owner = "intent-hq".to_string();
+        distinct.repo_name = "intentd-fe".to_string();
+        assert!(
+            store
+                .insert_pr_monitor(&distinct)
+                .await
+                .expect("distinct repo"),
+            "a different repo is not a duplicate"
+        );
+        assert_eq!(
+            store
+                .find_active_pr_monitor(&owner, "intent-hq", "intent", 42)
+                .await
+                .expect("find other repo"),
+            None
+        );
+    }
+
+    /// The 0119 migration dedupes pre-existing ACTIVE monitors whose repo
+    /// slugs differ only by case before re-creating both identity indexes
+    /// with `COLLATE NOCASE` (simulated by dropping the indexes, inserting
+    /// the case-variant duplicates, and re-running the migration file
+    /// verbatim): the oldest row (`created_at`, then `monitor_id`) stays
+    /// `active`, the rest turn `cancelled`, rows for other PRs / other
+    /// workspaces are untouched, and the new indexes reject fresh
+    /// case-variant duplicates.
+    #[tokio::test]
+    async fn migration_dedupes_case_variant_active_monitors_oldest_wins() {
+        let (_tmp, store, ws_id, owner) = store_with_owner().await;
+        for idx in [
+            "idx_pr_monitor_identity",
+            "idx_pr_monitor_workspace_identity",
+        ] {
+            sqlx::query(&format!("DROP INDEX {idx}"))
+                .execute(store.write_pool())
+                .await
+                .expect("drop identity index");
+        }
+        let other = add_agent(&store, &ws_id).await;
+        let ws_b = WorkspaceId("ws-pr-monitor-b".to_string());
+        store
+            .insert_workspace(&test_workspace(&ws_b, &now_iso()))
+            .await
+            .expect("insert ws b");
+        let agent_b = add_agent(&store, &ws_b).await;
+
+        let mk = |id: &str,
+                  ws: &WorkspaceId,
+                  agent: &AgentId,
+                  slug: (&str, &str),
+                  pr: i64,
+                  created: &str| {
+            let mut m = test_monitor(ws, agent, created);
+            m.monitor_id = PrMonitorId(id.to_string());
+            m.repo_owner = slug.0.to_string();
+            m.repo_name = slug.1.to_string();
+            m.pr_number = pr;
+            m
+        };
+        let rows = [
+            // Same agent, case-variant slugs: oldest wins.
+            mk(
+                "prmon-upper",
+                &ws_id,
+                &owner,
+                ("O", "R"),
+                42,
+                "2026-01-02T00:00:00Z",
+            ),
+            mk(
+                "prmon-lower",
+                &ws_id,
+                &owner,
+                ("o", "r"),
+                42,
+                "2026-01-01T00:00:00Z",
+            ),
+            // Another agent, another case variant of the same PR: loses too.
+            mk(
+                "prmon-mixed",
+                &ws_id,
+                &other,
+                ("o", "R"),
+                42,
+                "2026-01-03T00:00:00Z",
+            ),
+            // Different PR in the same workspace: untouched.
+            mk(
+                "prmon-other-pr",
+                &ws_id,
+                &other,
+                ("O", "R"),
+                43,
+                "2026-01-03T00:00:00Z",
+            ),
+            // Same PR in another workspace: untouched.
+            mk(
+                "prmon-other-ws",
+                &ws_b,
+                &agent_b,
+                ("O", "r"),
+                42,
+                "2026-01-03T00:00:00Z",
+            ),
+        ];
+        for m in &rows {
+            assert!(
+                store.insert_pr_monitor(m).await.expect("insert"),
+                "{} inserts while the identity indexes are absent",
+                m.monitor_id.0
+            );
+        }
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/0119_pr_monitor_identity_nocase.sql"
+        ))
+        .execute(store.write_pool())
+        .await
+        .expect("re-run 0119 migration");
+
+        let state_of = |id: &str| {
+            let store = &store;
+            let id = PrMonitorId(id.to_string());
+            async move { store.get_pr_monitor(&id).await.expect("get").state }
+        };
+        assert_eq!(state_of("prmon-lower").await, PrMonitorState::Active);
+        assert_eq!(state_of("prmon-upper").await, PrMonitorState::Cancelled);
+        assert_eq!(state_of("prmon-mixed").await, PrMonitorState::Cancelled);
+        assert_eq!(
+            state_of("prmon-other-pr").await,
+            PrMonitorState::Active,
+            "other PR in the workspace untouched"
+        );
+        assert_eq!(
+            state_of("prmon-other-ws").await,
+            PrMonitorState::Active,
+            "same PR in another workspace untouched"
+        );
+        assert_eq!(
+            store
+                .get_pr_monitor(&PrMonitorId("prmon-other-pr".to_string()))
+                .await
+                .expect("get")
+                .repo_owner,
+            "O",
+            "the migration never rewrites stored casing"
+        );
+
+        // The re-created indexes enforce the rule from here on.
+        assert!(
+            !store
+                .insert_pr_monitor(&mk(
+                    "prmon-late-agent",
+                    &ws_id,
+                    &owner,
+                    ("O", "R"),
+                    42,
+                    "2026-01-09T00:00:00Z"
+                ))
+                .await
+                .expect("insert after migration"),
+            "per-agent index rejects a new case-variant duplicate"
+        );
+        assert!(
+            !store
+                .insert_pr_monitor(&mk(
+                    "prmon-late-ws",
+                    &ws_id,
+                    &other,
+                    ("O", "R"),
+                    42,
+                    "2026-01-09T00:00:00Z"
+                ))
+                .await
+                .expect("insert after migration"),
+            "workspace index rejects a new case-variant duplicate"
         );
     }
 }
