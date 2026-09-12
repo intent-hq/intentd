@@ -68,41 +68,25 @@ impl Drop for DebounceEnvGuard {
     }
 }
 
-/// Create a temp dir with a recognizable `prefix` under the system temp root.
-/// The returned guard removes the dir on drop (including on panic); set
-/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
-pub(crate) fn test_tempdir(prefix: &str) -> tempfile::TempDir {
-    let mut dir = tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir()
-        .expect("create test tempdir");
-    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
-        dir.disable_cleanup(true);
-    }
-    dir
-}
+pub(crate) use crate::test_support::test_tempdir;
 
+/// `SQLite` db inside an RAII temp dir (see [`test_tempdir`]): the dir sweep on
+/// drop also covers the `-wal`/`-shm` sidecars and the `.config.toml` sibling.
 pub(crate) struct TempDb {
     pub(crate) path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     pub(crate) fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("intentd-svc-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
+        let dir = test_tempdir("intentd-svc-");
+        let path = dir.path().join("svc.db");
+        Self { path, _dir: dir }
     }
 }
 
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm", ".config.toml"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
-    }
-}
-
-/// A settings registry (backed by a config file next to the temp db, removed
-/// by [`TempDb`]'s drop) seeding `model.defaultProvider = "auggie"`: since
+/// A settings registry (backed by a config file next to the temp db, swept
+/// with [`TempDb`]'s dir) seeding `model.defaultProvider = "auggie"`: since
 /// monorepo#3044 there is no positional provider fallback, so tests that
 /// create/delegate agents without an explicit provider or model need a
 /// configured default to resolve to. The `providers.paths` override points
@@ -134,23 +118,15 @@ pub(crate) fn test_registry_with_default_provider(
 /// test that constructs a `Services` reachable from workspace provisioning
 /// **must** attach one via `.with_workspaces_root(root.path().to_path_buf())`;
 /// otherwise the guard panics rather than writing under `~/intent/workspaces`.
-pub(crate) struct WorkspacesRoot(PathBuf);
+pub(crate) struct WorkspacesRoot(tempfile::TempDir);
 
 impl WorkspacesRoot {
     pub(crate) fn new() -> Self {
-        let p = std::env::temp_dir().join(format!("intentd-wss-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).expect("mkdir hermetic workspaces root");
-        Self(p)
+        Self(test_tempdir("intentd-wss-"))
     }
 
     pub(crate) fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for WorkspacesRoot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        self.0.path()
     }
 }
 
@@ -2881,7 +2857,8 @@ async fn read_asset_reads_base64_from_assets_root() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
-    let root = std::env::temp_dir().join(format!("intentd-assets-{}", uuid::Uuid::new_v4()));
+    let root_guard = test_tempdir("intentd-assets-");
+    let root = root_guard.path().to_path_buf();
     std::fs::create_dir_all(root.join(&ws.0)).expect("mkdir");
     std::fs::write(root.join(&ws.0).join("img.png"), b"hello").expect("write asset");
     let svc = Services::new(store).with_assets_root(root.clone());
@@ -2893,7 +2870,6 @@ async fn read_asset_reads_base64_from_assets_root() {
     assert_eq!(r.asset_id, "img.png");
     assert_eq!(r.mime_type, "image/png");
     assert_eq!(r.data, "aGVsbG8="); // base64("hello")
-    let _ = std::fs::remove_dir_all(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -12637,7 +12613,7 @@ mod pr {
     use intent_store::Store;
     use serde_json::json;
 
-    use super::{workspace, TempDb};
+    use super::{test_tempdir, workspace, TempDb};
     use crate::Services;
 
     // Test stub: one independent bool per scripted scenario.
@@ -14554,18 +14530,8 @@ mod pr {
     // stubbed forge.
     // ------------------------------------------------------------------------
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn unique_dir(prefix: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn unique_dir(prefix: &str) -> tempfile::TempDir {
+        test_tempdir(&format!("{prefix}-"))
     }
 
     /// Commit everything in the worktree on the current branch, returning the oid.
@@ -14591,12 +14557,21 @@ mod pr {
     /// `feature` with an `origin` bare remote and a linked `o/r` repository.
     async fn ac_setup(
         forge: StubForge,
-    ) -> (TempDb, TempDir, TempDir, Services, WorkspaceId, PathBuf) {
+    ) -> (
+        TempDb,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Services,
+        WorkspaceId,
+        PathBuf,
+    ) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
 
-        let work = unique_dir("intentd-ac-work");
-        let bare = unique_dir("intentd-ac-bare");
+        let work_dir = unique_dir("intentd-ac-work");
+        let work = work_dir.path().to_path_buf();
+        let bare_dir = unique_dir("intentd-ac-bare");
+        let bare = bare_dir.path().to_path_buf();
         let mut opts = git2::RepositoryInitOptions::new();
         opts.initial_head("feature");
         let repo = git2::Repository::init_opts(&work, &opts).unwrap();
@@ -14620,7 +14595,7 @@ mod pr {
         store.insert_workspace(&ws).await.expect("ws");
 
         let svc = Services::new(store).with_source_control(Arc::new(forge));
-        (tmp, TempDir(work.clone()), TempDir(bare), svc, ws_id, work)
+        (tmp, work_dir, bare_dir, svc, ws_id, work)
     }
 
     #[tokio::test]
@@ -14674,7 +14649,7 @@ mod pr {
         assert_eq!(st["existingPR"]["number"], 7);
 
         // The bare remote now carries the feature branch.
-        let bare_repo = git2::Repository::open_bare(bare.0.clone()).unwrap();
+        let bare_repo = git2::Repository::open_bare(bare.path()).unwrap();
         assert!(bare_repo.find_reference("refs/heads/feature").is_ok());
 
         // mergePR via the stubbed forge.
@@ -14799,11 +14774,11 @@ mod pr {
     async fn add_remote_initializes_and_returns_status() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("store");
-        let dir = TempDir(unique_dir("intentd-ac-addremote"));
+        let dir = unique_dir("intentd-ac-addremote");
         let ws_id = WorkspaceId::new();
         let mut ws = workspace(&ws_id);
         ws.branch = "feature".into();
-        ws.worktree_path = Some(dir.0.to_string_lossy().to_string());
+        ws.worktree_path = Some(dir.path().to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
         let svc = Services::new(store).with_source_control(Arc::new(StubForge::default()));
 
@@ -15051,24 +15026,19 @@ mod pr {
     /// (`current_branch_at` reads the symbolic target, so no commit is needed).
     struct SweepRepo {
         dir: PathBuf,
+        _guard: tempfile::TempDir,
     }
 
     impl SweepRepo {
         fn init(branch: &str, origin: Option<&str>) -> Self {
-            let dir = std::env::temp_dir().join(format!("intentd-groot-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = test_tempdir("intentd-groot-");
+            let dir = guard.path().to_path_buf();
             let repo = git2::Repository::init(&dir).unwrap();
             repo.set_head(&format!("refs/heads/{branch}")).unwrap();
             if let Some(url) = origin {
                 repo.remote("origin", url).unwrap();
             }
-            Self { dir }
-        }
-    }
-
-    impl Drop for SweepRepo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            Self { dir, _guard: guard }
         }
     }
 
@@ -15134,8 +15104,8 @@ mod pr {
         let (_t, svc, ws) = sweep_setup(&parent.dir).await;
 
         // Seed a root whose directory no longer exists (auto-prune target).
-        let gone_dir = std::env::temp_dir().join(format!("intentd-gone-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&gone_dir).unwrap();
+        let gone_guard = test_tempdir("intentd-gone-");
+        let gone_dir = gone_guard.path().to_path_buf();
         let gone = sweep_root(&ws.id, &gone_dir, None);
         svc.store().upsert_workspace_git_root(&gone).await.unwrap();
         std::fs::remove_dir_all(&gone_dir).unwrap();
@@ -15357,7 +15327,8 @@ mod pr {
 
         // Root at guard/repo where `guard` is later made unsearchable, so a
         // stat of the root's path fails with PermissionDenied, not NotFound.
-        let guard = std::env::temp_dir().join(format!("intentd-guard-{}", uuid::Uuid::new_v4()));
+        let guard_dir = test_tempdir("intentd-guard-");
+        let guard = guard_dir.path().to_path_buf();
         let repo_dir = guard.join("repo");
         std::fs::create_dir_all(&repo_dir).unwrap();
         let root = sweep_root(&ws.id, &repo_dir, None);
@@ -15374,7 +15345,6 @@ mod pr {
 
         // Restore permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&guard);
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "root must survive the transient error");
@@ -15785,8 +15755,8 @@ mod pr {
         let primary = SweepRepo::init("main", None);
         let (_t, svc, ws) = sweep_setup(&primary.dir).await;
         // A plain directory, not a git repo: current-branch read fails.
-        let plain = std::env::temp_dir().join(format!("intentd-plain-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&plain).unwrap();
+        let plain_dir = test_tempdir("intentd-plain-");
+        let plain = plain_dir.path().to_path_buf();
         let mut root = sweep_root(&ws.id, &plain, Some(("o", "r")));
         root.pull_requests = Some(vec![pool_entry(
             43,
@@ -15797,7 +15767,6 @@ mod pr {
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
         let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
-        let _ = std::fs::remove_dir_all(&plain);
         assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
@@ -16341,23 +16310,18 @@ mod file_tracking {
     /// A self-cleaning git repository seeded with one commit.
     struct GitRepo {
         dir: PathBuf,
-    }
-
-    impl Drop for GitRepo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
+        _guard: tempfile::TempDir,
     }
 
     fn init_git_repo() -> GitRepo {
-        let dir = std::env::temp_dir().join(format!("intentd-ft-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard = test_tempdir("intentd-ft-");
+        let dir = guard.path().to_path_buf();
         let repo = Repository::init(&dir).unwrap();
         let mut cfg = repo.config().unwrap();
         cfg.set_str("user.name", "Test").unwrap();
         cfg.set_str("user.email", "test@example.com").unwrap();
         commit_file(&dir, "seed.txt", "seed\n", "seed commit");
-        GitRepo { dir }
+        GitRepo { dir, _guard: guard }
     }
 
     fn commit_file(dir: &std::path::Path, rel: &str, contents: &str, message: &str) {
@@ -19664,17 +19628,15 @@ mod file_tracking {
         assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
 
         // Directory without a `.git` entry.
-        let plain = std::env::temp_dir().join(format!("intentd-ft-plain-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&plain).unwrap();
+        let plain = test_tempdir("intentd-ft-plain-");
         let err = svc
             .git_root_register(
                 ws_id.clone(),
-                plain.to_string_lossy().into_owned(),
+                plain.path().to_string_lossy().into_owned(),
                 agent.clone(),
             )
             .await
             .unwrap_err();
-        let _ = std::fs::remove_dir_all(&plain);
         assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
 
         // The workspace's own primary root is tracked implicitly.
@@ -22255,22 +22217,17 @@ mod rules {
     use intent_store::Store;
     use serde_json::Value;
 
-    use super::{workspace, TempDb};
+    use super::{test_tempdir, workspace, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
-    struct TempTree(std::path::PathBuf);
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    struct TempTree(std::path::PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     /// A worktree containing a `CLAUDE.md` workspace rule file.
     fn worktree() -> TempTree {
-        let dir = std::env::temp_dir().join(format!("intentd-rules-svc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard = test_tempdir("intentd-rules-svc-");
+        let dir = guard.path().to_path_buf();
         std::fs::write(dir.join("CLAUDE.md"), "ALWAYS run the linter.").unwrap();
-        TempTree(dir)
+        TempTree(dir, guard)
     }
 
     async fn setup(dir: &std::path::Path) -> (TempDb, Store, Services, WorkspaceId) {
@@ -24130,12 +24087,7 @@ mod known_repo {
     async fn create_workspace_derives_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
-        struct TempRepo(PathBuf);
-        impl Drop for TempRepo {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
+        struct TempRepo(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -24144,8 +24096,8 @@ mod known_repo {
 
         // Helper: init a git repo with an origin remote and an initial commit.
         let make_repo = |remote_url: &str| -> TempRepo {
-            let dir = std::env::temp_dir().join(format!("intentd-origin-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = test_tempdir("intentd-origin-");
+            let dir = guard.path().to_path_buf();
             let repo = Repository::init(&dir).unwrap();
             let mut cfg = repo.config().unwrap();
             cfg.set_str("user.name", "Test").unwrap();
@@ -24160,7 +24112,7 @@ mod known_repo {
             let sig = Signature::now("Test", "test@example.com").unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
                 .unwrap();
-            TempRepo(dir)
+            TempRepo(dir, guard)
         };
 
         // GitHub https remote → owner and name derived.
@@ -24238,9 +24190,8 @@ mod known_repo {
 
         // No origin remote → owner stays None, name falls back to basename.
         let no_remote = {
-            let dir =
-                std::env::temp_dir().join(format!("intentd-noremote-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = test_tempdir("intentd-noremote-");
+            let dir = guard.path().to_path_buf();
             let repo = Repository::init(&dir).unwrap();
             let mut cfg = repo.config().unwrap();
             cfg.set_str("user.name", "Test").unwrap();
@@ -24254,7 +24205,7 @@ mod known_repo {
             let sig = Signature::now("Test", "test@example.com").unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
                 .unwrap();
-            TempRepo(dir)
+            TempRepo(dir, guard)
         };
         let noremote_ws = svc
             .create_workspace(
@@ -24388,12 +24339,7 @@ mod known_repo {
     async fn startup_prewarm_backfills_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
-        struct TempRepo(PathBuf);
-        impl Drop for TempRepo {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
+        struct TempRepo(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -24406,14 +24352,8 @@ mod known_repo {
         // Manually create a workspace row with repository_path but missing owner/name
         // (simulates old workspace created before the create derivation landed).
         let make_repo = |url: &str| -> TempRepo {
-            let dir = std::env::temp_dir().join(format!(
-                "intentd-backfill-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = test_tempdir("intentd-backfill-");
+            let dir = guard.path().to_path_buf();
             let repo = Repository::init(&dir).unwrap();
             repo.remote("origin", url).unwrap();
             let mut index = repo.index().unwrap();
@@ -24422,7 +24362,7 @@ mod known_repo {
             let sig = Signature::now("Test", "test@example.com").unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
                 .unwrap();
-            TempRepo(dir)
+            TempRepo(dir, guard)
         };
 
         let repo_path = make_repo("https://github.com/octocat/hello-world.git");
@@ -24679,18 +24619,12 @@ mod worktree_provisioning {
     use super::*;
     use intent_core::WorkspaceCreate;
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Temp directory tree swept on drop (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
+        let guard = test_tempdir(&format!("{prefix}-"));
+        TempDir(guard.path().to_path_buf(), guard)
     }
 
     /// Commit everything in the worktree on the current branch, returning the oid.
@@ -26864,21 +26798,15 @@ mod setup_lifecycle_events {
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::TempDb;
+    use super::{test_tempdir, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Temp directory tree swept on drop (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
+        let guard = test_tempdir(&format!("{prefix}-"));
+        TempDir(guard.path().to_path_buf(), guard)
     }
 
     /// Init a git repo with one commit; returns (guard, head branch).
@@ -27180,9 +27108,8 @@ mod file_ops_service {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
 
-        let dir = std::env::temp_dir().join(format!("intentd-fileapi-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir_guard = test_tempdir("intentd-fileapi-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
@@ -27221,8 +27148,6 @@ mod file_ops_service {
             .file_read(ws.clone(), "../escape".to_string(), None)
             .await;
         assert!(matches!(denied, Err(Error::Internal(_))));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `file.placeAttachment` wired through `WorkspaceApi`: a base64 payload
@@ -27238,9 +27163,8 @@ mod file_ops_service {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
 
-        let dir = std::env::temp_dir().join(format!("intentd-placeatt-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir_guard = test_tempdir("intentd-placeatt-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
         git2::Repository::init(&dir).unwrap();
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
@@ -27341,8 +27265,6 @@ mod file_ops_service {
                 .await;
             assert!(matches!(res, Err(Error::InvalidParams(_))), "{res:?}");
         }
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `file.getAttachmentInfo` (PROTOCOL §5.9): serves the registry row with
@@ -27355,9 +27277,8 @@ mod file_ops_service {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
-        let dir = std::env::temp_dir().join(format!("intentd-attinfo-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir_guard = test_tempdir("intentd-attinfo-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
@@ -27397,8 +27318,6 @@ mod file_ops_service {
         std::fs::remove_file(dir.join(".intent/attachments/notes.txt")).unwrap();
         let info2 = svc.file_get_attachment_info(id).await.expect("info 2");
         assert_eq!(info2["exists"], serde_json::json!(false));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `ws.file.getAttachment` backing op: copies the registered file into
@@ -27414,9 +27333,8 @@ mod file_ops_service {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
-        let dir = std::env::temp_dir().join(format!("intentd-attget-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir_guard = test_tempdir("intentd-attget-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
@@ -27498,8 +27416,6 @@ mod file_ops_service {
         }
         // No partial copy left behind.
         assert!(!dir.join("elsewhere/spec.pdf").exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Containment: a tampered registry row (escaping `stored_path` or
@@ -27512,7 +27428,10 @@ mod file_ops_service {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
-        let dir = std::env::temp_dir().join(format!("intentd-atttamper-{}", uuid::Uuid::new_v4()));
+        // The workspace root is a child of the swept tempdir so the escape
+        // targets below (siblings of the root) are swept with it.
+        let base = test_tempdir("intentd-atttamper-");
+        let dir = base.path().join("ws");
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
         let mut w = workspace(&ws);
@@ -27520,10 +27439,7 @@ mod file_ops_service {
         store.insert_workspace(&w).await.expect("ws");
 
         // A file OUTSIDE the workspace root that a tampered row points at.
-        let outside = dir.parent().unwrap().join(format!(
-            "intentd-atttamper-outside-{}.txt",
-            uuid::Uuid::new_v4()
-        ));
+        let outside = dir.parent().unwrap().join("outside.txt");
         std::fs::write(&outside, b"secret").unwrap();
 
         let escaping = intent_store::AttachmentRecord {
@@ -27600,9 +27516,6 @@ mod file_ops_service {
             Err(Error::NotFound(msg)) => assert!(msg.contains("unknown attachment id"), "{msg}"),
             other => panic!("expected NotFound, got {other:?}"),
         }
-
-        let _ = std::fs::remove_file(&outside);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
@@ -29223,21 +29136,15 @@ mod clone_orchestration {
     use intent_core::{WorkspaceApi, WorkspaceCreate, WorkspaceId};
     use intent_store::Store;
 
-    use super::TempDb;
+    use super::{test_tempdir, TempDb};
     use crate::{Error, EventBus, Services, SubscriptionFilter};
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Temp directory tree swept on drop (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
+        let guard = test_tempdir(&format!("{prefix}-"));
+        TempDir(guard.path().to_path_buf(), guard)
     }
 
     /// Init a small git repo with one commit; returns the guard.
@@ -30461,21 +30368,15 @@ mod repo_warm_cache {
     use intent_core::{Error, WorkspaceApi};
     use intent_store::Store;
 
-    use super::TempDb;
+    use super::{test_tempdir, TempDb};
     use crate::Services;
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Temp directory tree swept on drop (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
+        let guard = test_tempdir(&format!("{prefix}-"));
+        TempDir(guard.path().to_path_buf(), guard)
     }
 
     /// Init a small git repo with one commit; returns the guard.
@@ -39048,23 +38949,16 @@ mod local_changes {
     use intent_core::{now_iso, Error, WorkspaceId};
     use intent_store::Store;
 
-    use super::{workspace, TempDb};
+    use super::{test_tempdir, workspace, TempDb};
     use crate::Services;
 
-    /// Self-cleaning temp directory.
-    struct TempDir(PathBuf);
+    /// Self-cleaning temp directory (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     impl TempDir {
         fn new() -> Self {
-            let p = std::env::temp_dir().join(format!("intentd-lc-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&p).unwrap();
-            Self(p)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let guard = test_tempdir("intentd-lc-");
+            Self(guard.path().to_path_buf(), guard)
         }
     }
 
@@ -39186,8 +39080,8 @@ mod local_changes {
         let wt = TempDir::new();
         empty_repo(&wt.0);
         let (_t, svc, ws) = setup(Some(&wt.0), false).await;
-        let gone = std::env::temp_dir().join(format!("intentd-lc-gone-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&gone).unwrap();
+        let gone_guard = test_tempdir("intentd-lc-gone-");
+        let gone = gone_guard.path().to_path_buf();
         let root = git_root(&ws.id, &gone);
         svc.store().upsert_workspace_git_root(&root).await.unwrap();
         std::fs::remove_dir_all(&gone).unwrap();

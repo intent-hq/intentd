@@ -17,42 +17,35 @@ use super::shared_watch::SharedWatchHub;
 use super::watcher::{flush_due, Action, FileWatcher};
 use super::LIVENESS;
 
-/// Self-cleaning temp directory (db file + watched workspace root).
+/// Self-cleaning temp directory (watched workspace root); see
+/// [`crate::test_support::test_tempdir`].
 struct TempDir {
     path: PathBuf,
+    _guard: tempfile::TempDir,
 }
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let path =
-            std::env::temp_dir().join(format!("intentd-watch-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        Self { path }
+        let guard = crate::test_support::test_tempdir(&format!("intentd-watch-{tag}-"));
+        Self {
+            path: guard.path().to_path_buf(),
+            _guard: guard,
+        }
     }
 }
 
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
+/// `SQLite` db inside an RAII temp dir; the dir sweep on drop also covers the
+/// `-wal`/`-shm` sidecars.
 struct TempDb {
     path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("intentd-watch-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = crate::test_support::test_tempdir("intentd-watch-");
+        let path = dir.path().join("watch.db");
+        Self { path, _dir: dir }
     }
 }
 

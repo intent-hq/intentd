@@ -7,12 +7,13 @@ use std::time::Duration;
 
 use super::{run_one_shot_acp, run_one_shot_acp_in, OneShotCommand, OneShotError};
 use crate::acp_adapter::AdapterSlots;
+use crate::test_support::test_tempdir;
 
 /// Write `body` as an executable-by-node mock adapter script and return a
 /// launch command for it. The tempdir is returned so the caller keeps it
 /// alive for the duration of the run.
 fn mock_adapter(body: &str) -> (OneShotCommand, tempfile::TempDir) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = test_tempdir("intent-one-shot-");
     let script = dir.path().join("mock-one-shot-adapter.mjs");
     std::fs::write(&script, body).expect("write mock adapter");
     let cmd = OneShotCommand::binary(
@@ -118,8 +119,8 @@ async fn session_new_omits_meta_when_none_given() {
 async fn prompt_timeout_reports_timeout_and_reaps_child() {
     // The adapter answers setup, then never resolves the prompt. The runner
     // must bound the prompt phase and leave no surviving process.
-    let pidfile =
-        std::env::temp_dir().join(format!("intent-one-shot-{}.pid", uuid::Uuid::new_v4()));
+    let scratch = test_tempdir("intent-one-shot-pid-");
+    let pidfile = scratch.path().join("adapter.pid");
     let (cmd, _dir) = mock_adapter(&format!(
         "import fs from 'node:fs';
 fs.writeFileSync({pidfile:?}, String(process.pid));
@@ -146,7 +147,6 @@ const onPrompt = () => {{}};
         .trim()
         .parse()
         .expect("pid parses");
-    std::fs::remove_file(&pidfile).ok();
     // `kill(pid, 0)` returns ESRCH once the reaped child is gone.
     for _ in 0..100 {
         if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
