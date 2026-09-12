@@ -110,7 +110,7 @@ pub(crate) fn resolve_binary_path(name: &str, common_paths: &[String]) -> Option
 /// directories from an injected `home` (via
 /// [`path_utils::enriched_tool_dirs_with_home`]) instead of the real
 /// environment, so tests never mutate process-global `HOME`.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn resolve_binary_path_with_home(
     name: &str,
     common_paths: &[String],

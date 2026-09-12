@@ -24,6 +24,7 @@ const FANOUT_CAPACITY: usize = 2048;
 /// Read chunk size for the PTY reader loop.
 const READ_CHUNK: usize = 8192;
 /// Grace period between SIGTERM and SIGKILL during teardown (mirrors M5).
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for a signalled child to exit.
 const REAP_POLL: Duration = Duration::from_millis(20);
@@ -681,6 +682,13 @@ impl PtyHost {
     /// # Panics
     ///
     /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unused_async,
+            reason = "async on every platform; the group escalation awaits only on unix"
+        )
+    )]
     pub async fn reap_group_stragglers(&self, id: PtyId) {
         let Ok(session) = self.get(id) else { return };
         #[cfg(unix)]
@@ -698,7 +706,7 @@ impl PtyHost {
 
     /// Kill every PTY under `scope` (session/workspace teardown). Returns the
     /// number reaped. No process-group orphans are left behind.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn kill_scope(&self, scope: &str) -> usize {
         let victims: Vec<Arc<PtySession>> = {
             let mut sessions = self.sessions.lock().unwrap();
@@ -864,6 +872,13 @@ fn read_loop(mut reader: Box<dyn Read + Send>, fanout: &Arc<Mutex<Fanout>>) {
 /// Terminate a session's whole process group (SIGTERM→grace→SIGKILL), then drop
 /// the master and join the reader thread. The PTY child is a `setsid` session
 /// leader so `killpg` reaps grandchildren too (no orphans, mirroring M5).
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unused_async,
+        reason = "async on every platform; the group escalation awaits only on unix"
+    )
+)]
 async fn teardown(session: &PtySession) {
     #[cfg(unix)]
     {
