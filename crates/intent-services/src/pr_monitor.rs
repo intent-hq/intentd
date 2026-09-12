@@ -124,10 +124,16 @@ pub(crate) fn pr_monitor_fetches_per_tick(
 }
 
 /// The distinct `(owner, repo, pr)` identity a sweep dedupes fetches on.
+/// Forge slugs are case-insensitive, so the key folds case (matching the
+/// store's `COLLATE NOCASE` identity) and case-variant siblings share a fetch.
 type PrKey = (String, String, i64);
 
 fn pr_key(m: &PrMonitor) -> PrKey {
-    (m.repo_owner.clone(), m.repo_name.clone(), m.pr_number)
+    (
+        m.repo_owner.to_ascii_lowercase(),
+        m.repo_name.to_ascii_lowercase(),
+        m.pr_number,
+    )
 }
 
 /// One active monitor as the due-sweep sees it: its staleness anchor (parsed
@@ -432,6 +438,67 @@ fn pending_survives_recompute(m: &PrMonitor) -> bool {
 /// Wording owned by the harness (H6).
 pub(crate) fn monitor_label(m: &PrMonitor) -> String {
     crate::harness::latest().pr_monitor_label(&m.repo_owner, &m.repo_name, m.pr_number)
+}
+
+/// Outcome of [`Services::pr_monitor_try_register`]: the monitor was
+/// registered (or re-armed), or the call was refused because another agent
+/// in the workspace already holds the PR's active monitor.
+#[derive(Debug, Clone)]
+pub enum PrMonitorRegistration {
+    /// The caller now owns an active monitor on the PR.
+    Registered {
+        monitor: Box<PrMonitor>,
+        requirements: MergeRequirements,
+    },
+    /// Refused: one monitor per PR per workspace, and another agent holds it.
+    Refused(PrMonitorRefusal),
+}
+
+/// A refused `pr.monitor` registration — the ACTIVE monitor another agent in
+/// the same workspace already holds on the PR, plus that owner's session
+/// name when it has one.
+#[derive(Debug, Clone)]
+pub struct PrMonitorRefusal {
+    pub owner: PrMonitor,
+    pub owner_agent_name: Option<String>,
+}
+
+impl PrMonitorRefusal {
+    /// The structured `ws.pr.monitor` refusal payload: `ok: false` with
+    /// `refused: true` and `reason: "already-monitored"`, naming the owner
+    /// (`ownerAgentId`, `ownerAgentName` when known, `monitorId`) and
+    /// carrying an `instruction` telling the model how to proceed.
+    #[must_use]
+    pub fn to_wire(&self) -> Value {
+        let label = monitor_label(&self.owner);
+        let owner_id = self.owner.agent_id.to_string();
+        let owner_display = match &self.owner_agent_name {
+            Some(name) => format!("{name} ({owner_id})"),
+            None => owner_id.clone(),
+        };
+        let mut payload = json!({
+            "ok": false,
+            "refused": true,
+            "reason": "already-monitored",
+            "repo": format!("{}/{}", self.owner.repo_owner, self.owner.repo_name),
+            "prNumber": self.owner.pr_number,
+            "ownerAgentId": owner_id,
+            "monitorId": self.owner.monitor_id,
+            "instruction": format!(
+                "{label} is already monitored in this workspace by agent {owner_display}; \
+                 one monitor per PR per workspace. That agent receives the PR's wakes. \
+                 Instead of registering a second monitor, use ws.agent.send to ask the \
+                 owner either to relay the events you care about to you, or to relinquish \
+                 the monitor via ws.pr.unmonitor so you can register your own; for a \
+                 one-shot read of the PR's current state use ws.pr.snapshot. Retry \
+                 ws.pr.monitor only after the owner cancels its monitor or finishes."
+            ),
+        });
+        if let Some(name) = &self.owner_agent_name {
+            payload["ownerAgentName"] = json!(name);
+        }
+        payload
+    }
 }
 
 /// Whether a snapshot's merge-requirements checklist reads as truly
@@ -808,13 +875,15 @@ impl Services {
     /// refreshes the baseline and clears any pending changes, so the agent's
     /// next wake reports only what moves from here.
     ///
-    /// The initial fetch is load-bearing — a forge that cannot read the PR
-    /// (unsupported host, missing PR, no token) fails registration rather
-    /// than persisting a monitor that could never poll.
+    /// The direct-service convenience over [`Services::pr_monitor_try_register`]:
+    /// a workspace-level refusal (another agent already holds the PR's active
+    /// monitor) surfaces as `Error::InvalidParams` naming the owner. The MCP
+    /// op ([`Services::pr_monitor_start_op`]) uses the structured outcome
+    /// instead so the model can act on it.
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap, and propagates store or forge failures (e.g. when the PR cannot be fetched).
+    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap or another agent in the workspace already monitors the PR, and propagates store or forge failures (e.g. when the PR cannot be fetched).
     pub async fn pr_monitor_register(
         &self,
         workspace_id: &WorkspaceId,
@@ -823,11 +892,55 @@ impl Services {
         repo_name: &str,
         pr_number: u64,
     ) -> Result<(PrMonitor, MergeRequirements)> {
+        match self
+            .pr_monitor_try_register(workspace_id, agent_id, repo_owner, repo_name, pr_number)
+            .await?
+        {
+            PrMonitorRegistration::Registered {
+                monitor,
+                requirements,
+            } => Ok((*monitor, requirements)),
+            PrMonitorRegistration::Refused(refusal) => Err(Error::InvalidParams(format!(
+                "pr.monitor: {} is already monitored by agent {} in this workspace",
+                monitor_label(&refusal.owner),
+                refusal.owner.agent_id
+            ))),
+        }
+    }
+
+    /// Register (or idempotently re-arm) a monitor, or REFUSE when another
+    /// agent in `workspace_id` already holds the ACTIVE monitor on the PR —
+    /// one monitor per PR per workspace (`idx_pr_monitor_workspace_identity`).
+    /// The refusal is decided before the forge fetch, so a refused call costs
+    /// no forge request and persists nothing; the caller's OWN re-register is
+    /// never refused (it re-arms).
+    ///
+    /// The initial fetch is load-bearing — a forge that cannot read the PR
+    /// (unsupported host, missing PR, no token) fails registration rather
+    /// than persisting a monitor that could never poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap, and propagates store or forge failures (e.g. when the PR cannot be fetched).
+    pub async fn pr_monitor_try_register(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        repo_owner: &str,
+        repo_name: &str,
+        pr_number: u64,
+    ) -> Result<PrMonitorRegistration> {
         let existing = self
             .store
             .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number.cast_signed())
             .await?;
         if existing.is_none() {
+            if let Some(refusal) = self
+                .pr_monitor_refusal(workspace_id, agent_id, repo_owner, repo_name, pr_number)
+                .await?
+            {
+                return Ok(PrMonitorRegistration::Refused(refusal));
+            }
             let cap = self.pr_monitors_max_per_agent as usize;
             let active = self
                 .store
@@ -883,6 +996,13 @@ impl Services {
                 // same triple: re-arm the winner's row instead of surfacing
                 // the unique-index violation (the call stays idempotent).
                 monitor = self.rearm_pr_monitor(winner, baseline, &now).await?;
+            } else if let Some(refusal) = self
+                .pr_monitor_refusal(workspace_id, agent_id, repo_owner, repo_name, pr_number)
+                .await?
+            {
+                // Lost the insert race to ANOTHER agent's registration in
+                // this workspace: the same refusal as the pre-fetch check.
+                return Ok(PrMonitorRegistration::Refused(refusal));
             }
         }
         let monitor = monitor.ok_or_else(|| {
@@ -897,7 +1017,49 @@ impl Services {
         // the orthogonal `waiting` flag (§5.1).
         self.maybe_emit_display_status_changed(workspace_id).await;
         self.maybe_emit_waiting_changed(workspace_id).await;
-        Ok((monitor, snapshot.requirements))
+        Ok(PrMonitorRegistration::Registered {
+            monitor: Box::new(monitor),
+            requirements: snapshot.requirements,
+        })
+    }
+
+    /// The workspace-level duplicate check behind [`Services::pr_monitor_try_register`]:
+    /// `Some(refusal)` when an agent OTHER than `agent_id` holds the ACTIVE
+    /// monitor on `(repo, pr_number)` in `workspace_id`, naming that owner
+    /// (session name included when it has one). `None` when the PR is
+    /// unmonitored in the workspace or the holder is the caller itself.
+    async fn pr_monitor_refusal(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        repo_owner: &str,
+        repo_name: &str,
+        pr_number: u64,
+    ) -> Result<Option<PrMonitorRefusal>> {
+        let Some(owner) = self
+            .store
+            .find_active_pr_monitor_in_workspace(
+                workspace_id,
+                repo_owner,
+                repo_name,
+                pr_number.cast_signed(),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if owner.agent_id == *agent_id {
+            return Ok(None);
+        }
+        let owner_agent_name = match self.store.get_agent_session_summary(&owner.agent_id).await {
+            Ok(session) => Some(session.name).filter(|n| !n.trim().is_empty()),
+            Err(Error::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+        Ok(Some(PrMonitorRefusal {
+            owner,
+            owner_agent_name,
+        }))
     }
 
     /// Re-arm an existing ACTIVE monitor row for an idempotent re-register:
@@ -2053,6 +2215,10 @@ impl Services {
     /// `ws.pr.monitor`: register (idempotently) a monitor and return
     /// `{ ok, monitor, requirements }` — the row the UI lists plus the
     /// freshly fetched merge-requirements checklist the model acts on.
+    /// When another agent in the workspace already holds the PR's active
+    /// monitor the call is REFUSED with a structured, non-error payload
+    /// (`ok: false, refused: true, reason: "already-monitored"`) naming the
+    /// owner, so the model can coordinate instead of retrying.
     pub(crate) async fn pr_monitor_start_op(
         &self,
         workspace_id: &WorkspaceId,
@@ -2061,14 +2227,20 @@ impl Services {
         repo: Option<String>,
     ) -> Result<Value> {
         let (owner, name) = self.resolve_monitor_repo(workspace_id, repo).await?;
-        let (monitor, requirements) = self
-            .pr_monitor_register(workspace_id, agent_id, &owner, &name, pr_number)
-            .await?;
-        Ok(json!({
-            "ok": true,
-            "monitor": pr_monitor_wire(&monitor),
-            "requirements": requirements,
-        }))
+        match self
+            .pr_monitor_try_register(workspace_id, agent_id, &owner, &name, pr_number)
+            .await?
+        {
+            PrMonitorRegistration::Registered {
+                monitor,
+                requirements,
+            } => Ok(json!({
+                "ok": true,
+                "monitor": pr_monitor_wire(&monitor),
+                "requirements": requirements,
+            })),
+            PrMonitorRegistration::Refused(refusal) => Ok(refusal.to_wire()),
+        }
     }
 
     /// `ws.pr.unmonitor`: cancel the caller's own active monitor on
@@ -3549,6 +3721,274 @@ mod tests {
             .expect("re-register at cap");
     }
 
+    /// One monitor per PR per workspace: a second agent's `pr.monitor` on a
+    /// PR another agent already watches is REFUSED with the structured
+    /// payload naming the owner — no error, no forge fetch, no row, no
+    /// `prMonitor:registered` event — while the owner's own re-register
+    /// still re-arms idempotently.
+    #[tokio::test]
+    async fn a_second_agent_is_refused_and_told_who_owns_the_monitor() {
+        async fn registered_events(svc: &Services, ws: &WorkspaceId) -> usize {
+            svc.store()
+                .query_events(&intent_store::EventQuery {
+                    workspace_id: Some(ws.clone()),
+                    event_types: vec![PR_MONITOR_REGISTERED.to_string()],
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .len()
+        }
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let first = register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        let registered_before = registered_events(&svc, &ws).await;
+
+        let fetches_before = forge.fetches();
+        let refused = svc
+            .pr_monitor_start_op(&ws, &sibling, 42, None)
+            .await
+            .expect("a refusal is a payload, not an error");
+        assert_eq!(refused["ok"], json!(false), "{refused}");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(refused["reason"], json!("already-monitored"), "{refused}");
+        assert_eq!(
+            refused["ownerAgentId"],
+            json!(owner.to_string()),
+            "{refused}"
+        );
+        assert_eq!(refused["ownerAgentName"], json!("Owner"), "{refused}");
+        assert_eq!(refused["monitorId"], json!(first.monitor_id), "{refused}");
+        assert_eq!(refused["repo"], json!("o/r"), "{refused}");
+        assert_eq!(refused["prNumber"], json!(42), "{refused}");
+        let instruction = refused["instruction"].as_str().expect("instruction");
+        assert!(instruction.contains("o/r#42"), "{instruction}");
+        assert!(instruction.contains("Owner (agent-prmon)"), "{instruction}");
+        assert!(instruction.contains("ws.agent.send"), "{instruction}");
+        assert!(instruction.contains("relay the events"), "{instruction}");
+        assert!(
+            instruction.contains("relinquish the monitor via ws.pr.unmonitor"),
+            "{instruction}"
+        );
+        assert!(
+            instruction.contains("one-shot read of the PR's current state use ws.pr.snapshot"),
+            "{instruction}"
+        );
+        assert!(refused.get("monitor").is_none(), "{refused}");
+        assert!(refused.get("requirements").is_none(), "{refused}");
+
+        assert_eq!(
+            forge.fetches(),
+            fetches_before,
+            "refused before the forge fetch"
+        );
+        assert!(
+            svc.pr_monitors_for_agent(&sibling)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no row persisted for the refused caller"
+        );
+        let ws_view = svc.pr_monitor_list_op(&ws, None).await.expect("ws list");
+        let rows = ws_view["monitors"].as_array().expect("array");
+        assert_eq!(rows.len(), 1, "the workspace list stays single: {ws_view}");
+        assert_eq!(rows[0]["agentId"], json!(owner.to_string()));
+        assert_eq!(
+            registered_events(&svc, &ws).await,
+            registered_before,
+            "no prMonitor:registered event for the refused attempt"
+        );
+
+        // The direct-service path surfaces the same refusal as InvalidParams.
+        let err = svc
+            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .await
+            .expect_err("service path refuses too");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        assert!(err.to_string().contains("agent-prmon"), "{err}");
+
+        // The OWNER's own re-register is not a duplicate: it re-arms.
+        let rearmed = svc
+            .pr_monitor_start_op(&ws, &owner, 42, None)
+            .await
+            .expect("owner re-register");
+        assert_eq!(rearmed["ok"], json!(true), "{rearmed}");
+        assert_eq!(rearmed["monitor"]["monitorId"], json!(first.monitor_id));
+    }
+
+    /// An owner without a session name still yields a refusal —
+    /// `ownerAgentName` is simply omitted and the instruction names the id.
+    /// (A deleted owner session cascades its monitor rows away, so it can
+    /// never be the holder.)
+    #[tokio::test]
+    async fn a_refusal_omits_the_owner_name_when_the_owner_is_unnamed() {
+        let (_db, _root, svc, _forge, ws, _named) = setup().await;
+        let mut unnamed = agent(&ws, "agent-unnamed");
+        unnamed.name = String::new();
+        unnamed.name_explicitly_set = false;
+        svc.store()
+            .insert_agent_session(&unnamed)
+            .await
+            .expect("unnamed owner");
+        let owner = unnamed.id.clone();
+        register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+
+        let refused = svc
+            .pr_monitor_start_op(&ws, &sibling, 42, None)
+            .await
+            .expect("refusal");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(refused["ownerAgentId"], json!(owner.to_string()));
+        assert!(refused.get("ownerAgentName").is_none(), "{refused}");
+        assert!(
+            refused["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("by agent agent-unnamed;"),
+            "{refused}"
+        );
+    }
+
+    /// Only ACTIVE monitors block: once the owner cancels (or the monitor
+    /// completes on merge), another agent registers successfully.
+    #[tokio::test]
+    async fn a_cancelled_or_completed_monitor_no_longer_blocks_another_agent() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+
+        // Cancelled by the owner (`ws.pr.unmonitor`) → sibling registers.
+        register(&svc, &ws, &owner).await;
+        svc.pr_monitor_stop_op(&ws, &owner, 42, None)
+            .await
+            .expect("owner unmonitor");
+        let taken = svc
+            .pr_monitor_start_op(&ws, &sibling, 42, None)
+            .await
+            .expect("sibling register after cancel");
+        assert_eq!(taken["ok"], json!(true), "{taken}");
+        assert_eq!(taken["monitor"]["agentId"], json!(sibling.to_string()));
+        // ...and now the roles are reversed: the owner is refused.
+        let refused = svc
+            .pr_monitor_start_op(&ws, &owner, 42, None)
+            .await
+            .expect("refusal");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(refused["ownerAgentId"], json!(sibling.to_string()));
+
+        // Completed on merge → the PR is unmonitored again in the workspace.
+        forge.edit(|s| s.pr_state = PrState::Merged);
+        svc.poll_pr_monitors().await;
+        forge.edit(|s| s.pr_state = PrState::Open);
+        let again = svc
+            .pr_monitor_start_op(&ws, &owner, 42, None)
+            .await
+            .expect("register after completion");
+        assert_eq!(again["ok"], json!(true), "{again}");
+        assert_eq!(again["monitor"]["agentId"], json!(owner.to_string()));
+    }
+
+    /// The uniqueness is per WORKSPACE: the same PR monitored from two
+    /// workspaces is two independent monitors.
+    #[tokio::test]
+    async fn the_same_pr_in_another_workspace_is_not_a_duplicate() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        register(&svc, &ws, &owner).await;
+        let (ws2, other) = sibling_workspace(&svc, "agent-elsewhere").await;
+
+        let started = svc
+            .pr_monitor_start_op(&ws2, &other, 42, None)
+            .await
+            .expect("cross-workspace register");
+        assert_eq!(started["ok"], json!(true), "{started}");
+        assert_eq!(started["monitor"]["agentId"], json!(other.to_string()));
+        assert_eq!(
+            svc.pr_monitor_list_op(&ws, None).await.unwrap()["monitors"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            svc.pr_monitor_list_op(&ws2, None).await.unwrap()["monitors"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    /// Forge repo slugs are case-insensitive: a `repo` override that differs
+    /// from the monitored slug only by case is the SAME PR — the owner's
+    /// re-register re-arms the existing row (no second monitor, stored
+    /// casing untouched), a sibling's register is refused naming the owner,
+    /// and the owner's `ws.pr.unmonitor` under the variant cancels the row.
+    #[tokio::test]
+    async fn repo_slug_case_variants_identify_the_same_monitor() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let first = register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+
+        let rearmed = svc
+            .pr_monitor_start_op(&ws, &owner, 42, Some("O/R".into()))
+            .await
+            .expect("owner re-register under a case variant");
+        assert_eq!(rearmed["ok"], json!(true), "{rearmed}");
+        assert_eq!(rearmed["monitor"]["monitorId"], json!(first.monitor_id));
+        assert_eq!(
+            rearmed["monitor"]["repo"],
+            json!("o/r"),
+            "the stored casing is what the row reports"
+        );
+        assert_eq!(
+            svc.pr_monitors_for_agent(&owner).await.unwrap().len(),
+            1,
+            "no second monitor"
+        );
+
+        let refused = svc
+            .pr_monitor_start_op(&ws, &sibling, 42, Some("O/r".into()))
+            .await
+            .expect("refusal is a payload");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(refused["ownerAgentId"], json!(owner.to_string()));
+        assert_eq!(refused["monitorId"], json!(first.monitor_id));
+
+        let stopped = svc
+            .pr_monitor_stop_op(&ws, &owner, 42, Some("o/R".into()))
+            .await
+            .expect("owner unmonitor under a case variant");
+        assert_eq!(stopped["monitor"]["monitorId"], json!(first.monitor_id));
+        assert_eq!(stopped["monitor"]["state"], json!("cancelled"));
+        assert!(svc
+            .store()
+            .find_active_pr_monitor_in_workspace(&ws, "o", "r", 42)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The sweep's per-PR fetch key folds slug case, so monitors on case
+    /// variants of one PR (two workspaces here — one workspace never holds
+    /// two) share a single forge fetch per tick.
+    #[tokio::test]
+    async fn case_variant_monitors_share_one_fetch_per_sweep() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        svc.pr_monitor_register(&ws, &owner, "o", "r", 42)
+            .await
+            .expect("register");
+        let (ws2, other) = sibling_workspace(&svc, "agent-elsewhere").await;
+        svc.pr_monitor_register(&ws2, &other, "O", "R", 42)
+            .await
+            .expect("register case variant");
+
+        let before = forge.fetches();
+        svc.poll_pr_monitors().await;
+        assert_eq!(
+            forge.fetches() - before,
+            1,
+            "one shared fetch for the case-variant pair"
+        );
+    }
+
     #[tokio::test]
     async fn multiple_changes_coalesce_into_one_debounced_wake() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
@@ -4229,8 +4669,8 @@ mod tests {
         assert!(text.contains("cancelled from the app"), "{text}");
     }
 
-    /// Insert a second agent in the fixture workspace so a second monitor
-    /// can watch the SAME PR (a monitor is unique per (agent, repo, pr)).
+    /// Insert a second agent in the fixture workspace (for a monitor on a
+    /// DIFFERENT PR — a workspace holds one active monitor per PR).
     async fn second_agent(svc: &Services, ws: &WorkspaceId, id: &str) -> AgentId {
         svc.store()
             .insert_agent_session(&agent(ws, id))
@@ -4239,14 +4679,31 @@ mod tests {
         AgentId::from(id)
     }
 
+    /// A second workspace on the same `o/r` repo with its own agent, so a
+    /// sibling monitor can watch the SAME PR: monitors are unique per
+    /// (workspace, repo, pr), and the shared-fetch sweep still groups
+    /// siblings across workspaces.
+    async fn sibling_workspace(svc: &Services, id: &str) -> (WorkspaceId, AgentId) {
+        let ws = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("sibling workspace");
+        svc.store()
+            .insert_agent_session(&agent(&ws, id))
+            .await
+            .expect("sibling agent");
+        (ws, AgentId::from(id))
+    }
+
     #[tokio::test]
     async fn sweep_fetches_each_pr_once_across_sibling_monitors() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
         let svc = svc.with_pr_monitor_debounce_seconds(3600);
         let first = register(&svc, &ws, &owner).await;
-        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        let (ws2, sibling) = sibling_workspace(&svc, "agent-sibling").await;
         let second = svc
-            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .pr_monitor_register(&ws2, &sibling, "o", "r", 42)
             .await
             .expect("sibling register")
             .0;
@@ -4282,9 +4739,9 @@ mod tests {
     async fn sweep_dedupes_failed_fetches_and_records_the_error_on_every_sibling() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
         let first = register(&svc, &ws, &owner).await;
-        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        let (ws2, sibling) = sibling_workspace(&svc, "agent-sibling").await;
         let second = svc
-            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .pr_monitor_register(&ws2, &sibling, "o", "r", 42)
             .await
             .expect("sibling register")
             .0;
@@ -4373,9 +4830,9 @@ mod tests {
         // Comments move BETWEEN the registrations: first's baseline stays at
         // 0 comments, the sibling's registration fetch stamps 2.
         forge.edit(|s| s.conversation_comments = 2);
-        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        let (ws2, sibling) = sibling_workspace(&svc, "agent-sibling").await;
         let second = svc
-            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .pr_monitor_register(&ws2, &sibling, "o", "r", 42)
             .await
             .expect("sibling register")
             .0;
@@ -4721,15 +5178,16 @@ mod tests {
         let svc = svc
             .with_pr_monitor_poll_seconds(30)
             .with_pr_monitor_hourly_request_budget(1500);
-        let sibling = AgentId::from("agent-prmon-sibling");
-        svc.store()
-            .insert_agent_session(&agent(&ws, "agent-prmon-sibling"))
-            .await
-            .expect("sibling agent");
+        let (ws2, sibling) = sibling_workspace(&svc, "agent-prmon-sibling").await;
         let mut ids = Vec::new();
-        for (pr, who) in [(1_u64, &owner), (1, &sibling), (2, &owner), (3, &owner)] {
+        for (pr, ws, who) in [
+            (1_u64, &ws, &owner),
+            (1, &ws2, &sibling),
+            (2, &ws, &owner),
+            (3, &ws, &owner),
+        ] {
             let (m, _) = svc
-                .pr_monitor_register(&ws, who, "o", "r", pr)
+                .pr_monitor_register(ws, who, "o", "r", pr)
                 .await
                 .expect("register");
             backdate(&svc, &m.monitor_id, &format!("2020-01-01T00:00:0{pr}Z")).await;
@@ -4962,15 +5420,11 @@ mod tests {
         let svc = svc
             .with_pr_monitor_poll_seconds(30)
             .with_pr_monitor_hourly_request_budget(1500);
-        let sibling = AgentId::from("agent-prmon-sibling");
-        svc.store()
-            .insert_agent_session(&agent(&ws, "agent-prmon-sibling"))
-            .await
-            .expect("sibling agent");
+        let (ws2, sibling) = sibling_workspace(&svc, "agent-prmon-sibling").await;
         for pr in 1..=4_u64 {
-            for who in [&owner, &sibling] {
+            for (ws, who) in [(&ws, &owner), (&ws2, &sibling)] {
                 let (m, _) = svc
-                    .pr_monitor_register(&ws, who, "o", "r", pr)
+                    .pr_monitor_register(ws, who, "o", "r", pr)
                     .await
                     .expect("register");
                 backdate(&svc, &m.monitor_id, "2020-01-01T00:00:00Z").await;
@@ -5001,11 +5455,7 @@ mod tests {
             .with_pr_monitors_max_per_agent(20)
             .with_pr_monitor_poll_seconds(30)
             .with_pr_monitor_hourly_request_budget(1500);
-        let sibling = AgentId::from("agent-prmon-sibling");
-        svc.store()
-            .insert_agent_session(&agent(&ws, "agent-prmon-sibling"))
-            .await
-            .expect("sibling agent");
+        let (ws2, sibling) = sibling_workspace(&svc, "agent-prmon-sibling").await;
         let fresh_stamp = (time::OffsetDateTime::now_utc() - time::Duration::seconds(50))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
@@ -5021,7 +5471,7 @@ mod tests {
             )
             .await;
             let (fresh, _) = svc
-                .pr_monitor_register(&ws, &sibling, "o", "r", pr)
+                .pr_monitor_register(&ws2, &sibling, "o", "r", pr)
                 .await
                 .expect("register sibling");
             backdate(&svc, &fresh.monitor_id, &fresh_stamp).await;
