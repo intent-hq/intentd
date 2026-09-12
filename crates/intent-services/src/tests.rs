@@ -2452,6 +2452,50 @@ async fn set_content_stale_expected_version_without_base_is_lww() {
     assert_eq!(stored.rev, 2);
 }
 
+/// Only a rev the writer could have read merges: an `expectedVersion` ABOVE
+/// the stored rev was never served by this note, so it is the plain
+/// optimistic-concurrency mismatch (`Conflict`, `-32005` carrying the current
+/// row) — not a stale base that resolves to the newest snapshot and lets the
+/// incoming text land as an exact write.
+#[tokio::test]
+async fn set_content_future_expected_version_conflicts_without_writing() {
+    let (_tmp, svc, ws, id) = setup_versioned("body").await;
+    svc.set_note_content(ws.clone(), id.clone(), "body v1".into(), false, None, None)
+        .await
+        .expect("bump to rev 1");
+
+    let r = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "impossible base".into(),
+            false,
+            Some(7),
+            None,
+        )
+        .await;
+    match r {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], serde_json::json!(1));
+            assert_eq!(current["content"], serde_json::json!("body v1"));
+        }
+        other => panic!("future expectedVersion must be Conflict, got {other:?}"),
+    }
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "body v1", "nothing persisted");
+    assert_eq!(stored.rev, 1, "rev unchanged");
+    assert_eq!(
+        svc.store
+            .list_note_versions(&ws, &id)
+            .await
+            .expect("versions")
+            .len(),
+        2,
+        "no extra snapshot appended"
+    );
+}
+
 /// Conflict stays where it belongs (AC 6): the non-merging conditional writes
 /// — `note.update` (metadata arm), `note.updateMetadata`, `note.delete` —
 /// still surface a stale `expectedVersion` as `Conflict` (`-32005`).

@@ -8766,24 +8766,32 @@ struct SetContentMerge {
     conflicting_spans: usize,
 }
 
-/// Resolve what a `note.setContent` write persists on top of `current`
-/// (stored at `current_rev`). An absent or matching `expected_version` is the
-/// exact path (`incoming` replaces `current`). A stale `expected_version`
-/// recovers the writer's base via [`Store::get_note_version_content_by_rev`]
-/// and applies the writer's intent onto `current` with
-/// [`note_merge::three_way_merge`]; when no snapshot survives for that rev the
-/// write degrades to honest last-writer-wins.
+/// Resolve what a `note.setContent` write persists on top of the stored
+/// `current` row. An absent or matching `expected_version` is the exact path
+/// (`incoming` replaces the current text). A stale `expected_version` (below
+/// `current.rev`) recovers the writer's base via
+/// [`Store::get_note_version_content_by_rev`] and applies the writer's intent
+/// onto the current text with [`note_merge::three_way_merge`]; when no
+/// snapshot survives for that rev the write degrades to honest
+/// last-writer-wins. Only revs that could have been read merge: an
+/// `expected_version` above `current.rev` was never served by this note, so
+/// it is the plain optimistic-concurrency mismatch (`Error::Conflict`,
+/// `-32005`) rather than a base to merge from.
 async fn merge_set_content(
     store: &Store,
     workspace_id: &WorkspaceId,
     note_id: &NoteId,
-    current: &str,
-    current_rev: i64,
+    current: &Note,
     incoming: &str,
     expected_version: Option<i64>,
 ) -> Result<SetContentMerge> {
     let stale = match expected_version {
-        Some(v) if v != current_rev => v,
+        Some(v) if v > current.rev => {
+            let current = serde_json::to_value(current)
+                .map_err(|e| Error::Internal(format!("encode current note failed: {e}")))?;
+            return Err(Error::Conflict { current });
+        }
+        Some(v) if v < current.rev => v,
         _ => {
             return Ok(SetContentMerge {
                 text: incoming.to_string(),
@@ -8793,6 +8801,7 @@ async fn merge_set_content(
             })
         }
     };
+    let current = current.content.as_str();
     match store
         .get_note_version_content_by_rev(workspace_id, note_id, stale)
         .await?
@@ -8896,10 +8905,11 @@ struct ContentWrite<'a> {
 /// (`note.setContent` and the surgical `note.add` / `note.edit` /
 /// `note.editLines`): each attempt fetches the current row, resolves what to
 /// persist with [`merge_set_content`] (`incoming` verbatim when
-/// `expected_version` is absent or matches the current rev; otherwise the
-/// writer's intent three-way-merged onto the current text from the snapshot at
-/// `expected_version`, degrading to last-writer-wins when no snapshot
-/// survives), applies `policy`, runs comment-anchor recovery, and persists
+/// `expected_version` is absent or matches the current rev; when it is below
+/// the current rev, the writer's intent three-way-merged onto the current text
+/// from the snapshot at `expected_version`, degrading to last-writer-wins when
+/// no snapshot survives; when it is above the current rev, `Conflict` without
+/// a write), applies `policy`, runs comment-anchor recovery, and persists
 /// gated on the rev it read via [`persist_note_content`] — so a write that
 /// lands in between is merged into on the next attempt rather than
 /// overwritten. The last attempt's `Conflict` propagates unchanged.
@@ -8930,8 +8940,7 @@ async fn persist_merged_content(
             store,
             workspace_id,
             note_id,
-            &old_content,
-            current_rev,
+            &note,
             incoming,
             expected_version,
         )
