@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.48] - 2026-09-12
+
+### 🐛 Bug Fixes
+
+- *(intent-git)* Make test atexit cleanup compile on Windows ([#1835](https://github.com/intent-hq/intentd/pull/1835))
+
+### 🧪 Testing
+
+- *(script-ops)* Bound harness waits inside nextest's terminate budget and reap PTYs on drop ([#1833](https://github.com/intent-hq/intentd/pull/1833))
+- Make test scratch dirs self-cleaning ([#1825](https://github.com/intent-hq/intentd/pull/1825))
+
+### ⚙️ Miscellaneous Tasks
+
+- Lint Windows-gated code with clippy on the windows-msvc build job ([#1820](https://github.com/intent-hq/intentd/pull/1820))
+
+
 ## [0.9.47] - 2026-09-12
 
 ### 🐛 Bug Fixes
