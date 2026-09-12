@@ -270,10 +270,12 @@ fn create_test_repo() -> tempfile::TempDir {
 /// order, for both restart flavors:
 ///
 /// 1. Auto-restart: a service that outlives the too-fast floor (2s) and then
-///    exits emits `running` → `exited` → `restarting` (counter bumped to 1)
-///    strictly before the respawn's `running`.
+///    exits emits `starting` (the `script.start` launch window,
+///    intent-hq/intent#4858) → `running` → `exited` → `restarting` (counter
+///    bumped to 1) strictly before the respawn's `running`.
 /// 2. `script.restart`: the manual stop→start gap emits `exited` →
-///    `restarting` (counter reset to 0) → `running`.
+///    `restarting` (counter reset to 0) → `running` — no `starting`, the gap
+///    keeps its own status.
 #[tokio::test]
 async fn restarting_status_is_observable_over_wss() {
     let data_dir_guard = scratch_dir("data");
@@ -337,9 +339,30 @@ async fn restarting_status_is_observable_over_wss() {
     )
     .await;
     assert_eq!(started["ok"], json!(true));
+    // A status read issued right after the `script.start` reply never observes
+    // the pre-launch `idle` (intent-hq/intent#4858). Only the negative is
+    // asserted: the service exits on its own after three seconds, so a slow
+    // round trip may legitimately read a later state — the subscribed stream
+    // below checks the launch/restart sequence.
+    let status = wss_rpc(
+        &mut rpc,
+        14,
+        "script.status",
+        json!({ "workspaceId": ws_id, "scriptId": "restarting-1" }),
+    )
+    .await;
+    assert_ne!(
+        status["status"], "idle",
+        "status after start reply: {status}"
+    );
 
-    // Auto-restart cycle: running → exited → restarting → running, in strict
-    // stream order (nothing else can interleave on the state stream).
+    // Launch + auto-restart cycle: starting → running → exited → restarting →
+    // running, in strict stream order (nothing else can interleave on the
+    // state stream). `starting` is published before `script.start` replies,
+    // so a status read after the reply never sees the pre-launch `idle`.
+    let st = next_state(&mut sub, "restarting-1", 120).await;
+    assert_eq!(st["status"], "starting", "launch window: {st}");
+    assert!(st["pid"].is_null(), "no pid before the spawn: {st}");
     let st = next_state(&mut sub, "restarting-1", 120).await;
     assert_eq!(st["status"], "running", "first run: {st}");
     let st = next_state(&mut sub, "restarting-1", 120).await;

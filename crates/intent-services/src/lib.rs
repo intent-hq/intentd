@@ -674,11 +674,9 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
-    /// Test park seams (monorepo#1180, monorepo#1194) for the `script.*` race
-    /// windows (supervisor pre-registration, `start()` spawn-to-registration).
-    /// All `None` in production wiring; tests inject via the
-    /// `#[cfg(test)]`-only `with_script_supervise_park` /
-    /// `with_script_start_registration_park`.
+    /// Test park seam (monorepo#1180) for the `script.*` supervisor
+    /// pre-registration race window. `None` in production wiring; tests
+    /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
     script_parks: script_ops::ScriptParks,
     /// Test park seam (issue intent-hq/monorepo#1468 follow-up) for the
     /// completion-delivery classify→mark window: parks
@@ -1856,19 +1854,6 @@ impl Services {
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
         self.script_parks.supervise = Some(park);
-        self
-    }
-
-    /// Test seam (monorepo#1194): park `script.start` between spawning the
-    /// supervisor task and taking the registration lock so remove+recreate
-    /// races inside that window are deterministic. Production wiring keeps
-    /// `None` (no parking).
-    #[cfg(test)]
-    pub(crate) fn with_script_start_registration_park(
-        mut self,
-        park: Arc<script_ops::SupervisePark>,
-    ) -> Self {
-        self.script_parks.start_registration = Some(park);
         self
     }
 
@@ -16398,7 +16383,7 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.start(&workspace_id, &script_id).await })
+        Box::pin(async move { mgr.start(&workspace_id, &script_id) })
     }
 
     fn script_stop(
