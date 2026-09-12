@@ -29154,6 +29154,17 @@ mod clone_orchestration {
         dir
     }
 
+    /// Init a small git repo at `<tmp>/Mixed-Owner/Mixed-Repo`: explicitly
+    /// mixed-case owner/repo segments so the raw `file://` pair always
+    /// differs from the case-folded cache slot, regardless of the tempdir's
+    /// random suffix. Returns the guard and the repo path.
+    fn seed_mixed_case_repo(prefix: &str) -> (TempDir, PathBuf) {
+        let dir = unique_dir(prefix);
+        let repo_dir = dir.0.join("Mixed-Owner").join("Mixed-Repo");
+        seed_repo_at(&repo_dir);
+        (dir, repo_dir)
+    }
+
     /// Init a small git repo with one commit at `dir` (created if missing).
     fn seed_repo_at(dir: &std::path::Path) {
         std::fs::create_dir_all(dir).unwrap();
@@ -29188,11 +29199,13 @@ mod clone_orchestration {
     }
 
     /// Expected `<root>/.repo-cache/<owner>/<repo>` slot for `url`. The cache
-    /// key comes from the host-agnostic URL parse; persisted owner/name do
+    /// key comes from the host-agnostic URL parse, case-folded exactly as the
+    /// daemon folds it (`RepoRef::identity_parts`); persisted owner/name do
     /// not (only strict `github.com` URLs seed them), so tests must not
     /// derive the slot from the workspace row.
     fn expected_cache_dir(root: &std::path::Path, url: &str) -> PathBuf {
         let (owner, repo) = crate::clone_ops::parse_owner_repo(url).expect("owner/repo");
+        let (owner, repo) = intent_core::RepoRef::new(owner, repo).identity_parts();
         root.join(".repo-cache").join(owner).join(repo)
     }
 
@@ -29498,7 +29511,7 @@ mod clone_orchestration {
     /// does not seed `repositoryOwner` (basename fallback still names the row).
     #[tokio::test]
     async fn create_hydrates_from_cache_on_miss() {
-        let source = seed_repo("intentd-hydrate-src");
+        let (_source, source_dir) = seed_mixed_case_repo("intentd-hydrate-src");
         let root = unique_dir("intentd-hydrate-root");
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29508,7 +29521,7 @@ mod clone_orchestration {
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
 
-        let url = format!("file://{}", source.0.to_string_lossy());
+        let url = format!("file://{}", source_dir.to_string_lossy());
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
@@ -29564,7 +29577,7 @@ mod clone_orchestration {
     /// and hydrates a second, independent checkout.
     #[tokio::test]
     async fn second_create_hydrates_from_refreshed_cache_without_reclone() {
-        let source = seed_repo("intentd-hydrate2-src");
+        let (_source, source_dir) = seed_mixed_case_repo("intentd-hydrate2-src");
         let root = unique_dir("intentd-hydrate2-root");
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29573,7 +29586,7 @@ mod clone_orchestration {
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
-        let url = format!("file://{}", source.0.to_string_lossy());
+        let url = format!("file://{}", source_dir.to_string_lossy());
         let ws1 = svc
             .create_workspace(
                 WorkspaceCreate {
@@ -29802,7 +29815,7 @@ mod clone_orchestration {
     /// untouched for future creates.
     #[tokio::test]
     async fn delete_hydrated_workspace_removes_checkout_keeps_cache() {
-        let source = seed_repo("intentd-hydrate-del-src");
+        let (_source, source_dir) = seed_mixed_case_repo("intentd-hydrate-del-src");
         let root = unique_dir("intentd-hydrate-del-root");
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29811,7 +29824,7 @@ mod clone_orchestration {
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
-        let url = format!("file://{}", source.0.to_string_lossy());
+        let url = format!("file://{}", source_dir.to_string_lossy());
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
@@ -30365,7 +30378,7 @@ mod repo_warm_cache {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use intent_core::{Error, WorkspaceApi};
+    use intent_core::{Error, RepoRef, WorkspaceApi};
     use intent_store::Store;
 
     use super::{test_tempdir, TempDb};
@@ -30379,7 +30392,17 @@ mod repo_warm_cache {
         TempDir(guard.path().to_path_buf(), guard)
     }
 
-    /// Init a small git repo with one commit; returns the guard.
+    /// The on-disk cache slot for `owner`/`repo`: the daemon case-folds both
+    /// segments (`RepoRef::identity_parts`) while the warm result echoes the
+    /// raw case, so the raw pair must be folded before joining.
+    fn cache_slot(root: &std::path::Path, owner: &str, repo: &str) -> PathBuf {
+        let (owner, repo) = RepoRef::new(owner, repo).identity_parts();
+        root.join(".repo-cache").join(owner).join(repo)
+    }
+
+    /// Init a small git repo with one commit; returns the guard. Pass a
+    /// mixed-case `prefix` so the repo segment (the dir name) always differs
+    /// from its case-folded cache slot.
     fn seed_repo(prefix: &str) -> TempDir {
         let dir = unique_dir(prefix);
         let repo = git2::Repository::init(&dir.0).unwrap();
@@ -30415,10 +30438,11 @@ mod repo_warm_cache {
         loop {
             match svc.repo_warm_cache(url.to_string()).await {
                 Ok(v) => {
-                    let cache = root
-                        .join(".repo-cache")
-                        .join(v["owner"].as_str().unwrap())
-                        .join(v["repo"].as_str().unwrap());
+                    let cache = cache_slot(
+                        root,
+                        v["owner"].as_str().unwrap(),
+                        v["repo"].as_str().unwrap(),
+                    );
                     // The accepted re-warm proves the flag cleared; the
                     // populated cache proves the first ensure ran.
                     assert!(cache.join(".git").exists(), "repo cache populated");
@@ -30441,7 +30465,7 @@ mod repo_warm_cache {
     /// in-flight flag so a later warm is accepted again.
     #[tokio::test]
     async fn warm_starts_populates_cache_and_clears_flag() {
-        let source = seed_repo("intentd-warm-src");
+        let source = seed_repo("Intentd-Warm-Src");
         let root = unique_dir("intentd-warm-root");
         let (svc, _db) = services_with_root(&root).await;
 
@@ -30470,16 +30494,16 @@ mod repo_warm_cache {
     /// while the lock holder runs on the blocking pool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn second_warm_rejected_while_in_flight() {
-        let source = seed_repo("intentd-warm-busy-src");
+        let source = seed_repo("Intentd-Warm-Busy-Src");
         let root = unique_dir("intentd-warm-busy-root");
         let (svc, _db) = services_with_root(&root).await;
 
         let url = format!("file://{}", source.0.to_string_lossy());
         let (owner, repo) = crate::clone_ops::parse_owner_repo(&url).unwrap();
-        let cache_path = root.0.join(".repo-cache").join(&owner).join(&repo);
+        let cache_path = cache_slot(&root.0, &owner, &repo);
 
-        // Park the warm's ensure behind the per-repo cache lock so the
-        // in-flight window is deterministic.
+        // Park the warm's ensure behind the per-repo cache lock (keyed by
+        // the case-folded slot) so the in-flight window is deterministic.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
         let lock_holder = tokio::spawn(async move {
