@@ -16002,31 +16002,40 @@ impl WorkspaceApi for Services {
                     ))
                 }
             };
-            // Payload identity for the idempotency binding: the base64 arm
+            // Payload identity for the idempotency lookup: the base64 arm
             // hashes the decoded bytes; the sourcePath arm fingerprints on
             // `(fileName, size)` only (a possibly huge local file is not
             // re-read for a hash; b31e decision D). An unreadable source
-            // leaves the fingerprint unset and lets placement classify it.
-            let fingerprint = idempotency_key.as_ref().and_then(|_| match &source {
+            // leaves the lookup fingerprint unset and lets placement
+            // classify it. The BOUND fingerprint takes its size from the
+            // placed bytes (see `KeyedPlacement`).
+            let idempotency = idempotency_key.map(|key| match &source {
                 file_ops::AttachmentSource::Bytes(bytes) => {
-                    Some(attachment_upload::attachment_fingerprint(
-                        &file_name,
-                        bytes.len() as u64,
-                        Some(&attachment_upload::sha256_hex(bytes)),
-                    ))
+                    let sha = attachment_upload::sha256_hex(bytes);
+                    attachment_upload::KeyedPlacement {
+                        key,
+                        lookup_fingerprint: Some(attachment_upload::attachment_fingerprint(
+                            &file_name,
+                            bytes.len() as u64,
+                            Some(&sha),
+                        )),
+                        sha256: Some(sha),
+                    }
                 }
-                file_ops::AttachmentSource::CopyFrom(src) => {
-                    std::fs::metadata(src).ok().map(|md| {
+                file_ops::AttachmentSource::CopyFrom(src) => attachment_upload::KeyedPlacement {
+                    key,
+                    lookup_fingerprint: std::fs::metadata(src).ok().map(|md| {
                         attachment_upload::attachment_fingerprint(&file_name, md.len(), None)
-                    })
-                }
+                    }),
+                    sha256: None,
+                },
             });
             self.place_attachment_registered(
                 workspace_id,
                 &file_name,
                 &source,
                 mime_type,
-                idempotency_key.map(|key| (key, fingerprint)),
+                idempotency,
             )
             .await
         })

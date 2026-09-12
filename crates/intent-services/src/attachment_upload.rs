@@ -190,6 +190,20 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 
 const CONFLICTING_PAYLOAD: &str = "idempotencyKey already used with a different payload";
 
+/// A keyed placement request (intent-hq/intent#4691).
+pub(crate) struct KeyedPlacement {
+    pub(crate) key: String,
+    /// Payload identity for the pre-placement replay / conflict lookup.
+    /// `None` (an unreadable `sourcePath`) skips the lookup so placement
+    /// classifies the source error.
+    pub(crate) lookup_fingerprint: Option<String>,
+    /// SHA-256 part of the bound fingerprint (base64 + chunked arms). The
+    /// size part is always the PLACED byte length, never a pre-copy stat —
+    /// a `sourcePath` file resized between stat and copy would otherwise
+    /// bind a size the attachment does not have.
+    pub(crate) sha256: Option<String>,
+}
+
 /// Per-`(workspace, idempotencyKey)` in-flight locks for keyed placements
 /// (see `Services::attachment_idempotency_inflight`).
 pub(crate) type IdempotencyInflight =
@@ -285,12 +299,13 @@ impl Services {
     /// `file.attachmentUpload.commit` (PROTOCOL §5.9): resolves the
     /// workspace root, ensures the `.intent/` exclusion, places the payload
     /// collision-safely, and registers it under a daemon-minted UUID. With
-    /// `idempotency` = `(key, fingerprint)` (intent-hq/intent#4691) the
-    /// whole sequence runs under the key's in-flight guard: a live binding
-    /// with the same fingerprint short-circuits to the ORIGINAL result plus
+    /// a [`KeyedPlacement`] (intent-hq/intent#4691) the whole sequence runs
+    /// under the key's in-flight guard: a live binding with the same
+    /// fingerprint short-circuits to the ORIGINAL result plus
     /// `replayed: true` (nothing placed), a live binding with a different
     /// fingerprint is `InvalidParams`, and a fresh key is bound in the same
-    /// store transaction as the registry row. An unset fingerprint (an
+    /// store transaction as the registry row — with the fingerprint's size
+    /// taken from the placed bytes. An unset lookup fingerprint (an
     /// unreadable `sourcePath`) skips the lookup so placement classifies the
     /// source error; the primary key still rejects a double bind.
     pub(crate) async fn place_attachment_registered(
@@ -299,23 +314,23 @@ impl Services {
         file_name: &str,
         source: &crate::file_ops::AttachmentSource<'_>,
         mime_type: Option<String>,
-        idempotency: Option<(String, Option<String>)>,
+        idempotency: Option<KeyedPlacement>,
     ) -> Result<serde_json::Value> {
-        let Some((key, fingerprint)) = idempotency else {
+        let Some(keyed) = idempotency else {
             return self
                 .place_attachment_registered_inner(workspace_id, file_name, source, mime_type, None)
                 .await;
         };
         self.sweep_expired_attachment_idempotency_keys().await;
-        let lock = self.idempotency_inflight_lock(&workspace_id, &key);
+        let lock = self.idempotency_inflight_lock(&workspace_id, &keyed.key);
         let result = {
             let _guard = lock.lock().await;
-            let bound = match &fingerprint {
+            let bound = match &keyed.lookup_fingerprint {
                 Some(_) => {
                     self.store
                         .get_attachment_by_idempotency_key(
                             &workspace_id,
-                            &key,
+                            &keyed.key,
                             &idempotency_retention_cutoff(),
                         )
                         .await
@@ -325,7 +340,7 @@ impl Services {
             match bound {
                 Err(e) => Err(e),
                 Ok(Some((binding, record))) => {
-                    if Some(&binding.fingerprint) == fingerprint.as_ref() {
+                    if Some(&binding.fingerprint) == keyed.lookup_fingerprint.as_ref() {
                         Ok(replayed_placement_result(&record))
                     } else {
                         Err(Error::InvalidParams(CONFLICTING_PAYLOAD.to_string()))
@@ -337,23 +352,25 @@ impl Services {
                         file_name,
                         source,
                         mime_type,
-                        Some((key.as_str(), fingerprint.as_deref().unwrap_or_default())),
+                        Some((keyed.key.as_str(), keyed.sha256.as_deref())),
                     )
                     .await
                 }
             }
         };
-        self.release_idempotency_inflight_lock(&workspace_id, &key, &lock);
+        self.release_idempotency_inflight_lock(&workspace_id, &keyed.key, &lock);
         result
     }
 
+    /// `idempotency` = `(key, sha256)`: the key is bound to
+    /// `(fileName, placed size, sha256)`.
     async fn place_attachment_registered_inner(
         &self,
         workspace_id: WorkspaceId,
         file_name: &str,
         source: &crate::file_ops::AttachmentSource<'_>,
         mime_type: Option<String>,
-        idempotency: Option<(&str, &str)>,
+        idempotency: Option<(&str, Option<&str>)>,
     ) -> Result<serde_json::Value> {
         let store = &self.store;
         let root = crate::file_ops::resolve_root(store, &workspace_id, None).await;
@@ -396,9 +413,11 @@ impl Services {
             stored_path: result["path"].as_str().unwrap_or_default().to_string(),
         };
         let inserted = match idempotency {
-            Some((key, fingerprint)) => {
+            Some((key, sha256)) => {
+                let placed_size = result["size"].as_u64().unwrap_or_default();
+                let fingerprint = attachment_fingerprint(file_name, placed_size, sha256);
                 store
-                    .insert_attachment_with_idempotency_key(&record, key, fingerprint)
+                    .insert_attachment_with_idempotency_key(&record, key, &fingerprint)
                     .await
             }
             None => store.insert_attachment(&record).await,
@@ -535,23 +554,31 @@ impl Services {
             expired_dirs = drain_expired_sessions(&mut uploads);
             // A live session already holding this key in this workspace:
             // same identity ⇒ hand back its uploadId (the begin reply was
-            // lost); different identity ⇒ conflict. Checked under the same
-            // lock hold as the cap so two keyed begins cannot both open.
+            // lost) and treat the replay as activity, so a retry just under
+            // the idle TTL is not expired by its own next chunk; different
+            // identity ⇒ conflict. Checked under the same lock hold as the
+            // cap so two keyed begins cannot both open.
             let same_key = idempotency_key.as_ref().and_then(|key| {
                 uploads
-                    .iter()
+                    .iter_mut()
                     .find(|(_, s)| {
                         s.workspace_id == workspace_id && s.idempotency_key.as_ref() == Some(key)
                     })
-                    .map(|(id, s)| (id.clone(), s.fingerprint() == fingerprint))
+                    .map(|(id, s)| {
+                        let same_payload = s.fingerprint() == fingerprint;
+                        if same_payload {
+                            s.last_activity = Instant::now();
+                        }
+                        (id.clone(), s.staging_dir.clone(), same_payload)
+                    })
             });
             let live = uploads
                 .values()
                 .filter(|s| s.workspace_id == workspace_id)
                 .count();
-            if let Some((existing_id, same_payload)) = same_key {
+            if let Some((existing_id, existing_dir, same_payload)) = same_key {
                 if same_payload {
-                    Ok(Some(existing_id))
+                    Ok(Some((existing_id, existing_dir)))
                 } else {
                     Err(Error::InvalidParams(CONFLICTING_PAYLOAD.to_string()))
                 }
@@ -584,7 +611,17 @@ impl Services {
         for dir in expired_dirs {
             let _ = tokio::fs::remove_dir_all(&dir).await;
         }
-        if let Some(existing_id) = admitted? {
+        if let Some((existing_id, existing_dir)) = admitted? {
+            // The original begin registers its session before creating the
+            // staging dir, so a replay racing it could hand out an uploadId
+            // whose directory does not exist yet and fail the caller's first
+            // chunk. `create_dir_all` is idempotent and the session is live
+            // (the orphan sweep skips it), so creating it here is safe.
+            if let Err(e) = tokio::fs::create_dir_all(&existing_dir).await {
+                return Err(Error::Internal(format!(
+                    "create attachment upload staging dir failed: {e}"
+                )));
+            }
             return Ok(serde_json::json!({
                 "uploadId": existing_id,
                 "maxChunkBytes": ATTACHMENT_UPLOAD_MAX_CHUNK_BYTES,
@@ -918,15 +955,14 @@ impl Services {
         // leaves the session alive for retry or abort. The session's
         // idempotency key (if any) binds here with the chunked-arm
         // fingerprint — the verified declared size + SHA-256.
-        let idempotency = idempotency_key.map(|key| {
-            (
-                key,
-                Some(attachment_fingerprint(
-                    &file_name,
-                    declared_size,
-                    Some(&declared_sha),
-                )),
-            )
+        let idempotency = idempotency_key.map(|key| KeyedPlacement {
+            key,
+            lookup_fingerprint: Some(attachment_fingerprint(
+                &file_name,
+                declared_size,
+                Some(&declared_sha),
+            )),
+            sha256: Some(declared_sha.clone()),
         });
         let result = self
             .place_attachment_registered(
@@ -1309,6 +1345,183 @@ mod tests {
 
         // The other workspace's live session is untouched by the commit.
         assert_eq!(svc.attachment_uploads.lock().unwrap().len(), 1);
+    }
+
+    /// Regression (#1841 review): a keyed `sourcePath` placement binds the
+    /// key to the PLACED size, not the pre-copy stat. `/proc` files stat as
+    /// 0 bytes yet copy non-empty, so the two deterministically disagree;
+    /// the bound fingerprint must carry the copied length and a re-place of
+    /// the same (now stable) file must match it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn keyed_source_path_binds_placed_size_not_stat_size() {
+        let ws = WorkspaceId("ws-up-keyed-drift".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let src = "/proc/self/status";
+        assert_eq!(std::fs::metadata(src).unwrap().len(), 0, "precondition");
+        let placed = svc
+            .file_place_attachment(
+                ws.clone(),
+                "status.txt".to_string(),
+                None,
+                Some(src.to_string()),
+                None,
+                Some("key-drift".to_string()),
+            )
+            .await
+            .expect("keyed sourcePath place");
+        let placed_size = placed["size"].as_u64().unwrap();
+        assert!(placed_size > 0, "{placed}");
+
+        let (binding, _) = svc
+            .store()
+            .get_attachment_by_idempotency_key(
+                &ws,
+                "key-drift",
+                &super::idempotency_retention_cutoff(),
+            )
+            .await
+            .expect("lookup")
+            .expect("bound");
+        assert_eq!(
+            binding.fingerprint,
+            super::attachment_fingerprint("status.txt", placed_size, None),
+            "bound fingerprint must use the placed size"
+        );
+        assert_ne!(
+            binding.fingerprint,
+            super::attachment_fingerprint("status.txt", 0, None)
+        );
+    }
+
+    /// Regression (#1841 review): a keyed `begin` replay is activity. A
+    /// session idle just under the TTL that is replayed must not be swept
+    /// by the caller's very next op — the replay refreshes `last_activity`.
+    #[tokio::test]
+    async fn keyed_begin_replay_refreshes_last_activity() {
+        let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
+            "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
+            "100",
+        )]);
+        let ws = WorkspaceId("ws-up-keyed-refresh".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let payload = b"refresh-me".to_vec();
+        let sha = sha256_hex(&payload);
+        let key = Some("key-refresh".to_string());
+        let first = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "r.bin".to_string(),
+                payload.len() as u64,
+                sha.clone(),
+                None,
+                key.clone(),
+            )
+            .await
+            .expect("keyed begin");
+        let upload_id = first["uploadId"].as_str().unwrap().to_string();
+        // Backdate to just inside the TTL: still live for the replay's
+        // sweep, but expired by the next op unless the replay refreshes.
+        {
+            let mut uploads = svc.attachment_uploads.lock().unwrap();
+            let session = uploads.get_mut(&upload_id).unwrap();
+            session.last_activity = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(80))
+                .expect("backdate");
+        }
+        let again = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "r.bin".to_string(),
+                payload.len() as u64,
+                sha,
+                None,
+                key,
+            )
+            .await
+            .expect("keyed begin replay");
+        assert_eq!(again["uploadId"], serde_json::json!(upload_id));
+        assert_eq!(again["replayed"], serde_json::json!(true));
+        let idle = svc
+            .attachment_uploads
+            .lock()
+            .unwrap()
+            .get(&upload_id)
+            .expect("session still live")
+            .last_activity
+            .elapsed();
+        assert!(
+            idle < std::time::Duration::from_millis(50),
+            "not refreshed: {idle:?}"
+        );
+
+        svc.file_attachment_upload_chunk_op(upload_id.clone(), 0, b64(&payload))
+            .await
+            .expect("chunk after replay");
+        svc.file_attachment_upload_commit_op(upload_id)
+            .await
+            .expect("commit after replay");
+    }
+
+    /// Regression (#1841 review): a keyed `begin` replay racing the original
+    /// begin (session registered, staging dir not yet created) must hand
+    /// back an uploadId whose staging dir exists, so the first chunk lands.
+    #[tokio::test]
+    async fn keyed_begin_replay_creates_missing_staging_dir() {
+        let ws = WorkspaceId("ws-up-keyed-dir".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let payload = b"dir-race".to_vec();
+        let sha = sha256_hex(&payload);
+        let key = Some("key-dir".to_string());
+        let first = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "d.bin".to_string(),
+                payload.len() as u64,
+                sha.clone(),
+                None,
+                key.clone(),
+            )
+            .await
+            .expect("keyed begin");
+        let upload_id = first["uploadId"].as_str().unwrap().to_string();
+        let staging = svc
+            .attachment_uploads
+            .lock()
+            .unwrap()
+            .get(&upload_id)
+            .unwrap()
+            .staging_dir
+            .clone();
+        // Simulate the window before the original begin created its dir.
+        std::fs::remove_dir_all(&staging).expect("remove staging dir");
+        assert!(!staging.exists());
+
+        let again = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "d.bin".to_string(),
+                payload.len() as u64,
+                sha,
+                None,
+                key,
+            )
+            .await
+            .expect("keyed begin replay");
+        assert_eq!(again["uploadId"], serde_json::json!(upload_id));
+        assert!(staging.is_dir(), "replay must recreate the staging dir");
+        svc.file_attachment_upload_chunk_op(upload_id, 0, b64(&payload))
+            .await
+            .expect("chunk lands after replay");
     }
 
     /// `begin` rejections: unknown workspace, empty name, zero size,
