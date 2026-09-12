@@ -7233,6 +7233,7 @@ mod wsapi3_bindings_tests {
                     created_task_note_ids: Vec::new(),
                     created_tasks: Vec::new(),
                     warnings: Vec::new(),
+                    rev: 1,
                 })
             })
         }

@@ -8764,6 +8764,106 @@ pub async fn capture_system_note_version(store: &Store, note: &Note, rev: i64) -
     capture_note_version(store, note, &system_version_author(), rev).await
 }
 
+/// Bounded read-merge-persist attempts for `note.setContent`: on a store
+/// `Conflict` (another versioned write landed between the fetch and the
+/// persist) the loop re-fetches and re-merges against the new current; the
+/// last attempt's `Conflict` propagates unchanged.
+const SET_CONTENT_MAX_ATTEMPTS: usize = 5;
+
+/// Text `note.setContent` persists for one attempt, plus the baseline the
+/// reduction guard is measured against.
+struct SetContentMerge {
+    /// Content to clean and persist.
+    text: String,
+    /// The writer's base when `expected_version` was stale and its snapshot
+    /// was recoverable; `None` on the exact / LWW paths (guard measures
+    /// current → incoming).
+    base: Option<String>,
+    outcome: &'static str,
+    conflicting_spans: usize,
+}
+
+/// Resolve what a `note.setContent` write persists on top of `current`
+/// (stored at `current_rev`). An absent or matching `expected_version` is the
+/// exact path (`incoming` replaces `current`). A stale `expected_version`
+/// recovers the writer's base via [`Store::get_note_version_content_by_rev`]
+/// and applies the writer's intent onto `current` with
+/// [`note_merge::three_way_merge`]; when no snapshot survives for that rev the
+/// write degrades to honest last-writer-wins.
+async fn merge_set_content(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    current: &str,
+    current_rev: i64,
+    incoming: &str,
+    expected_version: Option<i64>,
+) -> Result<SetContentMerge> {
+    let stale = match expected_version {
+        Some(v) if v != current_rev => v,
+        _ => {
+            return Ok(SetContentMerge {
+                text: incoming.to_string(),
+                base: None,
+                outcome: "exact",
+                conflicting_spans: 0,
+            })
+        }
+    };
+    match store
+        .get_note_version_content_by_rev(workspace_id, note_id, stale)
+        .await?
+    {
+        Some(base) => {
+            let merged = note_merge::three_way_merge(&base, current, incoming);
+            Ok(SetContentMerge {
+                text: merged.text,
+                base: Some(base),
+                outcome: "merged",
+                conflicting_spans: merged.conflicting_spans,
+            })
+        }
+        None => Ok(SetContentMerge {
+            text: incoming.to_string(),
+            base: None,
+            outcome: "lww-no-base",
+            conflicting_spans: 0,
+        }),
+    }
+}
+
+/// `note.setContent` reduction guard: reject an unconfirmed write whose
+/// `incoming` text is more than 50 % shorter than `baseline` (the writer's
+/// base when known, else the stored current).
+fn check_set_content_reduction(
+    baseline: &str,
+    incoming: &str,
+    confirm_replacement: bool,
+) -> Result<()> {
+    if baseline.is_empty() || confirm_replacement {
+        return Ok(());
+    }
+    // Note sizes are far below 2^53 (loss-free in f64); the rounded
+    // percentage is in [0, 100] so the float→int cast is exact.
+    #[expect(clippy::cast_precision_loss)]
+    let old_len = baseline.chars().count() as f64;
+    #[expect(clippy::cast_precision_loss)]
+    let new_len = incoming.chars().count() as f64;
+    let reduction = (old_len - new_len) / old_len * 100.0;
+    if reduction > 50.0 {
+        // The rounded percentage is in (50, 100]: exact in i64.
+        #[expect(clippy::cast_possible_truncation)]
+        let reduction_pct = reduction.round() as i64;
+        return Err(Error::Internal(format!(
+            "⚠️ CONTENT REDUCTION DETECTED: Your new content ({} chars) is {}% shorter than the existing content ({} chars).\n\nThis will REPLACE the entire note. If you intended to:\n- ADD content: Use note.add instead\n- EDIT a section: Use note.edit instead\n- PROCEED with replacement: Call note.setContent again with confirmReplacement=true",
+            incoming.chars().count(),
+            reduction_pct,
+            baseline.chars().count()
+        )));
+    }
+    Ok(())
+}
+
 /// Comment anchor recovery pass, called by every note-content mutation before
 /// the new content is persisted. Reference `NotesService.updateNote` calls
 /// `recoverAllPartialAnchors` on the incoming markdown and marks unrecoverable
@@ -21592,53 +21692,60 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
-            // Guard before the CRDT merge so a rejected write never seeds the
-            // yrs doc with content that is not persisted.
+            // Guard before the merge so a rejected write touches neither the
+            // store nor the merge state.
             note_ops::reject_numbered_read_presentation(&content)?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let old_content = note.content.clone();
-            let previous_title = note.title.clone();
-            if !old_content.is_empty() {
-                // Note sizes are far below 2^53 (loss-free in f64); the rounded
-                // percentage is in [0, 100] so the float→int cast is exact.
-                #[expect(clippy::cast_precision_loss)]
-                let old_len = old_content.chars().count() as f64;
-                #[expect(clippy::cast_precision_loss)]
-                let new_len = content.chars().count() as f64;
-                let reduction = (old_len - new_len) / old_len * 100.0;
-                if reduction > 50.0 && !confirm_replacement {
-                    // The rounded percentage is in (50, 100]: exact in i64.
-                    #[expect(clippy::cast_possible_truncation)]
-                    let reduction_pct = reduction.round() as i64;
-                    return Err(Error::Internal(format!(
-                        "⚠️ CONTENT REDUCTION DETECTED: Your new content ({} chars) is {}% shorter than the existing content ({} chars).\n\nThis will REPLACE the entire note. If you intended to:\n- ADD content: Use note.add instead\n- EDIT a section: Use note.edit instead\n- PROCEED with replacement: Call note.setContent again with confirmReplacement=true",
-                        content.chars().count(),
-                        reduction_pct,
-                        old_content.chars().count()
-                    )));
+            // Read-merge-persist loop: each attempt merges the writer's intent
+            // onto the current stored text and persists gated on the rev it
+            // read, so a versioned write racing with this one is merged into
+            // on the next attempt rather than overwritten.
+            let mut attempt = 0;
+            let (note, old_content, previous_title, clean, now, rev) = loop {
+                attempt += 1;
+                let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+                let old_content = note.content.clone();
+                let previous_title = note.title.clone();
+                let current_rev = note.rev;
+                let merge = merge_set_content(
+                    &store,
+                    &workspace_id,
+                    &note_id,
+                    &old_content,
+                    current_rev,
+                    &content,
+                    expected_version,
+                )
+                .await?;
+                check_set_content_reduction(
+                    merge.base.as_deref().unwrap_or(&old_content),
+                    &content,
+                    confirm_replacement,
+                )?;
+                tracing::debug!(
+                    note = %note_id.0,
+                    attempt,
+                    current_rev,
+                    expected_version,
+                    outcome = merge.outcome,
+                    conflicting_spans = merge.conflicting_spans,
+                    "note.setContent merge"
+                );
+                let clean = note_ops::clean_set_content(&merge.text)?;
+                let mut plan =
+                    reanchor_note_comments(&store, &workspace_id, &note_id, clean).await?;
+                let clean = std::mem::take(&mut plan.content);
+                note.content = clean.clone();
+                let now = now_iso();
+                note.updated_at = now.clone();
+                match store.update_note_versioned(&note, Some(current_rev)).await {
+                    Ok(rev) => {
+                        plan.apply_orphaned(&store, &workspace_id).await?;
+                        break (note, old_content, previous_title, clean, now, rev);
+                    }
+                    Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
+                    Err(e) => return Err(e),
                 }
-            }
-            // Route the full-content write through the CRDT merge engine
-            // (`CRDTNotesService.applyContentUpdate`): the yrs `Doc` is seeded
-            // from `old_content` on first touch and subsequent writes diff
-            // against the doc's current text, so concurrent full-content
-            // writes converge instead of last-write-wins. The merged text is
-            // what we then clean + persist through the normal mutation flow,
-            // so the line-attribution recompute still fires downstream.
-            let merged = services.crdt_notes.apply_full_content(
-                &workspace_id,
-                &note_id,
-                &old_content,
-                &content,
-            );
-            let clean = note_ops::clean_set_content(&merged)?;
-            let mut plan = reanchor_note_comments(&store, &workspace_id, &note_id, clean).await?;
-            let clean = std::mem::take(&mut plan.content);
-            note.content = clean.clone();
-            let now = now_iso();
-            note.updated_at = now.clone();
-            let rev = store.update_note_versioned(&note, expected_version).await?;
-            plan.apply_orphaned(&store, &workspace_id).await?;
+            };
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             capture_note_version(&store, &note, &author, rev).await?;
             services
@@ -21651,9 +21758,9 @@ impl WorkspaceApi for Services {
                     caller_agent_id.as_ref(),
                 )
                 .await;
-            let (final_content, final_updated_at) = match outcome.refetched_note {
-                Some(n) => (n.content, n.updated_at),
-                None => (clean, now),
+            let (final_content, final_updated_at, final_rev) = match outcome.refetched_note {
+                Some(n) => (n.content, n.updated_at, n.rev),
+                None => (clean, now, rev),
             };
             publish_event(
                 bus.as_ref(),
@@ -21683,6 +21790,7 @@ impl WorkspaceApi for Services {
                 created_task_note_ids: outcome.created_note_ids,
                 created_tasks: outcome.created_tasks,
                 warnings: outcome.warnings,
+                rev: final_rev,
             })
         })
     }

@@ -18,7 +18,6 @@
 use similar::{capture_diff_slices, Algorithm, DiffOp};
 
 /// Result of [`three_way_merge`].
-#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergeOutcome {
     /// Merged text.
@@ -96,7 +95,6 @@ fn variant(cluster: &[Hunk], side: Side, base: &[char], start: usize, end: usize
 }
 
 /// Merge `incoming`'s edits (relative to `base`) onto `current`.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn three_way_merge(base: &str, current: &str, incoming: &str) -> MergeOutcome {
     if base == current || current == incoming {
         return MergeOutcome {

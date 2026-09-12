@@ -2337,6 +2337,277 @@ async fn set_content_merges_concurrent_writes() {
     assert_eq!(c.new_content, "B-line\nBODY\nA-line (edited)\nC-line");
 }
 
+/// [`setup`] plus a `note_version` snapshot at rev 0, so `expectedVersion: 0`
+/// resolves to a recoverable base for the three-way merge.
+async fn setup_versioned(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
+    let (tmp, svc, ws, id) = setup(content).await;
+    let note = svc.store.get_note(&ws, &id).await.expect("get note");
+    crate::capture_system_note_version(&svc.store, &note, 0)
+        .await
+        .expect("seed base snapshot");
+    (tmp, svc, ws, id)
+}
+
+/// Stale `expectedVersion` (AC 1, 2): the writer's intent (`beta` → `beta-A`
+/// against base rev 0) is merged onto the current text (rev 1, which appended
+/// `delta`), the write succeeds, and `rev` bumps to `current + 1` both in the
+/// result and in the store.
+#[tokio::test]
+async fn set_content_stale_expected_version_merges_and_bumps_rev() {
+    let (_tmp, svc, ws, id) = setup_versioned("alpha\nbeta\ngamma").await;
+
+    let b = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "alpha\nbeta\ngamma\ndelta".into(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("B write");
+    assert_eq!(b.rev, 1);
+
+    let a = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "alpha\nbeta-A\ngamma".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("stale expectedVersion merges instead of conflicting");
+    assert_eq!(a.new_content, "alpha\nbeta-A\ngamma\ndelta");
+    assert_eq!(a.old_content.as_deref(), Some("alpha\nbeta\ngamma\ndelta"));
+    assert_eq!(a.rev, 2);
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 2);
+    assert_eq!(stored.content, "alpha\nbeta-A\ngamma\ndelta");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.setContent merged").await;
+}
+
+/// Same-span conflict (AC 3): both writers replaced the same base word; the
+/// result keeps the current variant immediately followed by the incoming one
+/// (`WaWb`), dropping nothing.
+#[tokio::test]
+async fn set_content_same_word_conflict_keeps_both_variants() {
+    let (_tmp, svc, ws, id) = setup_versioned("one cat three").await;
+
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "one dog three".into(),
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("current write");
+
+    let merged = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "one fox three".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("conflicting spans merge, not -32005");
+    assert_eq!(merged.new_content, "one dogfox three");
+    assert_eq!(merged.rev, 2);
+}
+
+/// Reduction guard measured against the writer's base (AC 4): after a
+/// concurrent writer tripled the note, a 10 % removal relative to the base is
+/// tiny against base (accepted) even though it is ~70 % shorter than current;
+/// a 60 % removal relative to the base is still rejected with the existing
+/// message unless confirmed.
+#[tokio::test]
+async fn set_content_reduction_guard_measures_against_base() {
+    let lines: Vec<String> = (0..10).map(|i| format!("line-{i}-0123456789")).collect();
+    let base = lines.join("\n");
+    let (_tmp, svc, ws, id) = setup_versioned(&base).await;
+
+    let extra: Vec<String> = (10..30).map(|i| format!("line-{i}-0123456789")).collect();
+    let tripled = format!("{base}\n{}", extra.join("\n"));
+    svc.set_note_content(ws.clone(), id.clone(), tripled, false, None, None)
+        .await
+        .expect("tripling write");
+
+    let minus_ten_pct = lines[1..].join("\n");
+    let ok = svc
+        .set_note_content(ws.clone(), id.clone(), minus_ten_pct, false, Some(0), None)
+        .await
+        .expect("10% removal against base passes the guard");
+    assert!(!ok.new_content.contains("line-0-"), "removed line is gone");
+    assert!(
+        ok.new_content.contains("line-29-"),
+        "concurrent writer's tail survives the merge"
+    );
+    assert_eq!(ok.rev, 2);
+
+    let minus_sixty_pct = lines[6..].join("\n");
+    let denied = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            minus_sixty_pct,
+            false,
+            Some(0),
+            None,
+        )
+        .await;
+    match denied {
+        Err(Error::Internal(msg)) => assert!(
+            msg.starts_with("⚠️ CONTENT REDUCTION DETECTED"),
+            "existing guard message expected, got: {msg}"
+        ),
+        other => panic!("expected the reduction guard, got {other:?}"),
+    }
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 2, "a rejected write persists nothing");
+}
+
+/// No recoverable base (AC 5): a note whose `expectedVersion` predates every
+/// retained snapshot degrades to honest last-writer-wins — the incoming text
+/// lands verbatim and `rev` still bumps by one.
+#[tokio::test]
+async fn set_content_stale_expected_version_without_base_is_lww() {
+    // `setup` inserts the row directly: no snapshot exists at rev 0.
+    let (_tmp, svc, ws, id) = setup("v0 body").await;
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "v1 body (other writer)".into(),
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("other writer");
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(&ws, &id, 0)
+            .await
+            .expect("lookup"),
+        None,
+        "precondition: no snapshot at or below rev 0"
+    );
+
+    let r = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "v2 body (stale writer)".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("no base → LWW, not -32005");
+    assert_eq!(r.new_content, "v2 body (stale writer)");
+    assert_eq!(r.rev, 2);
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "v2 body (stale writer)");
+    assert_eq!(stored.rev, 2);
+}
+
+/// Conflict stays where it belongs (AC 6): the non-merging conditional writes
+/// — `note.update` (metadata arm), `note.updateMetadata`, `note.delete` —
+/// still surface a stale `expectedVersion` as `Conflict` (`-32005`).
+#[tokio::test]
+async fn set_content_merge_leaves_other_conditional_writes_conflicting() {
+    let (_tmp, svc, ws, id) = setup_versioned("body").await;
+    svc.set_note_content(ws.clone(), id.clone(), "body v1".into(), false, None, None)
+        .await
+        .expect("bump to rev 1");
+
+    let metadata_arm = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                title: Some("stale title".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(metadata_arm, Err(Error::Conflict { .. })),
+        "note.update metadata arm: {metadata_arm:?}"
+    );
+
+    let update_metadata = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("stale title".into()),
+            None,
+            Some(0),
+            None,
+        )
+        .await;
+    assert!(
+        matches!(update_metadata, Err(Error::Conflict { .. })),
+        "note.updateMetadata: {update_metadata:?}"
+    );
+
+    let delete = svc.delete_note(ws.clone(), id.clone(), Some(0)).await;
+    assert!(
+        matches!(delete, Err(Error::Conflict { .. })),
+        "note.delete: {delete:?}"
+    );
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("still present");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(stored.title, "Title");
+}
+
+/// Read-merge-persist loop converges under contention: four writers that all
+/// read rev 0 and insert a distinct line race through `set_note_content`
+/// concurrently; whichever lands first makes the others stale, and each
+/// stale writer re-fetches, re-merges and retries until its versioned write
+/// lands — every line survives and `rev` advances once per writer.
+#[tokio::test]
+async fn set_content_retry_loop_converges_under_concurrent_versioned_writes() {
+    let base = "l1\nl2\nl3\nl4\nl5";
+    let (_tmp, svc, ws, id) = setup_versioned(base).await;
+
+    let mut handles = Vec::new();
+    for i in 1..=4 {
+        let svc = svc.clone();
+        let ws = ws.clone();
+        let id = id.clone();
+        let incoming = base.replace(&format!("l{i}\n"), &format!("l{i}\nw{i}\n"));
+        handles.push(tokio::spawn(async move {
+            svc.set_note_content(ws, id, incoming, false, Some(0), None)
+                .await
+        }));
+    }
+    let mut revs = Vec::new();
+    for h in handles {
+        let r = h
+            .await
+            .expect("join")
+            .expect("every concurrent writer lands");
+        revs.push(r.rev);
+    }
+    revs.sort_unstable();
+    assert_eq!(revs, vec![1, 2, 3, 4]);
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 4);
+    assert_eq!(stored.content, "l1\nw1\nl2\nw2\nl3\nw3\nl4\nw4\nl5");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.setContent concurrent").await;
+}
+
 #[tokio::test]
 async fn update_note_expected_version_gate_hit_miss_absent() {
     let (_tmp, svc, ws, id) = setup("v0").await;
