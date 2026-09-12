@@ -327,7 +327,7 @@ enum ExpiresAt {
 /// Parse the bag's `expires_at` into [`ExpiresAt`]. Accepts JSON numbers and
 /// numeric strings; values above [`EXPIRES_AT_MS_THRESHOLD`] are already
 /// milliseconds, the rest are seconds.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn parse_expires_at(bag: &Value) -> ExpiresAt {
     let Some(v) = bag.get("expires_at") else {
         return ExpiresAt::Absent;
@@ -509,7 +509,7 @@ fn merge_refresh_response(bag: &Value, resp: &Value) -> Value {
 /// `"3600"`), consistent with the bag's `expires_at` parsing — otherwise a
 /// stringified lifetime would drop `expires_at` from the merged bag and
 /// permanently disable refresh for it.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn parse_expires_in(resp: &Value) -> Option<u64> {
     let n = match resp.get("expires_in")? {
         Value::Number(n) => n.as_f64(),

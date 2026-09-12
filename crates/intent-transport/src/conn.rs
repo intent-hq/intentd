@@ -284,7 +284,7 @@ impl ConnSubs {
 /// Frames that fail parse/envelope validation are exempt: they are answered
 /// inline with the router's `-32700`/`-32600`, so the error matrix does not
 /// change under load.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn process_frame(
     raw: &str,
     api: &Arc<dyn WorkspaceApi>,
@@ -1192,7 +1192,7 @@ async fn forward_note_subscription(
 /// (the eventual snapshot supersedes them) and the read is re-attempted on
 /// the next delivery or after [`CHAT_RECOVERY_RETRY`], whichever comes first,
 /// so the client keeps its rendered transcript until a good page converges it.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn forward_chat_subscription(
     api: Arc<dyn WorkspaceApi>,
     agent_id: AgentId,
@@ -1402,7 +1402,7 @@ const CHAT_RECOVERY_RETRY: std::time::Duration = std::time::Duration::from_secs(
 /// emit it at the next `seq`, reseed the mapper, and clear the pending flag.
 /// On a failed read the recovery stays pending for the caller to re-attempt.
 /// Returns `false` only when the outbound lane is closed (caller returns).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn attempt_chat_recovery(
     api: &dyn WorkspaceApi,
     agent_id: &AgentId,
@@ -1486,7 +1486,7 @@ fn parse_channel_params(
 /// [`subscriptions::task_delta`] pair so spec-body edits refresh flipped
 /// `specLinked` flags (monorepo#2407). Owns `seq` for strict monotonicity;
 /// aborted by [`ConnSub`] on unsubscribe / disconnect.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn forward_channel_subscription(
     api: Arc<dyn WorkspaceApi>,
     channel: Channel,

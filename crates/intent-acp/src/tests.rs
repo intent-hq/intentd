@@ -2156,7 +2156,6 @@ mod mcp_tests {
             Box::pin(async { Ok(Vec::new()) })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn git_agent_commit(
             &self,
             _workspace_id: WorkspaceId,
@@ -2210,7 +2209,6 @@ mod mcp_tests {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn agent_create(
             &self,
             _workspace_id: WorkspaceId,
@@ -2235,7 +2233,6 @@ mod mcp_tests {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn agent_send_message(
             &self,
             _workspace_id: WorkspaceId,
@@ -6976,7 +6973,7 @@ mod wsapi3_bindings_tests {
     /// test can inspect the peel result; unknown noteIds surface `NotFound`
     /// so the error-path tests can prove JS-visible failures.
     #[derive(Default)]
-    #[allow(clippy::struct_field_names)] // fields mirror the recorded method names
+    #[expect(clippy::struct_field_names)] // fields mirror the recorded method names
     struct FakeApi {
         get_note_calls: Mutex<Vec<String>>,
         create_note_calls: Mutex<Vec<CreateNoteCall>>,
@@ -7426,7 +7423,6 @@ mod wsapi3_bindings_tests {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn task_update(
             &self,
             _ws: WorkspaceId,
@@ -7579,7 +7575,6 @@ mod wsapi3_bindings_tests {
         }
 
         // ---- comment.* ----
-        #[allow(clippy::too_many_arguments)]
         fn comment_add(
             &self,
             _ws: WorkspaceId,
@@ -7679,7 +7674,6 @@ mod wsapi3_bindings_tests {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn comment_respond(
             &self,
             _ws: WorkspaceId,
@@ -9416,7 +9410,6 @@ mod wsapi4_bindings_tests {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn agent_send_message(
             &self,
             _ws: WorkspaceId,
@@ -9501,7 +9494,6 @@ mod wsapi4_bindings_tests {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn agent_create(
             &self,
             _ws: WorkspaceId,

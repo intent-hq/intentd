@@ -366,7 +366,7 @@ fn parse_listen_addr(line: &str) -> Option<String> {
 /// every restart report the same address; a restart that reports a different
 /// one (key file replaced underneath us) is logged loudly but kept — the
 /// supervisor's `address` still serves the original until stop/start.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn supervise(
     bin: PathBuf,
     key_path: PathBuf,

@@ -601,7 +601,7 @@ pub(crate) struct AttentionSignals {
 /// [`compute_display_status`]. Derived purely from persisted
 /// `state`/`last_snapshot` columns: no forge calls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub(crate) struct MonitorPrSignals {
     /// An ACTIVE monitor's last snapshot shows an open (non-draft) PR that
     /// sits in the forge's merge queue (`requirements.isInMergeQueue`) — the

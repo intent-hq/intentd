@@ -332,7 +332,7 @@ fn spawn_mock(
 }
 
 /// Run a single `session/prompt` turn, then reply with its stop reason.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn spawn_prompt(
     steps: Arc<Vec<Step>>,
     prompt_id: Value,

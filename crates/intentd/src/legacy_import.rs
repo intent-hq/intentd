@@ -1736,7 +1736,6 @@ fn session_from_legacy_json(
 /// (`toolCalls`/`toolResults`/`turnNumber`/`error`/…) are folded into the row
 /// metadata so nothing is dropped. Entries that are not objects or carry no
 /// usable role are malformed and skipped by the caller.
-#[allow(clippy::type_complexity)]
 fn message_from_legacy_json(raw: Value) -> Result<(String, Value, Option<Value>, String), String> {
     let Value::Object(mut obj) = raw else {
         return Err("message entry is not an object".to_string());

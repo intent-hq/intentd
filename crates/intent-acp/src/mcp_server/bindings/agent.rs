@@ -301,7 +301,7 @@ async fn create(
 /// number settings to the float wire shape (e.g. `20.0`), so the value is
 /// read as `f64` — `as_u64` would return `None` for floats and silently
 /// ignore user overrides.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn max_top_level_agents(api: &Arc<dyn WorkspaceApi>) -> u64 {
     api.settings_get("agents.maxTopLevelAgents".to_string())
         .await

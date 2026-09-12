@@ -946,7 +946,7 @@ mod tests {
     /// a SINGLE stream, and the demux still keeps them isolated — each sink
     /// sees only the events under its own root.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn sibling_roots_share_one_stream_and_stay_isolated() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1025,7 +1025,6 @@ mod tests {
     /// Dropping the last subscription for a group retires the stream, so an
     /// archived/closed workspace stops consuming fseventsd capacity.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn dropping_the_last_subscription_retires_the_stream() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1093,7 +1092,7 @@ mod tests {
     /// so on Linux (one global group) the co-tenant nested root would go
     /// silently dead without the re-registration in `SubHandle::drop`.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn dropping_an_outer_root_keeps_a_nested_root_covered() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1317,7 +1316,7 @@ mod tests {
     /// command channel and retries creation with backoff, and once the factory
     /// recovers the failed roots are re-registered and deliver events.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn watcher_creation_failure_settles_registrations_and_recovers() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1381,7 +1380,7 @@ mod tests {
     /// when a registration settles as failed, and `None` again once the hub
     /// is dropped (the `Weak` must not extend the hub's lifetime).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn watch_health_snapshot_tracks_roots_failures_and_hub_lifetime() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1436,7 +1435,7 @@ mod tests {
     /// registrar settles incoming registrations as failed while no watcher
     /// exists), and recovery drains the count back to zero.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn watch_health_reflects_creation_failure_and_recovery() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()

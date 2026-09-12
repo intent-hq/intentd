@@ -700,7 +700,7 @@ where
 }
 
 /// [`connect`] against the recording mock; also returns the recorded frames.
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn connect_recording() -> (
     Connection,
     mpsc::UnboundedReceiver<IncomingNotification>,

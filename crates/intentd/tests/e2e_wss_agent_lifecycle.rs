@@ -1470,7 +1470,7 @@ async fn mock_agent_full_turn_over_wss_with_session_mcp_servers() {
     );
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Session-status lifecycle persistence (P0 — chat-spinner clear). A normal
 /// `agent.sendMessage` turn must drive the persisted `agent_session.status`
 /// through `Idle → active → idle` and emit the matching
@@ -3546,7 +3546,7 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
     );
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// WAKE-1: `after_all` delegation fan-in over WSS, end to end. A parent fires
 /// TWO MCP `delegate_task` calls with `waitMode: "after_all"`; each child
 /// reports via `report_to_parent` (suppressed — no immediate parent message)
@@ -8498,7 +8498,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
     assert_eq!(user_count, 1, "replay delivered no second prompt: {conv}");
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Regression for the composite `(id, workspace_id)` note PK (migration 0030
 /// + `feat(services): workspace-scope note lookups + seed spec per workspace`):
 /// two `workspace.create` calls each seed their own `spec` note. Over the
@@ -9101,7 +9101,7 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
     .await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// STAB-118 (SUB-1 `after_all` duplicate wake): when a coordinator delegates
 /// two `after_all` children, sends follow-up messages to both via
 /// `agent.sendMessage` (which triggers SUB-1 auto-watch), and both children

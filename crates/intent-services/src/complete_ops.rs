@@ -1277,14 +1277,14 @@ rl.on('line', (line) => {
     /// The expected pair for a rung that resolved on the effective provider.
     /// (Wrapped in `Some` to mirror the resolver's return type — `None` is
     /// the closed gate.)
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(clippy::unnecessary_wraps)]
     fn on(provider: &str, model: &str) -> Option<(String, Option<String>)> {
         Some((provider.to_string(), Some(model.to_string())))
     }
 
     /// The expected pair for a chain that fell through entirely: the
     /// effective provider with its CLI default.
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(clippy::unnecessary_wraps)]
     fn cli_default(provider: &str) -> Option<(String, Option<String>)> {
         Some((provider.to_string(), None))
     }

@@ -172,7 +172,7 @@ pub enum WorkspaceDisplayStatus {
 /// Workspace entity (§9.1).
 // The bool fields mirror the protocol's wire shape; grouping them would
 // change the serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -537,7 +537,7 @@ pub struct ContextUsage {
 }
 
 // serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -1076,7 +1076,7 @@ pub struct WorkspaceUpdate {
 /// Deserialize a JSON `null` as `Some(None)` (explicit clear) and a missing
 /// field as `None` (no change), so `Option<Option<T>>` on [`WorkspaceUpdate`]
 /// can distinguish the two. A present non-null value maps to `Some(Some(v))`.
-#[allow(clippy::option_option)] // the nesting IS the absent-vs-null distinction
+#[expect(clippy::option_option)] // the nesting IS the absent-vs-null distinction
 fn deserialize_optional_field<'de, T, D>(
     deserializer: D,
 ) -> std::result::Result<Option<Option<T>>, D::Error>
@@ -2837,7 +2837,7 @@ pub const WORKSPACE_STATUS_MESSAGE_MAX_LENGTH: usize = 500;
 /// (not persisted, §19.2). `provider` is immutable once set on first real use.
 // The bool fields mirror the TS wire shape; grouping them would change the
 // serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSession {
@@ -3290,7 +3290,7 @@ pub struct AgentMetadata {
 /// iOS coverflow reads.
 // The bool fields mirror the TS wire shape; grouping them would change the
 // serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLite {
@@ -3943,7 +3943,7 @@ pub struct FileStatus {
 /// The bools mirror the wire contract 1:1 (each an independent flag on the
 /// `git.status` result), so folding them into enums would diverge the model
 /// from the protocol shape.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitStatus {

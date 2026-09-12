@@ -392,13 +392,13 @@ pub(crate) struct HarnessEntry {
     /// the read-live behavior (`session_agent_features`); exercised by
     /// registry tests meanwhile (hence the allow — the lib build has no
     /// reader).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub default_features: fn() -> AgentFeaturesSettings,
     /// `(camelCase key, human-readable label)` for every `agentFeatures`
     /// toggle this version knows about. For diagnostics/UI surfaces;
     /// exercised by registry tests meanwhile (hence the allow — the lib
     /// build has no reader).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub feature_labels: &'static [(&'static str, &'static str)],
 }
 
