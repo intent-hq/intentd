@@ -84,33 +84,6 @@ pub(crate) fn derive_default_target(url: &str) -> String {
     base.strip_suffix(".git").unwrap_or(base).to_string()
 }
 
-/// Best-effort `(owner, name)` extraction for a GitHub-style clone URL. Returns
-/// `None` when the URL does not carry an `owner/name` pair (bare filesystem
-/// paths, single-segment URLs, etc.); callers should fall back to any
-/// caller-supplied override.
-pub(crate) fn parse_owner_repo(url: &str) -> Option<(String, String)> {
-    let trimmed = url.trim().trim_end_matches('/');
-    let after_scheme = match trimmed.split_once("://") {
-        Some((_, rest)) => rest,
-        None => trimmed,
-    };
-    let (_host, path) = after_scheme.split_once(['/', ':'])?;
-    let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.len() < 2 {
-        return None;
-    }
-    let raw_name = segments.pop()?;
-    let owner = segments.pop()?.to_string();
-    let name = raw_name
-        .strip_suffix(".git")
-        .unwrap_or(raw_name)
-        .to_string();
-    if owner.is_empty() || name.is_empty() {
-        return None;
-    }
-    Some((owner, name))
-}
-
 /// Redact a `user[:pass]@` credential fragment from any URL-like substring in
 /// `text` (see [`intent_git::redact::redact_credentials`], monorepo#836).
 /// Best-effort; used for the terminal `error` payload.
@@ -1020,24 +993,6 @@ mod tests {
         assert_eq!(derive_default_target("https://github.com/a/b"), "b");
         assert_eq!(derive_default_target("git@github.com:a/b.git"), "b");
         assert_eq!(derive_default_target("https://github.com/a/b/"), "b");
-    }
-
-    #[test]
-    fn parse_owner_repo_handles_https_and_ssh() {
-        assert_eq!(
-            parse_owner_repo("https://github.com/owner/repo.git"),
-            Some(("owner".to_string(), "repo".to_string()))
-        );
-        assert_eq!(
-            parse_owner_repo("https://github.com/owner/repo"),
-            Some(("owner".to_string(), "repo".to_string()))
-        );
-        assert_eq!(
-            parse_owner_repo("git@github.com:owner/repo.git"),
-            Some(("owner".to_string(), "repo".to_string()))
-        );
-        assert_eq!(parse_owner_repo("https://github.com/repo"), None);
-        assert_eq!(parse_owner_repo(""), None);
     }
 
     #[test]

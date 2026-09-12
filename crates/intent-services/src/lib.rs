@@ -31,10 +31,10 @@ use intent_core::{
     CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
     CommentWire, ContentType, ContextItem, CreatedTaskEntry, Draft, Event, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, LineAttributionAuthor,
-    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitRemoteUrl,
+    LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     ProjectType, PullRequestInfo, ReadAssetResult, RepoRef, SaveAssetResult, ScriptCreateParams,
@@ -2858,64 +2858,6 @@ impl Services {
         }
     }
 
-    /// Parse a GitHub URL into the [`RepoRef`] it names, only if the host is
-    /// exactly `github.com`. Rejects URLs with hosts like `github.com.evil.com`.
-    /// The ref keeps the URL's casing; compare it under `RepoRef` equality.
-    fn parse_github_owner_repo(url: &str) -> Option<RepoRef> {
-        let trimmed = url.trim();
-        let to_ref = |(owner, name): (String, String)| RepoRef::new(owner, name);
-
-        // HTTPS: extract host from scheme://host/... form.
-        if let Some(rest) = trimmed
-            .strip_prefix("https://")
-            .or_else(|| trimmed.strip_prefix("http://"))
-        {
-            let host_end = rest.find('/').unwrap_or(rest.len());
-            let host = &rest[..host_end];
-            if host != "github.com" {
-                return None;
-            }
-            let path = &rest[host_end..];
-            return clone_ops::parse_owner_repo(&format!("https://github.com{path}")).map(to_ref);
-        }
-
-        // SSH URL: ssh://[user@]host[:port]/owner/repo(.git) form.
-        if let Some(rest) = trimmed.strip_prefix("ssh://") {
-            let rest = rest.split_once('@').map_or(rest, |(_, r)| r);
-            let host_end = rest.find('/').unwrap_or(rest.len());
-            let host = &rest[..host_end];
-            // Strip a numeric port; a non-numeric suffix stays part of the
-            // host and fails the strict check below.
-            let host = host.split_once(':').map_or(host, |(h, port)| {
-                if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
-                    h
-                } else {
-                    host
-                }
-            });
-            if host != "github.com" {
-                return None;
-            }
-            let path = &rest[host_end..];
-            return clone_ops::parse_owner_repo(&format!("https://github.com{path}")).map(to_ref);
-        }
-
-        // SSH scp-like: git@host:path form. Extract host before the colon.
-        if let Some(at_idx) = trimmed.find('@') {
-            let after_at = &trimmed[at_idx + 1..];
-            if let Some(colon_idx) = after_at.find(':') {
-                let host = &after_at[..colon_idx];
-                if host != "github.com" {
-                    return None;
-                }
-                let path = &after_at[colon_idx + 1..];
-                return clone_ops::parse_owner_repo(&format!("git@github.com:{path}")).map(to_ref);
-            }
-        }
-
-        None
-    }
-
     /// Start the one-time repository owner/name backfill after daemon listeners
     /// are live. The daemon invokes this from a detached readiness task, so the
     /// candidate read and every git/filesystem probe stay off startup and RPC
@@ -3003,7 +2945,7 @@ impl Services {
             intent_git::remote::origin_url(&repo_path)
                 .ok()
                 .flatten()
-                .and_then(|url| Self::parse_github_owner_repo(&url))
+                .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
         })
         .await
         .map_err(|error| Error::Internal(format!("repository metadata probe failed: {error}")))?;
@@ -4193,10 +4135,8 @@ impl Services {
                 .ok()
                 .and_then(std::result::Result::ok)
                 .flatten()
-                .and_then(|url| Self::parse_github_owner_repo(&url))
-                .map_or((None, None), |RepoRef { owner, name }| {
-                    (Some(owner), Some(name))
-                });
+                .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+                .map_or((None, None), |r| (Some(r.owner), Some(r.name)));
                 // Stamp the root's HEAD at registration time (fail-soft:
                 // unreadable HEAD ⇒ NULL, backfilled by a later sweep pass).
                 let registered_commit_sha = Self::read_git_root_head_sha(&canonical).await;
@@ -16891,9 +16831,9 @@ impl WorkspaceApi for Services {
                             {
                                 None
                             } else {
-                                clone_ops::parse_owner_repo(url)
+                                GitRemoteUrl::parse(url).and_then(|u| u.repo_slug())
                             };
-                            if let Some((owner, name)) = cache_owner_repo {
+                            if let Some(RepoRef { owner, name }) = cache_owner_repo {
                                 let request_id = uuid::Uuid::new_v4().to_string();
                                 // Stream the same `git:clone:*` frames as a
                                 // network clone so the FE initializer shows
@@ -17063,7 +17003,7 @@ impl WorkspaceApi for Services {
                                 if let Some(RepoRef {
                                     owner: gh_owner,
                                     name: gh_name,
-                                }) = Self::parse_github_owner_repo(url)
+                                }) = GitRemoteUrl::parse(url).and_then(|u| u.github_repo())
                                 {
                                     if input.repository_owner.is_none() {
                                         input.repository_owner = Some(gh_owner);
@@ -17160,7 +17100,7 @@ impl WorkspaceApi for Services {
                             // are trusted as GitHub identity by the
                             // `crossWorkspace.*` sibling predicate.
                             if let Some(RepoRef { owner, name }) =
-                                Self::parse_github_owner_repo(url)
+                                GitRemoteUrl::parse(url).and_then(|u| u.github_repo())
                             {
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
@@ -17237,7 +17177,7 @@ impl WorkspaceApi for Services {
                         intent_git::remote::origin_url(&repo_path)
                             .ok()
                             .flatten()
-                            .and_then(|url| Self::parse_github_owner_repo(&url))
+                            .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
                     } else {
                         None
                     };
@@ -17246,8 +17186,8 @@ impl WorkspaceApi for Services {
                         .repository_owner
                         .as_deref().is_none_or(str::is_empty)
                     {
-                        if let Some(repo) = origin_derived.as_ref() {
-                            input.repository_owner = Some(repo.owner.clone());
+                        if let Some(derived) = origin_derived.as_ref() {
+                            input.repository_owner = Some(derived.owner.clone());
                         }
                     }
                     // Apply derived name when caller left it blank; fall back to
@@ -17256,8 +17196,8 @@ impl WorkspaceApi for Services {
                         .repository_name
                         .as_deref().is_none_or(str::is_empty)
                     {
-                        if let Some(repo) = origin_derived {
-                            input.repository_name = Some(repo.name);
+                        if let Some(derived) = origin_derived {
+                            input.repository_name = Some(derived.name);
                         } else if let Some(name) = input
                             .repository_path
                             .as_deref()
@@ -23983,10 +23923,8 @@ impl WorkspaceApi for Services {
                     .ok()
                     .and_then(std::result::Result::ok)
                     .flatten()
-                    .and_then(|url| Self::parse_github_owner_repo(&url))
-                    .map_or((None, None), |RepoRef { owner, name }| {
-                        (Some(owner), Some(name))
-                    });
+                    .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+                    .map_or((None, None), |r| (Some(r.owner), Some(r.name)));
             // Stamp the root's HEAD at registration time (fail-soft:
             // unreadable HEAD ⇒ NULL; the store merge never overwrites an
             // existing value on re-registration).
@@ -24865,7 +24803,9 @@ impl WorkspaceApi for Services {
                 }
             }
             let url = github_url.trim().to_string();
-            let Some((owner, repo)) = clone_ops::parse_owner_repo(&url) else {
+            let Some(RepoRef { owner, name: repo }) =
+                GitRemoteUrl::parse(&url).and_then(|u| u.repo_slug())
+            else {
                 return Err(Error::InvalidParams(format!(
                     "githubUrl carries no owner/repo pair: {url}"
                 )));
