@@ -28,7 +28,7 @@ fn fixture() -> TempTree {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("intent-search-{nanos}-{n}"));
+    let root = std::env::temp_dir().join(format!("intent-search-{nanos}-{n}")); // tmp-hygiene: allow — swept by TempTree's Drop
     let src = root.join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
