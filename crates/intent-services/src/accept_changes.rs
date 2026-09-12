@@ -889,6 +889,48 @@ mod tests {
         assert!(v["existingPR"].is_null());
     }
 
+    #[test]
+    fn build_git_status_derives_owner_repo_from_origin_via_strict_github_identity() {
+        // Service-boundary pin for the accepted deltas against the deleted
+        // `parse_owner_repo` (intentd#1836): `git.status` owner/repo must
+        // come from the strict `github_repo()` accessor, so a port-bearing
+        // ssh:// or query-bearing https origin yields `acme`/`widget`, an
+        // extra-path GitHub origin yields null/null (not `widget/extra`), and
+        // a foreign host never surfaces a GitHub pair.
+        for (url, owner, repo) in [
+            (
+                "ssh://git@github.com:22/acme/widget.git",
+                Some("acme"),
+                Some("widget"),
+            ),
+            (
+                "https://github.com/acme/widget.git?ref=main",
+                Some("acme"),
+                Some("widget"),
+            ),
+            (
+                "git@github.com:acme/widget.git",
+                Some("acme"),
+                Some("widget"),
+            ),
+            ("https://github.com/acme/widget/extra", None, None),
+            ("https://gitlab.com/acme/widget.git", None, None),
+        ] {
+            let dir = init_repo("status-origin");
+            commit_file(dir.path(), "a.txt", "a\n", "add a");
+            Repository::open(dir.path())
+                .unwrap()
+                .remote("origin", url)
+                .unwrap();
+
+            let v = build_git_status_value(dir.path(), &mk_workspace()).unwrap();
+            assert_eq!(v["hasRemote"], true, "{url}");
+            assert_eq!(v["remoteUrl"], url, "{url}");
+            assert_eq!(v["owner"].as_str(), owner, "{url}");
+            assert_eq!(v["repo"].as_str(), repo, "{url}");
+        }
+    }
+
     // ----- prepare_invalid -----
 
     #[test]
