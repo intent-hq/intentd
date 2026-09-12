@@ -8747,6 +8747,20 @@ pub async fn capture_system_note_version(store: &Store, note: &Note, rev: i64) -
     capture_note_version(store, note, &system_version_author(), rev).await
 }
 
+/// [`persist_note_content`] with the daemon-internal system author and no
+/// `expectedVersion` gate, for noninteractive full-note *updates* outside this
+/// crate (the `intentd` importers re-writing an existing note). The row and
+/// its snapshot commit together, so an imported rev is never visible while
+/// its base still resolves to the previous content. Returns the post-write
+/// `rev`.
+///
+/// # Errors
+///
+/// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the write fails.
+pub async fn persist_system_note_content(store: &Store, note: &Note) -> Result<i64> {
+    persist_note_content(store, note, None, &system_version_author()).await
+}
+
 /// Bounded read-merge-persist attempts for `note.setContent`: on a store
 /// `Conflict` (another versioned write landed between the fetch and the
 /// persist) the loop re-fetches and re-merges against the new current; the
