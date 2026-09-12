@@ -5,6 +5,8 @@
 //! `note.unsubscribe` cleanup, and coexistence with the `events.subscribe`
 //! firehose (PROTOCOL §6, TB-0 §1).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

@@ -23,8 +23,10 @@ use intent_core::{
 };
 use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
 use intent_store::Store;
+#[cfg(unix)]
+use intent_transport::serve_uds;
 use intent_transport::{
-    ensure_tls_certificate, serve_uds, AsyncTokenStore, FileWatchStatus, PrimaryReverseRegistry,
+    ensure_tls_certificate, AsyncTokenStore, FileWatchStatus, PrimaryReverseRegistry,
     SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions, MAX_INBOUND_MESSAGE_BYTES,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -218,6 +220,7 @@ struct Server {
     port: u16,
     cfg: Arc<ClientConfig>,
     api: Arc<dyn WorkspaceApi>,
+    #[cfg_attr(not(unix), expect(dead_code))]
     bus: EventBus,
     store: Store,
     registry: Arc<intent_services::SettingsRegistry>,

@@ -4,6 +4,8 @@
 //! file-sourced (`CLAUDE.md`) entry, and that an edit surfaces via
 //! `settings:changed` carrying the `endUserRules` payload (no extra fetch).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

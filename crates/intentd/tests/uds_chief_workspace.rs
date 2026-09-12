@@ -13,6 +13,8 @@
 //!   `delete` on `__chief__` are safe no-ops that return the synthesized shape
 //!   (or `success: true` for delete) — the seeded row is never mutated.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::Path;

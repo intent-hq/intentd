@@ -2,6 +2,8 @@
 //! receives pushed `events.event` notifications for matching published events,
 //! unsubscribes, and a dropped connection releases its subscriptions (§6).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

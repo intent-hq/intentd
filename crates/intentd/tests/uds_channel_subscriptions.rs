@@ -4,6 +4,8 @@
 //! `{ added, updated, removedIds }` deltas mapped from bus change events via the
 //! re-read strategy (PROTOCOL §6, TB-0 §2/§3).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

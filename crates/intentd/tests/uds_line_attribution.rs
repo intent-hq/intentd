@@ -3,6 +3,8 @@
 //! FE-parity payload and publishes a `line-attribution:updated` event whose
 //! `data.attributions` matches what `line-attribution.load` then returns.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

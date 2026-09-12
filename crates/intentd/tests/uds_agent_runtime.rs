@@ -14,6 +14,8 @@
 //!
 //! Gated by `node` + the mock script (the CI ACP gate); skips cleanly otherwise.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

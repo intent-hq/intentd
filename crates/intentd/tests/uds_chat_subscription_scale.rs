@@ -14,6 +14,8 @@
 //! the assertion is deliberately lenient (a generous upper bound) because the
 //! test is diagnostic — the measured numbers are the deliverable.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

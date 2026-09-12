@@ -5,6 +5,8 @@
 //! malformed/unknown ids map to `-32602`. Directory roots are injected via
 //! `Services::with_specialist_dirs` so the test is hermetic.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::{Path, PathBuf};

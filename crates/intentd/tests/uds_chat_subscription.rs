@@ -9,6 +9,8 @@
 //! and asserted to equal a fresh `agent.getConversation` snapshot (the
 //! reconciliation invariant).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

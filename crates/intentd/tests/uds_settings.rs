@@ -5,6 +5,8 @@
 //! `settings:changed` event. Uses an in-memory secret store so the test never
 //! touches the real OS keychain.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

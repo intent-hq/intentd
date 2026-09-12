@@ -1,6 +1,8 @@
 //! `DoD` tests for repo config consumer integrations (workspace.create fallbacks,
 //! script bootstrap, agent instructions).
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
