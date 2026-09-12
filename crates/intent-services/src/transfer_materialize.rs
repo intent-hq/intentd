@@ -676,8 +676,9 @@ fn provision_sandbox_from_bundle(
 /// Second half of [`provision_sandbox_from_bundle`], on a sandbox directory
 /// that is already a clone (`CoW` or plain) of the checkout: fetch the
 /// sandbox branch from the bundle, check it out, reset the local workspace
-/// branch off the WIP sentinel, unwind the sandbox WIP snapshot, and finally
-/// bring the initialized submodules in line with the sandbox's own gitlinks.
+/// branch off the WIP sentinel, bring the initialized submodules in line
+/// with the gitlinks the verified tip records, and finally unwind the
+/// sandbox WIP snapshot.
 fn finish_sandbox_from_bundle(
     sandbox_path: &Path,
     bundle: &str,
