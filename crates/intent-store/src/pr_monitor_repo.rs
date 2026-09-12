@@ -162,13 +162,16 @@ fn monitor_from_row(r: &SqliteRow) -> Result<PrMonitor> {
 
 impl Store {
     /// Insert a new PR-monitor row. Returns `false` (without inserting) when
-    /// the `idx_pr_monitor_identity` unique index rejects the row — a
-    /// concurrent register already created an ACTIVE monitor for the same
-    /// `(agent, repo, PR)` triple; the caller re-arms that row instead.
+    /// a unique index rejects the row: `idx_pr_monitor_identity` (an ACTIVE
+    /// monitor for the same `(agent, repo, PR)` triple already exists — the
+    /// caller re-arms that row instead) or `idx_pr_monitor_workspace_identity`
+    /// (another agent in the same workspace already holds the ACTIVE monitor
+    /// for `(workspace, repo, PR)` — the caller refuses, naming the owner
+    /// found via [`Store::find_active_pr_monitor_in_workspace`]).
     ///
     /// # Errors
     ///
-    /// Returns `Error::Internal` if the insert fails for any reason other than the unique-index rejection (which returns `Ok(false)`).
+    /// Returns `Error::Internal` if the insert fails for any reason other than a unique-index rejection (which returns `Ok(false)`).
     pub async fn insert_pr_monitor(&self, m: &PrMonitor) -> Result<bool> {
         let sql = format!(
             "INSERT INTO pr_monitor ({COLUMNS}) \
@@ -253,6 +256,39 @@ impl Store {
             .fetch_optional(self.read_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("find pr monitor failed: {e}")))?;
+        row.as_ref().map(monitor_from_row).transpose()
+    }
+
+    /// The ACTIVE monitor any agent in `workspace_id` holds for
+    /// `(owner, name, number)`, if any — the workspace-scoped "who already
+    /// monitors this PR" lookup (`idx_pr_monitor_workspace_identity` makes
+    /// it at most one row). Owner-agnostic: compare `agent_id` to tell an
+    /// idempotent re-register from another agent's duplicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn find_active_pr_monitor_in_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        repo_owner: &str,
+        repo_name: &str,
+        pr_number: i64,
+    ) -> Result<Option<PrMonitor>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM pr_monitor WHERE workspace_id = ? AND repo_owner = ? \
+             AND repo_name = ? AND pr_number = ? AND state = 'active'"
+        );
+        let row = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .bind(repo_owner)
+            .bind(repo_name)
+            .bind(pr_number)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("find pr monitor in workspace failed: {e}"))
+            })?;
         row.as_ref().map(monitor_from_row).transpose()
     }
 
@@ -1028,5 +1064,265 @@ mod tests {
             .await
             .expect("get never-polled");
         assert_eq!(never.baseline_snapshot, None, "NULL stays NULL");
+    }
+
+    /// A second agent session in `ws_id` (the FK target a second-owner
+    /// `pr_monitor` row needs).
+    async fn add_agent(store: &Store, ws_id: &WorkspaceId) -> AgentId {
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&test_session(&agent_id, ws_id, &now_iso()))
+            .await
+            .expect("insert second session");
+        agent_id
+    }
+
+    /// `idx_pr_monitor_workspace_identity`: a second ACTIVE monitor on the
+    /// same `(workspace, repo, PR)` is rejected as `Ok(false)` even when a
+    /// DIFFERENT agent inserts it (the per-agent index alone would have let
+    /// it through), the same agent's duplicate is still `Ok(false)` via the
+    /// per-agent index, another workspace may monitor the same PR, and once
+    /// the owner's row turns terminal the other agent can register.
+    #[tokio::test]
+    async fn workspace_identity_index_rejects_second_agents_active_monitor() {
+        let (_tmp, store, ws_id, owner) = store_with_owner().await;
+        let other = add_agent(&store, &ws_id).await;
+        let ts = now_iso();
+
+        let first = test_monitor(&ws_id, &owner, &ts);
+        assert!(store.insert_pr_monitor(&first).await.expect("insert owner"));
+        assert!(
+            !store
+                .insert_pr_monitor(&test_monitor(&ws_id, &owner, &ts))
+                .await
+                .expect("same-agent duplicate"),
+            "per-agent index still rejects the owner's own duplicate"
+        );
+        let duplicate = test_monitor(&ws_id, &other, &ts);
+        assert!(
+            !store
+                .insert_pr_monitor(&duplicate)
+                .await
+                .expect("other-agent duplicate"),
+            "workspace index rejects another agent's active monitor on the same PR"
+        );
+        assert!(
+            store.get_pr_monitor(&duplicate.monitor_id).await.is_err(),
+            "rejected row was not inserted"
+        );
+
+        // A different PR in the same workspace is fine.
+        let mut other_pr = test_monitor(&ws_id, &other, &ts);
+        other_pr.pr_number = 43;
+        assert!(store.insert_pr_monitor(&other_pr).await.expect("other pr"));
+
+        // Another workspace may monitor the same PR (no cross-workspace rule).
+        let ws_b = WorkspaceId("ws-pr-monitor-b".to_string());
+        store
+            .insert_workspace(&test_workspace(&ws_b, &ts))
+            .await
+            .expect("insert ws b");
+        let agent_b = add_agent(&store, &ws_b).await;
+        assert!(store
+            .insert_pr_monitor(&test_monitor(&ws_b, &agent_b, &ts))
+            .await
+            .expect("other workspace"));
+
+        // Once the owner's row is terminal the other agent can register.
+        assert!(store
+            .update_pr_monitor_state(&first.monitor_id, PrMonitorState::Cancelled, &now_iso())
+            .await
+            .expect("cancel owner"));
+        assert!(
+            store
+                .insert_pr_monitor(&test_monitor(&ws_id, &other, &ts))
+                .await
+                .expect("register after cancel"),
+            "terminal rows do not block a fresh registration"
+        );
+    }
+
+    /// `find_active_pr_monitor_in_workspace` returns the workspace's ACTIVE
+    /// row for the PR whichever agent owns it, ignores other PRs and other
+    /// workspaces, and returns `None` once only terminal rows remain.
+    #[tokio::test]
+    async fn find_active_pr_monitor_in_workspace_is_owner_agnostic() {
+        let (_tmp, store, ws_id, owner) = store_with_owner().await;
+        let other = add_agent(&store, &ws_id).await;
+        let ts = now_iso();
+
+        assert_eq!(
+            store
+                .find_active_pr_monitor_in_workspace(&ws_id, "o", "r", 42)
+                .await
+                .expect("find empty"),
+            None
+        );
+
+        let first = test_monitor(&ws_id, &owner, &ts);
+        assert!(store.insert_pr_monitor(&first).await.expect("insert owner"));
+        let mut other_pr = test_monitor(&ws_id, &other, &ts);
+        other_pr.pr_number = 43;
+        assert!(store.insert_pr_monitor(&other_pr).await.expect("other pr"));
+
+        let found = store
+            .find_active_pr_monitor_in_workspace(&ws_id, "o", "r", 42)
+            .await
+            .expect("find")
+            .expect("owner's row found by a workspace-scoped lookup");
+        assert_eq!(found.monitor_id, first.monitor_id);
+        assert_eq!(found.agent_id, owner, "the owning agent is reported");
+        assert_ne!(found.agent_id, other);
+        assert_eq!(
+            store
+                .find_active_pr_monitor_in_workspace(&ws_id, "o", "r", 44)
+                .await
+                .expect("find other pr"),
+            None,
+            "unmonitored PR"
+        );
+        assert_eq!(
+            store
+                .find_active_pr_monitor_in_workspace(
+                    &WorkspaceId("ws-elsewhere".to_string()),
+                    "o",
+                    "r",
+                    42
+                )
+                .await
+                .expect("find other ws"),
+            None,
+            "scoped to the workspace"
+        );
+
+        assert!(store
+            .update_pr_monitor_state(&first.monitor_id, PrMonitorState::Completed, &now_iso())
+            .await
+            .expect("complete"));
+        assert_eq!(
+            store
+                .find_active_pr_monitor_in_workspace(&ws_id, "o", "r", 42)
+                .await
+                .expect("find after complete"),
+            None,
+            "terminal rows are not returned"
+        );
+    }
+
+    /// The 0118 migration dedupes pre-existing duplicate ACTIVE monitors on
+    /// one `(workspace, repo, PR)` before creating the workspace-scoped
+    /// unique index (simulated by dropping the index, inserting the
+    /// duplicates, and re-running the migration file verbatim): the oldest
+    /// row (`created_at`, then `monitor_id`) stays `active`, the others turn
+    /// `cancelled`, and rows for other PRs / other workspaces are untouched.
+    #[tokio::test]
+    async fn migration_dedupes_duplicate_active_monitors_oldest_wins() {
+        let (_tmp, store, ws_id, owner) = store_with_owner().await;
+        sqlx::query("DROP INDEX idx_pr_monitor_workspace_identity")
+            .execute(store.write_pool())
+            .await
+            .expect("drop 0118 index");
+        let other = add_agent(&store, &ws_id).await;
+        let third = add_agent(&store, &ws_id).await;
+        let ws_b = WorkspaceId("ws-pr-monitor-b".to_string());
+        store
+            .insert_workspace(&test_workspace(&ws_b, &now_iso()))
+            .await
+            .expect("insert ws b");
+        let agent_b = add_agent(&store, &ws_b).await;
+
+        let mk = |id: &str, ws: &WorkspaceId, agent: &AgentId, pr: i64, created: &str| {
+            let mut m = test_monitor(ws, agent, created);
+            m.monitor_id = PrMonitorId(id.to_string());
+            m.pr_number = pr;
+            m
+        };
+        let rows = [
+            // Duplicates on PR 42 in ws: `oldest` wins on created_at; `tie-a`
+            // and `tie-b` share a later created_at and lose regardless.
+            mk("prmon-tie-b", &ws_id, &third, 42, "2026-01-02T00:00:00Z"),
+            mk("prmon-oldest", &ws_id, &other, 42, "2026-01-01T00:00:00Z"),
+            mk("prmon-tie-a", &ws_id, &owner, 42, "2026-01-02T00:00:00Z"),
+            // Different PR in the same workspace: untouched.
+            mk("prmon-other-pr", &ws_id, &owner, 43, "2026-01-03T00:00:00Z"),
+            // Same PR in another workspace: untouched.
+            mk(
+                "prmon-other-ws",
+                &ws_b,
+                &agent_b,
+                42,
+                "2026-01-03T00:00:00Z",
+            ),
+        ];
+        for m in &rows {
+            assert!(
+                store.insert_pr_monitor(m).await.expect("insert"),
+                "{} inserts while the workspace index is absent",
+                m.monitor_id.0
+            );
+        }
+        // PR 44: two rows with equal `created_at` exercise the monitor_id
+        // tiebreak on its own.
+        for (id, agent) in [("prmon-tie-z", &owner), ("prmon-tie-y", &other)] {
+            let m = mk(id, &ws_id, agent, 44, "2026-01-05T00:00:00Z");
+            assert!(store.insert_pr_monitor(&m).await.expect("insert tie"));
+        }
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/0118_pr_monitor_workspace_identity.sql"
+        ))
+        .execute(store.write_pool())
+        .await
+        .expect("re-run 0118 migration");
+
+        let state_of = |id: &str| {
+            let store = &store;
+            let id = PrMonitorId(id.to_string());
+            async move { store.get_pr_monitor(&id).await.expect("get").state }
+        };
+        assert_eq!(state_of("prmon-oldest").await, PrMonitorState::Active);
+        assert_eq!(state_of("prmon-tie-a").await, PrMonitorState::Cancelled);
+        assert_eq!(state_of("prmon-tie-b").await, PrMonitorState::Cancelled);
+        assert_eq!(
+            state_of("prmon-other-pr").await,
+            PrMonitorState::Active,
+            "other PR in the workspace untouched"
+        );
+        assert_eq!(
+            state_of("prmon-other-ws").await,
+            PrMonitorState::Active,
+            "same PR in another workspace untouched"
+        );
+        assert_eq!(
+            state_of("prmon-tie-y").await,
+            PrMonitorState::Active,
+            "equal created_at: lowest monitor_id wins"
+        );
+        assert_eq!(state_of("prmon-tie-z").await, PrMonitorState::Cancelled);
+
+        let active_in_ws = store
+            .list_active_pr_monitors_by_workspace(&ws_id)
+            .await
+            .expect("list active");
+        let ids: Vec<&str> = active_in_ws
+            .iter()
+            .map(|m| m.monitor_id.0.as_str())
+            .collect();
+        assert_eq!(ids, vec!["prmon-oldest", "prmon-other-pr", "prmon-tie-y"]);
+
+        // The re-created index enforces the rule from here on.
+        assert!(
+            !store
+                .insert_pr_monitor(&mk(
+                    "prmon-late",
+                    &ws_id,
+                    &third,
+                    42,
+                    "2026-01-09T00:00:00Z"
+                ))
+                .await
+                .expect("insert after migration"),
+            "workspace index rejects a new duplicate"
+        );
     }
 }
