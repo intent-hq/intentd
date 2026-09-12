@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.44] - 2026-09-12
+
+### 🐛 Bug Fixes
+
+- *(core)* Avoid char-boundary panic in slug mention stripping ([#1800](https://github.com/intent-hq/intentd/pull/1800))
+
+
 ## [0.9.43] - 2026-09-11
 
 ### 🚀 Features
