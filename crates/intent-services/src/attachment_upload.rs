@@ -1361,6 +1361,112 @@ mod tests {
         assert_eq!(svc.attachment_uploads.lock().unwrap().len(), 1);
     }
 
+    /// Cross-surface replay on `commit` (PROTOCOL §5.9, #1841 review): a
+    /// keyed session whose key a same-key single-shot placement bound first
+    /// (matching fingerprint) commits as a replay of that placement —
+    /// nothing placed, the session retired, `replayed: true` on the result.
+    /// A session whose key the single-shot bound with a DIFFERENT payload
+    /// commits into the conflict error and stays alive for abort.
+    #[tokio::test]
+    async fn keyed_commit_replays_single_shot_bound_first_and_conflicts_otherwise() {
+        let ws = WorkspaceId("ws-up-keyed-xsurface".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let payload = b"cross-surface".to_vec();
+        let sha = sha256_hex(&payload);
+        let key = Some("key-x".to_string());
+        let begun = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "x.bin".to_string(),
+                payload.len() as u64,
+                sha.clone(),
+                None,
+                key.clone(),
+            )
+            .await
+            .expect("keyed begin");
+        let upload_id = begun["uploadId"].as_str().unwrap().to_string();
+        svc.file_attachment_upload_chunk_op(upload_id.clone(), 0, b64(&payload))
+            .await
+            .expect("chunk");
+
+        // The single-shot arm binds the key first with the same identity.
+        let placed = svc
+            .file_place_attachment(
+                ws.clone(),
+                "x.bin".to_string(),
+                Some(b64(&payload)),
+                None,
+                None,
+                key.clone(),
+            )
+            .await
+            .expect("single-shot place");
+        assert!(placed.get("replayed").is_none(), "{placed}");
+
+        let committed = svc
+            .file_attachment_upload_commit_op(upload_id.clone())
+            .await
+            .expect("commit replays");
+        let mut expected = placed.clone();
+        expected["replayed"] = serde_json::json!(true);
+        assert_eq!(committed, expected);
+        assert!(!checkout.0.join(".intent/attachments/x-2.bin").exists());
+        assert!(svc.attachment_uploads.lock().unwrap().is_empty());
+        let err = svc
+            .file_attachment_upload_commit_op(upload_id)
+            .await
+            .expect_err("session retired");
+        assert!(
+            err.to_string().contains("no attachment upload"),
+            "got {err}"
+        );
+
+        // Conflict guise: the session's identity differs from the binding.
+        let other = b"cross-surface!".to_vec();
+        let other_sha = sha256_hex(&other);
+        let begun = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "y.bin".to_string(),
+                other.len() as u64,
+                other_sha.clone(),
+                None,
+                Some("key-y".to_string()),
+            )
+            .await
+            .expect("keyed begin y");
+        let upload_id = begun["uploadId"].as_str().unwrap().to_string();
+        svc.file_attachment_upload_chunk_op(upload_id.clone(), 0, b64(&other))
+            .await
+            .expect("chunk y");
+        svc.file_place_attachment(
+            ws.clone(),
+            "y.bin".to_string(),
+            Some(b64(&payload)),
+            None,
+            None,
+            Some("key-y".to_string()),
+        )
+        .await
+        .expect("single-shot place y with other bytes");
+        let err = svc
+            .file_attachment_upload_commit_op(upload_id.clone())
+            .await
+            .expect_err("conflict");
+        assert!(matches!(err, Error::InvalidParams(_)), "got {err}");
+        assert!(err.to_string().contains("different payload"), "got {err}");
+        assert_eq!(svc.attachment_uploads.lock().unwrap().len(), 1);
+        let aborted = svc
+            .file_attachment_upload_abort_op(upload_id)
+            .await
+            .expect("abort");
+        assert_eq!(aborted["aborted"], serde_json::json!(true));
+    }
+
     /// Regression (#1841 review): a keyed `sourcePath` placement binds the
     /// key to the PLACED size, not the pre-copy stat. `/proc` files stat as
     /// 0 bytes yet copy non-empty, so the two deterministically disagree;
