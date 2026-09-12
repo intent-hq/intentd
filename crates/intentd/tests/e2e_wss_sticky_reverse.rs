@@ -865,11 +865,18 @@ async fn client_connected_and_disconnected_events_are_published_per_logical_clie
 /// normal epilogue — the registry entry is dropped by RAII. That departure
 /// must still be announced: `client:disconnected` reaches the subscriber and
 /// the client is gone from `live_clients()`.
+///
+/// The abort is forced, not raced: [`WsOptions::heartbeat_gate`] holds the
+/// reaper's abort back until the test has observed the connected state, so
+/// no amount of scheduling delay between the hello and that observation can
+/// let the 200ms pong deadline win (intent-hq/intent#4851).
 #[tokio::test]
 async fn heartbeat_abort_publishes_client_disconnected() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
     let fx = boot_with(WsOptions {
         heartbeat_interval: Duration::from_millis(100),
         heartbeat_timeout: Duration::from_millis(200),
+        heartbeat_gate: Some(gate_rx),
         ..WsOptions::default()
     })
     .await;
@@ -883,26 +890,30 @@ async fn heartbeat_abort_publishes_client_disconnected() {
     .await;
     assert!(ack.get("error").is_none(), "subscribe failed: {ack}");
 
-    // Hello with the capability. The hello reply is the barrier for the
-    // connected state: the connection loop binds the identity onto its
-    // registry entry *before* it writes the reply (`conn.rs`), so once the
-    // reply has been read the registry holds a live, eligible target. It is
-    // observed here, directly, while the socket is still being polled
-    // (`wss_rpc` answers pings inline). Observing it only after the
-    // subscriber's `client:connected` frame instead races the reaper: under
-    // suite load that frame can arrive after the 200ms pong deadline has
-    // already aborted the silent connection (intent-hq/intent#4851).
+    // Hello with the capability, then never poll the socket again, so no
+    // pong is ever answered. The gate is still closed: the reaper keeps
+    // pinging but cannot abort, so the connected state is observed on a
+    // connection that is guaranteed to still be registered — however long
+    // the hello reply or the subscriber's frame took to arrive.
     let silent = {
         let mut silent = connect(fx.port).await;
         let _ = wss_rpc(&mut silent, 1, "client.hello", hello("desktop-a", true)).await;
-        assert!(fx.registry.is_connected());
         silent
     };
-    // From here the socket is never polled again, so no pong is ever
-    // answered; the reaper aborts the server task.
     let ev = await_event(&mut sub, "client:connected", Duration::from_secs(2)).await;
     assert_eq!(ev["data"]["clientId"], "desktop-a");
+    assert!(fx.registry.is_connected());
+    // Well past the pong deadline the held-back reaper has still not fired.
+    assert!(
+        try_read_text(&mut sub, Duration::from_millis(600))
+            .await
+            .is_none(),
+        "reaper aborted while gated"
+    );
+    assert!(fx.registry.is_connected());
 
+    // Release the reaper; the next tick past the deadline aborts the task.
+    gate_tx.send(true).expect("gate receiver alive");
     let ev = await_event(&mut sub, "client:disconnected", Duration::from_secs(5)).await;
     assert_eq!(
         ev["data"],
