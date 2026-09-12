@@ -134,7 +134,10 @@ pub(crate) fn three_way_merge(base: &str, current: &str, incoming: &str) -> Merg
             // predecessor only by an Equal run the other side rewrote; keep
             // that writer's text contiguous.
             let continues = h.start == end && all[i..j].iter().any(|c| c.side == h.side);
-            if !(overlaps || continues) {
+            // Pure insertions at one offset are compared so an identical
+            // insertion on both sides applies once.
+            let same_offset_insertion = h.start == start && h.end == start && end == start;
+            if !(overlaps || continues || same_offset_insertion) {
                 break;
             }
             end = end.max(h.end);
@@ -152,7 +155,11 @@ pub(crate) fn three_way_merge(base: &str, current: &str, incoming: &str) -> Merg
                 out.extend_from_slice(&cur);
                 if cur != inc {
                     out.extend_from_slice(&inc);
-                    conflicting_spans += 1;
+                    // Distinct insertions at one offset both apply in order;
+                    // only a rewritten base span counts as a conflict.
+                    if end > start {
+                        conflicting_spans += 1;
+                    }
                 }
             }
             (true, false) => out.extend(variant(cluster, Side::Current, &base, start, end)),
@@ -336,6 +343,21 @@ mod tests {
             "ALPHA BETA gamma delta",
         );
         clean("abc", "aXc!", "aXc", "aXc!");
+    }
+
+    #[test]
+    fn identical_insertion_on_both_sides_applies_once() {
+        clean("abc", "aXbc!", "aXbc", "aXbc!");
+        clean("abc", "aXbc", "aXbc!", "aXbc!");
+        clean("abc", "!aXbc", "aXbc?", "!aXbc?");
+        clean("a c", "a new c", "a new c.", "a new c.");
+    }
+
+    #[test]
+    fn identical_insertion_with_emoji() {
+        clean("a🦊c", "a🐶🦊c🎉", "a🐶🦊c", "a🐶🦊c🎉");
+        clean("a🦊c", "a🐶🦊c", "a🐶🦊c🎉", "a🐶🦊c🎉");
+        clean("😀🎉", "😀🦀🎉", "😀🦀🎉!", "😀🦀🎉!");
     }
 
     #[test]
