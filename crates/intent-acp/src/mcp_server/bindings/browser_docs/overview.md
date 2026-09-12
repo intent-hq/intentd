@@ -162,9 +162,11 @@ first), `navigated-away` (capture ops only, and only checked right after a mount
 demand: the freshly mounted page shows a different origin than the tab list recorded
 — `navigate` back, or `listTabs` to re-check; drift on an already-mounted tab is not
 detected), or `not-painting` (capture ops only: the webview is mounted but its
-surface produced an empty image, reported as soon as observed — e.g. a
-`displayed: false` tab behind a sibling, or a `displayed: true` tab whose panel is
-hidden by zoom — `showTab` or `focusTab` it, then capture again). Other failures
+surface has not painted — either the capture did not return within the capture
+stage's own cap, or it returned an empty / empty-encoded image, reported as soon as
+observed — e.g. a `displayed: false` tab behind a sibling, or a `displayed: true`
+tab whose panel is hidden by zoom — `showTab` or `focusTab` it, then capture again).
+Other failures
 carry no `errorCode`, except ownership failures, which keep their `not-owner` /
 `already-claimed` codes. One backstop: if a batch still has not settled shortly
 after the request deadline (a stage that takes no deadline, such as `navigate`'s

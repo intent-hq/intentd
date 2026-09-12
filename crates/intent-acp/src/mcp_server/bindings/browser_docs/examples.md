@@ -145,8 +145,9 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
 `visibility: "visible"` means the tab is in the user's panel layout; it does not mean
 the tab can paint. Only a panel's active tab renders, so a visible tab that the user
 (or another open) pushed behind a sibling is `displayed: false`. A capture op mounts
-such a tab on demand, but if its surface still produces an empty image the op fails
-with `errorCode: "not-painting"`. Check `displayed` and bring the tab to the front
+such a tab on demand, but if its surface still does not paint (the capture times out
+at its own cap, or returns an empty image) the op fails with
+`errorCode: "not-painting"`. Check `displayed` and bring the tab to the front
 with `showTab` (no focus change) before capturing. `displayed` is a saved-layout fact
 (visible AND active in its panel), not a paint guarantee: a `displayed: true` tab
 whose panel is hidden by zoom can fail with `not-painting` too, and the field is
@@ -192,8 +193,9 @@ tab of a not-in-view workspace mounts the tab on demand under the request deadli
 succeeds with the same `warning`; when the mount, settle, or paint cannot happen it
 fails with a structured `errorCode` (`workspace-not-visible`, `deadline-exhausted`,
 `still-loading`, `navigated-away`, `not-painting`). `navigate` mounts on demand too but
-without the deadline, settle, or origin check, so it can only yield
-`workspace-not-visible` — see the overview topic.
+without the deadline, settle, or origin check, so of these mount/capture codes it can
+only yield `workspace-not-visible` (ownership and uncoded failures still apply) — see
+the overview topic.
 
 ## Opening Local HTML Files
 
