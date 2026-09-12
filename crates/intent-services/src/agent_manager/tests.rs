@@ -6627,6 +6627,46 @@ async fn quota_failure_provider_follows_failed_step() {
     );
 }
 
+/// No spawn-attempt record outlives its attempt: a spawn failure that is NOT
+/// a quota rejection still consumes it (the publisher runs once per failed
+/// attempt, quota or not), and a teardown that cancels an in-flight attempt
+/// (`stop` / `workspace.delete` → `detach`) drops it — so an agent that is
+/// never retried does not retain a per-agent entry.
+#[tokio::test]
+async fn spawn_attempt_provider_never_outlives_its_attempt() {
+    let (_tmp, mgr, _bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-sap"), AgentId::from("a-sap"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    mgr.spawn_attempt_provider
+        .lock()
+        .unwrap()
+        .insert(id.clone(), "mock".to_string());
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        "session/new failed: internal error",
+        None,
+        super::FailedProviderSource::SpawnAttempt,
+    )
+    .await;
+    assert!(
+        !mgr.spawn_attempt_provider.lock().unwrap().contains_key(&id),
+        "a non-quota spawn failure consumes the attempt record"
+    );
+
+    mgr.spawn_attempt_provider
+        .lock()
+        .unwrap()
+        .insert(id.clone(), "mock".to_string());
+    mgr.stop(&id).await;
+    assert!(
+        !mgr.spawn_attempt_provider.lock().unwrap().contains_key(&id),
+        "teardown drops the record of a cancelled attempt"
+    );
+}
+
 /// Durable-before-observable (monorepo#2009): the terminal-failure handlers
 /// complete the `status = error` + `stop_reason` store write BEFORE the
 /// terminal `agent:failed`/`agent:stream:end` pair is published, so a client

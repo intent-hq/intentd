@@ -2243,10 +2243,12 @@ pub struct AgentManager {
     /// existing replaceMessages semantics.
     force_recreate: Arc<Mutex<HashSet<AgentId>>>,
     /// The provider id [`AgentManager::ensure_started`] resolved for an
-    /// agent's most recent spawn attempt that failed AFTER resolution (child
-    /// spawn or ACP session setup), cleared when a later attempt succeeds.
-    /// Read by the spawn-failure publisher so a quota-stamped `agent:failed`
-    /// names the provider whose `session/new` was actually rejected.
+    /// agent's in-flight spawn attempt. Recorded before the child spawn / ACP
+    /// session setup can fail; removed when the attempt succeeds, consumed by
+    /// the spawn-failure publisher on any failure, and dropped by `detach`
+    /// when a teardown cancels the attempt — so no record outlives its
+    /// attempt. Read so a quota-stamped `agent:failed` names the provider
+    /// whose `session/new` was actually rejected.
     /// `last_turn_provider` is the wrong source there: an `agent.setModel`
     /// switch commits the new identity only once the new child is up
     /// (`maybe_persist_model_change_notice` runs after `start_session`), so
@@ -4396,6 +4398,9 @@ impl AgentManager {
         // visible before `end_turn` frees the busy slot.
         self.recreated.lock().unwrap().remove(agent_id);
         self.prepend_pending.lock().unwrap().remove(agent_id);
+        // A spawn attempt cancelled by this teardown never reaches the
+        // spawn-failure publisher that would consume its provider record.
+        self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         // Same staleness terms for the streaming path's persisted terminal-
         // error stash (monorepo#2050): the abort above may have landed between
         // `run_prompt_turn`'s stash and the terminal-failure handler's take,
@@ -11035,20 +11040,25 @@ async fn publish_terminal_failure_events(
     // this publisher it has been through the `session/prompt failed: …` wrap
     // boundary (or was never an ACP error at all — a spawn or a pre-turn
     // persist failure), and the message-level classifier is the only surface
-    // left. The provider read is deliberately inside the branch: a terminal
-    // failure that is not a quota rejection costs exactly what it did before.
-    // A spawn-attempt record is consumed (not just read) here: the terminal
-    // publisher runs once per failed spawn, and a record that outlived its
-    // attempt must not be able to label an unrelated later failure.
+    // left. The committed-turn store read is deliberately inside the branch: a
+    // terminal failure that is not a quota rejection costs exactly what it did
+    // before. A spawn-attempt record is consumed on EVERY failed spawn, quota
+    // or not: the terminal publisher runs once per failed attempt, and a
+    // record that outlived its attempt must not linger for an agent that is
+    // never retried nor be able to label an unrelated later failure.
+    let spawn_attempt = match provider_source {
+        FailedProviderSource::SpawnAttempt => {
+            mgr.spawn_attempt_provider.lock().unwrap().remove(agent_id)
+        }
+        FailedProviderSource::CommittedTurn => None,
+    };
     if intent_acp::message_is_quota_exceeded(error_msg) {
         let provider_id = match provider_source {
             FailedProviderSource::CommittedTurn => {
                 crate::agent_session::session_provider_id(&mgr.services, workspace_id, agent_id)
                     .await
             }
-            FailedProviderSource::SpawnAttempt => {
-                mgr.spawn_attempt_provider.lock().unwrap().remove(agent_id)
-            }
+            FailedProviderSource::SpawnAttempt => spawn_attempt,
         };
         stamp_quota_failure(&mut failed_data, provider_id.as_deref());
     }
