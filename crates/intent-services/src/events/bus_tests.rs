@@ -259,16 +259,17 @@ async fn type_glob_and_exclude_self() {
     assert_eq!(batch[0].actor.id.as_deref(), Some("agent-other"));
 }
 
+/// Events matched within `batch_window` coalesce into a single batch. The
+/// window is fired by advancing a paused clock, not by waiting it out, so the
+/// test does not depend on how long the three publishes take under load.
 #[tokio::test]
 async fn batch_window_coalesces_matched_events() {
+    // A window no realistic publish latency can reach: the three events are
+    // guaranteed to land inside it, and it never elapses on its own.
+    const WINDOW: Duration = Duration::from_secs(60);
     let (_tmp, bus) = bus().await;
-    // Generous real-time window so the three quick inserts coalesce into one.
-    let filter = SubscriptionFilter::for_subscriber(
-        &["note:*".to_string()],
-        None,
-        false,
-        Some(Duration::from_millis(300)),
-    );
+    let filter =
+        SubscriptionFilter::for_subscriber(&["note:*".to_string()], None, false, Some(WINDOW));
     let mut sub = bus.subscribe(filter);
 
     for _ in 0..3 {
@@ -276,6 +277,28 @@ async fn batch_window_coalesces_matched_events() {
             .await
             .expect("publish");
     }
+    // Wait until the delivery task has read every broadcast: a value stays
+    // queued until each live receiver has taken it, and the task buffers a
+    // matched event and arms the deadline in the same poll that receives it,
+    // so an empty queue means all three sit behind the one deadline.
+    for _ in 0..1_000 {
+        if bus.undelivered_broadcasts() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        bus.undelivered_broadcasts(),
+        0,
+        "delivery task did not drain the broadcast"
+    );
+
+    // Pause only now, after every publish (real SQLite I/O) has resolved: a
+    // paused runtime auto-advances to the next pending timer whenever it goes
+    // idle, and the store's pool reapers/acquire timeouts are such timers, so
+    // pausing around real I/O would fire them instead of our deadline.
+    tokio::time::pause();
+    tokio::time::advance(WINDOW).await;
 
     let batch = timeout(Duration::from_secs(2), sub.recv())
         .await
@@ -363,29 +386,74 @@ async fn dropping_bus_flushes_buffered_batch_before_close() {
     assert!(sub.recv().await.is_none());
 }
 
-#[tokio::test]
+/// A lone serial publisher must not pay an artificial batch-window wait on
+/// every publish: the writer's idle path flushes as soon as a request is
+/// received. Regression guard for the earlier 20 ms window, under which N
+/// sequential publishes cost at least N × 20 ms by construction.
+///
+/// Deterministic form: the writer loop runs under a paused clock with a no-I/O
+/// insert. A paused runtime auto-advances to the next pending timer whenever it
+/// goes idle, so any `sleep`/window wait inside the loop would move
+/// `tokio::time::Instant::now()`; asserting it did not move after N awaited
+/// publishes proves the loop contains no timer wait, with no wall-clock budget.
+#[tokio::test(start_paused = true)]
 async fn idle_publish_resolves_without_batch_window_delay() {
-    let (_tmp, bus) = bus().await;
-    // A lone serial publisher must not pay a fixed batch-window wait on every
-    // publish: with the writer's idle path flushing immediately, each publish
-    // is bounded only by its SQLite commit. Under the previous 20 ms window,
-    // 20 sequential publishes took >= 400 ms by construction, so any bound
-    // below that proves the fix; 350 ms leaves headroom for slow/contended CI.
-    let start = std::time::Instant::now();
-    for i in 0..20 {
-        bus.publish(&new_event(
+    const PUBLISHES: usize = 20;
+    let (btx, mut brx) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+    let (wtx, wrx) = tokio::sync::mpsc::channel::<super::bus::WriterRequest>(16);
+
+    let inserted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let insert_count = inserted.clone();
+    let writer = tokio::spawn(super::bus::writer_loop(
+        move |events: std::sync::Arc<[NewEvent]>| {
+            let base = insert_count.fetch_add(events.len(), std::sync::atomic::Ordering::SeqCst);
+            let stored: Vec<Event> = events
+                .iter()
+                .enumerate()
+                .map(|(i, ev)| stored_event(&format!("evt-{}", base + i), ev))
+                .collect();
+            async move { Ok(stored) }
+        },
+        wrx,
+        btx,
+    ));
+
+    let start = tokio::time::Instant::now();
+    for i in 0..PUBLISHES {
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        let ev = new_event(
             "test:idle",
             Some(&format!("publisher-{i}")),
             ActorType::Agent,
-        ))
-        .await
-        .expect("publish");
+        );
+        wtx.send((ev, otx)).await.expect("writer loop alive");
+        let stored = orx
+            .await
+            .expect("oneshot resolved")
+            .expect("insert succeeds");
+        assert_eq!(stored.id, format!("evt-{i}"));
     }
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_millis(350),
-        "20 sequential idle publishes should flush immediately; took {elapsed:?}"
+    assert_eq!(
+        tokio::time::Instant::now(),
+        start,
+        "idle publishes must resolve without any timer wait in the writer loop"
     );
+    assert_eq!(
+        inserted.load(std::sync::atomic::Ordering::SeqCst),
+        PUBLISHES,
+        "every publish was persisted"
+    );
+    for i in 0..PUBLISHES {
+        let ev = brx.try_recv().expect("each publish was broadcast");
+        assert_eq!(ev.id, format!("evt-{i}"));
+    }
+
+    // Shutdown invariant: closing the channel ends the loop.
+    drop(wtx);
+    timeout(Duration::from_secs(2), writer)
+        .await
+        .expect("writer loop exits on channel close")
+        .expect("writer loop task");
 }
 
 #[tokio::test]
