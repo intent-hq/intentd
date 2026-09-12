@@ -106,18 +106,19 @@ Revealing an existing tab is `showTab`-only.
   tab (a no-op success with `focus: false`; `focus: true` still focuses its panel).
   An unknown `tabId` fails as an action-result error naming the unknown id.
 - `listTabs` results carry `visibility: "visible" | "hidden"` on every tab, plus
-  `displayed?: boolean` — a fact about the saved layout, not a paint guarantee: true
-  when the tab is visible AND its panel's active tab (derived from the panel that
-  holds the tab). The field is present only when the host has reported it (it is
-  absent after a daemon restart until the host reconnects) — absent means unknown,
-  never `false`; re-read with `listTabs`. `visibility: "visible"` alone does not mean
-  the tab can paint: a visible tab that is not its panel's active tab is mounted but
-  renders nothing, so `visibility: "visible", displayed: false` is the "sits behind
-  another tab" state — `showTab` it (default `focus: false`) to bring it to the
-  front. Hidden tabs are `displayed: false` whenever the field is present. A
-  `displayed: true` tab actually paints only while its workspace is in view in the
-  app and its panel is not hidden (e.g. by another panel being zoomed/expanded);
-  `displayed` does not track either condition — see the capture-ops contract below.
+  `displayed?: boolean` — a fact about the saved layout only: true when the tab is
+  visible AND its panel's active tab (derived from the panel that holds the tab).
+  The field is present only while the daemon holds a current host report for it —
+  absent before the host first reports it, after a later report that omitted it
+  cleared it, and after a daemon restart until the host reconnects — so absent means
+  unknown (never `false`, and not "never reported"); re-read with `listTabs`.
+  `visibility: "visible"` alone does not mean displayed: a visible tab that is not
+  its panel's active tab is in the layout but is not painted on screen, so
+  `visibility: "visible", displayed: false` is the "sits behind another tab" state —
+  `showTab` it (default `focus: false`) to bring it to the front. Hidden tabs are
+  `displayed: false` whenever the field is present. `displayed` says nothing about
+  whether the workspace is in view or the panel is hidden by zoom; what a tab can
+  paint or capture is stated once in the capture-ops contract below.
 - `focusTab` is unchanged for visible tabs (activate + focus the panel). On a hidden
   tab it fails with an action-result error directing you to `showTab` — there is no
   focusTab overload that reveals a hidden tab.
@@ -127,35 +128,48 @@ navigation are deterministic offscreen thanks to viewport emulation. Reveal a ta
 only when the user should see it, and prefer the default `focus: false` so you never
 steal focus.
 
-**Capture ops and workspace visibility.** Tab operations do not require the
-workspace to be currently open/visible in the app. Layout-only actions (`openTab`
-hidden or visible, `closeTab`, `showTab`, `focusTab`, `claimTab`, `resizeTab`, …)
-apply their effects to the persisted layout state so it is correct when the user
-next opens the workspace. When the workspace is not visible in the UI, no actual UI
-focus/activation is attempted: `showTab { focus: true }`, `focusTab`, and
-`openTab { visible: true }` succeed, skip the UI focus attempt, and the action result
-carries an additive `warning` string stating that the workspace is not visible so no
-UI focus was attempted (the field is absent when the workspace is visible).
+**Capture ops and workspace visibility.** Layout-only actions (`openTab` hidden or
+visible, `closeTab`, `showTab`, `focusTab`, `claimTab`, `resizeTab`, …) do not need
+the workspace to be open/visible in the app: they apply their effects to the
+persisted layout state so it is correct when the user next opens the workspace.
+When the workspace is not visible in the UI, no actual UI focus/activation is
+attempted: `showTab { focus: true }`, `focusTab`, and `openTab { visible: true }`
+succeed, skip the UI focus attempt, and the action result carries an additive
+`warning` string stating that the workspace is not visible so no UI focus was
+attempted (the field is absent when the workspace is visible).
 
-Capture ops (`screenshot`, `getAccessibilityTree`, `evaluate`, and `navigate`, which
-runs through `evaluate`) need a mounted webview. A hidden tab is always mounted
-offscreen. A **visible** tab whose webview is not mounted — its workspace is not in
-view, or it sits behind another tab in its panel — is mounted on demand by the
-capture op itself (hydrate the layout, wait for the tab to register, wait for the
-page to finish loading, then capture), bounded by one request deadline so the op
-never outlives the request. A capture that mounted on demand against a not-in-view
-workspace succeeds with the same additive `warning` string. When a mount or paint
-cannot happen, the op fails as an action-result error (`success: false`, `error`
-naming the cause and remedy) carrying an additive structured `errorCode`:
-`workspace-not-visible` (no window hosts the workspace, so the tab cannot be mounted
-— open the workspace in a window and retry), `deadline-exhausted` (the request
-deadline ran out at a named stage — retry), `still-loading` (the page was still
+Capture ops (`screenshot`, `getAccessibilityTree`, `evaluate`) and `navigate` (which
+runs through `evaluate`) need a mounted webview. A tab whose webview is not mounted —
+typically a **visible** tab whose workspace is not in view or that sits behind another
+tab in its panel, but also a tab opened while its workspace was not in view, whatever
+its `visibility` — is mounted on demand by the op itself (hydrate the layout, wait for
+the tab to register). For the three capture ops the whole pipeline — mount, wait for
+the page to finish loading, capture — is bounded by one request deadline, so the op
+is designed not to outlive the request; `navigate` runs only the mount step with no
+deadline (its mount wait has its own cap), never waits for the page to settle, and
+does no origin check; `snapshot` does not go through the mount path at all. A mount
+on demand against a not-in-view workspace succeeds with the same additive `warning`
+string. When a mount, settle, or paint cannot happen, the op fails as an
+action-result error (`success: false`, `error` naming the cause and remedy) with an
+additive structured `errorCode`: `workspace-not-visible` (the tab could not be
+mounted while the workspace is not displayed in any window — either no window hosts
+it at all, or a background window hosts it but the offscreen mount wait ran out at
+its cap; retry shortly or `listTabs`, and open the workspace in a window if it is
+open nowhere), `deadline-exhausted` (capture ops only: the request deadline ran out
+at a named stage — retry), `still-loading` (capture ops only: the page was still
 loading after the bounded wait — retry, or `snapshot` with `waitFor: { networkIdle }`
-first), `navigated-away` (the mounted page shows a different origin than the tab
-list recorded — `navigate` back, or `listTabs` to re-check), or `not-painting` (the
-webview is mounted but its surface has not painted — e.g. a `displayed: false` tab
-behind a sibling, or a `displayed: true` tab whose panel is hidden by zoom — `showTab`
-or `focusTab` it, then capture again). `errorCode` is absent on other failures.
+first), `navigated-away` (capture ops only, and only checked right after a mount on
+demand: the freshly mounted page shows a different origin than the tab list recorded
+— `navigate` back, or `listTabs` to re-check; drift on an already-mounted tab is not
+detected), or `not-painting` (capture ops only: the webview is mounted but its
+surface produced an empty image, reported as soon as observed — e.g. a
+`displayed: false` tab behind a sibling, or a `displayed: true` tab whose panel is
+hidden by zoom — `showTab` or `focusTab` it, then capture again). Other failures
+carry no `errorCode`, except ownership failures, which keep their `not-owner` /
+`already-claimed` codes. One backstop: if a batch still has not settled shortly
+after the request deadline (a stage that takes no deadline, such as `navigate`'s
+mount or evaluate), the whole `ws.browser.exec` call fails with a top-level error
+naming the "action execution" stage instead of a per-action `errorCode`.
 
 ## Basic Actions
 - `{ action: "listTabs", scope? }` - List browser tabs (`scope: "mine" | "unclaimed" | "all"`, default `all`) with ownership, sizing, visibility, and `displayed` (visible AND its panel's active tab) info
