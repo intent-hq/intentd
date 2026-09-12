@@ -3385,6 +3385,7 @@ mod tests {
 
     /// Whether the process group led by `pgid` still has any member (a zombie
     /// leader counts until reaped), via `kill -0 -- -<pgid>`.
+    #[cfg(unix)]
     fn pgroup_alive(pgid: i64) -> bool {
         std::process::Command::new("kill")
             .args(["-0", "--", &format!("-{pgid}")])
