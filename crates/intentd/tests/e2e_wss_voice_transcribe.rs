@@ -43,13 +43,6 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
 struct MemTokenStore(Mutex<Option<String>>);
@@ -191,16 +184,22 @@ struct Fixture {
     engine: Arc<RecordingEngine>,
     store: Store,
     workspaces_root: PathBuf,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry `engine`.
 async fn boot_with_engine(
     engine: Arc<dyn VoiceEngine>,
-) -> (WsApiServer, u16, Arc<ClientConfig>, Store, PathBuf, TempDir) {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-voice-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+) -> (
+    WsApiServer,
+    u16,
+    Arc<ClientConfig>,
+    Store,
+    PathBuf,
+    tempfile::TempDir,
+) {
+    let dir_guard = common::test_tempdir("intentd-voice-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -225,7 +224,7 @@ async fn boot_with_engine(
     let ws_srv = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws_srv.start().await.expect("start");
-    (ws_srv, port, cfg, store, workspaces_root, TempDir(dir))
+    (ws_srv, port, cfg, store, workspaces_root, dir_guard)
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry the recording

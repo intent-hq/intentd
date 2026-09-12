@@ -11,7 +11,7 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -27,31 +27,23 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn scratch_dir(tag: &str) -> TempDir {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-newrepo-e2e-{tag}-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
-    TempDir(dir)
+fn scratch_dir(tag: &str) -> tempfile::TempDir {
+    common::test_tempdir(&format!("intentd-newrepo-e2e-{tag}-"))
 }
 
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
     let dir = scratch_dir("home");
-    let store = Store::open(&dir.0.join("intentd.db")).await.expect("store");
+    let store = Store::open(&dir.path().join("intentd.db"))
+        .await
+        .expect("store");
     let bus = EventBus::new(store.clone());
-    let workspaces_root = dir.0.join("workspaces");
+    let workspaces_root = dir.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
     let services = Services::new(store)
         .with_workspaces_root(workspaces_root)
@@ -128,7 +120,8 @@ fn run_git(args: &[&str], dir: &Path) -> String {
 async fn workspace_create_is_new_repo_initializes_and_provisions() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
-    let project = scratch_dir("fresh");
+    let project_dir = scratch_dir("fresh");
+    let project = project_dir.path();
 
     let resp = wss_rpc_raw(
         &mut rpc,
@@ -136,7 +129,7 @@ async fn workspace_create_is_new_repo_initializes_and_provisions() {
         "workspace.create",
         json!({
             "title": "New Project E2E",
-            "repositoryPath": project.0.to_string_lossy(),
+            "repositoryPath": project.to_string_lossy(),
             "isNewRepo": true,
         }),
     )
@@ -150,20 +143,20 @@ async fn workspace_create_is_new_repo_initializes_and_provisions() {
     let workspace = &resp["result"]["workspace"];
 
     // The source dir became a real repo with exactly one seeded commit.
-    let head_sha = run_git(&["rev-parse", "HEAD"], &project.0);
-    assert_eq!(run_git(&["rev-list", "--count", "HEAD"], &project.0), "1");
+    let head_sha = run_git(&["rev-parse", "HEAD"], project);
+    assert_eq!(run_git(&["rev-list", "--count", "HEAD"], project), "1");
     assert_eq!(
-        run_git(&["log", "-1", "--pretty=%s"], &project.0),
+        run_git(&["log", "-1", "--pretty=%s"], project),
         "Initial commit"
     );
-    assert!(project.0.join("README.md").exists(), "starter files seeded");
+    assert!(project.join("README.md").exists(), "starter files seeded");
 
     // ...and the workspace works directly in the initialized repository
     // folder (standalone repo) on its workspace branch — the row carries the
     // repository folder as `worktreePath` (intent-hq/monorepo#2611).
     assert_eq!(
         workspace["worktreePath"],
-        json!(project.0.to_string_lossy()),
+        json!(project.to_string_lossy()),
         "worktreePath carries the initialized repository folder, got: {workspace}"
     );
     assert_eq!(
@@ -174,11 +167,11 @@ async fn workspace_create_is_new_repo_initializes_and_provisions() {
     assert_eq!(workspace["baseCommitSha"], json!(head_sha));
     let branch = workspace["branch"].as_str().expect("branch populated");
     assert_eq!(
-        run_git(&["rev-parse", "--abbrev-ref", "HEAD"], &project.0),
+        run_git(&["rev-parse", "--abbrev-ref", "HEAD"], project),
         branch,
         "workspace branch checked out in place"
     );
-    assert_eq!(run_git(&["rev-parse", "HEAD"], &project.0), head_sha);
+    assert_eq!(run_git(&["rev-parse", "HEAD"], project), head_sha);
 }
 
 /// An `isNewRepo` initialization failure (`repositoryPath` points at a
@@ -190,7 +183,7 @@ async fn workspace_create_is_new_repo_init_failure_is_typed_with_no_row() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
     let parent = scratch_dir("initfail");
-    let file = parent.0.join("not-a-dir");
+    let file = parent.path().join("not-a-dir");
     std::fs::write(&file, "plain file\n").unwrap();
 
     let resp = wss_rpc_raw(
@@ -229,7 +222,8 @@ async fn workspace_create_is_new_repo_init_failure_is_typed_with_no_row() {
 async fn workspace_create_without_is_new_repo_keeps_row_only_skip() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
-    let project = scratch_dir("legacy");
+    let project_dir = scratch_dir("legacy");
+    let project = project_dir.path();
 
     let resp = wss_rpc_raw(
         &mut rpc,
@@ -237,7 +231,7 @@ async fn workspace_create_without_is_new_repo_keeps_row_only_skip() {
         "workspace.create",
         json!({
             "title": "Legacy Row-Only",
-            "repositoryPath": project.0.to_string_lossy(),
+            "repositoryPath": project.to_string_lossy(),
         }),
     )
     .await;
@@ -254,7 +248,7 @@ async fn workspace_create_without_is_new_repo_keeps_row_only_skip() {
     assert!(workspace["baseCommitSha"].is_null());
     assert!(workspace["checkoutMode"].is_null());
     assert!(
-        !project.0.join(".git").exists(),
+        !project.join(".git").exists(),
         "absent isNewRepo must not initialize the dir"
     );
 

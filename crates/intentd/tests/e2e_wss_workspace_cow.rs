@@ -61,24 +61,19 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
-    scratch: PathBuf,
+    _data_dir: tempfile::TempDir,
+    scratch: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-        let _ = std::fs::remove_dir_all(&self.scratch);
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-cow-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-cow-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -266,16 +261,14 @@ fn git_gate(test: &str) -> bool {
 /// (`intent_git::cow_probe` — the same capability check the daemon runs).
 fn cow_supported() -> bool {
     let probe = scratch_dir("probe");
-    let src = probe.join("src");
-    let dst = probe.join("dst");
+    let src = probe.path().join("src");
+    let dst = probe.path().join("dst");
     std::fs::create_dir_all(&src).expect("mkdir probe src");
     std::fs::create_dir_all(&dst).expect("mkdir probe dst");
-    let supported = matches!(
+    matches!(
         intent_git::cow_probe(&src, &dst),
         Ok(intent_git::CowSupport::Supported)
-    );
-    let _ = std::fs::remove_dir_all(&probe);
-    supported
+    )
 }
 
 /// Gate: skip on non-CoW filesystems.
@@ -351,7 +344,8 @@ async fn boot(
     workspaces_root: &Path,
     extra_env: &[(&str, &str)],
 ) -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = scratch_dir("data");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let scratch = scratch_dir("scratch");
     let root_s = workspaces_root.to_string_lossy().to_string();
     let mut env: Vec<(&str, &str)> = vec![
@@ -363,7 +357,7 @@ async fn boot(
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
         scratch,
     };
     let socket = data_dir.join("intentd.sock");
@@ -409,9 +403,10 @@ async fn workspace_create_provisions_cow_checkout_over_wss() {
     if !git_gate(TEST) || !cow_gate(TEST) {
         return;
     }
-    let root = scratch_dir("cowroot");
+    let root_dir = scratch_dir("cowroot");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root, &[]).await;
-    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut ws = connect_ws(port, cfg).await;
     set_cow_isolation(&mut ws, 1, true).await;
@@ -475,7 +470,6 @@ async fn workspace_create_provisions_cow_checkout_over_wss() {
         "workspace branch must not leak into the source repo: {src_branches}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -489,9 +483,10 @@ async fn workspace_create_defaults_to_worktree_when_cow_isolation_off() {
     if !git_gate(TEST) {
         return;
     }
-    let root = scratch_dir("wtroot");
+    let root_dir = scratch_dir("wtroot");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root, &[]).await;
-    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut ws = connect_ws(port, cfg).await;
     set_cow_isolation(&mut ws, 1, false).await;
@@ -533,7 +528,6 @@ async fn workspace_create_defaults_to_worktree_when_cow_isolation_off() {
         "worktree registered in the source repo: {worktrees}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -549,13 +543,14 @@ async fn workspace_create_falls_back_to_worktree_when_clone_fails_midflight() {
     if !git_gate(TEST) || !cow_gate(TEST) {
         return;
     }
-    let root = scratch_dir("cowmidroot");
+    let root_dir = scratch_dir("cowmidroot");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(
         &root,
         &[("INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH", "source-repo")],
     )
     .await;
-    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut ws = connect_ws(port, cfg).await;
     set_cow_isolation(&mut ws, 1, true).await;
@@ -590,7 +585,6 @@ async fn workspace_create_falls_back_to_worktree_when_clone_fails_midflight() {
         "fallback checkout is a linked worktree (gitfile .git)"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -605,12 +599,13 @@ async fn workspace_create_routes_linked_worktree_source_to_worktree_mode() {
     if !git_gate(TEST) || !cow_gate(TEST) {
         return;
     }
-    let root = scratch_dir("cowwtroot");
+    let root_dir = scratch_dir("cowwtroot");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root, &[]).await;
-    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, head_sha) = make_source_repo(daemon.scratch.path());
 
     // The user's checkout is a linked worktree of the main repo.
-    let user_wt = daemon.scratch.join("user-worktree");
+    let user_wt = daemon.scratch.path().join("user-worktree");
     run_git(
         &[
             "worktree",
@@ -659,7 +654,6 @@ async fn workspace_create_routes_linked_worktree_source_to_worktree_mode() {
         "source checkout is not rewritten"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -680,7 +674,8 @@ async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
     let Some(script) = mock_gate(TEST) else {
         return;
     };
-    let root = scratch_dir("sbroot");
+    let root_dir = scratch_dir("sbroot");
+    let root = root_dir.path().to_path_buf();
     // The delegated child's turn is delayed so the test can write a file into
     // the sandbox while the turn is still in flight (before agent:idle
     // triggers the auto-merge).
@@ -690,7 +685,7 @@ async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let (daemon, port, cfg) = boot(&root, &extra).await;
-    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
     set_cow_isolation(&mut rpc, 1, true).await;
@@ -842,7 +837,6 @@ async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
         "sandbox directory discarded after a clean merge"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -892,7 +886,8 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
     let Some(script) = mock_gate(TEST) else {
         return;
     };
-    let root = scratch_dir("sbslow");
+    let root_dir = scratch_dir("sbslow");
+    let root = root_dir.path().to_path_buf();
     let behavior = json!({ "response": "done", "echoCwd": true }).to_string();
     let extra: [(&str, &str); 3] = [
         ("MOCK_AGENT_SCRIPT_PATH", &script),
@@ -900,7 +895,7 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
         ("INTENTD_TEST_SANDBOX_PROVISION_DELAY_MS", "10000"),
     ];
     let (daemon, port, cfg) = boot(&root, &extra).await;
-    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
     set_cow_isolation(&mut rpc, 1, true).await;
@@ -1005,7 +1000,6 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
         "child must spawn in the settled sandbox, got {echoed}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -1023,7 +1017,8 @@ async fn delegate_falls_back_to_shared_mode_when_provisioning_fails() {
     let Some(script) = mock_gate(TEST) else {
         return;
     };
-    let root = scratch_dir("sberr");
+    let root_dir = scratch_dir("sberr");
+    let root = root_dir.path().to_path_buf();
     let behavior = json!({ "response": "done", "echoCwd": true }).to_string();
     let extra: [(&str, &str); 3] = [
         ("MOCK_AGENT_SCRIPT_PATH", &script),
@@ -1031,7 +1026,7 @@ async fn delegate_falls_back_to_shared_mode_when_provisioning_fails() {
         ("INTENTD_TEST_SANDBOX_PROVISION_ERROR", "1"),
     ];
     let (daemon, port, cfg) = boot(&root, &extra).await;
-    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
     set_cow_isolation(&mut rpc, 1, true).await;
@@ -1090,7 +1085,6 @@ async fn delegate_falls_back_to_shared_mode_when_provisioning_fails() {
         "no sandbox directory after a provisioning failure"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -1104,9 +1098,10 @@ async fn workspace_delete_removes_cow_clone_over_wss() {
     if !git_gate(TEST) || !cow_gate(TEST) {
         return;
     }
-    let root = scratch_dir("cowdel");
+    let root_dir = scratch_dir("cowdel");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root, &[]).await;
-    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut ws = connect_ws(port, cfg).await;
     set_cow_isolation(&mut ws, 1, true).await;
@@ -1162,7 +1157,6 @@ async fn workspace_delete_removes_cow_clone_over_wss() {
     assert!(repo.join("README.md").exists(), "source checkout intact");
     assert_eq!(run_git(&["rev-parse", "HEAD"], &repo), head_sha);
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -1179,9 +1173,10 @@ async fn workspace_create_falls_back_to_worktree_when_cow_unsupported_over_wss()
     if !git_gate(TEST) || !no_cow_gate(TEST) {
         return;
     }
-    let root = scratch_dir("cownope");
+    let root_dir = scratch_dir("cownope");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root, &[]).await;
-    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut ws = connect_ws(port, cfg).await;
     set_cow_isolation(&mut ws, 1, true).await;
@@ -1222,7 +1217,6 @@ async fn workspace_create_falls_back_to_worktree_when_cow_unsupported_over_wss()
         "fallback worktree registered in the source repo: {worktrees}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -1236,9 +1230,10 @@ async fn workspace_create_skip_isolation_wins_over_cow_isolation() {
     if !git_gate(TEST) {
         return;
     }
-    let root = scratch_dir("skipcow");
+    let root_dir = scratch_dir("skipcow");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root, &[]).await;
-    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut ws = connect_ws(port, cfg).await;
     set_cow_isolation(&mut ws, 1, true).await;
@@ -1284,7 +1279,6 @@ async fn workspace_create_skip_isolation_wins_over_cow_isolation() {
         "only the source repo's own entry: {worktrees}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -1299,9 +1293,10 @@ async fn workspace_duplicate_provisions_cow_clone_over_wss() {
     if !git_gate(TEST) || !cow_gate(TEST) {
         return;
     }
-    let root = scratch_dir("cowdup");
+    let root_dir = scratch_dir("cowdup");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root, &[]).await;
-    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut ws = connect_ws(port, cfg).await;
     set_cow_isolation(&mut ws, 1, true).await;
@@ -1377,7 +1372,6 @@ async fn workspace_duplicate_provisions_cow_clone_over_wss() {
         "duplicate branch must not leak into the source repo: {src_branches}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -1392,13 +1386,14 @@ async fn workspace_duplicate_falls_back_to_worktree_when_clone_fails_midflight()
     if !git_gate(TEST) || !cow_gate(TEST) {
         return;
     }
-    let root = scratch_dir("cowdupmid");
+    let root_dir = scratch_dir("cowdupmid");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(
         &root,
         &[("INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH", "source-repo")],
     )
     .await;
-    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut ws = connect_ws(port, cfg).await;
     set_cow_isolation(&mut ws, 1, true).await;
@@ -1449,6 +1444,5 @@ async fn workspace_duplicate_falls_back_to_worktree_when_clone_fails_midflight()
     );
     assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }

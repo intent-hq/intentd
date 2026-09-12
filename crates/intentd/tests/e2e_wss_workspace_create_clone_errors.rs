@@ -8,7 +8,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -25,23 +24,15 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-clone-err-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-clone-err-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -60,7 +51,7 @@ async fn boot() -> Fixture {
     Fixture {
         _ws: ws,
         port,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -219,13 +210,9 @@ async fn workspace_create_existing_clone_target_returns_destination_exists() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
 
-    let occupied = std::env::temp_dir().join(format!(
-        "clone-err-occupied-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::create_dir_all(&occupied).unwrap();
     // Drop guard so a failing assertion below cannot leak the dir in /tmp.
-    let _occupied_guard = TempDir(occupied.clone());
+    let occupied_guard = common::test_tempdir("clone-err-occupied-");
+    let occupied = occupied_guard.path().to_path_buf();
     std::fs::write(occupied.join("keep.txt"), "occupied").unwrap();
 
     let resp = wss_rpc_raw(
