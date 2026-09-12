@@ -3,8 +3,9 @@
 //! The repo-cache slot layout (`<workspaces_root>/.repo-cache/<owner>/<repo>`,
 //! case-folded via `RepoRef::identity_parts`) is owned by
 //! `intent_git::repo_cache::{REPO_CACHE_DIR_NAME, cache_root_for, cache_path_for}`.
-//! A test that spells `".repo-cache"` itself re-derives that layout and silently
-//! desynchronizes from production the next time the layout changes
+//! A test that spells the quoted `.repo-cache` directory name itself re-derives
+//! that layout and silently desynchronizes from production the next time the
+//! layout changes
 //! (intent-hq/intentd#1815 folded the slot; #1825 was ejected from the merge
 //! queue because hand-rolled test joins still used the unfolded form). This test
 //! fails naming the offending `file:line`s so that class of drift cannot return.
@@ -16,12 +17,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use intent_git::repo_cache::REPO_CACHE_DIR_NAME;
+
 const ALLOW_MARKER: &str = "// repo-cache-path: allow";
 
-const NEEDLE: &str = r#"".repo-cache""#;
+/// The quoted directory-name literal, e.g. `"` + `.repo-cache` + `"`, built
+/// from the constant so this file never spells it out itself.
+fn needle() -> String {
+    format!("\"{REPO_CACHE_DIR_NAME}\"")
+}
 
-/// The file that *defines* the helpers, and this guard (whose docs quote the
-/// literal).
+/// The file that *defines* the helpers (and the constant), and this guard.
 const EXEMPT_FILES: &[&str] = &[
     "crates/intent-git/src/repo_cache.rs",
     "crates/intentd/tests/repo_cache_path_guard.rs",
@@ -88,11 +94,12 @@ fn code_part(line: &str) -> &str {
     line.split("//").next().unwrap_or(line)
 }
 
-fn is_hand_rolled_repo_cache_path(line: &str) -> bool {
-    strip_ws(code_part(line)).contains(NEEDLE)
+fn is_hand_rolled_repo_cache_path(line: &str, needle: &str) -> bool {
+    strip_ws(code_part(line)).contains(needle)
 }
 
 fn scan(root: &Path) -> Vec<String> {
+    let needle = needle();
     let mut offenders = Vec::new();
     for file in scanned_files(root) {
         let src = fs::read_to_string(&file).expect("read test source");
@@ -100,7 +107,7 @@ fn scan(root: &Path) -> Vec<String> {
             if line.contains(ALLOW_MARKER) {
                 continue;
             }
-            if is_hand_rolled_repo_cache_path(line) {
+            if is_hand_rolled_repo_cache_path(line, &needle) {
                 let rel = file.strip_prefix(root).unwrap_or(&file);
                 offenders.push(format!("{}:{}", rel.display(), i + 1));
             }
