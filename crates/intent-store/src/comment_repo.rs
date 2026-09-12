@@ -8,14 +8,14 @@
 
 use intent_core::{
     AgentId, Comment, CommentAnchor, CommentStatus, CommentThread, CommentType, Error, Note,
-    NoteId, Result, WorkspaceId,
+    NoteId, NoteVersionAuthor, Result, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
-use crate::{enum_from_db, enum_to_db, tags_to_db, Store};
+use crate::{enum_from_db, enum_to_db, Store};
 
 const COMMENT_COLUMNS: &str = "id, thread_id, note_id, kind, content, author, author_type, \
     status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at";
@@ -172,25 +172,28 @@ impl Store {
     }
 
     /// Atomically persist a `comment.add`: the anchor-marker note rewrite
-    /// (the same full-row UPDATE + unconditional `rev` bump as
-    /// [`Store::update_note`]) and the comment INSERT run in ONE transaction,
-    /// so a failure between the two can never leave anchor markers embedded
-    /// in the note with no comment row (monorepo#638). Returns the
-    /// post-rewrite note `rev` so the caller can echo the authoritative
-    /// value. `NotFound` if the note row is absent; nothing persists on any
-    /// error.
+    /// (the same full-row UPDATE + `rev` bump as
+    /// [`Store::update_note_with_version`], gated on `expected_version` when
+    /// `Some`), its version snapshot under the bumped rev (stamped with
+    /// `author`) and the comment INSERT run in ONE transaction, so a failure
+    /// between them can never leave anchor markers embedded in the note with
+    /// no comment row (monorepo#638), no reader can observe the new rev
+    /// before its snapshot, and a rewrite built on a rev another writer has
+    /// since replaced never overwrites that write (it conflicts, so the
+    /// caller can re-read and re-anchor). Returns the post-rewrite note `rev`
+    /// so the caller can echo the authoritative value; nothing persists on
+    /// any error.
     ///
     /// # Errors
     ///
-    /// Returns `Error::NotFound` if the note row is absent; `Error::InvalidInput` on a duplicate comment id; `Error::Internal` if encoding fields or the transaction fails.
-    pub async fn update_note_with_comment(&self, note: &Note, c: &Comment) -> Result<i64> {
-        let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
-        let task_json = note
-            .metadata
-            .task
-            .as_ref()
-            .map(crate::note_repo::encode_task_json)
-            .transpose()?;
+    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note row is absent; `Error::InvalidInput` on a duplicate comment id; `Error::Internal` if encoding fields or the transaction fails.
+    pub async fn update_note_with_comment(
+        &self,
+        note: &Note,
+        expected_version: Option<i64>,
+        c: &Comment,
+        author: &NoteVersionAuthor,
+    ) -> Result<i64> {
         let (anchor_json, extra_json) = encode_comment_json(c, &Map::new())?;
 
         // IMMEDIATE mode: acquires the write lock upfront, avoiding the
@@ -208,43 +211,28 @@ impl Store {
 
         // Execute the transaction body; rollback explicitly on error.
         let result = async {
-            // Same statement as `update_note_versioned` (no expected_version
-            // gate): full-row replace scoped by (id, workspace_id) with the
-            // store-owned `rev = rev + 1` bump.
-            let res = sqlx::query(
-                "UPDATE note SET title=?, content=?, content_type=?, tags=?, \
-                 is_pinned=?, is_archived=?, is_default=?, parent_id=?, visibility=?, task_json=?, \
-                 created_at=?, updated_at=?, rev = rev + 1 WHERE id=? AND workspace_id=?",
+            // Same statement as `update_note_versioned`: full-row replace
+            // scoped by (id, workspace_id) with the store-owned `rev = rev + 1`
+            // bump, gated on `expected_version`. A miss (gate failed or note
+            // absent) is told apart after the rollback.
+            let Some(new_rev) = crate::note_repo::exec_update_note(
+                &mut *conn,
+                note,
+                expected_version,
+                crate::note_repo::NoteUpdateScope::FullRow,
             )
-            .bind(&note.title)
-            .bind(&note.content)
-            .bind(enum_to_db(&note.content_type)?)
-            .bind(tags_to_db(&note.tags)?)
-            .bind(i64::from(note.is_pinned))
-            .bind(i64::from(note.is_archived))
-            .bind(i64::from(note.is_default))
-            .bind(parent_id)
-            .bind(enum_to_db(&note.visibility)?)
-            .bind(task_json)
-            .bind(&note.created_at)
-            .bind(&note.updated_at)
-            .bind(&note.id.0)
-            .bind(&note.workspace_id.0)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
-            if res.rows_affected() == 0 {
-                return Err(Error::NotFound(format!("note {}", note.id)));
-            }
-
-            let new_rev: i64 = sqlx::query("SELECT rev FROM note WHERE id=? AND workspace_id=?")
-                .bind(&note.id.0)
-                .bind(&note.workspace_id.0)
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(|e| Error::Internal(format!("read back note rev failed: {e}")))?
-                .try_get("rev")
-                .map_err(|e| Error::Internal(format!("column rev: {e}")))?;
+            .await?
+            else {
+                return Ok(None);
+            };
+            crate::note_version_repo::insert_note_version(
+                &mut conn,
+                note,
+                author,
+                &note.updated_at,
+                new_rev,
+            )
+            .await?;
 
             let sql = format!(
                 "INSERT INTO comment ({COMMENT_COLUMNS}, workspace_id) \
@@ -282,7 +270,7 @@ impl Store {
                     }
                 })?;
 
-            Ok(new_rev)
+            Ok(Some(new_rev))
         }
         .await;
 
@@ -290,7 +278,12 @@ impl Store {
         // failure, if the COMMIT itself fails — monorepo#638) or roll back
         // the failed body (monorepo#680), so the sole write-pool connection
         // is never returned holding an open transaction.
-        crate::commit_with_rollback_guard(conn, result, "commit note+comment tx failed").await
+        match crate::commit_with_rollback_guard(conn, result, "commit note+comment tx failed")
+            .await?
+        {
+            Some(new_rev) => Ok(new_rev),
+            None => Err(self.note_update_miss(note).await),
+        }
     }
 
     /// Fetch a single comment by id, or `NotFound`.

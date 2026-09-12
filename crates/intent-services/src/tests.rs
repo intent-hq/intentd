@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Error, MessageOrigin, Note,
-    NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata,
-    NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
+    now_iso, AgentId, AgentSession, AgentStatus, BoxFuture, ContentType, Error, MessageOrigin,
+    Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata,
+    NoteUpdateInput, NoteVisibility, Result, Workspace, WorkspaceActivity, WorkspaceApi,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use intent_store::Store;
@@ -2247,70 +2247,1177 @@ async fn set_content_reduction_guard_requires_confirmation() {
     assert_eq!(ok.new_content, "x");
 }
 
-/// A5 (CRDT note-merge, PROTOCOL §5.2): two `note.setContent` calls whose new
-/// content each observes the other's write survive in the merged result. The
-/// second write's `oldContent` still points at the persisted state before it
-/// ran, but the CRDT diff against the yrs doc's *current* text preserves the
-/// first write's characters — the FE parity signal that the daemon no longer
-/// last-write-wins on concurrent full-content writes.
-#[tokio::test]
-async fn set_content_merges_concurrent_writes() {
-    let (_tmp, svc, ws, id) = setup("BODY").await;
-
-    // Author A appends a line at the end.
-    let a = svc
-        .set_note_content(
-            ws.clone(),
-            id.clone(),
-            "BODY\nA-line".into(),
-            true,
-            None,
-            None,
-        )
+/// [`setup`] plus a `note_version` snapshot at rev 0, so `expectedVersion: 0`
+/// resolves to a recoverable base for the three-way merge.
+async fn setup_versioned(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
+    let (tmp, svc, ws, id) = setup(content).await;
+    let note = svc.store.get_note(&ws, &id).await.expect("get note");
+    svc.store
+        .append_note_version(&note, &crate::system_version_author(), &note.updated_at, 0)
         .await
-        .expect("A write");
-    assert_eq!(a.new_content, "BODY\nA-line");
+        .expect("seed base snapshot");
+    (tmp, svc, ws, id)
+}
 
-    // Author B prepends a line, having read the post-A content as baseline —
-    // the yrs merge stitches both edits together.
+/// Stale `expectedVersion` (AC 1, 2): the writer's intent (`beta` → `beta-A`
+/// against base rev 0) is merged onto the current text (rev 1, which appended
+/// `delta`), the write succeeds, and `rev` bumps to `current + 1` both in the
+/// result and in the store.
+#[tokio::test]
+async fn set_content_stale_expected_version_merges_and_bumps_rev() {
+    let (_tmp, svc, ws, id) = setup_versioned("alpha\nbeta\ngamma").await;
+
     let b = svc
         .set_note_content(
             ws.clone(),
             id.clone(),
-            "B-line\nBODY\nA-line".into(),
-            true,
+            "alpha\nbeta\ngamma\ndelta".into(),
+            false,
             None,
             None,
         )
         .await
         .expect("B write");
-    assert_eq!(b.new_content, "B-line\nBODY\nA-line");
+    assert_eq!(b.rev, 1);
 
-    // A surgical mutation invalidates the CRDT session so the next
-    // `setContent` reseeds from the fresh persisted content.
-    svc.edit_note(
-        ws.clone(),
-        id.clone(),
-        NoteEditInput {
-            old: "A-line".into(),
-            new: "A-line (edited)".into(),
-        },
-        None,
-    )
-    .await
-    .expect("edit");
-    let c = svc
+    let a = svc
         .set_note_content(
-            ws,
-            id,
-            "B-line\nBODY\nA-line (edited)\nC-line".into(),
-            true,
-            None,
+            ws.clone(),
+            id.clone(),
+            "alpha\nbeta-A\ngamma".into(),
+            false,
+            Some(0),
             None,
         )
         .await
-        .expect("C write");
-    assert_eq!(c.new_content, "B-line\nBODY\nA-line (edited)\nC-line");
+        .expect("stale expectedVersion merges instead of conflicting");
+    assert_eq!(a.new_content, "alpha\nbeta-A\ngamma\ndelta");
+    assert_eq!(a.old_content.as_deref(), Some("alpha\nbeta\ngamma\ndelta"));
+    assert_eq!(a.rev, 2);
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 2);
+    assert_eq!(stored.content, "alpha\nbeta-A\ngamma\ndelta");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.setContent merged").await;
+}
+
+/// Same-span conflict (AC 3): both writers replaced the same base word; the
+/// result keeps the current variant immediately followed by the incoming one
+/// (`WaWb`), dropping nothing.
+#[tokio::test]
+async fn set_content_same_word_conflict_keeps_both_variants() {
+    let (_tmp, svc, ws, id) = setup_versioned("one cat three").await;
+
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "one dog three".into(),
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("current write");
+
+    let merged = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "one fox three".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("conflicting spans merge, not -32005");
+    assert_eq!(merged.new_content, "one dogfox three");
+    assert_eq!(merged.rev, 2);
+}
+
+/// Reduction guard measured against the writer's base (AC 4): after a
+/// concurrent writer tripled the note, a 10 % removal relative to the base is
+/// tiny against base (accepted) even though it is ~70 % shorter than current;
+/// a 60 % removal relative to the base is still rejected with the existing
+/// message unless confirmed.
+#[tokio::test]
+async fn set_content_reduction_guard_measures_against_base() {
+    let lines: Vec<String> = (0..10).map(|i| format!("line-{i}-0123456789")).collect();
+    let base = lines.join("\n");
+    let (_tmp, svc, ws, id) = setup_versioned(&base).await;
+
+    let extra: Vec<String> = (10..30).map(|i| format!("line-{i}-0123456789")).collect();
+    let tripled = format!("{base}\n{}", extra.join("\n"));
+    svc.set_note_content(ws.clone(), id.clone(), tripled, false, None, None)
+        .await
+        .expect("tripling write");
+
+    let minus_ten_pct = lines[1..].join("\n");
+    let ok = svc
+        .set_note_content(ws.clone(), id.clone(), minus_ten_pct, false, Some(0), None)
+        .await
+        .expect("10% removal against base passes the guard");
+    assert!(!ok.new_content.contains("line-0-"), "removed line is gone");
+    assert!(
+        ok.new_content.contains("line-29-"),
+        "concurrent writer's tail survives the merge"
+    );
+    assert_eq!(ok.rev, 2);
+
+    let minus_sixty_pct = lines[6..].join("\n");
+    let denied = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            minus_sixty_pct,
+            false,
+            Some(0),
+            None,
+        )
+        .await;
+    match denied {
+        Err(Error::Internal(msg)) => assert!(
+            msg.starts_with("⚠️ CONTENT REDUCTION DETECTED"),
+            "existing guard message expected, got: {msg}"
+        ),
+        other => panic!("expected the reduction guard, got {other:?}"),
+    }
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 2, "a rejected write persists nothing");
+}
+
+/// No recoverable base (AC 5): a note whose `expectedVersion` predates every
+/// retained snapshot degrades to honest last-writer-wins — the incoming text
+/// lands verbatim and `rev` still bumps by one.
+#[tokio::test]
+async fn set_content_stale_expected_version_without_base_is_lww() {
+    // `setup` inserts the row directly: no snapshot exists at rev 0.
+    let (_tmp, svc, ws, id) = setup("v0 body").await;
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "v1 body (other writer)".into(),
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("other writer");
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(&ws, &id, 0)
+            .await
+            .expect("lookup"),
+        None,
+        "precondition: no snapshot at or below rev 0"
+    );
+
+    let r = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "v2 body (stale writer)".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("no base → LWW, not -32005");
+    assert_eq!(r.new_content, "v2 body (stale writer)");
+    assert_eq!(r.rev, 2);
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "v2 body (stale writer)");
+    assert_eq!(stored.rev, 2);
+}
+
+/// Only a rev the writer could have read merges: an `expectedVersion` ABOVE
+/// the stored rev was never served by this note, so it is the plain
+/// optimistic-concurrency mismatch (`Conflict`, `-32005` carrying the current
+/// row) — not a stale base that resolves to the newest snapshot and lets the
+/// incoming text land as an exact write.
+#[tokio::test]
+async fn set_content_future_expected_version_conflicts_without_writing() {
+    let (_tmp, svc, ws, id) = setup_versioned("body").await;
+    svc.set_note_content(ws.clone(), id.clone(), "body v1".into(), false, None, None)
+        .await
+        .expect("bump to rev 1");
+
+    let r = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "impossible base".into(),
+            false,
+            Some(7),
+            None,
+        )
+        .await;
+    match r {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], serde_json::json!(1));
+            assert_eq!(current["content"], serde_json::json!("body v1"));
+        }
+        other => panic!("future expectedVersion must be Conflict, got {other:?}"),
+    }
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "body v1", "nothing persisted");
+    assert_eq!(stored.rev, 1, "rev unchanged");
+    assert_eq!(
+        svc.store
+            .list_note_versions(&ws, &id)
+            .await
+            .expect("versions")
+            .len(),
+        2,
+        "no extra snapshot appended"
+    );
+}
+
+/// The read-merge-persist loop is bounded: when every attempt's gated UPDATE
+/// misses (a `RAISE(IGNORE)` trigger makes the note row unconditionally
+/// unmatchable, counting each attempt), `note.setContent` stops after exactly
+/// [`crate::SET_CONTENT_MAX_ATTEMPTS`] misses and surfaces the last
+/// `Conflict` — same shape as the future-rev case — with no content write
+/// and no snapshot appended. Once the trigger is gone the same write lands,
+/// so exhaustion leaves the write pool usable.
+#[tokio::test]
+async fn set_content_retry_exhaustion_conflicts_without_writing() {
+    let (_tmp, svc, ws, id) = setup_versioned("body").await;
+    sqlx::raw_sql(
+        "CREATE TABLE cas_misses(n INTEGER);
+         INSERT INTO cas_misses VALUES (0);
+         CREATE TRIGGER force_cas_miss BEFORE UPDATE ON note BEGIN
+             UPDATE cas_misses SET n = n + 1;
+             SELECT RAISE(IGNORE);
+         END;",
+    )
+    .execute(svc.store.write_pool())
+    .await
+    .expect("arm trigger");
+
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        svc.set_note_content(
+            ws.clone(),
+            id.clone(),
+            "body attempted".into(),
+            false,
+            Some(0),
+            None,
+        ),
+    )
+    .await
+    .expect("bounded loop terminates");
+    match r {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], serde_json::json!(0));
+            assert_eq!(current["content"], serde_json::json!("body"));
+        }
+        other => panic!("exhausted retries must be Conflict, got {other:?}"),
+    }
+    let misses: i64 = sqlx::query_scalar("SELECT n FROM cas_misses")
+        .fetch_one(svc.store.read_pool())
+        .await
+        .expect("count misses");
+    assert_eq!(
+        usize::try_from(misses).expect("non-negative miss count"),
+        crate::SET_CONTENT_MAX_ATTEMPTS,
+        "exactly one gated UPDATE per attempt"
+    );
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!((stored.content.as_str(), stored.rev), ("body", 0));
+    assert_eq!(
+        svc.store
+            .list_note_versions(&ws, &id)
+            .await
+            .expect("versions")
+            .len(),
+        1,
+        "no snapshot appended by a missed attempt"
+    );
+
+    sqlx::query("DROP TRIGGER force_cas_miss")
+        .execute(svc.store.write_pool())
+        .await
+        .expect("disarm trigger");
+    let ok = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "body accepted".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("pool usable after exhaustion");
+    assert_eq!((ok.new_content.as_str(), ok.rev), ("body accepted", 1));
+}
+
+/// Legacy history (snapshots from before migration 0120 carry `rev = NULL`)
+/// transitions to recoverable revisions on its own: while no snapshot for the
+/// writer's rev exists, a stale `expectedVersion` is the documented
+/// last-writer-wins replace, and each such write records a snapshot at its
+/// new rev — so the first rev a writer reads *after* the transition merges.
+#[tokio::test]
+async fn set_content_null_history_transitions_to_recoverable_revs() {
+    let (_tmp, svc, ws, id) = setup_versioned("legacy body").await;
+    sqlx::query("UPDATE note_version SET rev = NULL")
+        .execute(svc.store.write_pool())
+        .await
+        .expect("age the history");
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(&ws, &id, 0)
+            .await
+            .expect("lookup"),
+        None,
+        "legacy snapshot is not a base"
+    );
+
+    let first = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "legacy body agent".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("lww write");
+    assert_eq!(first.rev, 1);
+    let second = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "legacy body user".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("second lww write");
+    assert_eq!(
+        (second.new_content.as_str(), second.rev),
+        ("legacy body user", 2),
+        "rev 0 still has no base: replace, not merge"
+    );
+
+    // Rev 1 was snapshotted by the first write, so a writer based on it merges.
+    let merged = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "legacy body agent again".into(),
+            false,
+            Some(1),
+            None,
+        )
+        .await
+        .expect("merge onto recoverable base");
+    assert_eq!(merged.rev, 3);
+    assert!(
+        merged.new_content.contains("user") && merged.new_content.contains("again"),
+        "both intents survive: {:?}",
+        merged.new_content
+    );
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "legacy transition").await;
+}
+
+/// Conflict stays where it belongs (AC 6): the non-merging conditional writes
+/// — `note.update` (metadata arm), `note.updateMetadata`, `note.delete` —
+/// still surface a stale `expectedVersion` as `Conflict` (`-32005`).
+#[tokio::test]
+async fn set_content_merge_leaves_other_conditional_writes_conflicting() {
+    let (_tmp, svc, ws, id) = setup_versioned("body").await;
+    svc.set_note_content(ws.clone(), id.clone(), "body v1".into(), false, None, None)
+        .await
+        .expect("bump to rev 1");
+
+    let metadata_arm = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                title: Some("stale title".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(metadata_arm, Err(Error::Conflict { .. })),
+        "note.update metadata arm: {metadata_arm:?}"
+    );
+
+    let update_metadata = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("stale title".into()),
+            None,
+            Some(0),
+            None,
+        )
+        .await;
+    assert!(
+        matches!(update_metadata, Err(Error::Conflict { .. })),
+        "note.updateMetadata: {update_metadata:?}"
+    );
+
+    let delete = svc.delete_note(ws.clone(), id.clone(), Some(0)).await;
+    assert!(
+        matches!(delete, Err(Error::Conflict { .. })),
+        "note.delete: {delete:?}"
+    );
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("still present");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(stored.title, "Title");
+}
+
+/// Drive `fut` one poll at a time until `stop` observes the condition it
+/// waits for or `max_polls` is exhausted; `fut` must still be pending at every
+/// step (the point is to inspect the store mid-flight). Returns whether `stop`
+/// fired.
+async fn poll_until<F, S, Fut>(
+    fut: &mut std::pin::Pin<Box<F>>,
+    max_polls: usize,
+    mut stop: S,
+) -> bool
+where
+    F: std::future::Future + ?Sized,
+    S: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    use std::future::poll_fn;
+    use std::task::Poll;
+    for _ in 0..max_polls {
+        let state = poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
+        assert!(state.is_pending(), "write finished before the pause point");
+        if stop().await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Regression (intentd#1817 review, finding 1): the content UPDATE and its
+/// `note_version` snapshot commit in ONE transaction, so the instant a reader
+/// observes the new rev on the note row, the base lookup by that rev already
+/// yields the new content. Before the fix the snapshot was appended in a
+/// second transaction: a writer that read rev 1 mid-gap recovered the rev-0
+/// text as its base and replayed the already-persisted insertion (observed
+/// `aXX!bcY`), and the delayed snapshot then landed with `rev = 1` after the
+/// rev-2/rev-3 rows, out of order.
+///
+/// The write is driven one poll at a time and the store (via a second
+/// connection) is sampled between polls; the invariant is asserted on every
+/// sample that shows rev 1 and once more after the write completes, so the
+/// test never depends on catching a particular window under load.
+#[tokio::test]
+async fn content_write_snapshot_is_visible_with_its_rev() {
+    let (tmp, svc, ws, id) = setup_versioned("abc").await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    let assert_rev1_has_snapshot = || async {
+        let current = other.get_note(&ws, &id).await.expect("get note");
+        if current.rev != 1 {
+            return false;
+        }
+        assert_eq!(current.content, "aXbc");
+        assert_eq!(
+            other
+                .get_note_version_content_by_rev(&ws, &id, 1)
+                .await
+                .expect("lookup"),
+            Some("aXbc".to_string()),
+            "rev 1 is visible, so its snapshot must be too"
+        );
+        true
+    };
+
+    let mut first =
+        Box::pin(svc.set_note_content(ws.clone(), id.clone(), "aXbc".into(), false, Some(0), None));
+    let mut samples_at_rev1 = 0;
+    let first = loop {
+        use std::future::Future;
+        let state =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx))).await;
+        if let std::task::Poll::Ready(done) = state {
+            break done.expect("first write");
+        }
+        if assert_rev1_has_snapshot().await {
+            samples_at_rev1 += 1;
+            if samples_at_rev1 >= 50 {
+                break first.await.expect("first write");
+            }
+        }
+    };
+    assert_eq!(first.rev, 1);
+    assert!(assert_rev1_has_snapshot().await);
+
+    // A second writer that read rev 1 after the first write committed.
+    let next = other_svc
+        .set_note_content(ws.clone(), id.clone(), "aXbcY".into(), false, Some(1), None)
+        .await
+        .expect("exact write at rev 1");
+    assert_eq!(next.rev, 2);
+    // A stale writer against rev 1: base is `aXbc`, so its `!` insertion
+    // lands once, on top of `Y`.
+    let merged = other_svc
+        .set_note_content(ws.clone(), id.clone(), "aX!bc".into(), false, Some(1), None)
+        .await
+        .expect("stale write merges");
+    assert_eq!(merged.rev, 3);
+    assert_eq!(merged.new_content, "aX!bcY");
+
+    // History stays in rev order: the newest snapshot is the rev-3 write,
+    // not a late rev-1 row.
+    assert_eq!(newest_version_rev(&svc.store, &ws, &id).await, Some(3));
+    let stored = svc.store.get_note(&ws, &id).await.expect("get note");
+    assert_eq!((stored.rev, stored.content.as_str()), (3, "aX!bcY"));
+}
+
+/// Race a surgical write against a user `note.setContent` that completes
+/// while the surgical write is parked on the write pool: the surgical op
+/// reads rev 0, the user's save lands at rev 1 (via a second `Store` on the
+/// same file), then the surgical write proceeds. Returns the op's result and
+/// the final stored note (rev 2, snapshotted).
+async fn surgical_write_races_user_save<T>(
+    base: &str,
+    user: &str,
+    op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, Result<T>>,
+) -> (T, Note) {
+    let (tmp, svc, ws, id) = setup_versioned(base).await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    // The sole write-pool connection: the surgical write blocks on acquire.
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = op(&svc, ws.clone(), id.clone());
+    let parked = poll_until(&mut fut, 20, || async {
+        svc.store.get_note(&ws, &id).await.expect("get note");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let saved = other_svc
+        .set_note_content(ws.clone(), id.clone(), user.into(), false, Some(0), None)
+        .await
+        .expect("user save");
+    assert_eq!(saved.rev, 1);
+    drop(held);
+
+    let result = fut.await.expect("surgical write");
+    let stored = other.get_note(&ws, &id).await.expect("final note");
+    assert_eq!(
+        stored.rev, 2,
+        "surgical write lands on top of the user save"
+    );
+    assert_eq!(
+        other
+            .get_note_version_content_by_rev(&ws, &id, 2)
+            .await
+            .expect("lookup"),
+        Some(stored.content.clone()),
+        "surgical write is snapshotted at its rev"
+    );
+    (result, stored)
+}
+
+/// Regression (intentd#1817 review, finding 2): `note.add` that read rev 0
+/// no longer overwrites a user `setContent` that landed at rev 1 — its write
+/// is gated on the rev it read, and the retry three-way-merges the appended
+/// chunk onto the user's text (`TYPED` survives, `AGENT` lands on top).
+#[tokio::test]
+async fn note_add_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| {
+            svc.add_to_note(
+                ws,
+                id,
+                NoteAddInput {
+                    content: "AGENT".into(),
+                    heading: None,
+                    position: None,
+                },
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(stored.content, "alpha TYPED\nbeta\ngamma\n\nAGENT");
+    assert_eq!(result.new_content, stored.content);
+    assert_eq!(result.old_content, "alpha TYPED\nbeta\ngamma");
+}
+
+/// Same race for `note.edit`: the replacement merges onto the user's save.
+#[tokio::test]
+async fn note_edit_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| {
+            svc.edit_note(
+                ws,
+                id,
+                NoteEditInput {
+                    old: "gamma".into(),
+                    new: "gamma AGENT".into(),
+                },
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(stored.content, "alpha TYPED\nbeta\ngamma AGENT");
+    assert_eq!(result.new_content, stored.content);
+}
+
+/// Same race for `note.editLines`: the line replacement merges onto the
+/// user's save.
+#[tokio::test]
+async fn note_edit_lines_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| {
+            svc.edit_note_lines(
+                ws,
+                id,
+                NoteEditLinesInput {
+                    start: 3,
+                    end: 3,
+                    content: "gamma AGENT".into(),
+                },
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(stored.content, "alpha TYPED\nbeta\ngamma AGENT");
+    assert_eq!(result.new_content, stored.content);
+    assert_eq!(result.total_lines_before, 3);
+    assert_eq!(result.total_lines_after, 3);
+}
+
+/// Regression (intentd#1817 re-verification, finding 1): `comment.add`'s
+/// anchor rewrite that read rev 0 no longer overwrites a user `setContent`
+/// that landed at rev 1 — the rewrite is gated on the rev it read, and the
+/// retry re-anchors on the user's text (`TYPED` survives, the markers wrap
+/// `gamma`, the comment row exists and `noteRev` is the rev that landed).
+#[tokio::test]
+async fn comment_add_reanchors_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| {
+            svc.comment_add(
+                ws,
+                id,
+                "gamma".into(),
+                "gamma".into(),
+                "Review".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        },
+    )
+    .await;
+    assert!(result.anchored);
+    assert_eq!(result.note_rev, 2);
+    let markers = format!(
+        "alpha TYPED\nbeta\n<!--anchor:{id}:start-->gamma<!--anchor:{id}:end-->",
+        id = result.comment_id
+    );
+    assert_eq!(stored.content, markers);
+}
+
+/// Same race for `primitive.addCli`: the appended block merges onto the
+/// user's save.
+#[tokio::test]
+async fn primitive_append_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| svc.primitive_add_cli(ws, id, "cargo test".into(), "run".into(), None),
+    )
+    .await;
+    assert!(stored.content.starts_with("alpha TYPED\nbeta\ngamma"));
+    assert!(stored.content.contains("ws-block:cli"));
+    assert!(stored.content.contains("cargo test"));
+    assert_eq!(result["content"], stored.content);
+}
+
+/// Same race for `task.updateStatus` on a plain (unlinked) checkbox line:
+/// the status flip merges onto the user's save.
+#[tokio::test]
+async fn task_update_status_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "- [ ] alpha\nbeta\ngamma",
+        "- [ ] alpha\nbeta TYPED\ngamma",
+        |svc, ws, id| svc.task_update_status(ws, id, "alpha".into(), "done".into(), None),
+    )
+    .await;
+    assert!(result.ok);
+    assert_eq!(stored.content, "- [x] alpha\nbeta TYPED\ngamma");
+}
+
+/// Same race for `task.update` on a plain checkbox line: the line edit
+/// merges onto the user's save.
+#[tokio::test]
+async fn task_update_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "- [ ] alpha\nbeta\ngamma",
+        "- [ ] alpha\nbeta TYPED\ngamma",
+        |svc, ws, id| {
+            svc.task_update(
+                ws,
+                id,
+                1,
+                Some("alpha AGENT".into()),
+                Some("in-progress".into()),
+                None,
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(result.new_text, "alpha AGENT");
+    assert_eq!(stored.content, "- [/] alpha AGENT\nbeta TYPED\ngamma");
+}
+
+/// Same race for `task.convertBlocks` against a plain user edit: the op
+/// reads rev 0 and a store-level versioned save lands at rev 1 in between.
+/// The conversion re-derives from the fresh content (the fence is still
+/// there) and lands at rev 2 with `TYPED` intact and exactly one child.
+#[tokio::test]
+async fn convert_blocks_rederives_onto_completed_user_save() {
+    let base = "intro\n\n@@@task\n# Do it\nbody\n@@@\n";
+    let (tmp, svc, ws, id) = setup_versioned(base).await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = svc.convert_task_blocks(ws.clone(), id.clone(), None);
+    // Yield between polls so the op's reads complete and it parks on the
+    // held write connection, not on an in-flight read.
+    let parked = poll_until(&mut fut, 100, || async {
+        other.get_note(&ws, &id).await.expect("yield read");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let mut user = other.get_note(&ws, &id).await.expect("get note");
+    user.content = "intro TYPED\n\n@@@task\n# Do it\nbody\n@@@\n".into();
+    user.updated_at = now_iso();
+    let (rev, _) = other
+        .update_note_with_version(
+            &user,
+            Some(0),
+            &crate::user_version_author(),
+            &user.updated_at,
+        )
+        .await
+        .expect("user save");
+    assert_eq!(rev, 1);
+    drop(held);
+
+    let result = fut.await.expect("convert blocks");
+    assert_eq!(result.converted_count, 1);
+    let stored = other.get_note(&ws, &id).await.expect("final note");
+    assert_eq!(stored.rev, 2);
+    assert_eq!(
+        stored.content,
+        format!(
+            "intro TYPED\n\n- [ ] [Do it](intent://local/task/{})\n",
+            result.created_note_ids[0]
+        )
+    );
+    assert_eq!(
+        other
+            .get_note_version_content_by_rev(&ws, &id, 2)
+            .await
+            .expect("lookup"),
+        Some(stored.content.clone())
+    );
+    let children: Vec<Note> = other
+        .list_notes(&ws)
+        .await
+        .expect("list notes")
+        .into_iter()
+        .filter(|n| n.parent_id.as_ref() == Some(&id))
+        .collect();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].id.0, result.created_note_ids[0]);
+}
+
+/// Regression (intentd#1817 re-verification, round 4): `task.convertBlocks`
+/// racing a real `note.setContent` that carries the same `@@@task` fence.
+/// The converter is parked after its rev-0 read; the user save lands
+/// (`TYPED`) and auto-converts the fence once (child #1, link at rev 2).
+/// Before the fix the parked converter then created a SECOND child and
+/// three-way-merged its own link onto the user's: two children, and the two
+/// generated UUIDs char-interleaved into one corrupt link. Now the
+/// converter's gated write misses, it re-derives from the fresh content —
+/// no fence remains, nothing to convert — and no child is ever persisted for
+/// the failed attempt: one child, the parent text clean, `TYPED` intact, and
+/// the newest snapshot matches the row.
+#[tokio::test]
+async fn convert_blocks_racing_real_user_save_converts_once() {
+    let base = "intro\n\n@@@task\n# Do it\nbody\n@@@\n";
+    let (tmp, svc, ws, id) = setup_versioned(base).await;
+    let other = Services::new(Store::open(&tmp.path).await.expect("open second store"));
+
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = svc.convert_task_blocks(ws.clone(), id.clone(), None);
+    let parked = poll_until(&mut fut, 100, || async {
+        other.store.get_note(&ws, &id).await.expect("yield read");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let user = other
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "intro TYPED\n\n@@@task\n# Do it\nbody\n@@@\n".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("user save");
+    assert_eq!(user.converted_count, 1);
+    drop(held);
+
+    let result = fut.await.expect("convert blocks");
+
+    let stored = other.store.get_note(&ws, &id).await.expect("final note");
+    let children: Vec<Note> = other
+        .store
+        .list_notes(&ws)
+        .await
+        .expect("list notes")
+        .into_iter()
+        .filter(|n| n.parent_id.as_ref() == Some(&id))
+        .collect();
+    assert_eq!(
+        children.len(),
+        1,
+        "one task block must not create duplicate tasks (parent: {:?})",
+        stored.content
+    );
+    assert_eq!(children[0].id.0, user.created_task_note_ids[0]);
+    assert_eq!(
+        stored.content,
+        format!(
+            "intro TYPED\n\n- [ ] [Do it](intent://local/task/{})\n",
+            children[0].id.0
+        )
+    );
+    assert_eq!(stored.rev, 2);
+    assert_eq!(result.converted_count, 0);
+    assert!(result.created_note_ids.is_empty());
+    assert_eq!(
+        other
+            .store
+            .get_note_version_content_by_rev(&ws, &id, stored.rev)
+            .await
+            .expect("lookup"),
+        Some(stored.content.clone())
+    );
+}
+
+/// Regression (intentd#1817 re-verification, finding 2): a note insert and
+/// its initial snapshot commit in ONE transaction, so the instant a fresh
+/// note is readable its rev 0 is a recoverable merge base. Before the fix
+/// the snapshot was appended in a second transaction: two `setContent(…,
+/// expectedVersion: 0)` writes issued against the note mid-gap found no base
+/// and degraded to last-writer-wins (`aXbc`@1, then `abcY`@2 dropped `X`),
+/// and the delayed rev-0 snapshot then landed after the rev-1/rev-2 rows.
+///
+/// `note.create` is driven one poll at a time and the store sampled (via a
+/// second connection) between polls; the invariant is asserted on the first
+/// sample that sees the note, the two writes are issued right there while
+/// creation is still in flight, and the outcome is asserted once more after
+/// it completes.
+#[tokio::test]
+async fn note_create_snapshot_is_visible_with_the_row() {
+    let (tmp, svc, ws, _seed) = setup("seed").await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    let mut create = svc.create_note(
+        ws.clone(),
+        NoteCreate {
+            title: "Fresh".into(),
+            content: Some("abc".into()),
+            tags: None,
+            parent_id: None,
+        },
+        None,
+        None,
+    );
+    let find_fresh = || async {
+        other
+            .list_notes(&ws)
+            .await
+            .expect("list notes")
+            .into_iter()
+            .find(|n| n.title == "Fresh")
+    };
+    let write_both = |fresh_id: NoteId| {
+        let other_svc = &other_svc;
+        let ws = &ws;
+        async move {
+            let a = other_svc
+                .set_note_content(
+                    ws.clone(),
+                    fresh_id.clone(),
+                    "aXbc".into(),
+                    false,
+                    Some(0),
+                    None,
+                )
+                .await
+                .expect("exact write at rev 0");
+            assert_eq!((a.new_content.as_str(), a.rev), ("aXbc", 1));
+            let b = other_svc
+                .set_note_content(ws.clone(), fresh_id, "abcY".into(), false, Some(0), None)
+                .await
+                .expect("stale write merges from the rev-0 base");
+            assert_eq!((b.new_content.as_str(), b.rev), ("aXbcY", 2));
+        }
+    };
+
+    let mut observed_mid_flight = false;
+    let created = loop {
+        let state =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(create.as_mut().poll(cx))).await;
+        if let std::task::Poll::Ready(done) = state {
+            break done.expect("note.create");
+        }
+        if observed_mid_flight {
+            continue;
+        }
+        let Some(fresh) = find_fresh().await else {
+            continue;
+        };
+        assert_eq!((fresh.content.as_str(), fresh.rev), ("abc", 0));
+        assert_eq!(
+            other
+                .get_note_version_content_by_rev(&ws, &fresh.id, 0)
+                .await
+                .expect("lookup"),
+            Some("abc".to_string()),
+            "the fresh row is visible, so its rev-0 snapshot must be too"
+        );
+        write_both(fresh.id).await;
+        observed_mid_flight = true;
+    };
+    if !observed_mid_flight {
+        write_both(created.note.id.clone()).await;
+    }
+
+    let stored = other
+        .get_note(&ws, &created.note.id)
+        .await
+        .expect("final note");
+    assert_eq!((stored.content.as_str(), stored.rev), ("aXbcY", 2));
+    assert_eq!(
+        newest_version_rev(&other, &ws, &created.note.id).await,
+        Some(2),
+        "history stays in rev order: no late rev-0 row after the rev-2 write"
+    );
+}
+
+/// Race a metadata-only write against a user `note.setContent` that completes
+/// while the metadata write is parked on the write pool (same choreography as
+/// [`surgical_write_races_user_save`]): the metadata op reads rev 0 with the
+/// old content, the user's save lands at rev 1, then the metadata write
+/// proceeds without an `expectedVersion` gate. Returns the final stored note.
+async fn metadata_write_races_user_save(
+    op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, Result<()>>,
+) -> Note {
+    let (tmp, svc, ws, id) = setup_versioned("abc").await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = op(&svc, ws.clone(), id.clone());
+    let parked = poll_until(&mut fut, 20, || async {
+        svc.store.get_note(&ws, &id).await.expect("get note");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let saved = other_svc
+        .set_note_content(ws.clone(), id.clone(), "aXbc".into(), false, Some(0), None)
+        .await
+        .expect("user save");
+    assert_eq!(saved.rev, 1);
+    drop(held);
+
+    fut.await.expect("metadata write");
+    let stored = other.get_note(&ws, &id).await.expect("final note");
+    assert_eq!(
+        stored.rev, 2,
+        "metadata write lands on top of the user save"
+    );
+    assert_eq!(
+        stored.content, "aXbc",
+        "metadata-only write must not rewrite content it read before the user save"
+    );
+    // No snapshot for the metadata rev: the base lookup by the new rev falls
+    // back to the user's rev-1 snapshot, which is exactly the stored content.
+    assert_eq!(newest_version_rev(&other, &ws, &id).await, Some(1));
+    assert_eq!(
+        other
+            .get_note_version_content_by_rev(&ws, &id, stored.rev)
+            .await
+            .expect("lookup"),
+        Some(stored.content.clone()),
+        "base for the metadata rev is the persisted content"
+    );
+    stored
+}
+
+/// Regression (intentd#1817 re-verification): `note.updateMetadata` that read
+/// rev 0 no longer reverts a user `setContent` that landed at rev 1. Before
+/// the fix the write was a full-row `UPDATE` carrying the stale `abc`, so the
+/// acknowledged insertion vanished and rev 2 resolved to a base (`aXbc`) that
+/// no longer matched the row — a false base for every later merge.
+#[tokio::test]
+async fn note_update_metadata_preserves_completed_user_save() {
+    let stored = metadata_write_races_user_save(|svc, ws, id| {
+        Box::pin(async move {
+            svc.update_note_metadata(ws, id, Some("Renamed".into()), None, None, None)
+                .await
+                .map(|_| ())
+        })
+    })
+    .await;
+    assert_eq!(stored.title, "Renamed");
+}
+
+/// Same race for the metadata arm of `note.update` (title/tags without
+/// `content`).
+#[tokio::test]
+async fn note_update_metadata_arm_preserves_completed_user_save() {
+    let stored = metadata_write_races_user_save(|svc, ws, id| {
+        Box::pin(async move {
+            svc.update_note(
+                ws,
+                id,
+                NoteUpdateInput {
+                    tags: Some(vec!["t".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await;
+    assert_eq!(stored.tags, vec!["t".to_string()]);
+}
+
+/// Same race for a task-metadata write (`task.markAsTask`): the `task_json`
+/// column lands, the content does not move.
+#[tokio::test]
+async fn task_metadata_write_preserves_completed_user_save() {
+    use intent_core::TaskStatus;
+    let stored = metadata_write_races_user_save(|svc, ws, id| {
+        Box::pin(async move {
+            svc.mark_as_task(
+                ws,
+                id,
+                "not_started".into(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await;
+    assert_eq!(
+        stored.metadata.task.map(|t| t.status),
+        Some(TaskStatus::NotStarted)
+    );
+}
+
+/// Read-merge-persist loop converges under contention: four writers that all
+/// read rev 0 and insert a distinct line race through `set_note_content`
+/// concurrently; whichever lands first makes the others stale, and each
+/// stale writer re-fetches, re-merges and retries until its versioned write
+/// lands — every line survives and `rev` advances once per writer.
+#[tokio::test]
+async fn set_content_retry_loop_converges_under_concurrent_versioned_writes() {
+    let base = "l1\nl2\nl3\nl4\nl5";
+    let (_tmp, svc, ws, id) = setup_versioned(base).await;
+
+    let mut handles = Vec::new();
+    for i in 1..=4 {
+        let svc = svc.clone();
+        let ws = ws.clone();
+        let id = id.clone();
+        let incoming = base.replace(&format!("l{i}\n"), &format!("l{i}\nw{i}\n"));
+        handles.push(tokio::spawn(async move {
+            svc.set_note_content(ws, id, incoming, false, Some(0), None)
+                .await
+        }));
+    }
+    let mut revs = Vec::new();
+    for h in handles {
+        let r = h
+            .await
+            .expect("join")
+            .expect("every concurrent writer lands");
+        revs.push(r.rev);
+    }
+    revs.sort_unstable();
+    assert_eq!(revs, vec![1, 2, 3, 4]);
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 4);
+    assert_eq!(stored.content, "l1\nw1\nl2\nw2\nl3\nw3\nl4\nw4\nl5");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.setContent concurrent").await;
 }
 
 #[tokio::test]
@@ -4341,6 +5448,244 @@ async fn note_add_stamps_user_author_when_caller_is_none() {
     assert_eq!(last.author.id, "user");
     assert_eq!(last.author.name, "User");
     assert_eq!(last.author.author_type, "user");
+}
+
+/// `rev` of the newest `note_version` row for `(ws, id)`, by version number.
+async fn newest_version_rev(store: &Store, ws: &WorkspaceId, id: &NoteId) -> Option<i64> {
+    sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT rev FROM note_version WHERE workspace_id = ?1 AND note_id = ?2 \
+         ORDER BY v DESC LIMIT 1",
+    )
+    .bind(ws.as_str())
+    .bind(id.as_str())
+    .fetch_one(store.read_pool())
+    .await
+    .expect("newest version row")
+}
+
+/// The post-write invariant every persisted content write must uphold: the
+/// newest `note_version` row carries the note's current `rev`, and the base
+/// lookup by that rev yields exactly the persisted content.
+async fn assert_snapshot_at_current_rev(svc: &Services, ws: &WorkspaceId, id: &NoteId, path: &str) {
+    let note = svc.store.get_note(ws, id).await.expect("get note");
+    assert_eq!(
+        newest_version_rev(&svc.store, ws, id).await,
+        Some(note.rev),
+        "{path}: newest note_version row must carry the post-write rev"
+    );
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(ws, id, note.rev)
+            .await
+            .expect("lookup"),
+        Some(note.content),
+        "{path}: base lookup by rev must yield the persisted content"
+    );
+}
+
+/// Every persisted content write snapshots the note at its post-write `rev`:
+/// the base a later writer sends as `expectedVersion` resolves, via
+/// `get_note_version_content_by_rev`, to exactly the content that write
+/// produced. Covers every `note.*` content path (create / setContent / add /
+/// edit / editLines / update / restoreVersion), the direct `task.*` content
+/// writes (`updateStatus`, `update`, `createPrerequisite`, and linked-checkbox
+/// materialization from `updateNoteStatus`), the `comment.add` anchor rewrite
+/// and the `primitive.*` append.
+#[tokio::test]
+async fn note_writes_record_post_write_rev_on_version_snapshot() {
+    let (_tmp, svc, ws, id) = setup("body\n- [ ] alpha\n- [ ] beta").await;
+
+    let created = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Fresh".into(),
+                content: Some("fresh body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create")
+        .note;
+    assert_snapshot_at_current_rev(&svc, &ws, &created.id, "note.create").await;
+
+    let before = svc.store.get_note(&ws, &id).await.expect("get");
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "replaced\n- [ ] alpha\n- [ ] beta".into(),
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect("set content");
+    let after_set = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(after_set.rev, before.rev + 1);
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.setContent").await;
+
+    svc.add_to_note(
+        ws.clone(),
+        id.clone(),
+        NoteAddInput {
+            content: "more".into(),
+            heading: None,
+            position: None,
+        },
+        None,
+    )
+    .await
+    .expect("add");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.add").await;
+    // The earlier base is still recoverable by its own rev.
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(&ws, &id, after_set.rev)
+            .await
+            .expect("lookup"),
+        Some(after_set.content.clone())
+    );
+
+    svc.edit_note(
+        ws.clone(),
+        id.clone(),
+        NoteEditInput {
+            old: "replaced".into(),
+            new: "edited".into(),
+        },
+        None,
+    )
+    .await
+    .expect("edit");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.edit").await;
+
+    svc.edit_note_lines(
+        ws.clone(),
+        id.clone(),
+        NoteEditLinesInput {
+            start: 1,
+            end: 1,
+            content: "lines".into(),
+        },
+        None,
+    )
+    .await
+    .expect("editLines");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.editLines").await;
+
+    svc.update_note(
+        ws.clone(),
+        id.clone(),
+        NoteUpdateInput {
+            content: Some("updated\n- [ ] alpha\n- [ ] beta".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.update").await;
+
+    svc.restore_note_version(ws.clone(), id.clone(), 1, None)
+        .await
+        .expect("restore");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.restoreVersion").await;
+
+    svc.task_update_status(ws.clone(), id.clone(), "alpha".into(), "done".into(), None)
+        .await
+        .expect("task.updateStatus");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "task.updateStatus").await;
+
+    svc.task_update(
+        ws.clone(),
+        id.clone(),
+        3,
+        Some("beta renamed".into()),
+        Some("in-progress".into()),
+        None,
+        None,
+    )
+    .await
+    .expect("task.update");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "task.update").await;
+
+    svc.comment_add(
+        ws.clone(),
+        id.clone(),
+        "beta renamed".into(),
+        "renamed".into(),
+        "note".into(),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("comment.add");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "comment.add").await;
+
+    svc.primitive_add_cli(
+        ws.clone(),
+        id.clone(),
+        "cargo test".into(),
+        "run tests".into(),
+        None,
+    )
+    .await
+    .expect("primitive.addCli");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "primitive.addCli").await;
+
+    // Task paths: a child task note is created, and flipping its status
+    // materializes the linked checkbox onto the parent.
+    svc.mark_as_task(
+        ws.clone(),
+        id.clone(),
+        "not_started".into(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
+    let child = svc
+        .create_prerequisite(
+            ws.clone(),
+            id.clone(),
+            "Child".into(),
+            Some("child body".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("createPrerequisite")
+        .prerequisite_note_id;
+    assert_snapshot_at_current_rev(&svc, &ws, &child, "task.createPrerequisite").await;
+
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        format!("- [ ] [Child](intent://local/task/{})", child.as_str()),
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect("link child");
+    let linked_rev = svc.store.get_note(&ws, &id).await.expect("get").rev;
+    svc.task_update_note_status(ws.clone(), child.clone(), "complete".into(), None, None)
+        .await
+        .expect("updateNoteStatus");
+    let materialized = svc.store.get_note(&ws, &id).await.expect("get");
+    assert!(
+        materialized.rev > linked_rev && materialized.content.starts_with("- [x]"),
+        "materialization must have rewritten the parent: {materialized:?}"
+    );
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "linked-checkbox materialization").await;
 }
 
 #[tokio::test]
@@ -9840,6 +11185,67 @@ mod change_event_parity {
         );
     }
 
+    /// Every note `workspace.duplicate` copies is snapshotted at its
+    /// post-insert `rev`, so the rev a client loads from the duplicate is a
+    /// recoverable merge base.
+    #[tokio::test]
+    async fn workspace_duplicate_copied_notes_record_post_write_rev_on_version_snapshot() {
+        use intent_core::WorkspaceCreate;
+        let h = harness().await;
+        let source = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Rev dup source".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        h.services
+            .create_note(
+                source.id.clone(),
+                NoteCreate {
+                    title: "Copied".into(),
+                    content: Some("copied body".into()),
+                    tags: None,
+                    parent_id: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("create note");
+
+        let dup = h
+            .services
+            .duplicate_workspace(source.id.clone(), None)
+            .await
+            .expect("duplicate");
+        let copied = h
+            .store
+            .list_notes(&dup.id)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|n| n.title == "Copied")
+            .expect("copied note present");
+        assert_eq!(
+            crate::tests::newest_version_rev(&h.store, &dup.id, &copied.id).await,
+            Some(copied.rev),
+            "newest note_version row must carry the copied note's rev"
+        );
+        assert_eq!(
+            h.store
+                .get_note_version_content_by_rev(&dup.id, &copied.id, copied.rev)
+                .await
+                .expect("lookup"),
+            Some("copied body".to_string())
+        );
+    }
+
     /// NULL fallback: a pre-migration row (no persisted override) resolves
     /// `workspace.getAutoCommit` against the global setting with
     /// `source: "global"`, and `effective_auto_commit` follows the global.
@@ -10476,7 +11882,7 @@ mod change_event_parity {
             author_type: "user".to_string(),
         };
         h.store
-            .append_note_version(&stray, &author, &stray_ts)
+            .append_note_version(&stray, &author, &stray_ts, stray.rev)
             .await
             .expect("v1");
 
@@ -11685,21 +13091,11 @@ mod change_event_parity {
             .contains_key(&(h.ws.clone(), intent_core::NoteId::from(id)))
     }
 
-    fn seed_crdt_session(h: &Harness, id: &str, content: &str) {
-        let nid = intent_core::NoteId::from(id);
-        h.services
-            .crdt_notes
-            .apply_full_content(&h.ws, &nid, content, content);
-        assert!(h.services.crdt_notes.has_session(&h.ws, &nid));
-    }
-
     /// A materialized parent write is a surgical content mutation like
-    /// `note.edit`: it drops the parent's cached CRDT session (so the next
-    /// `note.setContent` reseeds from the persisted marker) and schedules its
-    /// line-attribution recompute. Parents left untouched — and the task note
-    /// itself — keep their sessions and schedule nothing.
+    /// `note.edit`: it schedules the parent's line-attribution recompute.
+    /// Parents left untouched — and the task note itself — schedule nothing.
     #[tokio::test]
-    async fn materialization_invalidates_parent_crdt_and_schedules_attribution_recompute() {
+    async fn materialization_schedules_parent_attribution_recompute() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
         insert_task_note(&h, T2, TaskStatus::NotStarted).await;
@@ -11713,38 +13109,23 @@ mod change_event_parity {
             .insert_note(&note(&h.ws, FRESH, &other))
             .await
             .expect("insert other");
-        seed_crdt_session(&h, "spec", &body);
-        seed_crdt_session(&h, FRESH, &other);
 
         set_status(&h, T1, "complete").await;
 
         assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
         assert!(
-            !h.services.crdt_notes.has_session(&h.ws, &spec_id()),
-            "rewritten parent drops its CRDT session"
-        );
-        assert!(
             attribution_recompute_scheduled(&h, "spec"),
             "rewritten parent schedules a line-attribution recompute"
         );
-        assert!(h
-            .services
-            .crdt_notes
-            .has_session(&h.ws, &intent_core::NoteId::from(FRESH)));
         assert!(!attribution_recompute_scheduled(&h, FRESH));
         assert!(!attribution_recompute_scheduled(&h, T1));
-
-        // The marker already matches: no rewrite, so no invalidation either.
-        seed_crdt_session(&h, "spec", &linked("[x]", "T", T1));
-        set_status(&h, T1, "complete").await;
-        assert!(h.services.crdt_notes.has_session(&h.ws, &spec_id()));
     }
 
     /// Redirected writes through `task.updateStatus` / `task.update` behave as
-    /// on every other materializing path: the redirect target's parents are
-    /// invalidated too (here the parent is the note the call addressed).
+    /// on every other materializing path: the redirect target's parent (here
+    /// the note the call addressed) schedules its recompute too.
     #[tokio::test]
-    async fn redirected_write_invalidates_parent_crdt() {
+    async fn redirected_write_schedules_parent_attribution_recompute() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
         let body = linked("[ ]", "T", T1);
@@ -11752,7 +13133,6 @@ mod change_event_parity {
             .insert_note(&note(&h.ws, "spec", &body))
             .await
             .expect("insert spec");
-        seed_crdt_session(&h, "spec", &body);
 
         h.services
             .task_update(
@@ -11768,7 +13148,6 @@ mod change_event_parity {
             .expect("task.update");
 
         assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
-        assert!(!h.services.crdt_notes.has_session(&h.ws, &spec_id()));
         assert!(attribution_recompute_scheduled(&h, "spec"));
     }
 
@@ -30671,19 +32050,6 @@ mod line_attribution_hooks {
         .await
         .expect("comment.add");
         assert_debouncer_scheduled(&svc, &ws, &id);
-    }
-
-    #[tokio::test]
-    async fn spawn_crdt_session_sweep_loop_returns_abortable_handle() {
-        let (_tmp, svc, _ws, _id) = setup("").await;
-        let handle = svc.spawn_crdt_session_sweep_loop();
-        assert!(!handle.is_finished(), "sweep loop should stay running");
-        handle.abort();
-        let joined = handle.await;
-        assert!(
-            matches!(&joined, Err(e) if e.is_cancelled()),
-            "aborted sweep loop must join with a cancellation error: {joined:?}",
-        );
     }
 }
 

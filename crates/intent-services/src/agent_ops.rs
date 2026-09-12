@@ -12766,7 +12766,7 @@ impl Services {
             let now = now_iso();
             note.metadata.task = Some(task);
             note.updated_at = now;
-            self.store.update_note(&note).await?;
+            self.store.update_note_metadata(&note).await?;
         }
         Ok(())
     }

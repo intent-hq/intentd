@@ -1107,7 +1107,7 @@ async fn note_version_append_list_get_and_prune() {
     for i in 1..=total {
         note.content = format!("content v{i}");
         let v = store
-            .append_note_version(&note, &author, &ts)
+            .append_note_version(&note, &author, &ts, note.rev)
             .await
             .expect("append version");
         assert_eq!(v, i, "version numbers are strictly increasing");
@@ -1154,6 +1154,140 @@ async fn note_version_append_list_get_and_prune() {
     assert!(after.is_empty(), "note delete cascades to note_version");
 }
 
+/// Every content write records the note's post-write `rev` on its
+/// `note_version` row: `update_note` / `update_note_versioned` return the
+/// bumped `rev` (`RETURNING rev`), `append_note_version` stores it, and
+/// `get_note_version_content_by_rev` recovers the content as of that rev —
+/// the exact snapshot for a content rev, the preceding content snapshot for a
+/// metadata-only rev bump, `None` for a rev older than the oldest retained
+/// snapshot (pruned or predating the note); pre-migration `NULL` rows never
+/// match.
+#[tokio::test]
+async fn note_version_records_rev_and_looks_up_base_by_rev() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let ts = now_iso();
+    let mut note = Note {
+        id: NoteId::new(),
+        workspace_id: ws_id.clone(),
+        title: "Rev".to_string(),
+        content: "base".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata::default(),
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts.clone(),
+    };
+    store.insert_note(&note).await.expect("insert note");
+    let author = NoteVersionAuthor {
+        id: "user".to_string(),
+        name: "User".to_string(),
+        author_type: "user".to_string(),
+    };
+    // Snapshot right after insert carries the insert rev (0).
+    store
+        .append_note_version(&note, &author, &ts, note.rev)
+        .await
+        .expect("append v1");
+
+    // Versioned write: the returned rev is the post-write rev (0 → 1) and
+    // matches what the row now carries.
+    note.content = "one".to_string();
+    let rev1 = store
+        .update_note_versioned(&note, Some(0))
+        .await
+        .expect("versioned update");
+    assert_eq!(rev1, 1);
+    assert_eq!(
+        store.get_note(&ws_id, &note.id).await.expect("get").rev,
+        rev1
+    );
+    store
+        .append_note_version(&note, &author, &ts, rev1)
+        .await
+        .expect("append v2");
+
+    // Unconditional write: same contract (1 → 2).
+    note.content = "two".to_string();
+    let rev2 = store.update_note(&note).await.expect("update");
+    assert_eq!(rev2, 2);
+    store
+        .append_note_version(&note, &author, &ts, rev2)
+        .await
+        .expect("append v3");
+
+    // Base lookup by (workspace, note, rev): a content rev is an exact hit.
+    let by_rev = |rev: i64| store.get_note_version_content_by_rev(&ws_id, &note.id, rev);
+    assert_eq!(by_rev(0).await.expect("rev 0"), Some("base".to_string()));
+    assert_eq!(by_rev(1).await.expect("rev 1"), Some("one".to_string()));
+    assert_eq!(by_rev(2).await.expect("rev 2"), Some("two".to_string()));
+    // A rev older than the oldest snapshot has no base.
+    assert_eq!(by_rev(-1).await.expect("rev -1"), None);
+    // Scoped by workspace: another workspace id never matches.
+    assert_eq!(
+        store
+            .get_note_version_content_by_rev(&WorkspaceId::new(), &note.id, 1)
+            .await
+            .expect("other ws"),
+        None
+    );
+
+    // A metadata-only write bumps rev without a snapshot (2 → 3): the
+    // content as of rev 3 is the last content-write snapshot at or below it.
+    note.is_pinned = true;
+    let rev3 = store.update_note(&note).await.expect("metadata update");
+    assert_eq!(rev3, 3);
+    assert_eq!(
+        by_rev(3).await.expect("metadata-only rev 3"),
+        Some("two".to_string())
+    );
+
+    // A pre-migration row (`rev IS NULL`) never matches a base lookup even
+    // when `v` lines up with a rev a writer might send: with rev 1's snapshot
+    // NULLed out, the lookup falls back to the newest non-NULL rev below it.
+    sqlx::query("UPDATE note_version SET rev = NULL WHERE note_id = ? AND v = 2")
+        .bind(&note.id.0)
+        .execute(store.write_pool())
+        .await
+        .expect("null out rev");
+    assert_eq!(
+        by_rev(1).await.expect("rev 1 after NULL"),
+        Some("base".to_string())
+    );
+
+    // Once the rev's snapshot is pruned past MAX_NOTE_VERSIONS the base is
+    // gone: `None`, not an error.
+    for _ in 0..MAX_NOTE_VERSIONS {
+        note.content = "churn".to_string();
+        let rev = store.update_note(&note).await.expect("churn update");
+        store
+            .append_note_version(&note, &author, &ts, rev)
+            .await
+            .expect("churn append");
+    }
+    assert_eq!(by_rev(0).await.expect("pruned rev 0"), None);
+    assert_eq!(by_rev(2).await.expect("pruned rev 2"), None);
+    assert_eq!(by_rev(3).await.expect("pruned rev 3"), None);
+    let latest = store.get_note(&ws_id, &note.id).await.expect("get").rev;
+    assert_eq!(
+        by_rev(latest).await.expect("latest rev"),
+        Some("churn".to_string())
+    );
+}
+
 /// A failed statement inside `append_note_version`'s transaction rolls the
 /// whole write back and leaves the pooled write connection usable: appending
 /// for an absent note trips the composite `(note_id, workspace_id)` FK at
@@ -1181,7 +1315,7 @@ async fn append_note_version_rolls_back_on_body_error() {
     let mut ghost = note.clone();
     ghost.id = NoteId::new();
     assert!(store
-        .append_note_version(&ghost, &author, &ts)
+        .append_note_version(&ghost, &author, &ts, ghost.rev)
         .await
         .is_err());
     assert!(store
@@ -1192,7 +1326,7 @@ async fn append_note_version_rolls_back_on_body_error() {
 
     // The write connection is clean: a normal append still works.
     let v = store
-        .append_note_version(&note, &author, &ts)
+        .append_note_version(&note, &author, &ts, note.rev)
         .await
         .expect("append after body error");
     assert_eq!(v, 1);
@@ -1240,7 +1374,7 @@ async fn append_note_version_rolls_back_on_failed_commit() {
     let mut ghost = note.clone();
     ghost.id = NoteId::new();
     let err = store
-        .append_note_version(&ghost, &author, &ts)
+        .append_note_version(&ghost, &author, &ts, ghost.rev)
         .await
         .expect_err("COMMIT must fail on the deferred FK violation");
     assert!(
@@ -1257,7 +1391,7 @@ async fn append_note_version_rolls_back_on_failed_commit() {
     // ...and the failed COMMIT was rolled back, not left open: the next
     // append reuses the same pooled connection and commits normally.
     let v = store
-        .append_note_version(&note, &author, &ts)
+        .append_note_version(&note, &author, &ts, note.rev)
         .await
         .expect("append after failed COMMIT");
     assert_eq!(v, 1);
@@ -1301,7 +1435,7 @@ async fn append_note_version_detaches_conn_on_failed_body_error_rollback() {
     .expect("create trap trigger");
 
     let err = store
-        .append_note_version(&note, &author, &ts)
+        .append_note_version(&note, &author, &ts, note.rev)
         .await
         .expect_err("INSERT must fail on the rollback trigger");
     assert!(
@@ -1326,7 +1460,7 @@ async fn append_note_version_detaches_conn_on_failed_body_error_rollback() {
         .await
         .expect("drop trap trigger");
     let v = store
-        .append_note_version(&note, &author, &ts)
+        .append_note_version(&note, &author, &ts, note.rev)
         .await
         .expect("append after detach");
     assert_eq!(v, 1);
@@ -1407,7 +1541,7 @@ async fn rollback_or_poison_emits_warn_on_detach() {
         next_span_id: std::sync::atomic::AtomicU64::new(1),
     });
     store
-        .append_note_version(&note, &author, &ts)
+        .append_note_version(&note, &author, &ts, note.rev)
         .await
         .expect_err("INSERT must fail on the rollback trigger");
     drop(guard);
@@ -1788,7 +1922,7 @@ async fn adopt_stray_spec_with_dependents_commits_cleanly() {
         author_type: "user".to_string(),
     };
     store
-        .append_note_version(&stray, &author, &stray.created_at)
+        .append_note_version(&stray, &author, &stray.created_at, stray.rev)
         .await
         .expect("append version");
 
@@ -2116,10 +2250,33 @@ async fn comment_round_trip_update_delete_and_thread() {
     );
 }
 
-/// `update_note_with_comment` commits the note rewrite + comment INSERT in
-/// one transaction (monorepo#638): success returns the post-rewrite `rev`
-/// and persists both; a failed INSERT rolls the note rewrite back (no
-/// anchor markers without a comment row); an absent note is `NotFound`.
+fn version_author() -> NoteVersionAuthor {
+    NoteVersionAuthor {
+        id: "user".to_string(),
+        name: "User".to_string(),
+        author_type: "user".to_string(),
+    }
+}
+
+/// Newest `note_version` row's `(rev, content)` for a note, or `None`.
+async fn newest_version(store: &Store, ws: &WorkspaceId, id: &NoteId) -> Option<(i64, String)> {
+    sqlx::query_as::<_, (i64, String)>(
+        "SELECT rev, content FROM note_version WHERE workspace_id = ? AND note_id = ? \
+         ORDER BY v DESC LIMIT 1",
+    )
+    .bind(&ws.0)
+    .bind(&id.0)
+    .fetch_optional(store.read_pool())
+    .await
+    .expect("newest version row")
+}
+
+/// `update_note_with_comment` commits the note rewrite + its version
+/// snapshot + comment INSERT in one transaction (monorepo#638): success
+/// returns the post-rewrite `rev` and persists all three; a failed INSERT
+/// rolls the note rewrite and snapshot back (no anchor markers without a
+/// comment row, no snapshot for a rev that never landed); an absent note is
+/// `NotFound`.
 #[tokio::test]
 async fn update_note_with_comment_is_atomic_and_returns_rev() {
     let tmp = TempDb::new();
@@ -2131,12 +2288,14 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
         .expect("insert ws");
     let mut note = task_note(&ws_id, "Note", None);
     store.insert_note(&note).await.expect("insert note");
+    let author = version_author();
 
-    // Success: both persist, returned rev is the post-rewrite value (0 → 1).
+    // Success: all persist, returned rev is the post-rewrite value (0 → 1)
+    // and the snapshot carries it.
     note.content = "with <!--anchor:c1:start-->markers<!--anchor:c1:end-->".to_string();
     let c1 = sample_comment(&note.id, "c1", "c1");
     let rev = store
-        .update_note_with_comment(&note, &c1)
+        .update_note_with_comment(&note, Some(0), &c1, &author)
         .await
         .expect("atomic update+insert");
     assert_eq!(rev, 1);
@@ -2144,25 +2303,375 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
     assert_eq!(stored.rev, 1);
     assert_eq!(stored.content, note.content);
     assert_eq!(store.get_comment("c1").await.expect("get c1"), c1);
+    assert_eq!(
+        newest_version(&store, &ws_id, &note.id).await,
+        Some((1, note.content.clone()))
+    );
 
-    // Failure (duplicate comment id → INSERT fails): the note rewrite must
-    // roll back — content and rev stay at the committed state above.
+    // Failure (duplicate comment id → INSERT fails): the note rewrite and
+    // its snapshot must roll back — content, rev and history stay at the
+    // committed state above.
     note.content = "rewrite-that-must-roll-back".to_string();
     let dup = sample_comment(&note.id, "c1", "c1");
-    assert!(store.update_note_with_comment(&note, &dup).await.is_err());
+    assert!(store
+        .update_note_with_comment(&note, None, &dup, &author)
+        .await
+        .is_err());
     let after_fail = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(after_fail.rev, 1);
     assert_eq!(after_fail.content, stored.content);
+    assert_eq!(
+        newest_version(&store, &ws_id, &note.id).await,
+        Some((1, stored.content.clone()))
+    );
+
+    // Stale `expected_version` (row is at rev 1) → Conflict carrying the
+    // current entity; neither the rewrite nor the comment persists.
+    let c3 = sample_comment(&note.id, "c3", "c3");
+    match store
+        .update_note_with_comment(&note, Some(0), &c3, &author)
+        .await
+    {
+        Err(intent_core::Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 1);
+            assert_eq!(current["content"], stored.content);
+        }
+        other => panic!("expected Conflict for stale expected_version, got {other:?}"),
+    }
+    assert!(store.get_comment("c3").await.is_err());
+    assert_eq!(
+        newest_version(&store, &ws_id, &note.id).await,
+        Some((1, stored.content.clone()))
+    );
 
     // Absent note row → NotFound, and the comment must not persist.
     let mut ghost = note.clone();
     ghost.id = NoteId::new();
     let c2 = sample_comment(&ghost.id, "c2", "c2");
-    match store.update_note_with_comment(&ghost, &c2).await {
+    match store
+        .update_note_with_comment(&ghost, None, &c2, &author)
+        .await
+    {
         Err(intent_core::Error::NotFound(_)) => {}
         other => panic!("expected NotFound for absent note, got {other:?}"),
     }
     assert!(store.get_comment("c2").await.is_err());
+}
+
+/// `update_note_with_version` commits the content write and its snapshot
+/// atomically: the returned `(rev, v)` matches the row and the newest
+/// `note_version` row, the base lookup by the new rev yields the new content
+/// the moment the rev is visible, a stale `expected_version` is a `Conflict`
+/// that persists nothing (no row bump, no snapshot), and an absent note is
+/// `NotFound`.
+#[tokio::test]
+async fn update_note_with_version_is_atomic_and_gates_on_expected_version() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let mut note = task_note(&ws_id, "Note", None);
+    note.content = "base".to_string();
+    store.insert_note(&note).await.expect("insert note");
+    let author = version_author();
+    let ts = now_iso();
+
+    note.content = "one".to_string();
+    let (rev, v) = store
+        .update_note_with_version(&note, Some(0), &author, &ts)
+        .await
+        .expect("gated write");
+    assert_eq!((rev, v), (1, 1));
+    let stored = store.get_note(&ws_id, &note.id).await.expect("get note");
+    assert_eq!((stored.rev, stored.content.as_str()), (1, "one"));
+    assert_eq!(
+        newest_version(&store, &ws_id, &note.id).await,
+        Some((1, "one".to_string()))
+    );
+    assert_eq!(
+        store
+            .get_note_version_content_by_rev(&ws_id, &note.id, 1)
+            .await
+            .expect("lookup"),
+        Some("one".to_string())
+    );
+
+    // Unconditional write: rev and v both advance.
+    note.content = "two".to_string();
+    let (rev, v) = store
+        .update_note_with_version(&note, None, &author, &ts)
+        .await
+        .expect("unconditional write");
+    assert_eq!((rev, v), (2, 2));
+
+    // Stale gate: Conflict carrying the current row; nothing persisted.
+    note.content = "stale".to_string();
+    match store
+        .update_note_with_version(&note, Some(1), &author, &ts)
+        .await
+    {
+        Err(intent_core::Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 2);
+            assert_eq!(current["content"], "two");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    let stored = store.get_note(&ws_id, &note.id).await.expect("get note");
+    assert_eq!((stored.rev, stored.content.as_str()), (2, "two"));
+    assert_eq!(
+        newest_version(&store, &ws_id, &note.id).await,
+        Some((2, "two".to_string()))
+    );
+
+    // Absent note → NotFound, no snapshot row for it.
+    let mut ghost = note.clone();
+    ghost.id = NoteId::new();
+    match store
+        .update_note_with_version(&ghost, None, &author, &ts)
+        .await
+    {
+        Err(intent_core::Error::NotFound(_)) => {}
+        other => panic!("expected NotFound for absent note, got {other:?}"),
+    }
+    assert_eq!(newest_version(&store, &ws_id, &ghost.id).await, None);
+}
+
+/// `insert_note_with_version` commits the row and its initial snapshot
+/// atomically: the returned `v` matches the newest `note_version` row, the
+/// base lookup by `note.rev` yields the initial content, and a failed insert
+/// (duplicate `(id, workspace_id)`) leaves neither a row change nor a
+/// snapshot behind.
+#[tokio::test]
+async fn insert_note_with_version_commits_row_and_snapshot_together() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let mut note = task_note(&ws_id, "Note", None);
+    note.content = "base".to_string();
+    let author = version_author();
+    let ts = now_iso();
+
+    let v = store
+        .insert_note_with_version(&note, &author, &ts)
+        .await
+        .expect("atomic insert");
+    assert_eq!(v, 1);
+    let stored = store.get_note(&ws_id, &note.id).await.expect("get note");
+    assert_eq!((stored.rev, stored.content.as_str()), (0, "base"));
+    assert_eq!(
+        newest_version(&store, &ws_id, &note.id).await,
+        Some((0, "base".to_string()))
+    );
+    assert_eq!(
+        store
+            .get_note_version_content_by_rev(&ws_id, &note.id, 0)
+            .await
+            .expect("lookup"),
+        Some("base".to_string())
+    );
+
+    // Duplicate insert: the INSERT fails, so no second snapshot lands.
+    note.content = "dup".to_string();
+    assert!(store
+        .insert_note_with_version(&note, &author, &ts)
+        .await
+        .is_err());
+    let stored = store.get_note(&ws_id, &note.id).await.expect("get note");
+    assert_eq!((stored.rev, stored.content.as_str()), (0, "base"));
+    assert_eq!(
+        newest_version(&store, &ws_id, &note.id).await,
+        Some((0, "base".to_string()))
+    );
+    assert_eq!(
+        store.write_pool().size(),
+        1,
+        "connection returned to the pool"
+    );
+}
+
+/// `update_note_with_version_and_children` commits the gated parent write,
+/// its snapshot, and every child row + initial snapshot together: on success
+/// all are visible with recoverable bases; on a stale gate it is a `Conflict`
+/// that persists nothing — no parent bump, no snapshot, and no child rows.
+#[tokio::test]
+async fn update_note_with_version_and_children_is_all_or_nothing() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let mut parent = task_note(&ws_id, "Parent", None);
+    parent.content = "base".to_string();
+    store.insert_note(&parent).await.expect("insert parent");
+    let author = version_author();
+    let ts = now_iso();
+
+    let mut child = task_note(&ws_id, "Child", None);
+    child.parent_id = Some(parent.id.clone());
+    child.content = "child body".to_string();
+    parent.content = format!("- [ ] [Child](intent://local/task/{})", child.id.0);
+    let (rev, v) = store
+        .update_note_with_version_and_children(
+            &parent,
+            Some(0),
+            std::slice::from_ref(&child),
+            &author,
+            &ts,
+        )
+        .await
+        .expect("gated write with child");
+    assert_eq!((rev, v), (1, 1));
+    let stored = store
+        .get_note(&ws_id, &parent.id)
+        .await
+        .expect("get parent");
+    assert_eq!(
+        (stored.rev, stored.content.as_str()),
+        (1, parent.content.as_str())
+    );
+    assert_eq!(
+        newest_version(&store, &ws_id, &parent.id).await,
+        Some((1, parent.content.clone()))
+    );
+    let stored_child = store.get_note(&ws_id, &child.id).await.expect("get child");
+    assert_eq!(
+        (stored_child.rev, stored_child.content.as_str()),
+        (0, "child body")
+    );
+    assert_eq!(
+        store
+            .get_note_version_content_by_rev(&ws_id, &child.id, 0)
+            .await
+            .expect("lookup"),
+        Some("child body".to_string())
+    );
+
+    // Stale gate: Conflict; neither the parent nor the second child persists.
+    let mut ghost_child = task_note(&ws_id, "Ghost", None);
+    ghost_child.parent_id = Some(parent.id.clone());
+    ghost_child.content = "never".to_string();
+    parent.content = "stale rewrite".to_string();
+    match store
+        .update_note_with_version_and_children(
+            &parent,
+            Some(0),
+            std::slice::from_ref(&ghost_child),
+            &author,
+            &ts,
+        )
+        .await
+    {
+        Err(intent_core::Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 1);
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    let stored = store
+        .get_note(&ws_id, &parent.id)
+        .await
+        .expect("get parent");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(
+        newest_version(&store, &ws_id, &parent.id).await,
+        Some((1, stored.content.clone()))
+    );
+    assert!(matches!(
+        store.get_note(&ws_id, &ghost_child.id).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    assert_eq!(newest_version(&store, &ws_id, &ghost_child.id).await, None);
+    assert_eq!(
+        store.write_pool().size(),
+        1,
+        "connection returned to the pool"
+    );
+}
+
+/// A failure *inside* the body of `update_note_with_version_and_children`
+/// — after the parent UPDATE, its snapshot, and the first child have already
+/// executed — rolls all of them back: the second child's duplicate
+/// `(id, workspace_id)` INSERT fails, and afterwards the parent still holds
+/// its pre-write content and rev with no extra snapshot, the child row and
+/// its snapshot are absent, and the write pool is usable for the next write.
+#[tokio::test]
+async fn update_note_with_version_and_children_rolls_back_on_mid_body_child_error() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let mut parent = task_note(&ws_id, "Parent", None);
+    parent.content = "body".to_string();
+    let author = version_author();
+    let ts = now_iso();
+    store
+        .insert_note_with_version(&parent, &author, &ts)
+        .await
+        .expect("insert parent");
+
+    let mut child = task_note(&ws_id, "Child", None);
+    child.parent_id = Some(parent.id.clone());
+    child.content = "child body".to_string();
+    parent.content = "rewritten parent".to_string();
+    let result = store
+        .update_note_with_version_and_children(
+            &parent,
+            Some(0),
+            &[child.clone(), child.clone()],
+            &author,
+            &ts,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(intent_core::Error::Internal(_))),
+        "duplicate child insert fails the body: {result:?}"
+    );
+
+    let stored = store
+        .get_note(&ws_id, &parent.id)
+        .await
+        .expect("get parent");
+    assert_eq!((stored.content.as_str(), stored.rev), ("body", 0));
+    assert_eq!(
+        store
+            .list_note_versions(&ws_id, &parent.id)
+            .await
+            .expect("versions")
+            .len(),
+        1,
+        "parent snapshot rolled back"
+    );
+    assert!(matches!(
+        store.get_note(&ws_id, &child.id).await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    assert_eq!(
+        newest_version(&store, &ws_id, &child.id).await,
+        None,
+        "first child's snapshot rolled back"
+    );
+    assert_eq!(
+        store.write_pool().size(),
+        1,
+        "connection returned to the pool"
+    );
+
+    let (rev, v) = store
+        .update_note_with_version(&parent, Some(0), &author, &ts)
+        .await
+        .expect("pool usable after rollback");
+    assert_eq!((rev, v), (1, 2));
 }
 
 /// Regression for monorepo#680 at the `update_note_with_comment` site: a
@@ -2196,7 +2705,7 @@ async fn update_note_with_comment_detaches_conn_on_failed_body_error_rollback() 
     note.content = "rewrite-that-must-roll-back".to_string();
     let c1 = sample_comment(&note.id, "c1", "c1");
     let err = store
-        .update_note_with_comment(&note, &c1)
+        .update_note_with_comment(&note, None, &c1, &version_author())
         .await
         .expect_err("UPDATE must fail on the rollback trigger");
     assert!(
@@ -2219,7 +2728,7 @@ async fn update_note_with_comment_detaches_conn_on_failed_body_error_rollback() 
         .await
         .expect("drop trap trigger");
     let rev = store
-        .update_note_with_comment(&note, &c1)
+        .update_note_with_comment(&note, None, &c1, &version_author())
         .await
         .expect("update after detach");
     assert_eq!(rev, 1);

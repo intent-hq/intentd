@@ -2007,11 +2007,6 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
     // without an event bus. Aborted on clean shutdown.
     let agent_locks_loop = services.spawn_agent_locks_loop();
-    // CRDT session sweeper (A5, §5.2 CRDT): every hour, drop cached yrs docs
-    // for `(workspace, note)` pairs whose last access is older than 24h so
-    // long-lived daemons do not accumulate per-note session state. Aborted on
-    // clean shutdown.
-    let crdt_session_sweep = services.spawn_crdt_session_sweep_loop();
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
     // aggregate memory budget is installed (monorepo#2063), drain idle agents
@@ -2523,7 +2518,6 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     completion_delivery.abort();
     auto_commit_loop.abort();
     agent_locks_loop.abort();
-    crdt_session_sweep.abort();
     if let Some(reap_task) = reap_task {
         reap_task.abort();
     }

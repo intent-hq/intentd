@@ -9644,14 +9644,12 @@ async fn wss_note_list_slim_projection_bounds_large_frames() {
 
 /// Regression for monorepo#721 over the real WSS wire: full-content note
 /// writes (`note.setContent`) with non-ASCII content (emoji/CJK) must not
-/// corrupt content or panic the daemon. The CRDT merge engine computes
-/// UTF-16 code-unit offsets, but the `yrs` doc used byte offsets — so the
-/// second full-content write (the diff path over a doc already holding
-/// multi-byte chars) landed at wrong byte positions, panicking inside `yrs`
-/// and poisoning the sessions mutex (every later CRDT call then panicked,
-/// dropping the WSS connection). Post-fix: setContent with emoji/CJK, an
-/// edited setContent (diff path), a surgical `note.add`, and a reseeded
-/// setContent after the add all succeed with the expected merged content.
+/// corrupt content or panic the daemon. The original defect was an offset
+/// mismatch (UTF-16 code units vs. byte offsets) in the since-retired
+/// session-cache merge engine, which panicked on the second full-content
+/// write and dropped the WSS connection. The sequence — setContent with
+/// emoji/CJK, an edited setContent, a surgical `note.add`, and another
+/// setContent after the add — must all succeed with the expected content.
 #[tokio::test]
 async fn wss_note_set_content_non_ascii_merge_round_trip() {
     let srv = start(WsOptions::default()).await;

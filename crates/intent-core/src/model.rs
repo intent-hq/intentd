@@ -1543,6 +1543,10 @@ pub struct NoteSetContentResult {
     /// [`TaskConvertBlocksResult::warnings`]).
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// The note's `rev` after the write (post auto-conversion refetch): the
+    /// base a follow-up conditional write should send as `expectedVersion`.
+    #[serde(default)]
+    pub rev: i64,
 }
 
 /// Result of `note.updateMetadata`. Either a normal title/tags update or a

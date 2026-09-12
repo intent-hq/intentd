@@ -570,6 +570,7 @@ impl WorkspaceApi for FakeApi {
                 created_task_note_ids: vec![],
                 created_tasks: vec![],
                 warnings: vec![],
+                rev: 1,
             })
         })
     }
