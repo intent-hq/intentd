@@ -1,9 +1,13 @@
 //! Hidden, daemon-managed cache of read-only GitHub clones.
 //!
 //! Layout: `<cache_root>/<owner>/<repo>` — a normal clone with the remote's
-//! default branch checked out. The caller passes the cache root (e.g.
-//! `<workspaces_root>/.repo-cache`, dot-prefixed so it stays invisible to
-//! users and recent-repo derivation); this module never reads config.
+//! default branch checked out. The `<owner>/<repo>` key is the case-folded
+//! [`RepoRef`] identity (ASCII lowercase), so case-variant slugs of one
+//! repository (`Intent-HQ/IntentD`, `intent-hq/intentd`) share a single
+//! slot even on a case-sensitive filesystem. The caller passes the cache
+//! root (e.g. `<workspaces_root>/.repo-cache`, dot-prefixed so it stays
+//! invisible to users and recent-repo derivation); this module never reads
+//! config.
 //!
 //! [`ensure_cached_repo`] is the single entry point: it serializes callers on
 //! a per-repo async lock, then either clones fresh (cache miss) or refreshes
@@ -30,7 +34,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use git2::Repository;
-use intent_core::{Error, Result};
+use intent_core::{Error, RepoRef, Result};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::auth::{token_helper_config, TOKEN_ENV};
@@ -198,10 +202,80 @@ fn forget_fresh(cache_path: &Path) {
     map.remove(cache_path);
 }
 
-/// Ensure `<cache_root>/<owner>/<repo>` holds a fresh cached clone of
-/// `github_url` and return that path.
+/// The cache slot for `owner`/`repo`: `<cache_root>/<owner>/<repo>` with
+/// both segments case-folded per [`RepoRef::identity_parts`], so every
+/// casing of one slug resolves to (and locks on) the same path. Callers
+/// validate the raw segments first.
+fn cache_path_for(cache_root: &Path, owner: &str, repo: &str) -> PathBuf {
+    let (owner, repo) = RepoRef::new(owner, repo).identity_parts();
+    cache_root.join(owner).join(repo)
+}
+
+/// Adopt a pre-existing case-variant slot into the folded `cache_path`
+/// (case-sensitive filesystems only see this: a cache populated before the
+/// key was folded may sit at `<Owner>/<Repo>`). Runs only on a miss at the
+/// folded path; scans `cache_root` for an `<o>/<r>` directory whose
+/// [`RepoRef`] identity matches and renames it into place, then prunes the
+/// old owner dir if it emptied. Best effort — any failure leaves the miss
+/// in place and the caller clones fresh.
+fn adopt_case_variant_cache(cache_root: &Path, owner: &str, repo: &str, cache_path: &Path) {
+    if cache_path.exists() {
+        return;
+    }
+    let wanted = RepoRef::new(owner, repo);
+    let Ok(owners) = std::fs::read_dir(cache_root) else {
+        return;
+    };
+    for owner_entry in owners.flatten() {
+        let Ok(owner_name) = owner_entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(repos) = std::fs::read_dir(owner_entry.path()) else {
+            continue;
+        };
+        for repo_entry in repos.flatten() {
+            let Ok(repo_name) = repo_entry.file_name().into_string() else {
+                continue;
+            };
+            let candidate = repo_entry.path();
+            if candidate == cache_path
+                || RepoRef::new(owner_name.as_str(), repo_name.as_str()) != wanted
+                || !candidate.is_dir()
+            {
+                continue;
+            }
+            let Some(parent) = cache_path.parent() else {
+                return;
+            };
+            if let Err(e) = std::fs::create_dir_all(parent)
+                .and_then(|()| std::fs::rename(&candidate, cache_path))
+            {
+                tracing::warn!(
+                    error = %e,
+                    from = %candidate.display(),
+                    to = %cache_path.display(),
+                    "repo cache case-variant slot could not be adopted; cloning fresh"
+                );
+                return;
+            }
+            tracing::info!(
+                from = %candidate.display(),
+                to = %cache_path.display(),
+                "adopted case-variant repo cache slot"
+            );
+            // Prune the vacated owner dir only when it is now empty.
+            let _ = std::fs::remove_dir(owner_entry.path());
+            return;
+        }
+    }
+}
+
+/// Ensure `<cache_root>/<owner>/<repo>` (case-folded, see
+/// [`cache_path_for`]) holds a fresh cached clone of `github_url` and return
+/// that path.
 ///
-/// - Cache miss: full clone into the cache path.
+/// - Cache miss: full clone into the cache path. A pre-existing case-variant
+///   slot is adopted by rename first (see [`adopt_case_variant_cache`]).
 /// - Cache hit: `git fetch --prune origin` + hard reset of the remote default
 ///   branch. Any anomaly self-heals by deleting the cache dir and re-cloning —
 ///   refresh never fails the flow.
@@ -243,15 +317,19 @@ pub async fn ensure_cached_repo_with_progress(
 ) -> Result<PathBuf> {
     validate_segment("owner", owner)?;
     validate_segment("repo", repo)?;
-    let cache_path = cache_root.join(owner).join(repo);
+    let cache_path = cache_path_for(cache_root, owner, repo);
 
     let lock = lock_for(&cache_path);
     let _guard = lock.lock().await;
 
     let path = cache_path.clone();
+    let root = cache_root.to_path_buf();
+    let owner = owner.to_string();
+    let repo = repo.to_string();
     let url = github_url.to_string();
     let token = token.map(str::to_owned);
     tokio::task::spawn_blocking(move || {
+        adopt_case_variant_cache(&root, &owner, &repo, &path);
         ensure_blocking(&path, &url, token.as_deref(), progress.as_ref())
     })
     .await
@@ -304,9 +382,9 @@ fn ensure_blocking_with_ttl(
                 }
             }
         } else {
-            // The cache is keyed by `<owner>/<repo>` segments only, so two
-            // different hosts (or two `file://` sources) carrying the same
-            // owner/repo pair must never serve each other's content. A cache
+            // The cache is keyed by the case-folded `<owner>/<repo>` segments
+            // only, so two different hosts (or two `file://` sources) carrying
+            // the same owner/repo pair must never serve each other's content. A cache
             // whose `origin` differs from the requested URL is stale, not a
             // hit — wipe and re-clone from the requested URL.
             tracing::warn!(
@@ -342,9 +420,10 @@ fn origin_matches(cache_path: &Path, github_url: &str) -> bool {
 /// Whether `url` is a GitHub URL for exactly `owner`/`repo` — the check the
 /// GitHub-scoped [`list_cached_branches`] reader uses to confirm a cached
 /// slot's `origin`. Accepts the HTTPS/SSH URL and scp-like forms, an optional
-/// `.git` suffix, userinfo, and a port; host, owner, and repo compare
-/// case-insensitively (GitHub slugs are case-insensitive). Anything not on
-/// `github.com` — another host or a local path — is not a GitHub slot.
+/// `.git` suffix, userinfo, and a port; the host compares case-insensitively
+/// and owner/repo under [`RepoRef`] equality (GitHub slugs are
+/// case-insensitive). Anything not on `github.com` — another host or a local
+/// path — is not a GitHub slot.
 fn origin_is_github_slot(url: &str, owner: &str, repo: &str) -> bool {
     let trimmed = url.trim().trim_end_matches('/');
     let (rest, scp_like) = match trimmed.split_once("://") {
@@ -384,7 +463,7 @@ fn origin_is_github_slot(url: &str, owner: &str, repo: &str) -> bool {
         return false;
     }
     let r = r.strip_suffix(".git").unwrap_or(r);
-    o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo)
+    RepoRef::new(o, r) == RepoRef::new(owner, repo)
 }
 
 /// Refresh an existing cache: fetch + prune, re-resolve the remote's default
@@ -629,7 +708,8 @@ pub struct CachedBranches {
 }
 
 /// List branches from the cached clone at `<cache_root>/<owner>/<repo>`
-/// without touching the network. A cache miss (missing dir or an unopenable
+/// (case-folded, see [`cache_path_for`]) without touching the network. A
+/// cache miss (missing dir or an unopenable
 /// repo) is a graceful `Ok(None)`, never an error. Briefly holds the
 /// per-repo cache lock so a concurrent [`ensure_cached_repo`] refresh or
 /// re-clone is never observed mid-mutation — but only via `try_lock`: when
@@ -641,8 +721,8 @@ pub struct CachedBranches {
 /// trustworthy) folds to the same graceful miss — a deliberate trade-off
 /// favoring promptness over a hit during that briefer window.
 ///
-/// The cache is keyed by `<owner>/<repo>` segments only, while creation
-/// accepts GitHub-style URLs from any host and treats same-named origins as
+/// The cache is keyed by the case-folded `<owner>/<repo>` segments only, while
+/// creation accepts GitHub-style URLs from any host and treats same-named origins as
 /// distinct (see [`ensure_cached_repo`]'s origin check). This GitHub-scoped
 /// reader therefore verifies the slot's `origin` actually points at
 /// `github.com/<owner>/<repo>`; a slot occupied by another host's clone (or
@@ -658,7 +738,7 @@ pub async fn list_cached_branches(
 ) -> Result<Option<CachedBranches>> {
     validate_segment("owner", owner)?;
     validate_segment("repo", repo)?;
-    let cache_path = cache_root.join(owner).join(repo);
+    let cache_path = cache_path_for(cache_root, owner, repo);
 
     let lock = lock_for(&cache_path);
     let Ok(_guard) = lock.try_lock() else {
@@ -1643,6 +1723,78 @@ mod tests {
         assert_eq!(head_sha(&path), head_sha(origin.path()));
     }
 
+    /// Case-variant slugs of one repository resolve to ONE folded slot: the
+    /// second ensure lands on the same path and refreshes (marker survives)
+    /// instead of cloning a parallel `<Owner>/<Repo>` copy.
+    #[tokio::test]
+    async fn case_variant_slugs_share_one_cache_slot() {
+        let origin = init_repo("repocache-origin-casefold");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("casefold");
+        let url = file_url(origin.path());
+
+        let path = ensure_cached_repo(root.path(), &url, "Intent-HQ", "IntentD", None)
+            .await
+            .unwrap();
+        assert_eq!(path, root.path().join("intent-hq").join("intentd"));
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        forget_fresh(&path);
+        let path2 = ensure_cached_repo(root.path(), &url, "intent-hq", "intentd", None)
+            .await
+            .unwrap();
+
+        assert_eq!(path, path2);
+        assert!(marker.exists(), "case-variant slug must not clone twice");
+        assert!(
+            !root.path().join("Intent-HQ").exists(),
+            "no raw-cased slot may be created"
+        );
+    }
+
+    /// A slot populated before the key was folded (`<Owner>/<Repo>` on a
+    /// case-sensitive filesystem) is adopted by rename on the next ensure —
+    /// the clone is reused (marker survives), not re-cloned, and the vacated
+    /// owner dir is pruned.
+    #[tokio::test]
+    async fn preexisting_case_variant_slot_is_adopted_by_rename() {
+        let origin = init_repo("repocache-origin-adopt");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("adopt");
+        let url = file_url(origin.path());
+
+        let folded = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let marker = folded.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        // Move the slot to a raw-cased location, as a pre-fold cache would sit.
+        let legacy_owner = root.path().join("Acme");
+        std::fs::rename(root.path().join("acme"), &legacy_owner).unwrap();
+        std::fs::rename(legacy_owner.join("widget"), legacy_owner.join("Widget")).unwrap();
+        let case_sensitive_fs = !folded.exists();
+
+        forget_fresh(&folded);
+        let path = ensure_cached_repo(root.path(), &url, "Acme", "Widget", None)
+            .await
+            .unwrap();
+
+        assert_eq!(path, folded);
+        assert!(
+            marker.exists(),
+            "adoption must reuse the clone, not re-clone"
+        );
+        assert_eq!(head_sha(&path), head_sha(origin.path()));
+        if case_sensitive_fs {
+            assert!(
+                !legacy_owner.exists(),
+                "vacated raw-cased owner dir must be pruned"
+            );
+        }
+    }
+
     /// A cache that diverged from origin (local commit) is clobbered back to
     /// the origin tip by the refresh's hard reset — still no re-clone.
     #[tokio::test]
@@ -2109,8 +2261,9 @@ mod tests {
     }
 
     /// [`origin_is_github_slot`] URL-form coverage: HTTPS/SSH/scp-like
-    /// github.com origins for the slug match (case-insensitively, `.git`
-    /// optional); other hosts, schemes, slugs, and path shapes do not.
+    /// github.com origins for the slug match (case-insensitively on both the
+    /// URL and the requested owner/repo, `.git` optional); other hosts,
+    /// schemes, slugs, and path shapes do not.
     #[test]
     fn origin_is_github_slot_recognizes_github_urls() {
         for url in [
@@ -2124,6 +2277,7 @@ mod tests {
             "git@github.com:acme/widget.git",
         ] {
             assert!(origin_is_github_slot(url, "acme", "widget"), "{url}");
+            assert!(origin_is_github_slot(url, "ACME", "Widget"), "{url}");
         }
         for url in [
             "https://gitlab.com/acme/widget.git",
