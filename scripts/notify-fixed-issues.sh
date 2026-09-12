@@ -260,20 +260,22 @@ while IFS= read -r n; do
     failed=1
     continue
   fi
-  if [[ "$(head -n1 <<<"$linked")" != "CLOSED" ]]; then
-    echo "issue #$n: issue is still open; staying silent" >&2
-    skipped=$((skipped + 1))
-    continue
-  fi
-  linked=$(tail -n +2 <<<"$linked")
+  issue_state=$(sed -n '1p' <<<"$linked")
+  has_next=$(sed -n '2p' <<<"$linked")
+  linked=$(tail -n +3 <<<"$linked")
   # A truncated connection (>100 linked PRs) could hide an open or
-  # unreleased SOURCE_REPO PR beyond the first page: indeterminate => skip.
-  if [[ "$(head -n1 <<<"$linked")" != "false" ]]; then
+  # unreleased SOURCE_REPO PR beyond the first page: indeterminate => skip,
+  # whatever the issue state.
+  if [[ "$has_next" != "false" ]]; then
     echo "warning: issue #$n: more than 100 linked PRs (result truncated); completeness indeterminate, skipping" >&2
     failed=1
     continue
   fi
-  linked=$(tail -n +2 <<<"$linked")
+  if [[ "$issue_state" != "CLOSED" ]]; then
+    echo "issue #$n: issue is still open; staying silent" >&2
+    skipped=$((skipped + 1))
+    continue
+  fi
   incomplete=""
   delivered=false
   while read -r pr state oid; do
