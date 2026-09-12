@@ -9012,8 +9012,9 @@ async fn persist_merged_content(
 /// Returns a [`ReanchorPlan`]: the possibly-rewritten markdown plus the set
 /// of comments whose `is_orphaned` flag needs to be flipped to `true`.
 /// Already-orphaned comments are left as-is. The plan does **no** store
-/// writes — callers apply the note-content change first via `update_note`
-/// and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
+/// writes — callers first persist the note-content change via an atomic
+/// versioned write (`persist_note_content` / the `*_with_version` store
+/// helpers) and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
 /// cannot leave comment rows flagged orphaned while the persisted markdown
 /// still contains the original anchors.
 ///
@@ -11488,7 +11489,7 @@ impl Services {
     /// `in_progress` → `[/]`, else `[ ]`. Notes whose linked lines already
     /// carry the marker are left untouched (no write, no event); each
     /// rewritten note takes a `note:updated` and — like every other surgical
-    /// content mutation — drops its cached CRDT session and schedules its
+    /// content mutation — schedules its
     /// line-attribution recompute. Every parent write is versioned against a
     /// fresh read (retried on conflict), so a concurrent status write on a
     /// sibling task or an editor save landing in the window is never reverted.
@@ -22433,8 +22434,8 @@ impl WorkspaceApi for Services {
                 // write goes to the task (events, ready-task recompute) and
                 // the char follows via materialization — which also heals a
                 // line that had drifted from the task's status.
-                // Materialization invalidates the CRDT session and schedules
-                // the attribution recompute of every parent it rewrites.
+                // Materialization schedules the attribution recompute of
+                // every parent it rewrites.
                 match redirected_task_status(&status, current) {
                     Some(next) => {
                         services

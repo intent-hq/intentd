@@ -861,7 +861,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `note.add`: append/prepend/insert content (PROTOCOL §5.2).
     ///
-    /// Like every client content write, the transform runs against the row
+    /// The transform runs against the row
     /// the op read and persists through the read-merge-persist loop described
     /// on [`WorkspaceApi::set_note_content`], gated on that read's `rev`: a
     /// write that lands in between is merged into rather than overwritten.
