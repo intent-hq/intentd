@@ -277,11 +277,21 @@ async fn batch_window_coalesces_matched_events() {
             .await
             .expect("publish");
     }
-    // Let the delivery task drain the broadcast so all three events sit in
-    // its buffer behind the one deadline armed by the first of them.
-    for _ in 0..4 {
+    // Wait until the delivery task has read every broadcast: a value stays
+    // queued until each live receiver has taken it, and the task buffers a
+    // matched event and arms the deadline in the same poll that receives it,
+    // so an empty queue means all three sit behind the one deadline.
+    for _ in 0..1_000 {
+        if bus.undelivered_broadcasts() == 0 {
+            break;
+        }
         tokio::task::yield_now().await;
     }
+    assert_eq!(
+        bus.undelivered_broadcasts(),
+        0,
+        "delivery task did not drain the broadcast"
+    );
 
     // Pause only now, after every publish (real SQLite I/O) has resolved: a
     // paused runtime auto-advances to the next pending timer whenever it goes

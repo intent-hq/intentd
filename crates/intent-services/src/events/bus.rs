@@ -129,6 +129,12 @@ impl EventBus {
         self.tx.receiver_count()
     }
 
+    /// Broadcast values not yet read by every live subscriber's delivery task.
+    #[cfg(test)]
+    pub(super) fn undelivered_broadcasts(&self) -> usize {
+        self.tx.len()
+    }
+
     /// Append `ev` to the durable log, then broadcast the persisted event to
     /// live subscribers. Round-trips through the writer task that coalesces
     /// high-volume inserts into batched transactions. Returns an error if the
