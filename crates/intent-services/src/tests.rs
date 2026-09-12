@@ -31632,7 +31632,8 @@ mod browser_routing {
     /// Register an open tab of `ws` on `host`, owned by `owner` when given.
     /// Both the workspace and the host client are foreign keys of the row,
     /// so they are created on demand (`setup` already knows `desktop-a` /
-    /// `desktop-b` and the primary workspace).
+    /// `desktop-b` and the primary workspace). User tabs report
+    /// `displayed: true`, agent tabs `false` (hidden).
     async fn register_tab(
         svc: &Services,
         ws: &WorkspaceId,
@@ -31668,6 +31669,7 @@ mod browser_routing {
                 "ownerAgentId": owner,
                 "visibility": "hidden",
                 "emulatedSize": owner.map(|_| json!({ "width": 1280, "height": 800 })),
+                "displayed": owner.is_none(),
             }))
             .unwrap(),
         )
@@ -31772,13 +31774,14 @@ mod browser_routing {
             json!({
                 "tabId": "t-user", "workspaceId": ws.0, "url": "https://t-user.test/",
                 "title": "t-user", "ownerAgentId": null, "mode": "native",
-                "visibility": "hidden", "hostClientId": "desktop-a",
+                "visibility": "hidden", "displayed": true, "hostClientId": "desktop-a",
                 "hostName": "Desktop A", "hostConnected": true
             })
         );
         assert_eq!(tabs[1]["ownerAgentId"], "agent-1");
         assert_eq!(tabs[1]["mode"], "emulated");
         assert_eq!(tabs[1]["width"], 1280);
+        assert_eq!(tabs[1]["displayed"], false);
         assert_eq!(tabs[1]["hostClientId"], "desktop-b");
         assert_eq!(tabs[1]["hostConnected"], false, "desktop-b is not live");
         assert!(tabs[1].get("hostName").is_none());
@@ -31862,6 +31865,68 @@ mod browser_routing {
             .await
             .expect("known envelope tab");
         assert_eq!(scoped["success"], true);
+    }
+
+    /// intent-hq/intent#4835: `displayed` rides the registry-answered
+    /// `listTabs` entry exactly as the host last reported it — a host that
+    /// never reported it yields no key (never a default `false`), and a
+    /// later report flipping it is diffed into `browser:tab-updated {
+    /// changes: { displayed } }` and reflected on the next list.
+    #[tokio::test]
+    async fn list_tabs_carries_displayed_as_reported() {
+        let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
+        let (_t, _r, svc, bus, ws) = setup(reg).await;
+        let host = ClientId::from_string("desktop-a");
+        let report = |displayed: Option<bool>| -> intent_core::BrowserTabInput {
+            serde_json::from_value(json!({
+                "tabId": "t-legacy",
+                "workspaceId": ws.0,
+                "url": "https://t-legacy.test/",
+                "visibility": "visible",
+                "displayed": displayed,
+            }))
+            .unwrap()
+        };
+        svc.browser_upsert_tab(host.clone(), report(None))
+            .await
+            .expect("registered without displayed");
+        let list = || {
+            svc.browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+        };
+        let out = list().await.expect("list");
+        assert_eq!(out["result"][0]["tabId"], "t-legacy");
+        assert!(
+            out["result"][0].get("displayed").is_none(),
+            "never reported ⇒ omitted, not false: {}",
+            out["result"][0]
+        );
+
+        let events = tokio::spawn({
+            let bus = bus.clone();
+            let ws = ws.clone();
+            async move { tab_events(&bus, &ws, 1).await }
+        });
+        tokio::task::yield_now().await;
+        let updated = svc
+            .browser_upsert_tab(host.clone(), report(Some(true)))
+            .await
+            .expect("re-reported with displayed");
+        assert_eq!(updated.displayed, Some(true));
+        let evs = events.await.unwrap();
+        assert_eq!(evs[0]["type"], "browser:tab-updated");
+        assert_eq!(evs[0]["data"]["changes"], json!({ "displayed": true }));
+        assert_eq!(evs[0]["data"]["tab"]["displayed"], true);
+        assert_eq!(list().await.unwrap()["result"][0]["displayed"], true);
+
+        svc.browser_upsert_tab(host, report(Some(false)))
+            .await
+            .expect("flipped displayed");
+        assert_eq!(list().await.unwrap()["result"][0]["displayed"], false);
     }
 
     /// Model 5: a `claimTab` the driving client executed on a tab another

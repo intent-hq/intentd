@@ -81,7 +81,7 @@ fn test_workspace(ws_id: &WorkspaceId, ts: &str) -> Workspace {
 }
 
 struct Fixture {
-    _tmp: TempDb,
+    tmp: TempDb,
     store: Store,
     ws: WorkspaceId,
     host_a: ClientId,
@@ -111,7 +111,7 @@ async fn fixture() -> Fixture {
             .expect("upsert client");
     }
     Fixture {
-        _tmp: tmp,
+        tmp,
         store,
         ws,
         host_a,
@@ -130,7 +130,99 @@ fn input(ws: &WorkspaceId, tab_id: &str, url: &str) -> BrowserTabInput {
         owner_agent_name: None,
         visibility: BrowserTabVisibility::Visible,
         emulated_size: None,
+        displayed: None,
     }
+}
+
+/// `displayed` (intent-hq/intent#4835) is a process-local overlay, not a
+/// column: a report carrying it is diffed / applied / read back like any
+/// host field, an identical report is still a no-op, a report omitting it
+/// clears it (`changes.displayed: null`), and a fresh `Store` over the same
+/// database reads `None` until the host re-reports — the value never
+/// outlives the daemon process that heard it.
+#[tokio::test]
+async fn displayed_is_diffed_and_overlaid_without_persisting() {
+    let f = fixture().await;
+    let mut shown = input(&f.ws, "tab-1", "https://a.test/");
+    shown.displayed = Some(true);
+    let opened = f
+        .store
+        .upsert_browser_tab(&f.host_a, shown.clone())
+        .await
+        .unwrap();
+    assert_eq!(opened.tab().displayed, Some(true));
+    let listed = f.store.list_browser_tabs(&f.ws).await.unwrap();
+    assert_eq!(listed[0].displayed, Some(true), "list reads the overlay");
+    assert!(
+        matches!(
+            f.store.upsert_browser_tab(&f.host_a, shown).await.unwrap(),
+            BrowserTabUpsertOutcome::Unchanged(_)
+        ),
+        "identical displayed is a no-op"
+    );
+
+    let mut behind = input(&f.ws, "tab-1", "https://a.test/");
+    behind.displayed = Some(false);
+    let BrowserTabUpsertOutcome::Updated { tab, changes } =
+        f.store.upsert_browser_tab(&f.host_a, behind).await.unwrap()
+    else {
+        panic!("a flipped displayed updates");
+    };
+    assert_eq!(changes, json!({ "displayed": false }));
+    assert_eq!(tab.displayed, Some(false));
+    assert_eq!(
+        f.store
+            .get_browser_tab("tab-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .displayed,
+        Some(false)
+    );
+
+    // Sync refreshes the overlay too; a report without the field clears it.
+    let result = f
+        .store
+        .sync_browser_tabs(&f.host_a, vec![input(&f.ws, "tab-1", "https://a.test/")])
+        .await
+        .unwrap();
+    assert_eq!(result.updated.len(), 1);
+    assert_eq!(result.updated[0].1, json!({ "displayed": null }));
+    assert_eq!(result.updated[0].0.displayed, None);
+    assert_eq!(
+        f.store
+            .get_browser_tab("tab-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .displayed,
+        None
+    );
+    let mut shown = input(&f.ws, "tab-1", "https://a.test/");
+    shown.displayed = Some(true);
+    let result = f
+        .store
+        .sync_browser_tabs(&f.host_a, vec![shown])
+        .await
+        .unwrap();
+    assert_eq!(result.updated[0].1, json!({ "displayed": true }));
+
+    // A restart (a fresh Store over the same file) starts with no overlay;
+    // the row itself is untouched.
+    let reopened = Store::open(&f.tmp.path).await.expect("reopen store");
+    let tab = reopened.get_browser_tab("tab-1").await.unwrap().unwrap();
+    assert_eq!(tab.url, "https://a.test/");
+    assert_eq!(tab.displayed, None, "displayed is not persisted");
+    // The original store forgets the id with the row.
+    f.store
+        .remove_browser_tab(&f.host_a, "tab-1")
+        .await
+        .unwrap();
+    let mut fresh = input(&f.ws, "tab-1", "https://a.test/again");
+    fresh.displayed = None;
+    let reopened_row = f.store.upsert_browser_tab(&f.host_a, fresh).await.unwrap();
+    assert!(matches!(reopened_row, BrowserTabUpsertOutcome::Opened(_)));
+    assert_eq!(reopened_row.tab().displayed, None, "no stale overlay entry");
 }
 
 #[tokio::test]

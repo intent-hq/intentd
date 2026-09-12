@@ -4511,6 +4511,13 @@ pub struct BrowserTabSize {
 /// `url` / `title`; every other client is a viewer. `tab_id` is minted by the
 /// host and unique per daemon. Panel geometry is client-local and never
 /// stored.
+///
+/// `displayed` is the host-reported **layout fact** of the hidden-by-default
+/// contract (§5.9, monorepo#3045): `true` when the tab is not hidden AND is
+/// the active tab of the panel holding it in the workspace's saved layout.
+/// `None` means the host has never reported it (a pre-`displayed` host, or
+/// no report yet since the daemon started — see the store's process-local
+/// overlay); it is never `false` by default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserTab {
@@ -4530,6 +4537,8 @@ pub struct BrowserTab {
     pub visibility: BrowserTabVisibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emulated_size: Option<BrowserTabSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed: Option<bool>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -4590,6 +4599,9 @@ impl BrowserTab {
                 serde_json::json!(input.emulated_size),
             );
         }
+        if self.displayed != input.displayed {
+            changes.insert("displayed".to_string(), serde_json::json!(input.displayed));
+        }
         changes
     }
 
@@ -4606,6 +4618,7 @@ impl BrowserTab {
             owner_agent_name,
             visibility,
             emulated_size,
+            displayed,
         } = input;
         self.workspace_id = workspace_id;
         self.url = url;
@@ -4615,6 +4628,7 @@ impl BrowserTab {
         self.owner_agent_name = owner_agent_name;
         self.visibility = visibility;
         self.emulated_size = emulated_size;
+        self.displayed = displayed;
     }
 }
 
@@ -4640,6 +4654,10 @@ pub struct BrowserTabInput {
     pub visibility: BrowserTabVisibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emulated_size: Option<BrowserTabSize>,
+    /// Layout fact (see [`BrowserTab::displayed`]); omitted / `null` when
+    /// the host does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed: Option<bool>,
 }
 
 /// Outcome of a host-reported `browser.upsertTab`: the persisted row plus
