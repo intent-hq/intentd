@@ -1140,6 +1140,140 @@ async fn pr_monitor_cancel_removes_the_row_and_notifies_the_owner_over_wss() {
     assert_eq!(resp["error"]["code"], -32602, "error envelope: {resp}");
 }
 
+/// One monitor per PR per workspace (PROTOCOL §5.42): a second agent's
+/// `ws.pr.monitor` on a PR another agent in the same workspace already
+/// watches is REFUSED with the structured `ok: false` payload naming the
+/// owner — no forge fetch, no row, no `prMonitor:registered` event — and
+/// `prMonitor.list` over the wire stays single. After the owner's own
+/// `ws.pr.unmonitor`, the second agent registers normally and the list
+/// carries its row instead.
+#[tokio::test]
+async fn a_duplicate_monitor_is_refused_and_the_workspace_list_stays_single_over_wss() {
+    let fx = boot().await;
+    let second_id = AgentId::from("agent-prmon-second");
+    fx.services
+        .store()
+        .insert_agent_session(&agent_session(&fx.ws_id, second_id.as_str()))
+        .await
+        .expect("seed second agent");
+    let api: Arc<dyn WorkspaceApi> = fx.services.clone();
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["prMonitor:registered", "prMonitor:cancelled"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Agent A registers through the `ws.pr.monitor` binding's entry point.
+    let started = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("owner registers");
+    assert_eq!(started["ok"], json!(true), "{started}");
+    assert_eq!(started["monitor"]["agentId"], fx.agent_id.as_str());
+    assert_eq!(started["requirements"]["state"], "open");
+    let owner_monitor_id = started["monitor"]["monitorId"]
+        .as_str()
+        .expect("owner monitorId")
+        .to_string();
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], owner_monitor_id);
+
+    // Agent B's registration on the same PR is a refusal payload, not an
+    // error: it names the owner and its monitor, and carries no `monitor`
+    // or `requirements`.
+    let fetches_before = fx.forge.fetches();
+    let refused = api
+        .pr_monitor_start(fx.ws_id.clone(), second_id.clone(), 42, None)
+        .await
+        .expect("a refusal is a payload, not an error");
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(refused["refused"], json!(true), "{refused}");
+    assert_eq!(refused["reason"], json!("already-monitored"), "{refused}");
+    assert_eq!(refused["repo"], json!("o/r"), "{refused}");
+    assert_eq!(refused["prNumber"], json!(42), "{refused}");
+    assert_eq!(refused["ownerAgentId"], fx.agent_id.as_str(), "{refused}");
+    assert_eq!(refused["ownerAgentName"], json!("Owner"), "{refused}");
+    assert_eq!(refused["monitorId"], owner_monitor_id, "{refused}");
+    let instruction = refused["instruction"].as_str().expect("instruction");
+    assert!(instruction.contains("o/r#42"), "{instruction}");
+    assert!(instruction.contains("ws.agent.send"), "{instruction}");
+    assert!(instruction.contains("ws.pr.unmonitor"), "{instruction}");
+    assert!(instruction.contains("ws.pr.snapshot"), "{instruction}");
+    assert!(refused.get("monitor").is_none(), "{refused}");
+    assert!(refused.get("requirements").is_none(), "{refused}");
+    assert_eq!(
+        fx.forge.fetches(),
+        fetches_before,
+        "the refusal is decided before the forge fetch"
+    );
+    assert_no_event(&mut sub, "prMonitor:registered").await;
+
+    // The workspace-wide list over the wire stays single and owned by A.
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let rows = listed["monitors"].as_array().expect("monitors array");
+    assert_eq!(rows.len(), 1, "one monitor: {listed}");
+    assert_eq!(rows[0]["monitorId"], owner_monitor_id);
+    assert_eq!(rows[0]["agentId"], fx.agent_id.as_str());
+    assert_eq!(rows[0]["state"], "active");
+
+    // A relinquishes via `ws.pr.unmonitor`; B now registers normally.
+    let stopped = api
+        .pr_monitor_stop(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("owner unmonitors");
+    assert_eq!(stopped["ok"], json!(true), "{stopped}");
+    assert_eq!(stopped["monitor"]["monitorId"], owner_monitor_id);
+    assert_eq!(stopped["monitor"]["state"], "cancelled");
+    let evt = next_event(&mut sub, "prMonitor:cancelled").await;
+    assert_eq!(evt["data"]["monitorId"], owner_monitor_id);
+
+    let taken = api
+        .pr_monitor_start(fx.ws_id.clone(), second_id.clone(), 42, None)
+        .await
+        .expect("second agent registers after the cancel");
+    assert_eq!(taken["ok"], json!(true), "{taken}");
+    assert_eq!(taken["monitor"]["agentId"], second_id.as_str());
+    assert_eq!(taken["requirements"]["state"], "open");
+    let second_monitor_id = taken["monitor"]["monitorId"]
+        .as_str()
+        .expect("second monitorId")
+        .to_string();
+    assert_ne!(
+        second_monitor_id, owner_monitor_id,
+        "a fresh row, not a re-arm"
+    );
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], second_monitor_id);
+
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let rows = listed["monitors"].as_array().expect("monitors array");
+    assert_eq!(rows.len(), 1, "still one monitor: {listed}");
+    assert_eq!(rows[0]["monitorId"], second_monitor_id);
+    assert_eq!(rows[0]["agentId"], second_id.as_str());
+    assert_eq!(rows[0]["state"], "active");
+}
+
 /// A merged PR terminalizes the monitor: `prMonitor:completed` fires, the
 /// owner is woken immediately, and the `completed` row STAYS visible in
 /// `prMonitor.list` so merged PRs remain in the UI's list. The wake's
