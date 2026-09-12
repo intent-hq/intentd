@@ -11,7 +11,11 @@
 //!
 //! - Skipped: `crates/intent-core/src/repo_ref.rs`, any file named `tests.rs`
 //!   or under a `tests/` directory, and any `#[cfg(test)]` item (brace depth
-//!   is tracked from the attribute to the end of the following item).
+//!   is tracked from the attribute to the end of the following item). The
+//!   attribute is matched as the token sequence `# [ cfg ( test ) ]` with any
+//!   whitespace between tokens, after comments are blanked — so `#[cfg( test )]`
+//!   and `#[cfg(/* c */ test)]` are skipped, while `#[cfg(not(test))]` and
+//!   `#[cfg(all(test, …))]` are scanned like ordinary code.
 //! - String literals and comments are blanked first, so `"github.com"` and doc
 //!   comments never count. A "statement" is the text between `;` / `{` / `}`
 //!   boundaries.
@@ -21,7 +25,13 @@
 //!   component equal to `owner`, `repo`, `repository`, or `slug`, or the bare
 //!   token `name` when the same statement also carries an `owner` component.
 //! - Opt-out: `// repo-slug-fold: allow — <reason>` on the line immediately
-//!   above the statement's first line; the reason is required.
+//!   above the statement's first line. The marker counts only as a standalone
+//!   `//` line comment (nothing but whitespace before it, not inside a
+//!   `/* … */` block comment or a string literal, not trailing code), the
+//!   token must be exactly `repo-slug-fold: allow` (a longer word such as
+//!   `allowance` is malformed), and it must be followed by whitespace, an em
+//!   dash or hyphen, and a nonempty reason. A malformed marker never
+//!   suppresses the hit; the report says so.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -42,15 +52,16 @@ const EXCERPT_CHARS: usize = 120;
 struct Hit {
     line: usize,
     excerpt: String,
-    /// The line above carried the opt-out marker but no reason.
-    marker_without_reason: bool,
+    /// The line above carried something that starts like the opt-out marker
+    /// but is malformed (longer token, or no reason).
+    marker_malformed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Marker {
     Absent,
     WithReason,
-    WithoutReason,
+    Malformed,
 }
 
 /// A real `//` line comment found by the lexer (never one nested inside a
@@ -69,9 +80,11 @@ struct Stripped {
     line_comments: Vec<LineComment>,
 }
 
-/// Marker state of one line comment's text: `Absent` unless the comment is
-/// exactly the marker token (not a longer word such as `allowance`),
-/// optionally followed by a separator and reason.
+/// Marker state of one line comment's text: `Absent` unless it starts with
+/// the marker prefix; `WithReason` only when the token is exactly the marker
+/// (not a longer word such as `allowance`) followed by whitespace, a dash,
+/// and a nonempty reason; anything else that starts like the marker is
+/// `Malformed`.
 fn classify_marker(comment: &str) -> Marker {
     let Some(rest) = comment.strip_prefix(OPT_OUT_MARKER) else {
         return Marker::Absent;
@@ -81,11 +94,20 @@ fn classify_marker(comment: &str) -> Marker {
         .next()
         .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
     {
-        return Marker::Absent;
+        return Marker::Malformed;
     }
-    let reason = rest.trim().trim_start_matches(['—', '-', ':']).trim();
-    if reason.is_empty() {
-        Marker::WithoutReason
+    let after_space = rest.trim_start();
+    if after_space.len() == rest.len() && !rest.is_empty() {
+        return Marker::Malformed;
+    }
+    let Some(reason) = after_space
+        .strip_prefix('—')
+        .or_else(|| after_space.strip_prefix('-'))
+    else {
+        return Marker::Malformed;
+    };
+    if reason.trim().is_empty() {
+        Marker::Malformed
     } else {
         Marker::WithReason
     }
@@ -413,10 +435,10 @@ fn scan_source(src: &str) -> Vec<Hit> {
             let marker = markers.get(s.line - 1).copied().unwrap_or(Marker::Absent);
             match marker {
                 Marker::WithReason => None,
-                Marker::WithoutReason | Marker::Absent => Some(Hit {
+                Marker::Malformed | Marker::Absent => Some(Hit {
                     line: s.line,
                     excerpt: excerpt(&s.text),
-                    marker_without_reason: marker == Marker::WithoutReason,
+                    marker_malformed: marker == Marker::Malformed,
                 }),
             }
         })
@@ -494,8 +516,8 @@ fn slug_identity_is_only_folded_inside_repo_ref() {
         let src =
             fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
         for hit in scan_source(&src) {
-            let note = if hit.marker_without_reason {
-                "  (opt-out marker present but its reason is empty)"
+            let note = if hit.marker_malformed {
+                "  (opt-out marker is malformed: expected `// repo-slug-fold: allow — <reason>`)"
             } else {
                 ""
             };
@@ -666,7 +688,7 @@ fn flags_pre_31dc6cc7_lookup_known_repo_local_path() {
     );
     let hits = scan_source(src);
     assert!(hits[0].excerpt.contains("repository_owner"), "{hits:?}");
-    assert!(hits.iter().all(|h| !h.marker_without_reason), "{hits:?}");
+    assert!(hits.iter().all(|h| !h.marker_malformed), "{hits:?}");
 }
 
 #[test]
@@ -761,14 +783,35 @@ pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
 
 #[test]
 fn opt_out_marker_without_a_reason_still_fails() {
-    for marker in ["// repo-slug-fold: allow", "// repo-slug-fold: allow —"] {
+    for marker in [
+        "// repo-slug-fold: allow",
+        "// repo-slug-fold: allow —",
+        "// repo-slug-fold: allow -",
+        "// repo-slug-fold: allow —   ",
+        "// repo-slug-fold: allow reason without a dash",
+        "// repo-slug-fold: allow—no space before the dash",
+    ] {
         let src = format!(
             "fn slugify(repo_name: &str) -> String {{\n    {marker}\n    repo_name.to_lowercase()\n}}\n"
         );
         let hits = scan_source(&src);
         assert_eq!(hits.len(), 1, "{marker:?}: {hits:?}");
         assert_eq!(hits[0].line, 3, "{marker:?}");
-        assert!(hits[0].marker_without_reason, "{marker:?}");
+        assert!(hits[0].marker_malformed, "{marker:?}");
+    }
+}
+
+#[test]
+fn opt_out_marker_accepts_an_em_dash_or_a_hyphen() {
+    for marker in [
+        "// repo-slug-fold: allow — reason",
+        "// repo-slug-fold: allow - reason",
+        "// repo-slug-fold: allow   —   reason",
+    ] {
+        let src = format!(
+            "fn slugify(repo_name: &str) -> String {{\n    {marker}\n    repo_name.to_lowercase()\n}}\n"
+        );
+        assert_eq!(hit_lines(&src), Vec::<usize>::new(), "{marker:?}");
     }
 }
 
@@ -777,7 +820,7 @@ fn opt_out_marker_must_sit_immediately_above_the_statement() {
     let src = "fn slugify(repo_name: &str) -> String {\n    // repo-slug-fold: allow — reason\n\n    repo_name.to_lowercase()\n}\n";
     let hits = scan_source(src);
     assert_eq!(hit_lines(src), vec![4]);
-    assert!(!hits[0].marker_without_reason);
+    assert!(!hits[0].marker_malformed);
 }
 
 #[test]
@@ -786,7 +829,7 @@ fn opt_out_marker_counts_only_as_a_standalone_line_comment() {
     let in_block = "fn slugify(repo_name: &str) -> String {\n    /*\n    // repo-slug-fold: allow — example */\n    repo_name.to_lowercase()\n}\n";
     let hits = scan_source(in_block);
     assert_eq!(hit_lines(in_block), vec![4], "{hits:?}");
-    assert!(!hits[0].marker_without_reason);
+    assert!(!hits[0].marker_malformed);
 
     // Inside a string literal that spans lines.
     let in_string = "fn slugify(repo_name: &str) -> String {\n    let _doc = \"\n    // repo-slug-fold: allow — example\";\n    repo_name.to_lowercase()\n}\n";
@@ -796,7 +839,7 @@ fn opt_out_marker_counts_only_as_a_standalone_line_comment() {
     let trailing = "fn slugify(repo_name: &str) -> String {\n    let _n = 1; // repo-slug-fold: allow — example\n    repo_name.to_lowercase()\n}\n";
     let hits = scan_source(trailing);
     assert_eq!(hit_lines(trailing), vec![3], "{hits:?}");
-    assert!(!hits[0].marker_without_reason);
+    assert!(!hits[0].marker_malformed);
 }
 
 #[test]
@@ -811,7 +854,7 @@ fn opt_out_marker_must_match_the_whole_token() {
         );
         let hits = scan_source(&src);
         assert_eq!(hit_lines(&src), vec![3], "{marker:?}: {hits:?}");
-        assert!(!hits[0].marker_without_reason, "{marker:?}");
+        assert!(hits[0].marker_malformed, "{marker:?}");
     }
 }
 
@@ -820,6 +863,11 @@ fn cfg_test_attribute_matches_across_comments_and_whitespace() {
     let src = r"
 #[cfg(/* tests only */ test)]
 fn helper(owner: &str) -> String {
+    owner.to_ascii_lowercase()
+}
+
+#[cfg( test )]
+fn spaced(owner: &str) -> String {
     owner.to_ascii_lowercase()
 }
 
