@@ -39,18 +39,22 @@
 # error/timeout instead of connected/running) were originally attributed to
 # full-suite parallel load, but the deterministic cause was the daemon's
 # login-shell PATH capture (`$SHELL -ilc …` at boot): started in a background
-# process group of a PTY-backed local gate, the interactive shell stopped its
-# whole process group via tty job control (SIGTTIN), freezing the daemon and
-# the node mock-MCP fixture sharing its group until the probe timed out.
-# Fixed in intentd#1808 by detaching the capture from the controlling tty
-# (setsid); e2e_pty_job_control is the regression guard for that hazard class
-# and runs isolated with the other daemon-spawning binaries because it boots a
-# real daemon inside a PTY. Isolation is KEPT for the MCP binaries as load
-# protection: each test spawns a real daemon plus node mock-MCP fixtures, and
-# the daemon-side HTTP probe runs against hardcoded production handshake/probe
-# timeouts (10s/15s, mcp_servers.rs) with no test seam, so under full-suite
-# parallel load the localhost fixture/daemon can still starve past those
-# bounds.
+# process group of a PTY-backed local gate, the interactive shell ran its
+# job-control init and signalled its whole process group — `kill(0, SIGTTIN)`
+# — stopping every member with the default disposition. In a PTY-backed
+# nextest run that was the node mock-MCP fixtures (nextest ignores SIGTTIN
+# and the daemon inherits that, but node resets dispositions), so the daemon
+# kept running while every daemon->fixture request timed out and the probe
+# reported error instead of running. Fixed in intentd#1808 by detaching the
+# capture from the controlling tty (setsid); e2e_pty_job_control is the
+# regression guard for the hazard class (a default-disposition backgrounded
+# daemon stops too) and runs isolated with the other daemon-spawning binaries
+# because it boots a real daemon inside a PTY. Isolation is KEPT for the MCP
+# binaries as load protection: each test spawns a real daemon plus node
+# mock-MCP fixtures, and the daemon-side HTTP probe runs against hardcoded
+# production handshake/probe timeouts (10s/15s, mcp_servers.rs) with no test
+# seam, so under full-suite parallel load the localhost fixture/daemon can
+# still starve past those bounds.
 #
 # e2e_wss_pool_contention_stress also runs isolated: its tests assert
 # read-latency bounds (workspace.list / note.list mid-write-storm), which
