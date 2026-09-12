@@ -1030,22 +1030,17 @@ async fn import_workspace_notes(
         let note = note_from_legacy_file(workspace, &stem, &text, &path);
         match store.get_note(&workspace.id, &note.id).await {
             Ok(_) => counts.skipped += 1,
-            Err(Error::NotFound(_)) => match store.insert_note(&note).await {
-                Ok(()) => {
-                    counts.imported += 1;
-                    // Best-effort post-write snapshot so the imported rev is a
-                    // recoverable merge base; the note row already landed.
-                    if let Err(e) =
-                        intent_services::capture_system_note_version(store, &note, note.rev).await
-                    {
-                        tracing::warn!(path = %path.display(), note_id = %note.id, error = %e, "legacy note version snapshot failed");
+            // Row and initial snapshot commit together so the imported rev is
+            // a recoverable merge base from the instant the note is visible.
+            Err(Error::NotFound(_)) => {
+                match intent_services::persist_system_new_note(store, &note).await {
+                    Ok(_) => counts.imported += 1,
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), note_id = %note.id, error = %e, "legacy note insert failed");
+                        counts.failed += 1;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), note_id = %note.id, error = %e, "legacy note insert failed");
-                    counts.failed += 1;
-                }
-            },
+            }
             Err(e) => {
                 tracing::warn!(path = %path.display(), note_id = %note.id, error = %e, "legacy note lookup failed");
                 counts.failed += 1;

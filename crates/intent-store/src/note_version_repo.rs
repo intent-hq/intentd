@@ -112,6 +112,43 @@ impl Store {
         }
     }
 
+    /// Insert a note row and its initial version snapshot (at `note.rev`) in
+    /// ONE transaction, the insert-side counterpart of
+    /// [`Store::update_note_with_version`]: the row is never visible while
+    /// [`Store::get_note_version_content_by_rev`] cannot yet resolve its rev,
+    /// so a writer that reads the fresh note and later sends that rev as a
+    /// stale base always merges instead of degrading to last-writer-wins, and
+    /// the initial snapshot can never land after a later write's. Returns the
+    /// new version number.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if encoding fields or a statement fails (including a duplicate `(id, workspace_id)`).
+    pub async fn insert_note_with_version(
+        &self,
+        note: &Note,
+        author: &NoteVersionAuthor,
+        date: &str,
+    ) -> Result<i64> {
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
+
+        let result = async {
+            crate::note_repo::exec_insert_note(&mut *conn, note).await?;
+            insert_note_version(&mut conn, note, author, date, note.rev).await
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(conn, result, "commit note insert tx failed").await
+    }
+
     /// List a note's stored versions ascending by `v`, without content blobs
     /// (`content_length` is computed in SQL). Scoped by
     /// `(workspace_id, note_id)` (migration 0030 composite FK) so a same-id

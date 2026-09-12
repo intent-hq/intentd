@@ -8697,20 +8697,17 @@ async fn resolve_note_version_author(
     }
 }
 
-/// Append a full-snapshot version of `note`'s *current* (post-mutation) state,
-/// stamped with `author`, the note's `updated_at` and `rev` — the note's
-/// post-write `rev` as returned by the store write (or `note.rev` right after
-/// an insert), so the snapshot is the recoverable base for a writer that later
-/// sends that rev (PROTOCOL §5.2 version-history extensions). The store
-/// prunes to the newest 50 on append.
-async fn capture_note_version(
-    store: &Store,
-    note: &Note,
-    author: &NoteVersionAuthor,
-    rev: i64,
-) -> Result<i64> {
+/// Insert a new note row and its initial version snapshot (at `note.rev`,
+/// stamped with `author` and the note's `updated_at`) in one store transaction
+/// ([`Store::insert_note_with_version`]): the fresh row is never visible while
+/// its rev has no recoverable base, so a writer that reads the new note and
+/// later sends that rev as a stale base merges from the initial content
+/// instead of degrading to last-writer-wins (PROTOCOL §5.2 version-history
+/// extensions). Every note insert goes through here. Returns the version
+/// number.
+async fn persist_new_note(store: &Store, note: &Note, author: &NoteVersionAuthor) -> Result<i64> {
     store
-        .append_note_version(note, author, &note.updated_at, rev)
+        .insert_note_with_version(note, author, &note.updated_at)
         .await
 }
 
@@ -8719,9 +8716,9 @@ async fn capture_note_version(
 /// the snapshot that makes it a recoverable merge base become visible
 /// together, so no concurrent writer can read the new rev and resolve it to
 /// the previous content, and a snapshot can never land out of rev order.
-/// Every persisted content *update* goes through here; inserts snapshot via
-/// [`capture_note_version`] right after the row lands. Gated on
-/// `expected_version` when `Some` (`Conflict` on a mismatch, like
+/// Every persisted content *update* goes through here; inserts commit row and
+/// snapshot together via [`persist_new_note`]. Gated on `expected_version`
+/// when `Some` (`Conflict` on a mismatch, like
 /// [`Store::update_note_versioned`]). Returns the post-write `rev`.
 async fn persist_note_content(
     store: &Store,
@@ -8735,16 +8732,17 @@ async fn persist_note_content(
         .map(|(rev, _)| rev)
 }
 
-/// [`capture_note_version`] with the daemon-internal system author, for
-/// noninteractive note writes that live outside this crate (the `intentd`
+/// [`persist_new_note`] with the daemon-internal system author, for
+/// noninteractive note inserts that live outside this crate (the `intentd`
 /// importers). Imported notes are loaded by clients like any other, so their
-/// post-write `rev` must be a recoverable base too.
+/// initial `rev` must be a recoverable base too — the row and its snapshot
+/// commit together.
 ///
 /// # Errors
 ///
-/// Returns `Error::Internal` if the version append fails.
-pub async fn capture_system_note_version(store: &Store, note: &Note, rev: i64) -> Result<i64> {
-    capture_note_version(store, note, &system_version_author(), rev).await
+/// Returns `Error::Internal` if the insert or the version append fails.
+pub async fn persist_system_new_note(store: &Store, note: &Note) -> Result<i64> {
+    persist_new_note(store, note, &system_version_author()).await
 }
 
 /// [`persist_note_content`] with the daemon-internal system author and no
@@ -9516,9 +9514,8 @@ async fn ensure_spec_note(
         rev: 0,
         updated_at: now,
     };
-    store.insert_note(&note).await?;
     // Workspace-seed spec is daemon-internal; no caller agent applies.
-    capture_note_version(store, &note, &system_version_author(), note.rev).await?;
+    persist_new_note(store, &note, &system_version_author()).await?;
     publish_event(
         bus,
         note_change_event(
@@ -14104,9 +14101,8 @@ impl Services {
             rev: 0,
             updated_at: now,
         };
-        self.store.insert_note(&note).await?;
         let author = resolve_note_version_author(&self.store, caller_agent_id).await;
-        capture_note_version(&self.store, &note, &author, note.rev).await?;
+        persist_new_note(&self.store, &note, &author).await?;
         // Emit `note:created` so task-channel subscribers (spec UI) pick up
         // the new child task note live (TS parity: `createPrerequisiteNote`
         // routes through `createNote`, which emits `note:created`).
@@ -20579,30 +20575,14 @@ impl WorkspaceApi for Services {
                             rev: 0,
                             updated_at: now.clone(),
                         };
-                        match store.insert_note(&clone).await {
-                            Ok(()) => {
-                                if let Err(e) = capture_note_version(
-                                    &store,
-                                    &clone,
-                                    &system_version_author(),
-                                    clone.rev,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        workspace = %ws.id.as_str(),
-                                        error = %e,
-                                        "workspace.duplicate: failed to snapshot copied note"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    workspace = %ws.id.as_str(),
-                                    error = %e,
-                                    "workspace.duplicate: failed to copy note"
-                                );
-                            }
+                        if let Err(e) =
+                            persist_new_note(&store, &clone, &system_version_author()).await
+                        {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                error = %e,
+                                "workspace.duplicate: failed to copy note"
+                            );
                         }
                     }
                 }
@@ -21431,10 +21411,9 @@ impl WorkspaceApi for Services {
                         rev: 0,
                         updated_at: now,
                     };
-                    store.insert_note(&note).await?;
                     let author =
                         resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-                    capture_note_version(&store, &note, &author, note.rev).await?;
+                    persist_new_note(&store, &note, &author).await?;
                     services.schedule_line_attribution_recompute(
                         &note.workspace_id.clone(),
                         &note.id.clone(),

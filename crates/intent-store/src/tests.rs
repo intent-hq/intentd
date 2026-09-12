@@ -2416,6 +2416,63 @@ async fn update_note_with_version_is_atomic_and_gates_on_expected_version() {
     assert_eq!(newest_version(&store, &ws_id, &ghost.id).await, None);
 }
 
+/// `insert_note_with_version` commits the row and its initial snapshot
+/// atomically: the returned `v` matches the newest `note_version` row, the
+/// base lookup by `note.rev` yields the initial content, and a failed insert
+/// (duplicate `(id, workspace_id)`) leaves neither a row change nor a
+/// snapshot behind.
+#[tokio::test]
+async fn insert_note_with_version_commits_row_and_snapshot_together() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let mut note = task_note(&ws_id, "Note", None);
+    note.content = "base".to_string();
+    let author = version_author();
+    let ts = now_iso();
+
+    let v = store
+        .insert_note_with_version(&note, &author, &ts)
+        .await
+        .expect("atomic insert");
+    assert_eq!(v, 1);
+    let stored = store.get_note(&ws_id, &note.id).await.expect("get note");
+    assert_eq!((stored.rev, stored.content.as_str()), (0, "base"));
+    assert_eq!(
+        newest_version(&store, &ws_id, &note.id).await,
+        Some((0, "base".to_string()))
+    );
+    assert_eq!(
+        store
+            .get_note_version_content_by_rev(&ws_id, &note.id, 0)
+            .await
+            .expect("lookup"),
+        Some("base".to_string())
+    );
+
+    // Duplicate insert: the INSERT fails, so no second snapshot lands.
+    note.content = "dup".to_string();
+    assert!(store
+        .insert_note_with_version(&note, &author, &ts)
+        .await
+        .is_err());
+    let stored = store.get_note(&ws_id, &note.id).await.expect("get note");
+    assert_eq!((stored.rev, stored.content.as_str()), (0, "base"));
+    assert_eq!(
+        newest_version(&store, &ws_id, &note.id).await,
+        Some((0, "base".to_string()))
+    );
+    assert_eq!(
+        store.write_pool().size(),
+        1,
+        "connection returned to the pool"
+    );
+}
+
 /// Regression for monorepo#680 at the `update_note_with_comment` site: a
 /// `RAISE(ROLLBACK)` trigger on the note UPDATE fails the body *and*
 /// auto-rolls the transaction back, so the explicit ROLLBACK fails and the

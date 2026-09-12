@@ -263,9 +263,8 @@ async fn import_notes(store: &Store, dir: &Path, summary: &mut ImportSummary) {
 /// (updated). Note identity is composite (`(id, workspace_id)`, migration
 /// 0030), so the same `id` in different workspaces is a distinct row. Each
 /// persisted write snapshots the note at its post-write `rev` so the rev a
-/// client later loads is a recoverable merge base: an update commits row and
-/// snapshot in one transaction; an insert snapshots right after the row
-/// lands.
+/// client later loads is a recoverable merge base: both the update and the
+/// insert commit row and snapshot in one transaction.
 async fn upsert_note(store: &Store, note: &Note) -> anyhow::Result<bool> {
     match store.get_note(&note.workspace_id, &note.id).await {
         Ok(_) => {
@@ -273,19 +272,10 @@ async fn upsert_note(store: &Store, note: &Note) -> anyhow::Result<bool> {
             Ok(true)
         }
         Err(Error::NotFound(_)) => {
-            store.insert_note(note).await?;
-            snapshot_imported_note(store, note, note.rev).await;
+            intent_services::persist_system_new_note(store, note).await?;
             Ok(false)
         }
         Err(e) => Err(e.into()),
-    }
-}
-
-/// Best-effort post-write version snapshot for an imported note; a failure is
-/// logged and never fails the import (the note row itself already landed).
-async fn snapshot_imported_note(store: &Store, note: &Note, rev: i64) {
-    if let Err(e) = intent_services::capture_system_note_version(store, note, rev).await {
-        tracing::warn!(note_id = %note.id, rev, error = %e, "imported note version snapshot failed");
     }
 }
 

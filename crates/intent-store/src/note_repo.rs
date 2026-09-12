@@ -31,35 +31,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_note(&self, note: &Note) -> Result<()> {
-        let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
-        let task_json = note
-            .metadata
-            .task
-            .as_ref()
-            .map(encode_task_json)
-            .transpose()?;
-        let sql =
-            format!("INSERT INTO note ({NOTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-        sqlx::query(&sql)
-            .bind(&note.id.0)
-            .bind(&note.workspace_id.0)
-            .bind(&note.title)
-            .bind(&note.content)
-            .bind(enum_to_db(&note.content_type)?)
-            .bind(tags_to_db(&note.tags)?)
-            .bind(i64::from(note.is_pinned))
-            .bind(i64::from(note.is_archived))
-            .bind(i64::from(note.is_default))
-            .bind(parent_id)
-            .bind(enum_to_db(&note.visibility)?)
-            .bind(task_json)
-            .bind(&note.created_at)
-            .bind(note.rev)
-            .bind(&note.updated_at)
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("insert note failed: {e}")))?;
-        Ok(())
+        exec_insert_note(self.write_pool(), note).await
     }
 
     /// List notes in a workspace, ordered by creation time.
@@ -738,6 +710,43 @@ impl Store {
         })
         .await
     }
+}
+
+/// The one note INSERT statement, against any executor so it can ride an open
+/// transaction alongside the initial version snapshot
+/// ([`Store::insert_note_with_version`]).
+pub(crate) async fn exec_insert_note<'e, E>(executor: E, note: &Note) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
+    let task_json = note
+        .metadata
+        .task
+        .as_ref()
+        .map(encode_task_json)
+        .transpose()?;
+    let sql = format!("INSERT INTO note ({NOTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    sqlx::query(&sql)
+        .bind(&note.id.0)
+        .bind(&note.workspace_id.0)
+        .bind(&note.title)
+        .bind(&note.content)
+        .bind(enum_to_db(&note.content_type)?)
+        .bind(tags_to_db(&note.tags)?)
+        .bind(i64::from(note.is_pinned))
+        .bind(i64::from(note.is_archived))
+        .bind(i64::from(note.is_default))
+        .bind(parent_id)
+        .bind(enum_to_db(&note.visibility)?)
+        .bind(task_json)
+        .bind(&note.created_at)
+        .bind(note.rev)
+        .bind(&note.updated_at)
+        .execute(executor)
+        .await
+        .map_err(|e| Error::Internal(format!("insert note failed: {e}")))?;
+    Ok(())
 }
 
 /// Which columns a note UPDATE rewrites.

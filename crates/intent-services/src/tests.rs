@@ -2276,7 +2276,8 @@ async fn set_content_reduction_guard_requires_confirmation() {
 async fn setup_versioned(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
     let (tmp, svc, ws, id) = setup(content).await;
     let note = svc.store.get_note(&ws, &id).await.expect("get note");
-    crate::capture_system_note_version(&svc.store, &note, 0)
+    svc.store
+        .append_note_version(&note, &crate::system_version_author(), &note.updated_at, 0)
         .await
         .expect("seed base snapshot");
     (tmp, svc, ws, id)
@@ -2783,6 +2784,109 @@ async fn note_edit_lines_merges_onto_completed_user_save() {
     assert_eq!(result.total_lines_after, 3);
 }
 
+
+/// Regression (intentd#1817 re-verification, finding 2): a note insert and
+/// its initial snapshot commit in ONE transaction, so the instant a fresh
+/// note is readable its rev 0 is a recoverable merge base. Before the fix
+/// the snapshot was appended in a second transaction: two `setContent(…,
+/// expectedVersion: 0)` writes issued against the note mid-gap found no base
+/// and degraded to last-writer-wins (`aXbc`@1, then `abcY`@2 dropped `X`),
+/// and the delayed rev-0 snapshot then landed after the rev-1/rev-2 rows.
+///
+/// `note.create` is driven one poll at a time and the store sampled (via a
+/// second connection) between polls; the invariant is asserted on the first
+/// sample that sees the note, the two writes are issued right there while
+/// creation is still in flight, and the outcome is asserted once more after
+/// it completes.
+#[tokio::test]
+async fn note_create_snapshot_is_visible_with_the_row() {
+    let (tmp, svc, ws, _seed) = setup("seed").await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    let mut create = svc.create_note(
+        ws.clone(),
+        NoteCreate {
+            title: "Fresh".into(),
+            content: Some("abc".into()),
+            tags: None,
+            parent_id: None,
+        },
+        None,
+        None,
+    );
+    let find_fresh = || async {
+        other
+            .list_notes(&ws)
+            .await
+            .expect("list notes")
+            .into_iter()
+            .find(|n| n.title == "Fresh")
+    };
+    let write_both = |fresh_id: NoteId| {
+        let other_svc = &other_svc;
+        let ws = &ws;
+        async move {
+            let a = other_svc
+                .set_note_content(
+                    ws.clone(),
+                    fresh_id.clone(),
+                    "aXbc".into(),
+                    false,
+                    Some(0),
+                    None,
+                )
+                .await
+                .expect("exact write at rev 0");
+            assert_eq!((a.new_content.as_str(), a.rev), ("aXbc", 1));
+            let b = other_svc
+                .set_note_content(ws.clone(), fresh_id, "abcY".into(), false, Some(0), None)
+                .await
+                .expect("stale write merges from the rev-0 base");
+            assert_eq!((b.new_content.as_str(), b.rev), ("aXbcY", 2));
+        }
+    };
+
+    let mut observed_mid_flight = false;
+    let created = loop {
+        let state =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(create.as_mut().poll(cx))).await;
+        if let std::task::Poll::Ready(done) = state {
+            break done.expect("note.create");
+        }
+        if observed_mid_flight {
+            continue;
+        }
+        let Some(fresh) = find_fresh().await else {
+            continue;
+        };
+        assert_eq!((fresh.content.as_str(), fresh.rev), ("abc", 0));
+        assert_eq!(
+            other
+                .get_note_version_content_by_rev(&ws, &fresh.id, 0)
+                .await
+                .expect("lookup"),
+            Some("abc".to_string()),
+            "the fresh row is visible, so its rev-0 snapshot must be too"
+        );
+        write_both(fresh.id).await;
+        observed_mid_flight = true;
+    };
+    if !observed_mid_flight {
+        write_both(created.note.id.clone()).await;
+    }
+
+    let stored = other
+        .get_note(&ws, &created.note.id)
+        .await
+        .expect("final note");
+    assert_eq!((stored.content.as_str(), stored.rev), ("aXbcY", 2));
+    assert_eq!(
+        newest_version_rev(&other, &ws, &created.note.id).await,
+        Some(2),
+        "history stays in rev order: no late rev-0 row after the rev-2 write"
+    );
+}
 /// Race a metadata-only write against a user `note.setContent` that completes
 /// while the metadata write is parked on the write pool (same choreography as
 /// [`surgical_write_races_user_save`]): the metadata op reads rev 0 with the
