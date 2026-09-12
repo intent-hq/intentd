@@ -1,9 +1,9 @@
 //! Unit tests for the browser tab registry repository (REV-2 Model 2 & 6).
 
 use intent_core::{
-    now_iso, BrowserTabInput, BrowserTabSize, BrowserTabUpsertOutcome, BrowserTabVisibility,
-    ClientHostInfo, ClientId, Error, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    now_iso, AgentId, BrowserTabInput, BrowserTabSize, BrowserTabUpsertOutcome,
+    BrowserTabVisibility, ClientHostInfo, ClientId, Error, Workspace, WorkspaceActivity,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -223,6 +223,118 @@ async fn displayed_is_diffed_and_overlaid_without_persisting() {
     let reopened_row = f.store.upsert_browser_tab(&f.host_a, fresh).await.unwrap();
     assert!(matches!(reopened_row, BrowserTabUpsertOutcome::Opened(_)));
     assert_eq!(reopened_row.tab().displayed, None, "no stale overlay entry");
+}
+
+/// A re-home to another host (claim migration) clears the previous host's
+/// `displayed` fact — `changes.displayed: null`, the row reads `None` and the
+/// overlay entry is gone — until the new host reports it; a same-host
+/// owner-only claim keeps the fact and never mentions it.
+#[tokio::test]
+async fn claim_rehome_to_another_host_clears_displayed() {
+    let f = fixture().await;
+    let mut shown = input(&f.ws, "tab-1", "https://a.test/");
+    shown.displayed = Some(true);
+    f.store.upsert_browser_tab(&f.host_a, shown).await.unwrap();
+    assert_eq!(f.store.browser_tab_displayed.len(), 1);
+
+    let agent = AgentId("agent-1".to_string());
+    let (moved, changes) = f
+        .store
+        .reassign_browser_tab_host("tab-1", &f.host_b, Some(&agent))
+        .await
+        .unwrap()
+        .expect("re-homed");
+    assert_eq!(
+        changes,
+        json!({ "hostClientId": "client-b", "ownerAgentId": "agent-1", "displayed": null })
+    );
+    assert_eq!(moved.host_client_id, f.host_b);
+    assert_eq!(moved.displayed, None);
+    assert_eq!(
+        f.store
+            .get_browser_tab("tab-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .displayed,
+        None,
+        "the new host has not reported the fact"
+    );
+    assert_eq!(
+        f.store.browser_tab_displayed.len(),
+        0,
+        "no stale overlay entry"
+    );
+
+    // The new host reports; a same-host owner-only claim keeps its fact.
+    let mut theirs = input(&f.ws, "tab-1", "https://a.test/");
+    theirs.owner_agent_id = Some(agent.clone());
+    theirs.displayed = Some(false);
+    f.store.upsert_browser_tab(&f.host_b, theirs).await.unwrap();
+    let other = AgentId("agent-2".to_string());
+    let (kept, changes) = f
+        .store
+        .reassign_browser_tab_host("tab-1", &f.host_b, Some(&other))
+        .await
+        .unwrap()
+        .expect("owner changed");
+    assert_eq!(changes, json!({ "ownerAgentId": "agent-2" }));
+    assert_eq!(kept.displayed, Some(false));
+    assert_eq!(f.store.browser_tab_displayed.len(), 1);
+
+    // A re-home of a tab whose fact was never reported mentions no
+    // `displayed` at all.
+    f.store
+        .upsert_browser_tab(&f.host_a, input(&f.ws, "tab-2", "https://b.test/"))
+        .await
+        .unwrap();
+    let (_, changes) = f
+        .store
+        .reassign_browser_tab_host("tab-2", &f.host_b, None)
+        .await
+        .unwrap()
+        .expect("re-homed");
+    assert_eq!(changes, json!({ "hostClientId": "client-b" }));
+}
+
+/// The driving-client switch clears `displayed` on every tab it moves
+/// (`changes: { hostClientId, displayed: null }` when the fact was set) and
+/// leaves the unclaimed tabs' fact alone.
+#[tokio::test]
+async fn pin_switch_clears_displayed_on_moved_tabs() {
+    let f = fixture().await;
+    let agent = AgentId("agent-1".to_string());
+    for (id, owner, displayed) in [
+        ("mine-1", Some(&agent), Some(true)),
+        ("mine-2", Some(&agent), None),
+        ("user-tab", None, Some(true)),
+    ] {
+        let mut tab = input(&f.ws, id, "https://a.test/");
+        tab.owner_agent_id = owner.cloned();
+        tab.displayed = displayed;
+        f.store.upsert_browser_tab(&f.host_a, tab).await.unwrap();
+    }
+    assert_eq!(f.store.browser_tab_displayed.len(), 2);
+
+    let moved = f
+        .store
+        .reassign_claimed_browser_tabs(&f.ws, &f.host_b)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = moved.iter().map(|(t, _)| t.tab_id.as_str()).collect();
+    assert_eq!(ids, ["mine-1", "mine-2"]);
+    assert_eq!(
+        moved[0].1,
+        json!({ "hostClientId": "client-b", "displayed": null })
+    );
+    assert_eq!(moved[1].1, json!({ "hostClientId": "client-b" }));
+    assert!(moved.iter().all(|(t, _)| t.displayed.is_none()));
+    let rows = f.store.list_browser_tabs(&f.ws).await.unwrap();
+    let displayed_of = |id: &str| rows.iter().find(|t| t.tab_id == id).unwrap().displayed;
+    assert_eq!(displayed_of("mine-1"), None);
+    assert_eq!(displayed_of("mine-2"), None);
+    assert_eq!(displayed_of("user-tab"), Some(true), "not moved, fact kept");
+    assert_eq!(f.store.browser_tab_displayed.len(), 1);
 }
 
 #[tokio::test]
@@ -710,4 +822,59 @@ async fn rows_cascade_with_workspace_delete() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// `Store::delete_workspace` cascades the rows *and* evicts their `displayed`
+/// overlay entries — the host's later `removeTab` / `syncTabs` can no longer
+/// discover those ids, so nothing else would. Tabs of other workspaces keep
+/// theirs, a tombstoned row in the cascade is harmless, and a failed delete
+/// (unknown workspace) evicts nothing.
+#[tokio::test]
+async fn workspace_delete_evicts_displayed_overlay() {
+    let f = fixture().await;
+    let other = WorkspaceId(format!("ws-{}", Uuid::new_v4()));
+    f.store
+        .insert_workspace(&test_workspace(&other, &now_iso()))
+        .await
+        .unwrap();
+    for (ws, id) in [
+        (&f.ws, "gone-1"),
+        (&f.ws, "gone-2"),
+        (&f.ws, "tombstoned"),
+        (&other, "kept"),
+    ] {
+        let mut tab = input(ws, id, "https://a.test/");
+        tab.displayed = Some(true);
+        f.store.upsert_browser_tab(&f.host_a, tab).await.unwrap();
+    }
+    f.store.close_browser_tab("tombstoned").await.unwrap();
+    assert_eq!(f.store.browser_tab_displayed.len(), 3);
+
+    let missing = WorkspaceId("ws-missing".to_string());
+    assert!(matches!(
+        f.store.delete_workspace(&missing).await,
+        Err(Error::NotFound(_))
+    ));
+    assert_eq!(f.store.browser_tab_displayed.len(), 3, "nothing evicted");
+
+    f.store.delete_workspace(&f.ws).await.unwrap();
+    assert_eq!(f.store.browser_tab_displayed.len(), 1);
+    assert!(f.store.get_browser_tab("gone-1").await.unwrap().is_none());
+    assert_eq!(
+        f.store
+            .get_browser_tab("kept")
+            .await
+            .unwrap()
+            .unwrap()
+            .displayed,
+        Some(true)
+    );
+    // The id can be reused with no stale fact attached.
+    let reopened = f
+        .store
+        .upsert_browser_tab(&f.host_a, input(&other, "gone-1", "https://a.test/"))
+        .await
+        .unwrap();
+    assert!(matches!(reopened, BrowserTabUpsertOutcome::Opened(_)));
+    assert_eq!(reopened.tab().displayed, None);
 }

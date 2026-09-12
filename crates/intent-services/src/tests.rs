@@ -31931,7 +31931,10 @@ mod browser_routing {
 
     /// Model 5: a `claimTab` the driving client executed on a tab another
     /// client hosted re-homes the row (host + owner) with one
-    /// `browser:tab-updated`; a failed claim moves nothing.
+    /// `browser:tab-updated`; a failed claim moves nothing. The move clears
+    /// the previous host's `displayed` fact (`changes.displayed: null`, absent
+    /// on the event `tab` and the next list) until the new host reports it;
+    /// a same-host owner-only claim keeps it (intent-hq/intent#4835).
     #[tokio::test]
     async fn successful_claim_migrates_the_tab_to_the_driving_client() {
         let reg = two_clients();
@@ -31960,6 +31963,7 @@ mod browser_routing {
             .unwrap();
         assert_eq!(row.host_client_id, ClientId::from_string("desktop-b"));
         assert!(row.owner_agent_id.is_none());
+        assert_eq!(row.displayed, Some(true), "desktop-b reported the fact");
 
         // Now drive the migration the way a confirmed `claimTab` does.
         let events = tokio::spawn({
@@ -31983,12 +31987,28 @@ mod browser_routing {
             .unwrap();
         assert_eq!(row.host_client_id, ClientId::from_string("desktop-a"));
         assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
+        assert_eq!(
+            row.displayed, None,
+            "desktop-a has not reported the layout fact yet"
+        );
         let evs = events.await.unwrap();
         assert_eq!(evs[0]["type"], "browser:tab-updated");
         assert_eq!(
             evs[0]["data"]["changes"],
-            json!({ "hostClientId": "desktop-a", "ownerAgentId": "agent-1" })
+            json!({ "hostClientId": "desktop-a", "ownerAgentId": "agent-1", "displayed": null })
         );
+        assert!(evs[0]["data"]["tab"].get("displayed").is_none());
+        let listed = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed["result"][0]["tabId"], "user-tab");
+        assert!(listed["result"][0].get("displayed").is_none());
         // Re-homing the same tab to its current host and owner is a no-op
         // (no event).
         svc.browser_tab_claim_migrate(
@@ -32008,7 +32028,7 @@ mod browser_routing {
 
         // A claim of a tab the driving client already hosts records the
         // owner immediately (no wait for the host's own report) with
-        // `changes: { ownerAgentId }` only.
+        // `changes: { ownerAgentId }` only — the host's `displayed` stays.
         register_tab(&svc, &ws, "local-tab", "desktop-a", None).await;
         let events = tokio::spawn({
             let bus = bus.clone();
@@ -32031,9 +32051,11 @@ mod browser_routing {
             .unwrap();
         assert_eq!(row.host_client_id, ClientId::from_string("desktop-a"));
         assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
+        assert_eq!(row.displayed, Some(true), "same-host claim keeps the fact");
         let evs = events.await.unwrap();
         assert_eq!(evs[0]["type"], "browser:tab-updated");
         assert_eq!(evs[0]["data"]["tab"]["tabId"], "local-tab");
+        assert_eq!(evs[0]["data"]["tab"]["displayed"], true);
         assert_eq!(
             evs[0]["data"]["changes"],
             json!({ "ownerAgentId": "agent-1" })
@@ -32309,9 +32331,11 @@ mod browser_routing {
         let evs = events.await.unwrap();
         assert_eq!(evs[0]["type"], "browser:tab-updated");
         assert_eq!(evs[0]["data"]["tab"]["tabId"], "tab-on-a");
+        // The re-homed row drops desktop-a's `displayed` fact; the same-host
+        // row keeps desktop-b's.
         assert_eq!(
             evs[0]["data"]["changes"],
-            json!({ "hostClientId": "desktop-b", "ownerAgentId": "agent-1" })
+            json!({ "hostClientId": "desktop-b", "ownerAgentId": "agent-1", "displayed": null })
         );
         assert_eq!(evs[1]["type"], "browser:tab-updated");
         assert_eq!(evs[1]["data"]["tab"]["tabId"], "tab-on-b");
@@ -32335,8 +32359,10 @@ mod browser_routing {
     }
 
     /// Model 10: setting the pin moves every claimed tab of the workspace to
-    /// the new driving client (one `browser:tab-updated` each); unclaimed
-    /// tabs and other workspaces stay put; clearing the pin moves nothing.
+    /// the new driving client (one `browser:tab-updated` each, clearing the
+    /// old host's `displayed` fact: `changes.displayed: null`); unclaimed
+    /// tabs and other workspaces stay put (fact retained); clearing the pin
+    /// moves nothing.
     #[tokio::test]
     async fn set_browser_client_migrates_claimed_tabs() {
         let reg = two_clients();
@@ -32371,26 +32397,30 @@ mod browser_routing {
             assert_eq!(ev["type"], "browser:tab-updated");
             assert_eq!(
                 ev["data"]["changes"],
-                json!({ "hostClientId": "desktop-b" })
+                json!({ "hostClientId": "desktop-b", "displayed": null })
             );
+            assert!(ev["data"]["tab"].get("displayed").is_none());
         }
-        let host_of = |id: &str| {
+        let row_of = |id: &str| {
             let svc = svc.clone();
             let id = id.to_string();
-            async move {
-                svc.store
-                    .get_browser_tab(&id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .host_client_id
-                    .0
-            }
+            async move { svc.store.get_browser_tab(&id).await.unwrap().unwrap() }
+        };
+        let host_of = |id: &str| {
+            let row = row_of(id);
+            async move { row.await.host_client_id.0 }
         };
         assert_eq!(host_of("user-tab").await, "desktop-a");
         assert_eq!(host_of("mine-1").await, "desktop-b");
         assert_eq!(host_of("mine-2").await, "desktop-b");
         assert_eq!(host_of("elsewhere").await, "desktop-a");
+        assert_eq!(row_of("user-tab").await.displayed, Some(true), "not moved");
+        assert_eq!(row_of("mine-1").await.displayed, None, "moved: unknown");
+        assert_eq!(
+            row_of("elsewhere").await.displayed,
+            Some(false),
+            "not moved"
+        );
 
         svc.set_workspace_browser_client(ws.clone(), None)
             .await

@@ -21,9 +21,12 @@
 //! while that host process exists — so it lives in a process-local
 //! [`DisplayedOverlay`] keyed by `tab_id` and merged into every row the
 //! repository materializes. The overlay is updated after each committed host
-//! report and dropped with the row; a daemon restart empties it, and the
-//! host's connect-time `browser.syncTabs` re-reports the fact, so a row reads
-//! `displayed: None` ("never reported") in between rather than a stale value.
+//! report and dropped with the row (including rows a `workspace.delete`
+//! cascades away); a daemon restart empties it, and the host's connect-time
+//! `browser.syncTabs` re-reports the fact, so a row reads `displayed: None`
+//! ("never reported") in between rather than a stale value. Because the fact
+//! belongs to the host that reported it, a re-home to a *different* host
+//! (`reassign_*` below) clears it too — the new host has not reported yet.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -76,6 +79,36 @@ impl DisplayedOverlay {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(tab_id);
     }
+
+    /// Drop every listed id in one write lock (rows deleted in bulk, e.g. a
+    /// workspace cascade).
+    pub(crate) fn forget_all<'a>(&self, tab_ids: impl IntoIterator<Item = &'a str>) {
+        let mut map = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        for tab_id in tab_ids {
+            map.remove(tab_id);
+        }
+    }
+
+    /// Number of ids currently carrying a fact (tests check the overlay does
+    /// not leak ids whose rows are gone).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.read().unwrap_or_else(PoisonError::into_inner).len()
+    }
+}
+
+/// `tab_id` of every row (open or tombstoned) of workspace `id`, for
+/// [`Store::delete_workspace`] to evict from the overlay once the cascade
+/// that removes those rows has committed.
+pub(crate) async fn workspace_tab_ids(
+    conn: &mut SqliteConnection,
+    id: &WorkspaceId,
+) -> Result<Vec<String>> {
+    sqlx::query_scalar("SELECT tab_id FROM browser_tab WHERE workspace_id = ?")
+        .bind(&id.0)
+        .fetch_all(conn)
+        .await
+        .map_err(|e| Error::Internal(format!("list workspace browser tab ids failed: {e}")))
 }
 
 /// A stored row including its tombstone marker.
@@ -285,6 +318,9 @@ impl Store {
     /// field-wise `changes` (`hostClientId` / `ownerAgentId`), or `None` when
     /// there is no open row or nothing differs (the host already matches and
     /// the owner is unchanged — the host's own report covers that case).
+    /// An actual host change also clears `displayed` (the previous host's
+    /// layout fact; `changes.displayed: null` when it was set) until the new
+    /// host reports; a same-host owner-only claim keeps it.
     ///
     /// # Errors
     ///
@@ -309,11 +345,15 @@ impl Store {
                     return Ok(None);
                 };
                 let mut changes = serde_json::Map::new();
-                if tab.host_client_id != *new_host {
+                let host_changes = tab.host_client_id != *new_host;
+                if host_changes {
                     changes.insert(
                         "hostClientId".to_string(),
                         serde_json::Value::String(new_host.0.clone()),
                     );
+                    if tab.displayed.is_some() {
+                        changes.insert("displayed".to_string(), serde_json::Value::Null);
+                    }
                 }
                 if owner_agent_id.is_some() && tab.owner_agent_id != owner_agent_id {
                     changes.insert(
@@ -326,12 +366,18 @@ impl Store {
                 }
                 let mut updated = tab;
                 updated.host_client_id = new_host.clone();
+                if host_changes {
+                    updated.displayed = None;
+                }
                 if owner_agent_id.is_some() {
                     updated.owner_agent_id = owner_agent_id;
                 }
                 updated.updated_at = now_iso();
                 rehome_tab(&mut tx, &updated).await?;
                 commit(tx, "reassign browser tab host").await?;
+                if host_changes {
+                    displayed.forget(tab_id);
+                }
                 Ok(Some((updated, serde_json::Value::Object(changes))))
             }
         })
@@ -341,8 +387,9 @@ impl Store {
     /// Driving-client switch (REV-2 Model 10, `workspace.setBrowserClient`):
     /// every open **claimed** tab (`owner_agent_id` set) of workspace `id`
     /// not already hosted by `new_host` moves there. Returns each moved row
-    /// with its `changes` (`{ hostClientId }`), oldest first; unclaimed tabs
-    /// stay on their physical host.
+    /// with its `changes` (`{ hostClientId }`, plus `displayed: null` when the
+    /// previous host had reported the layout fact — the move clears it),
+    /// oldest first; unclaimed tabs stay on their physical host.
     ///
     /// # Errors
     ///
@@ -375,15 +422,21 @@ impl Store {
                 let now = now_iso();
                 for row in &rows {
                     let mut tab = map_row(row, &displayed)?.tab;
+                    let mut changes = serde_json::Map::new();
+                    changes.insert(
+                        "hostClientId".to_string(),
+                        serde_json::Value::String(new_host.0.clone()),
+                    );
+                    if tab.displayed.take().is_some() {
+                        changes.insert("displayed".to_string(), serde_json::Value::Null);
+                    }
                     tab.host_client_id = new_host.clone();
                     tab.updated_at.clone_from(&now);
                     rehome_tab(&mut tx, &tab).await?;
-                    moved.push((
-                        tab,
-                        serde_json::json!({ "hostClientId": new_host.0.clone() }),
-                    ));
+                    moved.push((tab, serde_json::Value::Object(changes)));
                 }
                 commit(tx, "reassign claimed browser tabs").await?;
+                displayed.forget_all(moved.iter().map(|(t, _)| t.tab_id.as_str()));
                 Ok(moved)
             }
         })
