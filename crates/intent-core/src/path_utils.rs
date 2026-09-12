@@ -230,6 +230,7 @@ fn user_db_shell() -> Option<String> {
 #[cfg(unix)]
 fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCapture> {
     use std::io::Read;
+    use std::os::unix::process::CommandExt;
     use std::sync::{Arc, Mutex};
 
     // Build command with sentinel-wrapped printf for PATH, plus a second
@@ -245,13 +246,37 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCaptu
     let mut args = flags.to_vec();
     args.push(&cmd);
 
-    let mut child = Command::new(shell)
+    let mut command = Command::new(shell);
+    command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+
+    // Detach the shell from the daemon's controlling terminal and process
+    // group. An interactive shell (`-i`) that starts in a *background*
+    // process group of its controlling tty runs job-control initialisation,
+    // which sends SIGTTIN to its whole process group — `kill(0, SIGTTIN)` —
+    // until it is foregrounded. That stops every group member with the
+    // default disposition (a backgrounded `intentd serve` in a real terminal,
+    // or the node fixtures a PTY-backed nextest test spawned before the
+    // daemon), and the shell then stalls until the 5s timeout. A new session
+    // has no controlling tty, so bash/zsh skip job-control init entirely
+    // while still sourcing the rc files this capture exists to read.
+    // `process_group(0)` alone is not enough: the shell would still stop
+    // itself and burn the timeout before the `-lc` fallback runs.
+    // SAFETY: `setsid` is async-signal-safe and touches no locks or heap
+    // state, so it is safe to call between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = command.spawn().ok()?;
 
     // Drain stdout concurrently to avoid pipe-buffer deadlock when rc files print >64KB of noise
     let stdout = child.stdout.take()?;
@@ -1187,6 +1212,49 @@ mod tests {
         assert!(
             capture.credential_env.is_empty(),
             "Missing env sentinels should degrade to an empty map"
+        );
+    }
+
+    /// The capture shell must run detached from the daemon's controlling
+    /// terminal: an interactive shell started in a background process group
+    /// of a tty runs job-control init and `kill(0, SIGTTIN)`s its own group,
+    /// stopping every default-disposition sibling (e.g. node fixtures spawned
+    /// by `e2e_wss_mcp_oauth_refresh` under a PTY-backed nextest run). The
+    /// fake shell only emits the sentinels when it is a session leader with
+    /// no controlling tty, which is exactly what `setsid` guarantees.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capture_login_shell_runs_in_its_own_session_without_controlling_tty() {
+        use std::fs;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_setsid_{pid}_{nanos}.sh"));
+
+        // /proc/<pid>/stat fields after the `(comm)` token: state ppid pgrp
+        // session tty_nr … — `$$` is the script interpreter itself, i.e. the
+        // process the capture spawned.
+        let capture = write_and_capture(
+            &fake_shell,
+            concat!(
+                "#!/bin/sh\n",
+                "stat=$(cat /proc/$$/stat)\n",
+                "set -- ${stat##*) }\n",
+                "if [ \"$4\" = \"$$\" ] && [ \"$5\" = \"0\" ]; then\n",
+                "  printf '__INTENT_PATH_S__/own/session/bin__INTENT_PATH_E__'\n",
+                "fi\n",
+            ),
+        );
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(
+            capture.dirs,
+            vec![PathBuf::from("/own/session/bin")],
+            "capture shell must be a session leader with no controlling tty"
         );
     }
 
