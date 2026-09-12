@@ -58,8 +58,9 @@ const INVARIANT_WINDOW: Duration = Duration::from_secs(8);
 /// unscaled, and every wait in the test is clamped to it: the setup waits
 /// (`min(daemon_startup_timeout, budget)` — 180 s at multiplier 3 on its own,
 /// so the clamp matters), the scan loop, and the capture barrier all end at
-/// `started + 150 s` at the latest, after which only the fixture ping remains
-/// (5 s connect + 5 s read). Worst case 150 + 10 = 160 s < 180 s.
+/// `started + 150 s` at the latest, after which only the fixture ping (5 s
+/// connect + 5 s read) and the teardown sweep in `Drop` (`REAP_TIMEOUT`, 5 s)
+/// remain. Worst case 150 + 10 + 5 = 165 s < 180 s.
 const TEST_BUDGET: Duration = Duration::from_secs(150);
 
 /// Connect/read bound for the post-window fixture ping; part of the
@@ -78,7 +79,8 @@ fn self_pid() -> i32 {
 }
 
 /// One `/proc/<pid>/stat` row: the fields after `(comm)` are
-/// `state ppid pgrp session tty_nr tpgid …`.
+/// `state ppid pgrp session tty_nr tpgid …`, with `starttime` (clock ticks
+/// since boot) as field 22 — optional here so truncated rows still parse.
 #[derive(Debug, Clone, PartialEq)]
 struct ProcStat {
     pid: i32,
@@ -89,6 +91,7 @@ struct ProcStat {
     session: i32,
     tty_nr: i32,
     tpgid: i32,
+    starttime: Option<u64>,
 }
 
 fn parse_stat(pid: i32, raw: &str) -> Option<ProcStat> {
@@ -98,7 +101,7 @@ fn parse_stat(pid: i32, raw: &str) -> Option<ProcStat> {
     let mut fields = raw[close + 1..].split_whitespace();
     let state = fields.next()?.chars().next()?;
     let mut next_i32 = || fields.next()?.parse::<i32>().ok();
-    Some(ProcStat {
+    let mut stat = ProcStat {
         pid,
         comm,
         state,
@@ -107,7 +110,11 @@ fn parse_stat(pid: i32, raw: &str) -> Option<ProcStat> {
         session: next_i32()?,
         tty_nr: next_i32()?,
         tpgid: next_i32()?,
-    })
+        starttime: None,
+    };
+    // `tpgid` is field 8; `starttime` is field 22.
+    stat.starttime = fields.nth(13).and_then(|f| f.parse().ok());
+    Some(stat)
 }
 
 /// Root of the procfs the harness reads; a constant so the no-`/proc` skip
@@ -283,6 +290,9 @@ struct Harness {
     _master: Box<dyn MasterPty + Send>,
     pty_out: Arc<Mutex<Vec<u8>>>,
     driver_pid: i32,
+    /// `starttime` of the driver, the first process the harness spawns; the
+    /// teardown sweep ignores adopted children that predate it.
+    epoch: u64,
     job_pgid: Option<i32>,
     daemon_pid: Option<i32>,
     dir: tempfile::TempDir,
@@ -412,7 +422,12 @@ impl Drop for Harness {
         let sessions: HashSet<i32> = std::iter::once(self.driver_pid)
             .chain(victims.iter().map(|p| p.session))
             .collect();
-        reap_adopted(&[self.driver_pid], &sessions, Instant::now() + REAP_TIMEOUT);
+        reap_adopted(
+            &[self.driver_pid],
+            &sessions,
+            self.epoch,
+            Instant::now() + REAP_TIMEOUT,
+        );
     }
 }
 
@@ -424,22 +439,29 @@ fn become_child_subreaper() {
     nix::sys::prctl::set_child_subreaper(true).expect("prctl(PR_SET_CHILD_SUBREAPER)");
 }
 
-/// Kill and reap every process the subreaper handed us (`ppid == self`,
-/// except `keep`) and every live member of `sessions`. Orphans reparent
+/// Kill and reap every process the subreaper handed us and every live member
+/// of `sessions`. An adopted child (`ppid == self`) counts only when it is in
+/// one of `sessions` or started at or after `since` (a `starttime` tick), and
+/// never when it is in our own session or in `keep`: under plain `cargo test`
+/// every test in this binary shares one process, so siblings' children —
+/// another test's driver, a helper's subprocess, an as-yet-unwaited zombie —
+/// are also `ppid == self` and must not be touched. Orphans reparent
 /// asynchronously after their parent dies, so the scan repeats until nothing
 /// live matches or `deadline` passes. Zombies we own are reaped so they leave
 /// `/proc`. Returns the pids killed.
-fn reap_adopted(keep: &[i32], sessions: &HashSet<i32>, deadline: Instant) -> Vec<i32> {
+fn reap_adopted(keep: &[i32], sessions: &HashSet<i32>, since: u64, deadline: Instant) -> Vec<i32> {
     let me = self_pid();
+    let my_session = read_stat(me).map(|p| p.session);
     let mut killed = Vec::new();
     loop {
         let mut live = false;
         for p in scan_procs() {
-            if p.pid == me || keep.contains(&p.pid) {
+            if p.pid == me || keep.contains(&p.pid) || Some(p.session) == my_session {
                 continue;
             }
-            let adopted = p.ppid == me;
-            if !adopted && !sessions.contains(&p.session) {
+            let in_session = sessions.contains(&p.session);
+            let adopted = p.ppid == me && (in_session || p.starttime.is_some_and(|t| t >= since));
+            if !adopted && !in_session {
                 continue;
             }
             if p.state == 'Z' {
@@ -525,10 +547,16 @@ fn spawn_driver(dir: tempfile::TempDir, fixture: &str) -> Harness {
     }
     let mut child = spawned.expect("spawn bash -m driver in pty");
     drop(pair.slave);
-    let Some(driver_pid) = child.process_id().and_then(|pid| i32::try_from(pid).ok()) else {
+    // The driver's `/proc` row is readable even if it already exited: we hold
+    // its handle, so at worst it is a zombie.
+    let ids = child
+        .process_id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(|pid| Some((pid, read_stat(pid)?.starttime?)));
+    let Some((driver_pid, epoch)) = ids else {
         let _ = child.kill();
         let _ = child.wait();
-        panic!("driver pid unavailable");
+        panic!("driver pid or /proc start time unavailable");
     };
     // From here on the driver is owned by the RAII guard, so any later panic
     // (in this function or the test) tears the session down.
@@ -538,6 +566,7 @@ fn spawn_driver(dir: tempfile::TempDir, fixture: &str) -> Harness {
         _master: pair.master,
         pty_out: Arc::clone(&pty_out),
         driver_pid,
+        epoch,
         job_pgid: None,
         daemon_pid: None,
         dir,
@@ -721,8 +750,21 @@ mod helper_tests {
             (s.state, s.ppid, s.pgrp, s.session, s.tty_nr, s.tpgid),
             ('T', 1, 2, 3, 4, 5)
         );
+        assert_eq!(s.starttime, None);
         assert!(parse_stat(7, "7 (bash) S 1 2").is_none());
         assert!(parse_stat(7, "no parens").is_none());
+    }
+
+    #[test]
+    fn parse_stat_reads_starttime_as_field_22() {
+        // Fields 3..=24 of a real row: `starttime` (22) is the 20th after `(comm)`.
+        let row = "4242 (bash) S 4100 4242 4242 0 -1 4194304 379 406 0 1 0 0 0 0 20 0 1 0 987654321 8192 512";
+        assert_eq!(parse_stat(4242, row).unwrap().starttime, Some(987_654_321));
+        let live = read_stat(self_pid()).map(|p| p.starttime);
+        assert!(
+            matches!(live, None | Some(Some(_))),
+            "own /proc row has no parsable starttime: {live:?}"
+        );
     }
 
     #[test]
@@ -791,16 +833,61 @@ mod helper_tests {
         }
     }
 
+    fn on_path(name: &str) -> bool {
+        std::env::var_os("PATH")
+            .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
+    }
+
+    /// Set on the re-invoked test binary that runs `orphan_scenario`.
+    const ORPHAN_CHILD_ENV: &str = "INTENTD_PTY_JC_ORPHAN_CHILD";
+    const ORPHAN_TEST: &str =
+        "helper_tests::reap_adopted_kills_and_reaps_orphan_inherited_as_subreaper";
+
     /// The P2 leak: a detached grandchild whose parent died before teardown
     /// is reachable neither by ancestry nor by session. As subreaper we
     /// inherit it, and `reap_adopted` must kill *and* reap it — even while it
     /// sits stopped, the state the leaked capture shell was found in.
+    ///
+    /// The scenario runs in a *subprocess* (this binary re-invoked on this one
+    /// test with `ORPHAN_CHILD_ENV` set): it makes the calling process a
+    /// subreaper and sweeps its adopted children, and under plain `cargo test`
+    /// — one process for the whole binary, unlike nextest — that process would
+    /// also own the e2e's driver and daemon.
     #[test]
     fn reap_adopted_kills_and_reaps_orphan_inherited_as_subreaper() {
-        if read_stat(self_pid()).is_none() {
-            eprintln!("skipping: procfs unavailable");
+        if std::env::var_os(ORPHAN_CHILD_ENV).is_some() {
+            orphan_scenario();
             return;
         }
+        for (what, present) in [
+            ("procfs", read_stat(self_pid()).is_some()),
+            ("/bin/bash", Path::new("/bin/bash").exists()),
+            ("setsid on PATH", on_path("setsid")),
+            ("sleep on PATH", on_path("sleep")),
+        ] {
+            if !present {
+                eprintln!("skipping adopted-orphan reap test: {what} unavailable");
+                return;
+            }
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let out = Command::new(exe)
+            .args(["--exact", ORPHAN_TEST, "--nocapture", "--test-threads=1"])
+            .env(ORPHAN_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .output()
+            .expect("re-invoke test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // "1 passed" guards against the filter silently matching nothing.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "orphan scenario subprocess: {}\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+            out.status
+        );
+    }
+
+    fn orphan_scenario() {
         become_child_subreaper();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("orphan.pid");
@@ -827,7 +914,9 @@ mod helper_tests {
         poll_until("grandchild to become a detached sleep", || {
             read_stat(orphan).is_some_and(|p| p.comm == "sleep" && p.session == orphan)
         });
+        let parent_stat = read_stat(parent_pid).expect("parent /proc row");
         assert_eq!(read_stat(orphan).unwrap().ppid, parent_pid);
+        let since = parent_stat.starttime.expect("parent starttime");
 
         parent.kill().expect("kill parent");
         parent.wait().expect("reap parent");
@@ -839,7 +928,10 @@ mod helper_tests {
             read_stat(orphan).is_some_and(|p| p.state == 'T')
         });
 
-        let killed = reap_adopted(&[], &HashSet::new(), Instant::now() + REAP_TIMEOUT);
+        // Not in any tracked session: only the `starttime >= since` arm can
+        // reach it — the same arm the harness relies on for a shell whose
+        // daemon parent died before the teardown snapshot.
+        let killed = reap_adopted(&[], &HashSet::new(), since, Instant::now() + REAP_TIMEOUT);
         assert!(killed.contains(&orphan), "orphan not killed: {killed:?}");
         assert_eq!(
             read_stat(orphan).map(|p| (p.state, p.ppid)),
