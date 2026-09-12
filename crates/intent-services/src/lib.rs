@@ -8714,6 +8714,27 @@ async fn capture_note_version(
         .await
 }
 
+/// Persist a note content write and its version snapshot in one store
+/// transaction ([`Store::update_note_with_version`]): the row's new `rev` and
+/// the snapshot that makes it a recoverable merge base become visible
+/// together, so no concurrent writer can read the new rev and resolve it to
+/// the previous content, and a snapshot can never land out of rev order.
+/// Every persisted content *update* goes through here; inserts snapshot via
+/// [`capture_note_version`] right after the row lands. Gated on
+/// `expected_version` when `Some` (`Conflict` on a mismatch, like
+/// [`Store::update_note_versioned`]). Returns the post-write `rev`.
+async fn persist_note_content(
+    store: &Store,
+    note: &Note,
+    expected_version: Option<i64>,
+    author: &NoteVersionAuthor,
+) -> Result<i64> {
+    store
+        .update_note_with_version(note, expected_version, author, &note.updated_at)
+        .await
+        .map(|(rev, _)| rev)
+}
+
 /// [`capture_note_version`] with the daemon-internal system author, for
 /// noninteractive note writes that live outside this crate (the `intentd`
 /// importers). Imported notes are loaded by clients like any other, so their
@@ -8824,6 +8845,140 @@ fn check_set_content_reduction(
         )));
     }
     Ok(())
+}
+
+/// How [`persist_merged_content`] turns one attempt's merged text into the
+/// text it persists.
+#[derive(Clone, Copy)]
+enum ContentWritePolicy {
+    /// `note.setContent`: the reduction guard (measured against the writer's
+    /// base when known, else the stored current) then the set-content cleaner.
+    SetContent { confirm_replacement: bool },
+    /// `note.add` / `note.edit` / `note.editLines`: the surgical transform
+    /// already ran against the content the caller read; the merged text
+    /// persists verbatim.
+    Surgical,
+}
+
+/// One persisted content write from [`persist_merged_content`].
+struct MergedContentWrite {
+    /// The note as persisted (`content` / `updated_at` are the written
+    /// values; `rev` is the pre-write rev the last attempt read — use `rev`).
+    note: Note,
+    /// The stored content the final attempt replaced.
+    old_content: String,
+    /// The persisted content (post-clean, post-reanchor).
+    content: String,
+    /// `updated_at` stamped on the write.
+    now: String,
+    /// Post-write rev.
+    rev: i64,
+}
+
+/// One client content write for [`persist_merged_content`].
+struct ContentWrite<'a> {
+    /// A row the caller already fetched: attempt 1 reuses it instead of
+    /// re-reading.
+    seed: Option<Note>,
+    /// The text the writer wants persisted (for surgical ops, the transform's
+    /// result against the `seed` content).
+    incoming: &'a str,
+    /// The rev the writer's `incoming` is based on (`None`: unconditional);
+    /// surgical callers pass the rev of their `seed` read.
+    expected_version: Option<i64>,
+    policy: ContentWritePolicy,
+    author: &'a NoteVersionAuthor,
+    /// Method label for the merge trace.
+    op: &'static str,
+}
+
+/// Read-merge-persist loop every client content write runs through
+/// (`note.setContent` and the surgical `note.add` / `note.edit` /
+/// `note.editLines`): each attempt fetches the current row, resolves what to
+/// persist with [`merge_set_content`] (`incoming` verbatim when
+/// `expected_version` is absent or matches the current rev; otherwise the
+/// writer's intent three-way-merged onto the current text from the snapshot at
+/// `expected_version`, degrading to last-writer-wins when no snapshot
+/// survives), applies `policy`, runs comment-anchor recovery, and persists
+/// gated on the rev it read via [`persist_note_content`] — so a write that
+/// lands in between is merged into on the next attempt rather than
+/// overwritten. The last attempt's `Conflict` propagates unchanged.
+async fn persist_merged_content(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    write: ContentWrite<'_>,
+) -> Result<MergedContentWrite> {
+    let ContentWrite {
+        mut seed,
+        incoming,
+        expected_version,
+        policy,
+        author,
+        op,
+    } = write;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut note = match seed.take() {
+            Some(note) => note,
+            None => fetch_note_peer(store, workspace_id, note_id).await?,
+        };
+        let old_content = note.content.clone();
+        let current_rev = note.rev;
+        let merge = merge_set_content(
+            store,
+            workspace_id,
+            note_id,
+            &old_content,
+            current_rev,
+            incoming,
+            expected_version,
+        )
+        .await?;
+        let text = match policy {
+            ContentWritePolicy::SetContent {
+                confirm_replacement,
+            } => {
+                check_set_content_reduction(
+                    merge.base.as_deref().unwrap_or(&old_content),
+                    incoming,
+                    confirm_replacement,
+                )?;
+                note_ops::clean_set_content(&merge.text)?
+            }
+            ContentWritePolicy::Surgical => merge.text,
+        };
+        tracing::debug!(
+            note = %note_id.0,
+            op,
+            attempt,
+            current_rev,
+            expected_version,
+            outcome = merge.outcome,
+            conflicting_spans = merge.conflicting_spans,
+            "note content merge"
+        );
+        let mut plan = reanchor_note_comments(store, workspace_id, note_id, text).await?;
+        let content = std::mem::take(&mut plan.content);
+        note.content = content.clone();
+        let now = now_iso();
+        note.updated_at = now.clone();
+        match persist_note_content(store, &note, Some(current_rev), author).await {
+            Ok(rev) => {
+                plan.apply_orphaned(store, workspace_id).await?;
+                return Ok(MergedContentWrite {
+                    note,
+                    old_content,
+                    content,
+                    now,
+                    rev,
+                });
+            }
+            Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Comment anchor recovery pass, called by every note-content mutation before
@@ -9593,8 +9748,7 @@ async fn append_primitive(
     let new_content = primitive_ops::append_block(&note.content, primitive, block_type);
     note.content = new_content.clone();
     note.updated_at = now_iso();
-    let rev = store.update_note(&note).await?;
-    capture_note_version(store, &note, &user_version_author(), rev).await?;
+    persist_note_content(store, &note, None, &user_version_author()).await?;
     publish_event(
         bus,
         note_change_event(
@@ -11379,22 +11533,15 @@ impl Services {
             };
             note.content = content;
             note.updated_at = now_iso();
-            let rev = match self
-                .store
-                .update_note_versioned(&note, Some(note.rev))
+            match persist_note_content(&self.store, &note, Some(note.rev), &system_version_author())
                 .await
             {
-                Ok(rev) => rev,
+                Ok(_) => {}
                 Err(Error::Conflict { .. }) if attempt < MAX_ATTEMPTS => continue,
                 Err(e) => {
                     tracing::warn!(note = %note.id.0, task = %task_id.0, attempt, error = %e, "materialize linked checkboxes: update failed");
                     return;
                 }
-            };
-            if let Err(e) =
-                capture_note_version(&self.store, &note, &system_version_author(), rev).await
-            {
-                tracing::warn!(note = %note.id.0, task = %task_id.0, error = %e, "materialize linked checkboxes: version snapshot failed");
             }
             self.schedule_line_attribution_recompute(workspace_id, &note.id);
             publish_event(
@@ -13858,13 +14005,12 @@ impl Services {
         }
         note.content = working;
         note.updated_at = now_iso();
-        let rev = store.update_note(&note).await?;
         // TS parity: the reference pushes a version snapshot ("Converted
         // task blocks to linked Task Notes") as part of the conversion
         // save, so the newest stored version matches the fence-free
         // content that line-attribution/history consumers diff against.
         let author = resolve_note_version_author(store, caller_agent_id).await;
-        capture_note_version(store, &note, &author, rev).await?;
+        persist_note_content(store, &note, None, &author).await?;
         self.schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
         // Emit `note:updated` for the rewritten parent so subscribers
         // refresh the fence-free content live (TS parity: the reference
@@ -21343,14 +21489,18 @@ impl WorkspaceApi for Services {
                 }
             }
             note.updated_at = now_iso();
-            let rev = store.update_note_versioned(&note, expected_version).await?;
+            if content_changed {
+                // FE-only `note.update`: no caller-agent context on this arm
+                // (transport router path), so the version author is the user.
+                persist_note_content(&store, &note, expected_version, &user_version_author())
+                    .await?;
+            } else {
+                store.update_note_versioned(&note, expected_version).await?;
+            }
             if let Some(plan) = reanchor_plan {
                 plan.apply_orphaned(&store, &workspace_id).await?;
             }
             if content_changed {
-                // FE-only `note.update`: no caller-agent context on this arm
-                // (transport router path), so the version author is the user.
-                capture_note_version(&store, &note, &user_version_author(), rev).await?;
                 services.schedule_line_attribution_recompute(
                     &note.workspace_id.clone(),
                     &note.id.clone(),
@@ -21401,23 +21551,34 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             note_ops::reject_numbered_read_presentation(&input.content)?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let old_content = note.content.clone();
-            let (new_content, position) = note_ops::apply_add(
-                &old_content,
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let (incoming, position) = note_ops::apply_add(
+                &note.content,
                 &input.content,
                 input.heading.as_deref(),
                 input.position.as_deref(),
             )?;
-            let mut plan =
-                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
-            let new_content = std::mem::take(&mut plan.content);
-            note.content = new_content.clone();
-            note.updated_at = now_iso();
-            let rev = store.update_note(&note).await?;
-            plan.apply_orphaned(&store, &workspace_id).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author, rev).await?;
+            let read_rev = note.rev;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: new_content,
+                ..
+            } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: Some(note),
+                    incoming: &incoming,
+                    expected_version: Some(read_rev),
+                    policy: ContentWritePolicy::Surgical,
+                    author: &author,
+                    op: "note.add",
+                },
+            )
+            .await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             let outcome = services
@@ -21482,19 +21643,30 @@ impl WorkspaceApi for Services {
                 ));
             }
             note_ops::reject_numbered_read_presentation(&input.new)?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let old_content = note.content.clone();
-            let (new_content, match_position, was_empty) =
-                note_ops::apply_edit(&old_content, &input.old, &input.new)?;
-            let mut plan =
-                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
-            let new_content = std::mem::take(&mut plan.content);
-            note.content = new_content.clone();
-            note.updated_at = now_iso();
-            let rev = store.update_note(&note).await?;
-            plan.apply_orphaned(&store, &workspace_id).await?;
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let (incoming, match_position, was_empty) =
+                note_ops::apply_edit(&note.content, &input.old, &input.new)?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author, rev).await?;
+            let read_rev = note.rev;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: new_content,
+                ..
+            } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: Some(note),
+                    incoming: &incoming,
+                    expected_version: Some(read_rev),
+                    policy: ContentWritePolicy::Surgical,
+                    author: &author,
+                    op: "note.edit",
+                },
+            )
+            .await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             let outcome = services
@@ -21557,20 +21729,31 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             note_ops::reject_numbered_read_presentation(&input.content)?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let old_content = note.content.clone();
-            let new_content =
-                note_ops::apply_edit_lines(&old_content, input.start, input.end, &input.content)?;
-            let total_lines_before = old_content.split('\n').count();
-            let mut plan =
-                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
-            let new_content = std::mem::take(&mut plan.content);
-            note.content = new_content.clone();
-            note.updated_at = now_iso();
-            let rev = store.update_note(&note).await?;
-            plan.apply_orphaned(&store, &workspace_id).await?;
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let incoming =
+                note_ops::apply_edit_lines(&note.content, input.start, input.end, &input.content)?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author, rev).await?;
+            let read_rev = note.rev;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: new_content,
+                ..
+            } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: Some(note),
+                    incoming: &incoming,
+                    expected_version: Some(read_rev),
+                    policy: ContentWritePolicy::Surgical,
+                    author: &author,
+                    op: "note.editLines",
+                },
+            )
+            .await?;
+            let total_lines_before = old_content.split('\n').count();
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             let outcome = services
@@ -21635,59 +21818,30 @@ impl WorkspaceApi for Services {
             // Guard before the merge so a rejected write touches neither the
             // store nor the merge state.
             note_ops::reject_numbered_read_presentation(&content)?;
-            // Read-merge-persist loop: each attempt merges the writer's intent
-            // onto the current stored text and persists gated on the rev it
-            // read, so a versioned write racing with this one is merged into
-            // on the next attempt rather than overwritten.
-            let mut attempt = 0;
-            let (note, old_content, previous_title, clean, now, rev) = loop {
-                attempt += 1;
-                let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-                let old_content = note.content.clone();
-                let previous_title = note.title.clone();
-                let current_rev = note.rev;
-                let merge = merge_set_content(
-                    &store,
-                    &workspace_id,
-                    &note_id,
-                    &old_content,
-                    current_rev,
-                    &content,
-                    expected_version,
-                )
-                .await?;
-                check_set_content_reduction(
-                    merge.base.as_deref().unwrap_or(&old_content),
-                    &content,
-                    confirm_replacement,
-                )?;
-                tracing::debug!(
-                    note = %note_id.0,
-                    attempt,
-                    current_rev,
-                    expected_version,
-                    outcome = merge.outcome,
-                    conflicting_spans = merge.conflicting_spans,
-                    "note.setContent merge"
-                );
-                let clean = note_ops::clean_set_content(&merge.text)?;
-                let mut plan =
-                    reanchor_note_comments(&store, &workspace_id, &note_id, clean).await?;
-                let clean = std::mem::take(&mut plan.content);
-                note.content = clean.clone();
-                let now = now_iso();
-                note.updated_at = now.clone();
-                match store.update_note_versioned(&note, Some(current_rev)).await {
-                    Ok(rev) => {
-                        plan.apply_orphaned(&store, &workspace_id).await?;
-                        break (note, old_content, previous_title, clean, now, rev);
-                    }
-                    Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
-                    Err(e) => return Err(e),
-                }
-            };
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author, rev).await?;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: clean,
+                now,
+                rev,
+            } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: None,
+                    incoming: &content,
+                    expected_version,
+                    policy: ContentWritePolicy::SetContent {
+                        confirm_replacement,
+                    },
+                    author: &author,
+                    op: "note.setContent",
+                },
+            )
+            .await?;
+            let previous_title = note.title.clone();
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             let outcome = services
@@ -22062,9 +22216,10 @@ impl WorkspaceApi for Services {
             note.title = version.title;
             note.content = version.content;
             note.updated_at = now_iso();
-            let rev = store.update_note(&note).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            let new_v = capture_note_version(&store, &note, &author, rev).await?;
+            let (_, new_v) = store
+                .update_note_with_version(&note, None, &author, &note.updated_at)
+                .await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
@@ -22187,9 +22342,8 @@ impl WorkspaceApi for Services {
             let updated = note_ops::apply_task_status(&note.content, &normalized, checkbox)?;
             note.content = updated;
             note.updated_at = now_iso();
-            let rev = store.update_note(&note).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author, rev).await?;
+            persist_note_content(&store, &note, None, &author).await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
@@ -22316,9 +22470,8 @@ impl WorkspaceApi for Services {
             if write_parent {
                 note.content = update.content;
                 note.updated_at = now_iso();
-                let rev = store.update_note(&note).await?;
                 let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-                capture_note_version(&store, &note, &author, rev).await?;
+                persist_note_content(&store, &note, None, &author).await?;
                 publish_event(
                     bus.as_ref(),
                     note_change_event(
@@ -23212,27 +23365,10 @@ impl WorkspaceApi for Services {
                         created_at: now.clone(),
                         updated_at: now,
                     };
-                    // The anchor-marker note rewrite + comment INSERT commit
-                    // atomically: a failure can never leave markers embedded
-                    // with no comment row (monorepo#638). The returned rev is
-                    // the authoritative post-rewrite value echoed to clients.
-                    // Duplicate-id detection rides the INSERT's PK constraint
-                    // inside that same transaction (no TOCTOU pre-check), so a
-                    // colliding client-supplied `commentId` is InvalidParams
-                    // even when two adds race.
-                    let note_rev = match store.update_note_with_comment(&note, &new_comment).await {
-                        Ok(rev) => rev,
-                        Err(Error::InvalidInput(_)) if client_supplied_id => {
-                            return Err(Error::InvalidParams(format!(
-                                "Invalid 'commentId': {comment_id}. A comment with this id already exists."
-                            )))
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    // The anchor rewrite is a persisted content write: snapshot
-                    // it under the post-rewrite rev so a writer holding that
-                    // rev can recover its base. The comment's author/type is
-                    // the only provenance the add carries.
+                    // The anchor rewrite is a persisted content write: it is
+                    // snapshotted under the post-rewrite rev so a writer
+                    // holding that rev can recover its base. The comment's
+                    // author/type is the only provenance the add carries.
                     let version_author = match new_comment.author_type {
                         AuthorType::User => user_version_author(),
                         AuthorType::Agent => NoteVersionAuthor {
@@ -23241,7 +23377,28 @@ impl WorkspaceApi for Services {
                             author_type: "agent".to_string(),
                         },
                     };
-                    capture_note_version(&store, &note, &version_author, note_rev).await?;
+                    // The anchor-marker note rewrite + its version snapshot +
+                    // comment INSERT commit atomically: a failure can never
+                    // leave markers embedded with no comment row
+                    // (monorepo#638), nor the new rev visible without its
+                    // snapshot. The returned rev is the authoritative
+                    // post-rewrite value echoed to clients. Duplicate-id
+                    // detection rides the INSERT's PK constraint inside that
+                    // same transaction (no TOCTOU pre-check), so a colliding
+                    // client-supplied `commentId` is InvalidParams even when
+                    // two adds race.
+                    let note_rev = match store
+                        .update_note_with_comment(&note, &new_comment, &version_author)
+                        .await
+                    {
+                        Ok(rev) => rev,
+                        Err(Error::InvalidInput(_)) if client_supplied_id => {
+                            return Err(Error::InvalidParams(format!(
+                                "Invalid 'commentId': {comment_id}. A comment with this id already exists."
+                            )))
+                        }
+                        Err(e) => return Err(e),
+                    };
                     services.schedule_line_attribution_recompute(
                         &note.workspace_id.clone(),
                         &note.id.clone(),

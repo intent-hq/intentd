@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Error, MessageOrigin, Note,
-    NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata,
-    NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
+    now_iso, AgentId, AgentSession, AgentStatus, BoxFuture, ContentType, Error, MessageOrigin,
+    Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata,
+    NoteUpdateInput, NoteVisibility, Result, Workspace, WorkspaceActivity, WorkspaceApi,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use intent_store::Store;
@@ -2502,6 +2502,224 @@ async fn set_content_merge_leaves_other_conditional_writes_conflicting() {
     let stored = svc.store.get_note(&ws, &id).await.expect("still present");
     assert_eq!(stored.rev, 1);
     assert_eq!(stored.title, "Title");
+}
+
+/// Drive `fut` one poll at a time until `stop` observes the condition it
+/// waits for or `max_polls` is exhausted; `fut` must still be pending at every
+/// step (the point is to inspect the store mid-flight). Returns whether `stop`
+/// fired.
+async fn poll_until<F, S, Fut>(
+    fut: &mut std::pin::Pin<Box<F>>,
+    max_polls: usize,
+    mut stop: S,
+) -> bool
+where
+    F: std::future::Future + ?Sized,
+    S: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    use std::future::poll_fn;
+    use std::task::Poll;
+    for _ in 0..max_polls {
+        let state = poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
+        assert!(state.is_pending(), "write finished before the pause point");
+        if stop().await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Regression (intentd#1817 review, finding 1): the content UPDATE and its
+/// `note_version` snapshot commit in ONE transaction, so the instant a reader
+/// observes the new rev on the note row, the base lookup by that rev already
+/// yields the new content. Before the fix the snapshot was appended in a
+/// second transaction: a writer that read rev 1 mid-gap recovered the rev-0
+/// text as its base and replayed the already-persisted insertion (observed
+/// `aXX!bcY`), and the delayed snapshot then landed with `rev = 1` after the
+/// rev-2/rev-3 rows, out of order.
+#[tokio::test]
+async fn content_write_snapshot_is_visible_with_its_rev() {
+    let (tmp, svc, ws, id) = setup_versioned("abc").await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    let mut first =
+        Box::pin(svc.set_note_content(ws.clone(), id.clone(), "aXbc".into(), false, Some(0), None));
+    let paused = poll_until(&mut first, 1000, || async {
+        let current = svc.store.get_note(&ws, &id).await.expect("get note");
+        if current.rev != 1 {
+            return false;
+        }
+        assert_eq!(current.content, "aXbc");
+        assert_eq!(
+            svc.store
+                .get_note_version_content_by_rev(&ws, &id, 1)
+                .await
+                .expect("lookup"),
+            Some("aXbc".to_string()),
+            "rev 1 is visible, so its snapshot must be too"
+        );
+        true
+    })
+    .await;
+    assert!(
+        paused,
+        "did not observe the committed content write mid-flight"
+    );
+
+    // A second writer that read rev 1 during the first write's tail.
+    let next = other_svc
+        .set_note_content(ws.clone(), id.clone(), "aXbcY".into(), false, Some(1), None)
+        .await
+        .expect("exact write at rev 1");
+    assert_eq!(next.rev, 2);
+    // A stale writer against rev 1: base is `aXbc`, so its `!` insertion
+    // lands once, on top of `Y`.
+    let merged = other_svc
+        .set_note_content(ws.clone(), id.clone(), "aX!bc".into(), false, Some(1), None)
+        .await
+        .expect("stale write merges");
+    assert_eq!(merged.rev, 3);
+    assert_eq!(merged.new_content, "aX!bcY");
+
+    assert_eq!(first.await.expect("first write").rev, 1);
+    // History stays in rev order: the newest snapshot is the rev-3 write,
+    // not a late rev-1 row.
+    assert_eq!(newest_version_rev(&svc.store, &ws, &id).await, Some(3));
+    let stored = svc.store.get_note(&ws, &id).await.expect("get note");
+    assert_eq!((stored.rev, stored.content.as_str()), (3, "aX!bcY"));
+}
+
+/// Race a surgical write against a user `note.setContent` that completes
+/// while the surgical write is parked on the write pool: the surgical op
+/// reads rev 0, the user's save lands at rev 1 (via a second `Store` on the
+/// same file), then the surgical write proceeds. Returns the op's result and
+/// the final stored note (rev 2, snapshotted).
+async fn surgical_write_races_user_save<T>(
+    base: &str,
+    user: &str,
+    op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, Result<T>>,
+) -> (T, Note) {
+    let (tmp, svc, ws, id) = setup_versioned(base).await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    // The sole write-pool connection: the surgical write blocks on acquire.
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = op(&svc, ws.clone(), id.clone());
+    let parked = poll_until(&mut fut, 20, || async {
+        svc.store.get_note(&ws, &id).await.expect("get note");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let saved = other_svc
+        .set_note_content(ws.clone(), id.clone(), user.into(), false, Some(0), None)
+        .await
+        .expect("user save");
+    assert_eq!(saved.rev, 1);
+    drop(held);
+
+    let result = fut.await.expect("surgical write");
+    let stored = other.get_note(&ws, &id).await.expect("final note");
+    assert_eq!(
+        stored.rev, 2,
+        "surgical write lands on top of the user save"
+    );
+    assert_eq!(
+        other
+            .get_note_version_content_by_rev(&ws, &id, 2)
+            .await
+            .expect("lookup"),
+        Some(stored.content.clone()),
+        "surgical write is snapshotted at its rev"
+    );
+    (result, stored)
+}
+
+/// Regression (intentd#1817 review, finding 2): `note.add` that read rev 0
+/// no longer overwrites a user `setContent` that landed at rev 1 — its write
+/// is gated on the rev it read, and the retry three-way-merges the appended
+/// chunk onto the user's text (`TYPED` survives, `AGENT` lands on top).
+#[tokio::test]
+async fn note_add_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| {
+            svc.add_to_note(
+                ws,
+                id,
+                NoteAddInput {
+                    content: "AGENT".into(),
+                    heading: None,
+                    position: None,
+                },
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(stored.content, "alpha TYPED\nbeta\ngamma\n\nAGENT");
+    assert_eq!(result.new_content, stored.content);
+    assert_eq!(result.old_content, "alpha TYPED\nbeta\ngamma");
+}
+
+/// Same race for `note.edit`: the replacement merges onto the user's save.
+#[tokio::test]
+async fn note_edit_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| {
+            svc.edit_note(
+                ws,
+                id,
+                NoteEditInput {
+                    old: "gamma".into(),
+                    new: "gamma AGENT".into(),
+                },
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(stored.content, "alpha TYPED\nbeta\ngamma AGENT");
+    assert_eq!(result.new_content, stored.content);
+}
+
+/// Same race for `note.editLines`: the line replacement merges onto the
+/// user's save.
+#[tokio::test]
+async fn note_edit_lines_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| {
+            svc.edit_note_lines(
+                ws,
+                id,
+                NoteEditLinesInput {
+                    start: 3,
+                    end: 3,
+                    content: "gamma AGENT".into(),
+                },
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(stored.content, "alpha TYPED\nbeta\ngamma AGENT");
+    assert_eq!(result.new_content, stored.content);
+    assert_eq!(result.total_lines_before, 3);
+    assert_eq!(result.total_lines_after, 3);
 }
 
 /// Read-merge-persist loop converges under contention: four writers that all
