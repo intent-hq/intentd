@@ -190,11 +190,15 @@ environment (all three) and `--show-progress none` on the nextest command (the `
 targets already set both) or progress-bar redraws flood the output buffer.
 
 The CI `check` job also runs the repo-slug fold lint,
-`cargo test -p intent-core --test repo_slug_fold_lint`, which fails naming `file:line`
-wherever owner/name slug identity is case-folded or compared outside
-`intent_core::RepoRef` (intent-hq/intentd#1809 → #1815); a site that is not slug identity
-opts out with `// repo-slug-fold: allow — <reason>` on the line immediately above the
-statement, and the reason is required.
+`cargo test -p intent-core --test repo_slug_fold_lint`, a deliberately narrow source
+heuristic: it fails naming `file:line` for every statement outside
+`intent_core::RepoRef` where a case-fold call (`to_lowercase`, `to_ascii_lowercase`,
+`eq_ignore_ascii_case`, `make_ascii_lowercase`) co-occurs with an `owner` / `repo` /
+`repository` / `slug` identifier (intent-hq/intentd#1809 → #1815). It does not prove
+every raw slug comparison is caught — route slug identity through `RepoRef` regardless.
+A flagged site that is not slug identity opts out with
+`// repo-slug-fold: allow — <reason>` on the line immediately above the statement, and
+the reason is required.
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.
