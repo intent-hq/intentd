@@ -209,5 +209,6 @@ single tracker for all components; never track issues in markdown files. Use lab
 `component:intentd` + `agent-filed`. See the [root `AGENTS.md`](../../AGENTS.md) →
 Filing Issues for the full conventions (dedup, cross-referencing,
 `Fixes intent-hq/intent#N` — the release notifier is completeness-gated: it comments
-on the issue only once every linked intentd fix PR is merged and contained in the
-released tag).
+on the issue only once the issue is closed and every linked intentd fix PR is merged
+and contained in the released tag; a plain `intent-hq/intent#N` mention never earns a
+release comment, only a closing-keyword reference on the actual fix PR does).
