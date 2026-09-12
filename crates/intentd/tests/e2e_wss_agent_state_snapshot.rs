@@ -44,7 +44,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -62,28 +61,24 @@ const CHILD_COUNTER_MARKER: &str = "KEEP_CHILD_ACTIVE_FOR_SNAPSHOT_E2E";
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let log_path = self.data_dir.join("daemon.log");
+        let log_path = self.data_dir.path().join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             if !log.is_empty() {
                 eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-snap-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-snap-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -413,7 +408,8 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let prompt_log = data_dir.join("prompt-log.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
@@ -441,6 +437,7 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
     .to_string();
 
     let mut _daemon = Daemon {
+        data_dir: data_dir_guard,
         child: spawn_serve(
             &data_dir,
             &[
@@ -451,7 +448,6 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
                 ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
             ],
         ),
-        data_dir: data_dir.clone(),
     };
     assert!(await_uds(&socket).await, "daemon did not start");
 
@@ -774,7 +770,8 @@ async fn snapshot_running_sub_agents_excludes_idle_children_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // The child's rule holds its turn open for a few seconds so the
@@ -801,6 +798,7 @@ async fn snapshot_running_sub_agents_excludes_idle_children_over_wss() {
     .to_string();
 
     let mut _daemon = Daemon {
+        data_dir: data_dir_guard,
         child: spawn_serve(
             &data_dir,
             &[
@@ -810,7 +808,6 @@ async fn snapshot_running_sub_agents_excludes_idle_children_over_wss() {
                 ("MOCK_AGENT_BEHAVIOR", &behavior),
             ],
         ),
-        data_dir: data_dir.clone(),
     };
     assert!(await_uds(&socket).await, "daemon did not start");
 
@@ -951,13 +948,15 @@ async fn snapshot_prs_groups_tracked_open_prs_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let prompt_log = data_dir.join("prompt-log.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "done" }).to_string();
 
     let mut _daemon = Daemon {
+        data_dir: data_dir_guard,
         child: spawn_serve(
             &data_dir,
             &[
@@ -968,7 +967,6 @@ async fn snapshot_prs_groups_tracked_open_prs_over_wss() {
                 ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
             ],
         ),
-        data_dir: data_dir.clone(),
     };
     assert!(await_uds(&socket).await, "daemon did not start");
 
@@ -1190,13 +1188,15 @@ async fn snapshot_tasks_counts_open_task_notes_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let prompt_log = data_dir.join("prompt-log.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "done" }).to_string();
 
     let mut _daemon = Daemon {
+        data_dir: data_dir_guard,
         child: spawn_serve(
             &data_dir,
             &[
@@ -1207,7 +1207,6 @@ async fn snapshot_tasks_counts_open_task_notes_over_wss() {
                 ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
             ],
         ),
-        data_dir: data_dir.clone(),
     };
     assert!(await_uds(&socket).await, "daemon did not start");
 

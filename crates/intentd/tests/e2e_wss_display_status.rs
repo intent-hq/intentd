@@ -13,7 +13,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,13 +46,6 @@ use common::TlsWs;
 
 /// A fixed 64-char hex token (valid shape) shared by server + client.
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
@@ -345,7 +337,7 @@ struct Fixture {
     cfg: Arc<ClientConfig>,
     ws_id: WorkspaceId,
     store: Store,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener over a seeded workspace. When
@@ -354,9 +346,8 @@ struct Fixture {
 /// repo info at all (PR paths inert for the task-driven test). `pr_status`
 /// seeds only the persisted `prStatus` column (no rich PR objects).
 async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestStatus>) -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-display-status-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = common::test_tempdir("intentd-display-status-");
+    let dir = tmp.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -446,7 +437,7 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
         cfg,
         ws_id,
         store,
-        _dir: TempDir(dir),
+        _dir: tmp,
     }
 }
 

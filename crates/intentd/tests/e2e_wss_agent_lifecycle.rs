@@ -30,15 +30,13 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-/// Live `intentd serve` process; killed and its data dir removed on drop.
+/// Live `intentd serve` process; killed on drop.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
@@ -59,15 +57,11 @@ impl Drop for Daemon {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -366,7 +360,8 @@ async fn mock_agent_full_turn_saves_readable_asset_over_wss() {
     // Pre-seed the daemon's DB with a workspace + target note (the daemon opens
     // this same data dir on launch). The store is closed before the daemon
     // process starts so it gets a clean handle. Mirrors the UDS analogue.
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     // The agent saves generated media, then embeds the returned URL in a note.
     // Both calls run through the production workspace_api MCP bridge.
@@ -395,10 +390,7 @@ async fn mock_agent_full_turn_saves_readable_asset_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -649,7 +641,8 @@ async fn abnormal_finish_reason_persists_on_transcript_over_wss() {
     let Some(script) = gate("WSS abnormal finishReason E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({
         "response": "refusing to continue",
@@ -663,10 +656,7 @@ async fn abnormal_finish_reason_persists_on_transcript_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -792,7 +782,8 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // The stalled prompt streams a chunk, then parks in total silence before
     // resolving `end_turn`; the quick prompt resolves immediately. Margins
@@ -815,10 +806,7 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
         ("INTENTD_SILENT_TAIL_SUSPECT_MS", "2000"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1003,7 +991,8 @@ async fn mid_turn_stall_and_resume_status_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({
         "response": "back after the stall",
@@ -1018,10 +1007,7 @@ async fn mid_turn_stall_and_resume_status_over_wss() {
         ("INTENTD_STREAM_STALL_MS", "1000"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1170,7 +1156,8 @@ async fn open_tool_call_suppresses_stall_status_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // `silentTailBeforeResultMs` parks AFTER the last session/update and
     // before the prompt resolves, so for the tool rule the silence spans a
@@ -1203,10 +1190,7 @@ async fn open_tool_call_suppresses_stall_status_over_wss() {
         ("INTENTD_STREAM_STALL_MS", "1000"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1354,7 +1338,8 @@ async fn mock_agent_full_turn_over_wss_with_session_mcp_servers() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let js = format!(
         "return await ws.note.add({}, {{ content: {} }});",
@@ -1377,10 +1362,7 @@ async fn mock_agent_full_turn_over_wss_with_session_mcp_servers() {
         ("MOCK_AGENT_SESSION_MCP", "1"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1488,7 +1470,8 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
     let Some(script) = gate("WSS status-lifecycle E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "status lifecycle ok" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -1498,10 +1481,7 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1713,7 +1693,8 @@ async fn agent_stop_keep_alive_resume_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -1723,10 +1704,7 @@ async fn agent_stop_keep_alive_resume_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -2023,7 +2001,8 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -2033,10 +2012,7 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -2252,7 +2228,8 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -2262,10 +2239,7 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -2487,7 +2461,8 @@ async fn interrupt_priority_send_to_task_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -2497,10 +2472,7 @@ async fn interrupt_priority_send_to_task_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -2655,7 +2627,8 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -2665,10 +2638,7 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -2881,7 +2851,8 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "parked" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -2891,10 +2862,7 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -3079,7 +3047,8 @@ async fn agent_diagnostics_reports_subtree_memory_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // Park the prompted agent mid-turn so its node child stays alive across
     // sampler sweeps and keeps a registered agent-root pid.
@@ -3091,10 +3060,7 @@ async fn agent_diagnostics_reports_subtree_memory_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -3245,7 +3211,8 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // Post-WSAPI-8: replace discrete `delegate_task` with the unified
     // `workspace_api` tool routing through `ws.agent.delegate`.
@@ -3272,10 +3239,7 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -3407,7 +3371,8 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "delegated child ran" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -3417,10 +3382,7 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -3569,7 +3531,8 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // Post-WSAPI-8: agents drive the workspace through the unified
     // `workspace_api` tool + `ws.*` bindings; the discrete
@@ -3636,10 +3599,7 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -3889,7 +3849,8 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     // The child reports via the unified `workspace_api` tool + `ws.*` binding
     // after an ordinary linked task-note append, reproducing monorepo#3577.
@@ -3941,10 +3902,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         ("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", "50"),
     ];
     let child_proc = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child: child_proc,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child: child_proc };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -4193,7 +4151,8 @@ async fn attention_request_discussion_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let request_js = format!(
         "await ws.note.add({}, {{ content: {} }}); await ws.task.updateNoteStatus({}, 'waiting'); return await ws.agent.requestDiscussion({});",
@@ -4221,10 +4180,7 @@ async fn attention_request_discussion_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child_proc = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child: child_proc,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child: child_proc };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -4591,7 +4547,8 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let request_js = format!(
         "return await ws.agent.requestDiscussion({});",
@@ -4616,10 +4573,7 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child_proc = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child: child_proc,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child: child_proc };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -4814,7 +4768,8 @@ async fn attention_request_cleared_by_drained_queue_message_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let request_js = format!(
         "return await ws.agent.requestDiscussion({});",
@@ -4848,10 +4803,7 @@ async fn attention_request_cleared_by_drained_queue_message_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child_proc = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child: child_proc,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child: child_proc };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -5096,7 +5048,8 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let blocker_js = format!(
         "await ws.note.add({}, {{ content: {} }}); return await ws.agent.reportBlocker({});",
@@ -5136,10 +5089,7 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child_proc = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child: child_proc,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child: child_proc };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -5375,7 +5325,8 @@ async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() 
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let request_js = format!(
         "return await ws.agent.requestDiscussion({});",
@@ -5431,10 +5382,7 @@ async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() 
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child_proc = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child: child_proc,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child: child_proc };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -5704,17 +5652,17 @@ where
 }
 
 /// Boot a hermetic `intentd serve` with WSS enabled (no mock-agent env), seed a
-/// workspace + note, and return `(daemon, ws_id, note_id, port, fingerprint)`.
+/// workspace + note, and return `(data_dir, daemon, ws_id, note_id, port, fingerprint)`.
+/// The data-dir guard comes first so it drops after the daemon.
 /// Used by the no-node read-arm sweep below.
-async fn boot_daemon_with_seeded_note() -> (Daemon, String, String, u16, String) {
-    let data_dir = temp_data_dir();
+async fn boot_daemon_with_seeded_note() -> (tempfile::TempDir, Daemon, String, String, u16, String)
+{
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
-    let daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -5724,7 +5672,7 @@ async fn boot_daemon_with_seeded_note() -> (Daemon, String, String, u16, String)
         .as_str()
         .expect("fingerprint")
         .to_string();
-    (daemon, ws_id, note_id, port, fingerprint)
+    (data_dir_guard, daemon, ws_id, note_id, port, fingerprint)
 }
 
 /// WSS-2 (router): drive a broad slice of untested-over-WSS read/lifecycle
@@ -5737,7 +5685,8 @@ async fn boot_daemon_with_seeded_note() -> (Daemon, String, String, u16, String)
 /// No agent turn → no `node` dependency.
 #[tokio::test]
 async fn router_read_lifecycle_arms_over_wss() {
-    let (_daemon, ws_id, note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let (_data_dir, _daemon, ws_id, note_id, port, fingerprint) =
+        boot_daemon_with_seeded_note().await;
     let cfg = client_config(&fingerprint);
     let mut rpc = connect_ws(port, cfg.clone()).await;
 
@@ -6045,7 +5994,8 @@ async fn router_read_lifecycle_arms_over_wss() {
 async fn terminal_create_env_over_wss() {
     use base64::Engine as _;
 
-    let (_daemon, ws_id, _note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let (_data_dir, _daemon, ws_id, _note_id, port, fingerprint) =
+        boot_daemon_with_seeded_note().await;
     let cfg = client_config(&fingerprint);
 
     // SUBSCRIBER conn — subscribe BEFORE spawning so no chunk is missed.
@@ -6235,7 +6185,8 @@ async fn terminal_data_many_chunks_transient_over_wss() {
     const CHUNKS: usize = 200;
     use base64::Engine as _;
 
-    let (_daemon, ws_id, _note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let (_data_dir, _daemon, ws_id, _note_id, port, fingerprint) =
+        boot_daemon_with_seeded_note().await;
     let cfg = client_config(&fingerprint);
 
     // SUBSCRIBER conn — subscribe BEFORE spawning so no chunk is missed.
@@ -6377,7 +6328,8 @@ async fn terminal_data_many_chunks_transient_over_wss() {
 /// behaves like no type filter.
 #[tokio::test]
 async fn event_query_event_type_glob_over_wss() {
-    let (_daemon, ws_id, note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let (_data_dir, _daemon, ws_id, note_id, port, fingerprint) =
+        boot_daemon_with_seeded_note().await;
     let cfg = client_config(&fingerprint);
     let mut rpc = connect_ws(port, cfg).await;
 
@@ -6468,7 +6420,8 @@ async fn event_query_event_type_glob_over_wss() {
 async fn event_query_response_bounded_over_wss() {
     const ONE_MIB: usize = 1024 * 1024;
     const SEEDED: usize = 50;
-    let (_daemon, ws_id, _note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let (_data_dir, _daemon, ws_id, _note_id, port, fingerprint) =
+        boot_daemon_with_seeded_note().await;
     let cfg = client_config(&fingerprint);
     let mut rpc = connect_ws(port, cfg).await;
 
@@ -6545,7 +6498,8 @@ async fn subscription_filter_branches_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     // Post-WSAPI-8: agents drive `add_to_note` via `workspace_api` +
     // `ws.note.add`; the discrete tool is gone.
@@ -6568,10 +6522,7 @@ async fn subscription_filter_branches_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -6689,7 +6640,8 @@ async fn mid_stream_subscriber_disconnect_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -6699,10 +6651,7 @@ async fn mid_stream_subscriber_disconnect_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -6817,7 +6766,8 @@ async fn mid_stream_subscriber_disconnect_over_wss() {
 /// EOF or timeout. No node required.
 #[tokio::test]
 async fn oversized_request_head_rejected_over_wss() {
-    let (_daemon, _ws_id, _note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let (_data_dir, _daemon, _ws_id, _note_id, port, fingerprint) =
+        boot_daemon_with_seeded_note().await;
     let cfg = client_config(&fingerprint);
     let mut tls = tls_connect(port, cfg).await;
 
@@ -6864,7 +6814,8 @@ async fn queue_message_self_drains_on_idle_agent_over_wss() {
     let Some(script) = gate("WSS queue self-drain E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "queued drain ok" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -6874,10 +6825,7 @@ async fn queue_message_self_drains_on_idle_agent_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -6994,7 +6942,8 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
     let Some(script) = gate("WSS dequeued message event E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // First turn is slow to keep the agent busy while we queue the second message.
     let behavior = json!({
@@ -7009,10 +6958,7 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -7175,7 +7121,8 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     let Some(script) = gate("WSS queued messageMetadata E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // First turn is slow to open a deterministic window where the second send
     // (carrying messageMetadata) lands on a busy agent and queues.
@@ -7191,10 +7138,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -7367,7 +7311,8 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
     let Some(script) = gate("WSS sub-threshold dequeue-wait E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // 2s busy window < 5s threshold; INTENTD_DEQUEUE_WAIT_MIN_MS deliberately
     // NOT set — this test exercises the production default.
@@ -7379,10 +7324,7 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -7585,7 +7527,8 @@ async fn user_app_message_id_round_trips_over_wss() {
     let Some(script) = gate("WSS userAppMessageId E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // First turn is slow so the SECOND tagged send lands on a busy agent and
     // exercises the queue fallback path.
@@ -7597,10 +7540,7 @@ async fn user_app_message_id_round_trips_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -7739,7 +7679,8 @@ async fn remove_queued_message_is_idempotent_over_wss() {
     // when the message id is unknown. The FE's seeded mirror diverges from the
     // BE's in-memory queue after a daemon restart; the BE must return success
     // (not an error) so the FE's optimistic delete sticks.
-    let (_daemon, ws_id, _note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let (_data_dir, _daemon, ws_id, _note_id, port, fingerprint) =
+        boot_daemon_with_seeded_note().await;
     let cfg = client_config(&fingerprint);
     let mut rpc = connect_ws(port, cfg.clone()).await;
 
@@ -7790,7 +7731,8 @@ async fn send_queued_message_now_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -7800,10 +7742,7 @@ async fn send_queued_message_now_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -8009,7 +7948,8 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
     let Some(script) = gate("WSS mixed-case queue drain E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // First turn delays 1.2s so we have a deterministic setup window to enqueue
     // + toggle editing + enqueue again while the agent is busy. Subsequent
@@ -8022,10 +7962,7 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -8251,7 +8188,8 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let behavior = json!({ "response": "initial agent ran" }).to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -8260,10 +8198,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -8507,13 +8442,11 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
 /// no cross-workspace bleed of body, title, or `workspaceId`.
 #[tokio::test]
 async fn workspace_create_seeds_per_workspace_spec_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -8582,11 +8515,10 @@ async fn workspace_create_seeds_per_workspace_spec_over_wss() {
 /// Init a small local git repo (one commit) and return its on-disk path. Used
 /// by the WSS clone-orchestration e2e as a `file://` source. Skips the test
 /// when `git` is unavailable on `PATH` by returning `None`.
-fn seed_local_repo(prefix: &str) -> Option<PathBuf> {
+fn seed_local_repo(prefix: &str) -> Option<tempfile::TempDir> {
     intent_providers::resolve_on_path("git")?;
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).ok()?;
+    let tmp = common::test_tempdir_in("/tmp", &format!("{prefix}-"));
+    let dir = tmp.path().to_path_buf();
     let run = |args: &[&str]| -> bool {
         Command::new("git")
             .args(args)
@@ -8607,7 +8539,7 @@ fn seed_local_repo(prefix: &str) -> Option<PathBuf> {
     if !run(&["add", "README.md"]) || !run(&["commit", "-q", "-m", "chore: init"]) {
         return None;
     }
-    Some(dir)
+    Some(tmp)
 }
 
 /// `workspace.create { githubUrl }` clones the URL inside the idempotent op
@@ -8620,14 +8552,12 @@ async fn workspace_create_clones_github_url_over_wss() {
         eprintln!("skipping WSS clone E2E: git not available");
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let clone_target = data_dir.join("cloned-checkout");
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -8662,7 +8592,7 @@ async fn workspace_create_clones_github_url_over_wss() {
         json!({
             "title": "Cloned via WSS",
             "branch": "feat/wss-clone",
-            "githubUrl": format!("file://{}", source.display()),
+            "githubUrl": format!("file://{}", source.path().display()),
             "clonePath": clone_target.to_string_lossy(),
         }),
     )
@@ -8712,9 +8642,6 @@ async fn workspace_create_clones_github_url_over_wss() {
         clone_done_first,
         "git:clone:done precedes workspace:created"
     );
-
-    // Cleanup the seed source (best-effort).
-    let _ = std::fs::remove_dir_all(&source);
 }
 
 /// DELIV-1 regression: neither `agent.wakeOrCreate`'s wake-message delivery
@@ -8740,7 +8667,8 @@ async fn deliv1_no_lost_messages_wake_or_create_then_send_to_task_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     // Distinct responses per turn keyed on prompt text so the transcript
     // assertion below can prove BOTH turns actually ran (not just one).
@@ -8759,10 +8687,7 @@ async fn deliv1_no_lost_messages_wake_or_create_then_send_to_task_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -8931,7 +8856,8 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "target finished the follow-up" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -8941,10 +8867,7 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -9123,7 +9046,8 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
 
     // The parent delegates two after_all children, sends follow-ups to each.
@@ -9167,10 +9091,7 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
         ("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", "50"),
     ];
     let child_proc = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child: child_proc,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child: child_proc };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -9396,7 +9317,8 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // Dedicated TMPDIR keeps the daemon's residual temp usage hermetic and
     // lets this test assert the generated rules file no longer lands there
@@ -9416,10 +9338,7 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
         ("TMPDIR", &tmp_dir_s),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -9534,17 +9453,15 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -9651,17 +9568,15 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -9724,7 +9639,8 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // Child behavior: first turn reports back, second turn acknowledges.
     let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
@@ -9764,10 +9680,7 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child_proc = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child: child_proc,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child: child_proc };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -9948,7 +9861,8 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
     let delegate_js = format!(
@@ -9996,10 +9910,7 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child_proc = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child: child_proc,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child: child_proc };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -10243,7 +10154,8 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     // Slow first turn to keep agent busy while we queue the second message.
     let behavior = json!({
@@ -10262,10 +10174,7 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -10534,7 +10443,8 @@ async fn stab_114_interrupt_zero_output_delivers_combined_prompt_over_wss() {
     };
     eprintln!("[STAB114-TEST] Test body running");
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, _note_id) = seed_workspace_and_note(&data_dir).await;
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
@@ -10548,10 +10458,7 @@ async fn stab_114_interrupt_zero_output_delivers_combined_prompt_over_wss() {
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -10744,7 +10651,8 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, _note_id) = seed_workspace_and_note(&data_dir).await;
     // blockUntilCancel streams a chunk then parks
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
@@ -10755,10 +10663,7 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -10858,7 +10763,8 @@ async fn agent_stop_before_first_token_persists_empty_interrupted_row_over_wss()
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, _note_id) = seed_workspace_and_note(&data_dir).await;
     // parkBeforeFirstChunk parks immediately without streaming any chunks.
     let behavior = json!({ "parkBeforeFirstChunk": true, "response": "resumed" }).to_string();
@@ -10869,10 +10775,7 @@ async fn agent_stop_before_first_token_persists_empty_interrupted_row_over_wss()
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -11010,7 +10913,8 @@ async fn agent_stop_zero_output_redelivers_message_and_image_on_follow_up_over_w
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, _note_id) = seed_workspace_and_note(&data_dir).await;
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
@@ -11025,10 +10929,7 @@ async fn agent_stop_zero_output_redelivers_message_and_image_on_follow_up_over_w
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -11224,7 +11125,8 @@ async fn image_reference_block_resolves_to_acp_image_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // The workspace needs a real filesystem root: `file.placeAttachment`
     // lands bytes under `.intent/attachments/` and the reference resolution
     // reads them back from the same root.
@@ -11252,10 +11154,7 @@ async fn image_reference_block_resolves_to_acp_image_over_wss() {
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -11387,7 +11286,8 @@ async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // parkMidToolCall: emit tool_call (in_progress) then park until cancel.
     let behavior = json!({ "parkMidToolCall": true, "response": "resumed" }).to_string();
@@ -11398,10 +11298,7 @@ async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -11541,7 +11438,8 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "seen" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -11551,10 +11449,7 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -11671,7 +11566,8 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // Rule-matched behavior: the SENDER's kickoff prompt drives a real MCP
     // `workspace_api` call that finds the target by name and sends to it; the
@@ -11701,10 +11597,7 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -11888,7 +11781,8 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     // The SENDER's rule-matched turn fires one workspace_api call covering
     // all three paths: sendToTask to the task assignee, an auto-tagged
@@ -11922,10 +11816,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -12164,7 +12055,8 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // Rule 1 (parent kickoff): spawn the child through the real MCP
     // `workspace_api` binding so the session persists `parent_agent_id`.
@@ -12222,10 +12114,7 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -12618,7 +12507,8 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
@@ -12631,10 +12521,7 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -12825,7 +12712,8 @@ async fn edit_and_regenerate_stops_in_flight_turn_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({
         "parkIfPromptContains": "PARK_ME",
@@ -12839,10 +12727,7 @@ async fn edit_and_regenerate_stops_in_flight_turn_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -13003,7 +12888,8 @@ async fn edit_and_regenerate_rejects_bad_message_ids_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "fine" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -13013,10 +12899,7 @@ async fn edit_and_regenerate_rejects_bad_message_ids_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -13163,7 +13046,8 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // The mock's first turn streams one chunk ("streaming-before-cancel") then
     // parks until session/cancel — a deterministic mid-stream state.
@@ -13175,10 +13059,7 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -13397,7 +13278,8 @@ async fn proposal_resource_standalone_block_over_chat_subscribe() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // The mock echoes a canned tool_call → tool_call_update pair whose
     // rawOutput carries the proposal-MIME resource item (no MCP round-trip).
@@ -13427,10 +13309,7 @@ async fn proposal_resource_standalone_block_over_chat_subscribe() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -13595,7 +13474,8 @@ async fn proposal_lifted_from_collapsed_output_over_chat_subscribe() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // The canned tool_call_update carries the auggie-collapsed rawOutput: the
     // daemon's own {ok, proposal} text-item payload stringified under
@@ -13626,10 +13506,7 @@ async fn proposal_lifted_from_collapsed_output_over_chat_subscribe() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -13796,7 +13673,8 @@ async fn token_usage_captured_at_turn_end_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // Turn 1 (top-level behavior): cumulative snapshot 70/50 (+30/+4 cached).
     // Turn 2 (rule, matched on the second prompt's marker): grows to 100/80
@@ -13830,10 +13708,7 @@ async fn token_usage_captured_at_turn_end_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -13950,7 +13825,8 @@ async fn usage_update_cost_captured_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({
         "response": "turn one",
@@ -13981,10 +13857,7 @@ async fn usage_update_cost_captured_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -14129,7 +14002,8 @@ async fn grok_meta_usage_bill_captured_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     seed_grok_path_override(&data_dir, &script);
     // No standard `usage` field on either turn — only the `_meta` bill, in
@@ -14175,10 +14049,7 @@ async fn grok_meta_usage_bill_captured_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -14307,7 +14178,8 @@ async fn status_only_tool_update_preserves_richer_title_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({
         "response": "title preserved",
@@ -14330,10 +14202,7 @@ async fn status_only_tool_update_preserves_richer_title_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -14585,7 +14454,8 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
     let Some(script) = gate("WSS queue-drain user-row chat delta E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // First turn is slow so the second send lands on a busy agent and queues.
     let behavior = json!({ "response": "mock reply", "firstTurnDelayMs": 2000 }).to_string();
@@ -14596,10 +14466,7 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -14764,7 +14631,8 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
     let Some(script) = gate("WSS direct-send user-row chat delta E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "direct reply" }).to_string();
     let env: [(&str, &str); 4] = [
@@ -14774,10 +14642,7 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -14954,7 +14819,8 @@ async fn tool_call_activity_pings_carry_last_tool_use_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({
         "response": "tools done\n",
@@ -14978,10 +14844,7 @@ async fn tool_call_activity_pings_carry_last_tool_use_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -15093,7 +14956,8 @@ async fn thinking_blocks_stream_and_persist_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // The mock echoes the canned thought chunks before its response text.
     let behavior = json!({
@@ -15113,10 +14977,7 @@ async fn thinking_blocks_stream_and_persist_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -15294,7 +15155,8 @@ async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "hello from mock" }).to_string();
     let env: [(&str, &str); 5] = [
@@ -15307,10 +15169,7 @@ async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
         ("INTENTD_IDLE_REAP_MS", "800"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -15468,7 +15327,8 @@ async fn agent_stop_on_wedged_transport_emits_terminal_events_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     // 5000 unawaited reads ≈ 5000 small error frames — comfortably more than
     // the OS pipe + the child's paused stream buffer + the 256-slot writer
@@ -15482,10 +15342,7 @@ async fn agent_stop_on_wedged_transport_emits_terminal_events_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -15655,7 +15512,8 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let prompt_log = data_dir.join("prompt-log.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().to_string();
@@ -15677,10 +15535,7 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
         ("MOCK_AGENT_KILLS_ON_INTERRUPT", "1"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
