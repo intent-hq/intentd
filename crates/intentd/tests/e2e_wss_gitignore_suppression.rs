@@ -328,7 +328,7 @@ async fn gitignored_write_is_suppressed_over_wss() {
     std::fs::create_dir_all(checkout.join("generated")).expect("mkdir generated");
 
     let child = spawn_serve(&data_dir, &home_dir);
-    let _guard = common::DaemonGuard::new(child, data_dir.clone(), true);
+    let _guard = common::DaemonGuard::process_only(child);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

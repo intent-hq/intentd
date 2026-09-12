@@ -472,7 +472,7 @@ async fn resume_via_session_load_replays_interrupted_tail() {
         &session_log,
         "daemon2.log",
     );
-    let _daemon2 = common::DaemonGuard::new(child2, data_dir.clone(), true);
+    let _daemon2 = common::DaemonGuard::process_only(child2);
     assert!(await_uds(&socket).await, "daemon2 did not start");
 
     let status = common::await_wss_status(&socket).await;

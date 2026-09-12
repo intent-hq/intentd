@@ -398,7 +398,7 @@ async fn interrupted_agents_persisted_across_restart() {
     #[cfg(unix)]
     cmd3.process_group(0);
     let child3 = cmd3.spawn().expect("spawn intentd serve 3");
-    let _guard3 = DaemonGuard::new(child3, data_dir.clone(), true);
+    let _guard3 = DaemonGuard::process_only(child3);
     assert!(await_uds(&socket).await, "daemon did not restart 2");
 
     let status = common::await_wss_status(&socket).await;
@@ -605,7 +605,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     #[cfg(unix)]
     cmd2.process_group(0);
     let child2 = cmd2.spawn().expect("spawn intentd serve 2");
-    let _daemon2 = DaemonGuard::new(child2, data_dir.clone(), true);
+    let _daemon2 = DaemonGuard::process_only(child2);
     assert!(await_uds(&socket).await, "daemon did not restart");
 
     let status = common::await_wss_status(&socket).await;

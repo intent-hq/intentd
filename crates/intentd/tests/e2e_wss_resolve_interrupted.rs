@@ -249,7 +249,7 @@ async fn resolve_interrupted_resume_and_abandon() {
     #[cfg(unix)]
     cmd.process_group(0);
     let child = cmd.spawn().expect("spawn intentd serve");
-    let mut guard = DaemonGuard::new(child, data_dir.clone(), true);
+    let mut guard = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let ws_id = "ws-resolve-test";
@@ -570,7 +570,7 @@ async fn resolve_interrupted_invalid_params_validation() {
     #[cfg(unix)]
     cmd.process_group(0);
     let child = cmd.spawn().expect("spawn intentd serve");
-    let mut guard = DaemonGuard::new(child, data_dir.clone(), true);
+    let mut guard = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "daemon did not start");
 
     // Fetch fingerprint and port
