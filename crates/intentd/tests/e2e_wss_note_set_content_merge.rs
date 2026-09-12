@@ -5,9 +5,9 @@
 //! three-way-merging its intent onto the current text instead of failing with
 //! `-32005`. The response carries the post-write `rev` (equal to `note.get`),
 //! the merged content holds both edits, and each write emits exactly one
-//! `note:updated`. Drives a real [`WsApiServer`] over plain `ws://` (insecure
-//! dev mode) so the WebSocket-upgrade → JSON-RPC → router → services → store
-//! round-trip is exercised end-to-end.
+//! `note:updated`. Drives a real [`WsApiServer`] over TLS with bearer auth
+//! and a fingerprint-pinned client, so the production wire path (TLS upgrade
+//! → JSON-RPC → router → services → store) is exercised end-to-end.
 
 #![cfg(unix)]
 
@@ -15,21 +15,29 @@ mod common;
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use intent_core::WorkspaceApi;
+use intent_core::{Result as CoreResult, WorkspaceApi};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
-use intent_transport::{WsApiServer, WsOptions};
+use intent_transport::{
+    ensure_tls_certificate, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
+};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
-use tokio::net::TcpStream;
+use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+use common::TlsWs;
+
+/// A fixed 64-char hex token (valid shape) shared by server + client.
+const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
 struct TempDir(PathBuf);
 impl Drop for TempDir {
@@ -38,12 +46,103 @@ impl Drop for TempDir {
     }
 }
 
+/// In-memory [`TokenStore`] so tests never touch the real OS keychain.
+#[derive(Default)]
+struct MemTokenStore(Mutex<Option<String>>);
+
+impl TokenStore for MemTokenStore {
+    fn load_token(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+    fn store_token(&self, token: &str) -> CoreResult<()> {
+        *self.0.lock().unwrap() = Some(token.to_string());
+        Ok(())
+    }
+}
+
+/// Client cert verifier that pins the server's SHA-256 fingerprint (colon hex)
+/// and otherwise validates the handshake signature with the ring provider.
+#[derive(Debug)]
+struct PinnedVerifier {
+    fingerprint: String,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let fp = Sha256::digest(end_entity.as_ref())
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        if fp == self.fingerprint {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("fingerprint mismatch".into()))
+        }
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+            fingerprint: fingerprint.to_string(),
+            provider,
+        }))
+        .with_no_client_auth();
+    Arc::new(config)
+}
+
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
+    cfg: Arc<ClientConfig>,
     _dir: TempDir,
 }
 
+/// Boot a TLS + bearer-auth WSS listener over a hermetic workspaces root.
 async fn boot() -> Fixture {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let dir = std::env::temp_dir().join(format!("intentd-setcontent-{}", &short[..8]));
@@ -57,35 +156,40 @@ async fn boot() -> Fixture {
         .with_settings_registry(common::registry_with_default_provider(&dir))
         .with_event_bus(bus.clone());
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+    let tls = ensure_tls_certificate(&dir).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let opts = WsOptions {
         base_port: 0,
         bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         ..Default::default()
     };
-    let ws = WsApiServer::new_insecure(api, bus, opts, None);
+    let ws = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
+    let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Fixture {
         _ws: ws,
         port,
+        cfg,
         _dir: TempDir(dir),
     }
 }
 
-async fn connect(port: u16) -> PlainWs {
-    let url = format!("ws://127.0.0.1:{port}/ws");
-    let (sock, _resp) = tokio_tungstenite::connect_async(&url)
-        .await
-        .expect("plain ws handshake");
-    sock
+/// Establish an authenticated WSS connection over pinned TLS (token in the
+/// query string).
+async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
+    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+    common::wss_connect_with_retry(port, cfg, &url).await
 }
 
-async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
+async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let v = wss_rpc_raw(ws, id, method, params).await;
     assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
     v["result"].clone()
 }
 
-async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
+async fn wss_rpc_raw(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(req.to_string().into()))
         .await
@@ -99,7 +203,10 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
                         return v;
                     }
                 }
-                Message::Ping(_) | Message::Pong(_) => {}
+                Message::Ping(p) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                Message::Pong(_) => {}
                 _ => panic!("unexpected message"),
             }
         }
@@ -110,7 +217,7 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
 
 /// Drain `events.event` notifications from the subscriber socket until it has
 /// been quiet for `settle`, returning the `note:updated` events for `note_id`.
-async fn drain_note_updated(evt: &mut PlainWs, note_id: &str, settle: Duration) -> Vec<Value> {
+async fn drain_note_updated(evt: &mut TlsWs, note_id: &str, settle: Duration) -> Vec<Value> {
     let mut seen = Vec::new();
     loop {
         match timeout(settle, evt.next()).await {
@@ -141,8 +248,8 @@ async fn drain_note_updated(evt: &mut PlainWs, note_id: &str, settle: Duration) 
 #[tokio::test]
 async fn note_set_content_stale_expected_version_merges_over_wss() {
     let fx = boot().await;
-    let mut rpc = connect(fx.port).await;
-    let mut evt = connect(fx.port).await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let mut evt = connect(fx.port, fx.cfg.clone()).await;
 
     let created = wss_rpc(
         &mut rpc,
