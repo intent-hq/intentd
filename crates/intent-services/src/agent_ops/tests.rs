@@ -28702,26 +28702,59 @@ async fn held_entry_excluded_from_drain_until_release() {
 
 /// The per-entry release timer flushes the hold at `holdUntil`: the entry
 /// becomes ready-to-send without any manual release call.
+///
+/// Both wall-clock races are kept out of the assertions:
+/// - The "held before the deadline" check runs against a FAR deadline; the
+///   enqueue awaits a persisted write-through, which under load can outlast a
+///   short hold, so a short deadline would already have passed here. The
+///   same-key upsert then shortens the deadline in place and re-arms the
+///   timer.
+/// - The flush is observed directly — the `holdKind` marker disappearing
+///   from the queue snapshot — rather than via `has_ready_to_send`.
+///   Readiness derives from `is_held()`, which compares `holdUntil` against
+///   the wall clock, so it flips true the instant the deadline passes,
+///   possibly before the spawned timer task has run `flush_expired_hold`;
+///   dequeuing at that point would race the flush and see the marker still
+///   set. Only the marker clearing proves the timer ran.
 #[tokio::test]
 async fn hold_timer_flush_makes_entry_ready() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "TimerFlush").await;
 
-    let soon = intent_core::iso_ms_from_now(150);
-    svc.enqueue_held_message(&id, "debounced".into(), None, "debounce", &soon, "child-1")
+    let far = intent_core::iso_ms_from_now(60_000);
+    let (held, _) = svc
+        .enqueue_held_message(&id, "debounced".into(), None, "debounce", &far, "child-1")
         .await;
     assert!(!svc.has_ready_to_send(&id), "held before the deadline");
 
-    // Wait past the deadline for the spawned timer to flush the hold.
+    // Same-key upsert: shorten the deadline and re-arm the release timer.
+    let soon = intent_core::iso_ms_from_now(150);
+    let (refreshed, _) = svc
+        .enqueue_held_message(&id, "debounced".into(), None, "debounce", &soon, "child-1")
+        .await;
+    assert_eq!(refreshed.id, held.id, "upsert keeps the entry id");
+
+    // Wait for the spawned timer to flush the hold: the marker clears in
+    // the queue snapshot. The deadline is a liveness bound only.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while !svc.has_ready_to_send(&id) {
+    loop {
+        let snapshot = svc.queue_snapshot(&id);
+        let entry = snapshot
+            .iter()
+            .find(|e| e["id"] == json!(held.id))
+            .expect("held entry stays queued");
+        if entry["holdKind"].is_null() {
+            break;
+        }
         assert!(
             tokio::time::Instant::now() < deadline,
             "timer flush did not release the hold in time"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    assert!(svc.has_ready_to_send(&id), "flushed entry is ready");
     let drained = svc.dequeue_message(&id).expect("flushed entry drains");
+    assert_eq!(drained.id, held.id);
     assert!(drained.hold_kind.is_none(), "flush cleared the marker");
     assert_eq!(drained.content, "debounced");
 }
