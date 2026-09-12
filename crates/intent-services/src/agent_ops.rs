@@ -264,46 +264,46 @@ impl AgentSnapshotPrs {
 }
 
 /// Group tracked PR pools into the snapshot's `prs` object. `pools` yields
-/// `(owner, name, prs)` per repo; a pool with a blank (empty/whitespace)
-/// owner or name is skipped entirely — no meaningful label can be formed —
-/// matching the identity-less-root skip upstream. A merged/closed entry in
-/// ANY pool suppresses that `(repo, number)` entirely: the freshest terminal
-/// state wins over a stale open duplicate regardless of which pool carries
-/// it. Among surviving open duplicates the workspace pool (yielded first)
-/// wins the grouping. The repo half of the key is the case-insensitive
+/// `(repo, prs)` per repo; a pool with a blank (empty/whitespace) owner or
+/// name is skipped entirely — no meaningful label can be formed — matching
+/// the identity-less-root skip upstream. A merged/closed entry in ANY pool
+/// suppresses that `(repo, number)` entirely: the freshest terminal state
+/// wins over a stale open duplicate regardless of which pool carries it.
+/// Among surviving open duplicates the workspace pool (yielded first) wins
+/// the grouping. The repo half of the key is the case-insensitive
 /// [`RepoRef`] identity, so case-variant pools of one repository dedupe
 /// together. Returns `None` when no open PR survives (the field is then
 /// omitted).
 fn grouped_open_prs<'a>(
-    pools: impl IntoIterator<Item = (&'a str, &'a str, &'a [PullRequestInfo])>,
+    pools: impl IntoIterator<Item = (RepoRef, &'a [PullRequestInfo])>,
 ) -> Option<AgentSnapshotPrs> {
-    let pools: Vec<(&str, &str, &[PullRequestInfo])> = pools
+    let pools: Vec<(RepoRef, &[PullRequestInfo])> = pools
         .into_iter()
-        .filter(|(owner, name, _)| !owner.trim().is_empty() && !name.trim().is_empty())
+        .filter(|(repo, _)| !repo.owner.trim().is_empty() && !repo.name.trim().is_empty())
         .collect();
     // Seed the seen-set with every merged/closed key so a terminal state in
     // any pool suppresses stale open duplicates of the same PR.
     let mut seen: HashSet<(RepoRef, u64)> = HashSet::new();
-    for &(owner, name, prs) in &pools {
-        for pr in prs {
+    for (repo, prs) in &pools {
+        for pr in *prs {
             if matches!(
                 pr.status,
                 PullRequestStatus::Merged | PullRequestStatus::Closed
             ) {
-                seen.insert((RepoRef::new(owner, name), pr.number));
+                seen.insert((repo.clone(), pr.number));
             }
         }
     }
     let mut groups = AgentSnapshotPrs::default();
-    for &(owner, name, prs) in &pools {
-        for pr in prs {
-            if !seen.insert((RepoRef::new(owner, name), pr.number)) {
+    for (repo, prs) in &pools {
+        for pr in *prs {
+            if !seen.insert((repo.clone(), pr.number)) {
                 continue;
             }
             if let Some(group) = groups.group_for(pr) {
                 group.push(crate::harness::latest().pr_monitor_label(
-                    owner,
-                    name,
+                    &repo.owner,
+                    &repo.name,
                     pr.number.cast_signed(),
                 ));
             }
@@ -10774,23 +10774,15 @@ impl Services {
                 Vec::new()
             }
         };
-        let mut pools: Vec<(&str, &str, &[PullRequestInfo])> = Vec::new();
+        let mut pools: Vec<(RepoRef, &[PullRequestInfo])> = Vec::new();
         if let Some(ws) = &workspace {
-            if let (Some(owner), Some(name), Some(prs)) = (
-                ws.repository_owner.as_deref(),
-                ws.repository_name.as_deref(),
-                ws.pull_requests.as_deref(),
-            ) {
-                pools.push((owner, name, prs));
+            if let (Some(repo), Some(prs)) = (ws.repo(), ws.pull_requests.as_deref()) {
+                pools.push((repo, prs));
             }
         }
         for root in &roots {
-            if let (Some(owner), Some(name), Some(prs)) = (
-                root.repo_owner.as_deref(),
-                root.repo_name.as_deref(),
-                root.pull_requests.as_deref(),
-            ) {
-                pools.push((owner, name, prs));
+            if let (Some(repo), Some(prs)) = (root.repo(), root.pull_requests.as_deref()) {
+                pools.push((repo, prs));
             }
         }
         grouped_open_prs(pools)
