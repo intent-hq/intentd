@@ -189,6 +189,13 @@ PTY-backed, so raw invocations need `CARGO_TERM_PROGRESS_WHEN=never` in the
 environment (all three) and `--show-progress none` on the nextest command (the `make`
 targets already set both) or progress-bar redraws flood the output buffer.
 
+The CI `check` job also runs the repo-slug fold lint,
+`cargo test -p intent-core --test repo_slug_fold_lint`, which fails naming `file:line`
+wherever owner/name slug identity is case-folded or compared outside
+`intent_core::RepoRef` (intent-hq/intentd#1809 → #1815); a site that is not slug identity
+opts out with `// repo-slug-fold: allow — <reason>` on the line immediately above the
+statement, and the reason is required.
+
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.
 

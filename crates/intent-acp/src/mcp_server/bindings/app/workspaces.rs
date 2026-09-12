@@ -125,6 +125,7 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
         // Query filter (searches across multiple fields)
         if let Some(ref q) = query {
             let q_lower = q.to_lowercase();
+            // repo-slug-fold: allow — free-text substring search over display fields, not slug identity
             let matches = [
                 ws.id.as_str(),
                 &ws.title,

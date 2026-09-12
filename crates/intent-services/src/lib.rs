@@ -10369,6 +10369,7 @@ fn write_workspace_metadata_file(root: &Path, ws: &Workspace) -> Result<()> {
 /// `"repo"` fallback.
 pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
     let mut slug = String::new();
+    // repo-slug-fold: allow — folder-name slugifier, not repo identity
     for c in repo_name.chars().flat_map(char::to_lowercase) {
         if slug.len() >= 50 {
             break;
