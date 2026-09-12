@@ -1969,6 +1969,14 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     tokio::spawn(async move {
         services_export_sweep.sweep_stale_export_staging().await;
     });
+    // Sweep expired attachment idempotency-key bindings (7-day retention,
+    // intent-hq/intent#4691); also swept lazily by keyed placements/begins.
+    let services_idempotency_sweep = services.clone();
+    tokio::spawn(async move {
+        services_idempotency_sweep
+            .sweep_expired_attachment_idempotency_keys()
+            .await;
+    });
     // Background PR refresh (§7.6): periodically re-fetch linked PRs (and
     // discover/link PRs for workspaces without one), persist any change, and
     // emit `pr:*` events so clients update without polling.

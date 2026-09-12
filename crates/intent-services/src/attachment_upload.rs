@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use intent_core::{Error, Result, WorkspaceApi as _, WorkspaceId};
+use intent_core::{Error, Result, WorkspaceId};
 use sha2::Digest as _;
 
 use crate::Services;
@@ -83,9 +83,22 @@ pub(crate) struct AttachmentUploadSession {
     /// session never expires (the flag guards it), and a failed commit
     /// refreshes the clock so the retry window restarts.
     pub last_activity: Instant,
+    /// Client-minted idempotency key from `begin` (intent-hq/intent#4691),
+    /// bound at commit like a keyed `file.placeAttachment`.
+    pub idempotency_key: Option<String>,
 }
 
 impl AttachmentUploadSession {
+    /// Payload identity the session's key binds to (the chunked arm's
+    /// fingerprint includes the declared SHA-256).
+    fn fingerprint(&self) -> String {
+        attachment_fingerprint(
+            &self.file_name,
+            self.declared_size,
+            Some(&self.declared_sha256),
+        )
+    }
+
     /// Idle past the TTL and safe to reclaim. Never true while a commit is
     /// in flight — expiring mid-commit would race the files being hashed.
     fn expired(&self, ttl: Duration) -> bool {
@@ -123,7 +136,288 @@ fn drain_expired_sessions(uploads: &mut HashMap<String, AttachmentUploadSession>
         .collect()
 }
 
+/// Retention window for idempotency-key bindings (intent-hq/intent#4691):
+/// after this the key reads as unknown and a retry places a fresh copy —
+/// the recovery window a client needs is minutes, not days.
+const ATTACHMENT_IDEMPOTENCY_RETENTION_MINUTES: i64 = 7 * 24 * 60;
+
+/// Maximum length of a client-supplied `idempotencyKey`.
+const ATTACHMENT_IDEMPOTENCY_KEY_MAX_LEN: usize = 128;
+
+/// Validate the optional `idempotencyKey` param: absent stays absent; a
+/// present value must be 1–128 characters with no surrounding whitespace
+/// trimmed away (the key is an opaque client-minted token — a UUID is the
+/// recommended shape).
+pub(crate) fn validate_idempotency_key(key: Option<String>) -> Result<Option<String>> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    if key.is_empty() || key.trim().len() != key.len() {
+        return Err(Error::InvalidParams(
+            "idempotencyKey must be a non-empty string without surrounding whitespace".to_string(),
+        ));
+    }
+    if key.chars().count() > ATTACHMENT_IDEMPOTENCY_KEY_MAX_LEN {
+        return Err(Error::InvalidParams(format!(
+            "idempotencyKey exceeds {ATTACHMENT_IDEMPOTENCY_KEY_MAX_LEN} characters"
+        )));
+    }
+    Ok(Some(key))
+}
+
+/// The ISO-8601 UTC instant bindings created at/before which are expired.
+pub(crate) fn idempotency_retention_cutoff() -> String {
+    intent_core::iso_minutes_ago(ATTACHMENT_IDEMPOTENCY_RETENTION_MINUTES)
+}
+
+/// Payload identity an idempotency key is bound to: the requested
+/// `fileName` (pre-sanitization, pre-suffix — what the client resends), the
+/// byte size, and — for the base64 and chunked arms — the lowercase-hex
+/// SHA-256. Encoded as a JSON array so a `fileName` can carry any character.
+pub(crate) fn attachment_fingerprint(file_name: &str, size: u64, sha256: Option<&str>) -> String {
+    serde_json::json!([file_name, size, sha256.map(str::to_ascii_lowercase)]).to_string()
+}
+
+/// Lowercase-hex SHA-256 of `bytes`.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+const CONFLICTING_PAYLOAD: &str = "idempotencyKey already used with a different payload";
+
+/// Per-`(workspace, idempotencyKey)` in-flight locks for keyed placements
+/// (see `Services::attachment_idempotency_inflight`).
+pub(crate) type IdempotencyInflight =
+    HashMap<(WorkspaceId, String), std::sync::Arc<tokio::sync::Mutex<()>>>;
+
+/// What a `commit` takes off its session under the registry lock before the
+/// fallible reassembly + placement runs: `(staging_dir, declared_size,
+/// declared_sha256, workspace_id, file_name, mime_type, seqs,
+/// idempotency_key)`.
+type CommitClaim = (
+    PathBuf,
+    u64,
+    String,
+    WorkspaceId,
+    String,
+    Option<String>,
+    Vec<u64>,
+    Option<String>,
+);
+
+/// The original placement result rebuilt from its registry row, plus the
+/// additive `replayed: true` marker. The disk is deliberately not
+/// re-checked — `file.getAttachmentInfo.exists` is the disk signal.
+fn replayed_placement_result(record: &intent_store::AttachmentRecord) -> serde_json::Value {
+    let mut result = serde_json::json!({
+        "ok": true,
+        "path": record.stored_path,
+        "fileName": record.file_name,
+        "size": record.size,
+        "attachmentId": record.id,
+        "uploadedAt": record.uploaded_at,
+        "replayed": true,
+    });
+    if let Some(mime) = &record.mime_type {
+        result["mimeType"] = serde_json::json!(mime);
+    }
+    result
+}
+
 impl Services {
+    /// Best-effort retention sweep of expired idempotency-key bindings
+    /// (intent-hq/intent#4691): runs at boot and lazily on every keyed
+    /// placement / `begin`. A failed sweep never fails the caller.
+    pub async fn sweep_expired_attachment_idempotency_keys(&self) {
+        match self
+            .store
+            .sweep_expired_attachment_idempotency_keys(&idempotency_retention_cutoff())
+            .await
+        {
+            Ok(0) => {}
+            Ok(removed) => {
+                tracing::info!(removed, "swept expired attachment idempotency keys");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "attachment idempotency key sweep failed");
+            }
+        }
+    }
+
+    /// Take the per-`(workspace, key)` in-flight lock for a keyed placement.
+    fn idempotency_inflight_lock(
+        &self,
+        workspace_id: &WorkspaceId,
+        key: &str,
+    ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.attachment_idempotency_inflight
+            .lock()
+            .expect("attachment idempotency registry poisoned")
+            .entry((workspace_id.clone(), key.to_string()))
+            .or_default()
+            .clone()
+    }
+
+    /// Drop the in-flight entry once no other caller holds it.
+    fn release_idempotency_inflight_lock(
+        &self,
+        workspace_id: &WorkspaceId,
+        key: &str,
+        lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let mut inflight = self
+            .attachment_idempotency_inflight
+            .lock()
+            .expect("attachment idempotency registry poisoned");
+        // Two strong refs = the map's and ours; anyone else waiting on the
+        // key holds a third.
+        if std::sync::Arc::strong_count(lock) <= 2 {
+            inflight.remove(&(workspace_id.clone(), key.to_string()));
+        }
+    }
+
+    /// Shared placement + registry path behind `file.placeAttachment` and
+    /// `file.attachmentUpload.commit` (PROTOCOL §5.9): resolves the
+    /// workspace root, ensures the `.intent/` exclusion, places the payload
+    /// collision-safely, and registers it under a daemon-minted UUID. With
+    /// `idempotency` = `(key, fingerprint)` (intent-hq/intent#4691) the
+    /// whole sequence runs under the key's in-flight guard: a live binding
+    /// with the same fingerprint short-circuits to the ORIGINAL result plus
+    /// `replayed: true` (nothing placed), a live binding with a different
+    /// fingerprint is `InvalidParams`, and a fresh key is bound in the same
+    /// store transaction as the registry row. An unset fingerprint (an
+    /// unreadable `sourcePath`) skips the lookup so placement classifies the
+    /// source error; the primary key still rejects a double bind.
+    pub(crate) async fn place_attachment_registered(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: &str,
+        source: &crate::file_ops::AttachmentSource<'_>,
+        mime_type: Option<String>,
+        idempotency: Option<(String, Option<String>)>,
+    ) -> Result<serde_json::Value> {
+        let Some((key, fingerprint)) = idempotency else {
+            return self
+                .place_attachment_registered_inner(workspace_id, file_name, source, mime_type, None)
+                .await;
+        };
+        self.sweep_expired_attachment_idempotency_keys().await;
+        let lock = self.idempotency_inflight_lock(&workspace_id, &key);
+        let result = {
+            let _guard = lock.lock().await;
+            let bound = match &fingerprint {
+                Some(_) => {
+                    self.store
+                        .get_attachment_by_idempotency_key(
+                            &workspace_id,
+                            &key,
+                            &idempotency_retention_cutoff(),
+                        )
+                        .await
+                }
+                None => Ok(None),
+            };
+            match bound {
+                Err(e) => Err(e),
+                Ok(Some((binding, record))) => {
+                    if Some(&binding.fingerprint) == fingerprint.as_ref() {
+                        Ok(replayed_placement_result(&record))
+                    } else {
+                        Err(Error::InvalidParams(CONFLICTING_PAYLOAD.to_string()))
+                    }
+                }
+                Ok(None) => {
+                    self.place_attachment_registered_inner(
+                        workspace_id.clone(),
+                        file_name,
+                        source,
+                        mime_type,
+                        Some((key.as_str(), fingerprint.as_deref().unwrap_or_default())),
+                    )
+                    .await
+                }
+            }
+        };
+        self.release_idempotency_inflight_lock(&workspace_id, &key, &lock);
+        result
+    }
+
+    async fn place_attachment_registered_inner(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: &str,
+        source: &crate::file_ops::AttachmentSource<'_>,
+        mime_type: Option<String>,
+        idempotency: Option<(&str, &str)>,
+    ) -> Result<serde_json::Value> {
+        let store = &self.store;
+        let root = crate::file_ops::resolve_root(store, &workspace_id, None).await;
+        if root.is_empty() {
+            return Err(Error::Internal(
+                "workspace has no resolved filesystem root".to_string(),
+            ));
+        }
+        // The exclusion contract (monorepo#1948) rides on the default
+        // `.intent/.gitignore` (ignore everything except config.json), so
+        // make sure the directory + gitignore exist before placing.
+        // `place_attachment` additionally drops an ignore-all `.gitignore`
+        // inside `attachments/` to cover repos with a customized
+        // `.intent/.gitignore`.
+        crate::repo_config::ensure_intent_dir(std::path::Path::new(&root)).await?;
+        let mut result =
+            crate::file_ops::place_attachment(&root, file_name, source).map_err(|e| {
+                // Surface placement failures in the daemon log so field
+                // reports are diagnosable without a client-side trace
+                // (monorepo#2144).
+                tracing::warn!(
+                    workspace = %workspace_id.as_str(),
+                    file_name = %file_name,
+                    error = %e,
+                    "file.placeAttachment failed"
+                );
+                e
+            })?;
+        // Attachment registry (PROTOCOL §5.9): record the placed file
+        // under a daemon-minted UUID so agents can retrieve it later via
+        // `ws.file.getAttachment`, and return the registry fields
+        // additively (presence-detected; old clients unaffected).
+        let record = intent_store::AttachmentRecord {
+            id: crate::new_uuid(),
+            workspace_id,
+            file_name: result["fileName"].as_str().unwrap_or(file_name).to_string(),
+            mime_type: mime_type.filter(|m| !m.trim().is_empty()),
+            size: result["size"].as_i64().unwrap_or_default(),
+            uploaded_at: intent_core::now_iso(),
+            stored_path: result["path"].as_str().unwrap_or_default().to_string(),
+        };
+        let inserted = match idempotency {
+            Some((key, fingerprint)) => {
+                store
+                    .insert_attachment_with_idempotency_key(&record, key, fingerprint)
+                    .await
+            }
+            None => store.insert_attachment(&record).await,
+        };
+        if let Err(e) = inserted {
+            // Don't leave a durable-but-unregistered file behind: a
+            // retry would place a collision-suffixed second copy that
+            // no attachmentId can ever retrieve.
+            let _ = std::fs::remove_file(std::path::Path::new(&root).join(&record.stored_path));
+            return Err(e);
+        }
+        result["attachmentId"] = serde_json::json!(record.id);
+        result["uploadedAt"] = serde_json::json!(record.uploaded_at);
+        if let Some(mime) = &record.mime_type {
+            result["mimeType"] = serde_json::json!(mime);
+        }
+        Ok(result)
+    }
+
     /// Root directory staged attachment uploads live under. Sibling of the
     /// workspace checkouts, mirroring the import staging root.
     fn attachment_upload_staging_root(&self) -> PathBuf {
@@ -142,7 +436,16 @@ impl Services {
     /// over-cap declared size, a malformed sha, and — after idle-expired
     /// sessions are reclaimed — a workspace already holding
     /// [`ATTACHMENT_UPLOAD_MAX_SESSIONS_PER_WORKSPACE`] live sessions
-    /// (monorepo#2275). Returns `{ uploadId, maxChunkBytes }`.
+    /// (monorepo#2275). Returns `{ uploadId, maxChunkBytes }`. With an
+    /// `idempotency_key` (intent-hq/intent#4691): a key already bound to a
+    /// committed attachment with the same `(fileName, sizeBytes, sha256)`
+    /// is `InvalidParams` ("already committed; look it up") — begin stays
+    /// shape-stable and the client recovers via `file.getAttachmentInfo`;
+    /// a bound key with a different payload identity is `InvalidParams`
+    /// (conflicting payload); a key held by a LIVE session of this
+    /// workspace with the same identity replays that session's
+    /// `{ uploadId, maxChunkBytes, replayed: true }` (a lost begin reply),
+    /// while a different identity is the same conflict error.
     pub(crate) async fn file_attachment_upload_begin_op(
         &self,
         workspace_id: WorkspaceId,
@@ -150,7 +453,9 @@ impl Services {
         size_bytes: u64,
         sha256: String,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> Result<serde_json::Value> {
+        let idempotency_key = validate_idempotency_key(idempotency_key)?;
         if file_name.trim().is_empty() {
             return Err(Error::InvalidParams(
                 "fileName must not be empty".to_string(),
@@ -189,6 +494,28 @@ impl Services {
                 other => other,
             })?;
 
+        let fingerprint = attachment_fingerprint(&file_name, size_bytes, Some(&sha));
+        if let Some(key) = &idempotency_key {
+            self.sweep_expired_attachment_idempotency_keys().await;
+            if let Some((binding, _)) = self
+                .store
+                .get_attachment_by_idempotency_key(
+                    &workspace_id,
+                    key,
+                    &idempotency_retention_cutoff(),
+                )
+                .await?
+            {
+                if binding.fingerprint != fingerprint {
+                    return Err(Error::InvalidParams(CONFLICTING_PAYLOAD.to_string()));
+                }
+                return Err(Error::InvalidParams(format!(
+                    "idempotencyKey {key:?} already committed; look it up via \
+                     file.getAttachmentInfo {{ workspaceId, idempotencyKey }}"
+                )));
+            }
+        }
+
         let upload_id = format!("upload-{}", uuid::Uuid::new_v4());
         let staging_dir = self.attachment_upload_staging_root().join(&upload_id);
 
@@ -206,11 +533,29 @@ impl Services {
                 .lock()
                 .expect("attachment upload registry poisoned");
             expired_dirs = drain_expired_sessions(&mut uploads);
+            // A live session already holding this key in this workspace:
+            // same identity ⇒ hand back its uploadId (the begin reply was
+            // lost); different identity ⇒ conflict. Checked under the same
+            // lock hold as the cap so two keyed begins cannot both open.
+            let same_key = idempotency_key.as_ref().and_then(|key| {
+                uploads
+                    .iter()
+                    .find(|(_, s)| {
+                        s.workspace_id == workspace_id && s.idempotency_key.as_ref() == Some(key)
+                    })
+                    .map(|(id, s)| (id.clone(), s.fingerprint() == fingerprint))
+            });
             let live = uploads
                 .values()
                 .filter(|s| s.workspace_id == workspace_id)
                 .count();
-            if live >= ATTACHMENT_UPLOAD_MAX_SESSIONS_PER_WORKSPACE {
+            if let Some((existing_id, same_payload)) = same_key {
+                if same_payload {
+                    Ok(Some(existing_id))
+                } else {
+                    Err(Error::InvalidParams(CONFLICTING_PAYLOAD.to_string()))
+                }
+            } else if live >= ATTACHMENT_UPLOAD_MAX_SESSIONS_PER_WORKSPACE {
                 Err(Error::InvalidParams(format!(
                     "workspace {} already has {live} attachment uploads in progress \
                      (max {ATTACHMENT_UPLOAD_MAX_SESSIONS_PER_WORKSPACE}) — commit or \
@@ -228,9 +573,10 @@ impl Services {
                     chunk_sizes: HashMap::new(),
                     committing: false,
                     last_activity: Instant::now(),
+                    idempotency_key,
                 };
                 uploads.insert(upload_id.clone(), session);
-                Ok(())
+                Ok(None)
             }
         };
         // Expired staging is reclaimed even when this begin was rejected at
@@ -238,7 +584,13 @@ impl Services {
         for dir in expired_dirs {
             let _ = tokio::fs::remove_dir_all(&dir).await;
         }
-        admitted?;
+        if let Some(existing_id) = admitted? {
+            return Ok(serde_json::json!({
+                "uploadId": existing_id,
+                "maxChunkBytes": ATTACHMENT_UPLOAD_MAX_CHUNK_BYTES,
+                "replayed": true,
+            }));
+        }
 
         // Lazy sweep: staging dirs with no live session are orphans (a
         // daemon restart drops the in-memory registry). Best-effort — a
@@ -488,6 +840,7 @@ impl Services {
                 session.file_name.clone(),
                 session.mime_type.clone(),
                 seqs,
+                session.idempotency_key.clone(),
             )
         };
 
@@ -524,18 +877,18 @@ impl Services {
     async fn file_attachment_upload_commit_body(
         &self,
         upload_id: &str,
-        claim: (
-            PathBuf,
-            u64,
-            String,
-            WorkspaceId,
-            String,
-            Option<String>,
-            Vec<u64>,
-        ),
+        claim: CommitClaim,
     ) -> Result<serde_json::Value> {
-        let (staging_dir, declared_size, declared_sha, workspace_id, file_name, mime_type, seqs) =
-            claim;
+        let (
+            staging_dir,
+            declared_size,
+            declared_sha,
+            workspace_id,
+            file_name,
+            mime_type,
+            seqs,
+            idempotency_key,
+        ) = claim;
 
         // Reassemble + hash on the blocking pool (sync I/O), landing the
         // assembled payload next to the chunks so the final placement copies
@@ -544,6 +897,7 @@ impl Services {
         {
             let staging_dir = staging_dir.clone();
             let assembled = assembled.clone();
+            let declared_sha = declared_sha.clone();
             tokio::task::spawn_blocking(move || {
                 assemble_and_verify(
                     &staging_dir,
@@ -561,14 +915,26 @@ impl Services {
         // collision-safe placement, registry insert, and result shape are
         // shared, so the commit result is byte-shape-identical to a
         // successful `file.placeAttachment` (PROTOCOL §5.9). A failure here
-        // leaves the session alive for retry or abort.
+        // leaves the session alive for retry or abort. The session's
+        // idempotency key (if any) binds here with the chunked-arm
+        // fingerprint — the verified declared size + SHA-256.
+        let idempotency = idempotency_key.map(|key| {
+            (
+                key,
+                Some(attachment_fingerprint(
+                    &file_name,
+                    declared_size,
+                    Some(&declared_sha),
+                )),
+            )
+        });
         let result = self
-            .file_place_attachment(
+            .place_attachment_registered(
                 workspace_id.clone(),
-                file_name.clone(),
-                None,
-                Some(assembled.to_string_lossy().into_owned()),
+                &file_name,
+                &crate::file_ops::AttachmentSource::CopyFrom(&assembled),
                 mime_type,
+                idempotency,
             )
             .await
             .map_err(|e| {
@@ -661,7 +1027,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use base64::Engine as _;
-    use intent_core::{Error, WorkspaceId};
+    use intent_core::{Error, WorkspaceApi as _, WorkspaceId};
     use intent_store::Store;
     use sha2::Digest as _;
 
@@ -712,6 +1078,7 @@ mod tests {
                 "report.bin".to_string(),
                 payload.len() as u64,
                 sha256_hex(payload),
+                None,
                 None,
             )
             .await
@@ -781,6 +1148,169 @@ mod tests {
         assert!(matches!(err, Error::NotFound(_)), "got {err}");
     }
 
+    /// Keyed chunked uploads (intent-hq/intent#4691): a same-key `begin`
+    /// with the same `(fileName, sizeBytes, sha256)` while the session is
+    /// live replays its `uploadId` (+ `replayed: true`) instead of opening a
+    /// second session; a different identity under the key is the conflict
+    /// error; after `commit` the key is bound to the attachment, so a
+    /// re-`begin` is rejected shape-stably ("already committed; look it
+    /// up"), `getAttachmentInfo` resolves the key, and a keyed
+    /// `file.placeAttachment` of the same bytes replays the committed
+    /// result (the base64 and chunked arms share one fingerprint).
+    #[tokio::test]
+    async fn keyed_begin_replays_live_session_and_commit_binds_key() {
+        let ws = WorkspaceId("ws-up-keyed".to_string());
+        let other_ws = WorkspaceId("ws-up-keyed-other".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let other_checkout = TempDir::new("attach-up-co-other");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+        let mut other_row = crate::tests::workspace(&other_ws);
+        other_row.worktree_path = Some(other_checkout.0.to_string_lossy().into_owned());
+        svc.store()
+            .insert_workspace(&other_row)
+            .await
+            .expect("seed other ws");
+
+        let payload = b"keyed chunked payload".to_vec();
+        let sha = sha256_hex(&payload);
+        let key = Some("key-chunked".to_string());
+        let first = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "keyed.bin".to_string(),
+                payload.len() as u64,
+                sha.clone(),
+                Some("application/octet-stream".to_string()),
+                key.clone(),
+            )
+            .await
+            .expect("keyed begin");
+        assert!(first.get("replayed").is_none(), "{first}");
+        let upload_id = first["uploadId"].as_str().unwrap().to_string();
+
+        // Lost begin reply: same identity → the same session, marked replayed.
+        let again = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "keyed.bin".to_string(),
+                payload.len() as u64,
+                sha.clone(),
+                None,
+                key.clone(),
+            )
+            .await
+            .expect("keyed begin replay");
+        assert_eq!(again["uploadId"], serde_json::json!(upload_id));
+        assert_eq!(again["maxChunkBytes"], first["maxChunkBytes"]);
+        assert_eq!(again["replayed"], serde_json::json!(true));
+        assert_eq!(
+            svc.attachment_uploads.lock().unwrap().len(),
+            1,
+            "no second session"
+        );
+
+        // Same key, different identity while live → conflict.
+        let err = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "keyed.bin".to_string(),
+                payload.len() as u64 + 1,
+                sha.clone(),
+                None,
+                key.clone(),
+            )
+            .await
+            .expect_err("live conflict");
+        assert!(err.to_string().contains("different payload"), "got {err}");
+
+        // Another workspace may use the same key freely.
+        let other = svc
+            .file_attachment_upload_begin_op(
+                other_ws.clone(),
+                "keyed.bin".to_string(),
+                payload.len() as u64,
+                sha.clone(),
+                None,
+                key.clone(),
+            )
+            .await
+            .expect("other ws keyed begin");
+        assert!(other.get("replayed").is_none(), "{other}");
+        assert_ne!(other["uploadId"], first["uploadId"]);
+
+        svc.file_attachment_upload_chunk_op(upload_id.clone(), 0, b64(&payload))
+            .await
+            .expect("chunk");
+        let committed = svc
+            .file_attachment_upload_commit_op(upload_id)
+            .await
+            .expect("commit");
+        assert!(committed.get("replayed").is_none(), "{committed}");
+        assert_eq!(committed["fileName"], serde_json::json!("keyed.bin"));
+
+        // Committed key: begin is rejected shape-stably and points at lookup.
+        let err = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "keyed.bin".to_string(),
+                payload.len() as u64,
+                sha.clone(),
+                None,
+                key.clone(),
+            )
+            .await
+            .expect_err("begin after commit");
+        assert!(matches!(err, Error::InvalidParams(_)), "got {err}");
+        assert!(err.to_string().contains("already committed"), "got {err}");
+        // A different identity under the committed key is the conflict.
+        let err = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "other-name.bin".to_string(),
+                payload.len() as u64,
+                sha.clone(),
+                None,
+                key.clone(),
+            )
+            .await
+            .expect_err("begin after commit, other identity");
+        assert!(err.to_string().contains("different payload"), "got {err}");
+
+        // Lookup by key resolves the committed attachment.
+        let info = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-chunked".to_string())
+            .await
+            .expect("lookup by key");
+        assert_eq!(info["attachmentId"], committed["attachmentId"]);
+        assert_eq!(
+            info["mimeType"],
+            serde_json::json!("application/octet-stream")
+        );
+        assert_eq!(info["exists"], serde_json::json!(true));
+
+        // The base64 arm shares the fingerprint: same bytes under the same
+        // key replay the committed placement instead of placing a copy.
+        let replayed = svc
+            .file_place_attachment(
+                ws.clone(),
+                "keyed.bin".to_string(),
+                Some(b64(&payload)),
+                None,
+                None,
+                key.clone(),
+            )
+            .await
+            .expect("keyed place replays commit");
+        let mut expected = committed.clone();
+        expected["replayed"] = serde_json::json!(true);
+        assert_eq!(replayed, expected);
+        assert!(!checkout.0.join(".intent/attachments/keyed-2.bin").exists());
+
+        // The other workspace's live session is untouched by the commit.
+        assert_eq!(svc.attachment_uploads.lock().unwrap().len(), 1);
+    }
+
     /// `begin` rejections: unknown workspace, empty name, zero size,
     /// over-cap size, malformed sha — each naming the specifics.
     #[tokio::test]
@@ -798,13 +1328,21 @@ mod tests {
                 10,
                 sha.clone(),
                 None,
+                None,
             )
             .await
             .expect_err("unknown ws");
         assert!(err.to_string().contains("ws-nope"), "got {err}");
 
         let err = svc
-            .file_attachment_upload_begin_op(ws.clone(), "  ".to_string(), 10, sha.clone(), None)
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "  ".to_string(),
+                10,
+                sha.clone(),
+                None,
+                None,
+            )
             .await
             .expect_err("empty name");
         assert!(err.to_string().contains("fileName"), "got {err}");
@@ -818,6 +1356,7 @@ mod tests {
                     doomed.to_string(),
                     10,
                     sha.clone(),
+                    None,
                     None,
                 )
                 .await
@@ -837,6 +1376,7 @@ mod tests {
                 10,
                 sha.clone(),
                 None,
+                None,
             )
             .await
             .expect("basename-usable name");
@@ -845,7 +1385,14 @@ mod tests {
             .expect("abort");
 
         let err = svc
-            .file_attachment_upload_begin_op(ws.clone(), "f.bin".to_string(), 0, sha.clone(), None)
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "f.bin".to_string(),
+                0,
+                sha.clone(),
+                None,
+                None,
+            )
             .await
             .expect_err("zero size");
         assert!(err.to_string().contains("positive"), "got {err}");
@@ -856,6 +1403,7 @@ mod tests {
                 "f.bin".to_string(),
                 super::ATTACHMENT_UPLOAD_MAX_TOTAL_BYTES + 1,
                 sha,
+                None,
                 None,
             )
             .await
@@ -868,6 +1416,7 @@ mod tests {
                 "f.bin".to_string(),
                 10,
                 "nothex".to_string(),
+                None,
                 None,
             )
             .await
@@ -947,6 +1496,7 @@ mod tests {
                 "big.bin".to_string(),
                 oversized.len() as u64,
                 sha256_hex(&oversized),
+                None,
                 None,
             )
             .await
@@ -1124,6 +1674,7 @@ mod tests {
                 chunk_sizes: std::collections::HashMap::new(),
                 committing: false,
                 last_activity: std::time::Instant::now(),
+                idempotency_key: None,
             },
         );
 
@@ -1162,6 +1713,7 @@ mod tests {
                 "fifth.bin".to_string(),
                 payload.len() as u64,
                 sha256_hex(&payload),
+                None,
                 None,
             )
             .await
