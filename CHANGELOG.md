@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.49] - 2026-09-12
+
+### 🚀 Features
+
+- *(browser)* Carry displayed on registry rows so listTabs includes it ([#1834](https://github.com/intent-hq/intentd/pull/1834))
+
+### 🧪 Testing
+
+- *(services)* Await the row delete before arming the idle timer ([#1829](https://github.com/intent-hq/intentd/pull/1829))
+- *(intentd)* Gate the heartbeat reaper in the heartbeat-abort e2e ([#1828](https://github.com/intent-hq/intentd/pull/1828))
+
+
 ## [0.9.48] - 2026-09-12
 
 ### 🐛 Bug Fixes
