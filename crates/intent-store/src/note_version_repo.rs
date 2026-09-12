@@ -23,6 +23,18 @@ impl Store {
     /// recover a writer's base. Returns the new version number (1-based,
     /// strictly increasing per note).
     ///
+    /// **Not a production content-write primitive.** Snapshotting in a
+    /// separate transaction from the row write is exactly the gap the
+    /// intentd#1817 review found: between the two commits a reader observes
+    /// the new `rev` while the base lookup for it still resolves to the
+    /// previous content, and two writers' snapshots can land out of rev order.
+    /// Production content writes go through
+    /// [`Store::insert_note_with_version`] /
+    /// [`Store::update_note_with_version`] (or
+    /// [`Store::update_note_with_version_and_children`]), which commit the row
+    /// and its snapshot together. No production writer calls this; it remains
+    /// for seeding history in fixtures.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.

@@ -27,6 +27,13 @@ pub(crate) fn encode_task_json(task: &intent_core::TaskMetadata) -> Result<Strin
 impl Store {
     /// Insert a note row. `metadata.task` is stored opaquely as `task_json` TEXT.
     ///
+    /// **Raw row insert — records no version snapshot.** A note created this
+    /// way has no recoverable base for its rev 0, so a later stale-rev
+    /// `note.setContent` degrades to last-writer-wins. Production note creation
+    /// goes through [`Store::insert_note_with_version`], which commits the row
+    /// and its initial snapshot in one transaction; this method remains for
+    /// fixtures.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
@@ -184,6 +191,14 @@ impl Store {
     /// is scoped by the note's own `workspace_id` so same-id notes across
     /// workspaces never collide. Returns the post-write `rev`.
     ///
+    /// **Raw row update — no gate, no snapshot.** It rewrites `content` from
+    /// the caller's copy and records no version for the bumped rev, so it can
+    /// clobber a concurrent content write and leaves the new rev without a
+    /// recoverable base. Production content writes go through
+    /// [`Store::update_note_with_version`]; metadata-only writes through
+    /// [`Store::update_note_metadata`] / [`Store::update_note_metadata_versioned`],
+    /// which leave `content` alone. This method remains for fixtures.
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
@@ -202,6 +217,12 @@ impl Store {
     /// the unconditional last-writer-wins bump. In all cases `rev` increments;
     /// the post-write `rev` is returned (`UPDATE … RETURNING rev`) so callers
     /// can record it on the version snapshot without a second read.
+    ///
+    /// **Raw gated update — records no snapshot.** Pairing it with a separate
+    /// [`Store::append_note_version`] reintroduces the row/snapshot visibility
+    /// gap described there; production content writes use
+    /// [`Store::update_note_with_version`], which runs this same conditional
+    /// UPDATE and the snapshot in one transaction.
     ///
     /// # Errors
     ///

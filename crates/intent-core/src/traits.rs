@@ -861,6 +861,11 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `note.add`: append/prepend/insert content (PROTOCOL §5.2).
     ///
+    /// Like every client content write, the transform runs against the row
+    /// the op read and persists through the read-merge-persist loop described
+    /// on [`WorkspaceApi::set_note_content`], gated on that read's `rev`: a
+    /// write that lands in between is merged into rather than overwritten.
+    ///
     /// `caller_agent_id` attributes the captured note version to the invoking
     /// agent (the MCP front door passes it); `None` → user-authored.
     fn add_to_note(
@@ -879,6 +884,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `note.edit`: first exact-match replacement (PROTOCOL §5.2).
+    ///
+    /// Persists through the same read-merge-persist loop as
+    /// [`WorkspaceApi::add_to_note`] (see [`WorkspaceApi::set_note_content`]).
     ///
     /// `caller_agent_id` attributes the captured note version to the invoking
     /// agent (the MCP front door passes it); `None` → user-authored.
@@ -899,6 +907,9 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `note.editLines`: 1-based inclusive line replace/delete/insert (PROTOCOL §5.2).
     ///
+    /// Persists through the same read-merge-persist loop as
+    /// [`WorkspaceApi::add_to_note`] (see [`WorkspaceApi::set_note_content`]).
+    ///
     /// `caller_agent_id` attributes the captured note version to the invoking
     /// agent (the MCP front door passes it); `None` → user-authored.
     fn edit_note_lines(
@@ -917,13 +928,23 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `note.setContent`: full replace with the reduction guard (PROTOCOL §5.2).
-    /// `expected_version` is the base `rev` the writer read: `None` or equal to
-    /// the current `rev` replaces as-is; a stale value three-way-merges
-    /// `diff(base → content)` onto the current text (honest last-writer-wins
-    /// when no snapshot survives for that rev) and only an exhausted
-    /// read-merge-persist retry loop surfaces `Conflict` (§5.2, §5.6). The
-    /// guard is measured against the base when one is recoverable. The result
-    /// carries the post-write `rev`.
+    /// `expected_version` is the base `rev` the writer read, resolved per
+    /// attempt of a bounded read-merge-persist loop (§5.2, §5.6):
+    ///
+    /// - `None`, or equal to the current `rev`: `content` replaces as-is.
+    /// - Below the current `rev` with a snapshot for that rev: the writer's
+    ///   intent `diff(base → content)` is three-way-merged onto the current
+    ///   text (a same-span conflict keeps both variants).
+    /// - Below the current `rev` with no surviving snapshot: honest
+    ///   last-writer-wins, `content` replaces as-is.
+    /// - Above the current `rev`: a rev this note never served, so `Conflict`
+    ///   (`-32005` carrying the current entity) immediately, without a write.
+    ///
+    /// Each attempt persists gated on the rev it read; a write that lands in
+    /// between is merged into on the next attempt, and only when every
+    /// attempt of the bounded loop misses its gate does the last `Conflict`
+    /// surface — again without a write. The guard is measured against the base
+    /// when one is recoverable. The result carries the post-write `rev`.
     ///
     /// `caller_agent_id` attributes the captured note version to the invoking
     /// agent (the MCP front door passes it); `None` → user-authored.
