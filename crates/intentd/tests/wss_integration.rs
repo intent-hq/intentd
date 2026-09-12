@@ -6371,6 +6371,79 @@ async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() 
 
 #[cfg(unix)]
 #[tokio::test]
+async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
+    // intent-hq/intent#4587: over the real WSS transport, a claude-code
+    // `agent.completeOnce` opens the ephemeral session with a slimming
+    // `_meta` — the caller's `systemPrompt` as a STRING (replaces the
+    // `claude_code` preset), `tools: []`, `settingSources: ["user"]` — and
+    // the turn carries the bare prompt (no `System:` composition). The mock
+    // fixture records the `session/new` `_meta` verbatim through its
+    // `MOCK_AGENT_SESSION_LOG` seam; a prompt-content rule proves the turn
+    // shape through the returned `{ text }`.
+    use std::os::unix::fs::PermissionsExt;
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping claude-code completeOnce e2e: node not on PATH");
+        return;
+    }
+    let fixture = format!(
+        "{}/tests/fixtures/mock-acp-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let dir = test_tempdir("intentd-wss-acp-claude-slim-");
+    let session_log = dir.path().join("sessions.jsonl");
+    let behavior = r#"{"response":"🤖\nbare-turn","rules":[{"ifPromptContains":"System:","response":"🤖\ncomposed-turn"}]}"#;
+    let bin = dir.path().join("claude-agent-acp");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nMOCK_AGENT_SESSION_LOG={:?} MOCK_AGENT_BEHAVIOR='{behavior}' exec node {fixture:?} \"$@\"\n",
+            session_log.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "claude-code": bin.to_string_lossy() }),
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":51,"method":"agent.completeOnce","params":{"prompt":"slug for login fix","systemPrompt":"be terse"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 51);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({ "text": "bare-turn" }),
+        "the claude-code turn carries the bare prompt, not the `System:` composition"
+    );
+
+    let log = std::fs::read_to_string(&session_log).expect("mock session log");
+    let calls: Vec<Value> = log
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("session log line"))
+        .collect();
+    assert_eq!(calls.len(), 1, "exactly one session/new, got: {log}");
+    assert_eq!(calls[0]["method"], "session/new");
+    assert_eq!(
+        calls[0]["meta"],
+        serde_json::json!({
+            "systemPrompt": "be terse",
+            "claudeCode": { "options": { "tools": [], "settingSources": ["user"] } },
+        }),
+        "claude-code session/new `_meta` on the wire"
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
     // A RESOLVED adapter that dies before completing the turn is a hard
     // -32603 (§5.32), not `{ available: false }` — the unavailable result is
