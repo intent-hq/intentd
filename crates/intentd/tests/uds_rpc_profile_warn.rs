@@ -20,18 +20,17 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    /// Swept after `Drop` reaps the child (fields drop after `drop()` runs).
+    _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -39,9 +38,8 @@ impl Drop for Daemon {
 /// `data_dir/daemon.log`, plus the given extra env vars.
 fn spawn_daemon(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, PathBuf, PathBuf) {
     // Keep the data dir short so `data_dir/intentd.sock` fits within SUN_LEN.
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", &format!("{prefix}-"));
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let log_path = data_dir.join("daemon.log");
     let log = std::fs::File::create(&log_path).expect("create daemon log");
@@ -61,7 +59,7 @@ fn spawn_daemon(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, PathBuf, PathBu
     (
         Daemon {
             child,
-            data_dir: data_dir.clone(),
+            _data_dir: data_dir_guard,
         },
         socket,
         log_path,
@@ -192,19 +190,13 @@ async fn default_thresholds_stay_quiet_for_normal_traffic() {
     );
 }
 
-struct TempRepo(PathBuf);
-
-impl Drop for TempRepo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+struct TempRepo(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
 /// Create a temporary git repo (initial commit on `main`) carrying the given
 /// `.intent/config.json` contents.
 fn create_repo_with_config(config: &str) -> TempRepo {
-    let repo_path = std::env::temp_dir().join(format!("itdp-repo-{}", Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&repo_path).expect("mkdir repo");
+    let repo_dir = common::test_tempdir("itdp-repo-");
+    let repo_path = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
         let out = Command::new("git")
             .args(args)
@@ -222,7 +214,7 @@ fn create_repo_with_config(config: &str) -> TempRepo {
     std::fs::write(repo_path.join("README.md"), "test").expect("write README");
     git(&["add", "."]);
     git(&["commit", "-m", "Initial commit"]);
-    TempRepo(repo_path)
+    TempRepo(repo_path, repo_dir)
 }
 
 /// Regression test for intent-hq/monorepo#1778: the first `script.list` for a

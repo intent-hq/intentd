@@ -26,43 +26,30 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{unix::OwnedReadHalf, UnixStream};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
-        }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = common::test_tempdir("intentd-uds-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
 struct TempDir {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 
 impl TempDir {
     fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("intentd-{prefix}-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("mkdir");
-        Self { path }
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        let dir = common::test_tempdir(&format!("intentd-{prefix}-"));
+        let path = dir.path().to_path_buf();
+        Self { _dir: dir, path }
     }
 }
 

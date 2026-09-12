@@ -116,8 +116,8 @@ async fn send(socket: &Path, frame: &str) -> Value {
 
 #[tokio::test]
 async fn uds_git_write_ops_round_trip() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-git-{}", &short[..8]));
+    let base_guard = common::test_tempdir_in("/tmp", "intentd-git-");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo = base.join("repo");
@@ -402,7 +402,6 @@ async fn uds_git_write_ops_round_trip() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Over-the-wire coverage for the write methods added alongside the
@@ -411,8 +410,8 @@ async fn uds_git_write_ops_round_trip() {
 /// their own crate-level tests (they need a bare-remote fixture).
 #[tokio::test]
 async fn uds_git_write_ops_wave_b_round_trip() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-gitwb-{}", &short[..8]));
+    let base_guard = common::test_tempdir_in("/tmp", "intentd-gitwb-");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo = base.join("repo");
@@ -587,15 +586,14 @@ async fn uds_git_write_ops_wave_b_round_trip() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Over-the-wire git read slice: `git.changes`, `git.diffs` (+ `git.diff`
 /// alias), and `git.commits` (+ `git.log` alias) populate the FE panels.
 #[tokio::test]
 async fn uds_git_read_ops_round_trip() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-gitr-{}", &short[..8]));
+    let base_guard = common::test_tempdir_in("/tmp", "intentd-gitr-");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo = base.join("repo");
@@ -730,7 +728,6 @@ async fn uds_git_read_ops_round_trip() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Register `child` as a submodule of `parent` at `sub_rel` via a real `git`
@@ -759,8 +756,8 @@ fn add_submodule(parent: &Path, child: &Path, sub_rel: &str) {
 /// containing submodule, and no commit lands.
 #[tokio::test]
 async fn uds_git_agent_commit_rejects_submodule_internal_file() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-gitsub-{}", &short[..8]));
+    let base_guard = common::test_tempdir_in("/tmp", "intentd-gitsub-");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let child = base.join("child");
@@ -852,7 +849,6 @@ async fn uds_git_agent_commit_rejects_submodule_internal_file() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Over-the-wire submodule-gitlink guard for discard (monorepo#1733):
@@ -861,8 +857,8 @@ async fn uds_git_agent_commit_rejects_submodule_internal_file() {
 /// submodule's uncommitted edit survives and the gitlink stays a `160000` entry.
 #[tokio::test]
 async fn uds_git_discard_rejects_submodule_internal_path() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-gitsubd-{}", &short[..8]));
+    let base_guard = common::test_tempdir_in("/tmp", "intentd-gitsubd-");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let child = base.join("child");
@@ -945,7 +941,6 @@ async fn uds_git_discard_rejects_submodule_internal_path() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Over-the-wire per-commit read slice: `git.commitDetails` returns metadata +
@@ -953,8 +948,8 @@ async fn uds_git_discard_rejects_submodule_internal_path() {
 /// per-file hunks.
 #[tokio::test]
 async fn uds_git_commit_details_round_trip() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-gitc-{}", &short[..8]));
+    let base_guard = common::test_tempdir_in("/tmp", "intentd-gitc-");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo = base.join("repo");
@@ -1091,15 +1086,14 @@ async fn uds_git_commit_details_round_trip() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Over-the-wire `git.branchStatus` slice: path-based ahead/behind + dirty-tree
 /// flag for the workspace-initializer `BranchSelector` seam (PROTOCOL §5.6).
 #[tokio::test]
 async fn uds_git_branch_status_round_trip() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-gitbs-{}", &short[..8]));
+    let base_guard = common::test_tempdir_in("/tmp", "intentd-gitbs-");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo = base.join("repo");
@@ -1246,7 +1240,6 @@ async fn uds_git_branch_status_round_trip() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Over-the-wire `git.getBranches` slice: the path-based branch listing used by
@@ -1256,8 +1249,8 @@ async fn uds_git_branch_status_round_trip() {
 /// rejected with distinct -32602 errors.
 #[tokio::test]
 async fn uds_git_get_branches_round_trip() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-gitgb-{}", &short[..8]));
+    let base_guard = common::test_tempdir_in("/tmp", "intentd-gitgb-");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     // `known` is registered as a workspace; `unreg` is a valid git repo the
@@ -1382,7 +1375,6 @@ async fn uds_git_get_branches_round_trip() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
@@ -1393,8 +1385,8 @@ async fn uds_git_get_branches_round_trip() {
 /// `{ ok: false, error }` failure, and the -32602 param rejections.
 #[tokio::test]
 async fn uds_git_pull_round_trip() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-gitpl-{}", &short[..8]));
+    let base_guard = common::test_tempdir_in("/tmp", "intentd-gitpl-");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
 
@@ -1525,7 +1517,6 @@ async fn uds_git_pull_round_trip() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Over-the-wire coverage for the read-side git extensions added alongside
@@ -1534,8 +1525,8 @@ async fn uds_git_pull_round_trip() {
 /// so `origin` is a configured URL only, not a reachable remote).
 #[tokio::test]
 async fn uds_git_read_ops_extensions_round_trip() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-gitreads-{}", &short[..8]));
+    let base_guard = common::test_tempdir_in("/tmp", "intentd-gitreads-");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo = base.join("repo");
@@ -1648,5 +1639,4 @@ async fn uds_git_read_ops_extensions_round_trip() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }

@@ -29,13 +29,14 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+impl TempDb {
+    fn new() -> Self {
+        let dir = common::test_tempdir("intentd-uds-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -129,9 +130,7 @@ async fn setup() -> (
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
-    let tmp = TempDb {
-        path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
-    };
+    let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
     let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus);
@@ -158,9 +157,7 @@ async fn setup_with_bus() -> (
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
-    let tmp = TempDb {
-        path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
-    };
+    let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
     let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus);
