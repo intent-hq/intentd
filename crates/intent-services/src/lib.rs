@@ -71,7 +71,6 @@ mod complete_ops;
 #[cfg(test)]
 mod completion_interception_tests;
 mod config_watcher;
-mod crdt_notes;
 mod create_progress;
 mod delete_grace;
 mod discovery_cache;
@@ -818,17 +817,6 @@ pub struct Services {
     /// service handle observes the same in-flight timers.
     line_attribution_debouncers:
         Arc<Mutex<HashMap<(WorkspaceId, NoteId), tokio::task::AbortHandle>>>,
-    /// Session-only CRDT merge engine for note full-content writes (PROTOCOL
-    /// `note.setContent` / `note.update` with content, §5.2). Ported from the
-    /// reference `CRDTDocumentManager` / `CRDTNotesService` — a yrs `Doc` is
-    /// seeded from the note's stored content on first touch and subsequent
-    /// full-content writes apply a char-level diff inside a yrs transaction;
-    /// the merged text is what the daemon persists, so concurrent writes
-    /// converge instead of last-write-wins. Surgical `note.*` / `task.*`
-    /// mutations invalidate the cached session so the next full-content write
-    /// reseeds from disk. Shared across clones like the other in-memory
-    /// registries.
-    crdt_notes: Arc<crdt_notes::CrdtNoteManager>,
     /// Per-workspace debouncers for `workspace:updated { lastActivity }` event
     /// emission (§10.1). Each write that can move derived `lastActivity`
     /// schedules a trailing-edge debounced emit; rapid bumps coalesce into one
@@ -1222,7 +1210,6 @@ impl Services {
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
-            crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
             last_activity_debounce_gen: Arc::new(Mutex::new(0)),
             idle_debouncers: Arc::new(Mutex::new(HashMap::new())),
@@ -4928,31 +4915,6 @@ impl Services {
                 ticker.tick().await;
                 services.refresh_all_workspace_prs(tick).await;
                 tick = tick.wrapping_add(1);
-            }
-        })
-    }
-
-    /// Spawn the CRDT session-sweeper loop (A5, reference parity with the
-    /// `CRDTNotesService` idle sweep): every [`crdt_notes::SESSION_SWEEP_INTERVAL`]
-    /// tick, drop cached `yrs` docs whose last access is older than
-    /// [`crdt_notes::SESSION_IDLE_TIMEOUT`] so long-lived daemons do not hold
-    /// per-note session state indefinitely. The first sweep runs after one
-    /// interval; missed ticks are skipped (no pile-up). Returns the task handle
-    /// so the composition root can hold/abort it.
-    #[must_use]
-    pub fn spawn_crdt_session_sweep_loop(&self) -> tokio::task::JoinHandle<()> {
-        let crdt_notes = self.crdt_notes.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(crdt_notes::SESSION_SWEEP_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Consume the immediate first tick so the loop waits one interval.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                let removed = crdt_notes.sweep_stale(crdt_notes::SESSION_IDLE_TIMEOUT);
-                if removed > 0 {
-                    tracing::info!(removed, "crdt session sweep evicted stale sessions");
-                }
             }
         })
     }
@@ -9295,16 +9257,6 @@ impl Services {
             note,
         })
     }
-
-    /// Drop any cached CRDT session for `(workspace, note)` after a surgical
-    /// content mutation (`note.add` / `note.edit` / `note.editLines`,
-    /// `task.updateStatus` / `task.update`, `note.restoreVersion`,
-    /// `note.convertBlocks`, `comment.add`) writes directly to storage. The
-    /// next full-content write (`note.setContent`) will reseed the yrs doc
-    /// from the fresh persisted content so the merge baseline stays coherent.
-    pub(crate) fn invalidate_crdt_note(&self, workspace_id: &WorkspaceId, note_id: &NoteId) {
-        self.crdt_notes.invalidate(workspace_id, note_id);
-    }
 }
 
 /// Seed the well-known `spec` note for a workspace (reference parity with
@@ -11444,7 +11396,6 @@ impl Services {
             {
                 tracing::warn!(note = %note.id.0, task = %task_id.0, error = %e, "materialize linked checkboxes: version snapshot failed");
             }
-            self.invalidate_crdt_note(workspace_id, &note.id);
             self.schedule_line_attribution_recompute(workspace_id, &note.id);
             publish_event(
                 self.event_bus.as_ref(),
@@ -13914,7 +13865,6 @@ impl Services {
         // content that line-attribution/history consumers diff against.
         let author = resolve_note_version_author(store, caller_agent_id).await;
         capture_note_version(store, &note, &author, rev).await?;
-        self.invalidate_crdt_note(&note.workspace_id, &note.id);
         self.schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
         // Emit `note:updated` for the rewritten parent so subscribers
         // refresh the fence-free content live (TS parity: the reference
@@ -21373,22 +21323,15 @@ impl WorkspaceApi for Services {
             let content_changed = input.content.is_some();
             let mut reanchor_plan: Option<ReanchorPlan> = None;
             if let Some(content) = input.content {
-                // Route the full-content write through the CRDT merge engine
-                // so concurrent writers converge (§5.2 / A5 parity with
-                // `CRDTNotesService.applyContentUpdate`).
-                let old_content = note.content.clone();
-                let merged = services.crdt_notes.apply_full_content(
-                    &workspace_id,
-                    &note_id,
-                    &old_content,
-                    &content,
-                );
+                // Plain versioned write: a stale `expectedVersion` surfaces
+                // `-32005` from `update_note_versioned` below; only
+                // `note.setContent` merges.
                 // Comment anchor recovery mirrors reference `updateNote`: run
-                // the merged markdown through `recoverAllPartialAnchors` before
+                // the new markdown through `recoverAllPartialAnchors` before
                 // persisting so surviving-partial anchors are repaired and
                 // unrecoverable ones are stripped + flipped to orphaned.
                 let mut plan =
-                    reanchor_note_comments(&store, &workspace_id, &note_id, merged).await?;
+                    reanchor_note_comments(&store, &workspace_id, &note_id, content).await?;
                 note.content = std::mem::take(&mut plan.content);
                 reanchor_plan = Some(plan);
             } else {
@@ -21477,7 +21420,6 @@ impl WorkspaceApi for Services {
             capture_note_version(&store, &note, &author, rev).await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
                 .auto_convert_task_blocks_after_write(
                     &note.workspace_id,
@@ -21555,7 +21497,6 @@ impl WorkspaceApi for Services {
             capture_note_version(&store, &note, &author, rev).await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
                 .auto_convert_task_blocks_after_write(
                     &note.workspace_id,
@@ -21632,7 +21573,6 @@ impl WorkspaceApi for Services {
             capture_note_version(&store, &note, &author, rev).await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
                 .auto_convert_task_blocks_after_write(
                     &note.workspace_id,
@@ -21890,7 +21830,6 @@ impl WorkspaceApi for Services {
             store
                 .delete_note_versioned(&workspace_id, &note_id, expected_version)
                 .await?;
-            services.crdt_notes.remove(&workspace_id, &note_id);
             publish_event(
                 bus.as_ref(),
                 note_change_event(&workspace_id, &note_id, &note.title, NOTE_DELETED, "delete"),
@@ -22128,7 +22067,6 @@ impl WorkspaceApi for Services {
             let new_v = capture_note_version(&store, &note, &author, rev).await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -22252,7 +22190,6 @@ impl WorkspaceApi for Services {
             let rev = store.update_note(&note).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             capture_note_version(&store, &note, &author, rev).await?;
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
@@ -22404,10 +22341,9 @@ impl WorkspaceApi for Services {
                     .set_task_note_status(&note.workspace_id, &task_id, next, None, caller_agent_id)
                     .await?;
             }
-            // A parent materialization rewrites already invalidates and
-            // schedules; only the direct write here needs it.
+            // A parent materialization rewrite already schedules; only the
+            // direct write here needs it.
             if write_parent {
-                services.invalidate_crdt_note(&note.workspace_id, &note.id);
                 services.schedule_line_attribution_recompute(&note.workspace_id, &note.id);
             }
             Ok(TaskUpdateResult {
@@ -23306,7 +23242,6 @@ impl WorkspaceApi for Services {
                         },
                     };
                     capture_note_version(&store, &note, &version_author, note_rev).await?;
-                    services.invalidate_crdt_note(&note.workspace_id, &note.id);
                     services.schedule_line_attribution_recompute(
                         &note.workspace_id.clone(),
                         &note.id.clone(),

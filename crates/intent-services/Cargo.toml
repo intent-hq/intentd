@@ -32,7 +32,6 @@ tracing = { workspace = true }
 serde = { workspace = true }
 time = { workspace = true, features = ["formatting", "local-offset"] }
 similar = { version = "3.1.1", default-features = false }
-yrs = "0.27.2"
 serde_yaml = "0.9"
 async-recursion = "1.1"
 toml_edit = "0.25.5"

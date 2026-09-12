@@ -2271,72 +2271,6 @@ async fn set_content_reduction_guard_requires_confirmation() {
     assert_eq!(ok.new_content, "x");
 }
 
-/// A5 (CRDT note-merge, PROTOCOL §5.2): two `note.setContent` calls whose new
-/// content each observes the other's write survive in the merged result. The
-/// second write's `oldContent` still points at the persisted state before it
-/// ran, but the CRDT diff against the yrs doc's *current* text preserves the
-/// first write's characters — the FE parity signal that the daemon no longer
-/// last-write-wins on concurrent full-content writes.
-#[tokio::test]
-async fn set_content_merges_concurrent_writes() {
-    let (_tmp, svc, ws, id) = setup("BODY").await;
-
-    // Author A appends a line at the end.
-    let a = svc
-        .set_note_content(
-            ws.clone(),
-            id.clone(),
-            "BODY\nA-line".into(),
-            true,
-            None,
-            None,
-        )
-        .await
-        .expect("A write");
-    assert_eq!(a.new_content, "BODY\nA-line");
-
-    // Author B prepends a line, having read the post-A content as baseline —
-    // the yrs merge stitches both edits together.
-    let b = svc
-        .set_note_content(
-            ws.clone(),
-            id.clone(),
-            "B-line\nBODY\nA-line".into(),
-            true,
-            None,
-            None,
-        )
-        .await
-        .expect("B write");
-    assert_eq!(b.new_content, "B-line\nBODY\nA-line");
-
-    // A surgical mutation invalidates the CRDT session so the next
-    // `setContent` reseeds from the fresh persisted content.
-    svc.edit_note(
-        ws.clone(),
-        id.clone(),
-        NoteEditInput {
-            old: "A-line".into(),
-            new: "A-line (edited)".into(),
-        },
-        None,
-    )
-    .await
-    .expect("edit");
-    let c = svc
-        .set_note_content(
-            ws,
-            id,
-            "B-line\nBODY\nA-line (edited)\nC-line".into(),
-            true,
-            None,
-            None,
-        )
-        .await
-        .expect("C write");
-    assert_eq!(c.new_content, "B-line\nBODY\nA-line (edited)\nC-line");
-}
-
 /// [`setup`] plus a `note_version` snapshot at rev 0, so `expectedVersion: 0`
 /// resolves to a recoverable base for the three-way merge.
 async fn setup_versioned(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
@@ -12279,21 +12213,11 @@ mod change_event_parity {
             .contains_key(&(h.ws.clone(), intent_core::NoteId::from(id)))
     }
 
-    fn seed_crdt_session(h: &Harness, id: &str, content: &str) {
-        let nid = intent_core::NoteId::from(id);
-        h.services
-            .crdt_notes
-            .apply_full_content(&h.ws, &nid, content, content);
-        assert!(h.services.crdt_notes.has_session(&h.ws, &nid));
-    }
-
     /// A materialized parent write is a surgical content mutation like
-    /// `note.edit`: it drops the parent's cached CRDT session (so the next
-    /// `note.setContent` reseeds from the persisted marker) and schedules its
-    /// line-attribution recompute. Parents left untouched — and the task note
-    /// itself — keep their sessions and schedule nothing.
+    /// `note.edit`: it schedules the parent's line-attribution recompute.
+    /// Parents left untouched — and the task note itself — schedule nothing.
     #[tokio::test]
-    async fn materialization_invalidates_parent_crdt_and_schedules_attribution_recompute() {
+    async fn materialization_schedules_parent_attribution_recompute() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
         insert_task_note(&h, T2, TaskStatus::NotStarted).await;
@@ -12307,38 +12231,23 @@ mod change_event_parity {
             .insert_note(&note(&h.ws, FRESH, &other))
             .await
             .expect("insert other");
-        seed_crdt_session(&h, "spec", &body);
-        seed_crdt_session(&h, FRESH, &other);
 
         set_status(&h, T1, "complete").await;
 
         assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
         assert!(
-            !h.services.crdt_notes.has_session(&h.ws, &spec_id()),
-            "rewritten parent drops its CRDT session"
-        );
-        assert!(
             attribution_recompute_scheduled(&h, "spec"),
             "rewritten parent schedules a line-attribution recompute"
         );
-        assert!(h
-            .services
-            .crdt_notes
-            .has_session(&h.ws, &intent_core::NoteId::from(FRESH)));
         assert!(!attribution_recompute_scheduled(&h, FRESH));
         assert!(!attribution_recompute_scheduled(&h, T1));
-
-        // The marker already matches: no rewrite, so no invalidation either.
-        seed_crdt_session(&h, "spec", &linked("[x]", "T", T1));
-        set_status(&h, T1, "complete").await;
-        assert!(h.services.crdt_notes.has_session(&h.ws, &spec_id()));
     }
 
     /// Redirected writes through `task.updateStatus` / `task.update` behave as
-    /// on every other materializing path: the redirect target's parents are
-    /// invalidated too (here the parent is the note the call addressed).
+    /// on every other materializing path: the redirect target's parent (here
+    /// the note the call addressed) schedules its recompute too.
     #[tokio::test]
-    async fn redirected_write_invalidates_parent_crdt() {
+    async fn redirected_write_schedules_parent_attribution_recompute() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
         let body = linked("[ ]", "T", T1);
@@ -12346,7 +12255,6 @@ mod change_event_parity {
             .insert_note(&note(&h.ws, "spec", &body))
             .await
             .expect("insert spec");
-        seed_crdt_session(&h, "spec", &body);
 
         h.services
             .task_update(
@@ -12362,7 +12270,6 @@ mod change_event_parity {
             .expect("task.update");
 
         assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
-        assert!(!h.services.crdt_notes.has_session(&h.ws, &spec_id()));
         assert!(attribution_recompute_scheduled(&h, "spec"));
     }
 
@@ -31310,19 +31217,6 @@ mod line_attribution_hooks {
         .await
         .expect("comment.add");
         assert_debouncer_scheduled(&svc, &ws, &id);
-    }
-
-    #[tokio::test]
-    async fn spawn_crdt_session_sweep_loop_returns_abortable_handle() {
-        let (_tmp, svc, _ws, _id) = setup("").await;
-        let handle = svc.spawn_crdt_session_sweep_loop();
-        assert!(!handle.is_finished(), "sweep loop should stay running");
-        handle.abort();
-        let joined = handle.await;
-        assert!(
-            matches!(&joined, Err(e) if e.is_cancelled()),
-            "aborted sweep loop must join with a cancellation error: {joined:?}",
-        );
     }
 }
 
