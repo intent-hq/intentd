@@ -188,15 +188,19 @@ struct Fixture {
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry `engine`.
+///
+/// The owning `TempDir` is the first tuple element so that destructuring
+/// callers (whose locals drop in reverse binding order) drop it after the
+/// `WsApiServer`, not before.
 async fn boot_with_engine(
     engine: Arc<dyn VoiceEngine>,
 ) -> (
+    tempfile::TempDir,
     WsApiServer,
     u16,
     Arc<ClientConfig>,
     Store,
     PathBuf,
-    tempfile::TempDir,
 ) {
     let dir_guard = common::test_tempdir("intentd-voice-");
     let dir = dir_guard.path().to_path_buf();
@@ -224,14 +228,14 @@ async fn boot_with_engine(
     let ws_srv = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws_srv.start().await.expect("start");
-    (ws_srv, port, cfg, store, workspaces_root, dir_guard)
+    (dir_guard, ws_srv, port, cfg, store, workspaces_root)
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry the recording
 /// stub engine.
 async fn boot() -> Fixture {
     let engine = Arc::new(RecordingEngine::default());
-    let (ws_srv, port, cfg, store, workspaces_root, dir) = boot_with_engine(engine.clone()).await;
+    let (dir, ws_srv, port, cfg, store, workspaces_root) = boot_with_engine(engine.clone()).await;
     Fixture {
         _ws: ws_srv,
         port,
@@ -556,7 +560,7 @@ async fn provider_override_still_uses_injected_engine() {
 /// unchanged from the pre-structured shape (PROTOCOL §5.41, monorepo#1448).
 #[tokio::test]
 async fn missing_api_key_surfaces_structured_error_data() {
-    let (_srv, port, cfg, _store, _root, _dir) = boot_with_engine(Arc::new(NoKeyEngine)).await;
+    let (_dir, _srv, port, cfg, _store, _root) = boot_with_engine(Arc::new(NoKeyEngine)).await;
     let mut ws = connect(port, cfg).await;
 
     let resp = wss_rpc_raw(
