@@ -25,7 +25,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -54,16 +53,12 @@ impl Drop for Daemon {
             if let Ok(log) = std::fs::read_to_string(&log_path) {
                 eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
-            let _ = std::fs::remove_dir_all(&self.data_dir);
         }
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-runtime-ctrl-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-runtime-ctrl-")
 }
 
 /// Shared `serve` setup: hermetic dirs, log redirection, env. Used by the
@@ -328,7 +323,8 @@ where
 /// → verify RPCs work → disable over UDS → verify listener stops and new connections fail.
 #[tokio::test]
 async fn runtime_ws_listener_toggle_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     // Start daemon with both UDS and TCP (server.wsApi.enabled seeded in config.toml)
     let child = spawn_serve(&data_dir, "both", &env);
@@ -446,7 +442,8 @@ async fn runtime_ws_listener_toggle_over_wss() {
 // Port numbers are far below 2^53: loss-free in f64.
 #[allow(clippy::cast_precision_loss)]
 async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let port_s = free_port().to_string();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
 
@@ -643,7 +640,8 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
 /// listener starts on the NEW port.
 #[tokio::test]
 async fn batch_hook_ordering_port_before_enable() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // No INTENTD_TCP_PORT: the env-0 ephemeral seam would override the batch's
     // explicit port and the bound port is exactly what proves hook ordering.
     // Boot UDS-only (no wsApi seed) so the batch below exercises a cold start.
@@ -715,7 +713,8 @@ async fn batch_hook_ordering_port_before_enable() {
 async fn wss_system_status_includes_capacity_version_uptime() {
     // system.status over WSS reports maxAgents, version, uptimeSeconds alongside
     // existing fields (additive change for FE health menu).
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
@@ -871,7 +870,8 @@ async fn wss_system_status_includes_capacity_version_uptime() {
 async fn wss_system_request_update_signals_the_sitter() {
     use std::os::unix::process::ExitStatusExt;
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let sitter_dir = data_dir.join("sitter");
     std::fs::create_dir_all(&sitter_dir).expect("mkdir sitter dir");
     let sitter_bin = sitter_dir.join("intentd-sitter");
@@ -995,7 +995,8 @@ async fn wss_system_status_reports_budget_fields_when_installed() {
     // agentMemoryChargedBytes once the descendant-tree sampler has landed a
     // sample (absent before — the budget is inert until then), and
     // queuedSpawns (0 with nothing queued).
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     std::fs::write(
         data_dir.join("config.toml"),
         "[agents]\nmemoryBudgetMb = 20480\n",
@@ -1056,7 +1057,8 @@ async fn runtime_toggled_wss_serves_system_status() {
     // Daemon starts UDS-only, then toggles WSS on at runtime via
     // settings.update. Verify system.status works over the runtime-started
     // WSS listener (tests OnceLock control population, §5.7).
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     // Start daemon with ONLY UDS (no wsApi config seed)
     let _daemon = Daemon {
@@ -1178,7 +1180,8 @@ async fn runtime_toggled_wss_serves_system_status() {
 /// without a tunnel) while serving loopback-free hosts for 0.0.0.0.
 #[tokio::test]
 async fn runtime_bind_address_change_restarts_listener() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Fixed seeded port (no INTENTD_TCP_PORT=0 seam) so the restarted
     // listener rebinds the same port and only the address changes.
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
@@ -1351,7 +1354,8 @@ async fn runtime_bind_address_list_applies_and_validates() {
         eprintln!("skipping: IPv6 loopback unavailable");
         return;
     }
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -1478,7 +1482,8 @@ async fn runtime_bind_address_list_applies_and_validates() {
 /// makes pairing succeed here).
 #[tokio::test]
 async fn tunnel_only_advertises_loopback_only() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Seed a wide bindAddress alongside tunnel-only BEFORE boot, so the test
     // proves the loopback override wins on the advertised surfaces.
     // configure_serve appends [server.wsApi] after these tables.
@@ -1570,7 +1575,8 @@ esac
 /// fires for a WSS caller and rolls the setting back.
 #[tokio::test]
 async fn tunnel_settings_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let tailcat = write_fake_tailcat(&data_dir);
     let tailcat_s = tailcat.to_string_lossy().to_string();
     let env: [(&str, &str); 3] = [

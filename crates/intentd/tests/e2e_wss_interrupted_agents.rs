@@ -16,7 +16,7 @@
 mod common;
 
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,11 +36,8 @@ use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-interrupted-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-interrupted-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -224,7 +221,8 @@ where
 
 #[tokio::test]
 async fn interrupted_agents_persisted_across_restart() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 
@@ -446,7 +444,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
     let ws_id = "ws-graceful-test";

@@ -19,7 +19,7 @@ mod common;
 use std::os::unix::process::CommandExt;
 
 use common::DaemonGuard;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,11 +38,8 @@ use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-resolve-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-resolve-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -229,7 +226,8 @@ async fn resolve_interrupted_resume_and_abandon() {
     // message as the last user-role message (and that it no longer mentions
     // "intentd").
     use intent_core::AgentId;
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 
@@ -550,7 +548,8 @@ async fn resolve_interrupted_resume_and_abandon() {
 
 #[tokio::test]
 async fn resolve_interrupted_invalid_params_validation() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 

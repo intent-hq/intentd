@@ -9,7 +9,7 @@
 mod common;
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,22 +23,17 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
-    legacy_root: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-        let _ = std::fs::remove_dir_all(&self.legacy_root);
     }
 }
 
@@ -237,11 +232,10 @@ async fn imported_count(ws: &mut common::TlsWs, id: i64) -> usize {
 #[tokio::test]
 async fn wss_serves_rpcs_and_streams_workspace_created_during_first_boot_import() {
     const WORKSPACES: usize = 5;
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itd-wli-{}", &id[..8]));
-    let legacy_root = PathBuf::from("/tmp").join(format!("itd-wlr-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).unwrap();
-    std::fs::create_dir_all(&legacy_root).unwrap();
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itd-wli-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let legacy_root_guard = common::test_tempdir_in("/tmp", "itd-wlr-");
+    let legacy_root = legacy_root_guard.path().to_path_buf();
     for i in 0..WORKSPACES {
         write_synthetic_workspace(&legacy_root, &format!("ws-wss-inflight-{i}"));
     }
@@ -253,8 +247,6 @@ async fn wss_serves_rpcs_and_streams_workspace_created_during_first_boot_import(
     let socket = data_dir.join("intentd.sock");
     let _daemon = Daemon {
         child: spawn_daemon(&data_dir, &legacy_root, &hold),
-        data_dir: data_dir.clone(),
-        legacy_root,
     };
 
     // Resolve the live WSS port + fingerprint over UDS, then connect a real
