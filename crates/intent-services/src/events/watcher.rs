@@ -560,13 +560,17 @@ impl FileWatcher {
         Self { _sub: sub, task }
     }
 
-    /// Await the shared watch on this workspace's root actually being
-    /// established. Registration is deferred off the caller's thread
-    /// (monorepo#1572), so tests must wait for it before mutating the tree.
+    /// Await the shared watch on this workspace's root actually being live.
+    /// Registration is deferred off the caller's thread (monorepo#1572), so
+    /// tests must wait for it before mutating the tree — and wait for *live*,
+    /// not merely settled: a registration settled as failed during a
+    /// creation retry (intent-hq/intent#4845) would otherwise let the test
+    /// write before the watch exists and lose the event. Panics with a
+    /// diagnostic on a dead watch or on `timeout`.
     #[cfg(test)]
     #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     pub(super) async fn wait_established(&self, timeout: Duration) {
-        self._sub.wait_established(timeout).await;
+        self._sub.probe().wait_live(timeout).await;
     }
 }
 

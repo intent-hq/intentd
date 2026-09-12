@@ -242,6 +242,13 @@ impl WatcherRegistry {
         self.hub.root_established(root)
     }
 
+    /// Human-readable registration state of one root, for wait diagnostics —
+    /// see [`SharedWatchHub::root_registration_state`].
+    #[cfg(test)]
+    fn root_registration_state(&self, root: &std::path::Path) -> &'static str {
+        self.hub.root_registration_state(root)
+    }
+
     /// Live shared `FSEvents` stream count — the consolidation metric.
     #[cfg(test)]
     fn stream_count(&self) -> usize {
@@ -588,7 +595,7 @@ mod tests {
     use tokio::time::{timeout, Instant};
 
     use super::*;
-    use crate::events::LIVENESS;
+    use crate::events::{TestBudget, LIVENESS};
 
     /// Self-cleaning temp directory (workspace roots).
     struct TempDir {
@@ -846,19 +853,59 @@ mod tests {
     /// race ahead of the registration it actually cares about. The short
     /// trailing sleep is the usual FSEvents/inotify settle margin: `watch()` has
     /// returned, but the backend needs a moment before it reports changes.
+    ///
+    /// `want = true` waits for the registration to be LIVE, not merely settled:
+    /// under inotify-instance exhaustion the hub settles the root as failed at
+    /// once and re-registers it when watcher creation later succeeds, so a
+    /// test that mutates the tree on "settled" writes against a dead watch and
+    /// then waits out its whole event budget. Expiry panics with the root's
+    /// registration state rather than falling through into the next wait: a
+    /// silent expiry left the stalled wait unidentifiable in the nextest kill
+    /// (intent-hq/intent#4872).
     async fn wait_for_root(registry: &WatcherRegistry, root: &std::path::Path, want: bool) {
-        let deadline = tokio::time::Instant::now() + LIVENESS;
-        loop {
-            let ready = match registry.root_established(root) {
-                Some(established) => want && established,
-                None => !want,
-            };
-            if ready || tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for_root_within(registry, root, want, &TestBudget::liveness()).await;
+    }
+
+    /// [`wait_for_root`] drawing its deadline from a budget shared with the
+    /// test's other waits, so a multi-phase test cannot stack several full
+    /// `LIVENESS` waits past the 180s nextest kill (intent-hq/intent#4872).
+    async fn wait_for_root_within(
+        registry: &WatcherRegistry,
+        root: &std::path::Path,
+        want: bool,
+        budget: &TestBudget,
+    ) {
+        try_wait_for_root(registry, root, want, budget.remaining())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    /// Poll the root's registration state until it matches `want` or
+    /// `remaining` runs out; the error names what the hub still reports.
+    async fn try_wait_for_root(
+        registry: &WatcherRegistry,
+        root: &std::path::Path,
+        want: bool,
+        remaining: Duration,
+    ) -> std::result::Result<(), String> {
+        let deadline = tokio::time::Instant::now() + remaining;
+        let target = if want { "live" } else { "unwatched" };
+        loop {
+            let state = registry.root_registration_state(root);
+            if state == target {
+                return Ok(());
+            }
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Err(format!(
+                    "root {} did not become {target} within {remaining:?}: registration {state} ({})",
+                    root.display(),
+                    super::super::shared_watch::os_watch_limits(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10).min(left)).await;
+        }
     }
 
     /// Actively confirm `ws_id`'s watch is live: rewrite a throwaway probe file
@@ -1154,27 +1201,74 @@ mod tests {
         // list), like a workspace opened later: `workspace:opened` carries
         // only the id, so the registry must resolve the path via the api.
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+        // One deadline for every wait below: three registration waits plus
+        // the event wait must not stack four full `LIVENESS` windows
+        // (intent-hq/intent#4872).
+        let budget = TestBudget::liveness();
 
         let registry = start_registry(&bus, api).await;
-        wait_for_root(&registry, &root.path, true).await;
+        wait_for_root_within(&registry, &root.path, true, &budget).await;
 
         // Simulate close → open: after close the watchers are gone, and the
         // reopen path exercises the get_workspace lookup.
         bus.publish(&lifecycle_event(WORKSPACE_CLOSED, &ws, false))
             .await
             .expect("publish closed");
-        wait_for_root(&registry, &root.path, false).await;
+        wait_for_root_within(&registry, &root.path, false, &budget).await;
 
         bus.publish(&lifecycle_event(WORKSPACE_OPENED, &ws, false))
             .await
             .expect("publish opened");
-        wait_for_root(&registry, &root.path, true).await;
+        wait_for_root_within(&registry, &root.path, true, &budget).await;
 
         std::fs::write(root.path.join("after-open.txt"), "hi").expect("write file");
-        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
+        let ev = next_file_event(&mut sub, &ws.id, budget.remaining()).await;
         assert!(
             ev.is_some(),
-            "reopened workspace must emit file events (path resolved via services)"
+            "reopened workspace must emit file events (path resolved via services); \
+             registration {}",
+            registry.root_registration_state(&root.path)
+        );
+    }
+
+    /// Regression for intent-hq/intent#4872: a root wait draws from the
+    /// shared budget and fails with a diagnostic when it runs out, instead of
+    /// silently expiring after a fresh `LIVENESS` and handing the next wait
+    /// another full window. Paused clock, so the bound is a virtual-time fact.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn wait_for_root_is_bounded_by_the_shared_budget_and_names_the_stall() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, _sub) = bus_and_sub().await;
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![]));
+        let registry = start_registry(&bus, api).await;
+        tokio::time::pause();
+
+        let total = Duration::from_millis(600);
+        let setup = Duration::from_millis(400);
+        let remainder = total.saturating_sub(setup);
+        let tick = Duration::from_millis(2);
+        let budget = TestBudget::new(total);
+        tokio::time::sleep(setup).await;
+
+        let never = std::path::Path::new("/nonexistent/never-registered");
+        let started = Instant::now();
+        let err = try_wait_for_root(&registry, never, true, budget.remaining())
+            .await
+            .expect_err("a root the registry never saw cannot become established");
+        assert!(
+            started.elapsed().abs_diff(remainder) <= tick,
+            "the wait must take only the budget's remainder, not a fresh {LIVENESS:?}: took {:?}",
+            started.elapsed()
+        );
+        assert!(budget.remaining().is_zero(), "budget must be spent");
+        assert!(
+            err.contains("never-registered")
+                && err.contains("become live")
+                && err.contains("registration unwatched"),
+            "diagnostic must name the root, the wanted state and the hub's state: {err}"
         );
     }
 
