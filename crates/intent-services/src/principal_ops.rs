@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::{
-    current_caller, lift_from_principal_id, now_iso, Caller, Error, Principal, PrincipalId, Result,
-    Workspace, WorkspaceId, FROM_PRINCIPAL_ID_KEY,
+    current_caller, lift_from_principal_id, now_iso, Caller, Error, InviteErrorKind, Principal,
+    PrincipalId, Result, Workspace, WorkspaceId, FROM_PRINCIPAL_ID_KEY,
 };
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -394,42 +394,70 @@ impl Services {
         }
         let this = self.clone();
         tokio::spawn(async move {
-            this.refresh_primary_identity(principal).await;
+            if let Err(e) = this.refresh_primary_identity(principal).await {
+                tracing::debug!(error = %e, "principal.me: github identity refresh skipped");
+            }
         });
     }
 
-    async fn refresh_primary_identity(&self, principal: Principal) {
+    /// Refresh the primary principal's cached GitHub profile from `GET /user`
+    /// and persist it. Returns the (possibly unchanged) row.
+    ///
+    /// Reconnect guard (multiplayer w4): once other principals or open
+    /// invites exist, the primary identity is load-bearing — invites were
+    /// minted from it and collaborators joined *this* person's daemon — so a
+    /// `GET /user` that names a **different** `github_user_id` (the user
+    /// reconnected GitHub as another account) leaves the cached identity
+    /// untouched and fails with [`InviteErrorKind::IdentityLocked`]. While
+    /// the daemon is still single-user the switch is applied as before.
+    pub(crate) async fn refresh_primary_identity(&self, principal: Principal) -> Result<Principal> {
         let fetched = tokio::time::timeout(IDENTITY_REFRESH_TIMEOUT, async {
-            let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
+            let sc = self.identity_source_control().await?;
             if !sc.check_auth().await.is_ok_and(|s| s.authenticated) {
                 return Err(Error::Internal("github auth not configured".to_string()));
             }
             sc.get_user().await.map_err(pr_ops::map_sc_err)
         })
-        .await;
-        let user = match fetched {
-            Ok(Ok(user)) => user,
-            Ok(Err(e)) => {
-                tracing::debug!(error = %e, "principal.me: github identity refresh skipped");
-                return;
+        .await
+        .map_err(|_| Error::Internal("github identity refresh timed out".to_string()))??;
+        self.apply_primary_identity(principal, &fetched).await
+    }
+
+    /// Persist a fetched GitHub profile onto the primary principal's row,
+    /// subject to the reconnect guard described on
+    /// [`Self::refresh_primary_identity`].
+    pub(crate) async fn apply_primary_identity(
+        &self,
+        principal: Principal,
+        user: &intent_sourcecontrol::UserIdentity,
+    ) -> Result<Principal> {
+        let fetched_id = user.id.and_then(|id| i64::try_from(id).ok());
+        if let (Some(cached), Some(fetched)) = (principal.github_user_id, fetched_id) {
+            if cached != fetched {
+                let locked = self.store.count_principals().await? > 1
+                    || self.store.count_open_workspace_invites().await? > 0;
+                if locked {
+                    tracing::warn!(
+                        cached_github_user_id = cached,
+                        fetched_github_user_id = fetched,
+                        "primary GitHub identity changed while other principals or open \
+                         invites exist; keeping the cached identity"
+                    );
+                    return Err(Error::Invite(InviteErrorKind::IdentityLocked));
+                }
             }
-            Err(_) => {
-                tracing::debug!("principal.me: github identity refresh timed out");
-                return;
-            }
-        };
+        }
         let mut updated = principal.clone();
-        updated.github_user_id = user.id.and_then(|id| i64::try_from(id).ok());
-        updated.login = Some(user.login);
-        updated.display_name = user.name;
-        updated.avatar_url = user.avatar_url;
+        updated.github_user_id = fetched_id;
+        updated.login = Some(user.login.clone());
+        updated.display_name = user.name.clone();
+        updated.avatar_url = user.avatar_url.clone();
         if updated == principal {
-            return;
+            return Ok(principal);
         }
         updated.updated_at = now_iso();
-        if let Err(e) = self.store.upsert_principal(&updated).await {
-            tracing::warn!(error = %e, "principal.me: github identity persist failed");
-        }
+        self.store.upsert_principal(&updated).await?;
+        Ok(updated)
     }
 
     /// Attach the membership summary to one `workspace.get` row, relative

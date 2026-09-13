@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,18 @@ use crate::tls::TlsCertificate;
 
 /// Maximum bytes accepted for an HTTP request head before `\r\n\r\n`.
 const MAX_HEAD_BYTES: usize = 16 * 1024;
+
+/// The unauthenticated invite-redemption endpoint (multiplayer w4).
+pub(crate) const INVITE_PATH: &str = "/invite";
+
+/// Concurrent `/invite` connections the listener admits; the endpoint is
+/// reachable without a credential, so it must not be able to exhaust the
+/// connection registry. Excess upgrades are refused with `503`.
+pub(crate) const MAX_INVITE_CONNECTIONS: usize = 32;
+
+/// Inbound message cap on `/invite`: an `invite.redeem` envelope is a few
+/// hundred bytes; anything larger is an anonymous peer wasting memory.
+pub(crate) const MAX_INVITE_MESSAGE_BYTES: usize = 16 * 1024;
 
 /// Tuning for a [`WsApiServer`]. [`Default`] mirrors the production posture:
 /// bind `127.0.0.1:5181` (loopback; `server.bindAddress` widens it
@@ -187,6 +199,8 @@ pub(crate) struct WsInner {
     pub cleanup_gate: Option<watch::Receiver<bool>>,
     /// Test-only reaper gate (from [`WsOptions::heartbeat_gate`]).
     pub heartbeat_gate: Option<watch::Receiver<bool>>,
+    /// Live `/invite` connections, capped at [`MAX_INVITE_CONNECTIONS`].
+    pub invite_connections: AtomicUsize,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -239,6 +253,7 @@ impl WsApiServer {
             tunnel_limits: options.tunnel_limits,
             cleanup_gate: options.cleanup_gate,
             heartbeat_gate: options.heartbeat_gate,
+            invite_connections: AtomicUsize::new(0),
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -279,6 +294,7 @@ impl WsApiServer {
             tunnel_limits: options.tunnel_limits,
             cleanup_gate: options.cleanup_gate,
             heartbeat_gate: options.heartbeat_gate,
+            invite_connections: AtomicUsize::new(0),
         };
         Self {
             inner: Arc::new(inner),
@@ -533,16 +549,41 @@ impl WsInner {
         if method.eq_ignore_ascii_case("GET") && path == "/health" {
             return self.write_health(&mut stream).await;
         }
-        if path != "/ws" && path != "/tunnel" {
+        if path != "/ws" && path != "/tunnel" && path != INVITE_PATH {
             return reject(&mut stream, 404, "Not Found").await;
         }
-        // §5.3 upgrade gate (shared by `/ws` and `/tunnel`): enable flag,
-        // origin allow-list, then bearer token.
+        // §5.3 upgrade gate (shared by `/ws`, `/tunnel` and `/invite`):
+        // enable flag, origin allow-list, then bearer token.
         if !self.enabled {
             return reject(&mut stream, 403, "Forbidden").await;
         }
         if !is_allowed_origin(origin.as_deref()) {
             return reject(&mut stream, 403, "Forbidden").await;
+        }
+        // `/invite` (multiplayer w4): the ONE unauthenticated endpoint. It
+        // has no bearer token by construction — the invitee holds only the
+        // link — so it skips credential resolution and gets a dedicated loop
+        // that serves `invite.redeem` and nothing else. Bounded: the accept
+        // is refused with 503 once `MAX_INVITE_CONNECTIONS` are open.
+        if path == INVITE_PATH {
+            let Some(key) = ws_key else {
+                return reject(&mut stream, 400, "Bad Request").await;
+            };
+            if self.invite_connections.load(Ordering::Relaxed) >= MAX_INVITE_CONNECTIONS {
+                return reject(&mut stream, 503, "Service Unavailable").await;
+            }
+            let accept = derive_accept_key(key.as_bytes());
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await?;
+            stream.flush().await?;
+            let config = WebSocketConfig::default()
+                .max_message_size(Some(MAX_INVITE_MESSAGE_BYTES))
+                .max_frame_size(Some(MAX_INVITE_MESSAGE_BYTES));
+            let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await;
+            self.spawn_invite_connection(ws);
+            return Ok(());
         }
         // The credential resolved at the gate binds the connection's caller
         // for its whole lifetime (multiplayer w1): the legacy file token is
@@ -705,6 +746,120 @@ impl WsInner {
         );
     }
 
+    /// Register a new `/invite` client and spawn its redemption loop. Invite
+    /// connections share the registry with `/ws` clients (heartbeat reaper,
+    /// `stop()` close, `/health` count) and additionally hold one slot of the
+    /// [`MAX_INVITE_CONNECTIONS`] cap for their lifetime.
+    fn spawn_invite_connection<S>(self: &Arc<Self>, ws: WebSocketStream<S>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.invite_connections.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
+        let last_pong = Arc::new(AtomicI64::new(mono_ms()));
+        let this = self.clone();
+        let handle = tokio::spawn({
+            let last_pong = last_pong.clone();
+            async move {
+                this.clone()
+                    .invite_connection_loop(ws, cmd_rx, last_pong)
+                    .await;
+                this.invite_connections.fetch_sub(1, Ordering::Relaxed);
+                this.deregister(id);
+            }
+        });
+        let abort = handle.abort_handle();
+        self.clients.lock().expect("ws clients poisoned").insert(
+            id,
+            ClientHandle {
+                cmd_tx,
+                last_pong,
+                abort,
+            },
+        );
+    }
+
+    /// Drive one `/invite` connection (multiplayer w4). No caller is bound
+    /// and nothing but `invite.redeem` is served: every other frame that
+    /// carries an id is answered `-32001`, and the `events.`/subscription
+    /// fast paths, the router and the reverse channel are never reached. Each
+    /// `invite.redeem` runs on a detached task (phase 2 blocks for up to the
+    /// device-code lifetime) so pings keep flowing and the reaper never
+    /// mistakes a waiting invitee for a dead peer.
+    async fn invite_connection_loop<S>(
+        self: Arc<Self>,
+        ws: WebSocketStream<S>,
+        mut cmd_rx: mpsc::Receiver<ConnCmd>,
+        last_pong: Arc<AtomicI64>,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut sink, mut stream) = ws.split();
+        let (out_tx, mut out_rx) = mpsc::channel::<String>(16);
+        loop {
+            tokio::select! {
+                incoming = stream.next() => match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            let frame = crate::events::error_frame(
+                                &serde_json::Value::Null, -32700, "Parse error");
+                            if out_tx.send(frame).await.is_err() { break; }
+                            continue;
+                        };
+                        match crate::invite::classify(&value) {
+                            Some(req) if req.method == crate::invite::InviteMethod::Redeem => {
+                                let api = self.api.clone();
+                                let out_tx = out_tx.clone();
+                                tokio::spawn(async move {
+                                    if let Some(frame) = crate::invite::handle_redeem(req, &api).await {
+                                        let _ = out_tx.send(frame).await;
+                                    }
+                                });
+                            }
+                            _ => {
+                                if let Some(frame) = crate::invite::refuse_non_invite(&value) {
+                                    if out_tx.send(frame).await.is_err() { break; }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if sink.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => last_pong.store(mono_ms(), Ordering::Relaxed),
+                    None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
+                },
+                Some(frame) = out_rx.recv() => {
+                    if sink.send(Message::Text(frame.into())).await.is_err() {
+                        break;
+                    }
+                }
+                cmd = cmd_rx.recv() => match cmd {
+                    None => break,
+                    Some(ConnCmd::Ping) => {
+                        if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(ConnCmd::Close) => {
+                        let _ = sink
+                            .send(Message::Close(Some(CloseFrame {
+                                code: CloseCode::Away,
+                                reason: "Server shutting down".into(),
+                            })))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = sink.close().await;
+    }
+
     /// Remove a client from the registry (idempotent).
     fn deregister(&self, id: u64) {
         self.clients
@@ -751,8 +906,38 @@ impl WsInner {
             .register(reverse.clone(), ReverseTransport::Wss);
         // Per-connection logical-client binding (§16): `None` until `client.hello`.
         let mut client_id: Option<intent_core::ClientId> = None;
+        // Credential revocation (multiplayer w4): a connection bound to a
+        // non-administrator principal closes the moment that principal's
+        // credentials are revoked (`principal.revokeSelf`), instead of
+        // lingering until its next RPC fails. Administrator and unbound
+        // connections never subscribe.
+        let revoked_principal = match &caller {
+            Some(Caller::Wire {
+                principal_id,
+                is_administrator: false,
+            }) => Some(principal_id.clone()),
+            _ => None,
+        };
+        let mut revocations = revoked_principal
+            .as_ref()
+            .and_then(|_| self.api.subscribe_principal_revocations());
         loop {
             tokio::select! {
+                revoked = recv_revocation(&mut revocations) => {
+                    match revoked {
+                        Some(id) if Some(&id) == revoked_principal.as_ref() => {
+                            let _ = sink
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: CloseCode::Policy,
+                                    reason: "credential revoked".into(),
+                                })))
+                                .await;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => revocations = None,
+                    }
+                }
                 incoming = stream.next() => match incoming {
                     Some(Err(e)) => {
                         // Over-limit inbound message or frame (monorepo#495):
@@ -840,6 +1025,26 @@ impl WsInner {
         }
         let _ = sink.close().await;
         self.deregister(id);
+    }
+}
+
+/// Await the next principal revocation on an optional feed: `Some(id)` per
+/// revoked principal (a lagged receiver skips ahead — a missed close only
+/// means that connection fails on its next RPC instead), `None` once the
+/// feed is closed, and pending forever when there is no feed so the
+/// `select!` branch never fires for administrator/unbound connections.
+async fn recv_revocation(
+    rx: &mut Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
+) -> Option<intent_core::PrincipalId> {
+    let Some(rx) = rx.as_mut() else {
+        return std::future::pending().await;
+    };
+    loop {
+        match rx.recv().await {
+            Ok(id) => return Some(id),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        }
     }
 }
 

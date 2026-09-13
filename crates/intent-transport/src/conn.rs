@@ -419,6 +419,26 @@ pub(crate) async fn process_frame(
                 };
             }
         }
+        // `workspace.invite.create` (multiplayer w4): wraps the minted invite
+        // into the `intent://invite` link with this listener's own pairing
+        // envelope (hosts / port / fingerprint, never the bearer token), so it
+        // runs here where the pairing provider is in reach. Not local-only:
+        // a remote owner mints links too. `invite.redeem` is NOT served on
+        // authenticated connections — only on the `/invite` endpoint.
+        if let Some(req) = crate::invite::classify(value) {
+            if req.method == crate::invite::InviteMethod::Create {
+                let frame = panic_guard::guard_frame(
+                    &method,
+                    rpc_id.clone(),
+                    crate::invite::handle_create(req, api, server_pairing_info),
+                )
+                .await;
+                return match frame {
+                    Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                    None => true,
+                };
+            }
+        }
         if let Some(req) = crate::provider_setup::classify(value) {
             let frame = panic_guard::guard_frame(
                 &method,

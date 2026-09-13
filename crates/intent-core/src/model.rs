@@ -408,7 +408,8 @@ pub struct WorkspaceMembership {
     pub my_role: Option<WorkspaceRole>,
     /// Number of `workspace_member` rows (the owner counts).
     pub member_count: u64,
-    /// Invitations awaiting acceptance. Always `0` until invitations land.
+    /// Open invitations (not redeemed, not revoked, not expired) awaiting
+    /// acceptance (multiplayer w4).
     pub open_invite_count: u64,
 }
 
@@ -5210,6 +5211,42 @@ impl PrincipalCredential {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.revoked_at.is_none()
+    }
+}
+
+/// One `workspace_invite` row (multiplayer w4): a single-use, expiring link
+/// an owner minted so one person can join a workspace as a collaborator.
+/// The link secret is persisted only as `secret_hash` (hex SHA-256); an
+/// optional pin restricts redemption to one GitHub account, entered as a
+/// login but stored and compared as the stable `pin_github_user_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceInvite {
+    pub id: String,
+    pub workspace_id: WorkspaceId,
+    #[serde(skip_serializing)]
+    pub secret_hash: String,
+    pub created_by_principal_id: PrincipalId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_github_user_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_login: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redeemed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redeemed_by_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+}
+
+impl WorkspaceInvite {
+    /// Whether the invite can still be redeemed at `now` (ISO-8601 UTC,
+    /// compared lexically like every other timestamp column).
+    #[must_use]
+    pub fn is_open_at(&self, now: &str) -> bool {
+        self.redeemed_at.is_none() && self.revoked_at.is_none() && self.expires_at.as_str() > now
     }
 }
 
