@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use intent_core::{PublishEvent, RepoRef, Workspace, WorkspaceApi, WorkspaceId, WorkspaceStatus};
+use intent_core::{
+    GitRemoteUrl, PublishEvent, RepoRef, Workspace, WorkspaceApi, WorkspaceId, WorkspaceStatus,
+};
 use serde_json::{json, Value};
 
 use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_vec_str};
@@ -496,24 +498,6 @@ fn parse_github_pr_or_issue_url(url: &str) -> Option<(String, Option<u64>)> {
     Some((repo_url, (segment == "pull").then_some(n)))
 }
 
-/// Parse a GitHub URL (https, www, or git@ form) into the [`RepoRef`] it
-/// names (TS `parseGithubOwnerRepo`). The ref keeps the URL's casing;
-/// compare it under `RepoRef` equality, which folds forge-slug case.
-fn parse_github_owner_repo(github_url: &str) -> Option<RepoRef> {
-    let t = github_url.trim();
-    let stripped = strip_prefix_ci(t, "https://www.github.com/")
-        .or_else(|| strip_prefix_ci(t, "http://www.github.com/"))
-        .or_else(|| strip_prefix_ci(t, "https://github.com/"))
-        .or_else(|| strip_prefix_ci(t, "http://github.com/"))
-        .or_else(|| strip_prefix_ci(t, "git@github.com:"))
-        .unwrap_or(t);
-    let stripped = strip_git_suffix(stripped);
-    let mut segs = stripped.split('/').filter(|s| !s.is_empty());
-    let owner = segs.next()?;
-    let repo = segs.next()?;
-    Some(RepoRef::new(owner, repo))
-}
-
 /// Whether a repository name (a workspace row's `repositoryName` or a
 /// checkout folder name) names the same repository as `wanted.name`, under
 /// [`RepoRef`] identity. The owner half is pinned to `wanted.owner` on both
@@ -676,7 +660,7 @@ async fn lookup_known_repo_local_path(
     api: &Arc<dyn WorkspaceApi>,
     github_url: &str,
 ) -> Option<String> {
-    let wanted = parse_github_owner_repo(github_url)?;
+    let wanted = GitRemoteUrl::parse(github_url)?.github_repo()?;
     let workspaces = api.list_workspaces(true).await.ok()?;
 
     let mut strict = Vec::new();
@@ -2090,21 +2074,6 @@ mod tests {
             lookup_known_repo_local_path(&api, "https://github.com/acme/widget").await,
             None
         );
-    }
-
-    #[test]
-    fn test_parse_github_owner_repo_keeps_casing_and_folds_identity() {
-        let parsed =
-            parse_github_owner_repo("https://www.GitHub.com/Intent-HQ/IntentD.git").unwrap();
-        assert_eq!(parsed.owner, "Intent-HQ");
-        assert_eq!(parsed.name, "IntentD");
-        assert_eq!(parsed, RepoRef::new("intent-hq", "intentd"));
-        assert_eq!(
-            parse_github_owner_repo("git@github.com:o/r.git").unwrap(),
-            RepoRef::new("O", "R")
-        );
-        assert_ne!(parsed, RepoRef::new("intent-hq", "other"));
-        assert!(parse_github_owner_repo("https://github.com/only-owner").is_none());
     }
 
     #[tokio::test]
