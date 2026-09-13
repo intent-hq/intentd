@@ -915,6 +915,23 @@ mod emit_path_taxonomy {
             .join("src")
     }
 
+    /// Scope of this golden (decided, multiplayer w3): the guard is lexical,
+    /// not semantic. It scans every string literal in the non-test source of
+    /// the emitting crates and classifies every literal shaped like an event
+    /// type — colon-separated `[A-Za-z0-9._-]` segments, first segment
+    /// letter-led — regardless of whether the literal sits in a `publish`
+    /// call, an `event_type:` field, or elsewhere. That is deliberately wider
+    /// than an emitter-position scan: any plausible `category:name` literal
+    /// added later, in either hyphen or underscore spelling and in any case,
+    /// fails here until it is classified. Deliberately malformed strings that
+    /// are not event-shaped (embedded spaces, leading `-`, colon-less,
+    /// interpolated `format!` pieces) are outside what this guard can see,
+    /// and are not its job: delivery is default-deny for any type absent
+    /// from `COLLABORATOR_EVENT_TYPES` (the `collaborator_only` match in
+    /// `intent-services/src/events/filter.rs`, pinned by the core golden's
+    /// `collaborator_predicate_is_default_deny` and the `collaborator_fan_out`
+    /// tests above), so a spelling that escapes this scan reaches no
+    /// collaborator until it is named in the taxonomy.
     #[test]
     fn every_emitted_literal_is_classified_in_the_taxonomy() {
         let mut seen: HashSet<String> = HashSet::new();
