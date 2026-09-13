@@ -608,18 +608,21 @@ mod emit_path_taxonomy {
         "antigravity-executable-v1:missing",
     ];
 
-    /// `ns:name`, `ns:name:sub`, … — lowercase-led segments of
-    /// `[A-Za-z0-9.-]` (the taxonomy carries `gitRoot:`, `prMonitor:`,
-    /// `mcp.servers:` and `displayStatus-changed` spellings).
+    /// `ns:name`, `ns:name:sub`, … — segments of `[A-Za-z0-9._-]`, each
+    /// led by an alphanumeric and the first by a letter. Deliberately wider
+    /// than the taxonomy's own spelling (`gitRoot:`, `prMonitor:`,
+    /// `mcp.servers:`, `displayStatus-changed`): an emitted typo such as
+    /// `note:new_event` or `Note:Updated` must reach the classifier and
+    /// fail there, not be filtered out here as "not an event".
     fn emit_shaped(lit: &str) -> bool {
         let mut segments = lit.split(':');
         let Some(first) = segments.next() else {
             return false;
         };
         let segment_ok = |s: &str| {
-            s.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+            s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
                 && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
         };
         let mut rest = 0;
         for s in segments {
@@ -628,7 +631,7 @@ mod emit_path_taxonomy {
             }
             rest += 1;
         }
-        rest > 0 && segment_ok(first)
+        rest > 0 && segment_ok(first) && first.starts_with(|c: char| c.is_ascii_alphabetic())
     }
 
     /// `Some(hashes)` when a raw string literal starts at `i`.
@@ -996,9 +999,10 @@ mod emit_path_taxonomy {
 
     /// Negative control: a new literal on an emit path that is not in the
     /// taxonomy is what the golden refuses — whether it is a new name in an
-    /// existing family or a new family altogether — while the same literal
-    /// inside a `#[cfg(test)]` module, a comment, or a non-event shape is
-    /// ignored.
+    /// existing family, a new family altogether, or a misspelling of a
+    /// known type (underscore, upper case) that would otherwise be
+    /// owner-only by default-deny — while the same literal inside a
+    /// `#[cfg(test)]` module, a comment, or a non-event shape is ignored.
     #[test]
     fn unclassified_literal_fails_the_golden() {
         let src = r#"
@@ -1009,7 +1013,14 @@ mod emit_path_taxonomy {
                 bus.publish("note:updated");
                 bus.publish("note:bogus-thing");
                 bus.publish("brandnew:emitted");
-                let _ = ('"', "not an event", "Note:Upper", "a:", ":b", "x:{y}");
+                bus.publish(Event { event_type: "note:new_event".to_string() });
+                bus.publish("Note:Updated");
+                bus.publish("AGENT:IDLE");
+                let _ = (
+                    '"', "not an event", "a:", ":b", "x:{y}", "note:",
+                    "HEAD:.gitmodules", "127.0.0.1:0", "_ns:name", "note:-x",
+                    "note:up dated", "http://x", "a::b",
+                );
             }
             #[cfg(test)]
             mod tests;
@@ -1034,12 +1045,21 @@ mod emit_path_taxonomy {
                 "note:updated",
                 "note:bogus-thing",
                 "brandnew:emitted",
+                "note:new_event",
+                "Note:Updated",
+                "AGENT:IDLE",
                 "agent:idle"
             ]
         );
         assert_eq!(
             unclassified(shaped.iter().copied()),
-            vec!["note:bogus-thing", "brandnew:emitted"]
+            vec![
+                "note:bogus-thing",
+                "brandnew:emitted",
+                "note:new_event",
+                "Note:Updated",
+                "AGENT:IDLE"
+            ]
         );
         assert_eq!(scanned.test_only_mods, vec!["tests".to_string()]);
         assert!(unclassified(["note:updated", "agent:idle"]).is_empty());
