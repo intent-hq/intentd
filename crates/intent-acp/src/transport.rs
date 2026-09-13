@@ -1048,7 +1048,12 @@ mod cancel_on_timeout_tests {
     /// A peer that has stopped reading its stdin with the writer queue full
     /// must not hold the timed-out caller hostage: the cancel is dropped and
     /// the request returns `Timeout` on the timer's schedule.
-    #[tokio::test]
+    ///
+    /// Paused time: the clock only advances when the runtime is idle, so the
+    /// 20ms settle below always fires before the request's 200ms timer no
+    /// matter how the host schedules the test, and the 2s guard measures the
+    /// wedged send by advancing past it rather than by waiting it out.
+    #[tokio::test(start_paused = true)]
     async fn timed_out_request_with_full_writer_queue_still_returns_on_time() {
         let (conn, _c2a_agent_unread, _a2c_agent) = silent_connection();
         let mut fut = Box::pin(conn.request_timeout_with_cancel(
