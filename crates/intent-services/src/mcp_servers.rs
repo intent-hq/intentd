@@ -711,9 +711,12 @@ impl McpHub {
     }
 
     /// Forward one tool request to the server's transport. stdio reuses the
-    /// live [`Connection`]; `http` runs a stateless streamable-HTTP session
-    /// per call (initialize → notifications/initialized → the request), the
-    /// whole session bounded by `timeout` on top of each request's own bound.
+    /// live [`Connection`], and a request abandoned on timeout is followed by
+    /// an MCP `notifications/cancelled` naming its id so the server can stop
+    /// the work (the HTTP session below drops its connection instead); `http`
+    /// runs a stateless streamable-HTTP session per call (initialize →
+    /// notifications/initialized → the request), the whole session bounded
+    /// by `timeout` on top of each request's own bound.
     async fn forward(
         &self,
         server_id: &str,
@@ -723,7 +726,16 @@ impl McpHub {
     ) -> Result<Value> {
         match self.tool_target(server_id)? {
             ToolTarget::Stdio(conn) => {
-                conn.request_timeout(method, params, timeout)
+                let cancel = |id: i64| {
+                    (
+                        "notifications/cancelled".to_string(),
+                        json!({
+                            "requestId": id,
+                            "reason": format!("{method} timed out after {}ms", timeout.as_millis()),
+                        }),
+                    )
+                };
+                conn.request_timeout_with_cancel(method, params, timeout, cancel)
                     .await
                     .map_err(|e| match e {
                         intent_acp::AcpError::Timeout(_) => {
@@ -3771,13 +3783,122 @@ mod tests {
                 "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}\n"
             );
             s2c.write_all(resp.as_bytes()).await.unwrap();
+            reader
         });
         let result = h
             .call_tool("s1", "echo", json!({ "x": 1 }), None)
             .await
             .unwrap();
-        responder.await.unwrap();
+        let mut reader = responder.await.unwrap();
         assert_eq!(result["content"][0]["text"], json!("ok"));
+        // An answered call is followed by nothing — no stray cancel.
+        let mut extra = String::new();
+        let quiet = tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut extra))
+            .await
+            .is_err();
+        assert!(quiet, "unexpected line after the answered call: {extra}");
+    }
+
+    /// The live stdio [`Connection`] behind a hub entry.
+    fn stdio_conn(h: &McpHub, id: &str) -> Arc<Connection> {
+        match &h.inner.servers.lock().unwrap()[id].runtime {
+            ServerRuntime::Stdio { conn, .. } => Arc::clone(conn),
+            ServerRuntime::Remote => panic!("{id} is not a stdio server"),
+        }
+    }
+
+    /// Read one JSON-RPC line from the fake server's stdin.
+    async fn read_json(reader: &mut tokio::io::BufReader<tokio::io::DuplexStream>) -> Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stdio_call_tool_timeout_sends_one_cancelled_notification() {
+        // The server never answers the first call. Once the per-call timeout
+        // fires the client sends exactly one notifications/cancelled naming
+        // the abandoned id: the next line on the wire is the follow-up call,
+        // not a second cancel.
+        let (h, c2s, mut s2c) = stdio_hub_with_duplex("s1");
+        let server = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(c2s);
+            let req = read_json(&mut reader).await;
+            assert_eq!(req["method"], json!("tools/call"));
+            let abandoned = req["id"].as_i64().unwrap();
+
+            let cancel = read_json(&mut reader).await;
+            assert_eq!(cancel["method"], json!("notifications/cancelled"));
+            assert!(cancel.get("id").is_none(), "notification: {cancel}");
+            assert_eq!(cancel["params"]["requestId"], json!(abandoned));
+            let reason = cancel["params"]["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("tools/call timed out after 100ms"),
+                "got: {reason}"
+            );
+
+            let next = read_json(&mut reader).await;
+            assert_eq!(
+                next["method"],
+                json!("tools/call"),
+                "one cancel only: {next}"
+            );
+            assert_eq!(next["params"]["name"], json!("fast"));
+            let id = next["id"].as_i64().unwrap();
+            let resp =
+                format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[]}}}}\n");
+            s2c.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let err = h
+            .call_tool("s1", "slow", json!({}), Some(Duration::from_millis(100)))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("timed out"), "got: {err}");
+        h.call_tool("s1", "fast", json!({}), None).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdio_late_reply_after_cancel_is_discarded() {
+        // A reply landing after the cancel is read and dropped — the
+        // connection stays usable and the next call gets its own answer.
+        let (h, c2s, mut s2c) = stdio_hub_with_duplex("s1");
+        let conn = stdio_conn(&h, "s1");
+        let server = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(c2s);
+            let abandoned = read_json(&mut reader).await["id"].as_i64().unwrap();
+            let cancel = read_json(&mut reader).await;
+            assert_eq!(cancel["params"]["requestId"], json!(abandoned));
+            let late = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{abandoned},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"late\"}}]}}}}\n"
+            );
+            s2c.write_all(late.as_bytes()).await.unwrap();
+
+            let next = read_json(&mut reader).await;
+            assert_eq!(next["params"]["name"], json!("fresh"));
+            let id = next["id"].as_i64().unwrap();
+            assert_ne!(id, abandoned);
+            let resp = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"fresh\"}}]}}}}\n"
+            );
+            s2c.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let before = conn.response_seq();
+        let err = h
+            .call_tool("s1", "slow", json!({}), Some(Duration::from_millis(100)))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("timed out"), "got: {err}");
+        // The late reply is consumed with no slot to land in: the response
+        // watermark advances while nothing is pending.
+        assert!(
+            conn.await_response_after(before, Duration::from_secs(2))
+                .await,
+            "late reply was read by the connection"
+        );
+        let result = h.call_tool("s1", "fresh", json!({}), None).await.unwrap();
+        assert_eq!(result["content"][0]["text"], json!("fresh"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

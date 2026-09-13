@@ -574,6 +574,59 @@ impl Connection {
         timeout: Duration,
     ) -> AcpResult<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.request_with_id(id, method, params, timeout).await
+    }
+
+    /// [`Connection::request_timeout`] that also tells the peer about an
+    /// abandoned request: when the request times out, the notification
+    /// `cancel(id)` yields (`(method, params)`, e.g. MCP's
+    /// `notifications/cancelled { requestId, reason }`) is sent for the
+    /// abandoned request id. The pending slot is already gone by then, so a
+    /// late reply to that id is discarded rather than delivered. A cancel
+    /// that fails to send is logged, never surfaced — the timeout is the
+    /// caller-facing outcome either way.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Connection::request_timeout`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub async fn request_timeout_with_cancel(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        cancel: impl FnOnce(i64) -> (String, Value),
+    ) -> AcpResult<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let result = self.request_with_id(id, method, params, timeout).await;
+        if matches!(result, Err(AcpError::Timeout(_))) {
+            let (cancel_method, cancel_params) = cancel(id);
+            if let Err(e) = self.notify(&cancel_method, cancel_params).await {
+                tracing::debug!(
+                    method,
+                    id,
+                    error = %e,
+                    "cancel notification for timed-out request not sent"
+                );
+            }
+        }
+        result
+    }
+
+    /// The request body shared by the `request_timeout*` entry points. The
+    /// pending slot for `id` is dropped with the guard on return, so a caller
+    /// that names the request to the peer afterwards does so with no slot
+    /// left for a late reply to land in.
+    async fn request_with_id(
+        &self,
+        id: i64,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> AcpResult<Value> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         // Drop-guard cleanup: covers the error/timeout arms below AND the
@@ -782,7 +835,8 @@ mod watermark_tests {
 
     /// A duplex-backed `Connection` whose "agent" never responds on its own:
     /// the test holds both remote ends and writes response lines by hand.
-    fn silent_connection() -> (Connection, tokio::io::DuplexStream, tokio::io::DuplexStream) {
+    pub(super) fn silent_connection(
+    ) -> (Connection, tokio::io::DuplexStream, tokio::io::DuplexStream) {
         let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
         let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
         let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
@@ -923,5 +977,86 @@ mod watermark_tests {
             1,
             "response watermark untouched by requests"
         );
+    }
+}
+
+#[cfg(test)]
+mod cancel_on_timeout_tests {
+    use super::watermark_tests::silent_connection;
+    use super::*;
+    use serde_json::json;
+
+    fn cancelled(id: i64) -> (String, Value) {
+        (
+            "notifications/cancelled".to_string(),
+            json!({ "requestId": id, "reason": "test" }),
+        )
+    }
+
+    async fn read_json(reader: &mut BufReader<tokio::io::DuplexStream>) -> Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// A timed-out request is followed on the wire by the cancel notification
+    /// naming its id, sent once the pending slot is gone.
+    #[tokio::test]
+    async fn timed_out_request_sends_cancel_for_its_id() {
+        let (conn, c2a_agent, _a2c_agent) = silent_connection();
+        let err = conn
+            .request_timeout_with_cancel(
+                "tools/call",
+                json!({ "name": "slow" }),
+                Duration::from_millis(50),
+                cancelled,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AcpError::Timeout(_)), "got: {err}");
+        assert!(!conn.has_pending_requests(), "slot dropped on timeout");
+
+        let mut reader = BufReader::new(c2a_agent);
+        let request = read_json(&mut reader).await;
+        assert_eq!(request["method"], json!("tools/call"));
+        let id = request["id"].as_i64().unwrap();
+        let cancel = read_json(&mut reader).await;
+        assert_eq!(cancel["method"], json!("notifications/cancelled"));
+        assert!(cancel.get("id").is_none(), "notification: {cancel}");
+        assert_eq!(cancel["params"]["requestId"], json!(id));
+        assert_eq!(cancel["params"]["reason"], json!("test"));
+    }
+
+    /// A request settled by the peer (here with a JSON-RPC error) sends no
+    /// cancel: only the request itself is on the wire.
+    #[tokio::test]
+    async fn answered_request_sends_no_cancel() {
+        let (conn, c2a_agent, mut a2c_agent) = silent_connection();
+        let mut fut = Box::pin(conn.request_timeout_with_cancel(
+            "tools/call",
+            json!({}),
+            Duration::from_secs(60),
+            cancelled,
+        ));
+        tokio::select! {
+            _ = &mut fut => panic!("request must still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        a2c_agent
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"nope\"}}\n")
+            .await
+            .unwrap();
+        a2c_agent.flush().await.unwrap();
+        let err = fut.await.unwrap_err();
+        assert!(matches!(err, AcpError::Rpc(_)), "got: {err}");
+
+        let mut reader = BufReader::new(c2a_agent);
+        let request = read_json(&mut reader).await;
+        assert_eq!(request["id"], json!(1));
+        let mut extra = String::new();
+        let quiet = tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut extra))
+            .await
+            .is_err();
+        assert!(quiet, "unexpected line after the request: {extra}");
     }
 }
