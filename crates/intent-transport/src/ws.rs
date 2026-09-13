@@ -216,6 +216,10 @@ pub(crate) struct WsInner {
     /// ([`MAX_INVITE_CONNECTIONS`]); a permit is acquired before the `101`
     /// and travels with the connection task.
     pub invite_permits: Arc<Semaphore>,
+    /// Listener-wide rate limit over phase-1 `invite.redeem` starts
+    /// ([`crate::invite::RedeemThrottle`]); shared by every `/invite`
+    /// connection so a reconnect never resets it.
+    pub redeem_throttle: crate::invite::SharedRedeemThrottle,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -269,6 +273,7 @@ impl WsApiServer {
             cleanup_gate: options.cleanup_gate,
             heartbeat_gate: options.heartbeat_gate,
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
+            redeem_throttle: crate::invite::new_redeem_throttle(),
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -310,6 +315,7 @@ impl WsApiServer {
             cleanup_gate: options.cleanup_gate,
             heartbeat_gate: options.heartbeat_gate,
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
+            redeem_throttle: crate::invite::new_redeem_throttle(),
         };
         Self {
             inner: Arc::new(inner),
@@ -812,8 +818,10 @@ impl WsInner {
     /// per connection: at most [`MAX_INFLIGHT_INVITE_REQUESTS`] tasks, each
     /// holding a pre-reserved response slot (so none ever waits to send), all
     /// owned by a [`JoinSet`] that aborts them when the connection ends.
-    /// Frames the loop answers itself (parse errors, non-invite refusals) go
-    /// straight to the sink and never contend for those slots.
+    /// Phase-1 starts additionally pass the listener-wide
+    /// [`crate::invite::RedeemThrottle`] before any store or upstream work.
+    /// Frames the loop answers itself (parse errors, throttle and non-invite
+    /// refusals) go straight to the sink and never contend for those slots.
     async fn invite_connection_loop<S>(
         self: Arc<Self>,
         ws: WebSocketStream<S>,
@@ -838,6 +846,14 @@ impl WsInner {
                         };
                         match crate::invite::classify(&value) {
                             Some(req) if req.method == crate::invite::InviteMethod::Redeem => {
+                                if let Err(refusal) = crate::invite::admit_redeem(
+                                    &req, &self.redeem_throttle, Instant::now())
+                                {
+                                    if let Some(frame) = refusal {
+                                        if sink.send(Message::Text(frame.into())).await.is_err() { break; }
+                                    }
+                                    continue;
+                                }
                                 let admitted = match admission.clone().try_acquire_owned() {
                                     Ok(permit) => out_tx
                                         .clone()

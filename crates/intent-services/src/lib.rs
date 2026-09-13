@@ -958,6 +958,10 @@ pub struct Services {
     /// `GET /user` on a `principal.me` read (multiplayer w1); shared across
     /// clones so the rate limit spans every RPC handle.
     principal_identity_refreshed_at: principal_ops::IdentityRefreshState,
+    /// Serialises the primary identity's lock check + write against invite
+    /// minting (multiplayer w4): see
+    /// [`principal_ops::IdentityTransitionLock`]. Shared across clones.
+    identity_transition: principal_ops::IdentityTransitionLock,
     /// In-flight identity-only device flows started by `invite.redeem`
     /// (multiplayer w4), keyed by flow id; shared across clones.
     invite_flows: invite_ops::InviteFlowState,
@@ -1334,6 +1338,7 @@ impl Services {
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
+            identity_transition: Arc::new(tokio::sync::Mutex::new(())),
             invite_flows: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             invite_flow_permits: invite_ops::new_flow_permits(),
             principal_revocations: tokio::sync::broadcast::channel(
