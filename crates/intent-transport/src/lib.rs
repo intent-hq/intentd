@@ -65,6 +65,7 @@ mod forward;
 pub mod host;
 pub mod host_env;
 mod host_ops;
+mod invite;
 pub mod lifecycle;
 pub mod listener;
 pub mod pairing;
