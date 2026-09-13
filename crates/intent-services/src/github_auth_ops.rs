@@ -275,7 +275,7 @@ pub(crate) fn is_production_login_host(base_uri: &str) -> bool {
 
 /// True iff `uri` is `https://…` or a cleartext `http://` pointing at a
 /// loopback host (`127.0.0.1`, `localhost`, `[::1]`).
-fn is_safe_login_base_uri(uri: &str) -> bool {
+pub(crate) fn is_safe_login_base_uri(uri: &str) -> bool {
     if uri.starts_with("https://") {
         return true;
     }

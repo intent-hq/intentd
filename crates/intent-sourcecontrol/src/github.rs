@@ -1414,6 +1414,18 @@ impl SourceControl for GitHubSourceControl {
         map_user_identity(v)
     }
 
+    async fn get_user_by_login(&self, login: &str) -> Result<UserIdentity> {
+        let login = login.trim();
+        if login.is_empty() || login.contains('/') {
+            return Err(Error::NotFound(format!("github user {login:?}")));
+        }
+        let v: Value = self
+            .client
+            .get(format!("/users/{login}"), None::<&()>)
+            .await?;
+        map_user_identity(v)
+    }
+
     async fn list_repos(&self, page: PageParams) -> Result<Page<Repo>> {
         let per_page = rest_per_page(page.limit);
         let page_no = rest_page(page.cursor.as_deref());

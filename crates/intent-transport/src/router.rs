@@ -172,6 +172,14 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: crate::catalog::FORBIDDEN_ERROR_MESSAGE.to_string(),
             data: Some(json!({ "code": "forbidden", "detail": detail })),
         },
+        // Invite / identity-only join refusal (multiplayer w4): the kind's
+        // own code with the stable `data.code` so an invite client can route
+        // "expired" / "pin mismatch" / "denied" without matching on prose.
+        ref e @ Error::Invite(kind) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": kind.as_str() })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -617,6 +625,34 @@ async fn dispatch(
                 .workspace_members_remove(id, intent_core::PrincipalId::from(principal_id))
                 .await
                 .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.members.leave` (multiplayer w4): the bound collaborator
+        // drops its own membership; an owner is `-32602`.
+        "workspace.members.leave" => {
+            let id = require_workspace_id(params)?;
+            let r = api
+                .workspace_members_leave(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.invite.*` (multiplayer w4): owner-only invite links.
+        // `workspace.invite.create` is handled on the connection fast-path
+        // (it wraps the secret into the `intent://invite` link with the
+        // listener's own hosts/port); only list/revoke route here.
+        "workspace.invite.list" => {
+            let id = require_workspace_id(params)?;
+            let r = api.workspace_invite_list(id).await.map_err(workspace_err)?;
+            Ok(r)
+        }
+        "workspace.invite.revoke" => {
+            let id = require_workspace_id(params)?;
+            let invite_id = require_str_param(params, "inviteId")?;
+            let r = api
+                .workspace_invite_revoke(id, invite_id)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "workspace.getTokenUsage" => {
@@ -2973,6 +3009,14 @@ async fn dispatch(
         // bound to at admission; no params. Fails when no caller is bound.
         "principal.me" => {
             let r = api.principal_me().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `principal.revokeSelf` (multiplayer w4): the bound collaborator
+        // revokes its own credentials and leaves its workspaces; the
+        // transport then closes its connections. The administrator is
+        // `-32602`.
+        "principal.revokeSelf" => {
+            let r = api.principal_revoke_self().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
         // `linear.*` (§5.28) is daemon-owned and global: no `workspaceId`. A key

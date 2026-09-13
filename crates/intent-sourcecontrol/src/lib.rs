@@ -20,7 +20,7 @@ pub mod token;
 
 use async_trait::async_trait;
 
-pub use device_flow::{DeviceFlow, PollStatus};
+pub use device_flow::{DeviceFlow, IdentityFlow, IdentityPollStatus, PollStatus};
 pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
 pub use model::{
@@ -66,6 +66,15 @@ pub trait SourceControl: Send + Sync {
 
     /// Authenticated user identity (`GET /user`). Backs `github.getUser`.
     async fn get_user(&self) -> Result<UserIdentity>;
+
+    /// Public profile of another account by login (`GET /users/{login}`),
+    /// used to resolve an invite pin to a stable account id (multiplayer w4).
+    /// [`Error::NotFound`] when no account has that login.
+    async fn get_user_by_login(&self, login: &str) -> Result<UserIdentity> {
+        Err(Error::Unsupported(format!(
+            "user lookup by login is not supported by this provider (login {login:?})"
+        )))
+    }
 
     // --- Repositories ---
 

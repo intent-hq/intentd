@@ -52,7 +52,7 @@ pub use clock::{
 };
 pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
-pub use error::{CloneErrorCategory, Error, Result};
+pub use error::{CloneErrorCategory, Error, InviteErrorKind, Result};
 pub use events::is_known_event_type;
 pub use git_remote_url::GitRemoteUrl;
 pub use ids::{
@@ -120,7 +120,8 @@ pub use model::{
     BrowserTabVisibility,
 };
 pub use model::{
-    Principal, PrincipalCredential, WorkspaceMember, WorkspaceMembership, WorkspaceRole,
+    Principal, PrincipalCredential, WorkspaceInvite, WorkspaceMember, WorkspaceMembership,
+    WorkspaceRole,
 };
 pub use model::{
     WORKSPACE_LIST_PR_CAP, WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES,
