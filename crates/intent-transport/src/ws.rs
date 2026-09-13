@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -27,8 +27,8 @@ use intent_services::EventBus;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::AbortHandle;
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::{AbortHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
 use tokio_tungstenite::tungstenite::extensions::{Extensions, ExtensionsConfig};
@@ -58,8 +58,17 @@ pub(crate) const INVITE_PATH: &str = "/invite";
 
 /// Concurrent `/invite` connections the listener admits; the endpoint is
 /// reachable without a credential, so it must not be able to exhaust the
-/// connection registry. Excess upgrades are refused with `503`.
+/// connection registry. Excess upgrades are refused with `503`. Each
+/// admitted connection holds one semaphore permit for exactly as long as
+/// its task lives (returned on any exit, including a heartbeat abort).
 pub(crate) const MAX_INVITE_CONNECTIONS: usize = 32;
+
+/// Concurrent `invite.redeem` requests one `/invite` connection may have in
+/// flight (a well-behaved client needs two: a start and its wait). Excess
+/// requests are refused with `flow-busy` immediately instead of spawning
+/// work; the response queue is sized so every admitted request always has a
+/// slot to answer into, so no task ever blocks on a full queue.
+pub(crate) const MAX_INFLIGHT_INVITE_REQUESTS: usize = 4;
 
 /// Inbound message cap on `/invite`: an `invite.redeem` envelope is a few
 /// hundred bytes; anything larger is an anonymous peer wasting memory.
@@ -203,8 +212,10 @@ pub(crate) struct WsInner {
     pub cleanup_gate: Option<watch::Receiver<bool>>,
     /// Test-only reaper gate (from [`WsOptions::heartbeat_gate`]).
     pub heartbeat_gate: Option<watch::Receiver<bool>>,
-    /// Live `/invite` connections, capped at [`MAX_INVITE_CONNECTIONS`].
-    pub invite_connections: AtomicUsize,
+    /// Admission permits for `/invite` connections
+    /// ([`MAX_INVITE_CONNECTIONS`]); a permit is acquired before the `101`
+    /// and travels with the connection task.
+    pub invite_permits: Arc<Semaphore>,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -257,7 +268,7 @@ impl WsApiServer {
             tunnel_limits: options.tunnel_limits,
             cleanup_gate: options.cleanup_gate,
             heartbeat_gate: options.heartbeat_gate,
-            invite_connections: AtomicUsize::new(0),
+            invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -298,7 +309,7 @@ impl WsApiServer {
             tunnel_limits: options.tunnel_limits,
             cleanup_gate: options.cleanup_gate,
             heartbeat_gate: options.heartbeat_gate,
-            invite_connections: AtomicUsize::new(0),
+            invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
         };
         Self {
             inner: Arc::new(inner),
@@ -568,14 +579,17 @@ impl WsInner {
         // has no bearer token by construction — the invitee holds only the
         // link — so it skips credential resolution and gets a dedicated loop
         // that serves `invite.redeem` and nothing else. Bounded: the accept
-        // is refused with 503 once `MAX_INVITE_CONNECTIONS` are open.
+        // is refused with 503 once `MAX_INVITE_CONNECTIONS` permits are held;
+        // the permit is taken atomically here, before the `101`, and rides
+        // with the connection task so an aborted (heartbeat-reaped) task
+        // returns it like a clean exit does.
         if path == INVITE_PATH {
             let Some(key) = ws_key else {
                 return reject(&mut stream, 400, "Bad Request").await;
             };
-            if self.invite_connections.load(Ordering::Relaxed) >= MAX_INVITE_CONNECTIONS {
+            let Ok(permit) = self.invite_permits.clone().try_acquire_owned() else {
                 return reject(&mut stream, 503, "Service Unavailable").await;
-            }
+            };
             let accept = derive_accept_key(key.as_bytes());
             let response = format!(
                 "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
@@ -586,7 +600,7 @@ impl WsInner {
                 .max_message_size(Some(MAX_INVITE_MESSAGE_BYTES))
                 .max_frame_size(Some(MAX_INVITE_MESSAGE_BYTES));
             let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await;
-            self.spawn_invite_connection(ws);
+            self.spawn_invite_connection(ws, permit);
             return Ok(());
         }
         // The credential resolved at the gate binds the connection's caller
@@ -752,13 +766,17 @@ impl WsInner {
 
     /// Register a new `/invite` client and spawn its redemption loop. Invite
     /// connections share the registry with `/ws` clients (heartbeat reaper,
-    /// `stop()` close, `/health` count) and additionally hold one slot of the
-    /// [`MAX_INVITE_CONNECTIONS`] cap for their lifetime.
-    fn spawn_invite_connection<S>(self: &Arc<Self>, ws: WebSocketStream<S>)
-    where
+    /// `stop()` close, `/health` count) and additionally hold one
+    /// [`MAX_INVITE_CONNECTIONS`] permit for their lifetime: it is owned by
+    /// the task's future, so it is released when the loop returns *and* when
+    /// the reaper aborts the task.
+    fn spawn_invite_connection<S>(
+        self: &Arc<Self>,
+        ws: WebSocketStream<S>,
+        permit: OwnedSemaphorePermit,
+    ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.invite_connections.fetch_add(1, Ordering::Relaxed);
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
         let last_pong = Arc::new(AtomicI64::new(mono_ms()));
@@ -766,10 +784,10 @@ impl WsInner {
         let handle = tokio::spawn({
             let last_pong = last_pong.clone();
             async move {
+                let _permit = permit;
                 this.clone()
                     .invite_connection_loop(ws, cmd_rx, last_pong)
                     .await;
-                this.invite_connections.fetch_sub(1, Ordering::Relaxed);
                 this.deregister(id);
             }
         });
@@ -788,9 +806,14 @@ impl WsInner {
     /// and nothing but `invite.redeem` is served: every other frame that
     /// carries an id is answered `-32001`, and the `events.`/subscription
     /// fast paths, the router and the reverse channel are never reached. Each
-    /// `invite.redeem` runs on a detached task (phase 2 blocks for up to the
+    /// `invite.redeem` runs on its own task (phase 2 blocks for up to the
     /// device-code lifetime) so pings keep flowing and the reaper never
-    /// mistakes a waiting invitee for a dead peer.
+    /// mistakes a waiting invitee for a dead peer — but that work is bounded
+    /// per connection: at most [`MAX_INFLIGHT_INVITE_REQUESTS`] tasks, each
+    /// holding a pre-reserved response slot (so none ever waits to send), all
+    /// owned by a [`JoinSet`] that aborts them when the connection ends.
+    /// Frames the loop answers itself (parse errors, non-invite refusals) go
+    /// straight to the sink and never contend for those slots.
     async fn invite_connection_loop<S>(
         self: Arc<Self>,
         ws: WebSocketStream<S>,
@@ -800,7 +823,9 @@ impl WsInner {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (mut sink, mut stream) = ws.split();
-        let (out_tx, mut out_rx) = mpsc::channel::<String>(16);
+        let (out_tx, mut out_rx) = mpsc::channel::<String>(MAX_INFLIGHT_INVITE_REQUESTS);
+        let admission = Arc::new(Semaphore::new(MAX_INFLIGHT_INVITE_REQUESTS));
+        let mut tasks: JoinSet<()> = JoinSet::new();
         loop {
             tokio::select! {
                 incoming = stream.next() => match incoming {
@@ -808,22 +833,36 @@ impl WsInner {
                         let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
                             let frame = crate::events::error_frame(
                                 &serde_json::Value::Null, -32700, "Parse error");
-                            if out_tx.send(frame).await.is_err() { break; }
+                            if sink.send(Message::Text(frame.into())).await.is_err() { break; }
                             continue;
                         };
                         match crate::invite::classify(&value) {
                             Some(req) if req.method == crate::invite::InviteMethod::Redeem => {
+                                let admitted = match admission.clone().try_acquire_owned() {
+                                    Ok(permit) => out_tx
+                                        .clone()
+                                        .try_reserve_owned()
+                                        .ok()
+                                        .map(|slot| (permit, slot)),
+                                    Err(_) => None,
+                                };
+                                let Some((permit, slot)) = admitted else {
+                                    if let Some(frame) = crate::invite::refuse_busy(&req) {
+                                        if sink.send(Message::Text(frame.into())).await.is_err() { break; }
+                                    }
+                                    continue;
+                                };
                                 let api = self.api.clone();
-                                let out_tx = out_tx.clone();
-                                tokio::spawn(async move {
+                                tasks.spawn(async move {
+                                    let _permit = permit;
                                     if let Some(frame) = crate::invite::handle_redeem(req, &api).await {
-                                        let _ = out_tx.send(frame).await;
+                                        slot.send(frame);
                                     }
                                 });
                             }
                             _ => {
                                 if let Some(frame) = crate::invite::refuse_non_invite(&value) {
-                                    if out_tx.send(frame).await.is_err() { break; }
+                                    if sink.send(Message::Text(frame.into())).await.is_err() { break; }
                                 }
                             }
                         }
@@ -842,6 +881,9 @@ impl WsInner {
                         break;
                     }
                 }
+                // Reap finished redeem tasks so the set never accumulates
+                // results across a long-lived connection.
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
                 cmd = cmd_rx.recv() => match cmd {
                     None => break,
                     Some(ConnCmd::Ping) => {
@@ -861,6 +903,9 @@ impl WsInner {
                 }
             }
         }
+        // Dropping the set aborts every redeem still in flight for this
+        // peer (the reaper's task abort drops it too).
+        tasks.abort_all();
         let _ = sink.close().await;
     }
 

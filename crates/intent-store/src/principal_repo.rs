@@ -809,6 +809,155 @@ impl Store {
         .map_err(|e| Error::Internal(format!("redeem workspace invite failed: {e}")))?;
         Ok(res.rows_affected() > 0)
     }
+
+    /// The invite join as ONE write transaction (multiplayer w4): resolve or
+    /// mint the principal keyed by `identity.github_user_id`, apply the
+    /// fetched profile, redeem the invite (the conditional `UPDATE` is the
+    /// single-use guard), add the `collaborator` membership and record the
+    /// credential hash. Either every row lands or none does — a credential
+    /// insert failure cannot consume the link or leave a member without a
+    /// credential — and, under `BEGIN IMMEDIATE` on the single-connection
+    /// write pool, two first joins of the same account cannot both miss the
+    /// lookup and race a duplicate `github_user_id` insert.
+    ///
+    /// `identity.id` is used only when no principal has linked the account;
+    /// `identity.is_primary` / `created_at` likewise. Returns the joined
+    /// principal (existing row refreshed, or the minted one), or `None` when
+    /// the invite was no longer open at redemption — checked first, inside
+    /// the transaction, so a closed invite writes nothing at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails (including
+    /// a duplicate credential hash or an unknown invite / workspace) and
+    /// `Error::InvalidInput` for a one-owner violation on the membership.
+    pub async fn join_workspace_by_invite(
+        &self,
+        invite_id: &str,
+        workspace_id: &WorkspaceId,
+        identity: &Principal,
+        credential_hash: &str,
+    ) -> Result<Option<Principal>> {
+        let github_user_id = identity
+            .github_user_id
+            .ok_or_else(|| Error::Internal("invite join requires a github_user_id".to_string()))?;
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("invite join acquire failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("invite join begin failed: {e}")))?;
+
+        let body_result: Result<Option<Principal>> = async {
+            let now = now_iso();
+            // Open-invite check before any write: under IMMEDIATE no other
+            // writer can close it between here and the UPDATE below, so a
+            // refused join commits a read-only transaction (no-op).
+            let open: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM workspace_invite \
+                 WHERE id = ? AND workspace_id = ? AND redeemed_at IS NULL \
+                   AND revoked_at IS NULL AND expires_at > ?",
+            )
+            .bind(invite_id)
+            .bind(&workspace_id.0)
+            .bind(&now)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("invite join open check failed: {e}")))?;
+            if open.is_none() {
+                return Ok(None);
+            }
+            let lookup =
+                format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE github_user_id = ?");
+            let existing = sqlx::query(&lookup)
+                .bind(github_user_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("invite join principal lookup failed: {e}")))?
+                .as_ref()
+                .map(map_principal_row);
+            let mut principal = existing.unwrap_or_else(|| identity.clone());
+            principal.github_user_id = Some(github_user_id);
+            principal.login.clone_from(&identity.login);
+            principal.display_name.clone_from(&identity.display_name);
+            principal.avatar_url.clone_from(&identity.avatar_url);
+            principal.updated_at.clone_from(&now);
+
+            let upsert = format!(
+                "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                     github_user_id = excluded.github_user_id, \
+                     login = excluded.login, \
+                     display_name = excluded.display_name, \
+                     avatar_url = excluded.avatar_url, \
+                     updated_at = excluded.updated_at"
+            );
+            sqlx::query(&upsert)
+                .bind(&principal.id.0)
+                .bind(principal.github_user_id)
+                .bind(&principal.login)
+                .bind(&principal.display_name)
+                .bind(&principal.avatar_url)
+                .bind(i64::from(principal.is_primary))
+                .bind(&principal.created_at)
+                .bind(&principal.updated_at)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("invite join upsert principal failed: {e}"))
+                })?;
+
+            let redeemed = sqlx::query(
+                "UPDATE workspace_invite SET redeemed_at = ?, redeemed_by_principal_id = ? \
+                 WHERE id = ? AND workspace_id = ? AND redeemed_at IS NULL \
+                   AND revoked_at IS NULL AND expires_at > ?",
+            )
+            .bind(&now)
+            .bind(&principal.id.0)
+            .bind(invite_id)
+            .bind(&workspace_id.0)
+            .bind(&now)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("invite join redeem failed: {e}")))?;
+            if redeemed.rows_affected() == 0 {
+                return Err(Error::Internal(format!(
+                    "invite {invite_id} closed inside its own join transaction"
+                )));
+            }
+
+            let member = format!(
+                "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
+                 ON CONFLICT(workspace_id, principal_id) DO NOTHING"
+            );
+            sqlx::query(&member)
+                .bind(&workspace_id.0)
+                .bind(&principal.id.0)
+                .bind(WorkspaceRole::Collaborator.as_str())
+                .bind(&now)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| map_owner_violation(&e, workspace_id, "invite join add member"))?;
+
+            sqlx::query(
+                "INSERT INTO principal_credential (token_hash, principal_id, created_at) \
+                 VALUES (?,?,?)",
+            )
+            .bind(credential_hash)
+            .bind(&principal.id.0)
+            .bind(&now)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("invite join insert credential failed: {e}")))?;
+            Ok(Some(principal))
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(conn, body_result, "invite join commit failed").await
+    }
 }
 
 fn map_invite_row(r: &SqliteRow) -> WorkspaceInvite {

@@ -423,6 +423,64 @@ impl Services {
         self.apply_primary_identity(principal, &fetched).await
     }
 
+    /// True once the primary identity is load-bearing: another principal
+    /// row exists or an invite is open (multiplayer w4).
+    pub(crate) async fn primary_identity_locked(&self) -> Result<bool> {
+        Ok(self.store.count_principals().await? > 1
+            || self.store.count_open_workspace_invites().await? > 0)
+    }
+
+    /// The pre-persist hook `github.connect` installs on its device flow
+    /// (multiplayer w4): the granted token's account is resolved through
+    /// the token-bound client and applied via [`Self::apply_primary_identity`]
+    /// *before* the engine writes the token, so a reconnect as a different
+    /// account is refused (the stored credential and cached identity stay)
+    /// while the identity is locked. When the daemon is still single-user
+    /// the switch is applied and the token persisted as before. A failed
+    /// `GET /user` refuses the grant only while locked: unverifiable is
+    /// unsafe exactly when there is something to protect.
+    pub(crate) fn connect_identity_guard(
+        &self,
+    ) -> intent_sourcecontrol::device_flow::IdentityGuard {
+        let this = self.clone();
+        Arc::new(
+            move |client: Arc<dyn intent_sourcecontrol::SourceControl>| {
+                let this = this.clone();
+                Box::pin(async move {
+                    let primary = this
+                        .store
+                        .get_primary_principal()
+                        .await
+                        .map_err(|e| format!("primary principal unavailable: {e}"))?;
+                    match client.get_user().await {
+                        Ok(user) => match this.apply_primary_identity(primary, &user).await {
+                            Ok(_) => Ok(()),
+                            Err(Error::Invite(InviteErrorKind::IdentityLocked)) => Err(format!(
+                                "authorized as GitHub account {} while collaborators or open \
+                             invites depend on the current identity; disconnect them first",
+                                user.login
+                            )),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "github.connect: identity apply failed");
+                                Ok(())
+                            }
+                        },
+                        Err(e) => {
+                            if this.primary_identity_locked().await.unwrap_or(true) {
+                                Err(format!(
+                                    "could not verify the authorized GitHub account ({e}) while \
+                                 the primary identity is locked"
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    }
+                })
+            },
+        )
+    }
+
     /// Persist a fetched GitHub profile onto the primary principal's row,
     /// subject to the reconnect guard described on
     /// [`Self::refresh_primary_identity`].
@@ -433,18 +491,14 @@ impl Services {
     ) -> Result<Principal> {
         let fetched_id = user.id.and_then(|id| i64::try_from(id).ok());
         if let (Some(cached), Some(fetched)) = (principal.github_user_id, fetched_id) {
-            if cached != fetched {
-                let locked = self.store.count_principals().await? > 1
-                    || self.store.count_open_workspace_invites().await? > 0;
-                if locked {
-                    tracing::warn!(
-                        cached_github_user_id = cached,
-                        fetched_github_user_id = fetched,
-                        "primary GitHub identity changed while other principals or open \
-                         invites exist; keeping the cached identity"
-                    );
-                    return Err(Error::Invite(InviteErrorKind::IdentityLocked));
-                }
+            if cached != fetched && self.primary_identity_locked().await? {
+                tracing::warn!(
+                    cached_github_user_id = cached,
+                    fetched_github_user_id = fetched,
+                    "primary GitHub identity changed while other principals or open \
+                     invites exist; keeping the cached identity"
+                );
+                return Err(Error::Invite(InviteErrorKind::IdentityLocked));
             }
         }
         let mut updated = principal.clone();

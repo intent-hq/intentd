@@ -43,6 +43,11 @@ pub(crate) enum FlowPhase {
     Denied,
     /// Polling failed repeatedly (network / non-retryable API error).
     Error,
+    /// The user authorized as a *different* GitHub account while other
+    /// principals or open invites depend on the cached primary identity
+    /// (multiplayer w4): the new token was discarded before persistence and
+    /// the previously stored credential is untouched.
+    IdentityLocked,
 }
 
 impl FlowPhase {
@@ -53,6 +58,7 @@ impl FlowPhase {
             Self::Expired => "expired",
             Self::Denied => "denied",
             Self::Error => "error",
+            Self::IdentityLocked => "identity-locked",
         }
     }
 }
@@ -177,6 +183,7 @@ pub(crate) async fn run_poll_loop(
             Ok(PollStatus::Authorized) => break None,
             Ok(PollStatus::Expired) => break Some(FlowPhase::Expired),
             Ok(PollStatus::Denied) => break Some(FlowPhase::Denied),
+            Ok(PollStatus::Refused) => break Some(FlowPhase::IdentityLocked),
             Err(e) => {
                 consecutive_errors += 1;
                 tracing::warn!(
@@ -409,6 +416,7 @@ mod tests {
         assert_eq!(FlowPhase::Expired.as_wire(), "expired");
         assert_eq!(FlowPhase::Denied.as_wire(), "denied");
         assert_eq!(FlowPhase::Error.as_wire(), "error");
+        assert_eq!(FlowPhase::IdentityLocked.as_wire(), "identity-locked");
     }
 
     #[test]

@@ -15390,7 +15390,7 @@ mod drafts_events {
 // status/reviews/check-run shapes and the review-thread filtering/fallback.
 // ============================================================================
 
-mod pr {
+pub(crate) mod pr {
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -15413,7 +15413,7 @@ mod pr {
     // Test stub: one independent bool per scripted scenario.
     #[expect(clippy::struct_excessive_bools)]
     #[derive(Default)]
-    struct StubForge {
+    pub(crate) struct StubForge {
         fail_threads: bool,
         /// When set, `list_prs` returns the sample PR so PR-refresh discovery can
         /// link an unlinked workspace by head ref.
@@ -15497,6 +15497,20 @@ mod pr {
         seen_pr_queries: std::sync::Mutex<Vec<PrQuery>>,
         /// Every [`IssueQuery`] handed to `list_issues`, in call order.
         seen_issue_queries: std::sync::Mutex<Vec<IssueQuery>>,
+        /// When true, `check_auth` reports no working credential (a revoked
+        /// or missing token), exercising the invite-create live auth gate
+        /// (multiplayer w4).
+        unauthenticated: bool,
+    }
+
+    impl StubForge {
+        /// A forge whose `check_auth` reports `authenticated: false`.
+        pub(crate) fn unauthenticated() -> Self {
+            Self {
+                unauthenticated: true,
+                ..Default::default()
+            }
+        }
     }
 
     /// The blended multi-repo page a forge answers for a search whose
@@ -15553,6 +15567,13 @@ mod pr {
             })
         }
         async fn check_auth(&self) -> ScResult<AuthStatus> {
+            if self.unauthenticated {
+                return Ok(AuthStatus {
+                    authenticated: false,
+                    login: None,
+                    scopes: vec![],
+                });
+            }
             Ok(AuthStatus {
                 authenticated: true,
                 login: Some("octocat".into()),
