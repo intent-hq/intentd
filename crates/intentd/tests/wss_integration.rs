@@ -4012,6 +4012,640 @@ async fn wss_collaborator_client_ids_are_principal_scoped() {
     srv.ws.stop().await;
 }
 
+/// One collaborator-side WSS client for the multiplayer w3 e2e below: a
+/// non-primary principal with its own credential, added to nothing until the
+/// test says so, plus a connection bound to it.
+struct Guest {
+    principal: intent_core::Principal,
+    ws: tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+    next_id: u64,
+}
+
+impl Guest {
+    async fn connect(srv: &Server, token: &str) -> Self {
+        use intent_core::{Principal, PrincipalId};
+        let principal = Principal {
+            id: PrincipalId::new(),
+            github_user_id: None,
+            login: Some("guest".to_string()),
+            display_name: Some("Guest User".to_string()),
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        srv.store.upsert_principal(&principal).await.expect("guest");
+        srv.store
+            .insert_principal_credential(&principal.id, &sha256_hex(token.as_bytes()))
+            .await
+            .expect("guest credential");
+        let url = format!("wss://localhost:{}/ws?token={token}", srv.port);
+        let ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+        Self {
+            principal,
+            ws,
+            next_id: 100,
+        }
+    }
+
+    /// One JSON-RPC round-trip on the guest connection (pushes and pings
+    /// interleaved on the same socket are skipped).
+    async fn call(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        let frame =
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        self.ws
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .expect("send");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match self.ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == id {
+                            return v;
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = self.ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{method} reply within 15s"))
+    }
+}
+
+/// A tiny real repository (one commit on `main`, repo-local identity) for
+/// direct-checkout workspaces in the in-process harness.
+fn seed_git_repo(prefix: &str) -> tempfile::TempDir {
+    let dir = test_tempdir(prefix);
+    let repo = dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL")
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    dir
+}
+
+fn git_stdout(repo: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(out.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Multiplayer w3 (Steer & edit, #1870 follow-up): a collaborator's
+/// `git.push` over WSS **succeeds** against a real checkout — the response
+/// carries `{ ok: true, branch, pushedSha }` (docs/protocol/methods/git.md
+/// §5.6) and the bare remote's branch ref lands on the pushed sha — where the
+/// same call from a non-member is `NotFound`.
+#[tokio::test]
+async fn wss_collaborator_git_push_succeeds_against_bare_remote() {
+    use intent_core::WorkspaceRole;
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let repo_dir = seed_git_repo("intentd-wss-collab-push-");
+    let repo = repo_dir.path().to_path_buf();
+    let bare_dir = test_tempdir("intentd-wss-collab-bare-");
+    let bare = bare_dir.path().join("remote.git");
+    git_stdout(
+        bare_dir.path(),
+        &["init", "--bare", "-q", bare.to_str().unwrap()],
+    );
+    git_stdout(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"Collab Push","worktreePath":"{}","path":"{}"}}}}"#,
+            repo.display(),
+            repo.display(),
+        ),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace id: {created}"))
+        .to_string();
+
+    let mut guest = Guest::connect(
+        &srv,
+        "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+    )
+    .await;
+
+    // Non-member: NotFound, membership undisclosed, nothing pushed.
+    let refused = guest
+        .call("git.push", json!({ "workspaceId": ws_id, "force": false }))
+        .await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert_eq!(refused["error"]["data"]["code"], "not-found", "{refused}");
+    assert!(
+        std::process::Command::new("git")
+            .current_dir(&bare)
+            .args(["rev-parse", "--verify", "-q", "refs/heads/main"])
+            .output()
+            .expect("run git")
+            .stdout
+            .is_empty(),
+        "a non-member's push must not reach the remote"
+    );
+
+    srv.store
+        .add_workspace_member(
+            &WorkspaceId::from(ws_id.as_str()),
+            &guest.principal.id,
+            WorkspaceRole::Collaborator,
+        )
+        .await
+        .expect("add collaborator");
+
+    // Collaborator: the push runs and lands on the remote.
+    let pushed = guest
+        .call("git.push", json!({ "workspaceId": ws_id, "force": false }))
+        .await;
+    assert!(pushed.get("error").is_none(), "collaborator push: {pushed}");
+    assert_eq!(pushed["result"]["ok"], true, "{pushed}");
+    assert_eq!(pushed["result"]["branch"], "main", "{pushed}");
+    assert_eq!(pushed["result"]["pushedSha"], head.as_str(), "{pushed}");
+    assert_eq!(
+        git_stdout(&bare, &["rev-parse", "refs/heads/main"]),
+        head,
+        "remote branch must sit on the pushed sha"
+    );
+
+    drop(guest);
+    srv.ws.stop().await;
+}
+
+/// Multiplayer w3 (decided: an agent steered by a collaborator acts with the
+/// owner's capabilities). Over WSS the collaborator's `host.exec` is refused
+/// before dispatch (`-32003`), yet its `agent.sendMessage` steer of the
+/// workspace's agent succeeds and is stamped with the collaborator; the same
+/// agent's `ws.host.exec` binding — the intent-acp `workspace_api` front
+/// door bound to the agent as caller, against the same services the WSS
+/// listener serves — then runs a real process in the workspace checkout and
+/// returns its stdout. The service seam agrees: `Caller::Agent` passes
+/// `host_exec`, a collaborator wire caller is `Forbidden`.
+#[tokio::test]
+async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities() {
+    use intent_acp::WorkspaceMcpServer;
+    use intent_core::{with_caller, AgentId, Caller, WorkspaceRole};
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", json!("auggie"));
+    let repo_dir = seed_git_repo("intentd-wss-collab-hostexec-");
+    let repo = repo_dir.path().to_path_buf();
+
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"Collab Steer","worktreePath":"{}","path":"{}"}}}}"#,
+            repo.display(),
+            repo.display(),
+        ),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace id: {created}"))
+        .to_string();
+    let agent = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Steered"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = agent["result"]["agent"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("agent id: {agent}"))
+        .to_string();
+
+    let mut guest = Guest::connect(
+        &srv,
+        "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2",
+    )
+    .await;
+    let ws_typed = WorkspaceId::from(ws_id.as_str());
+    srv.store
+        .add_workspace_member(&ws_typed, &guest.principal.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("add collaborator");
+
+    // Direct `host.exec` from the collaborator: refused before dispatch.
+    let exec_params = json!({ "workspaceId": ws_id, "command": "echo", "args": ["steered"] });
+    let refused = guest.call("host.exec", exec_params.clone()).await;
+    assert_eq!(refused["error"]["code"], -32003, "{refused}");
+    assert_eq!(refused["error"]["message"], "Forbidden", "{refused}");
+    assert!(refused.get("result").is_none(), "{refused}");
+
+    // The steer itself succeeds and is attributed to the collaborator.
+    let steered = guest
+        .call(
+            "agent.sendMessage",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "run echo steered" }),
+        )
+        .await;
+    assert_eq!(steered["result"]["success"], true, "steer: {steered}");
+    let message_id = steered["result"]["messageId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("messageId: {steered}"))
+        .to_string();
+    let conv = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let row = conv["result"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["id"] == message_id.as_str())
+        .unwrap_or_else(|| panic!("steer row: {conv}"));
+    assert_eq!(
+        row["metadata"]["fromPrincipalId"], guest.principal.id.0,
+        "{row}"
+    );
+
+    // The steered agent's binding: `ws.host.exec` through the intent-acp
+    // `workspace_api` tool, bound to the agent, over the harness services.
+    let agent_typed = AgentId::from_string(agent_id.clone());
+    let bridge = WorkspaceMcpServer::new(srv.api.clone(), ws_typed.clone())
+        .with_caller_agent_id(Some(agent_typed.clone()));
+    let resp = bridge
+        .handle_message(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "workspace_api",
+                "arguments": {
+                    "code": "return JSON.stringify(await ws.host.exec({ command: 'sh', args: ['-c', 'echo steered && pwd'] }));",
+                    "summary": "collaborator-steered host.exec"
+                }
+            }
+        }))
+        .await
+        .expect("tools/call returns a response");
+    assert_eq!(resp["result"]["isError"], false, "binding: {resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool text: {resp}"));
+    // The tool renders a string return as a JSON string literal; unwrap it.
+    let mut body: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}"));
+    if let Some(inner) = body.as_str() {
+        body = serde_json::from_str(inner).unwrap_or_else(|e| panic!("{e}: {inner}"));
+    }
+    assert_eq!(body["exitCode"], 0, "{body}");
+    let stdout = body["stdout"].as_str().expect("stdout");
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("steered"), "{body}");
+    let printed = lines.next().expect("pwd line");
+    let canonical = std::fs::canonicalize(&repo).unwrap_or_else(|_| repo.clone());
+    assert!(
+        Path::new(printed) == repo || Path::new(printed) == canonical,
+        "host.exec must run in the workspace checkout ({}), got {printed}",
+        repo.display()
+    );
+
+    // Service seam: the agent caller passes where the collaborator's own
+    // wire caller is Forbidden — the same gate the transport fronts.
+    let by_agent = with_caller(
+        Caller::Agent {
+            agent_id: agent_typed,
+        },
+        srv.api
+            .host_exec(ws_typed.clone(), json!({ "command": "true" })),
+    )
+    .await
+    .expect("agent host_exec");
+    assert_eq!(by_agent["exitCode"], 0);
+    let by_collaborator = with_caller(
+        Caller::Wire {
+            principal_id: guest.principal.id.clone(),
+            is_administrator: false,
+        },
+        srv.api.host_exec(ws_typed, json!({ "command": "true" })),
+    )
+    .await;
+    assert!(
+        matches!(by_collaborator, Err(intent_core::Error::Forbidden(_))),
+        "collaborator host_exec: {by_collaborator:?}"
+    );
+
+    drop(guest);
+    srv.ws.stop().await;
+}
+
+/// Multiplayer w3 regression (#1870 follow-up): `workspace.members.remove`
+/// while the member has a queued message. The owner and the collaborator
+/// each queue one entry on the workspace's agent (each stamped with its
+/// author); after the owner removes the collaborator the queue keeps only
+/// the owner's entry — stamp and author intact — both live
+/// (`agent.getQueue`, the `agent:queue:updated` echo) and durably (the
+/// persisted queue snapshot a later drain or restart would redrive), while
+/// the removed member's connection loses access (`agent.getQueue` and
+/// `workspace.get` are `NotFound`). A second collaborator's entry is not
+/// touched.
+#[tokio::test]
+async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
+    use intent_core::events::AGENT_QUEUE_UPDATED;
+    use intent_core::{lift_from_principal_id, AgentId, WorkspaceRole};
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", json!("auggie"));
+    let primary = srv
+        .store
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Queued Removal"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let agent = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Queued"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = agent["result"]["agent"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("agent id: {agent}"))
+        .to_string();
+
+    let ws_typed = WorkspaceId::from(ws_id.as_str());
+    let mut leaving = Guest::connect(
+        &srv,
+        "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3",
+    )
+    .await;
+    let mut staying = Guest::connect(
+        &srv,
+        "e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4",
+    )
+    .await;
+    for guest in [&leaving, &staying] {
+        srv.store
+            .add_workspace_member(&ws_typed, &guest.principal.id, WorkspaceRole::Collaborator)
+            .await
+            .expect("add collaborator");
+    }
+
+    // Owner, leaving member, staying member each queue one entry.
+    let owner_queued = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.queueMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","content":"from owner"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(owner_queued["result"]["success"], true, "{owner_queued}");
+    let leaving_queued = leaving
+        .call(
+            "agent.queueMessage",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "from leaving" }),
+        )
+        .await;
+    assert_eq!(
+        leaving_queued["result"]["success"], true,
+        "{leaving_queued}"
+    );
+    let staying_queued = staying
+        .call(
+            "agent.queueMessage",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "from staying" }),
+        )
+        .await;
+    assert_eq!(
+        staying_queued["result"]["success"], true,
+        "{staying_queued}"
+    );
+
+    let before = leaving
+        .call("agent.getQueue", json!({ "agentId": agent_id }))
+        .await;
+    let queue = before["result"]["queue"].as_array().expect("queue");
+    assert_eq!(queue.len(), 3, "{before}");
+    let stamp_of = |content: &str, queue: &[Value]| {
+        queue
+            .iter()
+            .find(|q| q["content"] == content)
+            .map(|q| q["messageMetadata"]["fromPrincipalId"].clone())
+    };
+    assert_eq!(
+        stamp_of("from owner", queue),
+        Some(json!(primary.id.0)),
+        "{before}"
+    );
+    assert_eq!(
+        stamp_of("from leaving", queue),
+        Some(json!(leaving.principal.id.0)),
+        "{before}"
+    );
+    assert_eq!(
+        stamp_of("from staying", queue),
+        Some(json!(staying.principal.id.0)),
+        "{before}"
+    );
+
+    // Owner subscribes for the shrunk-queue echo, then removes the member.
+    let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub_ws
+        .send(Message::Text(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"events.subscribe","params":{{"eventTypes":["{AGENT_QUEUE_UPDATED}"],"workspaceId":"{ws_id}"}}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .expect("subscribe");
+    loop {
+        match sub_ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json");
+                if v["id"] == 4 {
+                    assert!(v["result"]["subscriptionId"].is_string(), "{v}");
+                    break;
+                }
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+
+    let removed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"workspace.members.remove","params":{{"workspaceId":"{ws_id}","principalId":"{}"}}}}"#,
+            leaving.principal.id.0
+        ),
+    )
+    .await;
+    assert_eq!(removed["result"]["removed"], true, "{removed}");
+
+    // Live echo: the queue republished without the removed member's entry.
+    let echo = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == AGENT_QUEUE_UPDATED
+                    {
+                        return v["params"]["event"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("agent:queue:updated after removal");
+    assert_eq!(echo["data"]["agentId"], agent_id.as_str(), "{echo}");
+    let echoed: Vec<&str> = echo["data"]["queue"]
+        .as_array()
+        .expect("queue")
+        .iter()
+        .map(|q| q["content"].as_str().expect("content"))
+        .collect();
+    assert_eq!(echoed, vec!["from owner", "from staying"], "{echo}");
+
+    // Read side: the surviving entries keep their stamp and resolved author.
+    let after = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.getQueue","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let queue = after["result"]["queue"].as_array().expect("queue");
+    assert_eq!(queue.len(), 2, "{after}");
+    assert!(
+        queue.iter().all(|q| q["content"] != "from leaving"),
+        "removed member's entry must be gone: {after}"
+    );
+    assert_eq!(
+        stamp_of("from owner", queue),
+        Some(json!(primary.id.0)),
+        "{after}"
+    );
+    assert_eq!(
+        stamp_of("from staying", queue),
+        Some(json!(staying.principal.id.0)),
+        "{after}"
+    );
+    let owner_entry = queue
+        .iter()
+        .find(|q| q["content"] == "from owner")
+        .expect("owner entry");
+    assert_eq!(
+        owner_entry["author"]["principalId"], primary.id.0,
+        "{after}"
+    );
+    let staying_entry = queue
+        .iter()
+        .find(|q| q["content"] == "from staying")
+        .expect("staying entry");
+    assert_eq!(staying_entry["author"]["login"], "guest", "{after}");
+
+    // Durable side: the persisted snapshot (what a later drain or a restart
+    // redrives) carries no entry stamped with the removed member.
+    let agent_typed = AgentId::from_string(agent_id.clone());
+    let persisted: Vec<_> = srv
+        .store
+        .load_all_agent_queues()
+        .await
+        .expect("load queues")
+        .into_iter()
+        .filter(|row| row.agent_id == agent_typed)
+        .collect();
+    assert_eq!(persisted.len(), 2, "{persisted:?}");
+    assert!(
+        persisted.iter().all(|row| {
+            lift_from_principal_id(row.payload.get("messageMetadata")).as_ref()
+                != Some(&leaving.principal.id)
+        }),
+        "persisted snapshot must not redrive the removed member's entry: {persisted:?}"
+    );
+
+    // The removed member's connection has lost the workspace; the staying
+    // member still reads the queue.
+    let gone = leaving
+        .call("agent.getQueue", json!({ "agentId": agent_id }))
+        .await;
+    assert_eq!(gone["error"]["code"], -32602, "{gone}");
+    assert_eq!(gone["error"]["data"]["code"], "not-found", "{gone}");
+    let gone_ws = leaving
+        .call("workspace.get", json!({ "workspaceId": ws_id }))
+        .await;
+    assert_eq!(gone_ws["error"]["data"]["code"], "not-found", "{gone_ws}");
+    let still = staying
+        .call("agent.getQueue", json!({ "agentId": agent_id }))
+        .await;
+    assert_eq!(
+        still["result"]["queue"].as_array().map(Vec::len),
+        Some(2),
+        "{still}"
+    );
+
+    drop(leaving);
+    drop(staying);
+    srv.ws.stop().await;
+}
+
 /// Multiplayer w3: a connection bound to a non-administrator principal may
 /// call only the vetted `COLLABORATOR_METHODS`; everything else is refused
 /// before dispatch with the forbidden error (`-32003`, docs/protocol §9).
