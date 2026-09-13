@@ -13378,25 +13378,32 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
 
     // workspace.create: the `initialAgent.prompt` kickoff IS a persisted user
     // row (delivered daemon-side, no `agent.sendMessage` follows), stamped
-    // with the creating caller — a collaborator's first message must never
-    // fall back to the workspace owner.
-    let created_ws = with_caller(wire(&bob), async {
-        WorkspaceApi::create_workspace(
-            &svc,
-            intent_core::WorkspaceCreate {
-                title: Some("Bob's workspace".into()),
-                skip_isolation: Some(true),
-                initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
-                    prompt: Some("initial kickoff".into()),
-                    provider: Some("auggie".into()),
+    // with the creating caller — the creator's first message must never fall
+    // back to the workspace owner. The method is administrator-only, so the
+    // creator is bound as an administrator wire caller with its own principal.
+    let created_ws = with_caller(
+        Caller::Wire {
+            principal_id: bob.clone(),
+            is_administrator: true,
+        },
+        async {
+            WorkspaceApi::create_workspace(
+                &svc,
+                intent_core::WorkspaceCreate {
+                    title: Some("Bob's workspace".into()),
+                    skip_isolation: Some(true),
+                    initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                        prompt: Some("initial kickoff".into()),
+                        provider: Some("auggie".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-    })
+                },
+                None,
+            )
+            .await
+        },
+    )
     .await
     .expect("workspace.create");
     let initial_agent = AgentId::from(

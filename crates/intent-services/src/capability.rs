@@ -13,9 +13,19 @@
 //!   every workspace in v1 (no transfer RPC) and administers the daemon.
 //! - `Caller::Agent` / `Caller::Daemon` — act with the owner's capabilities
 //!   (decided: an agent steered by a collaborator still runs `ws.host.exec`).
-//! - An unbound request is not a collaborator (the transport binds every
-//!   wire caller; agents and hooks never enter through it), matching the
-//!   transport's `is_non_administrator_caller` and the event narrowing.
+//! - An unbound request (`current_caller() == None`) is treated as
+//!   unconstrained. **Interim deviation** from the w3 brief (AC: an
+//!   owner-only method with no caller context is `Forbidden`): `Caller` is a
+//!   `tokio::task_local!`, so every `tokio::spawn` drops the binding and the
+//!   event fan-out, git status refresher, PR-monitor flush, scheduled-delete
+//!   timer and the subscription snapshot/delta reads all reach these gates
+//!   unbound today. Failing closed here before those sites bind an explicit
+//!   `Caller::Daemon` (or the subscriber's wire caller) would break them, so
+//!   the permit stays and every unbound evaluation of a protected gate logs
+//!   one `tracing::warn!` per gate (a runtime inventory for the follow-up
+//!   task "Fail-closed unbound caller in the service layer",
+//!   `70c04ac1-d8d4-4195-a1a1-29d5e862685d`). Matches the transport's
+//!   `is_non_administrator_caller` and the event narrowing.
 //!
 //! Classes: *Member+* (Read / Steer & edit) → [`Services::require_member`];
 //! *Owner-only* (`workspace.delete` / `archive` / `export.*`,
@@ -32,6 +42,7 @@
 //! a collaborator, so the administrator / agent / hook paths pay nothing.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use intent_core::{
     current_caller, lift_from_principal_id, AgentId, Caller, Error, PrincipalId, Result, Workspace,
@@ -53,8 +64,41 @@ pub(crate) fn collaborator_caller() -> Option<PrincipalId> {
     }
 }
 
+/// [`collaborator_caller`] for a protected gate: when the request is unbound
+/// the interim permit (module docs) is logged once per `gate` per process so
+/// the fail-closed follow-up has a runtime inventory of unbound call sites.
+fn gated_collaborator_caller(gate: &str) -> Option<PrincipalId> {
+    if current_caller().is_none() {
+        static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let first = WARNED
+            .get_or_init(Mutex::default)
+            .lock()
+            .is_ok_and(|mut seen| seen.insert(gate.to_string()));
+        if first {
+            tracing::warn!(
+                gate,
+                "capability gate evaluated without a bound Caller; permitting (interim, see capability.rs)"
+            );
+        }
+        return None;
+    }
+    collaborator_caller()
+}
+
 fn not_a_member(workspace_id: &WorkspaceId) -> Error {
     Error::NotFound(format!("workspace {workspace_id}"))
+}
+
+/// The `workspace.update` fields a member (collaborator) may set: the
+/// workspace-card metadata the catalog promises. Every other field is
+/// owner-only. `changes` is the serialised (camelCase) `WorkspaceUpdate`
+/// delta, so a field is "touched" iff its key is present.
+pub(crate) fn collaborator_editable_update(changes: &Value) -> bool {
+    const EDITABLE: [&str; 4] = ["title", "tags", "statusMessage", "statusImageAssetId"];
+    match changes.as_object() {
+        Some(fields) => fields.keys().all(|k| EDITABLE.contains(&k.as_str())),
+        None => false,
+    }
 }
 
 impl Services {
@@ -63,8 +107,9 @@ impl Services {
     async fn collaborator_role(
         &self,
         workspace_id: &WorkspaceId,
+        gate: &str,
     ) -> Result<Option<(PrincipalId, Option<WorkspaceRole>)>> {
-        let Some(principal_id) = collaborator_caller() else {
+        let Some(principal_id) = gated_collaborator_caller(gate) else {
             return Ok(None);
         };
         let role = self
@@ -77,7 +122,7 @@ impl Services {
     /// Member+ gate for a workspace-scoped read / steer / edit. A
     /// collaborator who is not a member gets `NotFound`.
     pub(crate) async fn require_member(&self, workspace_id: &WorkspaceId) -> Result<()> {
-        match self.collaborator_role(workspace_id).await? {
+        match self.collaborator_role(workspace_id, "member").await? {
             None | Some((_, Some(_))) => Ok(()),
             Some((_, None)) => Err(not_a_member(workspace_id)),
         }
@@ -86,7 +131,7 @@ impl Services {
     /// Owner-only gate. A collaborator member gets `Forbidden`; a non-member
     /// `NotFound`.
     pub(crate) async fn require_owner(&self, workspace_id: &WorkspaceId, what: &str) -> Result<()> {
-        match self.collaborator_role(workspace_id).await? {
+        match self.collaborator_role(workspace_id, what).await? {
             None | Some((_, Some(WorkspaceRole::Owner))) => Ok(()),
             Some((_, Some(WorkspaceRole::Collaborator))) => Err(Error::Forbidden(format!(
                 "{what} requires the workspace owner"
@@ -98,7 +143,7 @@ impl Services {
     /// Administrator-only gate: a per-principal (collaborator) wire caller is
     /// refused regardless of workspace roles.
     pub(crate) fn require_administrator(what: &str) -> Result<()> {
-        match collaborator_caller() {
+        match gated_collaborator_caller(what) {
             None => Ok(()),
             Some(_) => Err(Error::Forbidden(format!(
                 "{what} requires the daemon administrator"
@@ -106,24 +151,86 @@ impl Services {
         }
     }
 
+    /// The agent's workspace for a membership check: the metadata-only
+    /// session row (no transcript hydration — monorepo#958); an unknown
+    /// agent is `NotFound`.
+    async fn agent_workspace(&self, agent_id: &AgentId) -> Result<WorkspaceId> {
+        Ok(self
+            .store
+            .get_agent_session_summary(agent_id)
+            .await?
+            .workspace_id)
+    }
+
     /// Member+ gate keyed by agent: resolves the agent's workspace (one point
     /// read, collaborator callers only) and requires membership there. An
     /// unknown agent is `NotFound` either way.
     pub(crate) async fn require_agent_member(&self, agent_id: &AgentId) -> Result<()> {
-        if collaborator_caller().is_none() {
+        if gated_collaborator_caller("member").is_none() {
             return Ok(());
         }
-        let session = self.store.get_agent_session(agent_id).await?;
-        self.require_member(&session.workspace_id).await
+        let workspace_id = self.agent_workspace(agent_id).await?;
+        self.require_member(&workspace_id).await
     }
 
     /// Owner-only gate keyed by agent (see [`Self::require_agent_member`]).
     pub(crate) async fn require_agent_owner(&self, agent_id: &AgentId, what: &str) -> Result<()> {
-        if collaborator_caller().is_none() {
+        if gated_collaborator_caller(what).is_none() {
             return Ok(());
         }
-        let session = self.store.get_agent_session(agent_id).await?;
-        self.require_owner(&session.workspace_id, what).await
+        let workspace_id = self.agent_workspace(agent_id).await?;
+        self.require_owner(&workspace_id, what).await
+    }
+
+    /// Path-based `git.*` gate (`git.getBranches` / `branchStatus` / `pull` /
+    /// `getRemoteUrl` take a caller-supplied `repoPath`): a collaborator may
+    /// only name a path that is the worktree, repository path or a registered
+    /// git root of one of its member workspaces; anything else is `Forbidden`
+    /// before the path is even validated (no existence disclosure). The
+    /// pre-registration workspace-create flow keeps arbitrary paths for the
+    /// administrator / agent / daemon callers.
+    pub(crate) async fn require_member_repo_path(&self, repo_path: &str, what: &str) -> Result<()> {
+        let Some(visible) = self.visible_workspace_ids().await? else {
+            return Ok(());
+        };
+        let forbidden = || {
+            Error::Forbidden(format!(
+                "{what}: repoPath is not a member workspace checkout"
+            ))
+        };
+        let wanted = std::path::Path::new(repo_path);
+        let wanted = wanted
+            .canonicalize()
+            .unwrap_or_else(|_| wanted.to_path_buf());
+        for workspace_id in &visible {
+            let Ok(ws) = self.store.get_workspace(workspace_id).await else {
+                continue;
+            };
+            let mut candidates: Vec<String> =
+                [ws.worktree_path.as_deref(), ws.repository_path.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            candidates.extend(
+                self.store
+                    .list_workspace_git_roots(workspace_id)
+                    .await?
+                    .into_iter()
+                    .map(|root| root.path),
+            );
+            for candidate in candidates {
+                let candidate = std::path::Path::new(&candidate);
+                let candidate = candidate
+                    .canonicalize()
+                    .unwrap_or_else(|_| candidate.to_path_buf());
+                if candidate == wanted {
+                    return Ok(());
+                }
+            }
+        }
+        Err(forbidden())
     }
 
     /// The workspace ids a collaborator caller may see, or `None` when the
@@ -140,6 +247,54 @@ impl Services {
                 .map(|m| m.workspace_id)
                 .collect(),
         ))
+    }
+
+    /// The workspace ids a collaborator caller *owns*, or `None` when the
+    /// caller is unconstrained.
+    pub(crate) async fn owned_workspace_ids(&self) -> Result<Option<HashSet<WorkspaceId>>> {
+        let Some(principal_id) = collaborator_caller() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.store
+                .list_principal_memberships(&principal_id)
+                .await?
+                .into_iter()
+                .filter(|m| m.role == WorkspaceRole::Owner)
+                .map(|m| m.workspace_id)
+                .collect(),
+        ))
+    }
+
+    /// `agent.pendingPermissions` (unfiltered) for a collaborator: keep only
+    /// the prompts of agents in workspaces the caller owns — the same
+    /// owner-only boundary as `agent:permission:*` event delivery. One
+    /// metadata-only session read per distinct prompting agent (pending
+    /// prompts are few); an agent that no longer resolves is dropped.
+    pub(crate) async fn retain_owned_agent_prompts(
+        &self,
+        requests: &mut Vec<intent_acp::PermissionRequestData>,
+    ) -> Result<()> {
+        let Some(owned) = self.owned_workspace_ids().await? else {
+            return Ok(());
+        };
+        let mut by_agent: HashMap<String, bool> = HashMap::new();
+        for request in requests.iter() {
+            if by_agent.contains_key(&request.session_id) {
+                continue;
+            }
+            let allowed = match self
+                .agent_workspace(&AgentId::from(request.session_id.as_str()))
+                .await
+            {
+                Ok(workspace_id) => owned.contains(&workspace_id),
+                Err(Error::NotFound(_)) => false,
+                Err(e) => return Err(e),
+            };
+            by_agent.insert(request.session_id.clone(), allowed);
+        }
+        requests.retain(|r| by_agent.get(&r.session_id).copied().unwrap_or(false));
+        Ok(())
     }
 
     /// Membership filter for `workspace.list` rows (and the workspace channel

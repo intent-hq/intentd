@@ -725,6 +725,25 @@ impl Services {
         )))
     }
 
+    /// Multiplayer w3 membership recheck for an upload continuation
+    /// (`chunk` / `commit` / `abort`): the session's workspace is the
+    /// authorization scope, re-evaluated on every call so a member removed
+    /// after `begin` can no longer write into (or abort within) the
+    /// workspace. An unknown upload id is left to the caller's own lookup
+    /// (its `NotFound` / idempotent-abort shape is unchanged).
+    pub(crate) async fn require_upload_member(&self, upload_id: &str) -> Result<()> {
+        let workspace_id = self
+            .attachment_uploads
+            .lock()
+            .expect("attachment upload registry poisoned")
+            .get(upload_id)
+            .map(|s| s.workspace_id.clone());
+        match workspace_id {
+            Some(workspace_id) => self.require_member(&workspace_id).await,
+            None => Ok(()),
+        }
+    }
+
     /// `file.attachmentUpload.chunk`: stage one seq-numbered slice of the
     /// payload. `data` is base64; the decoded slice is written to its own
     /// `chunk-<seq>` file, so retrying a seq is idempotent (same bytes land
