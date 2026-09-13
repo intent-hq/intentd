@@ -33795,24 +33795,45 @@ mod last_activity_events {
                 .expect("raise");
         }
 
-        // Drain all `workspace:attention-changed` events emitted during the burst.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        while timeout(Duration::from_millis(10), sub.recv()).await.is_ok() {}
-
-        // Wait for the debounce window to fire.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Consume the burst's immediate events (`workspace:attention-changed`,
+        // plus any `workspace:displayStatus-changed` a review_required raise
+        // moves) by type until the debounced `workspace:updated` arrives. An
+        // unconditional timed drain raced the debounce timer here: under
+        // package load the window expired while the drain was still consuming,
+        // which discarded the very event asserted below (intent#4886).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut updated: Option<Value> = None;
+        let mut trailing: Vec<Value> = Vec::new();
+        while updated.is_none() {
+            let batch = tokio::time::timeout_at(deadline, sub.recv())
+                .await
+                .expect("workspace:updated delivered")
+                .expect("subscription open");
+            for ev in &batch {
+                let ev = serde_json::to_value(ev).expect("serialize event");
+                if updated.is_some() {
+                    trailing.push(ev);
+                } else if ev["type"] == "workspace:updated" {
+                    updated = Some(ev);
+                }
+            }
+        }
 
         // Should see exactly one workspace:updated { lastActivity }.
-        let ev = recv_one(&mut sub).await;
+        let ev = updated.expect("workspace:updated captured");
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert!(ev["data"]["changes"]["lastActivity"].is_string());
 
-        // No second event (coalesced).
+        // No second workspace:updated (coalesced): neither in the remainder of
+        // the batch that carried the first nor within a quiet window after it.
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await {
+            for ev in &batch {
+                trailing.push(serde_json::to_value(ev).expect("serialize event"));
+            }
+        }
         assert!(
-            timeout(Duration::from_millis(100), sub.recv())
-                .await
-                .is_err(),
-            "burst coalesced into one event"
+            trailing.iter().all(|ev| ev["type"] != "workspace:updated"),
+            "burst coalesced into one workspace:updated, got trailing {trailing:?}"
         );
 
         // The emitted lastActivity matches a fresh workspace.get.
