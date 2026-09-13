@@ -961,6 +961,9 @@ pub struct Services {
     /// In-flight identity-only device flows started by `invite.redeem`
     /// (multiplayer w4), keyed by flow id; shared across clones.
     invite_flows: invite_ops::InviteFlowState,
+    /// Admission permits for those flows (`MAX_INFLIGHT_INVITE_FLOWS`),
+    /// taken before the upstream device-code request.
+    invite_flow_permits: invite_ops::InviteFlowPermits,
     /// Live feed of principals whose credentials were just revoked
     /// (`principal.revokeSelf`), consumed by the transport to close their
     /// connections (multiplayer w4).
@@ -1332,6 +1335,7 @@ impl Services {
             github_login_base_uri: None,
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             invite_flows: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            invite_flow_permits: invite_ops::new_flow_permits(),
             principal_revocations: tokio::sync::broadcast::channel(
                 invite_ops::REVOCATION_CHANNEL_CAPACITY,
             )
@@ -30161,6 +30165,11 @@ impl WorkspaceApi for Services {
             .oauth_client_id;
         let base_uri =
             github_auth_ops::resolve_login_base_uri(self.github_login_base_uri.as_deref());
+        // Reconnect guard (multiplayer w4): the granted account is verified
+        // against the primary identity BEFORE the token replaces the stored
+        // one; see `Services::connect_identity_guard`.
+        let api_base = invite_ops::resolve_api_base_uri(self.github_api_base_uri.as_deref());
+        let identity_guard = self.connect_identity_guard();
         Box::pin(async move {
             Self::require_administrator("github.connect")?;
             // Short critical section: reuse a live flow / clear a terminal
@@ -30186,6 +30195,7 @@ impl WorkspaceApi for Services {
             )
             .await
             .map_err(pr_ops::map_sc_err)?;
+            let flow = flow.with_identity_guard(api_base.as_deref(), identity_guard);
             let mut slot = state.lock().await;
             // A concurrent connect raced us while the lock was released: keep
             // the resident live flow (single-flow invariant) and drop ours —

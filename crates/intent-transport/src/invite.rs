@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use crate::events::{error_frame, error_frame_with_data, success_frame};
 use crate::pairing::encode_query_value;
 use crate::server::{pairing_hosts, ServerPairingInfo};
-use intent_core::{Error, Result, WorkspaceApi, WorkspaceId};
+use intent_core::{Error, InviteErrorKind, Result, WorkspaceApi, WorkspaceId};
 
 /// Version of the `intent://invite` payload format (`v` query parameter and
 /// the `version` field of the `workspace.invite.create` result).
@@ -128,6 +128,13 @@ fn respond(req: &InviteRequest, result: Result<Value>) -> Option<String> {
         ),
         Err(e) => error_frame(&req.id_echo, e.code(), &e.to_string()),
     })
+}
+
+/// Refuse an `invite.redeem` the connection will not run because it already
+/// has its per-connection quota of requests in flight (`flow-busy`, same
+/// code the daemon-wide flow cap answers with). `None` for a notification.
+pub(crate) fn refuse_busy(req: &InviteRequest) -> Option<String> {
+    respond(req, Err(Error::Invite(InviteErrorKind::FlowBusy)))
 }
 
 fn str_param(params: &Value, key: &str) -> Result<String> {

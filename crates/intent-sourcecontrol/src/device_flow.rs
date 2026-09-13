@@ -15,6 +15,9 @@
 //! are never logged, never carried in any `Debug`/`Serialize` shape, and the
 //! token never leaves this module — callers only see [`PollStatus`].
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::FileSecretStore;
@@ -26,7 +29,7 @@ use tokio::time::timeout;
 use crate::error::{Error, Result};
 use crate::model::UserIdentity;
 use crate::token::SECRET_ACCOUNT;
-use crate::SourceControl as _;
+use crate::SourceControl;
 
 #[cfg(test)]
 use intent_core::settings_file::DEFAULT_GITHUB_OAUTH_CLIENT_ID as DEFAULT_OAUTH_CLIENT_ID;
@@ -75,7 +78,27 @@ pub enum PollStatus {
     Expired,
     /// The user denied the authorization request.
     Denied,
+    /// The user authorized, but the [`IdentityGuard`] refused the granted
+    /// account: the token was discarded, nothing was persisted, and the
+    /// previously stored credential (if any) is untouched. Terminal.
+    Refused,
 }
+
+/// Pre-persist hook of a [`DeviceFlow`] (multiplayer w4): once a grant
+/// arrives, the hook receives a forge client bound to the *new* token —
+/// never the token itself — and decides before anything is written.
+/// `Ok(())` persists the token; `Err(reason)` discards it and the poll
+/// reports [`PollStatus::Refused`]. The daemon uses it to verify `GET /user`
+/// against the primary principal's reconnect guard so a different GitHub
+/// account cannot replace the publishing credential while collaborators or
+/// open invites depend on the cached identity.
+pub type IdentityGuard = Arc<
+    dyn Fn(
+            Arc<dyn SourceControl>,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Opaque in-flight flow handle returned by [`start`]. Holds the secret
 /// `device_code` privately; intentionally no `Debug`/`Serialize`.
@@ -85,6 +108,9 @@ pub struct DeviceFlow {
     device_code: SecretString,
     interval: u64,
     store: FileSecretStore,
+    /// Optional pre-persist hook plus the API base its client talks to
+    /// (`None` = api.github.com).
+    identity_guard: Option<(Option<String>, IdentityGuard)>,
 }
 
 /// The production login host the device flow talks to.
@@ -153,6 +179,7 @@ pub async fn start_at(
         device_code: SecretString::from(codes.device_code),
         interval: codes.interval,
         store: FileSecretStore::new(),
+        identity_guard: None,
     };
     Ok((auth, flow))
 }
@@ -164,9 +191,21 @@ impl DeviceFlow {
         self.interval
     }
 
+    /// Install an [`IdentityGuard`] consulted between the grant and the
+    /// token write; `api_base_uri` is where its client's API calls go
+    /// (`None` = api.github.com, the test seam points it at a mock).
+    #[must_use]
+    pub fn with_identity_guard(mut self, api_base_uri: Option<&str>, guard: IdentityGuard) -> Self {
+        self.identity_guard = Some((api_base_uri.map(str::to_string), guard));
+        self
+    }
+
     /// Poll the token endpoint once. On [`PollStatus::Authorized`] the access
     /// token has already been persisted to the secret store under
     /// `sourceControl.github.token` — it is never returned to the caller.
+    /// With an [`IdentityGuard`] installed, the grant is first handed to the
+    /// guard as a token-bound client; a refusal drops the token unpersisted
+    /// and reports [`PollStatus::Refused`].
     ///
     /// # Errors
     ///
@@ -191,6 +230,21 @@ impl DeviceFlow {
             .await?;
         match parse_poll_response(&body)? {
             PollResponse::Authorized { access_token } => {
+                if let Some((api_base_uri, guard)) = &self.identity_guard {
+                    let client: Arc<dyn SourceControl> =
+                        Arc::new(crate::github::GitHubSourceControl::new(
+                            access_token.expose_secret(),
+                            api_base_uri.as_deref(),
+                        )?);
+                    if let Err(reason) = guard(client).await {
+                        drop(access_token);
+                        tracing::warn!(
+                            reason,
+                            "github device flow grant refused by identity guard"
+                        );
+                        return Ok(PollStatus::Refused);
+                    }
+                }
                 persist_token(self.store.clone(), access_token).await?;
                 Ok(PollStatus::Authorized)
             }
@@ -230,6 +284,9 @@ pub struct IdentityFlow {
     client_id: SecretString,
     device_code: SecretString,
     interval: u64,
+    /// Set the moment a grant is received: the device code is spent, so no
+    /// further poll can (or may) re-exchange it — see [`Self::is_spent`].
+    spent: bool,
 }
 
 /// Start an identity-only device flow for `client_id` against github.com.
@@ -277,6 +334,7 @@ pub async fn start_identity_at(
         client_id,
         device_code: SecretString::from(codes.device_code),
         interval: codes.interval,
+        spent: false,
     };
     Ok((auth, flow))
 }
@@ -288,13 +346,26 @@ impl IdentityFlow {
         self.interval
     }
 
+    /// True once a grant was received: every post-grant outcome is
+    /// terminal. A failed identity lookup after the grant is reported as an
+    /// error, but the grant is not polled again — the device code has been
+    /// discarded and a further [`Self::poll_once`] fails without any request.
+    pub fn is_spent(&self) -> bool {
+        self.spent
+    }
+
     /// Poll the token endpoint once. On authorization the token is used for
     /// a single `GET /user` and dropped; only the resolved identity returns.
     ///
     /// # Errors
     ///
-    /// Returns an error when the token request or the identity lookup fails, or the response cannot be classified. Grant expiration and denial are not errors — they are reported as [`IdentityPollStatus::Expired`] and [`IdentityPollStatus::Denied`].
+    /// Returns an error when the token request or the identity lookup fails, or the response cannot be classified. Grant expiration and denial are not errors — they are reported as [`IdentityPollStatus::Expired`] and [`IdentityPollStatus::Denied`]. Once [`Self::is_spent`], every call fails immediately.
     pub async fn poll_once(&mut self) -> Result<IdentityPollStatus> {
+        if self.spent {
+            return Err(Error::Api(
+                "identity device grant already consumed; start a new flow".to_string(),
+            ));
+        }
         let body: Value = self
             .crab
             .post(
@@ -308,6 +379,10 @@ impl IdentityFlow {
             .await?;
         match parse_poll_response(&body)? {
             PollResponse::Authorized { access_token } => {
+                // The grant is single-use: retire the device code before the
+                // lookup so an identity failure cannot lead to a re-poll.
+                self.spent = true;
+                self.device_code = SecretString::from(String::new());
                 let client = crate::github::GitHubSourceControl::new(
                     access_token.expose_secret(),
                     self.api_base_uri.as_deref(),

@@ -16070,7 +16070,7 @@ mod drafts_events {
 // status/reviews/check-run shapes and the review-thread filtering/fallback.
 // ============================================================================
 
-mod pr {
+pub(crate) mod pr {
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -16093,7 +16093,7 @@ mod pr {
     // Test stub: one independent bool per scripted scenario.
     #[expect(clippy::struct_excessive_bools)]
     #[derive(Default)]
-    struct StubForge {
+    pub(crate) struct StubForge {
         fail_threads: bool,
         /// When set, `get_review_threads` fails with `RateLimited` (the
         /// GraphQL quota is exhausted), exercising the checklist's
@@ -16191,6 +16191,20 @@ mod pr {
         /// Runs at the start of every `list_comments` (the last forge read
         /// of `pr_state`), so a test can move daemon state mid-snapshot.
         on_list_comments: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// When true, `check_auth` reports no working credential (a revoked
+        /// or missing token), exercising the invite-create live auth gate
+        /// (multiplayer w4).
+        unauthenticated: bool,
+    }
+
+    impl StubForge {
+        /// A forge whose `check_auth` reports `authenticated: false`.
+        pub(crate) fn unauthenticated() -> Self {
+            Self {
+                unauthenticated: true,
+                ..Default::default()
+            }
+        }
     }
 
     /// The blended multi-repo page a forge answers for a search whose
@@ -16247,6 +16261,13 @@ mod pr {
             })
         }
         async fn check_auth(&self) -> ScResult<AuthStatus> {
+            if self.unauthenticated {
+                return Ok(AuthStatus {
+                    authenticated: false,
+                    login: None,
+                    scopes: vec![],
+                });
+            }
             Ok(AuthStatus {
                 authenticated: true,
                 login: Some("octocat".into()),
