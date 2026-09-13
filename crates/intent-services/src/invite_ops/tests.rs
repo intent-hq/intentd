@@ -1002,6 +1002,65 @@ async fn event_actor_is_the_acting_collaborator() {
     assert_eq!(rows[0].actor.name.as_deref(), Some("collab"));
 }
 
+/// The re-stamp is unconditional on the emitting path's actor: a pre-set
+/// non-system actor naming someone else is still replaced by the acting
+/// collaborator, so no code path (or client-influenced payload) can attribute
+/// a collaborator's action to another principal. Only an agent-actored event
+/// keeps its actor — the agent is the subject, not the person who acted.
+#[tokio::test]
+async fn event_actor_restamp_overrides_a_preset_non_system_actor() {
+    let (_tmp, f, _) = attribution_fixture().await;
+    let bus = crate::events::EventBus::new(f.store.clone());
+    let event = |event_type: &str, actor: intent_core::EventActor| intent_store::NewEvent {
+        workspace_id: f.ws.clone(),
+        timestamp: intent_core::now_iso(),
+        event_type: event_type.to_string(),
+        actor,
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({}),
+    };
+    let (preset_user, agent) = with_caller(wire(&f.collaborator), async {
+        let preset_user = bus
+            .publish(&event(
+                "note:updated",
+                intent_core::EventActor {
+                    actor_type: intent_core::ActorType::User,
+                    id: Some(f.primary.0.clone()),
+                    name: Some("owner".into()),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("publish preset-user event");
+        let agent = bus
+            .publish(&event(
+                "agent:status:changed",
+                intent_core::EventActor {
+                    actor_type: intent_core::ActorType::Agent,
+                    id: Some("agent-1".into()),
+                    name: Some("Agent".into()),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("publish agent event");
+        (preset_user, agent)
+    })
+    .await;
+    assert_eq!(preset_user.actor.actor_type, intent_core::ActorType::User);
+    assert_eq!(
+        preset_user.actor.id.as_deref(),
+        Some(f.collaborator.as_str()),
+        "a pre-set user actor is re-stamped with the acting collaborator"
+    );
+    assert_eq!(preset_user.actor.name.as_deref(), Some("collab"));
+    assert_eq!(agent.actor.actor_type, intent_core::ActorType::Agent);
+    assert_eq!(agent.actor.id.as_deref(), Some("agent-1"));
+}
+
 /// The administrator's events keep the actor the operation supplied.
 #[tokio::test]
 async fn event_actor_is_untouched_for_the_administrator() {

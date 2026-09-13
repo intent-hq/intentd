@@ -144,10 +144,14 @@ impl EventBus {
     /// ([`is_transient_file_event`]) so watcher noise never reaches `SQLite`;
     /// callers see the same `Ok(Event)` shape either way.
     ///
-    /// A system-actored event published inside a collaborator's request is
-    /// re-stamped with that collaborator — `{ type: user, id: principalId,
-    /// name }` (multiplayer w4) — so subscribers see who acted; every other
-    /// caller's actor is kept as supplied.
+    /// An event published inside a collaborator's request is re-stamped
+    /// with that collaborator — `{ type: user, id: principalId, name }`
+    /// (multiplayer w4) — whatever actor the emitting path set, so subscribers
+    /// see who acted and no code path can attribute a collaborator's action
+    /// to someone else. Only an agent-actored event keeps its actor: the
+    /// agent is the event's subject (`getAgentActivity` groups by it), not
+    /// the person who prodded it. Every other caller's actor is kept as
+    /// supplied.
     ///
     /// # Errors
     ///
@@ -177,10 +181,10 @@ impl EventBus {
             .map_err(|_| Error::Internal("event writer task dropped response".to_string()))?
     }
 
-    /// The collaborator-stamped copy of a system-actored `ev` when the
+    /// The collaborator-stamped copy of a non-agent-actored `ev` when the
     /// current request is a collaborator's; `None` leaves `ev` as supplied.
     async fn attribute_to_collaborator(&self, ev: &NewEvent) -> Option<NewEvent> {
-        if ev.actor.actor_type != ActorType::System {
+        if ev.actor.actor_type == ActorType::Agent {
             return None;
         }
         let actor = crate::principal_ops::collaborator_event_actor(&self.store).await?;
