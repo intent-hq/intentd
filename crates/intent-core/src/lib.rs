@@ -24,6 +24,7 @@ pub mod config;
 pub mod discovery_cache;
 pub mod error;
 pub mod events;
+pub mod git_remote_url;
 pub mod ids;
 pub mod model;
 pub mod path_utils;
@@ -51,6 +52,7 @@ pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
 pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
+pub use git_remote_url::GitRemoteUrl;
 pub use ids::{
     AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
     CHIEF_WORKSPACE_ID,

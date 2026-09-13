@@ -19387,57 +19387,6 @@ mod file_tracking {
         assert_eq!(details["fileDetails"], serde_json::json!([]));
     }
 
-    /// `parse_github_owner_repo` accepts the `ssh://` URL form (with
-    /// optional user and numeric port) alongside https and scp-like remotes,
-    /// keeps the strict `github.com` host check for all three
-    /// (monorepo#2053 review), and returns the typed `RepoRef`.
-    #[test]
-    fn parse_github_owner_repo_handles_ssh_url_form() {
-        let parse = Services::parse_github_owner_repo;
-        let ok = Some(intent_core::RepoRef::new("intent-hq", "intentd"));
-
-        // The ref keeps the URL's casing (`RepoRef` equality folds it).
-        let parsed = parse("https://github.com/Intent-HQ/IntentD.git").expect("parses");
-        assert_eq!(parsed.owner, "Intent-HQ");
-        assert_eq!(parsed.name, "IntentD");
-        assert_eq!(Some(parsed), ok);
-
-        // ssh:// forms.
-        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git"), ok);
-        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd"), ok);
-        assert_eq!(parse("ssh://github.com/intent-hq/intentd.git"), ok);
-        assert_eq!(parse("ssh://git@github.com:22/intent-hq/intentd.git"), ok);
-        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git/"), ok);
-
-        // Strict host check on ssh:// too.
-        assert_eq!(
-            parse("ssh://git@github.com.evil.com/intent-hq/intentd.git"),
-            None
-        );
-        assert_eq!(parse("ssh://git@gitlab.com/intent-hq/intentd.git"), None);
-        // A non-numeric "port" stays part of the host and is rejected.
-        assert_eq!(
-            parse("ssh://git@github.com.evil/intent-hq/intentd.git"),
-            None
-        );
-        assert_eq!(
-            parse("ssh://git@github.com:evil/intent-hq/intentd.git"),
-            None
-        );
-        // No owner/repo path.
-        assert_eq!(parse("ssh://git@github.com"), None);
-        assert_eq!(parse("ssh://git@github.com/intentd.git"), None);
-
-        // The existing https and scp-like forms still parse.
-        assert_eq!(parse("https://github.com/intent-hq/intentd.git"), ok);
-        assert_eq!(parse("git@github.com:intent-hq/intentd.git"), ok);
-        assert_eq!(
-            parse("https://github.com.evil.com/intent-hq/intentd.git"),
-            None
-        );
-        assert_eq!(parse("git@github.com.evil:intent-hq/intentd.git"), None);
-    }
-
     /// `register_git_root` emits `gitRoot:registered` on first registration
     /// and `gitRoot:updated` on re-registration; `unregister_git_root` emits
     /// `gitRoot:unregistered` (monorepo#2053).
@@ -29210,7 +29159,10 @@ mod clone_orchestration {
     /// (only strict `github.com` URLs seed them), so tests must not derive
     /// the slot from the workspace row.
     fn expected_cache_dir(root: &std::path::Path, url: &str) -> PathBuf {
-        let (owner, repo) = crate::clone_ops::parse_owner_repo(url).expect("owner/repo");
+        let (owner, repo) = intent_core::GitRemoteUrl::parse(url)
+            .and_then(|u| u.repo_slug())
+            .expect("owner/repo")
+            .identity_parts();
         intent_git::repo_cache::cache_path_for(
             &intent_git::repo_cache::cache_root_for(root),
             &owner,
@@ -29222,7 +29174,7 @@ mod clone_orchestration {
     /// `repositoryPath` to the clone target, and streams `git:clone:progress`
     /// + `git:clone:done` under the new workspace id before the row insert
     /// and `workspace:created`. Owner/name derivation from a real GitHub URL
-    /// is covered by `clone_ops::tests::parse_owner_repo_handles_https_and_ssh`.
+    /// is covered by `intent_core::git_remote_url` goldens.
     #[tokio::test]
     async fn create_clones_github_url_before_worktree() {
         let source = seed_repo("intentd-clone-src");
@@ -29293,8 +29245,8 @@ mod clone_orchestration {
         // Sanity: the host-agnostic parse (cache key) does yield acme/widget,
         // so the persisted row must be distinguishing on the host alone.
         assert_eq!(
-            crate::clone_ops::parse_owner_repo(&url),
-            Some(("acme".to_string(), "widget".to_string()))
+            intent_core::GitRemoteUrl::parse(&url).and_then(|u| u.repo_slug()),
+            Some(intent_core::RepoRef::new("acme", "widget"))
         );
 
         let root = unique_dir("intentd-nongh-root");
@@ -30508,8 +30460,10 @@ mod repo_warm_cache {
         let (svc, _db) = services_with_root(&root).await;
 
         let url = format!("file://{}", source.0.to_string_lossy());
-        let (owner, repo) = crate::clone_ops::parse_owner_repo(&url).unwrap();
-        let cache_path = cache_slot(&root.0, &owner, &repo);
+        let slot = intent_core::GitRemoteUrl::parse(&url)
+            .and_then(|u| u.repo_slug())
+            .unwrap();
+        let cache_path = cache_slot(&root.0, &slot.owner, &slot.name);
 
         // Park the warm's ensure behind the per-repo cache lock (keyed by
         // the case-folded slot) so the in-flight window is deterministic.
@@ -30536,8 +30490,8 @@ mod repo_warm_cache {
                 owner: busy_owner,
                 repo: busy_repo,
             }) => {
-                assert_eq!(busy_owner, owner, "busy error names the warming owner");
-                assert_eq!(busy_repo, repo, "busy error names the warming repo");
+                assert_eq!(busy_owner, slot.owner, "busy error names the warming owner");
+                assert_eq!(busy_repo, slot.name, "busy error names the warming repo");
             }
             other => panic!("expected WarmInFlight, got {other:?}"),
         }
