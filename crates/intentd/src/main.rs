@@ -6666,6 +6666,35 @@ mod tests {
         assert_eq!(std::fs::read(&link).unwrap(), b"secret");
     }
 
+    /// A stand-in sitter child (see [`spawn_stand_in_sitter`]) that is
+    /// killed and reaped on drop, so a failing assertion mid-test never
+    /// leaks it past the test (nextest `LEAK`, intent-hq/intent#4942).
+    #[cfg(unix)]
+    struct StandInSitter(std::process::Child);
+
+    #[cfg(unix)]
+    impl std::ops::Deref for StandInSitter {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl std::ops::DerefMut for StandInSitter {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for StandInSitter {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// A stand-in "sitter": `sleep` COPIED as `name` — the kernel-visible
     /// process name comes from the executed image itself, so a copy carries
     /// the name on every platform, whereas a symlink resolves to the
@@ -6673,8 +6702,19 @@ mod tests {
     /// for the dev build, `intentd` for the packaged rename. SIGUSR1's
     /// default disposition is terminate, so the child exiting on signal
     /// 10/30 proves delivery.
+    ///
+    /// Returns only once the child is observable under its sitter name:
+    /// `Command::spawn` returns when the child has committed to its exec
+    /// (glibc `posix_spawn` resumes the vfork parent from `exec_mmap`),
+    /// but the kernel installs the new `comm` — the `/proc/<pid>/stat`
+    /// name `pid_is_sitter` reads via sysinfo — later in `begin_new_exec`,
+    /// so a just-spawned copy can still carry this test binary's name
+    /// (intent-hq/intent#4942, ~25% of spawns idle, ~70% under CPU load).
+    /// The fixture therefore polls the production identity check itself
+    /// (`pid_is_sitter` with the pid as its own expected parent, so only
+    /// the name gate is exercised) until it accepts, bounded.
     #[cfg(unix)]
-    fn spawn_stand_in_sitter(dir: &Path, name: &str) -> std::process::Child {
+    fn spawn_stand_in_sitter(dir: &Path, name: &str) -> StandInSitter {
         let sleep = ["/bin/sleep", "/usr/bin/sleep"]
             .iter()
             .find(|p| Path::new(p).exists())
@@ -6687,9 +6727,21 @@ mod tests {
         // "Text file busy".
         for _ in 0..400 {
             match std::process::Command::new(&bin).arg("30").spawn() {
-                Ok(child) => return child,
+                Ok(child) => {
+                    let child = StandInSitter(child);
+                    let pid = child.id();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    while !pid_is_sitter(pid, pid) {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "stand-in sitter {name} (pid {pid}) never became visible under its sitter name"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    return child;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(e) => panic!("spawn stand-in sitter: {e}"),
             }
