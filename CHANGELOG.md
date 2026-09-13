@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.50] - 2026-09-13
+
+### 🔧 Refactor
+
+- *(core)* Single GitRemoteUrl parser for GitHub remote URLs ([#1836](https://github.com/intent-hq/intentd/pull/1836))
+
+
 ## [0.9.49] - 2026-09-12
 
 ### 🚀 Features
