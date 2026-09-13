@@ -248,6 +248,13 @@ impl ConnSubs {
         self.subs.remove(id).is_some()
     }
 
+    /// Whether a registered forwarder has exited on its own (`None` for an
+    /// unknown id). Test probe for the membership teardown paths.
+    #[cfg(test)]
+    pub(crate) fn forwarder_finished(&self, id: &str) -> Option<bool> {
+        self.subs.get(id).map(|s| s.handle.is_finished())
+    }
+
     /// Drop every subscription sharing `group` (`replaceGroup` semantics).
     fn remove_group(&mut self, group: &str) {
         let ids: Vec<String> = self
@@ -1091,12 +1098,28 @@ pub(crate) async fn handle_sub_fast_path(
                 }
                 // The chat channel is per-agent, not workspace-scoped, so the
                 // bus filter carries no `workspaceId`; the forwarder narrows the
-                // stream family to this agent (cross-agent isolation).
+                // stream family to this agent (cross-agent isolation). A
+                // non-administrator's live chunk/tool deltas are mapped from
+                // the event payload, not re-read, so the same delivery-time
+                // `MembershipGate` as `events.subscribe` decides whether the
+                // subscriber may see the agent's workspace; its side
+                // subscription on `workspace:updated` tears the stream down
+                // on the subscriber's own removal (multiplayer w3).
+                let gate = events::MembershipGate::for_current_caller(api);
+                let membership_events = gate.as_ref().map(|_| {
+                    bus.subscribe(SubscriptionFilter {
+                        event_types: vec![WORKSPACE_UPDATED.to_string()],
+                        workspace_id: None,
+                        batch_window: None,
+                        collaborator_only: true,
+                        ..Default::default()
+                    })
+                });
                 let subscription = bus.subscribe(SubscriptionFilter {
                     event_types: subscriptions::channel_event_types(Channel::Chat),
                     workspace_id: None,
                     batch_window: None,
-                    collaborator_only: crate::context::is_non_administrator_caller(),
+                    collaborator_only: gate.is_some(),
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
@@ -1131,6 +1154,7 @@ pub(crate) async fn handle_sub_fast_path(
                     delta_encoding,
                     projection,
                     subscription,
+                    gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
                     subscription_id.clone(),
                     out_tx.clone(),
                     timer,
@@ -1343,6 +1367,7 @@ async fn forward_chat_subscription(
     delta_encoding: subscriptions::DeltaEncoding,
     projection: Option<intent_core::ConversationProjection>,
     subscription: Subscription,
+    membership: Option<(events::MembershipGate, Subscription)>,
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
@@ -1355,6 +1380,7 @@ async fn forward_chat_subscription(
         delta_encoding,
         projection,
         subscription,
+        membership,
         subscription_id.clone(),
         out_tx,
         timer,
@@ -1365,7 +1391,9 @@ async fn forward_chat_subscription(
 
 /// The snapshot-then-tail loop behind [`forward_chat_subscription`], returning
 /// the fixed-vocabulary reason it exited for the lifecycle record:
-/// `client_closed` (the outbound lane is gone) or `bus_closed`.
+/// `client_closed` (the outbound lane is gone), `bus_closed`, or
+/// `membership_revoked` (the subscriber was removed from the agent's
+/// workspace, multiplayer w3).
 #[expect(clippy::too_many_arguments)]
 async fn chat_subscription_loop(
     api: Arc<dyn WorkspaceApi>,
@@ -1374,6 +1402,7 @@ async fn chat_subscription_loop(
     delta_encoding: subscriptions::DeltaEncoding,
     projection: Option<intent_core::ConversationProjection>,
     mut subscription: Subscription,
+    membership: Option<(events::MembershipGate, Subscription)>,
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
@@ -1381,6 +1410,14 @@ async fn chat_subscription_loop(
     // Everything this forwarder emits travels on the bulk lane; conflation
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
     let out_tx = out_tx.bulk_sender();
+    let (mut gate, mut membership_events) = match membership {
+        Some((gate, sub)) => (Some(gate), Some(sub)),
+        None => (None, None),
+    };
+    // The agent's workspace, learned from the first of its stream events
+    // (the chat channel is keyed by agent, not workspace): the subscriber's
+    // own unshare of THAT workspace ends the forwarder.
+    let mut agent_workspace: Option<String> = None;
     let mut snapshot = subscriptions::chat_snapshot(
         api.as_ref(),
         &agent_id,
@@ -1431,6 +1468,26 @@ async fn chat_subscription_loop(
                     }
                 }
                 Err(_) => return "client_closed",
+            },
+            // Membership changes invalidate the gate's cached verdicts
+            // before the next matched event is considered; the subscriber's
+            // own removal from the agent's workspace tears the stream down.
+            maybe = async { membership_events.as_mut().expect("guarded").recv().await },
+                if membership_events.is_some() =>
+            {
+                match (maybe, gate.as_mut()) {
+                    (Some(batch), Some(gate)) => {
+                        for event in &batch {
+                            gate.observe_membership_event(event);
+                            if gate.is_own_unshare(event)
+                                && agent_workspace.as_deref() == Some(event.workspace_id.as_str())
+                            {
+                                return "membership_revoked";
+                            }
+                        }
+                    }
+                    _ => membership_events = None,
+                }
             },
             // A pending recovery with a quiet bus: retry on a timer so the
             // client is not left stale until the next event happens to arrive.
@@ -1508,6 +1565,18 @@ async fn chat_subscription_loop(
                     // belong to this subscription.
                     if event.session_id.as_deref() != Some(agent_id.as_str()) {
                         continue;
+                    }
+                    if agent_workspace.is_none() && !event.workspace_id.as_str().is_empty() {
+                        agent_workspace = Some(event.workspace_id.as_str().to_string());
+                    }
+                    // Delivery-time membership (multiplayer w3): chunk and
+                    // tool deltas are payload-mapped, so a non-member of the
+                    // agent's workspace must be refused HERE, before the
+                    // mapper sees the event.
+                    if let Some(gate) = gate.as_mut() {
+                        if !gate.allows(&event).await {
+                            continue;
+                        }
                     }
                     let conflatable = conflate::chat_event_conflatable(&event);
                     let Some(delta) = state.delta(api.as_ref(), &event).await else {
@@ -1706,6 +1775,13 @@ async fn forward_channel_subscription(
         subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
             .await
     };
+    // The global workspace channel discloses ids through `workspace:deleted`
+    // tombstones, so a non-administrator subscriber only receives them for
+    // workspaces it has been shown (multiplayer w3); seeded from its own
+    // membership-scoped snapshot, no extra query.
+    let mut visible_workspaces = (channel == Channel::Workspace
+        && crate::context::is_non_administrator_caller())
+    .then(|| subscriptions::visible_workspace_ids(&snapshot));
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
     if out_tx.send_bulk(frame).await.is_err() {
         return;
@@ -1717,6 +1793,8 @@ async fn forward_channel_subscription(
             let delta = if channel == Channel::Task {
                 subscriptions::task_delta(api.as_ref(), &workspace_id, &event, &mut spec_links)
                     .await
+            } else if let Some(visible) = visible_workspaces.as_mut() {
+                subscriptions::workspace_delta(api.as_ref(), &event, Some(visible)).await
             } else {
                 subscriptions::channel_delta(
                     api.as_ref(),
