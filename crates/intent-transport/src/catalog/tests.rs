@@ -434,7 +434,11 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
 /// - `agent.replaceMessages` swaps the transcript wholesale (compaction /
 ///   restore); it re-persists rows with the metadata they already carry and
 ///   is not a human authoring event, so the Product Brief's ten-entry set
-///   excludes it.
+///   excludes it. Provenance is intentionally preserved verbatim there —
+///   including any `fromPrincipalId` on restored user rows — because it is an
+///   administrator-only historical restore/compaction operation: wave-3
+///   enforcement removes it from `COLLABORATOR_METHODS`, so collaborators
+///   cannot reach it and no non-owner caller can author a row through it.
 /// - `agent.dismissQuestions` delivers a daemon-authored system notice
 ///   (`type: questions_dismissed`, `source: system` — agent/automatic to
 ///   the author projection), never a human row; `agent.respondPermission`
