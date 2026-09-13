@@ -64,6 +64,45 @@ fn stamping_principal_id() -> Option<PrincipalId> {
     }
 }
 
+/// The bound collaborator — a non-administrator wire principal — whose
+/// requests the daemon attributes authoritatively (multiplayer w4): comment
+/// authorship and system-actored events. The administrator keeps the
+/// attribution its client supplies (it owns the daemon and predates
+/// principals); agents, the daemon and an absent caller are not people.
+pub(crate) fn collaborator_caller_id() -> Option<PrincipalId> {
+    match current_caller() {
+        Some(Caller::Wire {
+            principal_id,
+            is_administrator: false,
+        }) => Some(principal_id),
+        Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) | None => None,
+    }
+}
+
+/// The name a principal is attributed by: GitHub login, else display name,
+/// else the principal id.
+pub(crate) fn principal_attribution_name(principal: &Principal) -> String {
+    principal
+        .login
+        .clone()
+        .or_else(|| principal.display_name.clone())
+        .unwrap_or_else(|| principal.id.0.clone())
+}
+
+/// Authoritative event actor for a collaborator's request: `{ type: user,
+/// id: principalId, name }`. `None` for every other caller, or when the
+/// principal row cannot be read (the operation's own actor then stands).
+pub(crate) async fn collaborator_event_actor(store: &Store) -> Option<intent_core::EventActor> {
+    let principal_id = collaborator_caller_id()?;
+    let principal = store.get_principal(&principal_id).await.ok()?;
+    Some(intent_core::EventActor {
+        actor_type: intent_core::ActorType::User,
+        id: Some(principal_id.0),
+        name: Some(principal_attribution_name(&principal)),
+        ..Default::default()
+    })
+}
+
 /// Daemon-authoritative principal stamp on a user-origin message payload
 /// (multiplayer w2). Applied at every user-origin entry point BEFORE the
 /// payload is persisted or enqueued, so direct persists, queue entries and
@@ -361,6 +400,25 @@ pub(crate) fn principal_to_wire(p: &Principal, is_administrator: bool) -> Value 
 }
 
 impl Services {
+    /// Authoritative `(author, authorType)` for a comment written by the
+    /// bound collaborator: its attribution name and `"user"`, replacing
+    /// whatever the client supplied so a guest cannot sign as someone else
+    /// or as an agent. Every other caller's supplied values pass through.
+    pub(crate) async fn attribute_comment_author(
+        &self,
+        author: Option<String>,
+        author_type: Option<String>,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let Some(principal_id) = collaborator_caller_id() else {
+            return Ok((author, author_type));
+        };
+        let principal = self.store.get_principal(&principal_id).await?;
+        Ok((
+            Some(principal_attribution_name(&principal)),
+            Some("user".to_string()),
+        ))
+    }
+
     /// `principal.me`: see [`intent_core::WorkspaceApi::principal_me`].
     pub(crate) async fn principal_me_op(&self) -> Result<Value> {
         let caller = current_caller().ok_or_else(no_caller)?;
@@ -438,7 +496,10 @@ impl Services {
     /// while the identity is locked. When the daemon is still single-user
     /// the switch is applied and the token persisted as before. A failed
     /// `GET /user` refuses the grant only while locked: unverifiable is
-    /// unsafe exactly when there is something to protect.
+    /// unsafe exactly when there is something to protect. Every other
+    /// failure — the lock state or the principal row unreadable, the apply
+    /// failing — refuses too: the token is only persisted once the identity
+    /// has been positively applied.
     pub(crate) fn connect_identity_guard(
         &self,
     ) -> intent_sourcecontrol::device_flow::IdentityGuard {
@@ -462,7 +523,9 @@ impl Services {
                             )),
                             Err(e) => {
                                 tracing::warn!(error = %e, "github.connect: identity apply failed");
-                                Ok(())
+                                Err(format!(
+                                    "could not apply the authorized GitHub identity: {e}"
+                                ))
                             }
                         },
                         Err(e) => {
@@ -483,23 +546,27 @@ impl Services {
 
     /// Persist a fetched GitHub profile onto the primary principal's row,
     /// subject to the reconnect guard described on
-    /// [`Self::refresh_primary_identity`].
+    /// [`Self::refresh_primary_identity`]. While locked, only a profile
+    /// carrying the cached stable account id is applied: a different id
+    /// and a missing one (an unverifiable account) are both refused, and a
+    /// lock state that cannot be read propagates as an error rather than
+    /// admitting the change.
     pub(crate) async fn apply_primary_identity(
         &self,
         principal: Principal,
         user: &intent_sourcecontrol::UserIdentity,
     ) -> Result<Principal> {
         let fetched_id = user.id.and_then(|id| i64::try_from(id).ok());
-        if let (Some(cached), Some(fetched)) = (principal.github_user_id, fetched_id) {
-            if cached != fetched && self.primary_identity_locked().await? {
-                tracing::warn!(
-                    cached_github_user_id = cached,
-                    fetched_github_user_id = fetched,
-                    "primary GitHub identity changed while other principals or open \
-                     invites exist; keeping the cached identity"
-                );
-                return Err(Error::Invite(InviteErrorKind::IdentityLocked));
-            }
+        let same_account =
+            principal.github_user_id.is_some() && principal.github_user_id == fetched_id;
+        if !same_account && self.primary_identity_locked().await? {
+            tracing::warn!(
+                cached_github_user_id = principal.github_user_id,
+                fetched_github_user_id = fetched_id,
+                "primary GitHub identity changed or is unverifiable while other \
+                 principals or open invites exist; keeping the cached identity"
+            );
+            return Err(Error::Invite(InviteErrorKind::IdentityLocked));
         }
         let mut updated = principal.clone();
         updated.github_user_id = fetched_id;
