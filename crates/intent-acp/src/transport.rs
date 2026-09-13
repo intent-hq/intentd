@@ -106,6 +106,10 @@ pub struct ConnectionHooks {
     /// lines are dropped when the writer stalls or fails, so capture never
     /// backpressures the stderr drain or the agent runtime.
     pub stderr_log_dir: Option<PathBuf>,
+    /// Diagnostics-only owner of this connection: the agent id the reader
+    /// attributes an unparseable stdout line to. `None` for connections with
+    /// no agent (e.g. ephemeral adapter runs); never affects behavior.
+    pub agent_id: Option<String>,
 }
 
 /// Lines buffered between the stderr drain and the log writer task before
@@ -409,6 +413,7 @@ impl Connection {
         let auth_marker = hooks.auth_required_stdout_marker;
         let auth_required_reader = Arc::clone(&auth_required);
         let auth_error_reader = Arc::clone(&auth_error);
+        let agent_id_reader = hooks.agent_id;
         tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -438,7 +443,15 @@ impl Connection {
                         &notify_reader,
                         &client_req_seq_reader,
                     ),
-                    Err(e) => tracing::warn!(error = %e, "failed to parse ACP stdout line"),
+                    // Attribution without content: the agent id and the line
+                    // length locate the offending child, the line itself is
+                    // never logged.
+                    Err(e) => tracing::warn!(
+                        agent = agent_id_reader.as_deref().unwrap_or("unknown"),
+                        line_len = line.len(),
+                        error = %e,
+                        "failed to parse ACP stdout line"
+                    ),
                 }
             }
             // stdout closed: fail every still-pending request.

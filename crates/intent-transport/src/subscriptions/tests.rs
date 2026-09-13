@@ -328,6 +328,62 @@ fn slow_snapshot_warn_logs_fractional_millis_for_marginal_breach() {
 }
 
 #[test]
+fn chat_lifecycle_records_carry_the_triage_fields() {
+    let snapshot = json!({
+        "agentId": "agent-1",
+        "messages": [{ "id": "msg-1" }, { "id": "msg-2" }],
+        "resumed": true,
+    });
+    let lines = crate::protocol::test_capture::capture_events(|| {
+        trace_chat_subscribe("agent-1", "ws-sub-7", true);
+        trace_chat_snapshot("agent-1", "ws-sub-7", &snapshot);
+        trace_chat_forwarder_exit("agent-1", "ws-sub-7", "client_closed");
+        trace_chat_teardown("agent-1", "ws-sub-7");
+    });
+    assert_eq!(lines.len(), 4, "one record per stage: {lines:?}");
+    for (level, rendered) in &lines {
+        assert_eq!(*level, tracing::Level::INFO);
+        assert!(
+            rendered.contains("channel=\"chat\"")
+                && rendered.contains("scope=\"agent-1\"")
+                && rendered.contains("subscription_id=\"ws-sub-7\""),
+            "every stage carries channel/scope/subscription id: {rendered}"
+        );
+    }
+    assert!(lines[0].1.contains("stage=\"subscribe\"") && lines[0].1.contains("since=true"));
+    assert!(
+        lines[1].1.contains("stage=\"snapshot\"")
+            && lines[1].1.contains("resumed=true")
+            && lines[1].1.contains("page_size=2"),
+        "the snapshot record carries the resume result and page size: {}",
+        lines[1].1
+    );
+    assert!(
+        lines[2].1.contains("stage=\"forwarder_exit\"")
+            && lines[2].1.contains("reason=\"client_closed\""),
+        "the exit record names why the forwarder stopped: {}",
+        lines[2].1
+    );
+    assert!(lines[3].1.contains("stage=\"teardown\""));
+}
+
+#[test]
+fn chat_snapshot_record_defaults_a_degraded_page() {
+    // A seq-0 snapshot that degraded to an empty page (read failure) and a
+    // non-resume subscribe carry no `resumed`/`messages` — the record must
+    // still report both fields rather than going missing.
+    let lines = crate::protocol::test_capture::capture_events(|| {
+        trace_chat_snapshot("agent-1", "ws-sub-8", &json!({}));
+    });
+    assert_eq!(lines.len(), 1, "exactly one INFO event: {lines:?}");
+    let rendered = &lines[0].1;
+    assert!(
+        rendered.contains("resumed=false") && rendered.contains("page_size=0"),
+        "absent fields default instead of vanishing: {rendered}"
+    );
+}
+
+#[test]
 fn snapshot_warn_threshold_parses_override_and_falls_back() {
     assert_eq!(
         snapshot_warn_threshold_from(Some("50".to_string())),

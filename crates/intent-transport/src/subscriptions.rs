@@ -9,6 +9,12 @@
 //! deltas (seq 1, 2, …). TB-4 wires the `note` channel end-to-end; other
 //! channels (TB-5) reuse this machinery. The legacy `events.subscribe` firehose
 //! (`events.event`) is left intact and coexists (Risk R1).
+//!
+//! For "the client says chat is stuck" triage, grep the daemon log for the
+//! `intent_transport::subscription_lifecycle` INFO records ([`trace_chat_subscribe`],
+//! [`trace_chat_snapshot`], [`trace_chat_forwarder_exit`], [`trace_chat_teardown`]):
+//! per subscription id they show whether the subscribe arrived, whether a seq-0
+//! snapshot went out, and how the forwarder ended.
 
 use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE,
@@ -553,6 +559,79 @@ impl Drop for SnapshotTimer {
             SNAPSHOT_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Target the chat subscription lifecycle INFO records are emitted under.
+/// Content-free like the [`SNAPSHOT_WARN_TARGET`] records — channel, scope,
+/// subscription id, flags, and counts only, never message content.
+const LIFECYCLE_TARGET: &str = "intent_transport::subscription_lifecycle";
+
+/// Record an accepted `chat.subscribe`: the bus subscription is wired and the
+/// forwarder spawned, but the seq-0 snapshot has not been read yet. `since`
+/// is whether the client asked to resume (§7.1), not the id itself.
+pub(crate) fn trace_chat_subscribe(scope: &str, subscription_id: &str, since: bool) {
+    tracing::info!(
+        target: LIFECYCLE_TARGET,
+        channel = channel_name(Channel::Chat),
+        scope,
+        subscription_id,
+        stage = "subscribe",
+        since,
+        "chat subscription lifecycle"
+    );
+}
+
+/// Record the seq-0 snapshot a chat forwarder is about to queue: `resumed` is
+/// the §7.1 resume outcome and `page_size` the number of messages the emitted
+/// page carries.
+pub(crate) fn trace_chat_snapshot(scope: &str, subscription_id: &str, snapshot: &Value) {
+    let resumed = snapshot
+        .get("resumed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let page_size = snapshot
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    tracing::info!(
+        target: LIFECYCLE_TARGET,
+        channel = channel_name(Channel::Chat),
+        scope,
+        subscription_id,
+        stage = "snapshot",
+        resumed,
+        page_size,
+        "chat subscription lifecycle"
+    );
+}
+
+/// Record a chat forwarder loop exiting. `reason` is a fixed vocabulary:
+/// `client_closed` (the outbound lane is gone) or `bus_closed`.
+pub(crate) fn trace_chat_forwarder_exit(scope: &str, subscription_id: &str, reason: &'static str) {
+    tracing::info!(
+        target: LIFECYCLE_TARGET,
+        channel = channel_name(Channel::Chat),
+        scope,
+        subscription_id,
+        stage = "forwarder_exit",
+        reason,
+        "chat subscription lifecycle"
+    );
+}
+
+/// Record a chat subscription leaving the connection's registry —
+/// `chat.unsubscribe`, a `replaceGroup` replacement, or connection close. All
+/// three abort the forwarder, so this is the only teardown signal those paths
+/// produce.
+pub(crate) fn trace_chat_teardown(scope: &str, subscription_id: &str) {
+    tracing::info!(
+        target: LIFECYCLE_TARGET,
+        channel = channel_name(Channel::Chat),
+        scope,
+        subscription_id,
+        stage = "teardown",
+        "chat subscription lifecycle"
+    );
 }
 
 /// The bus event types a channel tails for deltas (TB-0 §3). The `agent:stream:*`

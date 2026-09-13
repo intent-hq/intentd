@@ -75,6 +75,80 @@ fn connect_mock(
     (conn, responder, stderr_w)
 }
 
+/// Records the rendered fields of every WARN the reader task emits. The reader
+/// runs as a task on the test's current-thread runtime, so a thread-local
+/// subscriber observes it.
+#[derive(Clone, Default)]
+struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl WarnCapture {
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Install `self` as the thread-local default, pinning callsite interest
+    /// at `sometimes` first via a process-global anchor so a rebuild on a
+    /// subscriber-less thread cannot cache the callsite as `never`
+    /// (monorepo#3580).
+    fn set_as_default(&self) -> tracing::subscriber::DefaultGuard {
+        static ANCHOR: std::sync::Once = std::sync::Once::new();
+        ANCHOR.call_once(|| {
+            tracing::subscriber::set_global_default(InterestAnchor)
+                .expect("intent-acp tests own this process's global tracing default");
+        });
+        tracing::subscriber::set_default(self.clone())
+    }
+}
+
+impl tracing::Subscriber for WarnCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::WARN
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{}={value:?} ", field.name());
+            }
+        }
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Consumes nothing itself (`enabled` is always false) — it exists only so
+/// every callsite resolves to `sometimes` instead of a cached `never`.
+struct InterestAnchor;
+
+impl tracing::Subscriber for InterestAnchor {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 #[tokio::test]
 async fn handshake_completes() {
     let provider = intent_providers::find_provider("auggie").unwrap();
@@ -127,6 +201,54 @@ async fn antigravity_auth_marker_fails_pending_and_future_requests_without_url()
     assert_eq!(conn.pending_len(), 0);
 }
 
+/// An unparseable stdout line is attributed to its agent and measured, never
+/// echoed: the WARN carries the agent id and the line length only.
+#[tokio::test]
+async fn unparseable_stdout_line_warns_with_agent_and_length_only() {
+    let capture = WarnCapture::default();
+    let _guard = capture.set_as_default();
+    let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
+    let (mut a2c_agent, a2c_client) = tokio::io::duplex(4096);
+    let _conn = Connection::new(
+        c2a_client,
+        a2c_client,
+        None,
+        ConnectionHooks {
+            agent_id: Some("agent-7".to_string()),
+            ..ConnectionHooks::default()
+        },
+    );
+
+    let line = "this is not json: sensitive transcript text";
+    a2c_agent
+        .write_all(format!("{line}\n").as_bytes())
+        .await
+        .unwrap();
+    a2c_agent.flush().await.unwrap();
+    for _ in 0..200 {
+        if !capture.lines().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let lines = capture.lines();
+    assert_eq!(lines.len(), 1, "exactly one parse WARN: {lines:?}");
+    let rendered = &lines[0];
+    assert!(
+        rendered.contains("agent=\"agent-7\""),
+        "the WARN names the owning agent: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("line_len={}", line.len())),
+        "the WARN carries the line length: {rendered}"
+    );
+    assert!(
+        !rendered.contains("sensitive transcript text"),
+        "the line content never enters the log: {rendered}"
+    );
+}
+
 #[tokio::test]
 async fn concurrent_writes_do_not_interleave() {
     let (conn, responder, _stderr) = connect_mock(ConnectionHooks::default());
@@ -164,6 +286,7 @@ async fn routes_requests_and_notifications() {
         auth_error_patterns: Vec::new(),
         stderr_log_dir: None,
         auth_required_stdout_marker: None,
+        agent_id: None,
     };
 
     let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);

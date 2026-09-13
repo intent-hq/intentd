@@ -2857,6 +2857,9 @@ impl AgentManager {
                 .agent_log_root
                 .as_ref()
                 .map(|root| root.join(&agent_id.0)),
+            // Diagnostics only: lets an unparseable stdout line name the agent
+            // whose child emitted it.
+            agent_id: Some(agent_id.0.clone()),
         };
         // Pre-first-token turn-startup hint: the child process is about to be
         // spawned for this agent, so surface the `launch` phase before the
