@@ -2473,6 +2473,48 @@ async fn set_content_future_expected_version_conflicts_without_writing() {
     );
 }
 
+/// The future-rev `Conflict` wins over the set-content guards: normalization
+/// of the incoming text is error-free and the empty / truncation validation
+/// runs on the merged text, after the merge has already raised `Conflict`,
+/// so `expectedVersion` above the stored rev is `-32005` even when the
+/// payload is an empty quoted string or a short `...` fragment. Nothing is
+/// written either way.
+#[tokio::test]
+async fn set_content_future_expected_version_conflicts_before_content_guards() {
+    let (_tmp, svc, ws, id) = setup_versioned("body").await;
+    svc.set_note_content(ws.clone(), id.clone(), "body v1".into(), false, None, None)
+        .await
+        .expect("bump to rev 1");
+
+    for payload in ["\"\"", "short..."] {
+        let r = svc
+            .set_note_content(
+                ws.clone(),
+                id.clone(),
+                payload.into(),
+                false,
+                Some(999),
+                None,
+            )
+            .await;
+        match r {
+            Err(Error::Conflict { current }) => {
+                assert_eq!(current["rev"], serde_json::json!(1), "{payload:?}");
+                assert_eq!(
+                    current["content"],
+                    serde_json::json!("body v1"),
+                    "{payload:?}"
+                );
+            }
+            other => panic!("{payload:?}: future expectedVersion must be Conflict, got {other:?}"),
+        }
+    }
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "body v1", "nothing persisted");
+    assert_eq!(stored.rev, 1, "rev unchanged");
+}
+
 /// The read-merge-persist loop is bounded: when every attempt's gated UPDATE
 /// misses (a `RAISE(IGNORE)` trigger makes the note row unconditionally
 /// unmatchable, counting each attempt), `note.setContent` stops after exactly
