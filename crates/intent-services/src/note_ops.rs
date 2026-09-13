@@ -173,9 +173,21 @@ fn colon_extract(s: &str) -> Option<String> {
     Some(rest.to_string())
 }
 
-/// `note.setContent` content cleaner (quote-strip, JSON-value extraction,
-/// truncation and empty guards). The >50% reduction guard lives in the service.
+/// `note.setContent` content cleaner: [`normalize_set_content`] then
+/// [`validate_set_content`]. The service applies the two halves around its
+/// three-way merge (normalize the writer's text before, validate the merged
+/// text after), so the composition only survives for the unit tests. The
+/// >50% reduction guard lives in the service.
+#[cfg(test)]
 pub(crate) fn clean_set_content(content: &str) -> Result<String> {
+    let clean = normalize_set_content(content);
+    validate_set_content(&clean)?;
+    Ok(clean)
+}
+
+/// Normalizing half of the `note.setContent` cleaner: quote-strip and
+/// JSON-value extraction. Runs on the writer's own text only.
+pub(crate) fn normalize_set_content(content: &str) -> String {
     let mut clean = content.to_string();
     if clean.starts_with('"') || clean.starts_with("\\\"") {
         clean = remove_first_char(&clean);
@@ -188,15 +200,22 @@ pub(crate) fn clean_set_content(content: &str) -> Result<String> {
             clean = extracted;
         }
     }
-    if clean.chars().count() < 50 && !clean.contains('\n') && clean.ends_with("...") {
+    clean
+}
+
+/// Validating half of the `note.setContent` cleaner: truncation and empty
+/// guards. Runs on the text that is about to persist, which after a merge is
+/// not necessarily the writer's own.
+pub(crate) fn validate_set_content(content: &str) -> Result<()> {
+    if content.chars().count() < 50 && !content.contains('\n') && content.ends_with("...") {
         return Err(Error::Internal(
             "Content appears to be truncated. Please provide the complete content.".to_string(),
         ));
     }
-    if clean.trim().is_empty() {
+    if content.trim().is_empty() {
         return Err(Error::Internal("Content cannot be empty.".to_string()));
     }
-    Ok(clean)
+    Ok(())
 }
 
 /// Separator the agent-facing `note.read` binding emits between a task note's
@@ -1922,6 +1941,23 @@ mod tests {
             clean_set_content("# normal\ncontent").unwrap(),
             "# normal\ncontent"
         );
+    }
+
+    /// The two halves compose to the cleaner: normalization never errors and
+    /// only strips, validation never strips and only guards.
+    #[test]
+    fn set_content_cleaner_splits_into_normalize_and_validate() {
+        assert_eq!(normalize_set_content("\"short...\""), "short...");
+        assert_eq!(normalize_set_content("\"  \""), "  ");
+        assert_eq!(
+            normalize_set_content("\"\"quoted\" lead"),
+            "\"quoted\" lead"
+        );
+        assert!(validate_set_content("short...").is_err());
+        assert!(validate_set_content("").is_err());
+        assert!(validate_set_content("  ").is_err());
+        assert!(validate_set_content("\"quoted\" lead").is_ok());
+        assert!(validate_set_content("long enough\nto keep...").is_ok());
     }
 
     #[test]

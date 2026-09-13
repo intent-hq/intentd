@@ -3245,6 +3245,73 @@ async fn set_content_cleaner_runs_once_on_the_incoming_text() {
     assert_eq!(stored.content, format!("{current}\nepsilon"));
 }
 
+/// The empty guard applies to the merged text, not just the writer's own:
+/// two zero-conflict partial deletions (`ab` → `a` and `ab` → `b`, each
+/// exactly 50 % so the unconfirmed reduction guard passes) merge to the empty
+/// string, which is rejected with the existing message and persists nothing.
+#[tokio::test]
+async fn set_content_stale_merge_that_empties_the_note_is_rejected() {
+    let (_tmp, svc, ws, id) = setup_versioned("ab").await;
+
+    let b = svc
+        .set_note_content(ws.clone(), id.clone(), "a".into(), false, None, None)
+        .await
+        .expect("B write");
+    assert_eq!(b.rev, 1);
+
+    let denied = svc
+        .set_note_content(ws.clone(), id.clone(), "b".into(), false, Some(0), None)
+        .await;
+    match denied {
+        Err(Error::Internal(msg)) => assert_eq!(msg, "Content cannot be empty."),
+        other => panic!("expected the empty guard, got {other:?}"),
+    }
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 1, "a rejected merge persists nothing");
+    assert_eq!(stored.content, "a");
+}
+
+/// Same for the truncation guard: neither side's text looks truncated, but
+/// the merged text (`one two\nthree...` minus ` two` minus `\n`) is a short
+/// single line ending in `...`, and is rejected without a write.
+#[tokio::test]
+async fn set_content_stale_merge_that_looks_truncated_is_rejected() {
+    let (_tmp, svc, ws, id) = setup_versioned("one two\nthree...").await;
+
+    let b = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "one\nthree...".into(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("B write");
+    assert_eq!(b.rev, 1);
+
+    let denied = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "one twothree...".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await;
+    match denied {
+        Err(Error::Internal(msg)) => {
+            assert!(msg.starts_with("Content appears to be truncated"), "{msg}");
+        }
+        other => panic!("expected the truncation guard, got {other:?}"),
+    }
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 1, "a rejected merge persists nothing");
+    assert_eq!(stored.content, "one\nthree...");
+}
+
 /// Same race for `task.update` on a plain checkbox line: the line edit
 /// merges onto the user's save.
 #[tokio::test]

@@ -8823,10 +8823,10 @@ fn check_set_content_reduction(
 /// text it persists.
 #[derive(Clone, Copy)]
 enum ContentWritePolicy {
-    /// `note.setContent`: the set-content cleaner runs once on the writer's
-    /// text before any merge, then each attempt applies the reduction guard
-    /// (measured against the writer's base when known, else the stored
-    /// current).
+    /// `note.setContent`: the set-content normalizer runs once on the
+    /// writer's text before any merge, then each attempt applies the
+    /// reduction guard (measured against the writer's base when known, else
+    /// the stored current) and validates the merged text before persisting.
     SetContent { confirm_replacement: bool },
     /// `note.add` / `note.edit` / `note.editLines`: the surgical transform
     /// already ran against the content the caller read; the merged text
@@ -8879,11 +8879,14 @@ struct ContentWrite<'a> {
 /// lands in between is merged into on the next attempt rather than
 /// overwritten. The last attempt's `Conflict` propagates unchanged.
 ///
-/// The `SetContent` cleaner runs on `incoming` once, before any merge: the
-/// merge (and the checkbox repair) then sees the shape that will persist —
-/// a quoted payload no longer hides a bullet behind its quote — and the
-/// merged text is persisted without a second pass, so current text that
-/// legitimately starts with a quote is not stripped by someone else's write.
+/// The `SetContent` cleaner is split around the merge: normalization
+/// (quote strip, JSON-value extraction) runs on `incoming` once, before any
+/// merge, so the merge (and the checkbox repair) sees the shape that will
+/// persist — a quoted payload no longer hides a bullet behind its quote —
+/// while current text that legitimately starts with a quote is not stripped
+/// by someone else's write. Validation (empty / truncated) runs on the
+/// merged text of each attempt, since a zero-conflict merge of two partial
+/// deletions can empty a note neither side emptied.
 async fn persist_merged_content(
     store: &Store,
     workspace_id: &WorkspaceId,
@@ -8898,11 +8901,11 @@ async fn persist_merged_content(
         author,
         op,
     } = write;
-    let cleaned;
+    let normalized;
     let merge_input = match policy {
         ContentWritePolicy::SetContent { .. } => {
-            cleaned = note_ops::clean_set_content(incoming)?;
-            cleaned.as_str()
+            normalized = note_ops::normalize_set_content(incoming);
+            normalized.as_str()
         }
         ContentWritePolicy::Surgical => incoming,
     };
@@ -8933,6 +8936,7 @@ async fn persist_merged_content(
                 incoming,
                 confirm_replacement,
             )?;
+            note_ops::validate_set_content(&merge.text)?;
         }
         let text = merge.text;
         tracing::debug!(
