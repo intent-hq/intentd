@@ -27420,7 +27420,7 @@ impl WorkspaceApi for Services {
             // wire caller is human-authored; any other role only has a
             // client-supplied stamp stripped.
             let metadata = if role == "user" {
-                crate::principal_ops::stamp_principal_attribution(metadata)
+                crate::principal_ops::stamp_principal_attribution(metadata)?
             } else {
                 crate::principal_ops::strip_principal_attribution(metadata)
             };
@@ -27562,7 +27562,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             let message_metadata =
-                crate::principal_ops::stamp_principal_attribution(message_metadata);
+                crate::principal_ops::stamp_principal_attribution(message_metadata)?;
             self.agent_send_to_task_op(
                 workspace_id,
                 task_note_id,
@@ -27596,7 +27596,7 @@ impl WorkspaceApi for Services {
             // metadata. Only a user-origin send is human-authored; an
             // automatic/agent-origin send has a client stamp stripped.
             let message_metadata = if origin.is_user() {
-                crate::principal_ops::stamp_principal_attribution(message_metadata)
+                crate::principal_ops::stamp_principal_attribution(message_metadata)?
             } else {
                 crate::principal_ops::strip_principal_attribution(message_metadata)
             };
@@ -27753,7 +27753,7 @@ impl WorkspaceApi for Services {
             let options = crate::agent_manager::TurnOptions {
                 image_blocks,
                 file_blocks,
-                message_metadata: crate::principal_ops::stamp_principal_attribution(None),
+                message_metadata: crate::principal_ops::stamp_principal_attribution(None)?,
                 ..Default::default()
             };
             if let Some(manager) = self.agent_manager() {
@@ -27815,7 +27815,7 @@ impl WorkspaceApi for Services {
             // so the drain-time persist and every `agent:queue:*` payload
             // carry it.
             let message_metadata =
-                crate::principal_ops::stamp_principal_attribution(message_metadata);
+                crate::principal_ops::stamp_principal_attribution(message_metadata)?;
             self.agent_queue_message_op(
                 agent_id,
                 content,
@@ -28131,7 +28131,7 @@ impl WorkspaceApi for Services {
             // Principal stamp (multiplayer w2) on the delivered context
             // message, whichever branch (wake / queue / create) carries it.
             input.message_metadata =
-                crate::principal_ops::stamp_principal_attribution(input.message_metadata);
+                crate::principal_ops::stamp_principal_attribution(input.message_metadata)?;
             self.agent_wake_or_create_op(workspace_id, task_note_id, context_message, input)
                 .await
         })

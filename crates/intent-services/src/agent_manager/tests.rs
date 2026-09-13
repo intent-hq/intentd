@@ -10324,6 +10324,7 @@ fn turn_progress_check_excludes_only_empty_marker_row() {
             content,
             metadata: None,
             app_message_id: None,
+            author: None,
             created_at: now_iso(),
         }
     }
