@@ -54,6 +54,7 @@ only on `intent-services`, never on `intent-store`.
 | domain logic / `WorkspaceApi`| `crates/intent-services/`                                    |
 | SQLite schema + migrations   | `crates/intent-store/`                                       |
 | ACP streaming / permissions  | `crates/intent-acp/`                                         |
+| browser tab contract / `ws.browser.docs` text | `crates/intent-acp/src/mcp_server/bindings/browser_docs/*.md` — change together with the cloudlands-fe executor (`src/features/browser/main/browser-action-executor.ts`, `embedded-browser-cdp-service.ts`, the browser-tab-registry saga) and `../../docs/protocol/methods/files-terminal-browser.md`; monorepo `make docs-check` cross-checks the shared `errorCode` / `displayed` tokens |
 | binary CLI + composition     | `crates/intentd/src/`                                        |
 | integration / e2e tests      | `crates/intentd/tests/`                                      |
 | deterministic ACP fixture    | `crates/intentd/tests/fixtures/mock-acp-agent.mjs`           |
