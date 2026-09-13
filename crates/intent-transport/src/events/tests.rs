@@ -176,10 +176,15 @@ fn event_notification_envelope_matches_protocol() {
 /// publishes, which is why those two live in the taxonomy. The same frame
 /// under the administrator delivers everything it named.
 mod collaborator_fan_out {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use intent_core::events::{CLIENT_CONNECTED, NOTE_UPDATED, TERMINAL_DATA};
-    use intent_core::{ActorType, Caller, EventActor, PrincipalId, WorkspaceId};
+    use futures::future::BoxFuture;
+    use intent_core::events::{CLIENT_CONNECTED, NOTE_UPDATED, TERMINAL_DATA, WORKSPACE_UPDATED};
+    use intent_core::{
+        ActorType, Caller, Error, EventActor, PrincipalId, Workspace, WorkspaceApi, WorkspaceId,
+    };
     use intent_services::EventBus;
     use intent_store::{NewEvent, Store};
     use serde_json::{json, Value};
@@ -187,7 +192,34 @@ mod collaborator_fan_out {
     use crate::conn::{handle_fast_path, outbound_channel, ConnSubs, OutboundReceiver};
     use crate::events::classify;
 
+    /// `workspace.get` stand-in: `Ok` for the workspaces in `members`,
+    /// `NotFound` otherwise — the shape the service layer answers a
+    /// collaborator with. Shared so a test can revoke membership mid-stream.
+    struct MembershipApi {
+        members: Arc<Mutex<HashSet<String>>>,
+    }
+
+    impl WorkspaceApi for MembershipApi {
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, intent_core::Result<Workspace>> {
+            let allowed = self.members.lock().unwrap().contains(id.as_str());
+            Box::pin(async move {
+                if allowed {
+                    Ok(Workspace {
+                        id,
+                        ..intent_core::chief_workspace()
+                    })
+                } else {
+                    Err(Error::NotFound(format!("workspace {id}")))
+                }
+            })
+        }
+    }
+
     fn event(event_type: &str, workspace_id: &str) -> NewEvent {
+        event_with(event_type, workspace_id, json!({}))
+    }
+
+    fn event_with(event_type: &str, workspace_id: &str, data: Value) -> NewEvent {
         NewEvent {
             workspace_id: WorkspaceId::from(workspace_id),
             timestamp: intent_core::now_iso(),
@@ -201,42 +233,69 @@ mod collaborator_fan_out {
             correlation_id: None,
             parent_event_id: None,
             metadata: None,
-            data: json!({}),
+            data,
         }
     }
 
-    /// Collect the `type` of every `events.event` frame on the bulk lane
-    /// until it stays quiet for a short window.
-    async fn delivered_types(rx: &mut OutboundReceiver) -> Vec<String> {
-        let mut types = Vec::new();
+    /// Collect `(type, workspaceId)` of every `events.event` frame on the
+    /// bulk lane until it stays quiet for a short window.
+    async fn delivered(rx: &mut OutboundReceiver) -> Vec<(String, String)> {
+        let mut out = Vec::new();
         while let Ok(Some(frame)) =
             tokio::time::timeout(Duration::from_millis(300), rx.bulk.recv()).await
         {
             let v: Value = serde_json::from_str(&frame).unwrap();
             assert_eq!(v["method"], "events.event");
-            types.push(v["params"]["event"]["type"].as_str().unwrap().to_string());
+            let ev = &v["params"]["event"];
+            out.push((
+                ev["type"].as_str().unwrap().to_string(),
+                ev["workspaceId"].as_str().unwrap_or_default().to_string(),
+            ));
         }
-        types
+        out
     }
 
-    async fn subscribe_and_publish(caller: Caller) -> Vec<String> {
+    async fn delivered_types(rx: &mut OutboundReceiver) -> Vec<String> {
+        delivered(rx).await.into_iter().map(|(t, _)| t).collect()
+    }
+
+    struct Harness {
+        bus: EventBus,
+        rx: OutboundReceiver,
+        subs: ConnSubs,
+        members: Arc<Mutex<HashSet<String>>>,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Subscribe through the real fast path under `caller`, with `members`
+    /// as the caller's member workspaces.
+    async fn subscribe(caller: Caller, members: &[&str], params: Value) -> Harness {
         let dir = tempfile::Builder::new()
             .prefix("intent-transport-collab-fanout-")
             .tempdir()
             .unwrap();
         let store = Store::open(&dir.path().join("bus.db")).await.unwrap();
         let bus = EventBus::new(store);
+        let members = Arc::new(Mutex::new(
+            members
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<HashSet<_>>(),
+        ));
+        let api: Arc<dyn WorkspaceApi> = Arc::new(MembershipApi {
+            members: Arc::clone(&members),
+        });
         let (out_tx, mut rx) = outbound_channel();
         let mut subs = ConnSubs::default();
 
-        let frame = json!({"jsonrpc":"2.0","id":1,"method":"events.subscribe",
-            "params":{"eventTypes":["client:*","terminal:data","note:*"]}});
+        let frame = json!({"jsonrpc":"2.0","id":1,"method":"events.subscribe", "params": params});
         let fast = classify(&frame).expect("classifies as events.subscribe");
         let bus_ref = &bus;
         let out_ref = &out_tx;
         let subs_ref = &mut subs;
+        let api_ref = &api;
         let accepted = crate::context::with_request_context(true, Some(caller), async move {
-            handle_fast_path(fast, bus_ref, out_ref, subs_ref).await
+            handle_fast_path(fast, api_ref, bus_ref, out_ref, subs_ref).await
         })
         .await;
         assert!(accepted);
@@ -245,15 +304,117 @@ mod collaborator_fan_out {
             reply["result"]["subscriptionId"].is_string(),
             "a subscription id is returned whatever the patterns: {reply}"
         );
+        Harness {
+            bus,
+            rx,
+            subs,
+            members,
+            _dir: dir,
+        }
+    }
 
+    async fn subscribe_and_publish(caller: Caller) -> Vec<String> {
+        let mut h = subscribe(
+            caller,
+            &["ws-1"],
+            json!({"eventTypes":["client:*","terminal:data","note:*"]}),
+        )
+        .await;
         // The transport's own `client:*` emit is a transient global event;
         // the other two are persisted through the writer task.
-        let _ = bus.publish_transient(&event(CLIENT_CONNECTED, ""));
-        bus.publish(&event(TERMINAL_DATA, "ws-1")).await.unwrap();
-        bus.publish(&event(NOTE_UPDATED, "ws-1")).await.unwrap();
-        let types = delivered_types(&mut rx).await;
-        drop(subs);
+        let _ = h.bus.publish_transient(&event(CLIENT_CONNECTED, ""));
+        h.bus.publish(&event(TERMINAL_DATA, "ws-1")).await.unwrap();
+        h.bus.publish(&event(NOTE_UPDATED, "ws-1")).await.unwrap();
+        let types = delivered_types(&mut h.rx).await;
+        drop(h.subs);
         types
+    }
+
+    /// Delivery-time membership: an unscoped `note:*` subscription under a
+    /// guest who is a member of `ws-1` only never carries `ws-2` events; a
+    /// mid-stream unshare of `ws-1` stops delivery even though the
+    /// subscription's own patterns exclude `workspace:updated`.
+    #[tokio::test]
+    async fn non_member_workspaces_are_filtered_at_delivery_and_removal_tears_down() {
+        let principal_id = PrincipalId::new();
+        let guest = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: false,
+        };
+        let mut h = subscribe(guest, &["ws-1"], json!({"eventTypes":["note:*"]})).await;
+        h.bus.publish(&event(NOTE_UPDATED, "ws-2")).await.unwrap();
+        h.bus.publish(&event(NOTE_UPDATED, "ws-1")).await.unwrap();
+        h.bus.publish(&event(NOTE_UPDATED, "ws-2")).await.unwrap();
+        assert_eq!(
+            delivered(&mut h.rx).await,
+            vec![(NOTE_UPDATED.to_string(), "ws-1".to_string())]
+        );
+
+        // Owner removes the guest: the service layer drops the membership
+        // row and publishes the unshare marker (`workspace_members_remove_op`).
+        h.members.lock().unwrap().remove("ws-1");
+        h.bus
+            .publish(&event_with(
+                WORKSPACE_UPDATED,
+                "ws-1",
+                json!({ "changes": { "members": true, "removedPrincipalId": principal_id.as_str() } }),
+            ))
+            .await
+            .unwrap();
+        // Let the side subscription observe the unshare before the next
+        // matched event (the cached `ws-1` verdict would otherwise still be
+        // within its TTL).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus.publish(&event(NOTE_UPDATED, "ws-1")).await.unwrap();
+        assert!(
+            delivered(&mut h.rx).await.is_empty(),
+            "no delivery after removal"
+        );
+        drop(h.subs);
+    }
+
+    /// The removed member's own unshare event is its final notification when
+    /// its patterns include `workspace:updated`; another member's unshare
+    /// of the same workspace is an ordinary update to a still-member.
+    #[tokio::test]
+    async fn unshare_event_is_the_removed_members_final_frame() {
+        let principal_id = PrincipalId::new();
+        let guest = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: false,
+        };
+        let mut h = subscribe(
+            guest,
+            &["ws-1"],
+            json!({"eventTypes":["note:*", "workspace:updated"]}),
+        )
+        .await;
+        h.bus
+            .publish(&event_with(
+                WORKSPACE_UPDATED,
+                "ws-1",
+                json!({ "changes": { "members": true, "removedPrincipalId": "someone-else" } }),
+            ))
+            .await
+            .unwrap();
+        h.members.lock().unwrap().remove("ws-1");
+        h.bus
+            .publish(&event_with(
+                WORKSPACE_UPDATED,
+                "ws-1",
+                json!({ "changes": { "members": true, "removedPrincipalId": principal_id.as_str() } }),
+            ))
+            .await
+            .unwrap();
+        h.bus.publish(&event(NOTE_UPDATED, "ws-1")).await.unwrap();
+        assert_eq!(
+            delivered(&mut h.rx).await,
+            vec![
+                (WORKSPACE_UPDATED.to_string(), "ws-1".to_string()),
+                (WORKSPACE_UPDATED.to_string(), "ws-1".to_string()),
+            ]
+        );
+        drop(h.subs);
     }
 
     #[tokio::test]

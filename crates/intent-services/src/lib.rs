@@ -15846,6 +15846,8 @@ impl Services {
 impl WorkspaceApi for Services {
     fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Daemon settings are host state: administrator-only in the matrix.
+            Self::require_administrator("settings.list")?;
             let _revision_guard = self.settings_revision_gate.read().await;
             let mut result = self.settings_service().list().await?;
             result["revision"] = serde_json::json!(self.settings_revision.load(Ordering::SeqCst));
@@ -15855,6 +15857,7 @@ impl WorkspaceApi for Services {
 
     fn settings_get(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            Self::require_administrator("settings.get")?;
             let _revision_guard = self.settings_revision_gate.read().await;
             let mut result = self.settings_service().get(&path).await?;
             result["revision"] = serde_json::json!(self.settings_revision.load(Ordering::SeqCst));
@@ -16790,26 +16793,50 @@ impl WorkspaceApi for Services {
             if let Some(ws) = workspace_id.as_ref() {
                 self.require_member(ws).await?;
             }
+            // Multiplayer w3: an unscoped collaborator query runs once per
+            // member workspace (each with the caller's `limit`), and the
+            // merged hits are re-ranked by the same `adjusted_rank` /
+            // `created_at` key and cut to `limit` — the same top-N the
+            // single global statement would produce restricted to those
+            // workspaces, without touching the plan-guarded FTS SQL.
+            let scopes: Vec<Option<WorkspaceId>> =
+                match (&workspace_id, self.visible_workspace_ids().await?) {
+                    (None, Some(visible)) => visible.into_iter().map(Some).collect(),
+                    _ => vec![workspace_id.clone()],
+                };
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let token = registry.register(&request_id);
             // User-typed queries are never handed to the FTS5 parser verbatim
             // (as-you-type input would surface `fts5: syntax error`); a query
             // with no searchable tokens yields empty matches, not an error.
-            let hits = match intent_search::fts_match_expr(&query) {
-                Some(expr) => {
-                    store
-                        .search_agent_messages_fts(
-                            &expr,
-                            workspace_id.as_ref(),
-                            agent_id.as_deref(),
-                            role.as_deref(),
-                            prefer_workspace_id.as_ref(),
-                            limit,
-                        )
-                        .await?
+            let mut hits = Vec::new();
+            if let Some(expr) = intent_search::fts_match_expr(&query) {
+                for scope in &scopes {
+                    hits.extend(
+                        store
+                            .search_agent_messages_fts(
+                                &expr,
+                                scope.as_ref(),
+                                agent_id.as_deref(),
+                                role.as_deref(),
+                                prefer_workspace_id.as_ref(),
+                                limit,
+                            )
+                            .await?,
+                    );
                 }
-                None => Vec::new(),
-            };
+                if scopes.len() > 1 {
+                    hits.sort_by(|a, b| {
+                        a.rank
+                            .total_cmp(&b.rank)
+                            .then_with(|| b.created_at.cmp(&a.created_at))
+                            .then_with(|| a.message_id.cmp(&b.message_id))
+                    });
+                    if let Some(n) = limit.and_then(|n| usize::try_from(n).ok()) {
+                        hits.truncate(n);
+                    }
+                }
+            }
             let matches = to_value_vec(search_ops::message_fts_matches(hits, &query))?;
             Ok(services.deliver_search(&request_id, workspace_id.as_ref(), matches, token))
         })
@@ -16836,12 +16863,19 @@ impl WorkspaceApi for Services {
                 workspace_id: workspace_id.clone(),
                 ..Default::default()
             };
-            // Multiplayer w3: a collaborator searches allowlisted rows only.
-            let events = if event_ops::narrow_query_for_caller(&mut q) {
+            // Multiplayer w3: a collaborator searches allowlisted rows only,
+            // and an unscoped query only its member workspaces (the query
+            // carries no SQL limit, so the post-filter is exact).
+            let mut events = if event_ops::narrow_query_for_caller(&mut q) {
                 store.query_events(&q).await?
             } else {
                 Vec::new()
             };
+            if workspace_id.is_none() {
+                if let Some(visible) = self.visible_workspace_ids().await? {
+                    events.retain(|ev| visible.contains(&ev.workspace_id));
+                }
+            }
             let matches = search_ops::event_matches(&events, &query, limit);
             let matches = to_value_vec(matches)?;
             Ok(services.deliver_search(&request_id, workspace_id.as_ref(), matches, token))
@@ -16859,7 +16893,12 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let token = registry.register(&request_id);
-            let notes = store.list_all_notes().await?;
+            let mut notes = store.list_all_notes().await?;
+            // Multiplayer w3: a collaborator matches only its member
+            // workspaces' notes (filtered before matching — unbounded list).
+            if let Some(visible) = self.visible_workspace_ids().await? {
+                notes.retain(|n| visible.contains(&n.workspace_id));
+            }
             let matches = search_ops::note_matches(&notes, &query);
             let matches = to_value_vec(matches)?;
             // Global search (no workspaceId) → always inline (notes sets are small).
@@ -16954,7 +16993,8 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let settings = self.settings_registry.clone();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            // `terminal.*` is host reach: owner-only in the matrix.
+            self.require_owner(&workspace_id, "terminal.create").await?;
             terminal_ops::create(
                 pty,
                 bus,
@@ -16977,7 +17017,12 @@ impl WorkspaceApi for Services {
         data: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
-        Box::pin(async move { terminal_ops::write(&pty, &terminal_id, &data) })
+        Box::pin(async move {
+            // Terminal-id keyed (no workspace to resolve a role against): a
+            // collaborator caller never reaches a PTY.
+            Self::require_administrator("terminal.write")?;
+            terminal_ops::write(&pty, &terminal_id, &data)
+        })
     }
 
     fn terminal_resize(
@@ -16987,12 +17032,18 @@ impl WorkspaceApi for Services {
         rows: u16,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
-        Box::pin(async move { terminal_ops::resize(&pty, &terminal_id, cols, rows) })
+        Box::pin(async move {
+            Self::require_administrator("terminal.resize")?;
+            terminal_ops::resize(&pty, &terminal_id, cols, rows)
+        })
     }
 
     fn terminal_kill(&self, terminal_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
-        Box::pin(async move { terminal_ops::kill(&pty, &terminal_id).await })
+        Box::pin(async move {
+            Self::require_administrator("terminal.kill")?;
+            terminal_ops::kill(&pty, &terminal_id).await
+        })
     }
 
     fn terminal_get_buffer(
@@ -17001,14 +17052,17 @@ impl WorkspaceApi for Services {
         max_bytes: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
-        Box::pin(async move { terminal_ops::get_buffer(&pty, &terminal_id, max_bytes) })
+        Box::pin(async move {
+            Self::require_administrator("terminal.getBuffer")?;
+            terminal_ops::get_buffer(&pty, &terminal_id, max_bytes)
+        })
     }
 
     fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         let boot_id = self.daemon_boot_id.clone();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            self.require_owner(&workspace_id, "terminal.list").await?;
             terminal_ops::list(&pty, &workspace_id, &boot_id)
         })
     }
@@ -17023,7 +17077,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            self.require_owner(&workspace_id, "terminal.readOutput")
+                .await?;
             terminal_ops::read_output(
                 &pty,
                 &workspace_id,
@@ -17398,6 +17453,7 @@ impl WorkspaceApi for Services {
         data: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_upload_member(&upload_id).await?;
             self.file_attachment_upload_chunk_op(upload_id, seq, data)
                 .await
         })
@@ -17407,14 +17463,20 @@ impl WorkspaceApi for Services {
         &self,
         upload_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.file_attachment_upload_commit_op(upload_id).await })
+        Box::pin(async move {
+            self.require_upload_member(&upload_id).await?;
+            self.file_attachment_upload_commit_op(upload_id).await
+        })
     }
 
     fn file_attachment_upload_abort(
         &self,
         upload_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.file_attachment_upload_abort_op(upload_id).await })
+        Box::pin(async move {
+            self.require_upload_member(&upload_id).await?;
+            self.file_attachment_upload_abort_op(upload_id).await
+        })
     }
 
     fn file_get_attachment_info(
@@ -17425,6 +17487,16 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let record = store
                 .get_attachment(&attachment_id)
+                .await
+                .map_err(|e| match e {
+                    Error::NotFound(_) => {
+                        Error::NotFound(format!("unknown attachment id: {attachment_id}"))
+                    }
+                    other => other,
+                })?;
+            // The record is globally keyed; its workspace is the scope. A
+            // non-member reads the same "unknown attachment" as a missing id.
+            self.require_member(&record.workspace_id)
                 .await
                 .map_err(|e| match e {
                     Error::NotFound(_) => {
@@ -17616,6 +17688,9 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            // The write lands on `workspace_id`/`note_id`: that workspace is
+            // the authorization scope; the referenced agent is checked too.
+            self.require_member(&workspace_id).await?;
             self.require_agent_member(&AgentId::from_string(agent_id.clone()))
                 .await?;
             let id = new_uuid();
@@ -17739,7 +17814,7 @@ impl WorkspaceApi for Services {
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            self.require_owner(&workspace_id, "script.list").await?;
             mgr.list(&workspace_id).await
         })
     }
@@ -17751,7 +17826,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            self.require_owner(&workspace_id, "script.create").await?;
             mgr.create(workspace_id, params).await
         })
     }
@@ -17763,7 +17838,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            self.require_owner(&workspace_id, "script.remove").await?;
             mgr.remove(&workspace_id, &script_id).await
         })
     }
@@ -17775,7 +17850,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            self.require_owner(&workspace_id, "script.start").await?;
             mgr.start(&workspace_id, &script_id)
         })
     }
@@ -17787,7 +17862,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            self.require_owner(&workspace_id, "script.stop").await?;
             mgr.stop(&workspace_id, &script_id).await
         })
     }
@@ -17799,7 +17874,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            self.require_owner(&workspace_id, "script.restart").await?;
             mgr.restart(&workspace_id, &script_id).await
         })
     }
@@ -17814,7 +17889,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            self.require_owner(&workspace_id, "script.output").await?;
             mgr.output(
                 &workspace_id,
                 &script_id,
@@ -17832,7 +17907,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            self.require_owner(&workspace_id, "script.status").await?;
             mgr.status(&workspace_id, &script_id)
         })
     }
@@ -17846,7 +17921,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            self.require_owner(&workspace_id, "script.run").await?;
             mgr.run(&workspace_id, &script_id, max_lines, timeout_seconds)
                 .await
         })
@@ -18123,6 +18198,8 @@ impl WorkspaceApi for Services {
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
         Box::pin(async move {
+            // Creates a worktree at an arbitrary host path: administrator-only.
+            Self::require_administrator("workspace.create")?;
             // Clone fields for logging (input moves into the closure below).
             let log_repo_path = input.repository_path.clone();
             let log_branch = input.branch.clone();
@@ -20275,6 +20352,14 @@ impl WorkspaceApi for Services {
         let changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
             self.require_member(&id).await?;
+            // Multiplayer w3: a member may steer the workspace card (title /
+            // tags / status message / status image); every other field —
+            // paths, repository identity, branch, lifecycle (`status` /
+            // `archived`), setup script, PR fields — is the owner's.
+            if !capability::collaborator_editable_update(&changes) {
+                self.require_owner(&id, "workspace.update (protected fields)")
+                    .await?;
+            }
             // Captured before the `if let` arms below move the fields out.
             let pr_fields_changed = update.pr_number.is_some()
                 || update.pr_url.is_some()
@@ -22524,6 +22609,9 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            // Target workspace first (the link row lives there), then the
+            // referenced agent's workspace.
+            self.require_member(&workspace_id).await?;
             self.require_agent_member(&AgentId::from_string(agent_id.clone()))
                 .await?;
             store.get_workspace(&workspace_id).await?;
@@ -22583,6 +22671,9 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let id = workspace_id.clone();
         Box::pin(async move {
+            // Multiplayer w3: gated before the spec reseed so a non-member
+            // neither reads nor writes (reseeds) the workspace.
+            self.require_member(&id).await?;
             // Self-heal parity with `notes.service.ts getNotes`: if the
             // well-known `spec` note is missing for this workspace, reseed it
             // before listing so pre-#110 workspaces (and any that lost their
@@ -24455,6 +24546,9 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            // Target workspace first (the task note and its status live
+            // there), then the referenced agent's workspace.
+            self.require_member(&workspace_id).await?;
             self.require_agent_member(&AgentId::from_string(agent_id.clone()))
                 .await?;
             if !is_valid_agent_id(&agent_id) {
@@ -26397,7 +26491,10 @@ impl WorkspaceApi for Services {
             // Path-based read used by the workspace-create flow *before* the
             // repo is registered: any existing local git repo is accepted
             // (matching the ungated TS handler); nonexistent / non-git paths
-            // are `-32602` (PROTOCOL §5.6).
+            // are `-32602` (PROTOCOL §5.6). A collaborator is confined to its
+            // member checkouts (multiplayer w3).
+            self.require_member_repo_path(&repo_path, "git.getBranches")
+                .await?;
             git_ops::validate_repo_path(&repo_path)?;
             intent_git::branches::get_branches(std::path::Path::new(&repo_path), include_remote)
         })
@@ -26410,6 +26507,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitBranchStatus>> {
         Box::pin(async move {
             // Same repo-path validation as `git_get_branches` (PROTOCOL §5.6).
+            self.require_member_repo_path(&repo_path, "git.branchStatus")
+                .await?;
             git_ops::validate_repo_path(&repo_path)?;
             intent_git::branches::branch_status(std::path::Path::new(&repo_path), &branch_name)
         })
@@ -26428,7 +26527,10 @@ impl WorkspaceApi for Services {
             // Path-based like `git_get_branches`: the workspace-create auto-pull
             // runs *before* the repo is registered, so any existing local git
             // repo is accepted; nonexistent / non-git paths are `-32602`
-            // (PROTOCOL §5.6).
+            // (PROTOCOL §5.6). A collaborator is confined to its member
+            // checkouts (multiplayer w3) — the pull runs with the owner's token.
+            self.require_member_repo_path(&repo_path, "git.pull")
+                .await?;
             git_ops::validate_repo_path(&repo_path)?;
             if branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams("branchName is required".to_string()));
@@ -27525,7 +27627,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             // Path-based validation like `git_get_branches`/`git_branch_status`:
-            // nonexistent / non-git repo path → -32602 (PROTOCOL §5.6).
+            // nonexistent / non-git repo path → -32602 (PROTOCOL §5.6); a
+            // collaborator is confined to its member checkouts.
+            self.require_member_repo_path(&repo_path, "git.getRemoteUrl")
+                .await?;
             git_ops::validate_repo_path(&repo_path)?;
             let name = remote_name
                 .as_deref()
@@ -28348,10 +28453,30 @@ impl WorkspaceApi for Services {
             })?;
             // Without a runtime manager there is no registry to answer against, so
             // every request id is unresolved.
-            let resolved = match self.agent_manager() {
-                Some(manager) => manager.respond_permission(&request_id, parsed),
-                None => false,
+            let Some(manager) = self.agent_manager() else {
+                return Ok(serde_json::json!({ "resolved": false }));
             };
+            // Multiplayer w3: the prompt is answered on behalf of the owner
+            // (the agent runs with the owner's capabilities), so a collaborator
+            // must own the prompting agent's workspace. The request id is
+            // resolved back to its agent through the pending snapshot; an
+            // unknown id stays `resolved: false` for everyone.
+            if capability::collaborator_caller().is_some() {
+                let Some(session_id) = manager
+                    .pending_permissions()
+                    .into_iter()
+                    .find(|r| r.request_id == request_id)
+                    .map(|r| r.session_id)
+                else {
+                    return Ok(serde_json::json!({ "resolved": false }));
+                };
+                self.require_agent_owner(
+                    &AgentId::from(session_id.as_str()),
+                    "agent.respondPermission",
+                )
+                .await?;
+            }
+            let resolved = manager.respond_permission(&request_id, parsed);
             Ok(serde_json::json!({ "resolved": resolved }))
         })
     }
@@ -28362,7 +28487,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             if let Some(agent) = agent_id.as_ref() {
-                self.require_agent_member(agent).await?;
+                self.require_agent_owner(agent, "agent.pendingPermissions")
+                    .await?;
             }
             // No manager ⇒ no outstanding prompts. Otherwise snapshot the registry
             // and, when an `agentId` filter is given, keep only that session's
@@ -28374,6 +28500,11 @@ impl WorkspaceApi for Services {
             if let Some(agent_id) = agent_id {
                 let filter = agent_id.as_str();
                 requests.retain(|r| r.session_id == filter);
+            } else {
+                // Multiplayer w3: the unfiltered registry spans every
+                // workspace; a collaborator keeps only prompts it may answer
+                // (agents in workspaces it owns — see `agent_respond_permission`).
+                self.retain_owned_agent_prompts(&mut requests).await?;
             }
             Ok(serde_json::json!({ "requests": requests }))
         })
@@ -28710,6 +28841,15 @@ impl WorkspaceApi for Services {
                         "Agent id {id} appears in both resume and abandon"
                     )));
                 }
+            }
+
+            // Multiplayer w3: every target is authorized before the first
+            // mutation — a batch naming any agent outside the caller's member
+            // workspaces fails as a whole (`NotFound` for that agent), so a
+            // mixed batch never partially applies.
+            for agent_id_str in resume_ids.iter().chain(abandon_ids.iter()) {
+                self.require_agent_member(&AgentId::from(agent_id_str.as_str()))
+                    .await?;
             }
 
             let mut resumed = Vec::new();
@@ -31371,9 +31511,9 @@ impl WorkspaceApi for Services {
         include_retired: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            if let Some(agent) = agent_id.as_ref() {
-                self.require_agent_member(agent).await?;
-            }
+            // The workspace is the authorization scope; the agent filter is
+            // just a filter (the wire arm always passes `None`).
+            self.require_member(&workspace_id).await?;
             self.hook_list_op(&workspace_id, agent_id.as_ref(), include_retired)
                 .await
         })
@@ -31458,9 +31598,8 @@ impl WorkspaceApi for Services {
         agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            if let Some(agent) = agent_id.as_ref() {
-                self.require_agent_member(agent).await?;
-            }
+            // See `hook_list`: gate the workspace, not the optional filter.
+            self.require_member(&workspace_id).await?;
             self.pr_monitor_list_op(&workspace_id, agent_id.as_ref())
                 .await
         })
