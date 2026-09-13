@@ -57,7 +57,7 @@ pub(crate) fn build_pairing_uri(
 
 /// Percent-encode a query value, passing through unreserved characters
 /// (RFC 3986) plus `:` (valid in query strings; keeps fingerprints readable).
-fn encode_query_value(s: &str) -> String {
+pub(crate) fn encode_query_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
