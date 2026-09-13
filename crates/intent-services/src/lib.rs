@@ -8713,6 +8713,9 @@ struct SetContentMerge {
     base: Option<String>,
     outcome: &'static str,
     conflicting_spans: usize,
+    /// Checkbox lines whose conflicting marker was collapsed back to one
+    /// valid marker after the merge (intent-hq/intent#4930).
+    repaired_markers: usize,
 }
 
 /// Resolve what a `note.setContent` write persists on top of the stored
@@ -8747,6 +8750,7 @@ async fn merge_set_content(
                 base: None,
                 outcome: "exact",
                 conflicting_spans: 0,
+                repaired_markers: 0,
             })
         }
     };
@@ -8757,11 +8761,20 @@ async fn merge_set_content(
     {
         Some(base) => {
             let merged = note_merge::three_way_merge(&base, current, incoming);
+            // Only a conflicting span can concatenate two marker variants;
+            // clean merges persist the merged text verbatim, and the repair
+            // is scoped to the spans that actually conflicted.
+            let (text, repaired_markers) = if merged.conflicting_spans > 0 {
+                note_merge::repair_checkbox_markers(&merged.text, &merged.conflict_ranges)
+            } else {
+                (merged.text, 0)
+            };
             Ok(SetContentMerge {
-                text: merged.text,
+                text,
                 base: Some(base),
                 outcome: "merged",
                 conflicting_spans: merged.conflicting_spans,
+                repaired_markers,
             })
         }
         None => Ok(SetContentMerge {
@@ -8769,6 +8782,7 @@ async fn merge_set_content(
             base: None,
             outcome: "lww-no-base",
             conflicting_spans: 0,
+            repaired_markers: 0,
         }),
     }
 }
@@ -8915,6 +8929,7 @@ async fn persist_merged_content(
             expected_version,
             outcome = merge.outcome,
             conflicting_spans = merge.conflicting_spans,
+            repaired_markers = merge.repaired_markers,
             "note content merge"
         );
         let mut plan = reanchor_note_comments(store, workspace_id, note_id, text).await?;

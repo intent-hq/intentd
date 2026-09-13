@@ -15,6 +15,8 @@
 //! - Identical edits on both sides apply once and are not a conflict.
 //! - Pure insertions at the same base offset both apply, current's first.
 
+use std::ops::Range;
+
 use similar::{capture_diff_slices, Algorithm, DiffOp};
 
 /// Result of [`three_way_merge`].
@@ -25,6 +27,10 @@ pub(crate) struct MergeOutcome {
     /// Number of base spans where both writers made different edits (each
     /// rendered as current-variant followed by incoming-variant).
     pub conflicting_spans: usize,
+    /// Byte range in `text` of each conflicting span's rendering (the
+    /// concatenated current and incoming variants), in order; one entry per
+    /// counted conflict.
+    pub conflict_ranges: Vec<Range<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -100,12 +106,14 @@ pub(crate) fn three_way_merge(base: &str, current: &str, incoming: &str) -> Merg
         return MergeOutcome {
             text: incoming.to_string(),
             conflicting_spans: 0,
+            conflict_ranges: Vec::new(),
         };
     }
     if base == incoming {
         return MergeOutcome {
             text: current.to_string(),
             conflicting_spans: 0,
+            conflict_ranges: Vec::new(),
         };
     }
 
@@ -119,6 +127,8 @@ pub(crate) fn three_way_merge(base: &str, current: &str, incoming: &str) -> Merg
 
     let mut out: Vec<char> = Vec::with_capacity(current.len().max(incoming.len()));
     let mut conflicting_spans = 0;
+    // char ranges in `out`; mapped to byte ranges once the text is built
+    let mut conflict_chars: Vec<Range<usize>> = Vec::new();
     let mut copied = 0; // base chars emitted so far
     let mut i = 0;
     while i < all.len() {
@@ -150,6 +160,7 @@ pub(crate) fn three_way_merge(base: &str, current: &str, incoming: &str) -> Merg
             (true, true) => {
                 let cur = variant(cluster, Side::Current, &base, start, end);
                 let inc = variant(cluster, Side::Incoming, &base, start, end);
+                let rendered_at = out.len();
                 out.extend_from_slice(&cur);
                 if cur != inc {
                     out.extend_from_slice(&inc);
@@ -157,6 +168,7 @@ pub(crate) fn three_way_merge(base: &str, current: &str, incoming: &str) -> Merg
                     // only a rewritten base span counts as a conflict.
                     if end > start {
                         conflicting_spans += 1;
+                        conflict_chars.push(rendered_at..out.len());
                     }
                 }
             }
@@ -168,10 +180,116 @@ pub(crate) fn three_way_merge(base: &str, current: &str, incoming: &str) -> Merg
     }
     out.extend_from_slice(&base[copied..]);
 
+    let conflict_ranges = if conflict_chars.is_empty() {
+        Vec::new()
+    } else {
+        // byte offset of every char boundary in `out`, plus the end
+        let mut byte_at = Vec::with_capacity(out.len() + 1);
+        let mut bytes = 0;
+        for c in &out {
+            byte_at.push(bytes);
+            bytes += c.len_utf8();
+        }
+        byte_at.push(bytes);
+        conflict_chars
+            .into_iter()
+            .map(|r| byte_at[r.start]..byte_at[r.end])
+            .collect()
+    };
+
     MergeOutcome {
         text: out.into_iter().collect(),
         conflicting_spans,
+        conflict_ranges,
     }
+}
+
+/// Whitespace `note_ops::match_task_line` skips around a bullet.
+fn is_js_space_char(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{000b}' | '\u{000c}')
+}
+
+/// Checkbox characters `note_ops::match_task_line` accepts inside `[ ]`.
+fn is_marker_char(c: char) -> bool {
+    matches!(c, ' ' | 'x' | 'X' | '/')
+}
+
+/// Collapse checkbox markers a conflicting [`three_way_merge`] left with both
+/// variants concatenated (`- [x ] …`, `- [x/] …`) back to one valid marker.
+/// The kept character is the first one — the *current* side's, since a
+/// conflicting span renders current-variant then incoming-variant. Only a
+/// marker whose bracket run overlaps one of `conflicts` (the merge's
+/// `conflict_ranges`, byte ranges in `merged`) is repaired, so text neither
+/// writer contended — including such a shape sitting in a code block — is
+/// left byte-identical, as are lines whose marker already parses, non-bullet
+/// lines and brackets holding anything but marker characters. Returns the
+/// text and the number of repaired lines.
+pub(crate) fn repair_checkbox_markers(merged: &str, conflicts: &[Range<usize>]) -> (String, usize) {
+    if conflicts.is_empty() {
+        return (merged.to_string(), 0);
+    }
+    let mut repaired = 0;
+    let mut out = String::with_capacity(merged.len());
+    let mut line_start = 0;
+    for (i, line) in merged.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match collapse_marker(line) {
+            Some((fixed, run)) => {
+                let run = line_start + run.start..line_start + run.end;
+                if conflicts
+                    .iter()
+                    .any(|c| c.start < run.end && run.start < c.end)
+                {
+                    repaired += 1;
+                    out.push_str(&fixed);
+                } else {
+                    out.push_str(line);
+                }
+            }
+            None => out.push_str(line),
+        }
+        line_start += line.len() + 1;
+    }
+    (out, repaired)
+}
+
+/// `line` with a `[` + two-or-more marker chars + `]` bullet marker reduced
+/// to its first char, plus the byte range of that bracket run in `line`;
+/// `None` when the line needs no repair.
+fn collapse_marker(line: &str) -> Option<(String, Range<usize>)> {
+    let mut it = line.char_indices().peekable();
+    while matches!(it.peek(), Some((_, c)) if is_js_space_char(*c)) {
+        it.next();
+    }
+    match it.next() {
+        Some((_, '-' | '*')) => {}
+        _ => return None,
+    }
+    while matches!(it.peek(), Some((_, c)) if is_js_space_char(*c)) {
+        it.next();
+    }
+    let (box_start, '[') = it.next()? else {
+        return None;
+    };
+    let (_, first) = it.next()?;
+    if !is_marker_char(first) {
+        return None;
+    }
+    let mut markers = 1;
+    let close = loop {
+        match it.next()? {
+            (idx, ']') => break idx,
+            (_, c) if is_marker_char(c) => markers += 1,
+            _ => return None,
+        }
+    };
+    if markers < 2 {
+        return None;
+    }
+    let fixed = format!("{}[{first}]{}", &line[..box_start], &line[close + 1..]);
+    Some((fixed, box_start..close + 1))
 }
 
 #[cfg(test)]
@@ -391,5 +509,188 @@ mod tests {
             "para one.\n\npara two has XY in it.\n\npara three."
         );
         assert_eq!(out.conflicting_spans, 1);
+    }
+
+    // --- conflict ranges --------------------------------------------------------
+
+    #[test]
+    fn conflict_ranges_cover_each_rendered_conflict() {
+        let out = merge("one cat three", "one dog three", "one fox three");
+        assert_eq!(out.conflict_ranges, vec![4..10]);
+        assert_eq!(&out.text[4..10], "dogfox");
+
+        let out = merge("aaa bbb ccc", "xxx bbb yyy", "zzz bbb www");
+        assert_eq!(out.conflict_ranges, vec![0..6, 11..17]);
+        assert_eq!(&out.text[0..6], "xxxzzz");
+        assert_eq!(&out.text[11..17], "yyywww");
+
+        // byte ranges, not char ranges
+        let out = merge("one 🦊🦊 three", "one 🐶🐶 three", "one 🦀🦀 three");
+        assert_eq!(out.conflict_ranges, vec![4..20]);
+        assert_eq!(&out.text[4..20], "🐶🐶🦀🦀");
+
+        // clean merges, fast paths and same-offset insertions report none
+        assert!(merge("abc", "abc", "xyz").conflict_ranges.is_empty());
+        assert!(merge("ab", "aXb", "aYb").conflict_ranges.is_empty());
+        assert!(merge("abc def", "xyz def", "abc! def")
+            .conflict_ranges
+            .is_empty());
+    }
+
+    // --- checkbox marker repair -----------------------------------------------
+
+    use crate::note_ops::{parse_tasks, set_linked_checkbox};
+
+    fn repair(out: &MergeOutcome) -> (String, usize) {
+        repair_checkbox_markers(&out.text, &out.conflict_ranges)
+    }
+
+    /// Regression for intent-hq/intent#4930: both writers changed the single
+    /// character inside `[ ]`, the merger concatenated the variants
+    /// (current first) and the line stopped parsing as a task.
+    #[test]
+    fn regression_intent_4930_conflicting_marker_collapses_to_current_side() {
+        let out = merge("- [ ] t", "- [x] t", "- [/] t");
+        assert_eq!(out.text, "- [x/] t", "current variant is emitted first");
+        assert_eq!(out.conflicting_spans, 1);
+        assert_eq!(out.conflict_ranges, vec![3..5]);
+        assert!(
+            parse_tasks(&out.text).is_empty(),
+            "malformed marker must not parse"
+        );
+
+        let (repaired, count) = repair(&out);
+        assert_eq!(repaired, "- [x] t");
+        assert_eq!(count, 1);
+        let rows = parse_tasks(&repaired);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "done");
+        assert_eq!(rows[0].text, "t");
+
+        // The issue's exact shape: in-progress base, materialized `[x]`, stale `[ ]`.
+        let out = merge("- [/] t", "- [x] t", "- [ ] t");
+        assert_eq!(out.text, "- [x ] t");
+        assert_eq!(repair(&out), ("- [x] t".to_string(), 1));
+    }
+
+    #[test]
+    fn repaired_linked_task_line_stays_linked_and_materializable() {
+        let base = "- [/] [T](intent://local/task/abc)";
+        let out = merge(
+            base,
+            "- [x] [T](intent://local/task/abc)",
+            "- [ ] [T](intent://local/task/abc)",
+        );
+        assert_eq!(out.text, "- [x ] [T](intent://local/task/abc)");
+        assert_eq!(out.conflicting_spans, 1);
+        assert!(set_linked_checkbox(&out.text, "abc", "[/]").is_none());
+
+        let (repaired, count) = repair(&out);
+        assert_eq!(repaired, "- [x] [T](intent://local/task/abc)");
+        assert_eq!(count, 1);
+        let rows = parse_tasks(&repaired);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_note_id.as_deref(), Some("abc"));
+        assert_eq!(
+            set_linked_checkbox(&repaired, "abc", "[/]").as_deref(),
+            Some("- [/] [T](intent://local/task/abc)")
+        );
+    }
+
+    #[test]
+    fn agreeing_marker_with_conflict_elsewhere_on_the_line_is_untouched() {
+        let out = merge("- [ ] cat", "- [x] dog", "- [x] fox");
+        assert_eq!(out.text, "- [x] dogfox");
+        assert_eq!(out.conflicting_spans, 1);
+        assert_eq!(repair(&out), (out.text.clone(), 0));
+    }
+
+    #[test]
+    fn non_conflicting_merge_is_never_altered() {
+        let out = merge("- [ ] t", "- [x] t", "- [ ] t!");
+        assert_eq!(out.text, "- [x] t!");
+        assert_eq!(out.conflicting_spans, 0);
+        assert_eq!(repair(&out), (out.text.clone(), 0));
+
+        // Identical marker edits apply once and leave nothing to repair.
+        let out = merge("- [ ] t", "- [x] t", "- [x] t");
+        assert_eq!(out.text, "- [x] t");
+        assert_eq!(repair(&out), (out.text.clone(), 0));
+    }
+
+    /// A conflict in prose must not license rewriting a marker-shaped line
+    /// neither writer touched — a fenced code block or indented code.
+    #[test]
+    fn uncontended_code_lines_survive_a_conflict_elsewhere() {
+        for code in [
+            "```\n- [x ] unchanged code\n```",
+            "~~~\n- [x ] unchanged code\n~~~",
+            "    - [x ] unchanged code",
+        ] {
+            let base = format!("cat\n\n{code}\n");
+            let current = format!("dog\n\n{code}\n");
+            let incoming = format!("fox\n\n{code}\n");
+            let out = merge(&base, &current, &incoming);
+            assert_eq!(out.text, format!("dogfox\n\n{code}\n"));
+            assert_eq!(out.conflicting_spans, 1);
+            assert_eq!(out.conflict_ranges, vec![0..6]);
+            assert_eq!(repair(&out), (out.text.clone(), 0), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn only_markers_inside_a_conflict_range_are_repaired() {
+        // A real marker conflict on one line, an uncontended malformed marker on another.
+        let out = merge(
+            "- [ ] one\n- [x ] two",
+            "- [x] one\n- [x ] two",
+            "- [/] one\n- [x ] two",
+        );
+        assert_eq!(out.text, "- [x/] one\n- [x ] two");
+        assert_eq!(out.conflict_ranges, vec![3..5]);
+        assert_eq!(repair(&out), ("- [x] one\n- [x ] two".to_string(), 1));
+
+        // Two marker conflicts on separate lines, indented and star bullets.
+        let out = merge(
+            "# H\n  * [ ] one\n- [/] two\nend",
+            "# H\n  * [/] one\n- [ ] two\nend",
+            "# H\n  * [x] one\n- [x] two\nend",
+        );
+        assert_eq!(out.text, "# H\n  * [/x] one\n- [ x] two\nend");
+        assert_eq!(out.conflict_ranges.len(), 2, "{out:?}");
+        let (repaired, count) = repair(&out);
+        assert_eq!(repaired, "# H\n  * [/] one\n- [ ] two\nend");
+        assert_eq!(count, 2);
+        assert_eq!(parse_tasks(&repaired).len(), 2);
+    }
+
+    #[test]
+    fn repair_without_conflicts_is_identity() {
+        let text = "- [ ] a\n* [x] b\n  - [/] c\n- [X] d\nsee [x ] in prose\n- [x ] stale\n";
+        assert_eq!(repair_checkbox_markers(text, &[]), (text.to_string(), 0));
+        assert_eq!(repair_checkbox_markers("", &[]), (String::new(), 0));
+    }
+
+    #[test]
+    fn repair_shapes_within_a_covering_range() {
+        let text = "# H\n  * [/ ] one\n- [ x] two\n- [xX/] three\nsee [x ] prose\n- [xy] t\nend";
+        let all: Vec<Range<usize>> = std::iter::once(0..text.len()).collect();
+        let (repaired, count) = repair_checkbox_markers(text, &all);
+        assert_eq!(
+            repaired,
+            "# H\n  * [/] one\n- [ ] two\n- [x] three\nsee [x ] prose\n- [xy] t\nend"
+        );
+        assert_eq!(count, 3);
+        // A range touching only the text after the bracket run does not qualify.
+        let after_run: Vec<Range<usize>> = std::iter::once(6..8).collect();
+        assert_eq!(
+            repair_checkbox_markers("- [x ] t", &after_run),
+            ("- [x ] t".to_string(), 0)
+        );
+        let last_marker_char: Vec<Range<usize>> = std::iter::once(5..6).collect();
+        assert_eq!(
+            repair_checkbox_markers("- [x ] t", &last_marker_char),
+            ("- [x] t".to_string(), 1)
+        );
     }
 }
