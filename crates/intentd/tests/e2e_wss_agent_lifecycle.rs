@@ -7625,9 +7625,13 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     .await;
     assert_eq!(send2["success"], true);
     assert_eq!(send2["queued"], true, "second send should queue: {send2}");
-    // (a) The queued entry wire shape carries messageMetadata verbatim.
+    // (a) The queued entry wire shape carries messageMetadata verbatim, plus
+    // the daemon's `fromPrincipalId` stamp for the wire caller.
+    let me = wss_rpc(&mut rpc, 15, "principal.me", json!({})).await;
+    let mut stamped = metadata.clone();
+    stamped["fromPrincipalId"] = me["id"].clone();
     assert_eq!(
-        send2["queuedMessage"]["messageMetadata"], metadata,
+        send2["queuedMessage"]["messageMetadata"], stamped,
         "queued entry must carry messageMetadata: {send2}"
     );
 
@@ -7641,7 +7645,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     .await;
     let queue = q["queue"].as_array().expect("queue array");
     assert_eq!(queue.len(), 1);
-    assert_eq!(queue[0]["messageMetadata"], metadata);
+    assert_eq!(queue[0]["messageMetadata"], stamped);
 
     // Wait for both turns to finish (first send + drained queued send).
     let mut stream_end_count = 0;
@@ -7676,7 +7680,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
                     .is_some_and(|t| t.starts_with("tagged queued message"))
         })
         .expect("drained user message row present");
-    for (key, want) in metadata.as_object().unwrap() {
+    for (key, want) in stamped.as_object().unwrap() {
         assert_eq!(
             &tagged["metadata"][key], want,
             "drained user row must persist messageMetadata field {key}: {tagged}"
@@ -7695,9 +7699,12 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     );
     // Both direct-delivery placements are covered: the row-level `metadata`
     // column (direct `agent.sendMessage` parity) and the in-block fold
-    // (`deliver_wake_message` parity) — the fold carries queueInfo too.
+    // (`deliver_wake_message` parity) — the fold carries queueInfo too, but
+    // the `fromPrincipalId` stamp stays row-level only.
+    let mut folded = tagged["metadata"].clone();
+    folded.as_object_mut().unwrap().remove("fromPrincipalId");
     assert_eq!(
-        tagged["contentBlocks"][0]["messageMetadata"], tagged["metadata"],
+        tagged["contentBlocks"][0]["messageMetadata"], folded,
         "drained user block must fold the same messageMetadata: {tagged}"
     );
 }
@@ -12993,23 +13000,24 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     })
     .await
     .expect("human row reached the chat channel");
-    match lean.get("metadata") {
-        None => {} // direct delivery: the lean metadata-free entity shape
-        Some(md) => {
-            // Queued delivery race: only the drain-time queueInfo stamp is
-            // allowed — human sends never gain A2A attribution metadata.
-            let keys: Vec<&String> = md
-                .as_object()
-                .unwrap_or_else(|| panic!("metadata is an object: {lean}"))
-                .keys()
-                .collect();
-            assert_eq!(
-                keys,
-                vec!["queueInfo"],
-                "a human row carries at most the queueInfo stamp: {lean}"
-            );
-        }
-    }
+    // A human row carries the daemon's `fromPrincipalId` stamp for the wire
+    // caller and, on the queued-delivery race, the drain-time queueInfo stamp
+    // — never A2A attribution metadata.
+    let md = lean["metadata"]
+        .as_object()
+        .unwrap_or_else(|| panic!("metadata is an object: {lean}"));
+    assert!(
+        md["fromPrincipalId"].is_string(),
+        "a human row carries the principal stamp: {lean}"
+    );
+    let extra: Vec<&String> = md
+        .keys()
+        .filter(|k| *k != "fromPrincipalId" && *k != "queueInfo")
+        .collect();
+    assert!(
+        extra.is_empty(),
+        "a human row carries at most the principal + queueInfo stamps: {lean}"
+    );
 
     // Contrast: a parentless BYSTANDER sending to the CHILD — a created
     // worker target (parent linkage), not an independent top-level peer —

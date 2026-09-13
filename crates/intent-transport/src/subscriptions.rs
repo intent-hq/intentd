@@ -1268,6 +1268,10 @@ impl ChatDeltaState {
         // `appMessageId` (`AgentMessage` skips the field when `None`), but a
         // hand-built row (tests, future callers) shouldn't leak `null`.
         let app_message_id = msg.get("appMessageId").filter(|v| !v.is_null());
+        // Lift the re-read's resolved `author` (user rows only) onto each
+        // entity so subscribers render the human author live, mirroring the
+        // `agent.getConversation` row shape. Omitted when absent.
+        let author = msg.get("author").filter(|v| !v.is_null());
         let blocks = msg.get("contentBlocks").and_then(Value::as_array)?;
         let mut added = Vec::new();
         let mut updated = Vec::new();
@@ -1301,6 +1305,9 @@ impl ChatDeltaState {
                 }
                 if let Some(app_id) = app_message_id {
                     obj.insert("appMessageId".to_string(), app_id.clone());
+                }
+                if let Some(author) = author {
+                    obj.insert("author".to_string(), author.clone());
                 }
             }
             push_entity(&mut added, &mut updated, is_added, entity);
