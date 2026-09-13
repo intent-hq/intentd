@@ -4215,8 +4215,12 @@ async fn wss_collaborator_git_push_succeeds_against_bare_remote() {
 /// agent's `ws.host.exec` binding — the intent-acp `workspace_api` front
 /// door bound to the agent as caller, against the same services the WSS
 /// listener serves — then runs a real process in the workspace checkout and
-/// returns its stdout. The service seam agrees: `Caller::Agent` passes
-/// `host_exec`, a collaborator wire caller is `Forbidden`.
+/// returns its stdout. The bridge is driven inside the collaborator's own
+/// `Caller::Wire` scope, so the pass is owed to the binding rebinding
+/// `Caller::Agent` (a bridge with no caller agent inherits the scope and is
+/// refused), not to the gate's unbound-caller permit. The service seam
+/// agrees: `Caller::Agent` passes `host_exec`, a collaborator wire caller is
+/// `Forbidden`.
 #[tokio::test]
 async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities() {
     use intent_acp::WorkspaceMcpServer;
@@ -4306,20 +4310,26 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
 
     // The steered agent's binding: `ws.host.exec` through the intent-acp
     // `workspace_api` tool, bound to the agent, over the harness services.
+    // Driven inside the collaborator's wire scope: only the bridge's own
+    // `Caller::Agent` rebinding lets the call through.
     let agent_typed = AgentId::from_string(agent_id.clone());
+    let collaborator = Caller::Wire {
+        principal_id: guest.principal.id.clone(),
+        is_administrator: false,
+    };
+    let tool_call = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "workspace_api",
+            "arguments": {
+                "code": "return JSON.stringify(await ws.host.exec({ command: 'sh', args: ['-c', 'echo steered && pwd'] }));",
+                "summary": "collaborator-steered host.exec"
+            }
+        }
+    });
     let bridge = WorkspaceMcpServer::new(srv.api.clone(), ws_typed.clone())
         .with_caller_agent_id(Some(agent_typed.clone()));
-    let resp = bridge
-        .handle_message(&json!({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {
-                "name": "workspace_api",
-                "arguments": {
-                    "code": "return JSON.stringify(await ws.host.exec({ command: 'sh', args: ['-c', 'echo steered && pwd'] }));",
-                    "summary": "collaborator-steered host.exec"
-                }
-            }
-        }))
+    let resp = with_caller(collaborator.clone(), bridge.handle_message(&tool_call))
         .await
         .expect("tools/call returns a response");
     assert_eq!(resp["result"]["isError"], false, "binding: {resp}");
@@ -4343,6 +4353,24 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
         repo.display()
     );
 
+    // Control: a bridge with no caller agent inherits the enclosing
+    // collaborator scope and is refused — the pass above is the binding's.
+    let unbound = WorkspaceMcpServer::new(srv.api.clone(), ws_typed.clone());
+    let refused = with_caller(collaborator.clone(), unbound.handle_message(&tool_call))
+        .await
+        .expect("tools/call returns a response");
+    assert_eq!(
+        refused["result"]["isError"], true,
+        "unbound bridge: {refused}"
+    );
+    let refused_text = refused["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool text: {refused}"));
+    assert!(
+        refused_text.contains("forbidden: host.exec requires the daemon administrator"),
+        "unbound bridge must surface the gate's refusal: {refused_text}"
+    );
+
     // Service seam: the agent caller passes where the collaborator's own
     // wire caller is Forbidden — the same gate the transport fronts.
     let by_agent = with_caller(
@@ -4356,10 +4384,7 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
     .expect("agent host_exec");
     assert_eq!(by_agent["exitCode"], 0);
     let by_collaborator = with_caller(
-        Caller::Wire {
-            principal_id: guest.principal.id.clone(),
-            is_administrator: false,
-        },
+        collaborator,
         srv.api.host_exec(ws_typed, json!({ "command": "true" })),
     )
     .await;
