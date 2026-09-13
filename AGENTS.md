@@ -186,6 +186,7 @@ pass. Run them from the monorepo root via the top-level `Makefile`:
 ```bash
 make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
 make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
+make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes
 make gate     # check, then test
 ```
 
