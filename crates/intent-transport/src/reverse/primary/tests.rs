@@ -139,6 +139,51 @@ async fn ineligible_and_unhelloed_connections_never_receive_default_dispatch() {
     );
 }
 
+/// Multiplayer w3: a connection bound to a non-administrator principal is
+/// never an eligible reverse target, even when its `client.hello` advertises
+/// `browserExec` — `Default`, `Client`, and `Pinned` resolution all skip it.
+#[tokio::test]
+async fn non_administrator_connections_are_never_eligible_reverse_targets() {
+    let reg = PrimaryReverseRegistry::new();
+    let (guest_tx, mut rx_guest) = mpsc::channel::<String>(4);
+    let guest = ReverseChannel::new(guest_tx).with_administrator(false);
+    let (owner, mut rx_owner) = idle_channel();
+    let g_guest = reg.register(guest, ReverseTransport::Wss);
+    g_guest.bind(identity("guest", true));
+    assert!(
+        !reg.is_connected(),
+        "a non-administrator connection must not count as an eligible client"
+    );
+    assert!(matches!(
+        reg.resolve(&client("guest")),
+        Err(ReverseDispatchError::ClientOffline { client_id, pinned: false, .. })
+            if client_id.as_str() == "guest"
+    ));
+
+    let g_owner = reg.register(owner.clone(), ReverseTransport::Wss);
+    g_owner.bind(identity("owner", true));
+    assert!(reg.is_connected());
+    let out = dispatch_and_reply(
+        &reg,
+        ReverseTarget::Default,
+        &owner,
+        &mut rx_owner,
+        json!({ "primary": "owner" }),
+    )
+    .await
+    .expect("ok");
+    assert_eq!(out, json!({ "primary": "owner" }));
+    assert!(
+        rx_guest.try_recv().is_err(),
+        "a non-administrator connection must never see browser.exec"
+    );
+    assert!(reg
+        .dispatch("browser.exec", json!({ "actions": [] }), pinned("guest"))
+        .await
+        .is_err());
+    assert!(rx_guest.try_recv().is_err());
+}
+
 #[tokio::test]
 async fn default_dispatch_routes_to_the_first_connected_eligible_channel() {
     let reg = PrimaryReverseRegistry::new();
