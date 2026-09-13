@@ -335,7 +335,10 @@ impl Store {
     /// snapshot: a write committing mid-export can no longer land a `note`
     /// row and a `note_version` snapshot from different revisions in the
     /// same archive (intent-hq/intent#4876). Readers never block the writer
-    /// in WAL mode, so holding the snapshot across all tables is free.
+    /// in WAL mode, so concurrent writes still proceed; the cost is that a
+    /// checkpoint cannot advance past this snapshot while it is held, so the
+    /// WAL can grow for the duration of a large export under sustained
+    /// writes (one-shot RPC, reclaimed at the next checkpoint after commit).
     ///
     /// # Errors
     ///
