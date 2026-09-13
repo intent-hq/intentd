@@ -8452,6 +8452,17 @@ mod change_event_parity {
         }
     }
 
+    /// Harness variant with the intent-hq/intentd#1857 `task.update`
+    /// projection park armed, so a race test can hold the first attempt
+    /// between the linked-line projection and the gated parent write.
+    async fn harness_with_task_update_park(
+        park: std::sync::Arc<crate::script_ops::SupervisePark>,
+    ) -> Harness {
+        let mut h = harness().await;
+        h.services = h.services.clone().with_task_update_projection_park(park);
+        h
+    }
+
     /// Subscribe to this workspace with immediate (un-batched) delivery.
     fn subscribe(h: &Harness) -> Subscription {
         h.bus.subscribe(SubscriptionFilter {
@@ -13628,6 +13639,92 @@ mod change_event_parity {
                 "{start:?}"
             );
         }
+    }
+
+    /// intent-hq/intentd#1857 review counterexample: the linked agent's
+    /// `task.update` (text + `todo`) projects `[ ]` from a read that saw the
+    /// task `in_progress`; before its parent write lands, another caller
+    /// completes the task and materialization rewrites the line to `[x]`.
+    /// The stale projection must not be three-way-merged onto the current
+    /// text (`[/]` → `[x]` vs `[/]` → `[ ]` char-interleave into `[x ]`, no
+    /// longer a checkbox): the gate miss re-derives from the fresh parent,
+    /// where the guard now refuses `todo` and the line projects `[x]`.
+    #[tokio::test]
+    async fn linked_line_write_re_derives_after_concurrent_completion() {
+        let park = std::sync::Arc::new(crate::script_ops::SupervisePark::default());
+        let h = harness_with_task_update_park(park.clone()).await;
+        insert_task_note(&h, T1, TaskStatus::InProgress).await;
+        // Versioned write so a snapshot exists at the writer's read rev: the
+        // three-way merge needs that base to produce the interleave (without
+        // one it degrades to last-writer-wins, which the refused write's
+        // materialization would then heal).
+        h.store
+            .insert_note(&note(&h.ws, "spec", "- [ ] placeholder"))
+            .await
+            .expect("insert spec");
+        let mut spec = h.store.get_note(&h.ws, &spec_id()).await.expect("spec");
+        spec.content = linked("[/]", "T", T1);
+        spec.updated_at = now_iso();
+        h.store
+            .update_note_with_version(&spec, None, &crate::user_version_author(), &spec.updated_at)
+            .await
+            .expect("versioned spec write");
+        let agent = AgentId::from("agent-linked");
+        let mut session = auto_unarchive_session(&agent, &h.ws, "Linked");
+        session.task_note_id = Some(intent_core::NoteId::from(T1));
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        let new_text = format!("[T](intent://local/task/{T1}) renamed");
+
+        let writer = {
+            let services = h.services.clone();
+            let ws = h.ws.clone();
+            let new_text = new_text.clone();
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                services
+                    .task_update(
+                        ws,
+                        spec_id(),
+                        1,
+                        Some(new_text),
+                        Some("todo".into()),
+                        None,
+                        Some(agent),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("task.update parks before its parent write");
+
+        // Another caller completes the task inside the window; materialization
+        // rewrites the linked line to `[x]`.
+        set_status(&h, T1, "complete").await;
+        assert_eq!(
+            note_content(&h, "spec").await.0,
+            linked("[x]", "T", T1),
+            "completion materialized before the stale write"
+        );
+
+        park.release.notify_one();
+        let r = tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("writer finishes")
+            .expect("writer task")
+            .expect("task.update");
+
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+        assert_eq!(
+            note_content(&h, "spec").await.0,
+            format!("- [x] {new_text}"),
+            "re-derived line carries the terminal marker, not a merged `[x ]`"
+        );
+        assert_eq!(r.status, "done", "echoes the projected marker");
+        assert_eq!(r.new_text, new_text);
     }
 }
 
