@@ -70,27 +70,72 @@ fn stamping_principal_id() -> Option<PrincipalId> {
 /// their drain/redrive all carry the same [`FROM_PRINCIPAL_ID_KEY`]: a wire
 /// caller's principal overwrites whatever the client supplied; an agent /
 /// daemon / absent caller strips the key instead. Every other field passes
-/// through untouched; a non-object payload cannot carry the stamp and is
-/// returned as-is (the row then resolves through the workspace fallback at
-/// serve time). Metadata only — the content is never annotated, so prompts
-/// stay byte-identical.
-pub(crate) fn stamp_principal_attribution(message_metadata: Option<Value>) -> Option<Value> {
-    match (message_metadata, stamping_principal_id()) {
-        (Some(Value::Object(mut obj)), Some(principal_id)) => {
+/// through untouched. A non-object payload cannot carry the stamp and is
+/// rejected with `InvalidParams` (the same rule `agent.queueMessage` and
+/// `userAppMessageId` already apply) — a human send must never be credited
+/// to the workspace fallback because its metadata had the wrong shape.
+/// Metadata only — the content is never annotated, so prompts stay
+/// byte-identical.
+pub(crate) fn stamp_principal_attribution(
+    message_metadata: Option<Value>,
+) -> Result<Option<Value>> {
+    let metadata = match message_metadata {
+        None => None,
+        Some(Value::Object(obj)) => Some(obj),
+        Some(_) => {
+            return Err(Error::InvalidParams(
+                "messageMetadata must be an object".to_string(),
+            ))
+        }
+    };
+    Ok(match (metadata, stamping_principal_id()) {
+        (Some(mut obj), Some(principal_id)) => {
             obj.insert(
                 FROM_PRINCIPAL_ID_KEY.to_string(),
                 Value::String(principal_id.0),
             );
             Some(Value::Object(obj))
         }
-        (Some(Value::Object(mut obj)), None) => {
+        (Some(mut obj), None) => {
             obj.remove(FROM_PRINCIPAL_ID_KEY);
             Some(Value::Object(obj))
         }
         (None, Some(principal_id)) => Some(json!({ FROM_PRINCIPAL_ID_KEY: principal_id.0 })),
         (None, None) => None,
-        (other, _) => other,
+    })
+}
+
+/// `true` when a queue entry / message payload carries the daemon's human
+/// principal stamp — the authoritative "a person wrote this" marker,
+/// independent of the entry's lifecycle origin (a human wake delivered
+/// through `deliver_wake_message` is enqueued as `Automatic`, yet stamped).
+pub(crate) fn carries_principal_stamp(message_metadata: Option<&Value>) -> bool {
+    lift_from_principal_id(message_metadata).is_some()
+}
+
+/// `true` when an unstamped queue entry's `messageMetadata` still reads as
+/// human-authored — the same rule the fe applies to transcript rows: an
+/// entry is agent/automatic origin iff its metadata is an object with a
+/// string `type` (other than the user-authored `question_answers` wizard
+/// tag), a non-empty `fromAgentId`, or `source == "system"`. Absent or
+/// non-object metadata fails open (human).
+fn is_human_authored_metadata(message_metadata: Option<&Value>) -> bool {
+    let Some(Value::Object(obj)) = message_metadata else {
+        return true;
+    };
+    match obj.get("type").and_then(Value::as_str) {
+        Some("question_answers") => return true,
+        Some(_) => return false,
+        None => {}
     }
+    if obj
+        .get("fromAgentId")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return false;
+    }
+    obj.get("source").and_then(Value::as_str) != Some("system")
 }
 
 /// Strip a client-supplied [`FROM_PRINCIPAL_ID_KEY`] without stamping — for
@@ -122,9 +167,10 @@ fn author_to_wire(principal_id: &PrincipalId, principal: Option<&Principal>) -> 
 /// Serve-time author resolution for the user messages of one workspace
 /// (multiplayer w2): the stamped [`FROM_PRINCIPAL_ID_KEY`], else the
 /// workspace's `legacy_author_principal_id`, else its current owner. One
-/// resolver per read so the workspace fallback is loaded at most once and
-/// each distinct principal at most once (RPC cost contract: bounded by the
-/// distinct authors on the page, never by its length).
+/// resolver per read: the workspace fallback is loaded at most once and a
+/// page's distinct authors are fetched in ONE batched statement by
+/// [`Self::prefetch`] (RPC cost contract: a transcript page costs a bounded
+/// number of statements, never one per distinct author).
 pub(crate) struct MessageAuthorResolver<'a> {
     services: &'a Services,
     workspace_id: &'a WorkspaceId,
@@ -133,6 +179,9 @@ pub(crate) struct MessageAuthorResolver<'a> {
     /// no fallback author.
     fallback: OnceCell<Option<PrincipalId>>,
     principals: HashMap<PrincipalId, Option<Principal>>,
+    /// Principal-table round trips issued so far (batched or single).
+    #[cfg(test)]
+    principal_lookups: usize,
 }
 
 impl<'a> MessageAuthorResolver<'a> {
@@ -142,6 +191,56 @@ impl<'a> MessageAuthorResolver<'a> {
             workspace_id,
             fallback: OnceCell::new(),
             principals: HashMap::new(),
+            #[cfg(test)]
+            principal_lookups: 0,
+        }
+    }
+
+    /// Warm the cache for one page: every distinct stamped principal in
+    /// `stamps` (the lifted stamp of each user row, `None` when unstamped)
+    /// plus the workspace fallback when any row is unstamped, in a single
+    /// `get_principals` statement. Only ids not already cached are fetched;
+    /// a failed batch leaves the cache untouched and [`Self::resolve`] falls
+    /// back to single lookups.
+    async fn prefetch(&mut self, stamps: Vec<Option<PrincipalId>>) {
+        let mut wanted: Vec<PrincipalId> = Vec::new();
+        let mut needs_fallback = false;
+        for stamp in stamps {
+            match stamp {
+                Some(id) => {
+                    if !self.principals.contains_key(&id) && !wanted.contains(&id) {
+                        wanted.push(id);
+                    }
+                }
+                None => needs_fallback = true,
+            }
+        }
+        if needs_fallback {
+            if let Some(id) = self.fallback_principal_id().await {
+                if !self.principals.contains_key(&id) && !wanted.contains(&id) {
+                    wanted.push(id);
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.principal_lookups += 1;
+        }
+        match self.services.store.get_principals(&wanted).await {
+            Ok(found) => {
+                for p in found {
+                    self.principals.insert(p.id.clone(), Some(p));
+                }
+                for id in wanted {
+                    self.principals.entry(id).or_insert(None);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "message author: batched principal read failed");
+            }
         }
     }
 
@@ -174,6 +273,10 @@ impl<'a> MessageAuthorResolver<'a> {
             None => self.fallback_principal_id().await?,
         };
         if !self.principals.contains_key(&principal_id) {
+            #[cfg(test)]
+            {
+                self.principal_lookups += 1;
+            }
             let loaded = match self.services.store.get_principal(&principal_id).await {
                 Ok(p) => Some(p),
                 Err(Error::NotFound(_)) => None,
@@ -190,9 +293,51 @@ impl<'a> MessageAuthorResolver<'a> {
         ))
     }
 
+    /// Set `author` on EVERY entry of a queue snapshot (`agent.getQueue` /
+    /// `agent:queue:updated`): the key is always present so a client can
+    /// treat it as authoritative — the projection resolved from the entry's
+    /// `messageMetadata` in the same order as a transcript user row (stamp,
+    /// else workspace fallback) and the same batched shape, or an explicit
+    /// `null`. A stamped entry always resolves (the stamp is the daemon's own
+    /// "a person submitted this" marker); an unstamped entry gets the
+    /// workspace fallback only when its metadata still reads as
+    /// human-authored ([`is_human_authored_metadata`]) — agent-sent and
+    /// automatic (hook / monitor / system) entries are `null`, as is anything
+    /// the workspace cannot resolve.
+    pub(crate) async fn attach_queue(&mut self, entries: &mut [Value]) {
+        let candidates: Vec<(usize, Option<PrincipalId>)> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let md = e.get("messageMetadata");
+                let stamp = lift_from_principal_id(md);
+                (stamp.is_some() || is_human_authored_metadata(md)).then_some((i, stamp))
+            })
+            .collect();
+        self.prefetch(candidates.iter().map(|(_, s)| s.clone()).collect())
+            .await;
+        for entry in entries.iter_mut() {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("author".to_string(), Value::Null);
+            }
+        }
+        for (i, _) in candidates {
+            let metadata = entries[i].get("messageMetadata").cloned();
+            if let Some(author) = self.resolve(metadata.as_ref()).await {
+                entries[i]["author"] = author;
+            }
+        }
+    }
+
     /// Attach `author` to every `user`-role message object in `messages`
     /// (the serialized transcript page). Non-user rows are untouched.
     pub(crate) async fn attach(&mut self, messages: &mut [Value]) {
+        let stamps = messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .map(|m| lift_from_principal_id(m.get("metadata")))
+            .collect();
+        self.prefetch(stamps).await;
         for message in messages.iter_mut() {
             if message.get("role").and_then(Value::as_str) != Some("user") {
                 continue;
@@ -203,6 +348,24 @@ impl<'a> MessageAuthorResolver<'a> {
             if let Some(obj) = message.as_object_mut() {
                 obj.insert("author".to_string(), author);
             }
+        }
+    }
+
+    /// Typed twin of [`Self::attach`] for reads that serve
+    /// [`intent_core::AgentMessage`] rows directly (`agent.getSession`):
+    /// same resolution, same `author` shape, so both hydration routes agree.
+    pub(crate) async fn attach_typed(&mut self, messages: &mut [intent_core::AgentMessage]) {
+        let stamps = messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| lift_from_principal_id(m.metadata.as_ref()))
+            .collect();
+        self.prefetch(stamps).await;
+        for message in messages.iter_mut() {
+            if message.role != "user" {
+                continue;
+            }
+            message.author = self.resolve(message.metadata.as_ref()).await;
         }
     }
 }
@@ -363,9 +526,10 @@ mod tests {
             (
                 stamp_principal_attribution(Some(
                     json!({ "fromPrincipalId": "someone-else", "kind": "reply" }),
-                )),
-                stamp_principal_attribution(Some(json!({ "kind": "reply" }))),
-                stamp_principal_attribution(None),
+                ))
+                .unwrap(),
+                stamp_principal_attribution(Some(json!({ "kind": "reply" }))).unwrap(),
+                stamp_principal_attribution(None).unwrap(),
             )
         })
         .await;
@@ -380,6 +544,48 @@ mod tests {
         assert_eq!(absent, Some(json!({ "fromPrincipalId": me.0 })));
     }
 
+    /// A non-object payload cannot carry the stamp: it is rejected as
+    /// `InvalidParams` for every caller kind instead of slipping past the
+    /// stamp (which would credit a human send to the workspace fallback).
+    #[tokio::test]
+    async fn stamp_rejects_non_object_metadata_for_every_caller() {
+        let me = PrincipalId::new();
+        for payload in [json!("x"), json!([]), json!(7), json!(true)] {
+            let wire_err = with_caller(wire(&me), {
+                let payload = payload.clone();
+                async move { stamp_principal_attribution(Some(payload)) }
+            })
+            .await;
+            assert!(
+                matches!(wire_err, Err(Error::InvalidParams(ref m)) if m == "messageMetadata must be an object"),
+                "wire caller, payload {payload}: {wire_err:?}"
+            );
+            let daemon_err = with_caller(Caller::Daemon, {
+                let payload = payload.clone();
+                async move { stamp_principal_attribution(Some(payload)) }
+            })
+            .await;
+            assert!(
+                matches!(daemon_err, Err(Error::InvalidParams(_))),
+                "daemon caller, payload {payload}: {daemon_err:?}"
+            );
+            assert!(
+                matches!(
+                    stamp_principal_attribution(Some(payload.clone())),
+                    Err(Error::InvalidParams(_))
+                ),
+                "unbound caller, payload {payload}"
+            );
+        }
+        assert!(carries_principal_stamp(Some(
+            &json!({ "fromPrincipalId": me.0 })
+        )));
+        assert!(!carries_principal_stamp(Some(
+            &json!({ "fromAgentId": "a" })
+        )));
+        assert!(!carries_principal_stamp(None));
+    }
+
     /// Agents, the daemon and an unbound context are not people: a
     /// client-supplied stamp is stripped and nothing is added.
     #[tokio::test]
@@ -389,33 +595,27 @@ mod tests {
             Caller::Agent {
                 agent_id: AgentId::new(),
             },
-            async { stamp_principal_attribution(spoofed()) },
+            async { stamp_principal_attribution(spoofed()).unwrap() },
         )
         .await;
         let daemon = with_caller(Caller::Daemon, async {
-            stamp_principal_attribution(spoofed())
+            stamp_principal_attribution(spoofed()).unwrap()
         })
         .await;
-        let unbound = stamp_principal_attribution(spoofed());
+        let unbound = stamp_principal_attribution(spoofed()).unwrap();
         for (label, got) in [("agent", agent), ("daemon", daemon), ("unbound", unbound)] {
             assert_eq!(got, Some(json!({ "kind": "reply" })), "{label}");
         }
         assert_eq!(
-            with_caller(Caller::Daemon, async { stamp_principal_attribution(None) }).await,
+            with_caller(Caller::Daemon, async {
+                stamp_principal_attribution(None).unwrap()
+            })
+            .await,
             None
         );
         assert_eq!(
             strip_principal_attribution(spoofed()),
             Some(json!({ "kind": "reply" }))
-        );
-        // A non-object payload cannot carry the stamp and is left alone.
-        let me = PrincipalId::new();
-        assert_eq!(
-            with_caller(wire(&me), async {
-                stamp_principal_attribution(Some(json!("x")))
-            })
-            .await,
-            Some(json!("x"))
         );
     }
 
@@ -478,5 +678,189 @@ mod tests {
         assert_eq!(page[0]["author"]["principalId"], primary.id.0);
         assert!(page[1].get("author").is_none());
         assert_eq!(page[2]["author"]["principalId"], guest.id.0);
+
+        // The typed twin (`agent.getSession`) produces the identical `author`
+        // per row — stamped, legacy-fallback and non-user alike.
+        let typed_row = |role: &str, metadata: Option<Value>| intent_core::AgentMessage {
+            id: format!("m-{role}"),
+            agent_id: AgentId::from("agent-typed"),
+            seq: 0,
+            role: role.to_string(),
+            content: json!([]),
+            metadata,
+            app_message_id: None,
+            author: None,
+            created_at: now_iso(),
+        };
+        let mut typed = vec![
+            typed_row("user", Some(json!({ "fromPrincipalId": primary.id.0 }))),
+            typed_row("assistant", None),
+            typed_row("user", None),
+        ];
+        let mut resolver = MessageAuthorResolver::new(&services, &ws);
+        resolver.attach_typed(&mut typed).await;
+        assert_eq!(typed[0].author, page[0].get("author").cloned());
+        assert_eq!(typed[1].author, None);
+        assert_eq!(typed[2].author, page[2].get("author").cloned());
+        let serialized = serde_json::to_value(&typed[1]).expect("serialize");
+        assert!(
+            serialized.get("author").is_none(),
+            "an unresolved author is omitted from the wire shape: {serialized}"
+        );
+    }
+
+    /// RPC cost contract: a transcript page with D distinct authors (stamped
+    /// and unstamped, known and vanished) costs ONE principal statement on
+    /// both hydration routes, not D — and rows the batch already answered
+    /// never trigger a single lookup.
+    #[tokio::test]
+    async fn resolver_batches_a_page_into_one_principal_lookup() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let primary = store.get_primary_principal().await.expect("primary");
+        let guests: Vec<Principal> = (0..3).map(|i| principal(&format!("g{i}"))).collect();
+        for g in &guests {
+            store.upsert_principal(g).await.expect("guest");
+        }
+        let services = Services::new(store);
+
+        let mut page = Vec::new();
+        for g in &guests {
+            for _ in 0..2 {
+                page.push(json!({ "role": "user", "metadata": { "fromPrincipalId": g.id.0 } }));
+            }
+        }
+        page.push(json!({ "role": "user", "metadata": { "fromPrincipalId": "gone" } }));
+        page.push(json!({ "role": "user" }));
+        page.push(json!({ "role": "assistant" }));
+        page.push(json!({ "role": "user", "metadata": { "fromPrincipalId": primary.id.0 } }));
+
+        let mut resolver = MessageAuthorResolver::new(&services, &ws);
+        resolver.attach(&mut page).await;
+        assert_eq!(
+            resolver.principal_lookups, 1,
+            "one batched statement for the whole page"
+        );
+        for (i, g) in guests.iter().enumerate() {
+            assert_eq!(page[2 * i]["author"]["principalId"], g.id.0);
+            assert_eq!(page[2 * i]["author"]["login"], format!("g{i}"));
+        }
+        assert_eq!(
+            page[6]["author"],
+            json!({ "principalId": "gone", "login": null, "displayName": null, "avatarUrl": null })
+        );
+        assert_eq!(page[7]["author"]["principalId"], primary.id.0);
+        assert!(page[8].get("author").is_none());
+        assert_eq!(page[9]["author"]["principalId"], primary.id.0);
+
+        // The typed route batches identically.
+        let typed_row = |metadata: Option<Value>| intent_core::AgentMessage {
+            id: "m".to_string(),
+            agent_id: AgentId::from("agent-typed"),
+            seq: 0,
+            role: "user".to_string(),
+            content: json!([]),
+            metadata,
+            app_message_id: None,
+            author: None,
+            created_at: now_iso(),
+        };
+        let mut typed: Vec<_> = guests
+            .iter()
+            .map(|g| typed_row(Some(json!({ "fromPrincipalId": g.id.0 }))))
+            .chain(std::iter::once(typed_row(None)))
+            .collect();
+        let mut resolver = MessageAuthorResolver::new(&services, &ws);
+        resolver.attach_typed(&mut typed).await;
+        assert_eq!(resolver.principal_lookups, 1);
+        assert!(typed.iter().all(|m| m.author.is_some()));
+
+        // An empty / non-user page issues no principal statement at all.
+        let mut resolver = MessageAuthorResolver::new(&services, &ws);
+        resolver.attach(&mut [json!({ "role": "assistant" })]).await;
+        assert_eq!(resolver.principal_lookups, 0);
+    }
+
+    /// Queue snapshots carry `author` on EVERY entry, resolved from
+    /// `messageMetadata` with the transcript's order and shape in one batched
+    /// statement: a stamped entry is its principal, an unstamped human entry
+    /// (no metadata, or the user-authored `question_answers` tag) falls back
+    /// to the workspace author, and agent-sent (`fromAgentId`), automatic
+    /// (string `type`) and `source: "system"` entries are an explicit `null`
+    /// — never an absent key.
+    #[tokio::test]
+    async fn resolver_attaches_author_to_queue_entries() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let primary = store.get_primary_principal().await.expect("primary");
+        let guest = principal("guest");
+        store.upsert_principal(&guest).await.expect("guest");
+        let services = Services::new(store);
+
+        let mut queue = vec![
+            json!({ "id": "q1", "content": "hi", "queuedAt": now_iso(), "position": 0,
+                    "messageMetadata": { "fromPrincipalId": guest.id.0 } }),
+            json!({ "id": "q2", "content": "legacy", "queuedAt": now_iso(), "position": 1 }),
+            json!({ "id": "q3", "content": "from agent", "queuedAt": now_iso(), "position": 2,
+                    "messageMetadata": { "fromAgentId": "agent-x", "fromAgentName": "X" } }),
+            json!({ "id": "q4", "content": "wake", "queuedAt": now_iso(), "position": 3,
+                    "messageMetadata": { "type": "hook_dispatch" } }),
+            json!({ "id": "q5", "content": "answers", "queuedAt": now_iso(), "position": 4,
+                    "messageMetadata": { "type": "question_answers" } }),
+            json!({ "id": "q6", "content": "dismissed", "queuedAt": now_iso(), "position": 5,
+                    "messageMetadata": { "source": "system" } }),
+        ];
+        let mut resolver = MessageAuthorResolver::new(&services, &ws);
+        resolver.attach_queue(&mut queue).await;
+        assert_eq!(resolver.principal_lookups, 1, "one batched statement");
+        assert!(
+            queue.iter().all(|e| e.get("author").is_some()),
+            "every entry carries the key: {}",
+            json!(queue)
+        );
+        assert_eq!(
+            queue[0]["author"],
+            json!({ "principalId": guest.id.0, "login": "guest", "displayName": "guest name",
+                    "avatarUrl": "https://example.test/guest.png" })
+        );
+        assert_eq!(queue[1]["author"]["principalId"], primary.id.0);
+        assert_eq!(
+            queue[2]["author"],
+            Value::Null,
+            "agent-sent entry is an explicit null: {}",
+            queue[2]
+        );
+        assert_eq!(
+            queue[3]["author"],
+            Value::Null,
+            "automatic wake is an explicit null: {}",
+            queue[3]
+        );
+        assert_eq!(queue[4]["author"]["principalId"], primary.id.0);
+        assert_eq!(queue[5]["author"], Value::Null, "{}", queue[5]);
+        assert_eq!(
+            queue[0]["messageMetadata"]["fromPrincipalId"], guest.id.0,
+            "the stamp itself is untouched"
+        );
+
+        // A workspace that resolves no fallback (unknown row: no owner, no
+        // legacy author) still emits the key.
+        let unknown_ws = WorkspaceId::new();
+        let mut queue = vec![
+            json!({ "id": "q7", "content": "legacy", "queuedAt": now_iso(),
+                                     "position": 0 }),
+        ];
+        let mut resolver = MessageAuthorResolver::new(&services, &unknown_ws);
+        resolver.attach_queue(&mut queue).await;
+        assert_eq!(
+            queue[0]["author"],
+            Value::Null,
+            "unresolvable: {}",
+            queue[0]
+        );
     }
 }

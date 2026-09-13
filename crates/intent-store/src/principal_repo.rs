@@ -54,6 +54,34 @@ impl Store {
             .ok_or_else(|| Error::NotFound(format!("principal {id}")))
     }
 
+    /// Fetch the principals in `ids` that exist, in one `IN (...)` statement
+    /// per chunk of `IDS_PER_STATEMENT` (below the `SQLite` bound-variable
+    /// limit). Unknown ids are simply absent from the result; order is
+    /// unspecified.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_principals(&self, ids: &[PrincipalId]) -> Result<Vec<Principal>> {
+        const IDS_PER_STATEMENT: usize = 32_000;
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(IDS_PER_STATEMENT) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql =
+                format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE id IN ({placeholders})");
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(&id.0);
+            }
+            let rows = query
+                .fetch_all(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("get principals failed: {e}")))?;
+            out.extend(rows.iter().map(map_principal_row));
+        }
+        Ok(out)
+    }
+
     /// The daemon's primary principal (the original single user, minted by
     /// migration `0125_principals`).
     ///

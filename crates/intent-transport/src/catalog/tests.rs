@@ -373,3 +373,140 @@ fn aliases_point_to_router_methods() {
         );
     }
 }
+
+/// Multiplayer w2 — the frozen set of user-origin chat entry points (Product
+/// Brief "Chat attribution"). Each is a `(method, how the human principal
+/// stamp reaches the persisted row / queue entry)` tuple; the service-side
+/// matrix (`intent_services::agent_ops::tests::principal_stamp_overwrites_client_value_on_every_user_origin_entry_point`)
+/// proves the stamp per row, and this golden freezes the set so a new entry
+/// point cannot be added without classifying it.
+const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
+    (
+        "agent.appendMessage",
+        "role `user` rows are stamped in `WorkspaceApi::agent_append_message`; other roles strip",
+    ),
+    (
+        "agent.create",
+        "stores `initialMessage` on the session only — no transcript row; the kickoff arrives through agent.sendMessage",
+    ),
+    (
+        "agent.editAndRegenerate",
+        "the edited message is a fresh user row stamped with the editor in `WorkspaceApi::agent_edit_and_regenerate`",
+    ),
+    (
+        "agent.editQueuedMessage",
+        "a wire edit of a human-authored entry (stamped, or user-origin) re-stamps the editor; agent/daemon edits keep the author",
+    ),
+    (
+        "agent.queueMessage",
+        "stamped on the queue entry in `WorkspaceApi::agent_queue_message`; the drain re-persists it",
+    ),
+    (
+        "agent.retry",
+        "re-delivers the requeued entry, which carries the stamp captured at enqueue / wake delivery",
+    ),
+    (
+        "agent.sendMessage",
+        "user-origin sends are stamped in `WorkspaceApi::agent_send_message`; direct persist, busy enqueue and auto-queue share it",
+    ),
+    (
+        "agent.sendQueuedMessageNow",
+        "drains the entry with the stamp captured at enqueue (the drainer is not the author)",
+    ),
+    (
+        "agent.sendToTask",
+        "stamped in `WorkspaceApi::agent_send_to_task` before the assignee delivery",
+    ),
+    (
+        "agent.wakeOrCreate",
+        "stamped on the input in `WorkspaceApi::agent_wake_or_create`; the wake row, parked queue entry and worker options carry it",
+    ),
+];
+
+/// Router arms whose body reads a `messageMetadata` param, attributed to the
+/// arm's method name(s). Same single-line-arm assumption as
+/// [`extract_router_methods`].
+fn router_arms_reading_message_metadata() -> HashSet<String> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let router_path = std::path::Path::new(manifest_dir).join("src/router.rs");
+    let source =
+        std::fs::read_to_string(&router_path).expect("Failed to read router.rs at test time");
+    let mut current: Vec<String> = Vec::new();
+    let mut methods = HashSet::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        // A non-indented line is a top-level item boundary (the dispatch
+        // function ended; free helpers below mention the param in errors).
+        if !line.is_empty() && !line.starts_with(' ') {
+            current.clear();
+        }
+        if trimmed.starts_with('"') && line.contains("=>") {
+            let before_arrow = &line[..line.find("=>").unwrap_or(line.len())];
+            current = before_arrow
+                .split('"')
+                .map(str::trim)
+                .filter(|part| {
+                    part.contains('.')
+                        && part
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '.' || c == '_')
+                })
+                .map(str::to_string)
+                .collect();
+        }
+        if line.contains("\"messageMetadata\"") && !trimmed.starts_with("//") {
+            methods.extend(current.iter().cloned());
+        }
+    }
+    methods
+}
+
+#[test]
+fn user_origin_message_entry_points_frozen() {
+    let router_set: HashSet<&str> = ROUTER_METHODS.iter().copied().collect();
+    let mut seen = HashSet::new();
+    let mut previous: Option<&str> = None;
+    for (method, note) in USER_ORIGIN_MESSAGE_ENTRY_POINTS {
+        assert!(
+            router_set.contains(method),
+            "{method} is classified as a user-origin message entry point but is not in ROUTER_METHODS"
+        );
+        assert!(
+            !note.trim().is_empty(),
+            "{method}: the classification note must explain how the stamp reaches the row"
+        );
+        assert!(seen.insert(*method), "{method} is classified twice");
+        if let Some(prev) = previous {
+            assert!(
+                prev < *method,
+                "USER_ORIGIN_MESSAGE_ENTRY_POINTS must be sorted: {prev} before {method}"
+            );
+        }
+        previous = Some(method);
+    }
+    assert_eq!(
+        USER_ORIGIN_MESSAGE_ENTRY_POINTS.len(),
+        10,
+        "the Product Brief enumerates ten user-origin entry points; a change here needs \
+         the service matrix and docs/protocol/ updated alongside"
+    );
+
+    // Every router arm that accepts `messageMetadata` must be classified —
+    // a new metadata-carrying method cannot land unstamped.
+    let reading = router_arms_reading_message_metadata();
+    assert!(
+        !reading.is_empty(),
+        "no router arm reads \"messageMetadata\" — the source scan is broken"
+    );
+    let mut unclassified: Vec<_> = reading
+        .iter()
+        .filter(|m| !seen.contains(m.as_str()))
+        .cloned()
+        .collect();
+    unclassified.sort();
+    assert!(
+        unclassified.is_empty(),
+        "router arms read `messageMetadata` without a USER_ORIGIN_MESSAGE_ENTRY_POINTS \
+         classification (stamp the human principal or classify why not): {unclassified:?}"
+    );
+}
