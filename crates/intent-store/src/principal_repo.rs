@@ -417,6 +417,32 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Resolve an **active** credential to its principal and bump
+    /// `last_used_at` in one statement. `None` for an unknown or revoked
+    /// hash. The single `UPDATE … WHERE revoked_at IS NULL RETURNING` closes
+    /// the lookup-then-touch window in which a concurrent revoke would
+    /// otherwise still admit the credential (intent-hq/intentd#1868).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn resolve_active_principal_credential(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<PrincipalId>> {
+        let row = sqlx::query(
+            "UPDATE principal_credential SET last_used_at = ? \
+             WHERE token_hash = ? AND revoked_at IS NULL \
+             RETURNING principal_id",
+        )
+        .bind(now_iso())
+        .bind(token_hash)
+        .fetch_optional(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("resolve principal credential failed: {e}")))?;
+        Ok(row.map(|r| PrincipalId(r.get::<String, _>("principal_id"))))
+    }
+
     /// Revoke a credential by token hash. Idempotent: returns whether the
     /// row flipped from active to revoked (`false` for an unknown or
     /// already-revoked hash).
