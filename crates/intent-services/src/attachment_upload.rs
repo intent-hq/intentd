@@ -2160,14 +2160,20 @@ mod tests {
 
     /// Regression (monorepo#2275): a session idle past the TTL is dropped —
     /// its staging dir swept — and subsequent chunk/commit calls get a clear
-    /// caller error instead of operating on reclaimed state. The TTL is
-    /// pinned tiny via the `INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS` seam.
+    /// caller error instead of operating on reclaimed state.
+    ///
+    /// The TTL is pinned generous via the `INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS`
+    /// seam and the idle period is synthesized by advancing the paused
+    /// runtime clock (intent-hq/intent#4880): with a millisecond TTL on the
+    /// wall clock, a stall between `begin` and the first `chunk` expired the
+    /// session before the test reached the expiry step.
     #[tokio::test]
     async fn idle_session_expires_and_subsequent_ops_fail_cleanly() {
         let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
             "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
-            "50",
+            "3600000",
         )]);
+        let ttl = super::attachment_upload_idle_ttl();
         let ws = WorkspaceId("ws-up-ttl".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
@@ -2184,7 +2190,12 @@ mod tests {
             .join(&upload_id);
         assert!(staging.exists());
 
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        // Idle past the TTL on the runtime clock, then hand the clock back
+        // before the service calls (the store's pool-acquire timeouts are
+        // tokio timers a paused clock would auto-advance).
+        tokio::time::pause();
+        tokio::time::advance(ttl * 2).await;
+        tokio::time::resume();
 
         // The expired session fails cleanly and its staging dir is swept.
         let err = svc
