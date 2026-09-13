@@ -62,7 +62,40 @@ impl Drop for Daemon {
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
+        // The mock child's stderr (its `[mock-agent] …` lines, including the
+        // wake-trigger poll outcome) is captured per agent under
+        // `agent-logs/<agentId>/<date>.log`; surface it so a missing wake is
+        // attributable to the mock or the daemon from the test output alone.
+        for path in agent_stderr_logs(&intent_core::agent_logs_root(&self.data_dir)) {
+            if let Ok(log) = std::fs::read_to_string(&path) {
+                eprintln!(
+                    "=== AGENT STDERR LOG {} ===\n{log}\n=== END LOG ===",
+                    path.display()
+                );
+            }
+        }
     }
+}
+
+/// Every regular file under `root`, recursively (empty when `root` is absent).
+fn agent_stderr_logs(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 fn temp_data_dir() -> tempfile::TempDir {
@@ -210,12 +243,18 @@ where
     }
 }
 
+/// Next `events.event` frame within `secs` — one overall deadline, NOT reset
+/// per frame: the WSS heartbeat Ping cadence equals the 30 s budget the
+/// callers pass, so a per-frame timeout let a Ping re-arm the wait and a
+/// missing wake surfaced only as nextest's 180 s kill (with no test output)
+/// instead of this panic (intent-hq/intent#4943).
 async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
+        let next = tokio::time::timeout_at(deadline, ws.next())
             .await
             .expect("wss event timed out");
         match next {
@@ -318,6 +357,19 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 /// Serialize a conversation row's `contentBlocks` for substring assertions.
 fn blocks_text(message: &Value) -> String {
     serde_json::to_string(&message["contentBlocks"]).unwrap_or_default()
+}
+
+/// Publish the wake trigger atomically: write a sibling temp file, then
+/// `rename` it into place. `std::fs::write` is create+truncate THEN write,
+/// and the mock polls the path every 25 ms — under CPU load the test thread
+/// is descheduled between those two syscalls long enough for the poll to
+/// read the empty file, log `emitting 0 unsolicited chunk(s)`, and clear
+/// itself, losing the wake for good (intent-hq/intent#4943). A rename makes
+/// the file appear with its full contents or not at all.
+fn write_wake_trigger(trigger_file: &Path, contents: &str) {
+    let tmp = trigger_file.with_extension("txt.tmp");
+    std::fs::write(&tmp, contents).expect("write wake trigger temp");
+    std::fs::rename(&tmp, trigger_file).expect("publish wake trigger");
 }
 
 /// Boot the daemon with the wake-trigger mock, create an agent, and drive one
@@ -447,7 +499,7 @@ async fn harness_wake_burst_streams_as_agent_initiated_turn_over_wss() {
 
     // Fire the burst: the mock emits one out-of-turn agent_message_chunk per
     // trigger-file line, OUTSIDE any session/prompt.
-    std::fs::write(&setup.trigger_file, WAKE_LINES.join("\n")).expect("write wake trigger");
+    write_wake_trigger(&setup.trigger_file, &WAKE_LINES.join("\n"));
 
     let mut wake_message_id: Option<String> = None;
     let mut chunk_text = String::new();
@@ -575,7 +627,7 @@ async fn empty_wake_response_surfaces_attention_over_wss() {
     let agent_id = setup.agent_id.clone();
 
     // Fire the incident-shaped burst: ONE chunk containing a bare newline.
-    std::fs::write(&setup.trigger_file, "<NEWLINE_ONLY>\n").expect("write wake trigger");
+    write_wake_trigger(&setup.trigger_file, "<NEWLINE_ONLY>\n");
 
     let mut saw_attention = false;
     let mut saw_idle = false;
@@ -656,7 +708,7 @@ async fn racing_user_send_queues_behind_wake_turn_over_wss() {
     let mut setup = wake_setup(&script, &behavior).await;
     let agent_id = setup.agent_id.clone();
 
-    std::fs::write(&setup.trigger_file, WAKE_LINES.join("\n")).expect("write wake trigger");
+    write_wake_trigger(&setup.trigger_file, &WAKE_LINES.join("\n"));
 
     // Wait for the wake turn to open (stream:start is emitted AFTER the wake
     // listener claimed the single-flight slot), then race a user send in.
