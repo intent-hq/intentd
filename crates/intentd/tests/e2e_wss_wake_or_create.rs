@@ -1327,6 +1327,14 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
             .insert_principal_credential(&guest.id, &token_hash)
             .await
             .expect("guest credential");
+        store
+            .add_workspace_member(
+                &intent_core::WorkspaceId::from(ws_id.as_str()),
+                &guest.id,
+                intent_core::WorkspaceRole::Collaborator,
+            )
+            .await
+            .expect("guest membership");
     }
 
     // SUBSCRIBER conn (owner) — subscribe BEFORE any turn.

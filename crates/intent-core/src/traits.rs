@@ -4356,6 +4356,39 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.members.list` (multiplayer w3): the members of a workspace
+    /// → `{ members: [{ principalId, login?, displayName?, avatarUrl?, role,
+    /// addedAt }] }`, owners first. Member-visible; a non-member gets
+    /// `NotFound`.
+    fn workspace_members_list(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_members_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.members.remove` (multiplayer w3): drop a collaborator from
+    /// a workspace → `{ removed: bool }`. Owner-only; the owner membership
+    /// itself cannot be removed (`InvalidParams`). The removed member's
+    /// queued user messages in the workspace are dropped.
+    fn workspace_members_remove(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_members_remove not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Transport seam: the daemon's primary principal, bound to UDS
     /// connections and to the legacy file bearer token at WSS upgrade.
     /// Errors when the composition root has no principal store (test stubs);
