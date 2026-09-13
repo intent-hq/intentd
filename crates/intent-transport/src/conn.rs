@@ -9,7 +9,7 @@
 //! transports handle by draining the two-lane outbound queue
 //! ([`OutboundSender`] / [`OutboundReceiver`], priority lane first).
 
-use intent_core::events::{NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED};
+use intent_core::events::{NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, WORKSPACE_UPDATED};
 use intent_core::{AgentId, ClientId, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
@@ -607,7 +607,7 @@ pub(crate) async fn process_frame(
                 &method,
                 rpc_id.clone(),
                 out_tx,
-                handle_fast_path(fast_path, bus, out_tx, subs),
+                handle_fast_path(fast_path, api, bus, out_tx, subs),
             )
             .await;
         }
@@ -786,6 +786,7 @@ async fn refuse_forbidden(method: &str, rpc_id: Option<Value>, out_tx: &Outbound
 /// fan-out test in `events::tests`.
 pub(crate) async fn handle_fast_path(
     fast_path: FastPath,
+    api: &Arc<dyn WorkspaceApi>,
     bus: &EventBus,
     out_tx: &OutboundSender,
     subs: &mut ConnSubs,
@@ -805,12 +806,26 @@ pub(crate) async fn handle_fast_path(
                 // individually (no server-side coalescing, §6.6). A
                 // non-administrator connection keeps whatever patterns it
                 // asked for (and its subscription id) but only allowlisted
-                // types ever match (multiplayer w3).
+                // types ever match (multiplayer w3), and every matched event
+                // is then checked against the subscriber's membership of its
+                // workspace at delivery (`MembershipGate`); a side
+                // subscription on `workspace:updated` feeds unshares to the
+                // gate so a removal tears delivery down at once.
+                let gate = events::MembershipGate::for_current_caller(api);
+                let membership_events = gate.as_ref().map(|_| {
+                    bus.subscribe(SubscriptionFilter {
+                        event_types: vec![WORKSPACE_UPDATED.to_string()],
+                        workspace_id: workspace_id.clone(),
+                        batch_window: None,
+                        collaborator_only: true,
+                        ..Default::default()
+                    })
+                });
                 let subscription = bus.subscribe(SubscriptionFilter {
                     event_types,
                     workspace_id,
                     batch_window: None,
-                    collaborator_only: crate::context::is_non_administrator_caller(),
+                    collaborator_only: gate.is_some(),
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
@@ -826,8 +841,11 @@ pub(crate) async fn handle_fast_path(
                         return false;
                     }
                 }
-                let handle = tokio::spawn(forward_subscription(
+                // Spawned with the request context re-established: the gate's
+                // membership re-reads run under the subscriber's caller.
+                let handle = spawn_forwarder(forward_subscription(
                     subscription,
+                    gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
                     subscription_id.clone(),
                     out_tx.clone(),
                 ));
@@ -873,6 +891,7 @@ async fn send_fast_path_error(id: events::IdInfo, message: &str, out_tx: &Outbou
 /// congestion the buffer stays empty and every frame passes straight through.
 async fn forward_subscription(
     mut subscription: Subscription,
+    membership: Option<(events::MembershipGate, Subscription)>,
     subscription_id: String,
     out_tx: OutboundSender,
 ) {
@@ -880,6 +899,10 @@ async fn forward_subscription(
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
     let out_tx = out_tx.bulk_sender();
     let mut buffer: ConflationBuffer<EventItem> = ConflationBuffer::new();
+    let (mut gate, mut membership_events) = match membership {
+        Some((gate, sub)) => (Some(gate), Some(sub)),
+        None => (None, None),
+    };
     loop {
         tokio::select! {
             biased;
@@ -892,6 +915,20 @@ async fn forward_subscription(
                 }
                 Err(_) => return,
             },
+            // Membership changes invalidate the gate's cached verdicts
+            // before the next matched event is considered.
+            maybe = async { membership_events.as_mut().expect("guarded").recv().await },
+                if membership_events.is_some() =>
+            {
+                match (maybe, gate.as_mut()) {
+                    (Some(batch), Some(gate)) => {
+                        for event in &batch {
+                            gate.observe_membership_event(event);
+                        }
+                    }
+                    _ => membership_events = None,
+                }
+            },
             maybe = subscription.recv() => {
                 let Some(batch) = maybe else {
                     // Bus closed: flush anything still pending, then stop.
@@ -901,6 +938,11 @@ async fn forward_subscription(
                     return;
                 };
                 for event in batch {
+                    if let Some(gate) = gate.as_mut() {
+                        if !gate.allows(&event).await {
+                            continue;
+                        }
+                    }
                     if let Some(key) = conflate::event_key(&event) {
                         let item = EventItem::new(&key, event);
                         let sid = &subscription_id;

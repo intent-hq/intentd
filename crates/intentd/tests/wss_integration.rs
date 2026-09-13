@@ -220,7 +220,6 @@ struct Server {
     port: u16,
     cfg: Arc<ClientConfig>,
     api: Arc<dyn WorkspaceApi>,
-    #[cfg_attr(not(unix), expect(dead_code))]
     bus: EventBus,
     store: Store,
     registry: Arc<intent_services::SettingsRegistry>,
