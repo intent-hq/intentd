@@ -7900,7 +7900,7 @@ async fn principals_migration_backfills_existing_workspaces() {
     {
         let store = Store::open(&tmp.path).await.expect("open store");
         for sql in [
-            "DELETE FROM _sqlx_migrations WHERE version = 125",
+            "DELETE FROM _sqlx_migrations WHERE version IN (125, 126)",
             "DROP TRIGGER workspace_owner_default_ai",
             "DROP TABLE principal_credential",
             "DROP TABLE workspace_member",
@@ -8065,8 +8065,10 @@ async fn principal_upsert_links_github_identity() {
 }
 
 /// Membership add is idempotent, role changes are scoped to the pair,
-/// removal reports whether a row went away, and unknown pairs surface as
-/// `NotFound` on role change.
+/// removal reports whether a row went away, unknown pairs surface as
+/// `NotFound` on role change, and a workspace has exactly one owner
+/// (migration `0126`): promoting a second member or adding a second owner
+/// is `InvalidInput` while the primary remains owner.
 #[tokio::test]
 async fn workspace_membership_add_set_role_remove() {
     let tmp = TempDb::new();
@@ -8126,12 +8128,51 @@ async fn workspace_membership_add_set_role_remove() {
         vec![ws_id.clone()]
     );
 
-    store
-        .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Owner)
-        .await
-        .expect("promote");
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws_id, &guest.id)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Collaborator)
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&other_ws, &guest.id)
+            .await
+            .expect("role"),
+        None
+    );
+
+    // Exactly one owner per workspace: the primary already owns it.
+    assert!(matches!(
+        store
+            .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Owner)
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        store
+            .add_workspace_member(&other_ws, &guest.id, WorkspaceRole::Owner)
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
     let members = store.list_workspace_members(&ws_id).await.expect("members");
-    assert!(members.iter().all(|m| m.role == WorkspaceRole::Owner));
+    assert_eq!(
+        members
+            .iter()
+            .map(|m| (m.principal_id.clone(), m.role))
+            .collect::<Vec<_>>(),
+        vec![
+            (primary.id.clone(), WorkspaceRole::Owner),
+            (guest.id.clone(), WorkspaceRole::Collaborator),
+        ],
+        "rejected promotion left the roles untouched"
+    );
+    // A same-role update (collaborator → collaborator) is scoped to the pair.
+    store
+        .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("no-op role update");
     assert_eq!(
         store
             .get_workspace_owner_principal_id(&ws_id)
@@ -8149,8 +8190,21 @@ async fn workspace_membership_add_set_role_remove() {
             .get_workspace_owner_principal_id(&ws_id)
             .await
             .expect("owner"),
+        None,
+        "demoting the only owner clears the mirrored column"
+    );
+    // With the owner seat free the earlier refusal no longer applies.
+    store
+        .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Owner)
+        .await
+        .expect("promote guest");
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
         Some(guest.id.clone()),
-        "demoting the mirrored owner re-derives the column from the remaining owner"
+        "promoting a member into the free owner seat re-derives the column"
     );
     assert_eq!(
         store
@@ -8171,7 +8225,7 @@ async fn workspace_membership_add_set_role_remove() {
     );
     assert!(matches!(
         store
-            .set_workspace_member_role(&other_ws, &guest.id, WorkspaceRole::Owner)
+            .set_workspace_member_role(&other_ws, &guest.id, WorkspaceRole::Collaborator)
             .await,
         Err(Error::NotFound(_))
     ));
@@ -8264,7 +8318,9 @@ async fn workspace_membership_add_set_role_remove() {
 /// ones, so two rows written in the same millisecond order arbitrarily; the
 /// mirror must therefore prefer the current owner and only fall back to the
 /// earliest-added row once the current owner loses the role
-/// (intent-hq/intentd#1868).
+/// (intent-hq/intentd#1868). Under the one-owner index (migration `0126`)
+/// the second promotion is refused outright, so the mirror stays on the
+/// current owner and only moves once the seat is vacated and re-filled.
 #[tokio::test]
 async fn workspace_owner_mirror_keeps_current_owner_on_promotion() {
     let tmp = TempDb::new();
@@ -8302,17 +8358,19 @@ async fn workspace_owner_mirror_keeps_current_owner_on_promotion() {
     .await
     .expect("backdate guest");
 
-    store
-        .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Owner)
-        .await
-        .expect("promote guest");
+    assert!(matches!(
+        store
+            .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Owner)
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
     assert_eq!(
         store
             .get_workspace_owner_principal_id(&ws_id)
             .await
             .expect("owner"),
         Some(primary.id.clone()),
-        "promoting a second owner keeps the current owner mirrored"
+        "a refused second-owner promotion keeps the current owner mirrored"
     );
 
     store
@@ -8324,8 +8382,20 @@ async fn workspace_owner_mirror_keeps_current_owner_on_promotion() {
             .get_workspace_owner_principal_id(&ws_id)
             .await
             .expect("owner"),
+        None,
+        "once the current owner loses the role nothing is mirrored"
+    );
+    store
+        .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Owner)
+        .await
+        .expect("promote guest");
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
         Some(guest.id.clone()),
-        "once the current owner loses the role the remaining owner is mirrored"
+        "the backdated row is mirrored once it is the only owner"
     );
 }
 
