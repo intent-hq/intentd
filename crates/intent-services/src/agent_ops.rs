@@ -3389,6 +3389,16 @@ impl Services {
             }
         }
         let mut messages = serde_json::to_value(&page).expect("messages serialize");
+        // Serve-time author projection (multiplayer w2): every user row gets
+        // `author` resolved from its `fromPrincipalId` stamp, else the
+        // workspace's legacy author, else its owner — the one projection
+        // `chat.subscribe` snapshots share. Bounded by the distinct authors
+        // on the page (RPC cost contract), never stored.
+        if let Some(arr) = messages.as_array_mut() {
+            crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
+                .attach(arr)
+                .await;
+        }
         // In-progress tail (monorepo#3647): append the in-flight turn's
         // partial assistant message when the caller opted in and this page
         // ends at the live tail, so a mid-turn read shows the tool calls and
@@ -3693,18 +3703,28 @@ impl Services {
         message: &AgentMessage,
         turn_id: Option<&str>,
     ) {
-        self.publish_agent_mutation_event(
-            workspace_id,
-            agent_id,
-            AGENT_MESSAGE,
-            agent_message_event_payload(agent_id, message, turn_id),
-        )
-        .await;
+        let mut payload = agent_message_event_payload(agent_id, message, turn_id);
+        let mut last_payload = agent_last_message_event_payload(agent_id, message, turn_id);
+        // Serve-time author (multiplayer w2): a user-row echo carries the
+        // same `author` projection `agent.getConversation` serves, so live
+        // subscribers render the sender without a follow-up read.
+        if message.role == "user" {
+            if let Some(author) =
+                crate::principal_ops::MessageAuthorResolver::new(self, workspace_id)
+                    .resolve(message.metadata.as_ref())
+                    .await
+            {
+                payload["author"] = author.clone();
+                last_payload["author"] = author;
+            }
+        }
+        self.publish_agent_mutation_event(workspace_id, agent_id, AGENT_MESSAGE, payload)
+            .await;
         self.publish_agent_mutation_event(
             workspace_id,
             agent_id,
             intent_core::events::AGENT_LAST_MESSAGE,
-            agent_last_message_event_payload(agent_id, message, turn_id),
+            last_payload,
         )
         .await;
     }
@@ -6160,6 +6180,13 @@ impl Services {
         content: String,
         editing: Option<bool>,
     ) -> Result<Value> {
+        // Principal stamp (multiplayer w2): an edit by a wire caller makes
+        // the editor the author of the (user-origin) entry; an agent /
+        // daemon edit leaves the original stamp alone.
+        let restamp = matches!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Wire { .. })
+        );
         let (edited, was_editing, now_editing) = {
             let mut guard = self
                 .agent_queues
@@ -6174,6 +6201,12 @@ impl Services {
                 .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
             let was = queue[position].editing;
             queue[position].content = content;
+            if restamp && queue[position].user_origin {
+                queue[position].message_metadata =
+                    crate::principal_ops::stamp_principal_attribution(
+                        queue[position].message_metadata.take(),
+                    );
+            }
             if let Some(flag) = editing {
                 queue[position].editing = flag;
             }

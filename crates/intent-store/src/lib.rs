@@ -74,6 +74,7 @@ pub use pr_monitor_repo::{
     pr_monitor_pause_error, PrMonitorListEntry, PrMonitorPollUpdate, WorkspacePrMonitorReads,
     PR_MONITOR_PAUSE_MARKER,
 };
+pub use principal_repo::WorkspaceAuthorFallback;
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 pub use transfer_repo::TRANSFER_TABLES;
