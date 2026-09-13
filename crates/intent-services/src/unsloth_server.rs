@@ -2197,6 +2197,30 @@ mod tests {
             .expect("stub child exits after release");
         }
 
+        /// Reap `pid` directly (the test process is its true OS parent) once
+        /// it exits — bounded `WNOHANG` polling, so a broken release
+        /// handshake fails with a diagnosable message instead of hanging
+        /// until nextest kills the test.
+        async fn reap_stub_child(pid: u32) {
+            use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+            let pid = nix::unistd::Pid::from_raw(pid.cast_signed());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => return,
+                    Ok(WaitStatus::StillAlive) => {}
+                    Ok(other) => panic!("unexpected stub child wait status: {other:?}"),
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(e) => panic!("waitpid on stub child failed: {e}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "stub child did not exit within 30s of release"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
         /// Stub Hugging Face API on an ephemeral loopback port: answers every
         /// request with 200 + `body` and counts hits (for cache assertions).
         async fn spawn_stub_hf(body: &'static str) -> (u16, Arc<AtomicUsize>) {
@@ -2938,11 +2962,11 @@ mod tests {
                 .expect("pid while running");
 
             // Let the child exit, then reap it directly (this test process is
-            // its true OS parent; the blocking `waitpid` is the exit
-            // synchronization), forcing the terminal "exited and reaped"
-            // state that a signal-0 probe can actually observe.
+            // its true OS parent; the reap is the exit synchronization),
+            // forcing the terminal "exited and reaped" state that a signal-0
+            // probe can actually observe.
             release_stub_child(dir.path());
-            let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid.cast_signed()), None);
+            reap_stub_child(pid).await;
 
             assert!(
                 mgr.status_snapshot().await.is_none(),
