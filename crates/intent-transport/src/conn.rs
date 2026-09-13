@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::browser;
+use crate::catalog;
 use crate::client;
 use crate::conflate::{self, ChatItem, ConflationBuffer, Enqueue, EventItem};
 use crate::control::{self, SystemControl};
@@ -351,6 +352,19 @@ pub(crate) async fn process_frame(
             &method,
             raw.len(),
         );
+        // Multiplayer w3 — default-deny allowlist for non-administrator
+        // connections. Runs before every classify and dispatch path (control,
+        // server/pairing, provider setup, host, browser, forward, client,
+        // drafts, subscription channels, events, router) so no fast path can
+        // be reached by a method outside `COLLABORATOR_METHODS`; aliases are
+        // canonicalised inside the lookup. Only a frame that already carries
+        // a method is gated — a malformed envelope keeps its `-32600`.
+        if !method.is_empty()
+            && crate::context::is_non_administrator_caller()
+            && !catalog::collaborator_may_call(&method)
+        {
+            return refuse_forbidden(&method, rpc_id, out_tx).await;
+        }
         if let Some(control) = control {
             if let Some(req) = control::classify(value) {
                 let is_uds = !crate::context::is_tcp_connection();
@@ -736,6 +750,29 @@ async fn reject_overloaded(
                 &id,
                 OVERLOAD_ERROR_CODE,
                 OVERLOAD_ERROR_MESSAGE,
+            ))
+            .await
+            .is_ok(),
+        None => !out_tx.is_closed(),
+    }
+}
+
+/// Refuse one frame from a non-administrator connection whose method is
+/// outside [`catalog::COLLABORATOR_METHODS`]: a request echoes
+/// `-32003 "Forbidden"` with its `id`, a notification (no `id`) is dropped
+/// without a response per PROTOCOL §9. Returns `false` only when the outbound
+/// channel is closed.
+async fn refuse_forbidden(method: &str, rpc_id: Option<Value>, out_tx: &OutboundSender) -> bool {
+    tracing::debug!(
+        method,
+        "refusing RPC: method is not on the collaborator allowlist"
+    );
+    match rpc_id {
+        Some(id) => out_tx
+            .send_priority(events::error_frame(
+                &id,
+                catalog::FORBIDDEN_ERROR_CODE,
+                catalog::FORBIDDEN_ERROR_MESSAGE,
             ))
             .await
             .is_ok(),

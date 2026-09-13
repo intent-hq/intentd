@@ -62,6 +62,21 @@ pub fn is_tcp_connection() -> bool {
     IS_TCP.try_with(|cell| *cell.borrow()).unwrap_or(true)
 }
 
+/// Whether the current request is bound to a caller who does **not**
+/// administer the daemon — a per-principal (collaborator) credential over the
+/// wire. This is the predicate every owner-only transport gate keys on
+/// (multiplayer w3).
+///
+/// An *unbound* request (`current_caller() == None`) is not non-administrator:
+/// the only admission path that leaves a wire connection unbound is the
+/// legacy administrator token when the composition root exposes no principal
+/// store (test stubs), and agents / hooks never enter through the transport.
+/// A per-principal credential always binds.
+#[must_use]
+pub fn is_non_administrator_caller() -> bool {
+    current_caller().is_some_and(|caller| !caller.is_administrator())
+}
+
 /// Run a future within a connection-context scope. The `is_tcp` flag will be
 /// visible to all code running within `f` via `is_tcp_connection()`.
 ///
