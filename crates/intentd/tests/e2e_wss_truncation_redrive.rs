@@ -365,6 +365,14 @@ fn delegate_js() -> String {
 /// idles normally, so the parent receives exactly ONE completion wake — the
 /// clean post-recovery one — and the child transcript carries the
 /// system-origin nudge row tagged `{"type": "auto_redrive"}`.
+///
+/// The single-wake shape depends on the `reportToParent` debounce
+/// (intent-hq/intent#3619): the redriven turn's report is parked as a held
+/// entry on the parent's queue and the child's idle a few ms later retracts
+/// it and folds its `agent:reportToParent` event into the terminal wake. The
+/// wake's metadata is asserted to carry that fold, so a regression back to an
+/// immediate report wake (a standalone `reported.` row followed by a second
+/// `completed.` wake) fails deterministically instead of only under load.
 #[tokio::test]
 async fn truncated_turn_redriven_and_no_premature_wake_over_wss() {
     let Some(script) = gate("WSS truncation auto-redrive E2E") else {
@@ -565,6 +573,33 @@ async fn truncated_turn_redriven_and_no_premature_wake_over_wss() {
     assert!(
         wake_text.contains("recovered after redrive"),
         "the wake carries the child's report: {wake_text}"
+    );
+    // intent-hq/intent#3619: the wake is the TERMINAL completion with the
+    // report folded in — not a standalone progress wake that a separate
+    // completion wake would follow.
+    assert!(
+        wake_text.contains("completed."),
+        "the single wake is the terminal completion: {wake_text}"
+    );
+    assert!(
+        !wake_text.contains("reported. Report:"),
+        "no standalone reportToParent progress wake was delivered: {wake_text}"
+    );
+    let metadata = &wakes[0]["metadata"];
+    assert_eq!(
+        metadata["eventTypes"],
+        json!(["agent:reportToParent", "agent:idle"]),
+        "the completion wake folds the report event ahead of the idle: {metadata}"
+    );
+    assert_eq!(
+        metadata["eventCount"],
+        json!(2),
+        "the completion wake counts both folded events: {metadata}"
+    );
+    assert_eq!(
+        metadata["watchStillArmed"],
+        json!(false),
+        "the completion wake retires the one-shot watch: {metadata}"
     );
 }
 
