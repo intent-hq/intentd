@@ -13024,7 +13024,17 @@ impl Services {
             c
         };
         let content = annotated.as_str();
-        let build_block = || match message_metadata {
+        // The `fromPrincipalId` stamp stays row-level only (parity with the
+        // drain-time `persist_user` fold).
+        let block_md = message_metadata.and_then(|md| match md {
+            Value::Object(m) => {
+                let mut m = m.clone();
+                m.remove(intent_core::FROM_PRINCIPAL_ID_KEY);
+                (!m.is_empty()).then_some(Value::Object(m))
+            }
+            other => Some(other.clone()),
+        });
+        let build_block = || match &block_md {
             Some(md) => json!({ "type": "text", "text": content, "messageMetadata": md }),
             None => json!({ "type": "text", "text": content }),
         };

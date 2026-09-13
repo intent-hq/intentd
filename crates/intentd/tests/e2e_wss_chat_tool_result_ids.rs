@@ -424,6 +424,8 @@ fn apply_entity(messages: &mut Vec<Value>, entity: &Value) {
         ("role", "role"),
         ("messageSeq", "seq"),
         ("timestamp", "timestamp"),
+        ("metadata", "metadata"),
+        ("author", "author"),
     ] {
         if let Some(v) = entity.get(from) {
             msg[to] = v.clone();

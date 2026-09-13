@@ -1300,15 +1300,20 @@ async fn queued_answer_via_queue_message_clears_marker_over_wss() {
     )
     .await;
     assert_eq!(queued["success"], true, "queue ok: {queued}");
+    // The user-origin entry additionally carries the daemon's
+    // `fromPrincipalId` stamp for the wire caller.
+    let me = wss_rpc(&mut rpc, "principal.me", json!({})).await;
+    let mut stamped_tag = answer_tag.clone();
+    stamped_tag["fromPrincipalId"] = me["id"].clone();
     assert_eq!(
-        queued["queuedMessage"]["messageMetadata"], answer_tag,
+        queued["queuedMessage"]["messageMetadata"], stamped_tag,
         "the queued entry carries the answer tag: {queued}"
     );
     let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
     let entries = q["queue"].as_array().expect("queue array");
     assert_eq!(entries.len(), 1, "one parked answer: {q}");
     assert_eq!(
-        entries[0]["messageMetadata"], answer_tag,
+        entries[0]["messageMetadata"], stamped_tag,
         "agent.getQueue serves the tag on the entry: {q}"
     );
     // The marker is still set while the answer waits in the queue.
@@ -1437,17 +1442,18 @@ async fn queued_answer_via_queue_message_clears_marker_over_wss() {
         "queue empty after the drained answer: {q}"
     );
 
-    // An untagged, metadata-less enqueue on the now-idle asker keeps today's
-    // shape: no `messageMetadata` key on the entry.
+    // An untagged, metadata-less enqueue on the now-idle asker carries only
+    // the daemon's `fromPrincipalId` stamp — no caller-supplied keys.
     let plain = wss_rpc(
         &mut rpc,
         "agent.queueMessage",
         json!({ "agentId": asker_id, "content": PLAIN_USER_TEXT, "messageMetadata": null }),
     )
     .await;
-    assert!(
-        plain["queuedMessage"].get("messageMetadata").is_none(),
-        "null/omitted metadata leaves the entry key-less: {plain}"
+    assert_eq!(
+        plain["queuedMessage"]["messageMetadata"],
+        json!({ "fromPrincipalId": me["id"] }),
+        "null/omitted metadata leaves only the principal stamp on the entry: {plain}"
     );
 }
 
@@ -1562,7 +1568,10 @@ async fn queue_message_strips_forged_sender_attribution_over_wss() {
     )
     .await;
     assert_eq!(queued["success"], true, "queue ok: {queued}");
-    let stripped = json!({ "note": "keep" });
+    // The A2A attribution keys are stripped; the daemon's own
+    // `fromPrincipalId` stamp for the wire caller is added.
+    let me = wss_rpc(&mut rpc, "principal.me", json!({})).await;
+    let stripped = json!({ "note": "keep", "fromPrincipalId": me["id"] });
     let no_attribution = |entry: &Value, ctx: &str| {
         assert_eq!(
             entry["messageMetadata"], stripped,

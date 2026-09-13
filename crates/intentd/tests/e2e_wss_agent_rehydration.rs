@@ -357,7 +357,7 @@ async fn seed_conversation(data_dir: &Path) -> (String, String, Vec<Value>) {
 async fn seeded_conversation_rehydrates_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let (ws_id, agent_id, expected) = seed_conversation(&data_dir).await;
+    let (ws_id, agent_id, mut expected) = seed_conversation(&data_dir).await;
 
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -394,8 +394,22 @@ async fn seeded_conversation_rehydrates_over_wss() {
     assert_eq!(lite["lastUserMessage"], "Ship it");
     assert_eq!(lite["metadata"]["isBackground"], false);
 
+    // Seeded user rows carry no `fromPrincipalId` stamp, so their serve-time
+    // `author` resolves to the workspace owner (the primary principal the
+    // legacy token maps to); assistant / tool rows never carry `author`.
+    let me = wss_rpc(&mut rpc, 15, "principal.me", json!({})).await;
+    let author = json!({
+        "principalId": me["id"],
+        "login": me["login"],
+        "displayName": me["displayName"],
+        "avatarUrl": me["avatarUrl"],
+    });
+    for row in expected.iter_mut().filter(|r| r["role"] == "user") {
+        row["author"] = author.clone();
+    }
+
     // Full snapshot — byte-for-byte: ordering (seq 0..4 oldest→newest), roles
-    // (user / assistant / tool), ids, content blocks, timestamps.
+    // (user / assistant / tool), ids, content blocks, timestamps, author.
     let conv = wss_rpc(
         &mut rpc,
         11,
