@@ -2830,14 +2830,38 @@ mod tests {
             assert!(err.to_string().contains("shutting down"), "got: {err}");
         }
 
+        /// Block until an in-flight `ensure_endpoint` has registered its
+        /// starting server (identity mirror set). Reads only the short-held
+        /// `identity` mirror mutex, never the startup-serializing `state`
+        /// lock — the startup holds that for its whole window. The deadline
+        /// is a hang guard for a startup that never registers, sized to
+        /// expire before nextest's kill window, not a latency bound.
+        async fn wait_for_identity_registered(mgr: &UnslothServerManager) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while lock_ignore_poison(&mgr.identity).is_none() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "startup never registered a starting server"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
         #[tokio::test]
         async fn status_snapshot_stays_responsive_during_in_flight_startup() {
             // Regression: `status_snapshot` must never contend with the
-            // startup-serializing `state` lock — it reads the lock-free
-            // `identity`/`phase` mirrors instead. `run` sleeps but never
-            // opens the HTTP socket, so the startup sits in its phase-1 probe
-            // loop for the whole (long) window; `status_snapshot` must return
-            // promptly throughout, not block behind `ensure_endpoint`.
+            // startup-serializing `state` lock — it reads the short-held
+            // `identity`/`phase` mirror mutexes instead. `run` sleeps but
+            // never opens the HTTP socket, so the startup sits in its phase-1
+            // probe loop holding `state` for the whole (long) window — the
+            // stub child's 300s lifetime, under the 600s `server_up_timeout`;
+            // a snapshot that contended for the lock could not return before
+            // that window elapsed. The contract is asserted as ORDERING — the
+            // snapshot returns while the startup is still in flight and
+            // still holds `state` — not as an elapsed-time bound: under CPU
+            // starvation the snapshot's own process-tree sampling takes
+            // seconds, which a tight budget misreads as lock contention
+            // (intent-hq/intent#4925).
             let dir = tempfile::tempdir().expect("tempdir");
             let binary = write_stub_binary(dir.path(), dir.path(), 1, None);
             let mut config = test_config(binary, dir.path().to_path_buf(), 1);
@@ -2847,18 +2871,27 @@ mod tests {
             let m2 = mgr.clone();
             let startup =
                 tokio::spawn(async move { m2.ensure_endpoint(REPO, None, 0, &|_, _| {}).await });
-            // Give the startup time to spawn the child and enter the probe
-            // loop (holding `state` for the remainder of the long timeout).
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Handshake rather than a fixed sleep: once the starting server
+            // is registered, the startup holds `state` until its window
+            // elapses or it is aborted.
+            wait_for_identity_registered(&mgr).await;
 
-            let start = tokio::time::Instant::now();
-            let status = tokio::time::timeout(Duration::from_secs(5), mgr.status_snapshot())
+            // Hang guard only: it must expire before nextest's 180s kill so
+            // a regression names the stalled step (a contending snapshot
+            // would otherwise sit behind the long startup window), but it
+            // is far too loose to measure latency — the ordering assertions
+            // below carry the contract.
+            let status = tokio::time::timeout(Duration::from_secs(60), mgr.status_snapshot())
                 .await
                 .expect("status_snapshot must not block behind the startup's state lock")
                 .expect("server tracked as running mid-startup");
             assert!(
-                start.elapsed() < Duration::from_secs(1),
-                "status_snapshot must return promptly, not wait out the startup timeout"
+                !startup.is_finished(),
+                "startup must still be in flight when the snapshot returns"
+            );
+            assert!(
+                mgr.state.try_lock().is_err(),
+                "the in-flight startup must still hold `state`: the snapshot returned without contending for it"
             );
             assert_eq!(status.repo_id, REPO);
             assert_eq!(status.phase, "starting");
@@ -3008,6 +3041,11 @@ mod tests {
         /// isn't drained concurrently the child blocks on `write()` once the
         /// pipe fills, `try_wait()` never observes an exit, and a live
         /// process is misreported as timed out.
+        ///
+        /// No wall-clock bound around the call: a regression surfaces as the
+        /// config's own `mint_timeout` firing (a named mint-timeout error,
+        /// within nextest's kill window), not as a tight elapsed budget that
+        /// CPU starvation alone can exceed (intent-hq/intent#4925).
         #[tokio::test]
         async fn mint_with_large_stdout_output_does_not_hang() {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -3032,13 +3070,10 @@ mod tests {
             let config = test_config(binary_path, dir.path().to_path_buf(), port);
             let mgr = UnslothServerManager::with_config(config);
 
-            let endpoint = tokio::time::timeout(
-                Duration::from_secs(5),
-                mgr.ensure_endpoint(REPO, None, 0, &|_, _| {}),
-            )
-            .await
-            .expect("mint must complete well within mint_timeout, not hang on a full pipe")
-            .expect("mint succeeds despite large stdout output");
+            let endpoint = mgr
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
+                .await
+                .expect("mint succeeds despite large stdout output (must not hang on a full pipe)");
             assert_eq!(endpoint.base_url, format!("http://127.0.0.1:{port}/v1"));
 
             mgr.shutdown().await;
