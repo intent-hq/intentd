@@ -554,14 +554,24 @@ async fn wake_or_create_widened_wire_contract_over_wss() {
                     .is_some_and(|t| t.contains("reboot"))
         })
         .unwrap_or_else(|| panic!("wake user row persisted: {convo}"));
+    // The row-level copy also carries the daemon's `fromPrincipalId` stamp
+    // for the wire caller; the in-block fold does not (row-level only).
+    let me = wss_rpc(&mut rpc, 8, "principal.me", json!({})).await;
+    let principal_id = me["id"].as_str().expect("caller principal id");
     assert_eq!(
         wake_row["metadata"],
-        json!({ "type": "task_wake", "source": "wake" }),
+        json!({ "type": "task_wake", "source": "wake", "fromPrincipalId": principal_id }),
         "wake row carries row-level messageMetadata (monorepo#1217): {wake_row}"
     );
     assert_eq!(
-        wake_row["contentBlocks"][0]["messageMetadata"]["type"], "task_wake",
+        wake_row["contentBlocks"][0]["messageMetadata"],
+        json!({ "type": "task_wake", "source": "wake" }),
         "in-block fold preserved alongside the row-level copy: {wake_row}"
+    );
+    assert_eq!(
+        wake_row["author"]["principalId"],
+        json!(principal_id),
+        "wake row resolves its author from the stamp: {wake_row}"
     );
 }
 
