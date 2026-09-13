@@ -1109,6 +1109,7 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
+        membership: None,
     }
 }
 

@@ -18,6 +18,7 @@ fn disable_node_compile_cache() {
 
 pub mod agent_configs;
 pub(crate) mod agent_logs;
+pub mod caller;
 pub mod chief_cwd;
 pub mod clock;
 pub mod config;
@@ -44,6 +45,7 @@ pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
     sweep_agent_logs, AGENT_LOG_RETENTION_DAYS,
 };
+pub use caller::{current_caller, with_caller, Caller};
 pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd};
 pub use clock::{
     iso_from_unix_secs, iso_minutes_ago, iso_ms_from_now, now_epoch_ms, now_iso, parse_iso,
@@ -112,7 +114,9 @@ pub use model::{
     BrowserTab, BrowserTabInput, BrowserTabSize, BrowserTabSyncResult, BrowserTabUpsertOutcome,
     BrowserTabVisibility,
 };
-pub use model::{Principal, PrincipalCredential, WorkspaceMember, WorkspaceRole};
+pub use model::{
+    Principal, PrincipalCredential, WorkspaceMember, WorkspaceMembership, WorkspaceRole,
+};
 pub use path_utils::prewarm_login_shell_path;
 pub use repo_ref::RepoRef;
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};

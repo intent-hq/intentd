@@ -2918,6 +2918,12 @@ async fn dispatch(
             let r = api.github_get_user().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        // `principal.me` (multiplayer w1): the principal this connection was
+        // bound to at admission; no params. Fails when no caller is bound.
+        "principal.me" => {
+            let r = api.principal_me().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         // `linear.*` (§5.28) is daemon-owned and global: no `workspaceId`. A key
         // that is absent or fails the `viewer` probe ("not configured") and any
         // other Linear failure surface as `-32603`; an invalid `filter` is

@@ -214,7 +214,23 @@ impl WorkspaceMcpServer {
         );
         tracing::trace!("workspace_api dispatch: eval starting");
         let eval_started = Instant::now();
-        let eval_result = js_eval(&full_code, &opts, Some(host)).await;
+        // Bind the calling agent as the request's caller for every `ws.*`
+        // call the script makes (multiplayer w1); host calls run inline on
+        // this task, so the task-local scope covers them. A bridge with no
+        // caller agent leaves whatever caller the enclosing scope bound.
+        let eval = js_eval(&full_code, &opts, Some(host));
+        let eval_result = match &self.caller_agent_id {
+            Some(agent_id) => {
+                intent_core::with_caller(
+                    intent_core::Caller::Agent {
+                        agent_id: agent_id.clone(),
+                    },
+                    eval,
+                )
+                .await
+            }
+            None => eval.await,
+        };
         let eval_ms = u64::try_from(eval_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let eval_ok = eval_result.is_ok();
         tracing::trace!(eval_ms, eval_ok, "workspace_api dispatch: eval finished");

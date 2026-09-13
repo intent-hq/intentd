@@ -336,6 +336,32 @@ pub struct Workspace {
     /// when no deletion is pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_delete_at: Option<String>,
+    /// Membership summary (multiplayer w1), flattened onto the row as
+    /// `ownerPrincipalId` / `myRole` / `memberCount` / `openInviteCount`.
+    /// Computed from `workspace_member` in SQL on `workspace.get` /
+    /// `workspace.list` (one query per call, never per row); `myRole` is
+    /// relative to the request's bound [`crate::Caller`]. Omitted when the
+    /// row was not served through the service layer.
+    #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<WorkspaceMembership>,
+}
+
+/// The membership fields carried on a [`Workspace`] row (multiplayer w1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceMembership {
+    /// The workspace's owner; `None` only for a row whose principal columns
+    /// were nulled by transfer import and not yet re-derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_principal_id: Option<PrincipalId>,
+    /// The caller's role in this workspace; omitted when the caller is not a
+    /// member (or no principal is bound to the request).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub my_role: Option<WorkspaceRole>,
+    /// Number of `workspace_member` rows (the owner counts).
+    pub member_count: u64,
+    /// Invitations awaiting acceptance. Always `0` until invitations land.
+    pub open_invite_count: u64,
 }
 
 impl Workspace {
@@ -470,6 +496,7 @@ pub fn chief_workspace() -> Workspace {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -5632,6 +5659,7 @@ mod tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");
