@@ -8179,6 +8179,92 @@ async fn workspace_membership_add_set_role_remove() {
     assert_eq!(members[0].principal_id, primary.id);
 }
 
+/// `workspace_membership_summaries` is scoped to exactly the requested ids:
+/// workspaces outside the selection (e.g. archived rows `workspace.list`
+/// filters out) never appear, an empty selection issues no query, and the
+/// viewer's role / member count are computed per selected row
+/// (intent-hq/intentd#1868).
+#[tokio::test]
+async fn workspace_membership_summaries_scoped_to_requested_ids() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let selected = WorkspaceId::from("ws-summary-selected");
+    let shared = WorkspaceId::from("ws-summary-shared");
+    let archived = WorkspaceId::from("ws-summary-archived");
+    for (ws, is_archived) in [(&selected, false), (&shared, false), (&archived, true)] {
+        store
+            .insert_workspace(&sample_workspace(ws, "S", is_archived))
+            .await
+            .expect("insert ws");
+    }
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(9),
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store.upsert_principal(&guest).await.expect("insert guest");
+    assert!(store
+        .add_workspace_member(&shared, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("add"));
+
+    assert!(
+        store
+            .workspace_membership_summaries(Some(&primary.id), &[])
+            .await
+            .expect("empty selection")
+            .is_empty(),
+        "an empty selection yields no summaries"
+    );
+
+    let map = store
+        .workspace_membership_summaries(Some(&guest.id), &[selected.clone(), shared.clone()])
+        .await
+        .expect("summaries");
+    let mut keys: Vec<&str> = map.keys().map(|id| id.0.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![selected.0.as_str(), shared.0.as_str()],
+        "only the requested workspaces are summarised; the archived row is absent"
+    );
+    let selected_summary = &map[&selected];
+    assert_eq!(
+        selected_summary.owner_principal_id,
+        Some(primary.id.clone())
+    );
+    assert_eq!(selected_summary.member_count, 1);
+    assert_eq!(selected_summary.my_role, None, "guest is not a member");
+    let shared_summary = &map[&shared];
+    assert_eq!(shared_summary.member_count, 2);
+    assert_eq!(shared_summary.my_role, Some(WorkspaceRole::Collaborator));
+
+    let one = store
+        .workspace_membership_summaries(None, std::slice::from_ref(&archived))
+        .await
+        .expect("single");
+    assert_eq!(
+        one.len(),
+        1,
+        "an explicitly selected archived row is summarised"
+    );
+    assert_eq!(one[&archived].my_role, None, "no viewer, no role");
+    assert!(
+        store
+            .workspace_membership_summaries(None, &[WorkspaceId::from("nowhere")])
+            .await
+            .expect("unknown")
+            .is_empty(),
+        "unknown ids produce no rows"
+    );
+}
+
 /// Credentials are found by hash only, `touch` bumps `last_used_at` on
 /// active rows, and revoke flips exactly once while keeping the row so a
 /// replayed token reads as revoked rather than unknown.
