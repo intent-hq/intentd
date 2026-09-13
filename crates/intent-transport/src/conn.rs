@@ -1513,10 +1513,20 @@ async fn chat_subscription_loop(
         Some((gate, sub)) => (Some(gate), Some(sub)),
         None => (None, None),
     };
-    // The agent's workspace, learned from the first of its stream events
-    // (the chat channel is keyed by agent, not workspace): the subscriber's
-    // own unshare of THAT workspace ends the forwarder.
-    let mut agent_workspace: Option<String> = None;
+    // The agent's workspace (the chat channel is keyed by agent, not
+    // workspace): the subscriber's own unshare of THAT workspace ends the
+    // forwarder. Resolved at subscribe time through the guarded `agent.get`
+    // so a member removed BEFORE the agent's first stream event is still
+    // torn down; a refused read (non-member) leaves it unknown until a
+    // stream event names the workspace, by which point the gate admits it.
+    let mut agent_workspace: Option<String> = match gate {
+        Some(_) => api
+            .agent_get(agent_id.clone(), None)
+            .await
+            .ok()
+            .map(|agent| agent.workspace_id.as_str().to_string()),
+        None => None,
+    };
     let mut snapshot = subscriptions::chat_snapshot(
         api.as_ref(),
         &agent_id,

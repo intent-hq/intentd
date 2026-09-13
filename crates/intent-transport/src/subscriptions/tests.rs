@@ -4733,6 +4733,34 @@ mod channel_membership {
                 ],
             }))
         }
+
+        /// The guarded `agent.get` (`require_agent_member`): the agent's
+        /// workspace for a member, `NotFound` otherwise.
+        fn agent_get(
+            &self,
+            agent_id: AgentId,
+            _workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, intent_core::Result<intent_core::AgentLite>> {
+            let workspace_id = agent_workspace(agent_id.as_str());
+            let allowed = self.allowed(&workspace_id);
+            Box::pin(async move {
+                if !allowed {
+                    return Err(Error::NotFound(format!("agent {agent_id}")));
+                }
+                let now = intent_core::now_iso();
+                Ok(serde_json::from_value(json!({
+                    "id": agent_id.as_str(),
+                    "workspaceId": workspace_id,
+                    "name": agent_id.as_str(),
+                    "status": "idle",
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "messageCount": 0,
+                    "metadata": { "isBackground": false },
+                }))
+                .expect("AgentLite from its wire shape"))
+            })
+        }
     }
 
     fn event(
@@ -4969,6 +4997,32 @@ mod channel_membership {
             "no delivery after removal"
         );
         assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(true));
+        drop(h.subs);
+    }
+
+    /// The agent's workspace is resolved at subscribe time (guarded
+    /// `agent.get`), so a member removed BEFORE the agent's first stream
+    /// event is still torn down instead of lingering until a chunk names
+    /// the workspace.
+    #[tokio::test]
+    async fn chat_member_removed_before_first_event_is_torn_down() {
+        let (principal_id, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], chat_subscribe("agent-1")).await;
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+
+        h.members.lock().unwrap().remove("ws-1");
+        h.bus
+            .publish(&unshare("ws-1", principal_id.as_str()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(true));
+
+        h.bus.publish(&chunk("ws-1", "agent-1", "!")).await.unwrap();
+        assert!(
+            deltas(&mut h.rx).await.is_empty(),
+            "no delivery after removal"
+        );
         drop(h.subs);
     }
 
