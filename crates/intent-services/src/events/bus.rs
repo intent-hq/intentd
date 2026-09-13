@@ -144,10 +144,17 @@ impl EventBus {
     /// ([`is_transient_file_event`]) so watcher noise never reaches `SQLite`;
     /// callers see the same `Ok(Event)` shape either way.
     ///
+    /// A system-actored event published inside a collaborator's request is
+    /// re-stamped with that collaborator — `{ type: user, id: principalId,
+    /// name }` (multiplayer w4) — so subscribers see who acted; every other
+    /// caller's actor is kept as supplied.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the event writer task has shut down or dropped the response.
     pub async fn publish(&self, ev: &NewEvent) -> Result<Event> {
+        let attributed = self.attribute_to_collaborator(ev).await;
+        let ev = attributed.as_ref().unwrap_or(ev);
         if is_transient_file_event(ev) {
             let event = self.publish_transient(ev);
             // The persisted path awaits `writer_tx.send()`, which yields and lets
@@ -168,6 +175,18 @@ impl EventBus {
             .map_err(|_| Error::Internal("event writer task closed".to_string()))?;
         rx.await
             .map_err(|_| Error::Internal("event writer task dropped response".to_string()))?
+    }
+
+    /// The collaborator-stamped copy of a system-actored `ev` when the
+    /// current request is a collaborator's; `None` leaves `ev` as supplied.
+    async fn attribute_to_collaborator(&self, ev: &NewEvent) -> Option<NewEvent> {
+        if ev.actor.actor_type != ActorType::System {
+            return None;
+        }
+        let actor = crate::principal_ops::collaborator_event_actor(&self.store).await?;
+        let mut stamped = ev.clone();
+        stamped.actor = actor;
+        Some(stamped)
     }
 
     /// Mint an event id (`UUIDv7`) + timestamp and broadcast to live subscribers
