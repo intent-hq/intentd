@@ -200,7 +200,7 @@ fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
     }
 }
 
-async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
+pub(super) async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
@@ -2249,7 +2249,7 @@ async fn set_content_reduction_guard_requires_confirmation() {
 
 /// [`setup`] plus a `note_version` snapshot at rev 0, so `expectedVersion: 0`
 /// resolves to a recoverable base for the three-way merge.
-async fn setup_versioned(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
+pub(super) async fn setup_versioned(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
     let (tmp, svc, ws, id) = setup(content).await;
     let note = svc.store.get_note(&ws, &id).await.expect("get note");
     svc.store
@@ -3311,47 +3311,6 @@ async fn set_content_stale_merge_that_empties_the_note_is_rejected() {
     let stored = svc.store.get_note(&ws, &id).await.expect("get");
     assert_eq!(stored.rev, 1, "a rejected merge persists nothing");
     assert_eq!(stored.content, "a");
-}
-
-/// Same for the truncation guard: neither side's text looks truncated, but
-/// the merged text (`one two\nthree...` minus ` two` minus `\n`) is a short
-/// single line ending in `...`, and is rejected without a write.
-#[tokio::test]
-async fn set_content_stale_merge_that_looks_truncated_is_rejected() {
-    let (_tmp, svc, ws, id) = setup_versioned("one two\nthree...").await;
-
-    let b = svc
-        .set_note_content(
-            ws.clone(),
-            id.clone(),
-            "one\nthree...".into(),
-            false,
-            None,
-            None,
-        )
-        .await
-        .expect("B write");
-    assert_eq!(b.rev, 1);
-
-    let denied = svc
-        .set_note_content(
-            ws.clone(),
-            id.clone(),
-            "one twothree...".into(),
-            false,
-            Some(0),
-            None,
-        )
-        .await;
-    match denied {
-        Err(Error::Internal(msg)) => {
-            assert!(msg.starts_with("Content appears to be truncated"), "{msg}");
-        }
-        other => panic!("expected the truncation guard, got {other:?}"),
-    }
-    let stored = svc.store.get_note(&ws, &id).await.expect("get");
-    assert_eq!(stored.rev, 1, "a rejected merge persists nothing");
-    assert_eq!(stored.content, "one\nthree...");
 }
 
 /// Same race for `task.update` on a plain checkbox line: the line edit

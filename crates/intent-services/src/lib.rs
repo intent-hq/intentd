@@ -70,6 +70,8 @@ mod clone_ops;
 mod complete_ops;
 #[cfg(test)]
 mod completion_interception_tests;
+#[cfg(test)]
+mod conditional_write_precedence_tests;
 mod config_watcher;
 mod create_progress;
 mod delete_grace;
