@@ -6400,6 +6400,9 @@ mod workspace_api_tool_tests {
 
     struct WorkspaceInfoMockApi {
         ws: Mutex<Workspace>,
+        /// `(called, caller)`: whether `get_workspace` ran and the task-local
+        /// [`intent_core::Caller`] it observed (multiplayer w1 caller binding).
+        seen_caller: Mutex<(bool, Option<intent_core::Caller>)>,
     }
 
     impl WorkspaceInfoMockApi {
@@ -6450,13 +6453,18 @@ mod workspace_api_tool_tests {
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,
+                membership: None,
             };
-            Arc::new(Self { ws: Mutex::new(ws) })
+            Arc::new(Self {
+                ws: Mutex::new(ws),
+                seen_caller: Mutex::new((false, None)),
+            })
         }
     }
 
     impl WorkspaceApi for WorkspaceInfoMockApi {
         fn get_workspace(&self, _id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            *self.seen_caller.lock().unwrap() = (true, intent_core::current_caller());
             let snapshot = self.ws.lock().unwrap().clone();
             Box::pin(async move { Ok(snapshot) })
         }
@@ -6765,6 +6773,33 @@ mod workspace_api_tool_tests {
         let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
         assert_eq!(body["id"], json!("amber-forest"));
         assert_eq!(body["path"], json!("/tmp/amber-forest"));
+    }
+
+    #[tokio::test]
+    async fn workspace_api_dispatch_binds_calling_agent_as_caller() {
+        // Multiplayer w1: every `ws.*` call a script makes runs with the
+        // bridge's calling agent bound as the task-local `Caller::Agent`;
+        // a bridge with no caller agent leaves no caller bound (fail-closed).
+        let api = WorkspaceInfoMockApi::new("amber-forest", None);
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_caller_agent_id(Some(intent_core::AgentId::from_string("agent-77")));
+        let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(
+            api.seen_caller.lock().unwrap().clone(),
+            (
+                true,
+                Some(intent_core::Caller::Agent {
+                    agent_id: intent_core::AgentId::from_string("agent-77"),
+                })
+            )
+        );
+
+        let api = WorkspaceInfoMockApi::new("amber-forest", None);
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
+        let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(api.seen_caller.lock().unwrap().clone(), (true, None));
     }
 
     #[tokio::test]
@@ -12698,6 +12733,7 @@ mod workspace_api_output_limit_tests {
                     checkout_mode: None,
                     disk_usage: None,
                     pending_delete_at: None,
+                    membership: None,
                 })
             })
         }
@@ -13023,6 +13059,7 @@ mod workspace_apply_proposal_tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 

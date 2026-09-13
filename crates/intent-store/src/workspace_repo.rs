@@ -967,5 +967,6 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         pending_delete_at: None,
         // pull_requests_total is set by the list-row slimming (intent-core), never persisted.
         pull_requests_total: None,
+        membership: None,
     })
 }

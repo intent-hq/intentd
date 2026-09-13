@@ -251,6 +251,7 @@ fn stub_workspace(id: &str) -> Workspace {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
