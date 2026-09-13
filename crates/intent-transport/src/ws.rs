@@ -65,6 +65,10 @@ pub(crate) const MAX_INVITE_CONNECTIONS: usize = 32;
 /// hundred bytes; anything larger is an anonymous peer wasting memory.
 pub(crate) const MAX_INVITE_MESSAGE_BYTES: usize = 16 * 1024;
 
+/// Upper bound on how long a revoked connection keeps draining in-flight RPC
+/// responses (its own `principal.revokeSelf` result) before the policy close.
+const REVOKE_FLUSH_GRACE: Duration = Duration::from_secs(5);
+
 /// Tuning for a [`WsApiServer`]. [`Default`] mirrors the production posture:
 /// bind `127.0.0.1:5181` (loopback; `server.bindAddress` widens it
 /// deliberately), WS API enabled, bearer auth on (TCP), 30s/60s heartbeat.
@@ -926,6 +930,25 @@ impl WsInner {
                 revoked = recv_revocation(&mut revocations) => {
                     match revoked {
                         Some(id) if Some(&id) == revoked_principal.as_ref() => {
+                            // Deliver in-flight RPC responses before the
+                            // close: when the revocation is the caller's own
+                            // `principal.revokeSelf`, the broadcast fires
+                            // inside the handler, so its response may not be
+                            // queued yet — it holds a reserved priority slot
+                            // until it is. Drain until the lane is idle,
+                            // bounded so a stuck handler cannot keep a revoked
+                            // connection open.
+                            let deadline = tokio::time::Instant::now() + REVOKE_FLUSH_GRACE;
+                            while !app_tx.priority_idle() {
+                                let next = tokio::time::timeout_at(deadline, app_rx.recv()).await;
+                                let Ok(Some(frame)) = next else { break };
+                                if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
+                                    continue;
+                                }
+                                if sink.send(Message::Text(frame.into())).await.is_err() {
+                                    break;
+                                }
+                            }
                             let _ = sink
                                 .send(Message::Close(Some(CloseFrame {
                                     code: CloseCode::Policy,
