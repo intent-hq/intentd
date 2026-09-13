@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.55] - 2026-09-13
+
+### 🐛 Bug Fixes
+
+- *(task)* Caller-aware terminal guard in task.updateNoteStatus ([#1857](https://github.com/intent-hq/intentd/pull/1857))
+
+### 🧪 Testing
+
+- *(services)* Deflake unsloth dead-child lifecycle tests ([#1851](https://github.com/intent-hq/intentd/pull/1851))
+- *(services)* Deflake millisecond-TTL tests with the paused runtime clock ([#1855](https://github.com/intent-hq/intentd/pull/1855))
+
+
 ## [0.9.54] - 2026-09-13
 
 ### 🐛 Bug Fixes
