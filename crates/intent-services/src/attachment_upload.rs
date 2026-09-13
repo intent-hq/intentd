@@ -1601,12 +1601,18 @@ mod tests {
     /// Regression (#1841 review): a keyed `begin` replay is activity. A
     /// session idle just under the TTL that is replayed must not be swept
     /// by the caller's very next op — the replay refreshes `last_activity`.
+    ///
+    /// Idle time is synthesized by advancing the paused runtime clock
+    /// (intent-hq/intent#4880): the replayed `begin` awaits the store before
+    /// its sweep reads `last_activity`, so a wall-clock backdate to "just
+    /// inside" a millisecond TTL expired the session under package load.
     #[tokio::test]
     async fn keyed_begin_replay_refreshes_last_activity() {
         let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
             "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
-            "100",
+            "3600000",
         )]);
+        let ttl = super::attachment_upload_idle_ttl();
         let ws = WorkspaceId("ws-up-keyed-refresh".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
@@ -1627,15 +1633,13 @@ mod tests {
             .await
             .expect("keyed begin");
         let upload_id = first["uploadId"].as_str().unwrap().to_string();
-        // Backdate to just inside the TTL: still live for the replay's
-        // sweep, but expired by the next op unless the replay refreshes.
-        {
-            let mut uploads = svc.attachment_uploads.lock().unwrap();
-            let session = uploads.get_mut(&upload_id).unwrap();
-            session.last_activity = tokio::time::Instant::now()
-                .checked_sub(std::time::Duration::from_millis(80))
-                .expect("backdate");
-        }
+        // Idle to just inside the TTL: still live for the replay's sweep,
+        // but expired by the next op's jump below unless the replay
+        // refreshes. The clock is handed back before each service call (the
+        // store's pool-acquire timeouts are tokio timers).
+        tokio::time::pause();
+        tokio::time::advance(ttl * 3 / 4).await;
+        tokio::time::resume();
         let again = svc
             .file_attachment_upload_begin_op(
                 ws.clone(),
@@ -1657,11 +1661,13 @@ mod tests {
             .expect("session still live")
             .last_activity
             .elapsed();
-        assert!(
-            idle < std::time::Duration::from_millis(50),
-            "not refreshed: {idle:?}"
-        );
+        assert!(idle < ttl / 4, "not refreshed: {idle:?}");
 
+        // Total idle since the original begin is now past the TTL; only the
+        // refreshed clock keeps the next op from sweeping the session.
+        tokio::time::pause();
+        tokio::time::advance(ttl / 2).await;
+        tokio::time::resume();
         svc.file_attachment_upload_chunk_op(upload_id.clone(), 0, b64(&payload))
             .await
             .expect("chunk after replay");
