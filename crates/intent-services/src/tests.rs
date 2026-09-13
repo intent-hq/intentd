@@ -33803,7 +33803,6 @@ mod last_activity_events {
         // which discarded the very event asserted below (intent#4886).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut updated: Option<Value> = None;
-        let mut trailing: Vec<Value> = Vec::new();
         while updated.is_none() {
             let batch = tokio::time::timeout_at(deadline, sub.recv())
                 .await
@@ -33811,11 +33810,15 @@ mod last_activity_events {
                 .expect("subscription open");
             for ev in &batch {
                 let ev = serde_json::to_value(ev).expect("serialize event");
-                if updated.is_some() {
-                    trailing.push(ev);
-                } else if ev["type"] == "workspace:updated" {
-                    updated = Some(ev);
+                if ev["type"] != "workspace:updated" {
+                    continue;
                 }
+                // A second one in the same batch is a coalescing failure.
+                assert!(
+                    updated.is_none(),
+                    "burst coalesced into one workspace:updated, got a second: {ev:?}"
+                );
+                updated = Some(ev);
             }
         }
 
@@ -33824,17 +33827,19 @@ mod last_activity_events {
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert!(ev["data"]["changes"]["lastActivity"].is_string());
 
-        // No second workspace:updated (coalesced): neither in the remainder of
-        // the batch that carried the first nor within a quiet window after it.
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await {
+        // No second workspace:updated (coalesced) within a quiet window after
+        // the first. One absolute deadline bounds the whole window, so a
+        // stream of unrelated events cannot keep extending it.
+        let quiet_until = tokio::time::Instant::now() + Duration::from_millis(100);
+        while let Ok(Some(batch)) = tokio::time::timeout_at(quiet_until, sub.recv()).await {
             for ev in &batch {
-                trailing.push(serde_json::to_value(ev).expect("serialize event"));
+                let ev = serde_json::to_value(ev).expect("serialize event");
+                assert_ne!(
+                    ev["type"], "workspace:updated",
+                    "burst coalesced into one workspace:updated, got a second: {ev:?}"
+                );
             }
         }
-        assert!(
-            trailing.iter().all(|ev| ev["type"] != "workspace:updated"),
-            "burst coalesced into one workspace:updated, got trailing {trailing:?}"
-        );
 
         // The emitted lastActivity matches a fresh workspace.get.
         let ws_after = h.store.get_workspace(&h.ws).await.expect("reload");
