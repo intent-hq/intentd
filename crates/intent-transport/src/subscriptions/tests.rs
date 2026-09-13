@@ -4652,10 +4652,19 @@ mod channel_membership {
         members: Arc<Mutex<HashSet<String>>>,
     }
 
+    /// Marker entry in `members`: the guarded conversation read fails
+    /// transiently (a store error inside `require_agent_member`) instead of
+    /// answering, for every caller.
+    const STORE_DOWN: &str = "!store-down";
+
     impl MembershipApi {
         fn allowed(&self, workspace_id: &str) -> bool {
             !crate::context::is_non_administrator_caller()
                 || self.members.lock().unwrap().contains(workspace_id)
+        }
+
+        fn store_down(&self) -> bool {
+            self.members.lock().unwrap().contains(STORE_DOWN)
         }
     }
 
@@ -4706,8 +4715,12 @@ mod channel_membership {
             _projection: Option<intent_core::ConversationProjection>,
             _include_in_progress: bool,
         ) -> BoxFuture<'_, intent_core::Result<Value>> {
+            let store_down = self.store_down();
             let allowed = self.allowed(&agent_workspace(agent_id.as_str()));
             Box::pin(async move {
+                if store_down {
+                    return Err(Error::Internal("membership lookup failed".into()));
+                }
                 if !allowed {
                     return Err(Error::NotFound(format!("agent {agent_id}")));
                 }
@@ -4936,6 +4949,39 @@ mod channel_membership {
             stranger.snapshot
         );
         drop(stranger.subs);
+    }
+
+    /// A transient failure of the guarded read has verified nothing: a
+    /// collaborator's seq-0 page then carries no live overlay, while the
+    /// administrator keeps the degrade-with-overlay contract.
+    #[tokio::test]
+    async fn chat_seq0_transient_guard_failure_skips_overlay_for_a_collaborator() {
+        let (_, caller) = guest();
+        let member = subscribe(caller, &["ws-1", STORE_DOWN], chat_subscribe("agent-1")).await;
+        assert_eq!(
+            member.snapshot["messages"],
+            json!([]),
+            "{}",
+            member.snapshot
+        );
+        assert!(
+            member.snapshot.get("isStreaming").is_none(),
+            "{}",
+            member.snapshot
+        );
+        drop(member.subs);
+
+        let owner = Caller::Wire {
+            principal_id: PrincipalId::new(),
+            is_administrator: true,
+        };
+        let admin = subscribe(owner, &[STORE_DOWN], chat_subscribe("agent-1")).await;
+        assert_eq!(
+            admin.snapshot["messages"][0]["id"], "msg-live",
+            "{}",
+            admin.snapshot
+        );
+        drop(admin.subs);
     }
 
     /// A non-member's `chat.subscribe` to a private workspace's agent gets
