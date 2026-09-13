@@ -23,7 +23,7 @@ use intent_core::{
 };
 use intent_sourcecontrol::{IdentityFlow, IdentityPollStatus, UserIdentity};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::{github_auth_ops, pr_ops, Services};
@@ -36,7 +36,9 @@ pub(crate) const MAX_INVITE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Concurrent identity-only device flows the daemon keeps in flight; the
 /// `/invite` endpoint is unauthenticated, so this bounds what an anonymous
-/// peer holding one valid link can make the daemon poll for.
+/// peer holding one valid link can make the daemon poll for. Enforced as a
+/// semaphore whose permit is taken *before* the device-code request and
+/// lives in the flow's slot, so refused starts cost no upstream call.
 pub(crate) const MAX_INFLIGHT_INVITE_FLOWS: usize = 16;
 
 /// Consecutive poll errors tolerated before a flow is marked failed.
@@ -59,10 +61,20 @@ pub(crate) struct InviteFlowSlot {
     settled_at: Option<Instant>,
     outcome: Option<Result<Value>>,
     done: watch::Sender<bool>,
+    /// The [`MAX_INFLIGHT_INVITE_FLOWS`] permit; released when the slot is
+    /// collected or purged.
+    _permit: OwnedSemaphorePermit,
 }
 
 /// In-flight and recently settled identity flows keyed by flow id.
 pub(crate) type InviteFlowState = Arc<tokio::sync::Mutex<HashMap<String, InviteFlowSlot>>>;
+
+/// Admission permits for identity flows ([`MAX_INFLIGHT_INVITE_FLOWS`]).
+pub(crate) type InviteFlowPermits = Arc<Semaphore>;
+
+pub(crate) fn new_flow_permits() -> InviteFlowPermits {
+    Arc::new(Semaphore::new(MAX_INFLIGHT_INVITE_FLOWS))
+}
 
 /// Live feed of principal ids whose credentials were just revoked; the
 /// transport closes the connections still bound to them.
@@ -159,22 +171,40 @@ impl Services {
 
     /// The principal an invite is minted by: the bound caller (the owner,
     /// or the administrator acting as the primary). Ensures it carries a
-    /// GitHub identity — the primary's is refreshed inline from `GET /user`
-    /// when still unlinked — else
-    /// [`InviteErrorKind::GithubIdentityRequired`].
+    /// GitHub identity, else [`InviteErrorKind::GithubIdentityRequired`].
+    ///
+    /// For the primary that identity is only as good as the daemon's GitHub
+    /// auth *right now*: a `github.revoke` leaves the cached `github_user_id`
+    /// on the row, so the cache alone does not qualify — `check_auth` must
+    /// confirm a configured, working credential on every mint, and the
+    /// profile is (re)fetched inline while the row is still unlinked. A
+    /// joined collaborator's identity was proven by its own device grant and
+    /// is accepted as cached.
     async fn inviting_principal(&self) -> Result<Principal> {
         let id = crate::principal_ops::caller_principal_id(&self.store)
             .await?
             .ok_or_else(crate::principal_ops::no_caller)?;
         let principal = self.store.get_principal(&id).await?;
+        if !principal.is_primary {
+            return if principal.github_user_id.is_some() {
+                Ok(principal)
+            } else {
+                Err(Error::Invite(InviteErrorKind::GithubIdentityRequired))
+            };
+        }
+        let authenticated = match self.identity_source_control().await {
+            Ok(sc) => sc.check_auth().await.is_ok_and(|s| s.authenticated),
+            Err(_) => false,
+        };
+        if !authenticated {
+            return Err(Error::Invite(InviteErrorKind::GithubIdentityRequired));
+        }
         if principal.github_user_id.is_some() {
             return Ok(principal);
         }
-        if principal.is_primary {
-            if let Ok(refreshed) = self.refresh_primary_identity(principal).await {
-                if refreshed.github_user_id.is_some() {
-                    return Ok(refreshed);
-                }
+        if let Ok(refreshed) = self.refresh_primary_identity(principal).await {
+            if refreshed.github_user_id.is_some() {
+                return Ok(refreshed);
             }
         }
         Err(Error::Invite(InviteErrorKind::GithubIdentityRequired))
@@ -426,13 +456,15 @@ impl Services {
             .await
             .map_err(|_| Error::Invite(InviteErrorKind::NotFound))?;
 
-        {
-            let mut flows = self.invite_flows.lock().await;
-            purge_flows(&mut flows);
-            if flows.len() >= MAX_INFLIGHT_INVITE_FLOWS {
-                return Err(Error::Invite(InviteErrorKind::FlowBusy));
-            }
-        }
+        // Reserve the flow's capacity before the upstream device-code
+        // request: purge collectable slots (returning their permits), then
+        // take one — a refused start never reaches GitHub. The permit is
+        // held by this frame until it moves into the slot below, so a start
+        // that fails upstream releases it on return.
+        purge_flows(&mut *self.invite_flows.lock().await);
+        let Ok(permit) = self.invite_flow_permits.clone().try_acquire_owned() else {
+            return Err(Error::Invite(InviteErrorKind::FlowBusy));
+        };
         let client_id = self
             .effective_settings()
             .source_control
@@ -452,22 +484,17 @@ impl Services {
         let flow_id = uuid::Uuid::new_v4().to_string();
         let deadline = Instant::now() + Duration::from_secs(auth.expires_in);
         let (done, _) = watch::channel(false);
-        {
-            let mut flows = self.invite_flows.lock().await;
-            if flows.len() >= MAX_INFLIGHT_INVITE_FLOWS {
-                return Err(Error::Invite(InviteErrorKind::FlowBusy));
-            }
-            flows.insert(
-                flow_id.clone(),
-                InviteFlowSlot {
-                    invite_id: invite.id.clone(),
-                    deadline,
-                    settled_at: None,
-                    outcome: None,
-                    done,
-                },
-            );
-        }
+        self.invite_flows.lock().await.insert(
+            flow_id.clone(),
+            InviteFlowSlot {
+                invite_id: invite.id.clone(),
+                deadline,
+                settled_at: None,
+                outcome: None,
+                done,
+                _permit: permit,
+            },
+        );
         tokio::spawn(
             self.clone()
                 .poll_invite_flow(flow_id.clone(), flow, deadline),
@@ -548,6 +575,13 @@ impl Services {
                     break Err(Error::Invite(InviteErrorKind::FlowDenied));
                 }
                 Err(e) => {
+                    // A failure *after* the grant (the one `GET /user`) is
+                    // terminal: the device code is spent and must not be
+                    // polled again. Pre-grant blips keep the retry budget.
+                    if flow.is_spent() {
+                        tracing::debug!(error = %e, "invite identity lookup failed after grant");
+                        break Err(Error::Invite(InviteErrorKind::FlowError));
+                    }
                     consecutive_errors += 1;
                     tracing::debug!(
                         error = %e,
@@ -569,10 +603,12 @@ impl Services {
     }
 
     /// The join itself, once the invitee's GitHub identity is proven:
-    /// re-check the invite (pin, still open), mint or reuse the principal
-    /// keyed by `github_user_id`, redeem the invite (the conditional UPDATE
-    /// is the single-use guard), add the `collaborator` membership and issue
-    /// a fresh per-principal credential.
+    /// re-check the invite (pin, still open), then — in one store
+    /// transaction ([`intent_store::Store::join_workspace_by_invite`]) —
+    /// mint or reuse the principal keyed by `github_user_id`, redeem the
+    /// invite (the conditional UPDATE is the single-use guard), add the
+    /// `collaborator` membership and record a fresh per-principal
+    /// credential. The event is published only after the commit.
     async fn complete_invite_join(&self, invite_id: &str, user: &UserIdentity) -> Result<Value> {
         let github_user_id = user
             .id
@@ -592,27 +628,28 @@ impl Services {
         {
             return Err(Error::Invite(InviteErrorKind::PinMismatch));
         }
-        let mut principal = self
+        let mut identity = Principal {
+            id: PrincipalId::new(),
+            github_user_id: None,
+            login: None,
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        apply_identity(&mut identity, user);
+        let token = random_hex_secret();
+        let Some(principal) = self
             .store
-            .find_principal_by_github_user_id(github_user_id)
+            .join_workspace_by_invite(
+                invite_id,
+                &invite.workspace_id,
+                &identity,
+                &hash_secret(&token),
+            )
             .await?
-            .unwrap_or_else(|| Principal {
-                id: PrincipalId::new(),
-                github_user_id: None,
-                login: None,
-                display_name: None,
-                avatar_url: None,
-                is_primary: false,
-                created_at: now_iso(),
-                updated_at: now_iso(),
-            });
-        apply_identity(&mut principal, user);
-        self.store.upsert_principal(&principal).await?;
-        if !self
-            .store
-            .redeem_workspace_invite(invite_id, &principal.id)
-            .await?
-        {
+        else {
             let kind = self
                 .store
                 .get_workspace_invite(invite_id)
@@ -620,18 +657,7 @@ impl Services {
                 .and_then(|i| closed_kind(&i, &now_iso()))
                 .unwrap_or(InviteErrorKind::NotFound);
             return Err(Error::Invite(kind));
-        }
-        self.store
-            .add_workspace_member(
-                &invite.workspace_id,
-                &principal.id,
-                WorkspaceRole::Collaborator,
-            )
-            .await?;
-        let token = random_hex_secret();
-        self.store
-            .insert_principal_credential(&principal.id, &hash_secret(&token))
-            .await?;
+        };
         let member_count = self.member_count(&invite.workspace_id).await?;
         crate::publish_event(
             self.event_bus.as_ref(),
