@@ -3425,6 +3425,7 @@ impl Services {
                         content: Value::Array(live.blocks),
                         metadata: None,
                         app_message_id: None,
+                        author: None,
                         created_at: live.last_activity_at.clone(),
                     };
                     let mut row = project_served_message(row);
@@ -3583,6 +3584,7 @@ impl Services {
                     content: Value::Array(live.blocks),
                     metadata: None,
                     app_message_id: None,
+                    author: None,
                     created_at: live.last_activity_at,
                 },
                 None => {
@@ -5266,6 +5268,12 @@ impl Services {
         if session.harness_features.is_none() {
             session.harness_features = self.current_agent_features_snapshot();
         }
+        // Serve-time author projection (multiplayer w2) on the typed
+        // transcript — the same shim `agent.getConversation` applies, so a
+        // client hydrating through either route sees one attribution shape.
+        crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
+            .attach_typed(&mut session.messages)
+            .await;
         Ok(session)
     }
 
@@ -6141,19 +6149,30 @@ impl Services {
     /// `agent.getQueue` (PROTOCOL §5.5). When `workspace_id` is supplied the
     /// callee verifies the session belongs to that workspace (defense-in-depth
     /// against a bare `agentId` probe across workspaces); a mismatch surfaces
-    /// as `NotFound`.
+    /// as `NotFound`. Entries carry the resolved `author` projection
+    /// ([`crate::principal_ops::MessageAuthorResolver::attach_queue`]) — the
+    /// same shape and resolution order as `agent.getConversation` user rows.
     pub(crate) async fn agent_get_queue_op(
         &self,
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
+        let owning_ws = match self.store.get_agent_session(&agent_id).await {
+            Ok(session) => Some(session.workspace_id),
+            Err(e) if workspace_id.is_some() => return Err(e),
+            Err(_) => None,
+        };
         if let Some(ws) = workspace_id.as_ref() {
-            let session = self.store.get_agent_session(&agent_id).await?;
-            if session.workspace_id != *ws {
+            if owning_ws.as_ref() != Some(ws) {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        let queue = self.queue_snapshot(&agent_id);
+        let mut queue = self.queue_snapshot(&agent_id);
+        if let Some(ws) = owning_ws.as_ref() {
+            crate::principal_ops::MessageAuthorResolver::new(self, ws)
+                .attach_queue(&mut queue)
+                .await;
+        }
         Ok(json!({ "success": true, "queue": queue }))
     }
 
@@ -6181,8 +6200,12 @@ impl Services {
         editing: Option<bool>,
     ) -> Result<Value> {
         // Principal stamp (multiplayer w2): an edit by a wire caller makes
-        // the editor the author of the (user-origin) entry; an agent /
-        // daemon edit leaves the original stamp alone.
+        // the editor the author of a human-authored entry; an agent /
+        // daemon edit leaves the original stamp alone. Human authorship is
+        // the entry's principal stamp (or a user-origin lifecycle) — NOT
+        // `user_origin` alone: a human wake parked by `deliver_wake_message`
+        // and a direct send that fell into the append-failure auto-queue are
+        // both enqueued as `Automatic` yet carry the author's stamp.
         let restamp = matches!(
             intent_core::current_caller(),
             Some(intent_core::Caller::Wire { .. })
@@ -6201,11 +6224,15 @@ impl Services {
                 .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
             let was = queue[position].editing;
             queue[position].content = content;
-            if restamp && queue[position].user_origin {
+            let human_authored = queue[position].user_origin
+                || crate::principal_ops::carries_principal_stamp(
+                    queue[position].message_metadata.as_ref(),
+                );
+            if restamp && human_authored {
                 queue[position].message_metadata =
                     crate::principal_ops::stamp_principal_attribution(
                         queue[position].message_metadata.take(),
-                    );
+                    )?;
             }
             if let Some(flag) = editing {
                 queue[position].editing = flag;
@@ -13275,11 +13302,18 @@ impl Services {
         // non-goal — the worker still mints one internally at spawn).
         self.publish_agent_message_events(workspace_id, agent_id, &message, None)
             .await;
+        // The worker's options carry the same row-level metadata so a
+        // terminal spawn/turn failure requeues the wake WITH its tag and
+        // principal stamp (`agent.getQueue` / `agent:queue:*` / the retry
+        // turn keep the author); the row itself is already persisted above.
         manager.clone().finish_prepersisted_turn_spawn(
             agent_id.clone(),
             workspace_id.clone(),
             content_owned,
-            crate::agent_manager::TurnOptions::default(),
+            crate::agent_manager::TurnOptions {
+                message_metadata: message_metadata.cloned(),
+                ..Default::default()
+            },
         );
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
@@ -14901,9 +14935,15 @@ impl Services {
     /// arriving after the settled shrink and resurrecting a drained entry).
     /// Publication order thus equals snapshot order, so the stream of
     /// `agent:queue:updated` payloads is monotone in queue mutation order.
+    /// The `author` projection is attached under the same gate (one batched
+    /// principal read per publish, see
+    /// [`crate::principal_ops::MessageAuthorResolver::attach_queue`]).
     async fn publish_queue_event(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) {
         let _gate = self.agent_queue_publish_gate.lock().await;
-        let queue = self.queue_snapshot(agent_id);
+        let mut queue = self.queue_snapshot(agent_id);
+        crate::principal_ops::MessageAuthorResolver::new(self, workspace_id)
+            .attach_queue(&mut queue)
+            .await;
         let event = intent_store::NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: now_iso(),

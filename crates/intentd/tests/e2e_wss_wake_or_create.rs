@@ -48,7 +48,8 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 struct Daemon {
     child: Child,
-    _data_dir: tempfile::TempDir,
+    /// Kept alive for the daemon's lifetime; the store lives under it.
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
@@ -338,7 +339,7 @@ async fn boot_daemon_with_task_env(
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
-        _data_dir: data_dir_guard,
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -1257,4 +1258,223 @@ async fn parked_messages_survive_wake_or_create_replacement() {
         "agent:queue:updated for B carries the migrated follow-up"
     );
     assert!(saw_deleted, "agent:deleted observed for the poisoned agent");
+}
+
+/// Multiplayer w2: a collaborator's `agent.wakeOrCreate` keeps its principal
+/// through the runtime wake path's terminal-failure requeue. The wake row is
+/// persisted with the guest's `fromPrincipalId`; when the turn fails
+/// session-fatally (mock provider safety block) the requeued kickoff on
+/// `agent.getQueue` / `agent:queue:updated` still carries the guest's stamp
+/// (not the owner's, not none) plus the resolved `author` projection, and
+/// `agent.getSession` serves the same `author` on the persisted row as
+/// `agent.getConversation`.
+#[tokio::test]
+async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
+    use intent_core::{now_iso, Principal, PrincipalId};
+    use intent_store::Store;
+    use sha2::Digest as _;
+
+    let Some(script) = gate("WSS guest wake attribution E2E") else {
+        return;
+    };
+    let behavior = json!({
+        "promptRpcError": {
+            "code": -32603,
+            "message": "The model provider blocked this response for safety reasons. \
+                        Please start a new session",
+        },
+    })
+    .to_string();
+    let (daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task_env(
+        "Guest Wake Task",
+        &[
+            ("MOCK_AGENT_SCRIPT_PATH", &script),
+            ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ],
+    )
+    .await;
+    let cfg = client_config(&fp);
+
+    // A collaborator with its own credential, seeded into the daemon's store.
+    let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: Some("Guest User".to_string()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    {
+        let store = Store::open(&daemon.data_dir.path().join("intentd.db"))
+            .await
+            .expect("open daemon store");
+        store
+            .upsert_principal(&guest)
+            .await
+            .expect("guest principal");
+        let token_hash =
+            sha2::Sha256::digest(guest_token.as_bytes())
+                .iter()
+                .fold(String::new(), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
+        store
+            .insert_principal_credential(&guest.id, &token_hash)
+            .await
+            .expect("guest credential");
+    }
+
+    // SUBSCRIBER conn (owner) — subscribe BEFORE any turn.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    // The GUEST wakes (creates) the task agent with a spoofed stamp.
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
+    let woke = wss_rpc(
+        &mut guest_rpc,
+        10,
+        "agent.wakeOrCreate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": task_note_id,
+            "contextMessage": "guest kickoff",
+            "model": "default",
+            "messageMetadata": { "fromPrincipalId": "spoof" },
+            "create": { "provider": "mock" },
+        }),
+    )
+    .await;
+    assert_eq!(woke["ok"], true, "guest wakeOrCreate: {woke}");
+    let agent_id = woke["agentId"].as_str().expect("agentId").to_string();
+
+    // Wait for the terminal failure and for the `agent:queue:updated` that
+    // announces the requeued kickoff.
+    let mut saw_status_error = false;
+    let mut requeue_event: Option<Value> = None;
+    for _ in 0..200 {
+        if saw_status_error && requeue_event.is_some() {
+            break;
+        }
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        if event["type"] == "agent:queue:updated"
+            && event["data"]["queue"]
+                .as_array()
+                .is_some_and(|q| q.iter().any(|m| m["content"] == "guest kickoff"))
+        {
+            requeue_event = Some(event["data"].clone());
+        }
+        if event["type"] == "agent:status-changed" && event["data"]["status"] == "error" {
+            saw_status_error = true;
+        }
+    }
+    assert!(saw_status_error, "agent parked in error after the block");
+
+    // The requeued kickoff keeps the guest's stamp — on the queue read …
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let queue = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.getQueue",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let parked = queue["queue"].as_array().expect("queue array");
+    let kickoff = parked
+        .iter()
+        .find(|m| m["content"] == "guest kickoff")
+        .unwrap_or_else(|| panic!("requeued kickoff on the queue: {queue}"));
+    assert_eq!(
+        kickoff["messageMetadata"]["fromPrincipalId"],
+        json!(guest.id.0),
+        "the requeued wake carries the guest's principal (never the spoof, never none): {kickoff}"
+    );
+    let expected_author = json!({
+        "principalId": guest.id.0,
+        "login": "guest",
+        "displayName": "Guest User",
+        "avatarUrl": null,
+    });
+    assert_eq!(
+        kickoff["author"], expected_author,
+        "agent.getQueue entries carry the resolved author: {kickoff}"
+    );
+    // … and on the `agent:queue:updated` payload that announced the requeue.
+    let queue_event = requeue_event.expect("agent:queue:updated announcing the requeue");
+    let announced = queue_event["queue"]
+        .as_array()
+        .expect("queue array")
+        .iter()
+        .find(|m| m["content"] == "guest kickoff")
+        .unwrap_or_else(|| panic!("requeued kickoff in agent:queue:updated: {queue_event}"));
+    assert_eq!(
+        announced["messageMetadata"]["fromPrincipalId"],
+        json!(guest.id.0),
+        "agent:queue:updated carries the guest's stamp: {announced}"
+    );
+    assert_eq!(
+        announced["author"], expected_author,
+        "agent:queue:updated entries carry the resolved author: {announced}"
+    );
+
+    // The persisted wake row: stamped, and served with the same `author` by
+    // both hydration routes.
+    let session = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let session_row = session["session"]["messages"]
+        .as_array()
+        .expect("session messages")
+        .iter()
+        .find(|m| m["role"] == "user" && m["metadata"]["fromPrincipalId"] == json!(guest.id.0))
+        .unwrap_or_else(|| panic!("stamped wake row in agent.getSession: {session}"));
+    assert_eq!(
+        session_row["author"], expected_author,
+        "agent.getSession serves the resolved author: {session_row}"
+    );
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let conv_row = conv["messages"]
+        .as_array()
+        .expect("conversation messages")
+        .iter()
+        .find(|m| m["id"] == session_row["id"])
+        .unwrap_or_else(|| panic!("the same row in agent.getConversation: {conv}"));
+    assert_eq!(
+        conv_row["author"], expected_author,
+        "agent.getConversation and agent.getSession agree on the author"
+    );
+    assert!(
+        session["session"]["messages"]
+            .as_array()
+            .expect("session messages")
+            .iter()
+            .filter(|m| m["role"] != "user")
+            .all(|m| m.get("author").is_none()),
+        "non-user rows carry no author on agent.getSession: {session}"
+    );
 }
