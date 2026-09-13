@@ -608,7 +608,8 @@ pub(crate) fn trace_chat_snapshot(scope: &str, subscription_id: &str, snapshot: 
 }
 
 /// Record a chat forwarder loop exiting. `reason` is a fixed vocabulary:
-/// `client_closed` (the outbound lane is gone) or `bus_closed`.
+/// `client_closed` (the outbound lane is gone), `bus_closed`, or
+/// `membership_revoked` (the subscriber lost the agent's workspace).
 pub(crate) fn trace_chat_forwarder_exit(scope: &str, subscription_id: &str, reason: &'static str) {
     tracing::info!(
         target: LIFECYCLE_TARGET,
@@ -1784,7 +1785,10 @@ pub(crate) async fn channel_delta(
         // generic arm is unreachable for `Note`; full rows keep it faithful.
         Channel::Note => note_delta(api, workspace_id, event, None).await,
         Channel::Agent => agent_delta(api, event).await,
-        Channel::Workspace => workspace_delta(api, event).await,
+        // The workspace channel's tombstone scoping is stateful (the
+        // forwarder threads the subscriber's visible-id set); this generic
+        // arm is the unscoped administrator form.
+        Channel::Workspace => workspace_delta(api, event, None).await,
         Channel::Comment => comment_delta(api, workspace_id, note_id?, event).await,
         // The task channel uses the stateful [`task_delta`] mapper directly in
         // the forwarder: it tracks the spec's task-link set across deltas so a
@@ -1995,23 +1999,59 @@ pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option
     }
 }
 
+/// The workspace ids a `workspace` channel subscriber has been shown so far,
+/// seeded from the snapshot rows — `id` of each — and maintained by
+/// [`workspace_delta`]. Only a non-administrator forwarder tracks one
+/// (multiplayer w3): the channel is global, so without it a
+/// `workspace:deleted` tombstone would disclose the id of a workspace the
+/// subscriber was never a member of.
+pub(crate) fn visible_workspace_ids(snapshot: &Value) -> HashSet<String> {
+    snapshot
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Map a `workspace` channel event by re-reading the [`Workspace`]. The channel
 /// is global, so the id comes from `data.workspaceId` (falling back to the
 /// event's `workspaceId`). `workspace:created` → `added`, `workspace:deleted` →
 /// `removedIds`, every other status/PR event → `updated`.
-pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
+///
+/// With `visible` (a non-administrator subscriber), a `workspace:deleted`
+/// tombstone is emitted only for a workspace previously shown to this
+/// subscriber, and every successful re-read records the id as shown; the
+/// subscriber's own unshare removes it. Without it (administrator) every
+/// tombstone is emitted as before.
+pub(crate) async fn workspace_delta(
+    api: &dyn WorkspaceApi,
+    event: &Event,
+    visible: Option<&mut HashSet<String>>,
+) -> Option<Value> {
     let workspace_id = event
         .data
         .get("workspaceId")
         .and_then(Value::as_str)
         .map_or_else(|| event.workspace_id.as_str().to_string(), str::to_string);
     match event.event_type.as_str() {
-        WORKSPACE_DELETED => Some(json!({ "removedIds": [workspace_id] })),
+        WORKSPACE_DELETED => {
+            if let Some(visible) = visible {
+                if !visible.remove(&workspace_id) {
+                    return None;
+                }
+            }
+            Some(json!({ "removedIds": [workspace_id] }))
+        }
         WORKSPACE_CREATED => {
             let ws = api
-                .get_workspace(WorkspaceId::from(workspace_id))
+                .get_workspace(WorkspaceId::from(workspace_id.clone()))
                 .await
                 .ok()?;
+            if let Some(visible) = visible {
+                visible.insert(workspace_id);
+            }
             Some(json!({ "added": [serde_json::to_value(ws).ok()?] }))
         }
         WORKSPACE_UPDATED
@@ -2029,12 +2069,18 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
             // re-read, which is `NotFound` for non-members (no delta) — a
             // non-member workspace id is never disclosed.
             if is_unshare_of_current_caller(event) {
+                if let Some(visible) = visible {
+                    visible.remove(&workspace_id);
+                }
                 return Some(json!({ "removedIds": [workspace_id] }));
             }
             let ws = api
-                .get_workspace(WorkspaceId::from(workspace_id))
+                .get_workspace(WorkspaceId::from(workspace_id.clone()))
                 .await
                 .ok()?;
+            if let Some(visible) = visible {
+                visible.insert(workspace_id);
+            }
             Some(json!({ "updated": [serde_json::to_value(ws).ok()?] }))
         }
         _ => None,
