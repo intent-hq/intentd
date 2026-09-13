@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::{
-    current_caller, now_iso, Caller, Error, Principal, PrincipalId, Result, Workspace,
+    current_caller, now_iso, Caller, Error, Principal, PrincipalId, Result, Workspace, WorkspaceId,
 };
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -140,7 +140,7 @@ impl Services {
         let viewer = caller_principal_id(&self.store).await.ok().flatten();
         match self
             .store
-            .workspace_membership_summaries(viewer.as_ref(), Some(&ws.id))
+            .workspace_membership_summaries(viewer.as_ref(), std::slice::from_ref(&ws.id))
             .await
         {
             Ok(mut map) => ws.membership = map.remove(&ws.id),
@@ -148,12 +148,17 @@ impl Services {
         }
     }
 
-    /// Attach membership summaries to `workspace.list` rows in one query.
+    /// Attach membership summaries to `workspace.list` rows in one query
+    /// scoped to exactly the rows being returned (an empty list issues none).
     pub(crate) async fn attach_workspace_memberships(&self, list: &mut [Workspace]) {
+        if list.is_empty() {
+            return;
+        }
         let viewer = caller_principal_id(&self.store).await.ok().flatten();
+        let ids: Vec<WorkspaceId> = list.iter().map(|ws| ws.id.clone()).collect();
         match self
             .store
-            .workspace_membership_summaries(viewer.as_ref(), None)
+            .workspace_membership_summaries(viewer.as_ref(), &ids)
             .await
         {
             Ok(mut map) => {
