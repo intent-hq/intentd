@@ -8705,6 +8705,174 @@ mod change_event_parity {
         );
     }
 
+    /// Caller-aware terminal guard on `task.updateNoteStatus`: a task's OWN
+    /// linked agent (session `task_note_id == noteId`, or listed in
+    /// `assignedAgentIds`) cannot move the task out of `complete` /
+    /// `cancelled` — the write is a no-op that answers the unchanged status
+    /// plus the presence-detected `advisory`, and emits no
+    /// `task:status-changed`. Every other caller (unlinked agent, the
+    /// caller-less router/FE path) and every non-terminal starting status
+    /// transition exactly as before, with no `advisory`.
+    #[tokio::test]
+    async fn task_note_status_terminal_guard_blocks_only_linked_agent() {
+        let h = harness().await;
+        let mk_session = |id: &str, task_note_id: Option<intent_core::NoteId>| AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from(id),
+            workspace_id: h.ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: id.to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            retired_at: None,
+        };
+        let task_id = intent_core::NoteId::from("task-guard");
+        // `linked-session` is linked via its session row; `linked-assigned`
+        // only via the task's `assignedAgentIds`; `outsider` is neither.
+        for (id, linked) in [
+            ("linked-session", Some(task_id.clone())),
+            ("linked-assigned", None),
+            ("outsider", None),
+        ] {
+            h.store
+                .insert_agent_session(&mk_session(id, linked))
+                .await
+                .expect("session");
+        }
+        let mut tn = note(&h.ws, "task-guard", "Guarded");
+        tn.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::InProgress,
+            assigned_agent_ids: vec![AgentId::from("linked-assigned")],
+            ..Default::default()
+        });
+        h.store.insert_note(&tn).await.expect("insert task note");
+        let set = |status: &str, caller: Option<&str>| {
+            h.services.task_update_note_status(
+                h.ws.clone(),
+                task_id.clone(),
+                status.to_string(),
+                None,
+                caller.map(AgentId::from),
+            )
+        };
+        let status_of = |ev: &Value| ev["type"] == "task:status-changed";
+
+        // Non-terminal start: the linked agent transitions as before.
+        let res = set("review_required", Some("linked-session"))
+            .await
+            .expect("linked agent from in_progress");
+        assert_eq!(res.status, TaskStatus::ReviewRequired);
+        assert!(res.advisory.is_none(), "no advisory on a real transition");
+
+        // Close the task with no caller (router/FE path).
+        let res = set("complete", None).await.expect("complete");
+        assert_eq!(res.status, TaskStatus::Complete);
+        assert!(res.advisory.is_none());
+        let mut sub = subscribe(&h);
+
+        // Both linkage shapes are blocked: no-op, advisory, no event.
+        for caller in ["linked-session", "linked-assigned"] {
+            let res = set("review_required", Some(caller))
+                .await
+                .expect("blocked write still ok");
+            assert!(res.ok);
+            assert_eq!(
+                res.status,
+                TaskStatus::Complete,
+                "{caller}: status unchanged"
+            );
+            assert_eq!(
+                res.note.metadata.task.as_ref().map(|t| t.status),
+                Some(TaskStatus::Complete)
+            );
+            assert_eq!(
+                res.advisory.as_deref(),
+                Some(
+                    "Task is complete; a task's own linked agent cannot reopen it. \
+                     Ask the coordinator or user to reopen the task if more work is needed."
+                ),
+                "{caller}: advisory"
+            );
+            // Terminal → terminal by the linked agent is blocked too.
+            let res = set("cancelled", Some(caller)).await.expect("blocked");
+            assert_eq!(
+                res.status,
+                TaskStatus::Complete,
+                "{caller}: complete→cancelled blocked"
+            );
+            assert!(res.advisory.is_some());
+        }
+        let stored = h.store.get_note(&h.ws, &task_id).await.expect("note");
+        assert_eq!(
+            stored.metadata.task.as_ref().map(|t| t.status),
+            Some(TaskStatus::Complete),
+            "blocked writes never reach the store"
+        );
+        assert!(
+            !drain_events(&mut sub).await.iter().any(status_of),
+            "blocked writes emit no task:status-changed"
+        );
+
+        // Same-status write by the linked agent stays the ordinary no-op
+        // (no advisory — nothing was refused).
+        let res = set("complete", Some("linked-session"))
+            .await
+            .expect("same status");
+        assert_eq!(res.status, TaskStatus::Complete);
+        assert!(res.advisory.is_none());
+
+        // An unlinked agent reopens the task as before.
+        let res = set("review_required", Some("outsider"))
+            .await
+            .expect("outsider reopens");
+        assert_eq!(res.status, TaskStatus::ReviewRequired);
+        assert!(res.advisory.is_none());
+        let evs = drain_events(&mut sub).await;
+        let ev = evs.iter().find(|ev| status_of(ev)).expect("status event");
+        assert_eq!(ev["data"]["agentId"], "outsider");
+
+        // Back to terminal, then the caller-less path reopens as before.
+        set("cancelled", None).await.expect("cancel");
+        let res = set("in_progress", None).await.expect("router reopens");
+        assert_eq!(res.status, TaskStatus::InProgress);
+        assert!(res.advisory.is_none());
+    }
+
     /// Drain every published event until the bus goes quiet, flattening
     /// batches into one ordered list of wire-JSON envelopes.
     async fn drain_events(sub: &mut Subscription) -> Vec<Value> {

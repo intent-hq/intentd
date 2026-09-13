@@ -1774,6 +1774,12 @@ pub struct TaskUpdateNoteStatusResult {
     pub note_id: NoteId,
     pub status: TaskStatus,
     pub note: Note,
+    /// Presence-detected: set only when the caller-aware terminal guard
+    /// refused the write (a task's own linked agent tried to move it out of
+    /// `complete` / `cancelled`). `status` / `note` then echo the unchanged
+    /// task; absent (never `null`) on every write that went through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory: Option<String>,
 }
 
 /// Result of `task.update` (atomic single-line edit).

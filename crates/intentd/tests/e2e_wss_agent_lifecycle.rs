@@ -4118,6 +4118,207 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     );
 }
 
+/// Caller-aware terminal guard on `task.updateNoteStatus` over WSS — the
+/// incident shape: a task's assigned agent runs
+/// `ws.task.updateNoteStatus(id, "review_required")` through the production
+/// `workspace_api` MCP bridge (which passes the caller agent) AFTER a
+/// caller-less front-door write (`task.updateNoteStatus` over WSS, the
+/// coordinator/verifier/user path) closed the task as `complete`. Asserts
+/// over the real wire (PROTOCOL §5.5):
+///  - the MCP call answers `ok: true`, the unchanged `status: "complete"`
+///    and the presence-detected `advisory` string;
+///  - no `task:status-changed` is emitted for the blocked write;
+///  - `task.get` still reads `complete` after the agent's turn.
+#[tokio::test]
+async fn linked_agent_cannot_reopen_terminal_task_over_wss() {
+    const GO: &str = "GUARD_WSS_GO";
+    const RESULT_TAG: &str = "GUARD_WSS_RESULT ";
+    let Some(script) = gate("WSS task terminal-guard E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    // The agent attempts the reopen through the MCP path, then appends the
+    // raw result to the task note so the wire-visible response shape can be
+    // read back through `note.get`.
+    let reopen_js = format!(
+        "const r = await ws.task.updateNoteStatus({}, 'review_required'); \
+         await ws.note.add({}, {{ content: '\\n' + {} + JSON.stringify(r) }}); \
+         return r;",
+        json!(note_id),
+        json!(note_id),
+        json!(RESULT_TAG),
+    );
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": reopen_js, "summary": "linked agent reopen attempt" }
+                },
+                "response": "attempted reopen",
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child: child_proc };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let marked = wss_rpc(
+        &mut rpc,
+        10,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Guarded", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let assigned = wss_rpc(
+        &mut rpc,
+        12,
+        "task.assignAgent",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(assigned["ok"], true, "assignAgent ok: {assigned}");
+    // Front door (no caller): closes the task exactly as before, with no
+    // `advisory` on the response.
+    let closed = wss_rpc(
+        &mut rpc,
+        13,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "complete" }),
+    )
+    .await;
+    assert_eq!(closed["ok"], true, "front-door complete ok: {closed}");
+    assert_eq!(
+        closed["status"], "complete",
+        "front-door complete: {closed}"
+    );
+    assert!(
+        closed.get("advisory").is_none(),
+        "no advisory on an unblocked write: {closed}"
+    );
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so we miss no task event.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "task:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let sent = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    let mut task_events: Vec<Value> = Vec::new();
+    let mut idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !idle {
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the agent's terminal agent:idle: {task_events:?}")
+        };
+        let ev = &frame["params"]["event"];
+        let ev_type = ev["type"].as_str().unwrap_or_default();
+        if ev_type.starts_with("task:") {
+            task_events.push(ev.clone());
+        }
+        if ev_type == "agent:idle" && ev["data"]["agentId"] == agent_id.as_str() {
+            idle = true;
+        }
+    }
+    assert!(
+        !task_events
+            .iter()
+            .any(|ev| ev["type"] == "task:status-changed"),
+        "blocked reopen emits no task:status-changed: {task_events:?}"
+    );
+
+    let task = wss_rpc(
+        &mut rpc,
+        15,
+        "task.get",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id }),
+    )
+    .await;
+    assert_eq!(
+        task["task"]["status"], "complete",
+        "assigned agent's reopen attempt left the task complete: {task}"
+    );
+    let note = wss_rpc(
+        &mut rpc,
+        16,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    let content = note["note"]["content"].as_str().unwrap_or_default();
+    let result_line = content
+        .lines()
+        .find_map(|line| line.strip_prefix(RESULT_TAG))
+        .unwrap_or_else(|| panic!("agent appended the MCP result to the note: {note}"));
+    let result: Value = serde_json::from_str(result_line).expect("MCP result JSON");
+    assert_eq!(result["ok"], true, "blocked write still ok: {result}");
+    assert_eq!(
+        result["noteId"], note_id,
+        "blocked write echoes noteId: {result}"
+    );
+    assert_eq!(
+        result["status"], "complete",
+        "blocked write answers the unchanged terminal status: {result}"
+    );
+    assert_eq!(
+        result["advisory"].as_str(),
+        Some(
+            "Task is complete; a task's own linked agent cannot reopen it. \
+             Ask the coordinator or user to reopen the task if more work is needed."
+        ),
+        "blocked write carries the advisory: {result}"
+    );
+}
+
 /// Agent attention requests over WSS — discussion kind, task-linked caller.
 /// A parentless delegated agent linked to an `in_progress` task note calls
 /// `ws.agent.requestDiscussion(reason)` mid-turn. Asserts over the real wire

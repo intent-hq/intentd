@@ -9260,6 +9260,15 @@ impl Services {
     /// ready-task set, re-announces dependents across the complete boundary
     /// and probes the displayStatus rollup; either way it then materializes
     /// the status char onto every line linking the task.
+    ///
+    /// Caller-aware terminal guard: when the task is already `complete` /
+    /// `cancelled` and the caller is the task's OWN linked agent (session
+    /// `task_note_id` names the task, or the agent is in the task's
+    /// `assignedAgentIds`), a move to a different status is refused as a
+    /// no-op — the result echoes the unchanged task plus `advisory`, no
+    /// event fires, and only the checkbox materialization still runs. Every
+    /// other caller (unlinked agent, the caller-less router path) is
+    /// unaffected.
     pub(crate) async fn set_task_note_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -9277,6 +9286,39 @@ impl Services {
             ));
         };
         let previous_status = task.status;
+        if previous_status != new_status
+            && matches!(
+                previous_status,
+                TaskStatus::Complete | TaskStatus::Cancelled
+            )
+        {
+            if let Some(agent_id) = caller_agent_id.as_ref() {
+                let linked = task.assigned_agent_ids.contains(agent_id)
+                    || store
+                        .get_agent_session(agent_id)
+                        .await
+                        .ok()
+                        .is_some_and(|s| s.task_note_id.as_ref() == Some(&note.id));
+                if linked {
+                    let word = match previous_status {
+                        TaskStatus::Cancelled => "cancelled",
+                        _ => "complete",
+                    };
+                    self.materialize_linked_checkboxes(&note.workspace_id, &note.id)
+                        .await;
+                    return Ok(TaskUpdateNoteStatusResult {
+                        ok: true,
+                        note_id: note.id.clone(),
+                        status: previous_status,
+                        note,
+                        advisory: Some(format!(
+                            "Task is {word}; a task's own linked agent cannot reopen it. \
+                             Ask the coordinator or user to reopen the task if more work is needed."
+                        )),
+                    });
+                }
+            }
+        }
         let now = now_iso();
         apply_status_transition(&mut task, new_status, &now);
         note.metadata.task = Some(task);
@@ -9371,6 +9413,7 @@ impl Services {
             note_id: note.id.clone(),
             status: new_status,
             note,
+            advisory: None,
         })
     }
 }

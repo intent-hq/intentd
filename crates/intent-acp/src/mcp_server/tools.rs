@@ -201,7 +201,8 @@ API:
 
   ws.task.updateStatus(noteId, taskText, status) → { ok, noteId, status, note }  // Atomically change one checkbox status by task text. Prefer this over `note.setContent()` when marking tasks done/in progress to avoid conflicts.
     `status`: `"done"`, `"todo"`, or `"in-progress"`. `taskText` must match the checkbox text exactly.
-  ws.task.updateNoteStatus(noteId, status) → { ok, noteId, status }  // Task-note metadata status. Values include `"not_started"`, `"waiting"`, `"discussion_needed"`, `"blocked"`, `"in_progress"`, `"review_required"`, `"complete"`, `"cancelled"`.
+  ws.task.updateNoteStatus(noteId, status) → { ok, noteId, status, advisory? }  // Task-note status. Values include `"not_started"`, `"waiting"`, `"discussion_needed"`, `"blocked"`, `"in_progress"`, `"review_required"`, `"complete"`, `"cancelled"`.
+    The task's OWN linked agent (assignee / task-note owner) cannot move it out of `"complete"` / `"cancelled"`: the call is a no-op answering the unchanged `status` plus `advisory` (absent when the write went through) — ask the coordinator or user to reopen it.
   ws.task.update(noteId, line, { text?, status?, expected? }) → { ok, lineNumber, ... }  // Atomically edit only one checkbox line, preserving the rest of the note. Prefer this over `note.setContent()` for task edits.
     `line` is the 1-based task line number from `note.read()`. `status`: `"done"`, `"todo"`, or `"in-progress"`. `expected` enables conflict detection if another agent may have changed the task.
   ws.task.getMyTask(taskNoteId) → task  // Reads a task note with metadata, dependencies, and acceptance criteria.
@@ -452,7 +453,8 @@ API:
 
   ws.task.updateStatus(noteId, taskText, status) → { ok, noteId, status, note }  // Atomically change one checkbox status by task text. Prefer this over `note.setContent()` when marking tasks done/in progress to avoid conflicts.
     `status`: `"done"`, `"todo"`, or `"in-progress"`. `taskText` must match the checkbox text exactly.
-  ws.task.updateNoteStatus(noteId, status) → { ok, noteId, status }  // Task-note metadata status. Values include `"not_started"`, `"waiting"`, `"discussion_needed"`, `"blocked"`, `"in_progress"`, `"review_required"`, `"complete"`, `"cancelled"`.
+  ws.task.updateNoteStatus(noteId, status) → { ok, noteId, status, advisory? }  // Task-note status. Values include `"not_started"`, `"waiting"`, `"discussion_needed"`, `"blocked"`, `"in_progress"`, `"review_required"`, `"complete"`, `"cancelled"`.
+    The task's OWN linked agent (assignee / task-note owner) cannot move it out of `"complete"` / `"cancelled"`: the call is a no-op answering the unchanged `status` plus `advisory` (absent when the write went through) — ask the coordinator or user to reopen it.
   ws.task.update(noteId, line, { text?, status?, expected? }) → { ok, lineNumber, ... }  // Atomically edit only one checkbox line, preserving the rest of the note. Prefer this over `note.setContent()` for task edits.
     `line` is the 1-based task line number from `note.read()`. `status`: `"done"`, `"todo"`, or `"in-progress"`. `expected` enables conflict detection if another agent may have changed the task.
   ws.task.getMyTask(taskNoteId) → task  // Reads a task note with metadata, dependencies, and acceptance criteria.
