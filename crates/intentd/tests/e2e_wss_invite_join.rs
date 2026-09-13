@@ -900,4 +900,67 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     let v = wss_rpc(&mut owner, 13, "principal.me", json!({})).await;
     assert_eq!(v["result"]["isAdministrator"], json!(true));
     assert_eq!(v["result"]["login"], json!("owner"));
+
+    // 9. Redemption is rate-limited across time, not just in flight: a
+    //    serial stream of bad-link starts is answered `invite-not-found`
+    //    (the store was consulted) until the listener-wide burst (8, one
+    //    token back per 5 s) is spent, then `invite-flow-busy` before any
+    //    store work. The bucket belongs to the listener, so a reconnect does
+    //    not refill it: a fresh connection gets at most the single token a
+    //    refill boundary may have restored meanwhile, never a new burst.
+    let mut flood = connect_invite(port, cfg.clone()).await;
+    let mut codes = Vec::new();
+    for i in 0..10 {
+        let v = wss_rpc(
+            &mut flood,
+            40 + i,
+            "invite.redeem",
+            json!({ "inviteId": invite_id, "secret": format!("guess-{i}") }),
+        )
+        .await;
+        codes.push(
+            v["error"]["data"]["code"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    assert_eq!(codes[0], "invite-not-found", "{codes:?}");
+    assert_eq!(codes[9], "invite-flow-busy", "{codes:?}");
+    drop(flood);
+    let mut again = connect_invite(port, cfg.clone()).await;
+    let mut after = Vec::new();
+    for i in 0..2 {
+        let v = wss_rpc(
+            &mut again,
+            50 + i,
+            "invite.redeem",
+            json!({ "inviteId": invite_id, "secret": format!("again-{i}") }),
+        )
+        .await;
+        after.push(
+            v["error"]["data"]["code"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    assert_eq!(
+        after[1], "invite-flow-busy",
+        "reconnect did not refill the bucket: {after:?}"
+    );
+    // A phase-2 wait is not subject to the throttle (an unknown flow is
+    // still answered from the flow table, not refused as busy).
+    let v = wss_rpc(
+        &mut again,
+        52,
+        "invite.redeem",
+        json!({ "flowId": "no-such-flow" }),
+    )
+    .await;
+    assert_eq!(
+        v["error"]["data"]["code"],
+        json!("invite-flow-not-found"),
+        "{v}"
+    );
 }

@@ -16,7 +16,8 @@
 //!   collaborator credential exactly once.
 
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -135,6 +136,95 @@ fn respond(req: &InviteRequest, result: Result<Value>) -> Option<String> {
 /// code the daemon-wide flow cap answers with). `None` for a notification.
 pub(crate) fn refuse_busy(req: &InviteRequest) -> Option<String> {
     respond(req, Err(Error::Invite(InviteErrorKind::FlowBusy)))
+}
+
+/// Phase-1 `invite.redeem` starts the listener admits in one burst before
+/// the throttle engages. Legitimate use is one start per invitee (a retry or
+/// two at most); the burst keeps a handful of near-simultaneous joins from
+/// tripping it.
+pub(crate) const INVITE_START_BURST: u32 = 8;
+
+/// One start token is restored per this interval once the burst is spent
+/// (a sustained 12 attempts per minute across every `/invite` peer).
+pub(crate) const INVITE_START_REFILL: Duration = Duration::from_secs(5);
+
+/// Listener-wide token bucket over phase-1 `invite.redeem` starts — the
+/// requests that hash the secret against the store and open an upstream
+/// device flow. The per-connection in-flight quota bounds concurrency
+/// only; this bounds the *rate*, so a peer cannot enumerate links or churn
+/// device flows by serialising attempts or reconnecting: the bucket lives
+/// on the listener, not the connection. Phase-2 waits (`{ flowId }`) are
+/// not counted — they read a flow the start already paid for.
+#[derive(Debug)]
+pub(crate) struct RedeemThrottle {
+    tokens: u32,
+    last_refill: Instant,
+}
+
+impl RedeemThrottle {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            tokens: INVITE_START_BURST,
+            last_refill: now,
+        }
+    }
+
+    /// Take one start token, refilling first for the whole intervals that
+    /// elapsed since the last refill. `false` while the bucket is empty.
+    pub(crate) fn try_take(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        let refilled = u32::try_from(elapsed.as_millis() / INVITE_START_REFILL.as_millis())
+            .unwrap_or(u32::MAX);
+        if refilled > 0 {
+            self.tokens = self.tokens.saturating_add(refilled).min(INVITE_START_BURST);
+            self.last_refill = if self.tokens == INVITE_START_BURST {
+                now
+            } else {
+                self.last_refill + INVITE_START_REFILL * refilled
+            };
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
+
+/// Shared handle to the listener's [`RedeemThrottle`].
+pub(crate) type SharedRedeemThrottle = Arc<Mutex<RedeemThrottle>>;
+
+pub(crate) fn new_redeem_throttle() -> SharedRedeemThrottle {
+    Arc::new(Mutex::new(RedeemThrottle::new(Instant::now())))
+}
+
+/// True for a phase-1 `invite.redeem` (`{ inviteId, secret }`): no
+/// non-empty `flowId`. Mirrors the dispatch in [`handle_redeem`].
+pub(crate) fn is_redeem_start(req: &InviteRequest) -> bool {
+    !matches!(opt_str_param(&req.params, "flowId"), Ok(Some(f)) if !f.trim().is_empty())
+}
+
+/// Apply the start throttle to a classified `invite.redeem` *before* any
+/// store or upstream work: `Some(frame)` is the `flow-busy` refusal to send
+/// instead of running the request (`None` also for a throttled
+/// notification, which is simply dropped); `Ok(())` admits it.
+pub(crate) fn admit_redeem(
+    req: &InviteRequest,
+    throttle: &SharedRedeemThrottle,
+    now: Instant,
+) -> std::result::Result<(), Option<String>> {
+    if !is_redeem_start(req) {
+        return Ok(());
+    }
+    let admitted = throttle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .try_take(now);
+    if admitted {
+        Ok(())
+    } else {
+        Err(refuse_busy(req))
+    }
 }
 
 fn str_param(params: &Value, key: &str) -> Result<String> {

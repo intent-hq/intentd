@@ -292,7 +292,22 @@ impl Services {
             redeemed_by_principal_id: None,
             revoked_at: None,
         };
-        self.store.insert_workspace_invite(&invite).await?;
+        // The insert is what locks the primary identity, so it is
+        // serialised with the identity transition and the creator's
+        // identity is revalidated under the lock: a switch that landed
+        // since `inviting_principal` qualified it means this link would
+        // have been minted from an identity that no longer holds.
+        {
+            let _transition = self.identity_transition.lock().await;
+            let current = self.store.get_principal(&creator.id).await?;
+            if current.github_user_id.is_none() || current.github_user_id != creator.github_user_id
+            {
+                return Err(Error::Internal(
+                    "the inviting GitHub identity changed while minting; retry".to_string(),
+                ));
+            }
+            self.store.insert_workspace_invite(&invite).await?;
+        }
         // The first invite of a workspace pins its legacy author: content
         // authored before anyone else could have joined is the owner's.
         if let Some(fallback) = self.store.get_workspace_author_fallback(&ws.id).await? {

@@ -269,6 +269,149 @@ async fn primary_identity_locked_while_an_invite_is_open() {
     assert_eq!(updated.github_user_id, Some(20));
 }
 
+/// Poll a spawned task a few scheduler turns and report whether it settled.
+async fn settles(handle: &tokio::task::JoinHandle<impl Send>) -> bool {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        if handle.is_finished() {
+            return true;
+        }
+    }
+    false
+}
+
+/// The identity switch's lock check and write are one critical section:
+/// a switch parked on the transition lock re-reads the lock state once it
+/// gets in, so an invite minted meanwhile is seen and the switch refused —
+/// the read cannot go stale between count and write.
+#[tokio::test]
+async fn identity_switch_rechecks_the_lock_after_a_concurrent_mint() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services = Services::new(store.clone()).with_source_control(Arc::new(StubForge::default()));
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let mut primary = store.get_primary_principal().await.expect("primary");
+    primary.github_user_id = Some(10);
+    primary.login = Some("first".into());
+    store
+        .upsert_principal(&primary)
+        .await
+        .expect("seed identity");
+    assert!(!services
+        .primary_identity_locked()
+        .await
+        .expect("lock state"));
+
+    let held = services.identity_transition.clone().lock_owned().await;
+    let switch = tokio::spawn({
+        let services = services.clone();
+        let primary = primary.clone();
+        async move {
+            services
+                .apply_primary_identity(primary, &identity("second", 20))
+                .await
+        }
+    });
+    assert!(
+        !settles(&switch).await,
+        "switch waits for the transition lock"
+    );
+    // The mint lands while the switch is parked (the store path: the
+    // service path would itself queue behind the same lock).
+    let invite = WorkspaceInvite {
+        id: uuid::Uuid::new_v4().to_string(),
+        workspace_id: ws.clone(),
+        secret_hash: hash_secret("s"),
+        created_by_principal_id: primary.id.clone(),
+        pin_github_user_id: None,
+        pin_login: None,
+        created_at: now_iso(),
+        expires_at: iso_after(60),
+        redeemed_at: None,
+        redeemed_by_principal_id: None,
+        revoked_at: None,
+    };
+    store
+        .insert_workspace_invite(&invite)
+        .await
+        .expect("mint while parked");
+    drop(held);
+
+    let err = switch.await.expect("switch task");
+    assert_eq!(invite_kind(&err), InviteErrorKind::IdentityLocked);
+    let stored = store.get_primary_principal().await.expect("primary");
+    assert_eq!(stored.github_user_id, Some(10));
+    assert_eq!(stored.login.as_deref(), Some("first"));
+}
+
+/// Invite minting queues behind the transition lock and revalidates the
+/// creator's identity under it: a switch that landed while the mint was
+/// parked refuses the mint and writes no invite; an unchanged identity
+/// mints once the lock is released.
+#[tokio::test]
+async fn invite_mint_waits_for_the_transition_and_revalidates_the_creator() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+
+    let held = f.services.identity_transition.clone().lock_owned().await;
+    let mint = tokio::spawn({
+        let services = f.services.clone();
+        let (ws, owner) = (f.ws.clone(), f.owner.clone());
+        async move {
+            with_caller(
+                wire(&owner),
+                services.workspace_invite_create_op(&ws, None, None),
+            )
+            .await
+        }
+    });
+    assert!(!settles(&mint).await, "mint waits for the transition lock");
+    let mut owner = f.store.get_principal(&f.owner).await.expect("owner");
+    owner.github_user_id = Some(9999);
+    f.store
+        .upsert_principal(&owner)
+        .await
+        .expect("identity switched while parked");
+    drop(held);
+    let r = mint.await.expect("mint task");
+    assert!(
+        matches!(r, Err(Error::Internal(ref m)) if m.contains("changed while minting")),
+        "{r:?}"
+    );
+    assert_eq!(
+        f.store
+            .count_open_workspace_invites()
+            .await
+            .expect("count invites"),
+        0
+    );
+
+    let held = f.services.identity_transition.clone().lock_owned().await;
+    let mint = tokio::spawn({
+        let services = f.services.clone();
+        let (ws, owner) = (f.ws.clone(), f.owner.clone());
+        async move {
+            with_caller(
+                wire(&owner),
+                services.workspace_invite_create_op(&ws, None, None),
+            )
+            .await
+        }
+    });
+    assert!(!settles(&mint).await, "second mint waits too");
+    drop(held);
+    mint.await.expect("mint task").expect("mints once released");
+    assert_eq!(
+        f.store
+            .count_open_workspace_invites()
+            .await
+            .expect("count invites"),
+        1
+    );
+}
+
 /// The primary's cached `github_user_id` survives `github.revoke`, so the
 /// cache alone must not mint: with no working credential the create is
 /// `GithubIdentityRequired`, and no invite row is written.

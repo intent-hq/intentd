@@ -37,6 +37,15 @@ const IDENTITY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Last successful/attempted identity refresh instant, shared across clones.
 pub(crate) type IdentityRefreshState = Arc<tokio::sync::Mutex<Option<Instant>>>;
 
+/// Serialises the primary identity transition (multiplayer w4). The
+/// reconnect guard's "is the identity locked?" read and its row write are
+/// two awaits, and an invite is what locks the identity — so without this,
+/// `workspace.invite.create` could commit an invite between the two and the
+/// switch would land on an identity a fresh link was just minted from.
+/// [`Services::apply_primary_identity`] holds it across check + write;
+/// invite minting holds it across its own identity revalidation + insert.
+pub(crate) type IdentityTransitionLock = Arc<tokio::sync::Mutex<()>>;
+
 /// The forbidden error for a request with no bound caller.
 pub(crate) fn no_caller() -> Error {
     Error::Internal("forbidden: request is not bound to a principal".to_string())
@@ -550,12 +559,14 @@ impl Services {
     /// carrying the cached stable account id is applied: a different id
     /// and a missing one (an unverifiable account) are both refused, and a
     /// lock state that cannot be read propagates as an error rather than
-    /// admitting the change.
+    /// admitting the change. The lock check and the write run under the
+    /// [`IdentityTransitionLock`], so no invite is minted in between.
     pub(crate) async fn apply_primary_identity(
         &self,
         principal: Principal,
         user: &intent_sourcecontrol::UserIdentity,
     ) -> Result<Principal> {
+        let _transition = self.identity_transition.lock().await;
         let fetched_id = user.id.and_then(|id| i64::try_from(id).ok());
         let same_account =
             principal.github_user_id.is_some() && principal.github_user_id == fetched_id;
