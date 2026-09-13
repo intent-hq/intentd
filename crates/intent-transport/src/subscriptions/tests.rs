@@ -2440,13 +2440,13 @@ mod workspace_delta_chief {
             // Id resolved from `data.workspaceId` …
             let from_data = workspace_event(event_type, "w", Some(CHIEF_WORKSPACE_ID));
             assert!(
-                workspace_delta(&api, &from_data).await.is_none(),
+                workspace_delta(&api, &from_data, None).await.is_none(),
                 "{event_type} with data.workspaceId=__chief__ must map to no delta"
             );
             // … and from the event's own `workspaceId` fallback.
             let from_event = workspace_event(event_type, CHIEF_WORKSPACE_ID, None);
             assert!(
-                workspace_delta(&api, &from_event).await.is_none(),
+                workspace_delta(&api, &from_event, None).await.is_none(),
                 "{event_type} scoped to __chief__ must map to no delta"
             );
         }
@@ -2462,15 +2462,19 @@ mod workspace_delta_chief {
         let api = AnyWorkspaceApi {
             reads: AtomicUsize::new(0),
         };
-        let d = workspace_delta(&api, &workspace_event(WORKSPACE_UPDATED, "w", Some("w")))
-            .await
-            .expect("real workspace update maps to a delta");
+        let d = workspace_delta(
+            &api,
+            &workspace_event(WORKSPACE_UPDATED, "w", Some("w")),
+            None,
+        )
+        .await
+        .expect("real workspace update maps to a delta");
         assert_eq!(d["updated"][0]["id"], "w", "delta: {d}");
-        let d = workspace_delta(&api, &workspace_event(WORKSPACE_CREATED, "w", None))
+        let d = workspace_delta(&api, &workspace_event(WORKSPACE_CREATED, "w", None), None)
             .await
             .expect("real workspace create maps to a delta");
         assert_eq!(d["added"][0]["id"], "w", "delta: {d}");
-        let d = workspace_delta(&api, &workspace_event(WORKSPACE_DELETED, "w", None))
+        let d = workspace_delta(&api, &workspace_event(WORKSPACE_DELETED, "w", None), None)
             .await
             .expect("real workspace delete maps to a delta");
         assert_eq!(d["removedIds"][0], "w", "delta: {d}");
@@ -2568,7 +2572,7 @@ mod workspace_delta_list_projection {
             (WORKSPACE_UPDATED, "updated"),
             (PR_UPDATED, "updated"),
         ] {
-            let d = workspace_delta(&DetailWorkspaceApi, &workspace_event(event_type))
+            let d = workspace_delta(&DetailWorkspaceApi, &workspace_event(event_type), None)
                 .await
                 .expect("delta");
             let row = &d[key][0];
@@ -4609,5 +4613,448 @@ mod chat_terminal_reconcile_failure {
             );
             assert_eq!(updated[0]["streamingComplete"], true);
         }
+    }
+}
+
+/// Multiplayer w3 delivery-time membership on the channel fast-paths: the
+/// per-agent `chat` channel maps chunk/tool deltas straight from the event
+/// payload, and the global `workspace` channel emits `workspace:deleted`
+/// tombstones without a re-read — both driven through the REAL
+/// [`crate::conn::handle_sub_fast_path`] under a non-administrator caller.
+mod channel_membership {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use futures::future::BoxFuture;
+    use intent_core::events::{
+        AGENT_TOOL_CALL, CHAT_STREAM_DELTA, WORKSPACE_DELETED, WORKSPACE_UPDATED,
+    };
+    use intent_core::{
+        ActorType, AgentId, Caller, Error, EventActor, PrincipalId, Workspace, WorkspaceApi,
+        WorkspaceId,
+    };
+    use intent_services::EventBus;
+    use intent_store::{NewEvent, Store};
+    use serde_json::{json, Value};
+
+    use crate::conn::{handle_sub_fast_path, outbound_channel, ConnSubs, OutboundReceiver};
+    use crate::subscriptions::classify;
+
+    /// The service layer as a collaborator sees it: `workspace.get` /
+    /// `workspace.list` answer only the `members` workspaces, and
+    /// `agent.getConversation` is an empty page (the guarded read).
+    struct MembershipApi {
+        members: Arc<Mutex<HashSet<String>>>,
+    }
+
+    impl WorkspaceApi for MembershipApi {
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, intent_core::Result<Workspace>> {
+            let allowed = self.members.lock().unwrap().contains(id.as_str());
+            Box::pin(async move {
+                if allowed {
+                    Ok(Workspace {
+                        id,
+                        ..intent_core::chief_workspace()
+                    })
+                } else {
+                    Err(Error::NotFound(format!("workspace {id}")))
+                }
+            })
+        }
+
+        fn list_workspaces(
+            &self,
+            _include_archived: bool,
+        ) -> BoxFuture<'_, intent_core::Result<Vec<Workspace>>> {
+            let mut ids: Vec<String> = self.members.lock().unwrap().iter().cloned().collect();
+            ids.sort();
+            Box::pin(async move {
+                Ok(ids
+                    .into_iter()
+                    .map(|id| Workspace {
+                        id: WorkspaceId::from(id),
+                        ..intent_core::chief_workspace()
+                    })
+                    .collect())
+            })
+        }
+
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+            _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
+        ) -> BoxFuture<'_, intent_core::Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [],
+                    "truncated": false,
+                    "totalMessages": 0,
+                    "nextToken": Value::Null,
+                }))
+            })
+        }
+    }
+
+    fn event(
+        event_type: &str,
+        workspace_id: &str,
+        session_id: Option<&str>,
+        data: Value,
+    ) -> NewEvent {
+        NewEvent {
+            workspace_id: WorkspaceId::from(workspace_id),
+            timestamp: intent_core::now_iso(),
+            event_type: event_type.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::System,
+                id: Some("system".to_string()),
+                ..Default::default()
+            },
+            session_id: session_id.map(str::to_string),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data,
+        }
+    }
+
+    fn chunk(workspace_id: &str, agent_id: &str, text: &str) -> NewEvent {
+        event(
+            CHAT_STREAM_DELTA,
+            workspace_id,
+            Some(agent_id),
+            json!({
+                "agentId": agent_id,
+                "content": text,
+                "messageId": "m-1",
+                "blockIndex": 0,
+                "blockId": "m-1:0",
+                "blockType": "text",
+            }),
+        )
+    }
+
+    fn tool_call(workspace_id: &str, agent_id: &str) -> NewEvent {
+        event(
+            AGENT_TOOL_CALL,
+            workspace_id,
+            Some(agent_id),
+            json!({
+                "agentId": agent_id,
+                "messageId": "m-1",
+                "toolCallId": "tc-1",
+                "title": "ls",
+                "status": "pending",
+            }),
+        )
+    }
+
+    fn unshare(workspace_id: &str, principal_id: &str) -> NewEvent {
+        event(
+            WORKSPACE_UPDATED,
+            workspace_id,
+            None,
+            json!({ "changes": { "members": true, "removedPrincipalId": principal_id } }),
+        )
+    }
+
+    /// Every `subscription.push` delta on the bulk lane until it stays quiet.
+    async fn deltas(rx: &mut OutboundReceiver) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), rx.bulk.recv()).await
+        {
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["method"], "subscription.push");
+            out.push(v["params"]["delta"].clone());
+        }
+        out
+    }
+
+    struct Harness {
+        bus: EventBus,
+        rx: OutboundReceiver,
+        subs: ConnSubs,
+        members: Arc<Mutex<HashSet<String>>>,
+        subscription_id: String,
+        snapshot: Value,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Subscribe `raw` through the real fast path under `caller`, returning
+    /// the harness after the seq-0 snapshot has been received.
+    async fn subscribe(caller: Caller, members: &[&str], raw: Value) -> Harness {
+        let dir = tempfile::Builder::new()
+            .prefix("intent-transport-channel-membership-")
+            .tempdir()
+            .unwrap();
+        let store = Store::open(&dir.path().join("bus.db")).await.unwrap();
+        let bus = EventBus::new(store);
+        let members = Arc::new(Mutex::new(
+            members
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<HashSet<_>>(),
+        ));
+        let api: Arc<dyn WorkspaceApi> = Arc::new(MembershipApi {
+            members: Arc::clone(&members),
+        });
+        let (out_tx, mut rx) = outbound_channel();
+        let mut subs = ConnSubs::default();
+        let sub = classify(&raw).expect("classifies as a fast-path subscribe");
+        let (bus_ref, out_ref, subs_ref, api_ref) = (&bus, &out_tx, &mut subs, &api);
+        let accepted = crate::context::with_request_context(true, Some(caller), async move {
+            handle_sub_fast_path(sub, api_ref, bus_ref, out_ref, subs_ref).await
+        })
+        .await;
+        assert!(accepted);
+        let reply: Value = serde_json::from_str(&rx.priority.recv().await.unwrap()).unwrap();
+        let subscription_id = reply["result"]["subscriptionId"]
+            .as_str()
+            .expect("subscription id")
+            .to_string();
+        let push: Value = serde_json::from_str(&rx.bulk.recv().await.unwrap()).unwrap();
+        assert_eq!(push["params"]["seq"], 0, "{push}");
+        Harness {
+            bus,
+            rx,
+            subs,
+            members,
+            subscription_id,
+            snapshot: push["params"]["snapshot"].clone(),
+            _dir: dir,
+        }
+    }
+
+    fn guest() -> (PrincipalId, Caller) {
+        let principal_id = PrincipalId::new();
+        let caller = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: false,
+        };
+        (principal_id, caller)
+    }
+
+    fn chat_subscribe(agent_id: &str) -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"chat.subscribe","params":{"agentId":agent_id}})
+    }
+
+    /// A non-member's `chat.subscribe` to a private workspace's agent gets
+    /// the empty guarded snapshot and then NO live chunk or tool deltas.
+    #[tokio::test]
+    async fn chat_live_deltas_are_refused_to_a_non_member() {
+        let (_, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], chat_subscribe("agent-2")).await;
+        assert_eq!(h.snapshot["messages"], json!([]));
+        h.bus
+            .publish(&chunk("ws-2", "agent-2", "secret"))
+            .await
+            .unwrap();
+        h.bus.publish(&tool_call("ws-2", "agent-2")).await.unwrap();
+        assert!(deltas(&mut h.rx).await.is_empty(), "no live delta leaks");
+        drop(h.subs);
+    }
+
+    /// A member receives the live stream; its own removal from the agent's
+    /// workspace ends delivery AND exits the forwarder, while another
+    /// member's removal leaves the stream live.
+    #[tokio::test]
+    async fn chat_member_stream_is_torn_down_on_own_removal() {
+        let (principal_id, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], chat_subscribe("agent-1")).await;
+        h.bus
+            .publish(&chunk("ws-1", "agent-1", "Hel"))
+            .await
+            .unwrap();
+        let first = deltas(&mut h.rx).await;
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(first[0]["added"][0]["block"]["text"], "Hel", "{first:?}");
+
+        // Someone else's unshare of ws-1: still a member, still live.
+        h.bus
+            .publish(&unshare("ws-1", "someone-else"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus
+            .publish(&chunk("ws-1", "agent-1", "lo"))
+            .await
+            .unwrap();
+        assert_eq!(deltas(&mut h.rx).await.len(), 1);
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+
+        // Own removal: the service layer drops the row and publishes the
+        // unshare marker; the forwarder exits and nothing follows.
+        h.members.lock().unwrap().remove("ws-1");
+        h.bus
+            .publish(&unshare("ws-1", principal_id.as_str()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus.publish(&chunk("ws-1", "agent-1", "!")).await.unwrap();
+        h.bus.publish(&tool_call("ws-1", "agent-1")).await.unwrap();
+        assert!(
+            deltas(&mut h.rx).await.is_empty(),
+            "no delivery after removal"
+        );
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(true));
+        drop(h.subs);
+    }
+
+    /// An administrator's chat stream is untouched by membership events.
+    #[tokio::test]
+    async fn chat_administrator_stream_ignores_membership() {
+        let principal_id = PrincipalId::new();
+        let owner = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: true,
+        };
+        let mut h = subscribe(owner, &[], chat_subscribe("agent-2")).await;
+        h.bus
+            .publish(&unshare("ws-2", principal_id.as_str()))
+            .await
+            .unwrap();
+        h.bus
+            .publish(&chunk("ws-2", "agent-2", "Hi"))
+            .await
+            .unwrap();
+        assert_eq!(deltas(&mut h.rx).await.len(), 1);
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+        drop(h.subs);
+    }
+
+    fn workspace_subscribe() -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"workspace.subscribe","params":{}})
+    }
+
+    /// The global `workspace` channel under a guest: a `workspace:deleted`
+    /// tombstone is emitted only for a workspace the guest was shown (its
+    /// snapshot / an `updated` delta); a private workspace's deletion is
+    /// silent, and after the guest's own unshare so is that workspace's.
+    #[tokio::test]
+    async fn workspace_deleted_tombstones_are_scoped_to_visible_workspaces() {
+        let (principal_id, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1", "ws-3"], workspace_subscribe()).await;
+        let ids: Vec<&str> = h
+            .snapshot
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["ws-1", "ws-3"]);
+
+        // Private ws-2 deleted: nothing. Member ws-1 deleted: tombstone.
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-2",
+                None,
+                json!({ "workspaceId": "ws-2" }),
+            ))
+            .await
+            .unwrap();
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-1",
+                None,
+                json!({ "workspaceId": "ws-1" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["ws-1"] })]
+        );
+
+        // Own unshare of ws-3 is the final `removedIds`; its later deletion
+        // is silent.
+        h.members.lock().unwrap().remove("ws-3");
+        h.bus
+            .publish(&unshare("ws-3", principal_id.as_str()))
+            .await
+            .unwrap();
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-3",
+                None,
+                json!({ "workspaceId": "ws-3" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["ws-3"] })]
+        );
+        drop(h.subs);
+    }
+
+    /// A workspace the guest is added to after subscribing becomes visible
+    /// through its `updated` delta, so its later deletion IS tombstoned.
+    #[tokio::test]
+    async fn workspace_added_after_subscribe_is_tombstoned_on_delete() {
+        let (_, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], workspace_subscribe()).await;
+        h.members.lock().unwrap().insert("ws-2".to_string());
+        h.bus
+            .publish(&event(
+                WORKSPACE_UPDATED,
+                "ws-2",
+                None,
+                json!({ "workspaceId": "ws-2", "changes": { "members": true } }),
+            ))
+            .await
+            .unwrap();
+        let added = deltas(&mut h.rx).await;
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0]["updated"][0]["id"], "ws-2");
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-2",
+                None,
+                json!({ "workspaceId": "ws-2" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["ws-2"] })]
+        );
+        drop(h.subs);
+    }
+
+    /// The administrator's global channel still tombstones every deletion.
+    #[tokio::test]
+    async fn workspace_administrator_receives_every_tombstone() {
+        let owner = Caller::Wire {
+            principal_id: PrincipalId::new(),
+            is_administrator: true,
+        };
+        let mut h = subscribe(owner, &["ws-1"], workspace_subscribe()).await;
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-9",
+                None,
+                json!({ "workspaceId": "ws-9" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["ws-9"] })]
+        );
+        drop(h.subs);
     }
 }
