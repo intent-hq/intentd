@@ -26,8 +26,8 @@ use intent_core::events::{
     WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
-    extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, ConversationProjection, Event,
-    Note, NoteId, NoteListProjection, WorkspaceApi, WorkspaceId, SLIM_PAGE_BUDGET_BYTES,
+    extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, ConversationProjection, Error,
+    Event, Note, NoteId, NoteListProjection, WorkspaceApi, WorkspaceId, SLIM_PAGE_BUDGET_BYTES,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -790,7 +790,7 @@ pub(crate) async fn chat_snapshot(
     since_message_id: Option<&str>,
     projection: Option<ConversationProjection>,
 ) -> Value {
-    let mut snapshot = match api
+    let (mut snapshot, overlay) = match api
         .agent_get_conversation(
             agent_id.clone(),
             None,
@@ -803,19 +803,32 @@ pub(crate) async fn chat_snapshot(
         )
         .await
     {
-        Ok(v) => v,
-        Err(_) => json!({
-            "agentId": agent_id.as_str(),
-            "messages": [],
-            "truncated": false,
-            "totalMessages": 0,
-            "nextToken": Value::Null,
-        }),
+        Ok(v) => (v, true),
+        // A refused read (a non-member's guarded page, multiplayer w3 — or an
+        // unknown agent) serves the empty page WITHOUT the live overlay: the
+        // in-flight turn and activity flags are not membership-gated, so
+        // overlaying them would leak the live turn the persisted page just
+        // refused. A transient read error keeps the overlay as before.
+        Err(err) => {
+            let refused = matches!(err, Error::Forbidden(_) | Error::NotFound(_));
+            (
+                json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [],
+                    "truncated": false,
+                    "totalMessages": 0,
+                    "nextToken": Value::Null,
+                }),
+                !refused,
+            )
+        }
     };
     if let Some(since) = since_message_id {
         apply_resume_filter(&mut snapshot, since);
     }
-    overlay_live_state(api, agent_id, &mut snapshot, projection).await;
+    if overlay {
+        overlay_live_state(api, agent_id, &mut snapshot, projection).await;
+    }
     snapshot
 }
 
