@@ -18,7 +18,9 @@
 //!    - Before spawning, capture `is_tcp_connection()` from the current context
 //!    - Wrap spawned work in `with_connection_context(is_tcp, ...)` with the captured value
 //!    - This ensures the transport origin is visible to all code in the spawned task
-//!    - All spawns in `conn.rs` follow this pattern: `host::handle`, `browser::handle`, `handle_message`
+//!    - All spawns in `conn.rs` follow this pattern: `host::handle`, `browser::handle`,
+//!      `handle_message`, and the subscription forwarders (`spawn_forwarder`), whose
+//!      seq-0 snapshot and delta re-reads run inside the scope for the task's lifetime
 //!
 //! 3. **Origin checks run within established context**:
 //!    - `server.*` RPCs: inline on read loop, context guaranteed

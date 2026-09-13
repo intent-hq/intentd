@@ -426,6 +426,14 @@ async fn workspace_channel_snapshot_then_updated_delta() {
         ws_entry.get("diffSummary").is_none(),
         "snapshot rows omit diffSummary: {ws_entry}"
     );
+    // Multiplayer w1: the forwarder runs with the connection's Caller
+    // re-bound (a UDS connection IS the primary user), so the seq-0 row
+    // carries the caller-relative membership summary (intentd#1868).
+    assert_eq!(
+        ws_entry["myRole"], "owner",
+        "snapshot rows carry the caller's role: {ws_entry}"
+    );
+    assert_eq!(ws_entry["memberCount"], 1, "{ws_entry}");
     // The snapshot's displayStatus matches a subsequent enriched
     // workspace.get for the same data (same derivation, no drift).
     let got = rpc(
@@ -471,6 +479,11 @@ async fn workspace_channel_snapshot_then_updated_delta() {
     assert_eq!(d1["params"]["kind"], "delta");
     assert_eq!(d1["params"]["seq"], 1);
     assert_eq!(d1["params"]["delta"]["updated"][0]["id"], ws_id.as_str());
+    // The delta re-read runs in the same caller scope as the snapshot.
+    assert_eq!(
+        d1["params"]["delta"]["updated"][0]["myRole"], "owner",
+        "delta rows carry the caller's role: {d1}"
+    );
 
     let _ = shutdown_tx.send(());
     let _ = server.await;
