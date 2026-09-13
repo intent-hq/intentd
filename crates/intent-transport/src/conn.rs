@@ -782,8 +782,9 @@ async fn refuse_forbidden(method: &str, rpc_id: Option<Value>, out_tx: &Outbound
 
 /// Handle a classified `events.subscribe` / `events.unsubscribe` request,
 /// mirroring `handleSubscribe` / `handleUnsubscribe`. Returns `false` when the
-/// outbound channel is closed.
-async fn handle_fast_path(
+/// outbound channel is closed. `pub(crate)` for the conn-level collaborator
+/// fan-out test in `events::tests`.
+pub(crate) async fn handle_fast_path(
     fast_path: FastPath,
     bus: &EventBus,
     out_tx: &OutboundSender,
@@ -801,11 +802,15 @@ async fn handle_fast_path(
                     subs.remove_group(group);
                 }
                 // Canonical WS bridge: each accepted event is delivered
-                // individually (no server-side coalescing, §6.6).
+                // individually (no server-side coalescing, §6.6). A
+                // non-administrator connection keeps whatever patterns it
+                // asked for (and its subscription id) but only allowlisted
+                // types ever match (multiplayer w3).
                 let subscription = bus.subscribe(SubscriptionFilter {
                     event_types,
                     workspace_id,
                     batch_window: None,
+                    collaborator_only: crate::context::is_non_administrator_caller(),
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
@@ -985,6 +990,7 @@ pub(crate) async fn handle_sub_fast_path(
                     ],
                     workspace_id: Some(workspace_id.clone()),
                     batch_window: None,
+                    collaborator_only: crate::context::is_non_administrator_caller(),
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
@@ -1048,6 +1054,7 @@ pub(crate) async fn handle_sub_fast_path(
                     event_types: subscriptions::channel_event_types(Channel::Chat),
                     workspace_id: None,
                     batch_window: None,
+                    collaborator_only: crate::context::is_non_administrator_caller(),
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
@@ -1125,6 +1132,7 @@ pub(crate) async fn handle_sub_fast_path(
                         event_types: subscriptions::channel_event_types(channel),
                         workspace_id: filter_ws,
                         batch_window: None,
+                        collaborator_only: crate::context::is_non_administrator_caller(),
                         ..Default::default()
                     });
                     let subscription_id = events::next_subscription_id();
