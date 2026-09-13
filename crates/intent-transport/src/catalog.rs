@@ -477,9 +477,13 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
 /// `github.*` / `linear.*` / `sentry.*` / `voice.*` (act with the primary
 /// user's third-party credentials), `settings.*`, `repo.*`, `mcp.*`,
 /// `server.*` / `pairing.*` / `system.*` (except `system.capabilities`),
-/// `workspace.create` / `git.clone` (arbitrary host paths), and agent / hook /
-/// PR-monitor deletion. The golden test in `catalog/tests.rs` freezes the
-/// refused remainder so a new method must be classified explicitly.
+/// `workspace.create` / `git.clone` (arbitrary host paths), agent / hook /
+/// PR-monitor deletion, and `agent.replaceMessages` — it persists
+/// client-supplied user rows verbatim, so a non-owner could forge
+/// `fromPrincipalId` attribution; collaborators keep
+/// `agent.editAndRegenerate` for the edit flow. The golden test in
+/// `catalog/tests.rs` freezes the refused remainder so a new method must be
+/// classified explicitly.
 pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("agent.appendMessage", "Steer: appends a row to a workspace agent conversation; the caller's principal is stamped on user rows. Workspace-scoped, no host reach."),
     ("agent.cancelSubscriptions", "Steer: cancels an agent's own event subscriptions / delegation groups. Agent-scoped bookkeeping, no host reach."),
@@ -505,7 +509,6 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("agent.queueMessage", "Steer: queues a message for an agent; stamped with the caller's principal."),
     ("agent.removeQueuedMessage", "Steer: retracts a queued message. Queue write, agent-scoped."),
     ("agent.rename", "Steer: renames an agent session. Metadata write."),
-    ("agent.replaceMessages", "Steer: replaces the editable tail of a conversation. Conversation write, workspace-scoped."),
     ("agent.resolveInterrupted", "Steer: resumes or dismisses an interrupted agent. Agent lifecycle, no host reach."),
     ("agent.respondPermission", "Steer: answers an agent's ACP permission prompt. The agent already acts with the owner's capabilities; this only unblocks it."),
     ("agent.restore", "Steer: restores a retired agent. Agent lifecycle."),

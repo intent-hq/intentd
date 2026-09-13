@@ -1064,13 +1064,16 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// `rules.*`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
 /// export / import / setup / browser-client pinning, `git.clone`,
 /// `git.agentCommit` (agent-only), agent deletion / proposals / one-shot
-/// completions, hook run/cancel, PR-monitor cancel/flush, daemon-wide metrics.
+/// completions, `agent.replaceMessages` (persists client-supplied user rows
+/// verbatim, so a non-owner could forge `fromPrincipalId`), hook run/cancel,
+/// PR-monitor cancel/flush, daemon-wide metrics.
 const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "agent.cancelDelete",
     "agent.completeOnce",
     "agent.delete",
     "agent.diagnostics",
     "agent.enhancePrompt",
+    "agent.replaceMessages",
     "agent.reportToParent",
     "agent.resolveProposal",
     "browser.closeTab",
@@ -1411,6 +1414,7 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "workspace.create",
         "git.clone",
         "agent.delete",
+        "agent.replaceMessages",
         "terminal.list",
         "script.list",
         "debug.sampleStacks",
