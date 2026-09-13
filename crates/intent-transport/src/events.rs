@@ -18,12 +18,13 @@ use intent_core::{Caller, Event, PrincipalId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Map, Value};
 
 /// Delivery-time membership boundary for a non-administrator connection's
-/// raw `events.subscribe` stream (multiplayer w3). The bus filter only
-/// narrows event *types*; this gate decides, per event, whether the
-/// subscriber may see the event's *workspace*, by re-reading it through the
-/// API under the subscriber's caller (`workspace.get` is `NotFound` for a
-/// non-member). Verdicts are cached per workspace for [`Self::TTL`] so a
-/// busy stream costs one read per workspace per window, and an unshare
+/// raw `events.subscribe` stream and its per-agent `chat` channel
+/// (multiplayer w3). The bus filter only narrows event *types*; this gate
+/// decides, per event, whether the subscriber may see the event's
+/// *workspace*, by re-reading it through the API under the subscriber's
+/// caller (`workspace.get` is `NotFound` for a non-member). Verdicts are
+/// cached per workspace for [`Self::TTL`] so a busy stream costs one read
+/// per workspace per window, and an unshare
 /// (`workspace:updated { changes: { members, removedPrincipalId } }`)
 /// invalidates the entry immediately: the removed member sees that one
 /// event as its final notification and nothing after it.
@@ -76,6 +77,11 @@ impl MembershipGate {
                 .unwrap_or(false)
     }
 
+    /// Whether `event` is the subscriber's own removal from its workspace.
+    pub(crate) fn is_own_unshare(&self, event: &Event) -> bool {
+        Self::unshared_principal(event) == Some(self.principal_id.as_str())
+    }
+
     /// Forget the verdict for a workspace whose membership just changed. Fed
     /// by the side subscription on `workspace:updated`, so a removal takes
     /// effect even when the subscriber's own patterns exclude that type.
@@ -84,7 +90,7 @@ impl MembershipGate {
             return;
         }
         let workspace_id = event.workspace_id.as_str();
-        if Self::unshared_principal(event) == Some(self.principal_id.as_str()) {
+        if self.is_own_unshare(event) {
             self.verdicts
                 .insert(workspace_id.to_string(), (false, Instant::now()));
         } else {
@@ -100,7 +106,7 @@ impl MembershipGate {
             // event reaching here has nothing to authorize against.
             return false;
         }
-        if Self::unshared_principal(event) == Some(self.principal_id.as_str()) {
+        if self.is_own_unshare(event) {
             // The removed member's own final notification.
             self.verdicts
                 .insert(workspace_id.to_string(), (false, Instant::now()));
