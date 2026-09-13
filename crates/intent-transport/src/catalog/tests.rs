@@ -403,7 +403,7 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
     ),
     (
         "agent.retry",
-        "re-delivers the requeued entry, which carries the stamp captured at enqueue / wake delivery",
+        "re-delivers the requeued entry with the stamp captured at enqueue / wake delivery — the retrier is never the author (`guest_wake_stamp_survives_terminal_failure_requeue_over_wss`)",
     ),
     (
         "agent.sendMessage",
@@ -422,6 +422,401 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
         "stamped on the input in `WorkspaceApi::agent_wake_or_create`; the wake row, parked queue entry and worker options carry it",
     ),
 ];
+
+/// The complement of [`USER_ORIGIN_MESSAGE_ENTRY_POINTS`]: every other method
+/// in the full catalog (router + fast path), each affirmed NOT to write a
+/// human-authored chat row or queue entry. Together the two ledgers must
+/// partition the catalog exactly ([`chat_write_classification`]), so adding
+/// ANY method — with or without a `messageMetadata` param — fails CI until it
+/// is placed in one list or the other.
+///
+/// Classification notes for the entries a reader might question:
+/// - `agent.replaceMessages` swaps the transcript wholesale (compaction /
+///   restore); it re-persists rows with the metadata they already carry and
+///   is not a human authoring event, so the Product Brief's ten-entry set
+///   excludes it.
+/// - `agent.dismissQuestions` delivers a daemon-authored system notice
+///   (`type: questions_dismissed`, `source: system` — agent/automatic to
+///   the author projection), never a human row; `agent.respondPermission`
+///   and `agent.stop` drive turn control without appending a chat row
+///   (question answers travel as `agent.sendMessage` content).
+/// - `note.*`, `comment.*`, `task.*`, `github.*` write notes, comments and
+///   forge objects — never the agent transcript.
+const NON_USER_ORIGIN_METHODS: &[&str] = &[
+    "agent.cancelDelete",
+    "agent.cancelSubscriptions",
+    "agent.completeOnce",
+    "agent.delegate",
+    "agent.delete",
+    "agent.diagnostics",
+    "agent.dismissQuestions",
+    "agent.enhancePrompt",
+    "agent.get",
+    "agent.getConversation",
+    "agent.getMessageBlock",
+    "agent.getModels",
+    "agent.getQueue",
+    "agent.getSession",
+    "agent.getSessionStats",
+    "agent.getSubscriptions",
+    "agent.list",
+    "agent.listActive",
+    "agent.listInterrupted",
+    "agent.listUserMessages",
+    "agent.markSeen",
+    "agent.pendingPermissions",
+    "agent.removeQueuedMessage",
+    "agent.rename",
+    "agent.replaceMessages",
+    "agent.reportToParent",
+    "agent.resolveInterrupted",
+    "agent.resolveProposal",
+    "agent.respondPermission",
+    "agent.restore",
+    "agent.setModel",
+    "agent.stop",
+    "agent.subscribe",
+    "agent.summary",
+    "agent.unsubscribe",
+    "agent.update",
+    "browser.closeTab",
+    "browser.exec",
+    "browser.listTabs",
+    "browser.navigateTab",
+    "browser.removeTab",
+    "browser.syncTabs",
+    "browser.upsertTab",
+    "client.hello",
+    "client.list",
+    "comment.add",
+    "comment.delete",
+    "comment.getThread",
+    "comment.list",
+    "comment.resolveThread",
+    "comment.respond",
+    "crossWorkspace.listNotes",
+    "crossWorkspace.listSiblings",
+    "crossWorkspace.readNote",
+    "debug.sampleStacks",
+    "drafts.clear",
+    "drafts.get",
+    "drafts.set",
+    "event.agentActivity",
+    "event.query",
+    "event.workspaceSummary",
+    "events.subscribe",
+    "events.unsubscribe",
+    "file.attachmentUpload.abort",
+    "file.attachmentUpload.begin",
+    "file.attachmentUpload.chunk",
+    "file.attachmentUpload.commit",
+    "file.delete",
+    "file.exists",
+    "file.getAttachmentInfo",
+    "file.list",
+    "file.mkdir",
+    "file.placeAttachment",
+    "file.read",
+    "file.readChunk",
+    "file.rename",
+    "file.stat",
+    "file.tree",
+    "file.write",
+    "forward.close",
+    "forward.create",
+    "forward.list",
+    "git.agentCommit",
+    "git.branchDiff",
+    "git.branchStatus",
+    "git.changes",
+    "git.checkMergeConflicts",
+    "git.checkoutBranch",
+    "git.clone",
+    "git.commit",
+    "git.commitDetails",
+    "git.commits",
+    "git.createBranch",
+    "git.diffs",
+    "git.discard",
+    "git.fetch",
+    "git.getBranches",
+    "git.getConfig",
+    "git.getRemoteUrl",
+    "git.numstat",
+    "git.pull",
+    "git.push",
+    "git.removeLockFile",
+    "git.renameBranch",
+    "git.showFile",
+    "git.stage",
+    "git.stageHunk",
+    "git.status",
+    "git.unstage",
+    "git.unstageHunk",
+    "gitRoot.list",
+    "github.authStatus",
+    "github.branches.list",
+    "github.branches.listCached",
+    "github.cancelAuth",
+    "github.connect",
+    "github.getReviewThreads",
+    "github.getUser",
+    "github.issues.get",
+    "github.issues.list",
+    "github.issues.search",
+    "github.listReviewComments",
+    "github.pulls.create",
+    "github.pulls.get",
+    "github.pulls.list",
+    "github.pulls.merge",
+    "github.pulls.search",
+    "github.pulls.updateBranch",
+    "github.replyReviewComment",
+    "github.repoConfig.get",
+    "github.repos.get",
+    "github.repos.list",
+    "github.repos.search",
+    "github.resolveThread",
+    "github.revoke",
+    "github.unresolveThread",
+    "hook.cancel",
+    "hook.list",
+    "hook.runNow",
+    "host.checkAuggie",
+    "host.checkGh",
+    "host.checkGit",
+    "host.checkNode",
+    "host.createDirectory",
+    "host.directoryStatus",
+    "host.env",
+    "host.exec",
+    "host.execStream",
+    "host.execStream.cancel",
+    "host.execStream.write",
+    "host.findApp",
+    "host.findBinary",
+    "host.listDirectory",
+    "host.listInstalledEditors",
+    "host.openInEditor",
+    "host.providerAuthStatus",
+    "host.providerDiscovery",
+    "host.providerTestPrompt",
+    "host.status",
+    "host.toolAvailability",
+    "linear.authStatus",
+    "linear.createIssue",
+    "linear.getIssue",
+    "linear.listIssues",
+    "linear.listLabels",
+    "linear.listProjects",
+    "linear.listTeams",
+    "linear.listWorkflowStates",
+    "linear.searchIssues",
+    "linear.updateIssue",
+    "linear.viewer",
+    "mcp.oauth.delete",
+    "mcp.oauth.get",
+    "mcp.oauth.list",
+    "mcp.oauth.set",
+    "mcp.servers.create",
+    "mcp.servers.delete",
+    "mcp.servers.getStatus",
+    "mcp.servers.list",
+    "mcp.servers.restart",
+    "mcp.servers.toggle",
+    "mcp.servers.update",
+    "mcp.testConnection",
+    "metrics.clearAgentStats",
+    "metrics.getAgentStats",
+    "metrics.getAllWorkspaceStats",
+    "metrics.getWorkspaceStats",
+    "models.list",
+    "note.add",
+    "note.create",
+    "note.delete",
+    "note.edit",
+    "note.editLines",
+    "note.get",
+    "note.getVersion",
+    "note.lineAttribution.computeNow",
+    "note.lineAttribution.load",
+    "note.list",
+    "note.listTasks",
+    "note.listVersions",
+    "note.readAsset",
+    "note.restoreVersion",
+    "note.saveAsset",
+    "note.setContent",
+    "note.update",
+    "note.updateMetadata",
+    "pairing.getInfo",
+    "pr.refresh",
+    "pr.status",
+    "prMonitor.cancel",
+    "prMonitor.flush",
+    "prMonitor.list",
+    "primitive.addAgentAction",
+    "primitive.addCli",
+    "primitive.addPatch",
+    "primitive.addReference",
+    "principal.me",
+    "providers.catalog",
+    "providers.setup.cancel",
+    "providers.setup.login",
+    "providers.setup.start",
+    "providers.setup.status",
+    "repo.list",
+    "repo.remove",
+    "repo.warmCache",
+    "repoConfig.ensureDir",
+    "repoConfig.get",
+    "repoConfig.has",
+    "repoConfig.save",
+    "rules.get",
+    "rules.list",
+    "rules.update",
+    "sandbox.cow.discard",
+    "sandbox.cow.merge",
+    "script.create",
+    "script.list",
+    "script.output",
+    "script.remove",
+    "script.restart",
+    "script.run",
+    "script.start",
+    "script.status",
+    "script.stop",
+    "search.cancel",
+    "search.codebase",
+    "search.events",
+    "search.fileNames",
+    "search.inFiles",
+    "search.messages",
+    "search.notes",
+    "sentry.assignIssue",
+    "sentry.authStatus",
+    "sentry.getIssue",
+    "sentry.ignoreIssue",
+    "sentry.listIssues",
+    "sentry.listProjects",
+    "sentry.resolveIssue",
+    "sentry.searchIssues",
+    "server.pairingInfo",
+    "server.rotateToken",
+    "settings.get",
+    "settings.list",
+    "settings.reset",
+    "settings.update",
+    "skill.list",
+    "specialist.create",
+    "specialist.delete",
+    "specialist.edit",
+    "specialist.get",
+    "specialist.list",
+    "stats.getRateHistory",
+    "stats.getUsage",
+    "system.capabilities",
+    "system.gitCredential",
+    "system.importLegacy",
+    "system.requestUpdate",
+    "system.shutdown",
+    "system.status",
+    "task.assignAgent",
+    "task.convertBlocks",
+    "task.createPrerequisite",
+    "task.get",
+    "task.getMyTask",
+    "task.linkAgent",
+    "task.list",
+    "task.listAgentLinks",
+    "task.markAsTask",
+    "task.removeAgentFromAllTasks",
+    "task.setRelations",
+    "task.unlinkAgent",
+    "task.update",
+    "task.updateNoteStatus",
+    "task.updateStatus",
+    "terminal.create",
+    "terminal.getBuffer",
+    "terminal.kill",
+    "terminal.list",
+    "terminal.readOutput",
+    "terminal.resize",
+    "terminal.write",
+    "unsloth.status",
+    "unsloth.stop",
+    "voice.getWorkspaceVocabulary",
+    "voice.transcribe",
+    "workspace.archive",
+    "workspace.cancelDelete",
+    "workspace.cleanup",
+    "workspace.create",
+    "workspace.delete",
+    "workspace.detectProjectType",
+    "workspace.diskUsage",
+    "workspace.dismissAttention",
+    "workspace.duplicate",
+    "workspace.export.abort",
+    "workspace.export.finalize",
+    "workspace.export.read",
+    "workspace.export.start",
+    "workspace.findRepositories",
+    "workspace.generateSetupScript",
+    "workspace.get",
+    "workspace.getAutoCommit",
+    "workspace.getBrowserClient",
+    "workspace.getContext",
+    "workspace.getSetupScript",
+    "workspace.getTokenUsage",
+    "workspace.getUiContext",
+    "workspace.import.abort",
+    "workspace.import.begin",
+    "workspace.import.chunk",
+    "workspace.import.commit",
+    "workspace.initializeRepository",
+    "workspace.list",
+    "workspace.localChanges",
+    "workspace.markSeen",
+    "workspace.restore",
+    "workspace.saveSetupScript",
+    "workspace.setAutoCommit",
+    "workspace.setBrowserClient",
+    "workspace.transfer.plan",
+    "workspace.unarchive",
+    "workspace.update",
+    "workspace.updateContext",
+    "workspace.updateUiContext",
+];
+
+/// Partition check shared by the golden and its negative control: every
+/// catalog method must be in exactly one ledger, and every ledger entry must
+/// name a catalog method. Returns `(unclassified, doubly_classified, stale)`.
+fn chat_write_classification(catalog: &[&str]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let catalog: HashSet<&str> = catalog.iter().copied().collect();
+    let user_write: HashSet<&str> = USER_ORIGIN_MESSAGE_ENTRY_POINTS
+        .iter()
+        .map(|(m, _)| *m)
+        .collect();
+    let non_write: HashSet<&str> = NON_USER_ORIGIN_METHODS.iter().copied().collect();
+    let mut unclassified: Vec<String> = catalog
+        .iter()
+        .filter(|m| !user_write.contains(*m) && !non_write.contains(*m))
+        .map(ToString::to_string)
+        .collect();
+    let mut doubly: Vec<String> = user_write
+        .intersection(&non_write)
+        .map(ToString::to_string)
+        .collect();
+    let mut stale: Vec<String> = user_write
+        .union(&non_write)
+        .filter(|m| !catalog.contains(*m))
+        .map(ToString::to_string)
+        .collect();
+    unclassified.sort();
+    doubly.sort();
+    stale.sort();
+    (unclassified, doubly, stale)
+}
 
 /// Router arms whose body reads a `messageMetadata` param, attributed to the
 /// arm's method name(s). Same single-line-arm assumption as
@@ -491,8 +886,46 @@ fn user_origin_message_entry_points_frozen() {
          the service matrix and docs/protocol/ updated alongside"
     );
 
-    // Every router arm that accepts `messageMetadata` must be classified —
-    // a new metadata-carrying method cannot land unstamped.
+    // Exhaustive partition of the FULL catalog (router + fast path): a new
+    // method — content-only or metadata-carrying — cannot land unclassified.
+    let full_catalog: Vec<&str> = ROUTER_METHODS
+        .iter()
+        .chain(FASTPATH_METHODS.iter())
+        .copied()
+        .collect();
+    let (unclassified, doubly, stale) = chat_write_classification(&full_catalog);
+    assert!(
+        unclassified.is_empty(),
+        "catalog methods with no chat-write classification — add each to \
+         USER_ORIGIN_MESSAGE_ENTRY_POINTS (and stamp the human principal) or to \
+         NON_USER_ORIGIN_METHODS (affirming it writes no human chat row): {unclassified:?}"
+    );
+    assert!(
+        doubly.is_empty(),
+        "methods classified as both user-write and non-write: {doubly:?}"
+    );
+    assert!(
+        stale.is_empty(),
+        "classified methods that are no longer in the catalog: {stale:?}"
+    );
+    assert_eq!(
+        USER_ORIGIN_MESSAGE_ENTRY_POINTS.len() + NON_USER_ORIGIN_METHODS.len(),
+        full_catalog.len(),
+        "the two ledgers must partition the catalog exactly"
+    );
+    let mut previous: Option<&str> = None;
+    for method in NON_USER_ORIGIN_METHODS {
+        if let Some(prev) = previous {
+            assert!(
+                prev < *method,
+                "NON_USER_ORIGIN_METHODS must be sorted and duplicate-free: {prev} before {method}"
+            );
+        }
+        previous = Some(method);
+    }
+
+    // Belt and braces: every router arm that reads `messageMetadata` must be
+    // on the user-write side (or classified non-write on purpose).
     let reading = router_arms_reading_message_metadata();
     assert!(
         !reading.is_empty(),
@@ -509,4 +942,30 @@ fn user_origin_message_entry_points_frozen() {
         "router arms read `messageMetadata` without a USER_ORIGIN_MESSAGE_ENTRY_POINTS \
          classification (stamp the human principal or classify why not): {unclassified:?}"
     );
+}
+
+/// Negative control for [`user_origin_message_entry_points_frozen`]: a
+/// content-only method (no `messageMetadata` param, so invisible to the
+/// source scan) added to the catalog is reported as unclassified until a
+/// ledger names it.
+#[test]
+fn content_only_new_method_is_reported_unclassified() {
+    let mut probed: Vec<&str> = ROUTER_METHODS
+        .iter()
+        .chain(FASTPATH_METHODS.iter())
+        .copied()
+        .collect();
+    probed.push("agent.newHumanWrite");
+    let (unclassified, doubly, stale) = chat_write_classification(&probed);
+    assert_eq!(unclassified, vec!["agent.newHumanWrite".to_string()]);
+    assert!(doubly.is_empty() && stale.is_empty());
+
+    // And removing a classified method from the catalog surfaces as stale.
+    let shrunk: Vec<&str> = probed
+        .iter()
+        .copied()
+        .filter(|m| *m != "agent.newHumanWrite" && *m != "agent.appendMessage")
+        .collect();
+    let (_, _, stale) = chat_write_classification(&shrunk);
+    assert_eq!(stale, vec!["agent.appendMessage".to_string()]);
 }

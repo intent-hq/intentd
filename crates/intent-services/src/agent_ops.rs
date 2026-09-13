@@ -1209,13 +1209,17 @@ impl QueuedMessage {
     /// `event_notification` payload) — entries without it keep the legacy shape.
     /// `turnId` is only present when set (monorepo#1022: correlation id stable
     /// across requeues; entries rehydrated from legacy payloads always have one
-    /// backfilled).
+    /// backfilled). `author` is ALWAYS present: `null` here, overwritten with
+    /// the resolved projection by
+    /// [`crate::principal_ops::MessageAuthorResolver::attach_queue`] on the
+    /// surfaces that resolve it — a consumer never sees the key absent.
     pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
             "content": self.content,
             "queuedAt": self.queued_at,
             "position": position,
+            "author": Value::Null,
         });
         if !self.turn_id.is_empty() {
             v["turnId"] = Value::String(self.turn_id.clone());
@@ -6152,12 +6156,15 @@ impl Services {
     /// as `NotFound`. Entries carry the resolved `author` projection
     /// ([`crate::principal_ops::MessageAuthorResolver::attach_queue`]) — the
     /// same shape and resolution order as `agent.getConversation` user rows.
+    /// The key is present on every row regardless: when the unscoped read
+    /// finds no session to resolve against, entries keep the `null` default
+    /// from [`QueuedMessage::to_value`].
     pub(crate) async fn agent_get_queue_op(
         &self,
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
-        let owning_ws = match self.store.get_agent_session(&agent_id).await {
+        let owning_ws = match self.store.get_agent_session_summary(&agent_id).await {
             Ok(session) => Some(session.workspace_id),
             Err(e) if workspace_id.is_some() => return Err(e),
             Err(_) => None,
