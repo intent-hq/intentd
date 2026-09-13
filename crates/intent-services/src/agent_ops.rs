@@ -2590,7 +2590,11 @@ impl Services {
         let Some(manager) = self.agent_manager() else {
             return Ok(json!({ "streams": [] }));
         };
-        let busy = manager.list_busy();
+        let mut busy = manager.list_busy();
+        // Cross-workspace surface: a collaborator sees only member workspaces.
+        if let Some(visible) = self.visible_workspace_ids().await? {
+            busy.retain(|(_, workspace_id)| visible.contains(workspace_id));
+        }
         if busy.is_empty() {
             return Ok(json!({ "streams": [] }));
         }
