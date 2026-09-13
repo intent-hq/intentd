@@ -3191,6 +3191,14 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
             row["waiting"], true,
             "batched hook/PR waiting signal: {row}"
         );
+        // Multiplayer w1: the forwarder task runs with the subscribing
+        // connection's Caller re-bound, so the seq-0 rows carry the
+        // membership summary relative to the caller (intentd#1868).
+        assert_eq!(
+            row["myRole"], "owner",
+            "seq-0 snapshot rows carry the caller's role: {row}"
+        );
+        assert_eq!(row["memberCount"], 1, "{row}");
     }
     let active_snap = snap_rows
         .iter()
