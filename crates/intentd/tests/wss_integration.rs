@@ -3529,6 +3529,242 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
     srv.ws.stop().await;
 }
 
+/// Multiplayer w3: non-administrators receive only vetted event types, live
+/// and durable. A collaborator subscribed to the `note:*` / `terminal:*` /
+/// `host:*` categories on a workspace it is a member of receives
+/// `note:updated` but never `terminal:data`, `host:exec:stdout` or
+/// `terminal:exit` while the owner drives all four through the bus; the
+/// owner's identical subscription still sees every one. `event.query` from
+/// the collaborator returns no excluded rows (an explicit `terminal:*` filter
+/// yields `[]`) while the administrator's query returns them all.
+#[tokio::test]
+async fn wss_collaborator_event_fan_out_and_query_are_allowlisted() {
+    use intent_core::events::{HOST_EXEC_STDOUT, NOTE_UPDATED, TERMINAL_DATA, TERMINAL_EXIT};
+    use intent_core::{ActorType, EventActor, Principal, PrincipalId, WorkspaceRole};
+    use intent_store::NewEvent;
+    use serde_json::json;
+
+    type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
+
+    async fn reply(ws: &mut Ws, id: u64) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == id {
+                            return v;
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("reply within 10s")
+    }
+
+    /// Collect delivered `events.event` types until `until` arrives.
+    async fn delivered_until(ws: &mut Ws, until: &str) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut types = Vec::new();
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] != "events.event" {
+                            continue;
+                        }
+                        let ty = v["params"]["event"]["type"]
+                            .as_str()
+                            .expect("event type")
+                            .to_string();
+                        let done = ty == until;
+                        types.push(ty);
+                        if done {
+                            return types;
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {until}"))
+    }
+
+    let srv = start(WsOptions::default()).await;
+    let ws_id = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws_id))
+        .await
+        .expect("insert workspace");
+
+    let guest_token = "ececececececececececececececececececececececececececececececececec";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    srv.store.upsert_principal(&guest).await.expect("guest");
+    srv.store
+        .insert_principal_credential(&guest.id, &sha256_hex(guest_token.as_bytes()))
+        .await
+        .expect("guest credential");
+    srv.store
+        .add_workspace_member(&ws_id, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("add collaborator");
+
+    // Collaborator: the patterns name owner-only categories too; the
+    // subscription is still accepted.
+    let guest_url = format!("wss://localhost:{}/ws?token={guest_token}", srv.port);
+    let mut guest_ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &guest_url).await;
+    let sub = json!({ "jsonrpc": "2.0", "id": 1, "method": "events.subscribe",
+        "params": { "eventTypes": ["note:*", "terminal:*", "host:*"], "workspaceId": ws_id.0 } });
+    guest_ws
+        .send(Message::Text(sub.to_string().into()))
+        .await
+        .expect("send");
+    let v = reply(&mut guest_ws, 1).await;
+    assert!(
+        v["result"]["subscriptionId"].is_string(),
+        "collaborator subscribe returns an id whatever the patterns: {v}"
+    );
+
+    // Owner (legacy token): the same subscription as a positive control.
+    let mut owner_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    owner_ws
+        .send(Message::Text(sub.to_string().into()))
+        .await
+        .expect("send");
+    let v = reply(&mut owner_ws, 1).await;
+    assert!(v["result"]["subscriptionId"].is_string(), "{v}");
+
+    // The owner drives three excluded types and then one allowlisted type.
+    // `publish` resolves after the durable commit + broadcast, so delivery
+    // order matches publish order and `note:updated` is last.
+    let event = |event_type: &str, data: Value| NewEvent {
+        workspace_id: ws_id.clone(),
+        timestamp: now_iso(),
+        event_type: event_type.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::User,
+            id: Some("owner".to_string()),
+            ..Default::default()
+        },
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    };
+    for (ty, data) in [
+        (
+            TERMINAL_DATA,
+            json!({ "terminalId": "t-1", "data": "secret" }),
+        ),
+        (
+            HOST_EXEC_STDOUT,
+            json!({ "execId": "x-1", "chunk": "secret" }),
+        ),
+        (TERMINAL_EXIT, json!({ "terminalId": "t-1", "exitCode": 0 })),
+        (
+            NOTE_UPDATED,
+            json!({ "noteId": "spec", "action": "update" }),
+        ),
+    ] {
+        srv.bus.publish(&event(ty, data)).await.expect("publish");
+    }
+
+    assert_eq!(
+        delivered_until(&mut owner_ws, NOTE_UPDATED).await,
+        vec![TERMINAL_DATA, HOST_EXEC_STDOUT, TERMINAL_EXIT, NOTE_UPDATED],
+        "the owner's subscription sees every type"
+    );
+    assert_eq!(
+        delivered_until(&mut guest_ws, NOTE_UPDATED).await,
+        vec![NOTE_UPDATED],
+        "the collaborator's subscription sees only allowlisted types"
+    );
+
+    // Durable reads: the owner sees all four rows; the collaborator's query
+    // is narrowed to the allowlist, and an explicit excluded filter is empty.
+    let query = |id: u64, params: Value| {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "event.query", "params": params }).to_string()
+    };
+    let types_of = |rows: &Value| -> Vec<String> {
+        rows.as_array()
+            .unwrap_or_else(|| panic!("rows array: {rows}"))
+            .iter()
+            .map(|e| e["type"].as_str().expect("type").to_string())
+            .collect()
+    };
+
+    owner_ws
+        .send(Message::Text(
+            query(2, json!({ "workspaceId": ws_id.0 })).into(),
+        ))
+        .await
+        .expect("send");
+    let owner_rows = reply(&mut owner_ws, 2).await;
+    let mut owner_types = types_of(&owner_rows["result"]);
+    owner_types.sort_unstable();
+    assert_eq!(
+        owner_types,
+        vec![HOST_EXEC_STDOUT, NOTE_UPDATED, TERMINAL_DATA, TERMINAL_EXIT],
+        "administrator event.query returns every persisted row: {owner_rows}"
+    );
+
+    guest_ws
+        .send(Message::Text(
+            query(2, json!({ "workspaceId": ws_id.0 })).into(),
+        ))
+        .await
+        .expect("send");
+    let guest_rows = reply(&mut guest_ws, 2).await;
+    assert!(guest_rows.get("error").is_none(), "{guest_rows}");
+    assert_eq!(
+        types_of(&guest_rows["result"]),
+        vec![NOTE_UPDATED],
+        "collaborator event.query returns no excluded rows: {guest_rows}"
+    );
+
+    guest_ws
+        .send(Message::Text(
+            query(
+                3,
+                json!({ "workspaceId": ws_id.0, "eventType": "terminal:*" }),
+            )
+            .into(),
+        ))
+        .await
+        .expect("send");
+    let filtered = reply(&mut guest_ws, 3).await;
+    assert_eq!(
+        filtered["result"],
+        json!([]),
+        "an excluded-only filter yields no rows for a collaborator: {filtered}"
+    );
+
+    drop(guest_ws);
+    drop(owner_ws);
+    srv.ws.stop().await;
+}
+
 /// Multiplayer w2: every human-authored chat entry is stamped with the wire
 /// caller's principal — `agent.sendMessage` (direct persist),
 /// `agent.appendMessage` (`user` role) and `agent.queueMessage` (queue entry
