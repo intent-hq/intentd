@@ -31635,7 +31635,8 @@ mod browser_routing {
     /// Register an open tab of `ws` on `host`, owned by `owner` when given.
     /// Both the workspace and the host client are foreign keys of the row,
     /// so they are created on demand (`setup` already knows `desktop-a` /
-    /// `desktop-b` and the primary workspace).
+    /// `desktop-b` and the primary workspace). User tabs report
+    /// `displayed: true`, agent tabs `false` (hidden).
     async fn register_tab(
         svc: &Services,
         ws: &WorkspaceId,
@@ -31671,6 +31672,7 @@ mod browser_routing {
                 "ownerAgentId": owner,
                 "visibility": "hidden",
                 "emulatedSize": owner.map(|_| json!({ "width": 1280, "height": 800 })),
+                "displayed": owner.is_none(),
             }))
             .unwrap(),
         )
@@ -31775,13 +31777,14 @@ mod browser_routing {
             json!({
                 "tabId": "t-user", "workspaceId": ws.0, "url": "https://t-user.test/",
                 "title": "t-user", "ownerAgentId": null, "mode": "native",
-                "visibility": "hidden", "hostClientId": "desktop-a",
+                "visibility": "hidden", "displayed": true, "hostClientId": "desktop-a",
                 "hostName": "Desktop A", "hostConnected": true
             })
         );
         assert_eq!(tabs[1]["ownerAgentId"], "agent-1");
         assert_eq!(tabs[1]["mode"], "emulated");
         assert_eq!(tabs[1]["width"], 1280);
+        assert_eq!(tabs[1]["displayed"], false);
         assert_eq!(tabs[1]["hostClientId"], "desktop-b");
         assert_eq!(tabs[1]["hostConnected"], false, "desktop-b is not live");
         assert!(tabs[1].get("hostName").is_none());
@@ -31867,9 +31870,74 @@ mod browser_routing {
         assert_eq!(scoped["success"], true);
     }
 
+    /// intent-hq/intent#4835: `displayed` rides the registry-answered
+    /// `listTabs` entry exactly as the host last reported it — a host that
+    /// never reported it yields no key (never a default `false`), and a
+    /// later report flipping it is diffed into `browser:tab-updated {
+    /// changes: { displayed } }` and reflected on the next list.
+    #[tokio::test]
+    async fn list_tabs_carries_displayed_as_reported() {
+        let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
+        let (_t, _r, svc, bus, ws) = setup(reg).await;
+        let host = ClientId::from_string("desktop-a");
+        let report = |displayed: Option<bool>| -> intent_core::BrowserTabInput {
+            serde_json::from_value(json!({
+                "tabId": "t-legacy",
+                "workspaceId": ws.0,
+                "url": "https://t-legacy.test/",
+                "visibility": "visible",
+                "displayed": displayed,
+            }))
+            .unwrap()
+        };
+        svc.browser_upsert_tab(host.clone(), report(None))
+            .await
+            .expect("registered without displayed");
+        let list = || {
+            svc.browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+        };
+        let out = list().await.expect("list");
+        assert_eq!(out["result"][0]["tabId"], "t-legacy");
+        assert!(
+            out["result"][0].get("displayed").is_none(),
+            "never reported ⇒ omitted, not false: {}",
+            out["result"][0]
+        );
+
+        let events = tokio::spawn({
+            let bus = bus.clone();
+            let ws = ws.clone();
+            async move { tab_events(&bus, &ws, 1).await }
+        });
+        tokio::task::yield_now().await;
+        let updated = svc
+            .browser_upsert_tab(host.clone(), report(Some(true)))
+            .await
+            .expect("re-reported with displayed");
+        assert_eq!(updated.displayed, Some(true));
+        let evs = events.await.unwrap();
+        assert_eq!(evs[0]["type"], "browser:tab-updated");
+        assert_eq!(evs[0]["data"]["changes"], json!({ "displayed": true }));
+        assert_eq!(evs[0]["data"]["tab"]["displayed"], true);
+        assert_eq!(list().await.unwrap()["result"][0]["displayed"], true);
+
+        svc.browser_upsert_tab(host, report(Some(false)))
+            .await
+            .expect("flipped displayed");
+        assert_eq!(list().await.unwrap()["result"][0]["displayed"], false);
+    }
+
     /// Model 5: a `claimTab` the driving client executed on a tab another
     /// client hosted re-homes the row (host + owner) with one
-    /// `browser:tab-updated`; a failed claim moves nothing.
+    /// `browser:tab-updated`; a failed claim moves nothing. The move clears
+    /// the previous host's `displayed` fact (`changes.displayed: null`, absent
+    /// on the event `tab` and the next list) until the new host reports it;
+    /// a same-host owner-only claim keeps it (intent-hq/intent#4835).
     #[tokio::test]
     async fn successful_claim_migrates_the_tab_to_the_driving_client() {
         let reg = two_clients();
@@ -31898,6 +31966,7 @@ mod browser_routing {
             .unwrap();
         assert_eq!(row.host_client_id, ClientId::from_string("desktop-b"));
         assert!(row.owner_agent_id.is_none());
+        assert_eq!(row.displayed, Some(true), "desktop-b reported the fact");
 
         // Now drive the migration the way a confirmed `claimTab` does.
         let events = tokio::spawn({
@@ -31921,12 +31990,28 @@ mod browser_routing {
             .unwrap();
         assert_eq!(row.host_client_id, ClientId::from_string("desktop-a"));
         assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
+        assert_eq!(
+            row.displayed, None,
+            "desktop-a has not reported the layout fact yet"
+        );
         let evs = events.await.unwrap();
         assert_eq!(evs[0]["type"], "browser:tab-updated");
         assert_eq!(
             evs[0]["data"]["changes"],
-            json!({ "hostClientId": "desktop-a", "ownerAgentId": "agent-1" })
+            json!({ "hostClientId": "desktop-a", "ownerAgentId": "agent-1", "displayed": null })
         );
+        assert!(evs[0]["data"]["tab"].get("displayed").is_none());
+        let listed = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed["result"][0]["tabId"], "user-tab");
+        assert!(listed["result"][0].get("displayed").is_none());
         // Re-homing the same tab to its current host and owner is a no-op
         // (no event).
         svc.browser_tab_claim_migrate(
@@ -31946,7 +32031,7 @@ mod browser_routing {
 
         // A claim of a tab the driving client already hosts records the
         // owner immediately (no wait for the host's own report) with
-        // `changes: { ownerAgentId }` only.
+        // `changes: { ownerAgentId }` only — the host's `displayed` stays.
         register_tab(&svc, &ws, "local-tab", "desktop-a", None).await;
         let events = tokio::spawn({
             let bus = bus.clone();
@@ -31969,9 +32054,11 @@ mod browser_routing {
             .unwrap();
         assert_eq!(row.host_client_id, ClientId::from_string("desktop-a"));
         assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
+        assert_eq!(row.displayed, Some(true), "same-host claim keeps the fact");
         let evs = events.await.unwrap();
         assert_eq!(evs[0]["type"], "browser:tab-updated");
         assert_eq!(evs[0]["data"]["tab"]["tabId"], "local-tab");
+        assert_eq!(evs[0]["data"]["tab"]["displayed"], true);
         assert_eq!(
             evs[0]["data"]["changes"],
             json!({ "ownerAgentId": "agent-1" })
@@ -32247,9 +32334,11 @@ mod browser_routing {
         let evs = events.await.unwrap();
         assert_eq!(evs[0]["type"], "browser:tab-updated");
         assert_eq!(evs[0]["data"]["tab"]["tabId"], "tab-on-a");
+        // The re-homed row drops desktop-a's `displayed` fact; the same-host
+        // row keeps desktop-b's.
         assert_eq!(
             evs[0]["data"]["changes"],
-            json!({ "hostClientId": "desktop-b", "ownerAgentId": "agent-1" })
+            json!({ "hostClientId": "desktop-b", "ownerAgentId": "agent-1", "displayed": null })
         );
         assert_eq!(evs[1]["type"], "browser:tab-updated");
         assert_eq!(evs[1]["data"]["tab"]["tabId"], "tab-on-b");
@@ -32273,8 +32362,10 @@ mod browser_routing {
     }
 
     /// Model 10: setting the pin moves every claimed tab of the workspace to
-    /// the new driving client (one `browser:tab-updated` each); unclaimed
-    /// tabs and other workspaces stay put; clearing the pin moves nothing.
+    /// the new driving client (one `browser:tab-updated` each, clearing the
+    /// old host's `displayed` fact: `changes.displayed: null`); unclaimed
+    /// tabs and other workspaces stay put (fact retained); clearing the pin
+    /// moves nothing.
     #[tokio::test]
     async fn set_browser_client_migrates_claimed_tabs() {
         let reg = two_clients();
@@ -32309,26 +32400,30 @@ mod browser_routing {
             assert_eq!(ev["type"], "browser:tab-updated");
             assert_eq!(
                 ev["data"]["changes"],
-                json!({ "hostClientId": "desktop-b" })
+                json!({ "hostClientId": "desktop-b", "displayed": null })
             );
+            assert!(ev["data"]["tab"].get("displayed").is_none());
         }
-        let host_of = |id: &str| {
+        let row_of = |id: &str| {
             let svc = svc.clone();
             let id = id.to_string();
-            async move {
-                svc.store
-                    .get_browser_tab(&id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .host_client_id
-                    .0
-            }
+            async move { svc.store.get_browser_tab(&id).await.unwrap().unwrap() }
+        };
+        let host_of = |id: &str| {
+            let row = row_of(id);
+            async move { row.await.host_client_id.0 }
         };
         assert_eq!(host_of("user-tab").await, "desktop-a");
         assert_eq!(host_of("mine-1").await, "desktop-b");
         assert_eq!(host_of("mine-2").await, "desktop-b");
         assert_eq!(host_of("elsewhere").await, "desktop-a");
+        assert_eq!(row_of("user-tab").await.displayed, Some(true), "not moved");
+        assert_eq!(row_of("mine-1").await.displayed, None, "moved: unknown");
+        assert_eq!(
+            row_of("elsewhere").await.displayed,
+            Some(false),
+            "not moved"
+        );
 
         svc.set_workspace_browser_client(ws.clone(), None)
             .await
@@ -33156,20 +33251,41 @@ mod last_activity_events {
     /// its own entry before the delete's sweep runs, so the sweep finds no
     /// handle to abort) — must not emit the spurious `{ idle }` event, and
     /// must still remove its own map entry.
+    ///
+    /// The interleaving is made explicit (intent#4846): the row delete is
+    /// awaited BEFORE `agent_activity_end` arms the timer. Arming first and
+    /// deleting second let the debounce window expire while the real store
+    /// delete was still in flight under package load, so the timer's
+    /// existence probe found the row and emitted the `{ idle }` this test
+    /// forbids. Deleting first produces the same fire-time state the guard
+    /// is for — entry still present, gen/count guards pass, row gone —
+    /// without the timer racing the delete's I/O.
     #[tokio::test]
     async fn idle_timer_firing_against_deleted_workspace_skips_emit() {
         let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
         let mut sub = subscribe(&h);
 
-        // Last in-flight session ends → idle flip scheduled.
+        // Session enters flight (emits the agent_running flip) while the row
+        // still exists.
         h.services.agent_activity_begin(&h.ws).await;
-        h.services.agent_activity_end(&h.ws);
 
         // Delete the row directly in the store, bypassing the services-layer
-        // sweep — the interleaving where the timer fires while the delete is
-        // mid-flight (entry still present, gen/count guards pass, row gone).
+        // sweep, and await it before the timer is armed: the fire is then
+        // guaranteed to observe the deleted row.
         h.store.delete_workspace(&h.ws).await.expect("row delete");
+
+        // Last in-flight session ends → idle flip scheduled against the
+        // already-deleted id.
+        h.services.agent_activity_end(&h.ws);
+        assert!(
+            h.services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "idle flip must be pending before the timer fires"
+        );
 
         // Bounded poll: the timer fires, hits the emit-time existence guard,
         // and must still sweep its map entry on the way out.

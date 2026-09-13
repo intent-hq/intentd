@@ -261,6 +261,9 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 pub struct Store {
     write_pool: SqlitePool,
     read_pool: SqlitePool,
+    /// Process-local `displayed` overlay of the browser tab registry; see
+    /// `browser_tab_repo::DisplayedOverlay`.
+    browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
 }
 
 impl Store {
@@ -304,6 +307,7 @@ impl Store {
         Ok(Self {
             write_pool,
             read_pool,
+            browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
         })
     }
 

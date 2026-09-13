@@ -759,6 +759,41 @@ impl PtyHost {
         count
     }
 
+    /// SIGKILL every tracked session's process group immediately, without
+    /// awaiting: the synchronous, drop-safe counterpart to
+    /// [`kill_all`](Self::kill_all) for guards that run while a runtime is
+    /// unwinding (a panicking test harness) and so cannot await the TERM
+    /// grace. Latches the host closed exactly like `kill_all`, so a
+    /// supervisor that observes the exit and respawns is refused and its
+    /// child reaped in place. Sessions stay registered: each exit watcher
+    /// reaps its direct child and latches the status. Tolerates a poisoned
+    /// sessions lock so a panicking caller never double-panics. Returns the
+    /// number of sessions signalled.
+    pub fn kill_all_sync(&self) -> usize {
+        self.closed.store(true, Ordering::SeqCst);
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for session in sessions.values() {
+            #[cfg(unix)]
+            {
+                if let Some(pid) = session.pid {
+                    let _ = kill_group(pid, PtySignal::Kill);
+                } else if let Ok(mut killer) = session.killer.lock() {
+                    let _ = killer.kill();
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if let Ok(mut killer) = session.killer.lock() {
+                    let _ = killer.kill();
+                }
+            }
+        }
+        sessions.len()
+    }
+
     fn get(&self, id: PtyId) -> Result<Arc<PtySession>> {
         self.sessions
             .lock()
@@ -1542,6 +1577,71 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// `kill_all_sync` (intent-hq/intentd#1822 follow-up): a synchronous
+    /// sweep SIGKILLs every tracked process group — including a TERM+HUP
+    /// trapping descendant — returns without awaiting, leaves the sessions
+    /// registered with their exit latched by the watcher, and closes the host
+    /// so a respawn racing the sweep is refused.
+    #[tokio::test]
+    async fn kill_all_sync_kills_every_group_and_closes_host() {
+        let host = PtyHost::new();
+        let plain = host.spawn(cat_spec("scope-a")).unwrap();
+        let mut spec = SpawnSpec::new("scope-b", "sh");
+        spec.args = vec![
+            "-c".into(),
+            r#"sh -c 'trap "" TERM HUP; echo "trapped-$$"; while :; do sleep 1; done' & sleep 300"#
+                .into(),
+        ];
+        let trapped = host.spawn(spec).unwrap();
+        let leader = host.pid(trapped).expect("leader pid");
+
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
+        let descendant: u32 = loop {
+            let out = host.scrollback(trapped).unwrap();
+            let text = String::from_utf8_lossy(&out);
+            if let Some(pid) = text
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("trapped-").and_then(|p| p.parse().ok()))
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant pid never printed within deadline; scrollback: {text:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            pid_alive(descendant),
+            "descendant alive before kill_all_sync"
+        );
+
+        let started = Instant::now();
+        assert_eq!(host.kill_all_sync(), 2);
+        assert!(
+            started.elapsed() < TERM_GRACE,
+            "kill_all_sync must not await the TERM grace"
+        );
+        assert_eq!(host.count(), 2, "sessions stay registered");
+
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
+        while pid_alive(descendant) || !process_group_empty(leader) {
+            assert!(
+                Instant::now() < deadline,
+                "process group {leader} (descendant {descendant}) survived kill_all_sync"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for id in [plain, trapped] {
+            let exit = host.wait(id).await.expect("exit latched");
+            assert!(!exit.success, "{id} was killed: {exit:?}");
+        }
+        let err = host
+            .spawn(cat_spec("scope-late"))
+            .expect_err("spawn refused after kill_all_sync");
+        assert!(err.to_string().contains("shut down"), "{err}");
     }
 
     /// A `spawn` racing `kill_all` (monorepo#1526): a request already in
