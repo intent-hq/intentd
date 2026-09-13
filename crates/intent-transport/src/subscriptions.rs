@@ -808,7 +808,10 @@ pub(crate) async fn chat_snapshot(
         // unknown agent) serves the empty page WITHOUT the live overlay: the
         // in-flight turn and activity flags are not membership-gated, so
         // overlaying them would leak the live turn the persisted page just
-        // refused. A transient read error keeps the overlay as before.
+        // refused. A transient read error keeps the overlay only for an
+        // administrator: for a collaborator the guarded read is the ONLY
+        // membership check on this path, and a failure inside the guard
+        // itself (store error) has verified nothing.
         Err(err) => {
             let refused = matches!(err, Error::Forbidden(_) | Error::NotFound(_));
             (
@@ -819,7 +822,7 @@ pub(crate) async fn chat_snapshot(
                     "totalMessages": 0,
                     "nextToken": Value::Null,
                 }),
-                !refused,
+                !refused && !crate::context::is_non_administrator_caller(),
             )
         }
     };
