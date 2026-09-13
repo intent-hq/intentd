@@ -16780,12 +16780,16 @@ impl WorkspaceApi for Services {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let token = registry.register(&request_id);
             let limit = limit.and_then(|n| usize::try_from(n).ok());
-            let events = store
-                .query_events(&EventQuery {
-                    workspace_id: workspace_id.clone(),
-                    ..Default::default()
-                })
-                .await?;
+            let mut q = EventQuery {
+                workspace_id: workspace_id.clone(),
+                ..Default::default()
+            };
+            // Multiplayer w3: a collaborator searches allowlisted rows only.
+            let events = if event_ops::narrow_query_for_caller(&mut q) {
+                store.query_events(&q).await?
+            } else {
+                Vec::new()
+            };
             let matches = search_ops::event_matches(&events, &query, limit);
             let matches = to_value_vec(matches)?;
             Ok(services.deliver_search(&request_id, workspace_id.as_ref(), matches, token))
@@ -25108,16 +25112,19 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             if let Some(agent_id) = agent_id {
                 // `getAgentFiles(agentId, 100)`: file:changed by that agent.
-                let events = store
-                    .query_events(&EventQuery {
-                        workspace_id: Some(workspace_id),
-                        event_types: vec![intent_core::events::FILE_CHANGED.to_string()],
-                        actor_type: Some(ActorType::Agent),
-                        actor_id: Some(agent_id),
-                        limit: Some(100),
-                        ..Default::default()
-                    })
-                    .await?;
+                let mut q = EventQuery {
+                    workspace_id: Some(workspace_id),
+                    event_types: vec![intent_core::events::FILE_CHANGED.to_string()],
+                    actor_type: Some(ActorType::Agent),
+                    actor_id: Some(agent_id),
+                    limit: Some(100),
+                    ..Default::default()
+                };
+                let events = if event_ops::narrow_query_for_caller(&mut q) {
+                    store.query_events(&q).await?
+                } else {
+                    Vec::new()
+                };
                 let files: Vec<FileActivity> =
                     events.iter().map(event_ops::file_activity_named).collect();
                 serde_json::to_value(files)
@@ -25125,14 +25132,17 @@ impl WorkspaceApi for Services {
             } else {
                 // `getAgentActivity(minutesAgo || 30)`: agent events in-window.
                 let minutes = minutes_ago.filter(|&m| m != 0).unwrap_or(30);
-                let events = store
-                    .query_events(&EventQuery {
-                        workspace_id: Some(workspace_id),
-                        actor_type: Some(ActorType::Agent),
-                        since: Some(iso_minutes_ago(minutes)),
-                        ..Default::default()
-                    })
-                    .await?;
+                let mut q = EventQuery {
+                    workspace_id: Some(workspace_id),
+                    actor_type: Some(ActorType::Agent),
+                    since: Some(iso_minutes_ago(minutes)),
+                    ..Default::default()
+                };
+                let events = if event_ops::narrow_query_for_caller(&mut q) {
+                    store.query_events(&q).await?
+                } else {
+                    Vec::new()
+                };
                 let activity = event_ops::aggregate_agent_activity(&events);
                 serde_json::to_value(activity)
                     .map_err(|e| Error::Internal(format!("serialize agent activity failed: {e}")))
@@ -25149,13 +25159,18 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // TS `workspaceSummary(minutesAgo || 60)`.
             let minutes = minutes_ago.filter(|&m| m != 0).unwrap_or(60);
-            let events = store
-                .query_events(&EventQuery {
-                    workspace_id: Some(workspace_id),
-                    since: Some(iso_minutes_ago(minutes)),
-                    ..Default::default()
-                })
-                .await?;
+            let mut q = EventQuery {
+                workspace_id: Some(workspace_id),
+                since: Some(iso_minutes_ago(minutes)),
+                ..Default::default()
+            };
+            // Multiplayer w3: a collaborator's summary is built from
+            // allowlisted rows only.
+            let events = if event_ops::narrow_query_for_caller(&mut q) {
+                store.query_events(&q).await?
+            } else {
+                Vec::new()
+            };
             Ok(event_ops::build_workspace_summary(&events, minutes))
         })
     }
@@ -25221,6 +25236,16 @@ impl WorkspaceApi for Services {
             }
             if let Some(m) = params.minutes_ago.filter(|&m| m != 0) {
                 q.since = Some(iso_minutes_ago(m));
+            }
+            // Multiplayer w3: a collaborator reads only allowlisted rows;
+            // the narrowing lands in the SQL type filter so `limit` and
+            // `nextToken` count real rows.
+            if !event_ops::narrow_query_for_caller(&mut q) {
+                return Ok(if paginate {
+                    serde_json::json!({ "items": [], "nextToken": serde_json::Value::Null })
+                } else {
+                    serde_json::json!([])
+                });
             }
             if !paginate {
                 // Legacy bare array (store yields newest→oldest), bounded

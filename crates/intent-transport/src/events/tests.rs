@@ -168,3 +168,147 @@ fn event_notification_envelope_matches_protocol() {
     let keys: Vec<&String> = ev.as_object().unwrap().keys().collect();
     assert_eq!(keys.len(), 6);
 }
+
+/// Multiplayer w3 fan-out: a REAL `events.subscribe` through
+/// [`crate::conn::handle_fast_path`] under a non-administrator caller may
+/// name owner-only patterns, but the forwarder only ever emits allowlisted
+/// types — including the `client:*` pair the transport's reverse registry
+/// publishes, which is why those two live in the taxonomy. The same frame
+/// under the administrator delivers everything it named.
+mod collaborator_fan_out {
+    use std::time::Duration;
+
+    use intent_core::events::{CLIENT_CONNECTED, NOTE_UPDATED, TERMINAL_DATA};
+    use intent_core::{ActorType, Caller, EventActor, PrincipalId, WorkspaceId};
+    use intent_services::EventBus;
+    use intent_store::{NewEvent, Store};
+    use serde_json::{json, Value};
+
+    use crate::conn::{handle_fast_path, outbound_channel, ConnSubs, OutboundReceiver};
+    use crate::events::classify;
+
+    fn event(event_type: &str, workspace_id: &str) -> NewEvent {
+        NewEvent {
+            workspace_id: WorkspaceId::from(workspace_id),
+            timestamp: intent_core::now_iso(),
+            event_type: event_type.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::System,
+                id: Some("system".to_string()),
+                ..Default::default()
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({}),
+        }
+    }
+
+    /// Collect the `type` of every `events.event` frame on the bulk lane
+    /// until it stays quiet for a short window.
+    async fn delivered_types(rx: &mut OutboundReceiver) -> Vec<String> {
+        let mut types = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), rx.bulk.recv()).await
+        {
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["method"], "events.event");
+            types.push(v["params"]["event"]["type"].as_str().unwrap().to_string());
+        }
+        types
+    }
+
+    async fn subscribe_and_publish(caller: Caller) -> Vec<String> {
+        let dir = tempfile::Builder::new()
+            .prefix("intent-transport-collab-fanout-")
+            .tempdir()
+            .unwrap();
+        let store = Store::open(&dir.path().join("bus.db")).await.unwrap();
+        let bus = EventBus::new(store);
+        let (out_tx, mut rx) = outbound_channel();
+        let mut subs = ConnSubs::default();
+
+        let frame = json!({"jsonrpc":"2.0","id":1,"method":"events.subscribe",
+            "params":{"eventTypes":["client:*","terminal:data","note:*"]}});
+        let fast = classify(&frame).expect("classifies as events.subscribe");
+        let bus_ref = &bus;
+        let out_ref = &out_tx;
+        let subs_ref = &mut subs;
+        let accepted = crate::context::with_request_context(true, Some(caller), async move {
+            handle_fast_path(fast, bus_ref, out_ref, subs_ref).await
+        })
+        .await;
+        assert!(accepted);
+        let reply: Value = serde_json::from_str(&rx.priority.recv().await.unwrap()).unwrap();
+        assert!(
+            reply["result"]["subscriptionId"].is_string(),
+            "a subscription id is returned whatever the patterns: {reply}"
+        );
+
+        // The transport's own `client:*` emit is a transient global event;
+        // the other two are persisted through the writer task.
+        let _ = bus.publish_transient(&event(CLIENT_CONNECTED, ""));
+        bus.publish(&event(TERMINAL_DATA, "ws-1")).await.unwrap();
+        bus.publish(&event(NOTE_UPDATED, "ws-1")).await.unwrap();
+        let types = delivered_types(&mut rx).await;
+        drop(subs);
+        types
+    }
+
+    #[tokio::test]
+    async fn non_administrator_receives_only_allowlisted_types() {
+        let guest = Caller::Wire {
+            principal_id: PrincipalId::new(),
+            is_administrator: false,
+        };
+        assert_eq!(
+            subscribe_and_publish(guest).await,
+            vec![NOTE_UPDATED.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn administrator_receives_everything_named() {
+        let owner = Caller::Wire {
+            principal_id: PrincipalId::new(),
+            is_administrator: true,
+        };
+        assert_eq!(
+            subscribe_and_publish(owner).await,
+            vec![
+                CLIENT_CONNECTED.to_string(),
+                TERMINAL_DATA.to_string(),
+                NOTE_UPDATED.to_string()
+            ]
+        );
+    }
+
+    /// The reverse registry's transition → event-type mapping resolves to
+    /// taxonomy members that the allowlist refuses, so the exhaustive golden
+    /// in `intent-core/tests/events.rs` covers the transport's own emits.
+    #[test]
+    fn client_transitions_publish_taxonomy_types_outside_the_allowlist() {
+        use crate::reverse::{ClientTransition, ReverseClientIdentity};
+        use intent_core::{ClientHostInfo, ClientId};
+
+        let identity = ReverseClientIdentity {
+            client_id: ClientId::from_string("c-1"),
+            name: None,
+            capabilities: json!({}),
+            host: ClientHostInfo {
+                hostname: None,
+                pretty_hostname: None,
+                device_kind: None,
+            },
+        };
+        for transition in [
+            ClientTransition::Connected(identity.clone()),
+            ClientTransition::Disconnected(identity),
+        ] {
+            let ty = transition.event_type();
+            assert!(intent_core::events::is_known_event_type(ty), "{ty}");
+            assert!(!intent_core::events::is_collaborator_event_type(ty), "{ty}");
+        }
+    }
+}

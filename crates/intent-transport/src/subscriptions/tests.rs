@@ -221,6 +221,36 @@ fn chat_channel_tails_stream_family_and_message() {
     assert!(!channel_is_global(Channel::Chat));
 }
 
+/// Multiplayer w3: every type a collaborator-callable subscription channel
+/// tails is on the collaborator event allowlist, so the match-time
+/// `collaborator_only` guard never silently starves a channel a guest may
+/// open (`note` / `task` / `agent` / `workspace` / `comment` / `chat` are all
+/// in `COLLABORATOR_METHODS`). A channel that starts tailing an owner-only
+/// type must either vet it in `COLLABORATOR_EVENT_TYPES` or be removed from
+/// the method allowlist.
+#[test]
+fn channel_event_types_are_all_collaborator_visible() {
+    for channel in [
+        Channel::Note,
+        Channel::Task,
+        Channel::Agent,
+        Channel::Workspace,
+        Channel::Comment,
+        Channel::Chat,
+    ] {
+        let types = channel_event_types(channel);
+        assert!(!types.is_empty(), "{channel:?} tails no types");
+        let hidden: Vec<&String> = types
+            .iter()
+            .filter(|t| !intent_core::events::is_collaborator_event_type(t))
+            .collect();
+        assert!(
+            hidden.is_empty(),
+            "{channel:?} channel tails types outside COLLABORATOR_EVENT_TYPES: {hidden:?}"
+        );
+    }
+}
+
 #[test]
 fn comment_params_require_workspace_and_note() {
     let ok = parse(r#"{"workspaceId":"w","noteId":"n","replaceGroup":"comment:n"}"#);
