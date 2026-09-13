@@ -24,10 +24,13 @@ on:
   # coverage wall time is paid once, on the merged tree, instead of on every
   # push to the PR. The gate is event-aware about this (see the gate
   # comment): it requires the coverage jobs outright on merge_group and
-  # accepts their skip on pull_request / push. Merge groups are created by
-  # the repo's own ruleset from already-filed PRs, so they need no same-repo
-  # fork guard. pr-title / conflict-markers are PR-metadata checks that stay
-  # pull_request-only — the gate accepts their skip.
+  # accepts their skip on pull_request / push. The build job's target-gated
+  # clippy step runs on both pull_request and merge_group (see its comment),
+  # so the queue lints the merged tree's macOS / Windows-only code too.
+  # Merge groups are created by the repo's own ruleset from already-filed
+  # PRs, so they need no same-repo fork guard. pr-title / conflict-markers
+  # are PR-metadata checks that stay pull_request-only — the gate accepts
+  # their skip.
   merge_group:
 
 permissions:
@@ -627,16 +630,24 @@ jobs:
       # `#[cfg(not(unix))]` code is never compiled, so warnings in
       # target-only code (including outer `#[allow]`s that only expand there
       # and trip `clippy::allow_attributes`) land silently and break
-      # `make check` on every macOS or Windows dev box. Linting here (PRs
-      # only, same invocation as the check job) closes the gap. It runs on
-      # the native runners rather than as Linux cross-target runs because
+      # `make check` on every macOS or Windows dev box. Linting here (same
+      # invocation as the check job) closes the gap. It runs on PRs and on
+      # merge-queue runs, not on push: the queue tests the actual merged
+      # tree, and a PR-only step let intent-hq/intentd#1825 (green on its
+      # own PR run) land a Windows-only E0433 via the queue — main's push
+      # run skipped the step, so ~8 open PRs failed the required gate until
+      # intent-hq/intentd#1835 fixed it. Main's push run builds a tree the
+      # queue already linted, so it stays skipped there. It runs on the
+      # native runners rather than as Linux cross-target runs because
       # `cargo clippy --target <triple>` still executes the native build
       # scripts (libz-sys and friends try-compile C for the target even when
       # pkg-config resolves a system lib), which would require a full
       # darwin / MSVC cross C toolchain on Linux; the native runners need
-      # nothing extra and share this job's warm target dir.
+      # nothing extra and share this job's warm target dir. release-fast-path
+      # is pull_request-only, so its output is empty on merge_group and the
+      # `!= 'true'` guard lets the step run there (same as the check step).
       - name: Clippy (target-gated code)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'pull_request' && (runner.os == 'macOS' || runner.os == 'Windows')
+        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (runner.os == 'macOS' || runner.os == 'Windows')
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Build (release)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
