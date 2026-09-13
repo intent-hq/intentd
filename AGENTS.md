@@ -201,6 +201,10 @@ The raw equivalents in `packages/intentd` are `cargo fmt --check`,
 PTY-backed, so raw invocations need `CARGO_TERM_PROGRESS_WHEN=never` in the
 environment (all three) and `--show-progress none` on the nextest command (the `make`
 targets already set both) or progress-bar redraws flood the output buffer.
+Raw invocations must also run under the rustup-managed toolchain pinned in
+`rust-toolchain.toml` (`rustup run <pin> cargo ...` when a non-rustup cargo shadows
+`PATH` — a Homebrew cargo once ran the gates on the wrong toolchain, see
+intent-hq/intentd#1853); the `make` targets are the supported path.
 
 The CI `check` job also runs the repo-slug fold lint,
 `cargo test -p intent-core --test repo_slug_fold_lint`, a deliberately narrow source
