@@ -582,9 +582,13 @@ impl Connection {
     /// `cancel(id)` yields (`(method, params)`, e.g. MCP's
     /// `notifications/cancelled { requestId, reason }`) is sent for the
     /// abandoned request id. The pending slot is already gone by then, so a
-    /// late reply to that id is discarded rather than delivered. A cancel
-    /// that fails to send is logged, never surfaced — the timeout is the
-    /// caller-facing outcome either way.
+    /// late reply to that id is discarded rather than delivered. The cancel
+    /// is best-effort and never waits: it is queued only if the writer has
+    /// room right now (a full queue means the peer has stopped reading its
+    /// stdin, and the timed-out caller must not block behind it). A cancel
+    /// that is dropped or fails to send is logged, never surfaced — the
+    /// timeout is the caller-facing outcome either way, on the timer's
+    /// schedule.
     ///
     /// # Errors
     ///
@@ -604,7 +608,7 @@ impl Connection {
         let result = self.request_with_id(id, method, params, timeout).await;
         if matches!(result, Err(AcpError::Timeout(_))) {
             let (cancel_method, cancel_params) = cancel(id);
-            if let Err(e) = self.notify(&cancel_method, cancel_params).await {
+            if let Err(e) = self.try_notify(&cancel_method, &cancel_params) {
                 tracing::debug!(
                     method,
                     id,
@@ -614,6 +618,20 @@ impl Connection {
             }
         }
         result
+    }
+
+    /// [`Connection::notify`] that never waits for writer capacity: the line
+    /// is queued if the outbound channel has room right now, else dropped.
+    fn try_notify(&self, method: &str, params: &Value) -> AcpResult<()> {
+        let line = encode_message(None, method, params)?;
+        self.writer_tx.try_send(line).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                AcpError::Transport("writer queue full".to_string())
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                AcpError::Transport("writer task closed".to_string())
+            }
+        })
     }
 
     /// The request body shared by the `request_timeout*` entry points. The
@@ -1025,6 +1043,54 @@ mod cancel_on_timeout_tests {
         assert!(cancel.get("id").is_none(), "notification: {cancel}");
         assert_eq!(cancel["params"]["requestId"], json!(id));
         assert_eq!(cancel["params"]["reason"], json!("test"));
+    }
+
+    /// A peer that has stopped reading its stdin with the writer queue full
+    /// must not hold the timed-out caller hostage: the cancel is dropped and
+    /// the request returns `Timeout` on the timer's schedule.
+    #[tokio::test]
+    async fn timed_out_request_with_full_writer_queue_still_returns_on_time() {
+        let (conn, _c2a_agent_unread, _a2c_agent) = silent_connection();
+        let mut fut = Box::pin(conn.request_timeout_with_cancel(
+            "tools/call",
+            json!({}),
+            Duration::from_millis(200),
+            cancelled,
+        ));
+        // Let the request line reach the writer before the flood.
+        tokio::select! {
+            _ = &mut fut => panic!("request must still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        // Wedge the writer: one line larger than the duplex buffer (which the
+        // peer never drains) parks it mid-write, then the bounded channel
+        // behind it is filled to capacity. Top off after yielding, since the
+        // writer takes one item off the channel before it parks.
+        let noise = json!({ "pad": "x".repeat(8192) });
+        for _ in 0..8 {
+            loop {
+                match conn.try_notify("noise", &noise) {
+                    Ok(()) => {}
+                    Err(AcpError::Transport(msg)) => {
+                        assert_eq!(msg, "writer queue full");
+                        break;
+                    }
+                    Err(e) => panic!("unexpected: {e}"),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if conn.writer_tx.capacity() == 0 {
+                break;
+            }
+        }
+        assert_eq!(conn.writer_tx.capacity(), 0, "writer queue wedged full");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), fut).await;
+        let err = outcome
+            .expect("timed-out call returned within budget")
+            .unwrap_err();
+        assert!(matches!(err, AcpError::Timeout(_)), "got: {err}");
+        assert!(!conn.has_pending_requests(), "slot dropped on timeout");
     }
 
     /// A request settled by the peer (here with a JSON-RPC error) sends no
