@@ -24793,6 +24793,9 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            // A collaborator's comment is attributed by the daemon, not the
+            // client (multiplayer w4).
+            let (author, author_type) = self.attribute_comment_author(author, author_type).await?;
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
             let warn_note_id = note_id.clone();
@@ -25263,6 +25266,9 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            // A collaborator's reply is attributed by the daemon, not the
+            // client (multiplayer w4).
+            let (author, author_type) = self.attribute_comment_author(author, author_type).await?;
             if thread_id.is_none() && comment_id.is_none() {
                 return Err(Error::InvalidParams(
                     "Either threadId or commentId must be provided".to_string(),
