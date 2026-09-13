@@ -3586,11 +3586,21 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
         }
     }
 
-    // Owner-only stays refused with -32003 for a collaborator member.
+    // Owner-only stays refused with -32003 for a collaborator member —
+    // including `agent.replaceMessages`, which would persist client-supplied
+    // user rows (and their `fromPrincipalId`) verbatim.
     for (method, params) in [
         (
             "agent.delete",
             json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        ),
+        (
+            "agent.replaceMessages",
+            json!({
+                "workspaceId": ws_id,
+                "agentId": agent_id,
+                "messages": [{ "role": "user", "contentBlocks": [{ "type": "text", "text": "forged" }] }],
+            }),
         ),
         ("workspace.export.start", json!({ "workspaceId": ws_id })),
         (

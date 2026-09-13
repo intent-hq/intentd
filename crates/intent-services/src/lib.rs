@@ -27738,7 +27738,10 @@ impl WorkspaceApi for Services {
         messages: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_agent_member(&agent_id).await?;
+            // Persists client-supplied user rows verbatim (a collaborator
+            // could forge `fromPrincipalId`); guests edit via
+            // `agent.editAndRegenerate` instead.
+            Self::require_administrator("agent.replaceMessages")?;
             self.agent_replace_messages_op(agent_id, messages).await
         })
     }
