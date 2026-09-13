@@ -165,6 +165,10 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
   debugging. `tmp_hygiene_guard.rs` fails the suite on any raw `PathBuf::from("/tmp")` /
   `Path::new("/tmp")` / `temp_dir().join(..)` in test code unless the line ends with
   `// tmp-hygiene: allow — <reason>` (pure path arithmetic only).
+- **Repo-cache paths** — derive them with `intent_git::repo_cache::cache_root_for` /
+  `cache_path_for`, never `join(".repo-cache")`. `repo_cache_path_guard.rs` fails the
+  suite on a literal `".repo-cache"` in test code unless the line ends with
+  `// repo-cache-path: allow — <reason>`.
 
 ### Asserting the protocol contract
 

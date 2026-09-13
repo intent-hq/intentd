@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use intent_core::{RepoRef, Result as CoreResult, WorkspaceApi};
+use intent_core::{Result as CoreResult, WorkspaceApi};
+use intent_git::repo_cache::{cache_path_for, cache_root_for};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 use intent_transport::{
@@ -231,11 +232,10 @@ fn owner_repo_of(dir: &std::path::Path) -> (String, String) {
 }
 
 /// The on-disk cache slot for `owner`/`repo`: the daemon case-folds both
-/// segments (`RepoRef::identity_parts`) while the RPC result echoes the raw
-/// case, so the raw pair must be folded before joining.
+/// segments while the RPC result echoes the raw case, so derive the slot
+/// through the daemon's own `cache_path_for` rather than joining.
 fn cache_slot(root: &std::path::Path, owner: &str, repo: &str) -> PathBuf {
-    let (owner, repo) = RepoRef::new(owner, repo).identity_parts();
-    root.join(".repo-cache").join(owner).join(repo)
+    cache_path_for(&cache_root_for(root), owner, repo)
 }
 
 /// Poll `repo.warmCache` until the detached warm completes: an accepted

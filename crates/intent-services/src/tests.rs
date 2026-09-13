@@ -29154,16 +29154,20 @@ mod clone_orchestration {
     }
 
     /// Expected `<root>/.repo-cache/<owner>/<repo>` slot for `url`. The cache
-    /// key comes from the host-agnostic URL parse, case-folded exactly as the
-    /// daemon folds it (`RepoRef::identity_parts`); persisted owner/name do
-    /// not (only strict `github.com` URLs seed them), so tests must not
-    /// derive the slot from the workspace row.
+    /// key comes from the host-agnostic URL parse and is folded by the same
+    /// `cache_path_for` helper the daemon uses; persisted owner/name do not
+    /// (only strict `github.com` URLs seed them), so tests must not derive
+    /// the slot from the workspace row.
     fn expected_cache_dir(root: &std::path::Path, url: &str) -> PathBuf {
         let (owner, repo) = intent_core::GitRemoteUrl::parse(url)
             .and_then(|u| u.repo_slug())
             .expect("owner/repo")
             .identity_parts();
-        root.join(".repo-cache").join(owner).join(repo)
+        intent_git::repo_cache::cache_path_for(
+            &intent_git::repo_cache::cache_root_for(root),
+            &owner,
+            &repo,
+        )
     }
 
     /// `githubUrl` → daemon clones via `file://` (fast, hermetic), sets
@@ -29762,7 +29766,7 @@ mod clone_orchestration {
             "worktree is distinct from the cloned repo"
         );
         assert!(
-            !root.0.join(".repo-cache").exists(),
+            !intent_git::repo_cache::cache_root_for(&root.0).exists(),
             "explicit clonePath must not touch the repo cache"
         );
     }
@@ -30335,7 +30339,8 @@ mod repo_warm_cache {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use intent_core::{Error, RepoRef, WorkspaceApi};
+    use intent_core::{Error, WorkspaceApi};
+    use intent_git::repo_cache::{cache_path_for, cache_root_for};
     use intent_store::Store;
 
     use super::{test_tempdir, TempDb};
@@ -30350,11 +30355,10 @@ mod repo_warm_cache {
     }
 
     /// The on-disk cache slot for `owner`/`repo`: the daemon case-folds both
-    /// segments (`RepoRef::identity_parts`) while the warm result echoes the
-    /// raw case, so the raw pair must be folded before joining.
+    /// segments while the warm result echoes the raw case, so derive the
+    /// slot through the daemon's own `cache_path_for` rather than joining.
     fn cache_slot(root: &std::path::Path, owner: &str, repo: &str) -> PathBuf {
-        let (owner, repo) = RepoRef::new(owner, repo).identity_parts();
-        root.join(".repo-cache").join(owner).join(repo)
+        cache_path_for(&cache_root_for(root), owner, repo)
     }
 
     /// Init a small git repo with one commit; returns the guard. Pass a

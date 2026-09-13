@@ -16878,7 +16878,8 @@ impl WorkspaceApi for Services {
                                     url,
                                 )
                                 .await;
-                                let cache_root = workspaces_root.join(".repo-cache");
+                                let cache_root =
+                                    intent_git::repo_cache::cache_root_for(&workspaces_root);
                                 // Real streaming progress for the ensure: the
                                 // callback forwards raw git output to a pump
                                 // task that parses it (submodule-aware) and
@@ -24828,12 +24829,11 @@ impl WorkspaceApi for Services {
                     )));
                 }
             }
-            let cache_root = resolve_workspaces_parent(
+            let cache_root = intent_git::repo_cache::cache_root_for(&resolve_workspaces_parent(
                 workspaces_root,
                 workspaces_root_pinned,
                 &worktrees_location,
-            )?
-            .join(".repo-cache");
+            )?);
             // Global single-flight: claim the slot or reject immediately with
             // the busy error naming the warm already in flight (never queue).
             {
@@ -27742,7 +27742,7 @@ impl WorkspaceApi for Services {
         let registry = self.settings_registry.clone();
         let ls_remote_base = self.branches_ls_remote_base.clone();
         Box::pin(async move {
-            let cache_root = cache_parent.join(".repo-cache");
+            let cache_root = intent_git::repo_cache::cache_root_for(&cache_parent);
             if let Some(cached) =
                 intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await?
             {
