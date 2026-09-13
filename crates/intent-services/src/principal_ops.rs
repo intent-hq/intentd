@@ -75,7 +75,7 @@ fn stamping_principal_id() -> Option<PrincipalId> {
 
 /// The bound collaborator — a non-administrator wire principal — whose
 /// requests the daemon attributes authoritatively (multiplayer w4): comment
-/// authorship and system-actored events. The administrator keeps the
+/// authorship and every non-agent-actored event. The administrator keeps the
 /// attribution its client supplies (it owns the daemon and predates
 /// principals); agents, the daemon and an absent caller are not people.
 pub(crate) fn collaborator_caller_id() -> Option<PrincipalId> {
