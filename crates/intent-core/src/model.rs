@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
+use crate::ids::{
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, PrincipalId, WorkspaceGitRootId, WorkspaceId,
+};
 use crate::repo_ref::RepoRef;
 
 /// Builds a [`RepoRef`] from an optional owner/name pair: `Some` only when
@@ -5067,6 +5069,85 @@ impl WorkspaceGitRoot {
     #[must_use]
     pub fn repo(&self) -> Option<RepoRef> {
         repo_ref_from_parts(self.repo_owner.as_deref(), self.repo_name.as_deref())
+    }
+}
+
+/// A person known to the daemon (multiplayer w1). Principals are GitHub
+/// identities: `github_user_id` is the stable GitHub account id once linked
+/// (`None` for the primary principal until the auth flow links it), and
+/// `login` / `display_name` / `avatar_url` are cached profile fields refreshed
+/// on each link. Exactly one principal per daemon is `is_primary` — the
+/// daemon's original single user, minted by migration `0125_principals`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Principal {
+    pub id: PrincipalId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_user_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    pub is_primary: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A principal's role within a workspace. Wire/DB words are the lowercase
+/// variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceRole {
+    Owner,
+    Collaborator,
+}
+
+impl WorkspaceRole {
+    /// Stored / wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkspaceRole::Owner => "owner",
+            WorkspaceRole::Collaborator => "collaborator",
+        }
+    }
+}
+
+/// One `workspace_member` row: a principal's membership in a workspace with
+/// its [`WorkspaceRole`]. The owner membership is created alongside the
+/// workspace (by trigger, mirroring `workspace.owner_principal_id`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceMember {
+    pub workspace_id: WorkspaceId,
+    pub principal_id: PrincipalId,
+    pub role: WorkspaceRole,
+    pub added_at: String,
+}
+
+/// One `principal_credential` row: a bearer token issued to a principal,
+/// persisted only as `token_hash` (hex SHA-256 of the presented token; the
+/// service layer hashes, the store never sees plaintext). A revoked
+/// credential keeps its row with `revoked_at` set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrincipalCredential {
+    pub token_hash: String,
+    pub principal_id: PrincipalId,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+}
+
+impl PrincipalCredential {
+    /// Whether the credential is still usable (not revoked).
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.revoked_at.is_none()
     }
 }
 

@@ -173,6 +173,23 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          advisory wake repeats once on the target",
     ),
     (
+        "principal",
+        "daemon-global people registry (the primary principal is minted per daemon \
+         by migration 0125); principal ids are daemon-local, so the import \
+         transform nulls the workspace's `owner_principal_id` / \
+         `legacy_author_principal_id` and the workspace insert trigger re-derives \
+         the owner from the target's primary principal",
+    ),
+    (
+        "workspace_member",
+        "rows FK onto daemon-local `principal` ids; the target's workspace insert \
+         trigger recreates the owner membership for its own primary principal",
+    ),
+    (
+        "principal_credential",
+        "per-daemon bearer credentials; credentials never leave the source machine",
+    ),
+    (
         "agent_message_fts",
         "derived FTS5 index over `agent_message`; the target's insert triggers \
          rebuild it from the imported rows",
@@ -1008,7 +1025,7 @@ mod tests {
     /// `transferred_table_columns_match_snapshot` after deciding what the
     /// column change means for transfer (see that test's message).
     const TRANSFERRED_COLUMNS: &str = "\
-workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id
+workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id, legacy_author_principal_id, owner_principal_id
 note: id, workspace_id, title, content, content_type, tags, is_pinned, is_archived, is_default, parent_id, visibility, task_json, created_at, updated_at, rev
 note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content, rev
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json

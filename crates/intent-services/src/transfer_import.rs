@@ -1220,7 +1220,10 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 ///   rewritten under `<target_root>/<workspaceId>/`; PR linkage columns are
 ///   kept (monitors re-poll); `browser_client_id` is nulled — it names a
 ///   client of the source daemon (the `client` table never transfers), so
-///   the imported workspace starts unpinned.
+///   the imported workspace starts unpinned; `owner_principal_id` /
+///   `legacy_author_principal_id` are nulled — they name source-daemon
+///   principals (the `principal` table never transfers), and the target's
+///   workspace insert trigger re-derives the owner from its own primary.
 /// - **`agent_session`**: `acp_session_id` / `backend_session_id` nulled (no
 ///   stale resume, ACP sessions are process-local), `is_active` forced 0;
 ///   in-flight statuses (`active`/`Processing`/`Waiting`) become `idle` with
@@ -1266,8 +1269,14 @@ fn transform_rows(
                             *value = ws_dir.to_string_lossy().to_string();
                         }
                     }
-                    if map.contains_key("browser_client_id") {
-                        map.insert("browser_client_id".into(), serde_json::Value::Null);
+                    for key in [
+                        "browser_client_id",
+                        "owner_principal_id",
+                        "legacy_author_principal_id",
+                    ] {
+                        if map.contains_key(key) {
+                            map.insert(key.into(), serde_json::Value::Null);
+                        }
                     }
                 }
             }
@@ -1475,6 +1484,30 @@ mod tests {
         let outcome = transform_one("workspace", serde_json::json!({ "id": "ws-import" }));
         let row = &find(&outcome, "workspace")[0];
         assert!(row.get("browser_client_id").is_none());
+    }
+
+    /// Principal columns name source-daemon principals (the `principal`
+    /// table never transfers), so both are nulled and the target's insert
+    /// trigger assigns its own primary principal as owner; archives predating
+    /// the columns import untouched.
+    #[test]
+    fn transform_nulls_workspace_principal_columns() {
+        let outcome = transform_one(
+            "workspace",
+            serde_json::json!({
+                "id": "ws-import",
+                "owner_principal_id": "principal-src",
+                "legacy_author_principal_id": "principal-src",
+            }),
+        );
+        let row = &find(&outcome, "workspace")[0];
+        assert_eq!(row["owner_principal_id"], serde_json::Value::Null);
+        assert_eq!(row["legacy_author_principal_id"], serde_json::Value::Null);
+
+        let outcome = transform_one("workspace", serde_json::json!({ "id": "ws-import" }));
+        let row = &find(&outcome, "workspace")[0];
+        assert!(row.get("owner_principal_id").is_none());
+        assert!(row.get("legacy_author_principal_id").is_none());
     }
 
     /// Relative / null path values are left untouched by the rewrite.

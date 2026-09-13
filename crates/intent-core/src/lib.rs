@@ -54,7 +54,7 @@ pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
 pub use git_remote_url::GitRemoteUrl;
 pub use ids::{
-    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, PrincipalId, WorkspaceGitRootId, WorkspaceId,
     CHIEF_WORKSPACE_ID,
 };
 pub use model::asset_extension_from_mime;
@@ -120,6 +120,7 @@ pub use model::{
     WORKSPACE_LIST_PR_CAP, WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES,
     WORKSPACE_LIST_ROW_KEYS,
 };
+pub use model::{Principal, PrincipalCredential, WorkspaceMember, WorkspaceRole};
 pub use path_utils::prewarm_login_shell_path;
 pub use repo_ref::RepoRef;
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
