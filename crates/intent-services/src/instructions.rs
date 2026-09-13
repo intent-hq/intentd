@@ -157,6 +157,12 @@ pub(crate) static V2_2: InstructionSet = InstructionSet {
     ..V2
 };
 
+/// Harness v2.4 adds self-contained plain-language communication guidance.
+pub(crate) static V2_4: InstructionSet = InstructionSet {
+    common: instr!("v2.4", "common"),
+    ..V2_2
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -463,9 +469,8 @@ mod tests {
         defaults()
     }
 
-    /// The latest set's common body. Harness v2 keeps v1.1 behavior and adds
-    /// only scoped sibling-workspace guidance; v2.1 and v2.2 leave it as is.
-    const COMMON_LATEST: &str = V2_2.common;
+    /// The latest common body includes v2.4 plain-language guidance.
+    const COMMON_LATEST: &str = V2_4.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;

@@ -25,12 +25,8 @@ const AUTO_COMMIT_CLAUSE: &str = " Auto-commit is enabled; do not include prompt
     committing or reviewing changes before committing.";
 
 #[test]
-fn current_harness_version_is_v2_3() {
-    assert_eq!(intent_core::model::CURRENT_HARNESS_VERSION, "2.3");
-    assert_eq!(
-        crate::harness::resolve_entry(intent_core::model::CURRENT_HARNESS_VERSION).version,
-        "2.3"
-    );
+fn v2_3_remains_registered() {
+    assert_eq!(crate::harness::resolve_entry("2.3").version, "2.3");
 }
 
 /// Exact bytes of the reworded block, both auto-commit variants. The
