@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.54] - 2026-09-13
+
+### 🐛 Bug Fixes
+
+- *(store)* Export transfer rows under one read transaction ([#1850](https://github.com/intent-hq/intentd/pull/1850))
+
+### 🧪 Testing
+
+- *(services)* Deflake last_activity_events::burst_coalescing ([#1852](https://github.com/intent-hq/intentd/pull/1852))
+
+
 ## [0.9.53] - 2026-09-13
 
 ### 🚀 Features
