@@ -1928,14 +1928,14 @@ fn golden_bundled_doctrine_hashes() {
         })
         .collect();
     let expected = vec![
-        "task-loop: f18d40f5c74b12b45c9f656900665c82398fc5aaa716c5770e22068dd839a560".to_string(),
-        "interactive: 072a355b7c77a499b00701c9e175673a4ff4224c486f51677f7caa23986d5788".to_string(),
-        "workspace-agent: 202521ab3e7055486384e3093fc6d1f2b4f507c0248a9808597cae465a4cb268"
+        "task-loop: 938ae524126d664d8b4b933abab1a68797c8b8f6c94bc0b3e70f6e9d68a1b23c".to_string(),
+        "interactive: d8fdbee9470ecd48683b03ff639361bd1c7139238ab2955822189575c3eb88f3".to_string(),
+        "workspace-agent: d7ddf5d9bb008ede66149c0e99e468f17daa12b63cd4d7544d25fc6bb887c4e1"
             .to_string(),
-        "task-breakdown: 55aeb42266161ca997549cfe887bbc807c3511920d6304f5d4508c327fbad3be"
+        "task-breakdown: 657a284b8722089926152a05af82d1644f175fbcb9bf10d817996ac3666f50a7"
             .to_string(),
-        "common: e098afd3a53c2313c8e4207a8c07f011119a5f7767270328f4dfa541cf455185".to_string(),
-        "workspace: fe126c3dc9450fdef98bffc0cffdc170e488b26b926e1e2e137dd6f42702b308".to_string(),
+        "common: 4daa6b80fbe589c0f152b728afeeedf4cb2b631897426ce8c34a96d47206e5e1".to_string(),
+        "workspace: c3185a4fedf3e4d991d363632d67f7a2ab46ec005d666f042e3828e8e2b62e21".to_string(),
     ];
     assert_eq!(actual, expected);
 }

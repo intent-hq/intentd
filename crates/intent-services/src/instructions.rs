@@ -749,7 +749,7 @@ mod tests {
         assert!(!out.contains("ws.hook."));
         // Neighboring sections survive intact, with clean separation.
         assert!(out.contains("## Raising Attention"));
-        assert!(out.contains("progressing work.\n\n## Response Organization"));
+        assert!(out.contains("returns an `advisory`.\n\n## Response Organization"));
         assert!(out.contains("## Rich Chat Rendering"));
     }
 
@@ -835,7 +835,7 @@ mod tests {
         assert!(!common.contains("ws.pr.monitor"));
         // Neighboring sections survive intact, with clean separation.
         assert!(common.contains("## Raising Attention"));
-        assert!(common.contains("progressing work.\n\n## Response Organization"));
+        assert!(common.contains("returns an `advisory`.\n\n## Response Organization"));
         assert!(common.contains("## Rich Chat Rendering"));
     }
 
