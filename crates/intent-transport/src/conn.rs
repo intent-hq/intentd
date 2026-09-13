@@ -817,8 +817,10 @@ pub(crate) async fn handle_fast_path(
                 // is then checked against the subscriber's membership of its
                 // workspace at delivery (`MembershipGate`); a side
                 // subscription on `workspace:updated` feeds unshares to the
-                // gate so a removal tears delivery down at once.
+                // gate so a removal tears delivery down at once — and, for
+                // a subscription scoped to one `workspaceId`, ends it.
                 let gate = events::MembershipGate::for_current_caller(api);
+                let scoped_workspace = gate.as_ref().and(workspace_id.clone());
                 let membership_events = gate.as_ref().map(|_| {
                     bus.subscribe(SubscriptionFilter {
                         event_types: vec![WORKSPACE_UPDATED.to_string()],
@@ -853,6 +855,7 @@ pub(crate) async fn handle_fast_path(
                 let handle = spawn_forwarder(forward_subscription(
                     subscription,
                     gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
+                    scoped_workspace,
                     subscription_id.clone(),
                     out_tx.clone(),
                 ));
@@ -896,9 +899,15 @@ async fn send_fast_path_error(id: events::IdInfo, message: &str, out_tx: &Outbou
 /// flushed first (a conflated frame always lands before its stream's terminal
 /// event, e.g. `terminal:exit`), then the barrier blocks as before. With no
 /// congestion the buffer stays empty and every frame passes straight through.
+///
+/// A guarded subscriber's own unshare from `scoped_workspace` (the
+/// subscription's `workspaceId`, when one was given) ends the forwarder,
+/// like the scoped collection channels; a global stream stays alive for the
+/// subscriber's other member workspaces, the gate suppressing the rest.
 async fn forward_subscription(
     mut subscription: Subscription,
     membership: Option<(events::MembershipGate, Subscription)>,
+    scoped_workspace: Option<String>,
     subscription_id: String,
     out_tx: OutboundSender,
 ) {
@@ -931,6 +940,11 @@ async fn forward_subscription(
                     (Some(batch), Some(gate)) => {
                         for event in &batch {
                             gate.observe_membership_event(event);
+                            if gate.is_own_unshare(event)
+                                && scoped_workspace.as_deref() == Some(event.workspace_id.as_str())
+                            {
+                                return;
+                            }
                         }
                     }
                     _ => membership_events = None,
