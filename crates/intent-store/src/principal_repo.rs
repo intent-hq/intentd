@@ -151,9 +151,12 @@ impl Store {
 
     /// Membership summaries for `workspace.get` / `workspace.list`
     /// (multiplayer w1): owner, member count and `viewer`'s role, computed
-    /// in SQL in ONE query for every workspace (or just `workspace_id`),
-    /// keyed by workspace id. `viewer = None` yields no `my_role`.
-    /// `open_invite_count` is `0` until invitations exist.
+    /// in SQL in ONE query scoped to exactly `workspace_ids` (the rows the
+    /// caller is about to return — never the whole table, so archived or
+    /// filtered-out workspaces cost nothing), keyed by workspace id. An empty
+    /// `workspace_ids` short-circuits without touching the database.
+    /// `viewer = None` yields no `my_role`. `open_invite_count` is `0` until
+    /// invitations exist.
     ///
     /// # Errors
     ///
@@ -161,20 +164,21 @@ impl Store {
     pub async fn workspace_membership_summaries(
         &self,
         viewer: Option<&PrincipalId>,
-        workspace_id: Option<&WorkspaceId>,
+        workspace_ids: &[WorkspaceId],
     ) -> Result<HashMap<WorkspaceId, WorkspaceMembership>> {
-        let mut sql = String::from(
+        if workspace_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let sql = format!(
             "SELECT w.id AS workspace_id, w.owner_principal_id, \
                 (SELECT COUNT(*) FROM workspace_member m WHERE m.workspace_id = w.id) AS member_count, \
                 (SELECT m.role FROM workspace_member m \
                     WHERE m.workspace_id = w.id AND m.principal_id = ?) AS my_role \
-             FROM workspace w",
+             FROM workspace w WHERE w.id IN ({placeholders})"
         );
-        if workspace_id.is_some() {
-            sql.push_str(" WHERE w.id = ?");
-        }
         let mut query = sqlx::query(&sql).bind(viewer.map(|p| p.0.as_str()));
-        if let Some(id) = workspace_id {
+        for id in workspace_ids {
             query = query.bind(&id.0);
         }
         let rows = query
