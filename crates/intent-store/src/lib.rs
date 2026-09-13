@@ -73,6 +73,7 @@ pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
 pub use pr_monitor_repo::{
     pr_monitor_pause_error, PrMonitorListEntry, PrMonitorPollUpdate, PR_MONITOR_PAUSE_MARKER,
 };
+pub use principal_repo::WorkspaceAuthorFallback;
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 pub use transfer_repo::TRANSFER_TABLES;

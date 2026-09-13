@@ -23,6 +23,18 @@ const MEMBER_COLUMNS: &str = "workspace_id, principal_id, role, added_at";
 
 const CREDENTIAL_COLUMNS: &str = "token_hash, principal_id, created_at, last_used_at, revoked_at";
 
+/// The workspace columns an unstamped user message's author is resolved
+/// from (see [`Store::get_workspace_author_fallback`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceAuthorFallback {
+    /// The principal pre-multiplayer content is credited to; `None` for a
+    /// workspace created after migration `0125`.
+    pub legacy_author_principal_id: Option<PrincipalId>,
+    /// The current owner; `None` only for a transfer-imported row whose
+    /// principal columns were not yet re-derived.
+    pub owner_principal_id: Option<PrincipalId>,
+}
+
 impl Store {
     /// Fetch a principal by id.
     ///
@@ -147,6 +159,60 @@ impl Store {
         Ok(row
             .and_then(|r| r.get::<Option<String>, _>("owner_principal_id"))
             .map(PrincipalId))
+    }
+
+    /// The principals an unstamped (pre-multiplayer) user message in
+    /// `workspace_id` resolves to at serve time, in fallback order:
+    /// `legacy_author_principal_id`, then `owner_principal_id`. `None` when
+    /// the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_workspace_author_fallback(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<WorkspaceAuthorFallback>> {
+        let row = sqlx::query(
+            "SELECT legacy_author_principal_id, owner_principal_id FROM workspace WHERE id = ?",
+        )
+        .bind(&workspace_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("get workspace author fallback failed: {e}")))?;
+        Ok(row.map(|r| WorkspaceAuthorFallback {
+            legacy_author_principal_id: r
+                .get::<Option<String>, _>("legacy_author_principal_id")
+                .map(PrincipalId),
+            owner_principal_id: r
+                .get::<Option<String>, _>("owner_principal_id")
+                .map(PrincipalId),
+        }))
+    }
+
+    /// Set (or clear) the workspace's `legacy_author_principal_id` — the
+    /// principal its unstamped user messages are credited to.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` when the workspace does not exist and
+    /// `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_legacy_author_principal_id(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: Option<&PrincipalId>,
+    ) -> Result<()> {
+        let result =
+            sqlx::query("UPDATE workspace SET legacy_author_principal_id = ? WHERE id = ?")
+                .bind(principal_id.map(|p| p.0.as_str()))
+                .bind(&workspace_id.0)
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("set workspace legacy author failed: {e}")))?;
+        if result.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {workspace_id}")));
+        }
+        Ok(())
     }
 
     /// Membership summaries for `workspace.get` / `workspace.list`
