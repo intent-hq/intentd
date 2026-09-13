@@ -2016,8 +2016,8 @@ impl Services {
         self.ac_status_inflight.waiters(workspace_id)
     }
 
-    /// Test-only: rebuild the status cache with a compressed fallback TTL so
-    /// expiry coverage completes in milliseconds.
+    /// Test-only: rebuild the status cache with an explicit fallback TTL
+    /// (expiry coverage advances the paused runtime clock past it).
     #[cfg(test)]
     pub(crate) fn with_git_status_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.git_status_cache = Arc::new(git_status_cache::GitStatusCache::with_ttl(ttl));

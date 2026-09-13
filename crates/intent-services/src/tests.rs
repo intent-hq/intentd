@@ -18818,6 +18818,11 @@ mod file_tracking {
 
     /// The fallback TTL bounds staleness for changes no daemon signal reports:
     /// an out-of-band edit is picked up once the cached entry expires.
+    ///
+    /// The TTL is generous and expiry is synthesized by advancing the paused
+    /// runtime clock (intent-hq/intent#4880): with a millisecond TTL measured
+    /// against the wall clock, a scheduling stall between the two "inside the
+    /// TTL" reads expired the entry early under package load.
     #[tokio::test]
     async fn git_status_cache_expires_after_its_ttl() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18826,9 +18831,10 @@ mod file_tracking {
         let repo = init_git_repo();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
+        let ttl = std::time::Duration::from_secs(3600);
         let scans = Arc::new(AtomicUsize::new(0));
         let svc = svc
-            .with_git_status_cache_ttl(std::time::Duration::from_millis(50))
+            .with_git_status_cache_ttl(ttl)
             .with_git_status_scan_probe({
                 let scans = Arc::clone(&scans);
                 Arc::new(move || {
@@ -18854,7 +18860,13 @@ mod file_tracking {
         );
         assert_eq!(scans.load(Ordering::SeqCst), 1, "no rescan inside the TTL");
 
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        // Age the cached entry past the TTL on the runtime clock, then hand
+        // the clock back before the read: the scan and the store's
+        // pool-acquire timeouts are tokio timers a paused clock would
+        // auto-advance.
+        tokio::time::pause();
+        tokio::time::advance(ttl * 2).await;
+        tokio::time::resume();
         let expired = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
