@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use intent_core::{
     now_iso, AgentId, AgentSession, AgentStatus, BoxFuture, ContentType, Error, MessageOrigin,
     Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata,
-    NoteUpdateInput, NoteVisibility, Result, Workspace, WorkspaceActivity, WorkspaceApi,
+    NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use intent_store::Store;
@@ -2813,7 +2813,7 @@ async fn content_write_snapshot_is_visible_with_its_rev() {
 async fn surgical_write_races_user_save<T>(
     base: &str,
     user: &str,
-    op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, Result<T>>,
+    op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, intent_core::Result<T>>,
 ) -> (T, Note) {
     let (tmp, svc, ws, id) = setup_versioned(base).await;
     let other = Store::open(&tmp.path).await.expect("open second store");
@@ -3287,7 +3287,7 @@ async fn note_create_snapshot_is_visible_with_the_row() {
 /// old content, the user's save lands at rev 1, then the metadata write
 /// proceeds without an `expectedVersion` gate. Returns the final stored note.
 async fn metadata_write_races_user_save(
-    op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, Result<()>>,
+    op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, intent_core::Result<()>>,
 ) -> Note {
     let (tmp, svc, ws, id) = setup_versioned("abc").await;
     let other = Store::open(&tmp.path).await.expect("open second store");
