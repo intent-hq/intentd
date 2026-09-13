@@ -903,8 +903,9 @@ async fn forward_subscription(
 /// Subscribe wires the bus subscription FIRST (so concurrent mutations are
 /// captured), enqueues the `{ subscriptionId }` response, then spawns the
 /// forwarder that emits the snapshot (seq 0) and tails deltas. Returns `false`
-/// when the outbound channel is closed.
-async fn handle_sub_fast_path(
+/// when the outbound channel is closed. `pub(crate)` for the conn-level chat
+/// lifecycle test in `subscriptions::tests`.
+pub(crate) async fn handle_sub_fast_path(
     sub: SubFastPath,
     api: &Arc<dyn WorkspaceApi>,
     bus: &EventBus,
@@ -1011,7 +1012,10 @@ async fn handle_sub_fast_path(
                 });
                 let subscription_id = events::next_subscription_id();
                 // Logged before the response enqueue so a client that vanishes
-                // mid-reply still leaves the subscribe record behind.
+                // mid-reply still leaves the subscribe record behind. The
+                // failure arm below closes it with a teardown record: no
+                // forwarder or registry entry exists yet, so nothing else
+                // could ever emit the terminal record for this id.
                 subscriptions::trace_chat_subscribe(
                     &agent_id,
                     &subscription_id,
@@ -1023,6 +1027,7 @@ async fn handle_sub_fast_path(
                         &json!({ "subscriptionId": subscription_id }),
                     );
                     if out_tx.send_priority(frame).await.is_err() {
+                        subscriptions::trace_chat_teardown(&agent_id, &subscription_id);
                         return false;
                     }
                 }
@@ -1277,11 +1282,14 @@ async fn chat_subscription_loop(
     )
     .await;
     subscriptions::stamp_delta_encoding(&mut snapshot, delta_encoding);
-    subscriptions::trace_chat_snapshot(agent_id.as_str(), &subscription_id, &snapshot);
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
     if out_tx.send(frame).await.is_err() {
         return "client_closed";
     }
+    // Logged only after the frame is queued, so a full/closed lane never
+    // leaves a snapshot record overstating progress (the `client_closed`
+    // exit above is that path's terminal record).
+    subscriptions::trace_chat_snapshot(agent_id.as_str(), &subscription_id, &snapshot);
     timer.snapshot_emitted();
     let mut state = subscriptions::ChatDeltaState::new(&agent_id, delta_encoding, projection);
     // Mid-turn resume (CS-0 D5): if the snapshot carried an in-flight message,

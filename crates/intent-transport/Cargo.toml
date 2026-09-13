@@ -42,6 +42,11 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
 ctor = "1.0.10"
+# The conn-level chat lifecycle test builds a real `EventBus`, which needs an
+# `intent_store::Store`. `intent-store` depends only on `intent-core`, so this
+# dev-only edge introduces no cycle; the normal-build dependency direction
+# (transport → services only) is unchanged.
+intent-store = { path = "../intent-store", version = "0.9.47" }
 
 [lints]
 workspace = true

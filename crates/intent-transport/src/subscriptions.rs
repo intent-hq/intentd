@@ -566,9 +566,10 @@ impl Drop for SnapshotTimer {
 /// subscription id, flags, and counts only, never message content.
 const LIFECYCLE_TARGET: &str = "intent_transport::subscription_lifecycle";
 
-/// Record an accepted `chat.subscribe`: the bus subscription is wired and the
-/// forwarder spawned, but the seq-0 snapshot has not been read yet. `since`
-/// is whether the client asked to resume (§7.1), not the id itself.
+/// Record an accepted `chat.subscribe`: the bus subscription is wired, but the
+/// forwarder is only spawned after the reply enqueue succeeds — a failed
+/// enqueue closes this record with an immediate teardown record instead.
+/// `since` is whether the client asked to resume (§7.1), not the id itself.
 pub(crate) fn trace_chat_subscribe(scope: &str, subscription_id: &str, since: bool) {
     tracing::info!(
         target: LIFECYCLE_TARGET,
@@ -581,14 +582,15 @@ pub(crate) fn trace_chat_subscribe(scope: &str, subscription_id: &str, since: bo
     );
 }
 
-/// Record the seq-0 snapshot a chat forwarder is about to queue: `resumed` is
-/// the §7.1 resume outcome and `page_size` the number of messages the emitted
-/// page carries.
+/// Record the seq-0 snapshot a chat forwarder queued (logged after the frame
+/// lands on the outbound lane, so the record never overstates progress).
+/// `resumed` mirrors the snapshot's §7.1 resume-outcome key verbatim: omitted
+/// when the snapshot carries no `resumed` key (no resume requested), else
+/// `true`/`false` for an honored/declined resume — so the record alone
+/// distinguishes "no resume attempted" from "resume failed". `page_size` is
+/// the number of messages the emitted page carries.
 pub(crate) fn trace_chat_snapshot(scope: &str, subscription_id: &str, snapshot: &Value) {
-    let resumed = snapshot
-        .get("resumed")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let resumed = snapshot.get("resumed").and_then(serde_json::Value::as_bool);
     let page_size = snapshot
         .get("messages")
         .and_then(serde_json::Value::as_array)
@@ -620,9 +622,10 @@ pub(crate) fn trace_chat_forwarder_exit(scope: &str, subscription_id: &str, reas
 }
 
 /// Record a chat subscription leaving the connection's registry —
-/// `chat.unsubscribe`, a `replaceGroup` replacement, or connection close. All
+/// `chat.unsubscribe`, a `replaceGroup` replacement, or connection close (all
 /// three abort the forwarder, so this is the only teardown signal those paths
-/// produce.
+/// produce) — or, before any registry entry exists, a subscribe whose reply
+/// enqueue failed, so every subscribe record is closed by a terminal record.
 pub(crate) fn trace_chat_teardown(scope: &str, subscription_id: &str) {
     tracing::info!(
         target: LIFECYCLE_TARGET,
