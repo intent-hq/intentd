@@ -8858,13 +8858,15 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
 }
 
 /// Multiplayer w2 — `workspace.create`'s `initialAgent.prompt` is the
-/// creator's first user row, delivered daemon-side through the runtime
-/// `AgentManager` (no `agent.sendMessage` follows). A collaborator creating a
-/// workspace over WSS must be stamped as that row's author — never the
-/// workspace owner via the legacy fallback — on `agent.getSession` and
-/// `agent.getConversation` alike.
+/// creator's first user row, stamped with the bound caller in
+/// `WorkspaceApi::create_workspace` (the transport catalog ledger lists it as
+/// a user-origin chat entry point). Under the default-deny
+/// `COLLABORATOR_METHODS` allowlist `workspace.create` is administrator-only,
+/// so a collaborator's attempt over WSS is `Forbidden` before anything is
+/// provisioned: no workspace, no kickoff agent, no `agent:*` traffic for the
+/// owner's subscriber.
 #[tokio::test]
-async fn workspace_create_initial_agent_prompt_carries_creator_stamp_over_wss() {
+async fn workspace_create_by_collaborator_is_forbidden_over_wss() {
     use intent_core::{now_iso, Principal, PrincipalId};
     use intent_store::Store;
 
@@ -8928,8 +8930,8 @@ async fn workspace_create_initial_agent_prompt_carries_creator_stamp_over_wss() 
             .expect("guest credential");
     }
 
-    // SUBSCRIBER conn (owner) — the workspace id is minted by the create, so
-    // subscribe unfiltered BEFORE creating.
+    // SUBSCRIBER conn (owner) — unfiltered `agent:*`, so a kickoff agent
+    // spawned behind a leaked create would show up here.
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_resp = wss_rpc(
         &mut sub,
@@ -8943,10 +8945,10 @@ async fn workspace_create_initial_agent_prompt_carries_creator_stamp_over_wss() 
         "subscribed: {sub_resp}"
     );
 
-    // The GUEST creates the workspace with an initialAgent prompt.
+    // The GUEST attempts to create a workspace with an initialAgent prompt.
     let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
     let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
-    let created = wss_rpc(
+    let refused = wss_rpc_envelope(
         &mut guest_rpc,
         10,
         "workspace.create",
@@ -8960,80 +8962,32 @@ async fn workspace_create_initial_agent_prompt_carries_creator_stamp_over_wss() 
         }),
     )
     .await;
-    let ws_id = created["workspace"]["id"]
-        .as_str()
-        .expect("workspace id")
-        .to_string();
-    let agent_id = created["initialAgent"]["id"]
-        .as_str()
-        .expect("result carries the created agent")
-        .to_string();
+    assert_eq!(
+        refused["error"]["code"],
+        json!(-32003),
+        "a collaborator's workspace.create is Forbidden: {refused}"
+    );
+    assert!(
+        refused.get("result").is_none(),
+        "no workspace / initialAgent in a refused create: {refused}"
+    );
 
-    // Wait for the initial turn to finish so the transcript is settled.
-    let mut ends = 0u32;
-    for _ in 0..120 {
-        let frame = wss_event(&mut sub, 30).await;
-        let ev = &frame["params"]["event"];
-        if ev["type"] == "agent:stream:end" && ev["data"]["agentId"] == agent_id.as_str() {
-            ends += 1;
-            break;
-        }
-    }
-    assert_eq!(ends, 1, "initial agent turn reached stream:end");
-
-    // The persisted kickoff row: stamped with the GUEST, served with the
-    // resolved author by both hydration routes.
-    let expected_author = json!({
-        "principalId": guest.id.0,
-        "login": "guest",
-        "displayName": "Guest User",
-        "avatarUrl": null,
-    });
+    // Nothing was provisioned: the owner's listing carries no such workspace
+    // and the subscriber sees no agent traffic in the quiet window.
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    let session = wss_rpc(
-        &mut rpc,
-        11,
-        "agent.getSession",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
-    )
-    .await;
-    let user_rows: Vec<&Value> = session["session"]["messages"]
-        .as_array()
-        .expect("session messages")
-        .iter()
-        .filter(|m| m["role"] == "user")
-        .collect();
-    assert_eq!(
-        user_rows.len(),
-        1,
-        "exactly one delivered prompt: {session}"
+    let listed = wss_rpc(&mut rpc, 11, "workspace.list", json!({})).await;
+    assert!(
+        listed["workspaces"]
+            .as_array()
+            .expect("workspaces array")
+            .iter()
+            .all(|w| w["title"] != "Guest WS"),
+        "refused create provisioned nothing: {listed}"
     );
-    let session_row = user_rows[0];
-    assert_eq!(
-        session_row["metadata"]["fromPrincipalId"],
-        json!(guest.id.0),
-        "the initialAgent kickoff row carries the creator's principal: {session_row}"
-    );
-    assert_eq!(
-        session_row["author"], expected_author,
-        "agent.getSession serves the creator as author: {session_row}"
-    );
-    let conv = wss_rpc(
-        &mut rpc,
-        12,
-        "agent.getConversation",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
-    )
-    .await;
-    let conv_row = conv["messages"]
-        .as_array()
-        .expect("conversation messages")
-        .iter()
-        .find(|m| m["id"] == session_row["id"])
-        .unwrap_or_else(|| panic!("the same row in agent.getConversation: {conv}"));
-    assert_eq!(
-        conv_row["author"], expected_author,
-        "agent.getConversation and agent.getSession agree on the creator"
+    let quiet = wss_event_opt(&mut sub, 2).await;
+    assert!(
+        quiet.is_none(),
+        "no agent:* event follows a refused create: {quiet:?}"
     );
 }
 

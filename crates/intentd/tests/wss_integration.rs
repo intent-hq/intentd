@@ -3365,6 +3365,170 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     srv.ws.stop().await;
 }
 
+/// Multiplayer w3: a connection bound to a non-administrator principal may
+/// call only the vetted `COLLABORATOR_METHODS`; everything else is refused
+/// before dispatch with the forbidden error (`-32003`, docs/protocol §9).
+/// The happy-path client boot trace (`client.hello`, `system.capabilities`,
+/// `host.status`, `principal.me`, `workspace.list`, `events.subscribe`,
+/// `workspace.subscribe`) succeeds; `host.exec`, `browser.exec`,
+/// `forward.create`, `github.authStatus`, `mcp.servers.list` are refused;
+/// the alias `git.diff` is canonicalised to `git.diffs` before the lookup
+/// (allowed, so it reaches the router and fails on params, not on -32003);
+/// a `/tunnel` upgrade with the collaborator credential is refused (403). The
+/// legacy token keeps the administrator's unrestricted surface.
+#[tokio::test]
+async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
+    use intent_core::{Principal, PrincipalId};
+    use serde_json::json;
+
+    async fn reply(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        id: u64,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == id {
+                            return v;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("reply within 10s")
+    }
+
+    let srv = start(WsOptions::default()).await;
+
+    let guest_token = "dcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    srv.store.upsert_principal(&guest).await.expect("guest");
+    srv.store
+        .insert_principal_credential(&guest.id, &sha256_hex(guest_token.as_bytes()))
+        .await
+        .expect("guest credential");
+
+    // One collaborator connection; each frame gets its own id so the reply
+    // can be matched even when a subscription snapshot arrives in between.
+    let url = format!("wss://localhost:{}/ws?token={guest_token}", srv.port);
+    let mut ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+    let mut next_id = 0u64;
+    let mut call = |method: &str, params: Value| {
+        next_id += 1;
+        let id = next_id;
+        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        (id, frame.to_string())
+    };
+
+    // Happy-path boot trace: every call succeeds.
+    for (method, params) in [
+        (
+            "client.hello",
+            json!({ "clientId": "w3-guest", "name": "guest fe", "capabilities": {} }),
+        ),
+        ("system.capabilities", json!({})),
+        ("host.status", json!({})),
+        ("principal.me", json!({})),
+        ("workspace.list", json!({})),
+        (
+            "events.subscribe",
+            json!({ "eventTypes": ["workspace:updated"] }),
+        ),
+        ("workspace.subscribe", json!({})),
+    ] {
+        let (id, frame) = call(method, params);
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert!(
+            v.get("error").is_none(),
+            "{method} must succeed for a collaborator: {v}"
+        );
+    }
+
+    // Owner-only methods are refused before dispatch with -32003.
+    for (method, params) in [
+        ("host.exec", json!({ "command": "true" })),
+        (
+            "browser.exec",
+            json!({ "actions": [{ "action": "listTabs" }] }),
+        ),
+        (
+            "forward.create",
+            json!({ "workspaceId": WorkspaceId::new().0, "port": 3000 }),
+        ),
+        ("github.authStatus", json!({})),
+        ("mcp.servers.list", json!({})),
+        ("settings.get", json!({ "key": "theme" })),
+        ("workspace.create", json!({ "path": "/nonexistent/w3" })),
+    ] {
+        let (id, frame) = call(method, params);
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(
+            v["error"]["code"], -32003,
+            "{method} must be refused for a collaborator: {v}"
+        );
+        assert!(v.get("result").is_none(), "{v}");
+    }
+
+    // The alias `git.diff` is canonicalised to `git.diffs` (allowed): it is
+    // not refused by the allowlist, so it reaches the router and fails on its
+    // params (unknown workspace) rather than with -32003.
+    let (id, frame) = call("git.diff", json!({ "workspaceId": WorkspaceId::new().0 }));
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let v = reply(&mut ws, id).await;
+    assert_ne!(
+        v["error"]["code"], -32003,
+        "git.diff must classify like git.diffs (allowed): {v}"
+    );
+    drop(ws);
+
+    // `/tunnel` is owner-only: the upgrade is refused (403) for a
+    // per-principal credential, while `/ws` with the same credential was
+    // accepted above.
+    let resp = https_request(
+        srv.port,
+        srv.cfg.clone(),
+        &upgrade_req("/tunnel", None, Some(guest_token)),
+    )
+    .await;
+    assert_eq!(
+        status_code(&resp),
+        403,
+        "collaborator /tunnel upgrade: {resp}"
+    );
+
+    // The administrator's connection keeps the unrestricted surface.
+    let admin = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.authStatus","params":{}}"#,
+    )
+    .await;
+    assert_ne!(
+        admin["error"]["code"], -32003,
+        "administrator must not be allowlisted: {admin}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// Multiplayer w2: every human-authored chat entry is stamped with the wire
 /// caller's principal — `agent.sendMessage` (direct persist),
 /// `agent.appendMessage` (`user` role) and `agent.queueMessage` (queue entry

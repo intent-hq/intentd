@@ -10,6 +10,8 @@
 //!   CLIs, dev tooling) and connections without the capability (FE auxiliary
 //!   `JsonRpcClient`s) are never candidates — this is what fixes the REV-1
 //!   misrouting where the first arrival won regardless of what it could do.
+//!   A connection bound to a non-administrator principal is never a
+//!   candidate either (multiplayer w3; [`super::ReverseChannel::is_administrator`]).
 //! - [`ReverseTarget::Default`] → the **first-connected** eligible connection
 //!   (unchanged single-desktop behaviour); none → `NoClient`.
 //! - [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`] → the **newest**
@@ -308,10 +310,16 @@ struct Entry {
 }
 
 impl Entry {
+    /// An eligible reverse target advertised `browserExec` **and** is the
+    /// administrator's connection (multiplayer w3): a connection bound to a
+    /// non-administrator principal never hosts tabs or serves reverse RPCs,
+    /// whatever its hello claims.
     fn is_eligible(&self) -> bool {
-        self.identity
-            .as_ref()
-            .is_some_and(ReverseClientIdentity::browser_exec)
+        self.channel.is_administrator()
+            && self
+                .identity
+                .as_ref()
+                .is_some_and(ReverseClientIdentity::browser_exec)
     }
 
     fn has_client(&self, client_id: &ClientId) -> bool {
