@@ -158,6 +158,17 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
   the UDS suites are a useful reference for shaping new tests, but they do **not** replace
   the WSS e2e requirement; the WSS path has its own concerns (TLS upgrade, bearer auth,
   origin allow-list, fingerprint pinning, heartbeat) that only the WSS harness covers.
+- **Scratch dirs** — create them with `common::test_tempdir(prefix)` /
+  `common::test_tempdir_in("/tmp", prefix)` (or `test_support::test_tempdir` inside
+  `intent-services`), declared before any guard that kills a daemon child: the `TempDir`
+  sweeps on drop (including on panic) and `INTENTD_TEST_KEEP_TMP=1` keeps it for
+  debugging. `tmp_hygiene_guard.rs` fails the suite on any raw `PathBuf::from("/tmp")` /
+  `Path::new("/tmp")` / `temp_dir().join(..)` in test code unless the line ends with
+  `// tmp-hygiene: allow — <reason>` (pure path arithmetic only).
+- **Repo-cache paths** — derive them with `intent_git::repo_cache::cache_root_for` /
+  `cache_path_for`, never `join(".repo-cache")`. `repo_cache_path_guard.rs` fails the
+  suite on a literal `".repo-cache"` in test code unless the line ends with
+  `// repo-cache-path: allow — <reason>`.
 
 ### Asserting the protocol contract
 
@@ -179,6 +190,7 @@ pass. Run them from the monorepo root via the top-level `Makefile`:
 ```bash
 make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
 make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
+make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes
 make gate     # check, then test
 ```
 
@@ -188,6 +200,17 @@ The raw equivalents in `packages/intentd` are `cargo fmt --check`,
 PTY-backed, so raw invocations need `CARGO_TERM_PROGRESS_WHEN=never` in the
 environment (all three) and `--show-progress none` on the nextest command (the `make`
 targets already set both) or progress-bar redraws flood the output buffer.
+
+The CI `check` job also runs the repo-slug fold lint,
+`cargo test -p intent-core --test repo_slug_fold_lint`, a deliberately narrow source
+heuristic: it fails naming `file:line` for every statement outside
+`intent_core::RepoRef` where a case-fold call (`to_lowercase`, `to_ascii_lowercase`,
+`eq_ignore_ascii_case`, `make_ascii_lowercase`) co-occurs with an `owner` / `repo` /
+`repository` / `slug` identifier (intent-hq/intentd#1809 → #1815). It does not prove
+every raw slug comparison is caught — route slug identity through `RepoRef` regardless.
+A flagged site that is not slug identity opts out with
+`// repo-slug-fold: allow — <reason>` on the line immediately above the statement, and
+the reason is required.
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.

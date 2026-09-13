@@ -8,8 +8,8 @@
 // uses a subset of it, so unused items are expected.
 #![allow(dead_code)]
 
-#[cfg(unix)]
 use std::fmt::Write as _;
+#[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
@@ -738,12 +738,11 @@ impl Drop for DaemonGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
 
-    #[cfg(unix)]
     #[test]
     fn guard_kills_process_on_drop() {
         // Spawn a sleep process. Detach all three stdio streams so the child

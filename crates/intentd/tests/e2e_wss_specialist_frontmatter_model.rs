@@ -7,7 +7,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -31,22 +30,18 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -203,7 +198,8 @@ where
 
 #[tokio::test]
 async fn specialist_frontmatter_model_resolved_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // Pre-seed the database with a workspace that has a repository_path pointing
@@ -245,7 +241,7 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     ];
     let daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     assert!(await_uds(&socket).await, "daemon did not boot");
 
@@ -297,7 +293,8 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
 /// canonical resolved view.
 #[tokio::test]
 async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // Pre-seed a workspace (repository_path so project-tier resolution has a
@@ -322,7 +319,7 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
     ];
     let daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     assert!(await_uds(&socket).await, "daemon did not boot");
 
@@ -415,7 +412,8 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
 /// non-hidden specialist omits the field entirely.
 #[tokio::test]
 async fn specialist_hidden_round_trips_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // Hermetic user tier: HOME=data_dir so the daemon reads
@@ -440,7 +438,7 @@ async fn specialist_hidden_round_trips_over_wss() {
     ];
     let daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     assert!(await_uds(&socket).await, "daemon did not boot");
 
@@ -488,7 +486,8 @@ async fn specialist_hidden_round_trips_over_wss() {
 /// resolvable for pinned v1 sessions, while `pr-shepherd` remains gone.
 #[tokio::test]
 async fn embedded_bundled_catalog_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // Hermetic empty user tier: HOME=data_dir with no specialists written.
@@ -499,7 +498,7 @@ async fn embedded_bundled_catalog_over_wss() {
     ];
     let daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     assert!(await_uds(&socket).await, "daemon did not boot");
 
@@ -579,7 +578,8 @@ async fn embedded_bundled_catalog_over_wss() {
 /// the read-only `specialists.dir` setting.
 #[tokio::test]
 async fn specialists_replacement_dir_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // The replacement base tier: a single specialist, nothing else survives.
@@ -612,7 +612,7 @@ async fn specialists_replacement_dir_over_wss() {
     ];
     let daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     assert!(await_uds(&socket).await, "daemon did not boot");
 
@@ -676,7 +676,8 @@ async fn specialists_replacement_dir_over_wss() {
 /// inherited one, and `roleReminder` stays winner-takes-all (not inherited).
 #[tokio::test]
 async fn specialist_config_scalars_inherit_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // Bundled tier via the INTENTD_BUNDLED_SPECIALISTS_DIR seam.
@@ -723,7 +724,7 @@ async fn specialist_config_scalars_inherit_over_wss() {
     ];
     let daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     assert!(await_uds(&socket).await, "daemon did not boot");
 
@@ -833,7 +834,8 @@ where
 /// with `-32602`.
 #[tokio::test]
 async fn specialist_model_options_round_trip_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // Bundled tier via the INTENTD_BUNDLED_SPECIALISTS_DIR seam.
@@ -874,7 +876,7 @@ async fn specialist_model_options_round_trip_over_wss() {
     ];
     let daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     assert!(await_uds(&socket).await, "daemon did not boot");
 
@@ -981,7 +983,8 @@ async fn specialist_model_options_round_trip_over_wss() {
 /// `icon`, non-array `teamAgents`) are rejected with `-32602`.
 #[tokio::test]
 async fn specialist_picker_metadata_round_trips_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // Bundled tier via the INTENTD_BUNDLED_SPECIALISTS_DIR seam.
@@ -1015,7 +1018,7 @@ async fn specialist_picker_metadata_round_trips_over_wss() {
     ];
     let daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     assert!(await_uds(&socket).await, "daemon did not boot");
 

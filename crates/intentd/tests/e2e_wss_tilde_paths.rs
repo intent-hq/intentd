@@ -29,30 +29,24 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
-    home: PathBuf,
+    data_dir: tempfile::TempDir,
+    _home: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-        let _ = std::fs::remove_dir_all(&self.home);
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-tilde-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-tilde-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -288,8 +282,10 @@ fn seed_repo(dir: &Path) -> PathBuf {
 /// Boot a daemon with `HOME` pointed at a fresh temp directory. Returns the
 /// daemon guard, the fake home, the WSS port, and the pinned client config.
 async fn boot() -> (Daemon, PathBuf, u16, Arc<ClientConfig>) {
-    let data_dir = scratch_dir("data");
-    let home = scratch_dir("home");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let home_guard = scratch_dir("home");
+    let home = home_guard.path().to_path_buf();
     let home_str = home.to_string_lossy().into_owned();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -299,8 +295,8 @@ async fn boot() -> (Daemon, PathBuf, u16, Arc<ClientConfig>) {
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
-        home: home.clone(),
+        data_dir: data_dir_guard,
+        _home: home_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -324,7 +320,7 @@ async fn workspace_create_expands_tilde_clone_path_over_wss() {
         return;
     }
     let (daemon, home, port, cfg) = boot().await;
-    let source = seed_repo(&daemon.data_dir.join("clone-src"));
+    let source = seed_repo(&daemon.data_dir.path().join("clone-src"));
 
     let mut rpc = connect_ws(port, cfg).await;
     let created = wss_rpc(
@@ -399,7 +395,7 @@ async fn git_clone_expands_tilde_parent_dir_over_wss() {
         return;
     }
     let (daemon, home, port, cfg) = boot().await;
-    let source = seed_repo(&daemon.data_dir.join("clone-src"));
+    let source = seed_repo(&daemon.data_dir.path().join("clone-src"));
 
     // Subscribe BEFORE issuing the clone so the terminal frame is not missed.
     let mut sub = connect_ws(port, cfg.clone()).await;

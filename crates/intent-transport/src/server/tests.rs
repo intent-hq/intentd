@@ -78,6 +78,20 @@ fn host_environment(device_kind: Option<&str>) -> crate::host_env::HostEnvironme
     }
 }
 
+/// A fresh RAII data dir for `tag` under the system temp root. The returned
+/// guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+fn temp_data_dir(tag: &str) -> tempfile::TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix(&format!("intentd-test-{tag}-"))
+        .tempdir()
+        .expect("create test temp dir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
+    dir
+}
+
 #[test]
 fn classify_pairing_info() {
     let req = json!({"jsonrpc": "2.0", "method": "server.pairingInfo", "id": 1});
@@ -111,19 +125,13 @@ fn classify_other_method() {
 
 #[tokio::test]
 async fn handle_pairing_info_local_success() {
-    use std::env;
-    let tmpdir = env::temp_dir().join(format!(
-        "intentd-test-{}-{}",
-        std::process::id(),
-        "pairing_info_local"
-    ));
-    std::fs::create_dir_all(&tmpdir).unwrap();
+    let tmpdir = temp_data_dir("pairing_info_local");
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("test-token-abc123")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
         bind_addresses: None,
         tc_address: None,
-        data_dir: tmpdir.clone(),
+        data_dir: tmpdir.path().to_path_buf(),
         token_store: store,
         host_environment: host_environment(Some("server")),
     });
@@ -159,7 +167,6 @@ async fn handle_pairing_info_local_success() {
     assert_eq!(result["hardwareModel"], "PowerEdge R760");
     // No tunnel in the snapshot: tcAddress is ABSENT, not null.
     assert!(result.get("tcAddress").is_none());
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
@@ -168,19 +175,13 @@ async fn handle_pairing_info_available_ips_ignore_loopback_bind() {
     // but availableIps still lists every bind candidate — the FE's bind
     // picker needs the candidates precisely when the daemon is locked to
     // loopback. Loopback itself is never in the candidate list.
-    use std::env;
-    let tmpdir = env::temp_dir().join(format!(
-        "intentd-test-{}-{}",
-        std::process::id(),
-        "pairing_info_available_ips"
-    ));
-    std::fs::create_dir_all(&tmpdir).unwrap();
+    let tmpdir = temp_data_dir("pairing_info_available_ips");
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("test-token-abc123")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
         bind_addresses: Some(vec!["127.0.0.1".parse().unwrap()]),
         tc_address: None,
-        data_dir: tmpdir.clone(),
+        data_dir: tmpdir.path().to_path_buf(),
         token_store: store,
         host_environment: host_environment(Some("server")),
     });
@@ -206,24 +207,17 @@ async fn handle_pairing_info_available_ips_ignore_loopback_bind() {
             .is_loopback()),
         "availableIps never contains loopback: {available:?}"
     );
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
 async fn handle_pairing_info_includes_tc_address_when_tunnel_up() {
-    use std::env;
-    let tmpdir = env::temp_dir().join(format!(
-        "intentd-test-{}-{}",
-        std::process::id(),
-        "pairing_info_tc"
-    ));
-    std::fs::create_dir_all(&tmpdir).unwrap();
+    let tmpdir = temp_data_dir("pairing_info_tc");
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("test-token-abc123")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
         bind_addresses: None,
         tc_address: Some("tc7f2a91.tailcat.net".to_string()),
-        data_dir: tmpdir.clone(),
+        data_dir: tmpdir.path().to_path_buf(),
         token_store: store,
         host_environment: host_environment(None),
     });
@@ -239,24 +233,17 @@ async fn handle_pairing_info_includes_tc_address_when_tunnel_up() {
     assert_eq!(parsed["result"]["tcAddress"], "tc7f2a91.tailcat.net");
     assert!(parsed["result"].get("deviceKind").is_none());
     assert!(parsed["result"].get("hardwareModel").is_none());
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
 async fn handle_pairing_info_remote_rejects() {
-    use std::env;
-    let tmpdir = env::temp_dir().join(format!(
-        "intentd-test-{}-{}",
-        std::process::id(),
-        "pairing_info_remote"
-    ));
-    std::fs::create_dir_all(&tmpdir).unwrap();
+    let tmpdir = temp_data_dir("pairing_info_remote");
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::default()));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
         bind_addresses: None,
         tc_address: None,
-        data_dir: tmpdir.clone(),
+        data_dir: tmpdir.path().to_path_buf(),
         token_store: store,
         host_environment: host_environment(Some("server")),
     });
@@ -272,7 +259,6 @@ async fn handle_pairing_info_remote_rejects() {
     assert_eq!(parsed["jsonrpc"], "2.0");
     assert!(parsed["error"].is_object());
     assert_eq!(parsed["error"]["code"], -32001);
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
@@ -294,18 +280,13 @@ async fn handle_rotate_token_local_success() {
     let _guard = EnvGuard(env::var("INTENTD_AUTH_TOKEN").ok());
     env::remove_var("INTENTD_AUTH_TOKEN");
 
-    let tmpdir = env::temp_dir().join(format!(
-        "intentd-test-{}-{}",
-        std::process::id(),
-        "rotate_token_local"
-    ));
-    std::fs::create_dir_all(&tmpdir).unwrap();
+    let tmpdir = temp_data_dir("rotate_token_local");
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("old-token")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
         bind_addresses: None,
         tc_address: None,
-        data_dir: tmpdir.clone(),
+        data_dir: tmpdir.path().to_path_buf(),
         token_store: store.clone(),
         host_environment: host_environment(Some("server")),
     });
@@ -326,7 +307,6 @@ async fn handle_rotate_token_local_success() {
     // Same shape as server.pairingInfo: the additive bind-candidate set rides along.
     assert_eq!(parsed["result"]["availableIps"], json!(collect_local_ips()));
 
-    let _ = std::fs::remove_dir_all(&tmpdir);
     // _guard drops here, restoring the original env var value
 }
 

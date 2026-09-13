@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use intent_core::{Error, PullRequestStatus, Result, Workspace};
+use intent_core::{Error, GitRemoteUrl, PullRequestStatus, Result, Workspace};
 use serde_json::{json, Map, Value};
 
 use crate::file_tracking_ops::commit_to_value;
@@ -101,30 +101,6 @@ pub(crate) fn is_valid_git_remote_url(url: &str) -> bool {
         }
     }
     false
-}
-
-/// Parse `(owner, repo)` from a GitHub remote URL (`github.com[:/]owner/repo`),
-/// tolerating a trailing `.git` and repo names with dots.
-pub(crate) fn parse_owner_repo(url: &str) -> Option<(String, String)> {
-    let idx = url.find("github.com")?;
-    let after = &url[idx + "github.com".len()..];
-    let after = after
-        .strip_prefix(':')
-        .or_else(|| after.strip_prefix('/'))?;
-    let mut parts = after.splitn(2, '/');
-    let owner = parts.next()?.trim();
-    let repo_raw = parts.next()?.trim();
-    if owner.is_empty() || repo_raw.is_empty() {
-        return None;
-    }
-    let repo = repo_raw
-        .trim_end_matches('/')
-        .strip_suffix(".git")
-        .unwrap_or_else(|| repo_raw.trim_end_matches('/'));
-    if repo.is_empty() {
-        return None;
-    }
-    Some((owner.to_string(), repo.to_string()))
 }
 
 /// The trunk branch name for a workspace: its `baseRef` (with a leading
@@ -239,10 +215,12 @@ pub(crate) fn build_git_status_value_with(
         }
     }
 
+    // Strict `github.com` host: a foreign remote whose path merely contains
+    // `github.com` must not surface as a GitHub owner/repo pair.
     let (owner, repo) = remote_url
         .as_deref()
-        .and_then(parse_owner_repo)
-        .map_or((None, None), |(o, r)| (Some(o), Some(r)));
+        .and_then(|url| GitRemoteUrl::parse(url)?.github_repo())
+        .map_or((None, None), |r| (Some(r.owner), Some(r.name)));
 
     tracing::debug!(
         files = status.files.len(),
@@ -797,46 +775,6 @@ mod tests {
         assert!(!is_valid_git_remote_url("https://example.com/r\nname"));
     }
 
-    // ----- parse_owner_repo -----
-
-    #[test]
-    fn parses_owner_repo_with_dots_and_git_suffix() {
-        assert_eq!(
-            parse_owner_repo("https://github.com/octo/molecules.gg.git"),
-            Some(("octo".into(), "molecules.gg".into()))
-        );
-        assert_eq!(
-            parse_owner_repo("git@github.com:o/r.git"),
-            Some(("o".into(), "r".into()))
-        );
-        assert_eq!(parse_owner_repo("https://gitlab.com/o/r.git"), None);
-    }
-
-    #[test]
-    fn parses_owner_repo_handles_trailing_slash_and_no_git() {
-        assert_eq!(
-            parse_owner_repo("https://github.com/o/r/"),
-            Some(("o".into(), "r".into()))
-        );
-        assert_eq!(
-            parse_owner_repo("https://github.com/o/r"),
-            Some(("o".into(), "r".into()))
-        );
-    }
-
-    #[test]
-    fn parses_owner_repo_rejects_missing_owner_or_repo() {
-        // Missing path segments after `github.com:` or `github.com/`.
-        assert_eq!(parse_owner_repo("https://github.com/"), None);
-        assert_eq!(parse_owner_repo("https://github.com/owner"), None);
-        // Empty owner.
-        assert_eq!(parse_owner_repo("https://github.com//repo"), None);
-        // Trailing-slash-only repo segment collapses to empty.
-        assert_eq!(parse_owner_repo("https://github.com/o//"), None);
-        // Bare `.git` repo name collapses to empty after suffix strip.
-        assert_eq!(parse_owner_repo("https://github.com/o/.git"), None);
-    }
-
     // ----- trunk_branch -----
 
     #[test]
@@ -949,6 +887,48 @@ mod tests {
         assert!(v["owner"].is_null());
         assert!(v["repo"].is_null());
         assert!(v["existingPR"].is_null());
+    }
+
+    #[test]
+    fn build_git_status_derives_owner_repo_from_origin_via_strict_github_identity() {
+        // Service-boundary pin for the accepted deltas against the deleted
+        // `parse_owner_repo` (intentd#1836): `git.status` owner/repo must
+        // come from the strict `github_repo()` accessor, so a port-bearing
+        // ssh:// or query-bearing https origin yields `acme`/`widget`, an
+        // extra-path GitHub origin yields null/null (not `widget/extra`), and
+        // a foreign host never surfaces a GitHub pair.
+        for (url, owner, repo) in [
+            (
+                "ssh://git@github.com:22/acme/widget.git",
+                Some("acme"),
+                Some("widget"),
+            ),
+            (
+                "https://github.com/acme/widget.git?ref=main",
+                Some("acme"),
+                Some("widget"),
+            ),
+            (
+                "git@github.com:acme/widget.git",
+                Some("acme"),
+                Some("widget"),
+            ),
+            ("https://github.com/acme/widget/extra", None, None),
+            ("https://gitlab.com/acme/widget.git", None, None),
+        ] {
+            let dir = init_repo("status-origin");
+            commit_file(dir.path(), "a.txt", "a\n", "add a");
+            Repository::open(dir.path())
+                .unwrap()
+                .remote("origin", url)
+                .unwrap();
+
+            let v = build_git_status_value(dir.path(), &mk_workspace()).unwrap();
+            assert_eq!(v["hasRemote"], true, "{url}");
+            assert_eq!(v["remoteUrl"], url, "{url}");
+            assert_eq!(v["owner"].as_str(), owner, "{url}");
+            assert_eq!(v["repo"].as_str(), repo, "{url}");
+        }
     }
 
     // ----- prepare_invalid -----

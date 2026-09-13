@@ -18,7 +18,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -34,7 +34,6 @@ use sha2::{Digest, Sha256};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use uuid::Uuid;
 
 use common::TlsWs;
 
@@ -53,7 +52,7 @@ fn next_id() -> i64 {
 /// dir removed on drop, with the daemon log echoed on failure.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
@@ -66,20 +65,16 @@ impl Drop for Daemon {
         }
         let _ = self.child.wait();
         if std::thread::panicking() {
-            let log_path = self.data_dir.join("daemon.log");
+            let log_path = self.data_dir.path().join("daemon.log");
             if let Ok(log) = std::fs::read_to_string(&log_path) {
                 eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-archhook-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-archhook-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -400,7 +395,8 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     })
     .to_string();
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -411,7 +407,7 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -590,7 +586,8 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     })
     .to_string();
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -601,7 +598,7 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");

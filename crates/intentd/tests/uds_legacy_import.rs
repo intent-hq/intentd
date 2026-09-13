@@ -13,20 +13,15 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
-    legacy_root: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-        let _ = std::fs::remove_dir_all(&self.legacy_root);
     }
 }
 
@@ -162,19 +157,17 @@ async fn imported_inflight_count(socket: &Path) -> usize {
 
 #[tokio::test]
 async fn imports_against_live_store_with_default_and_forced_modes() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itd-li-{}", &id[..8]));
-    let legacy_root = PathBuf::from("/tmp").join(format!("itd-lr-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).unwrap();
-    std::fs::create_dir_all(&legacy_root).unwrap();
+    // Guards are declared before the daemon so the child is reaped first.
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itd-li-");
+    let legacy_root_guard = common::test_tempdir_in("/tmp", "itd-lr-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let legacy_root = legacy_root_guard.path().to_path_buf();
     write_legacy_workspace(&legacy_root, "Legacy title");
     // Existing DB path suppresses first-boot import so only the RPC drives it.
     std::fs::write(data_dir.join("intentd.db"), []).unwrap();
     let socket = data_dir.join("intentd.sock");
     let mut daemon = Daemon {
         child: spawn_daemon(&data_dir, &legacy_root, None),
-        data_dir,
-        legacy_root,
     };
     await_socket(&socket).await;
 
@@ -196,7 +189,7 @@ async fn imports_against_live_store_with_default_and_forced_modes() {
         "already in DB"
     );
 
-    write_legacy_workspace(&daemon.legacy_root, "Updated title");
+    write_legacy_workspace(&legacy_root, "Updated title");
     let forced = rpc(
         &socket,
         "system.importLegacy",
@@ -223,11 +216,10 @@ async fn imports_against_live_store_with_default_and_forced_modes() {
 async fn serves_rpcs_while_first_boot_import_is_in_flight() {
     const WORKSPACES: usize = 25;
     const NOTES_PER_WORKSPACE: usize = 4;
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itd-lif-{}", &id[..8]));
-    let legacy_root = PathBuf::from("/tmp").join(format!("itd-lfr-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).unwrap();
-    std::fs::create_dir_all(&legacy_root).unwrap();
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itd-lif-");
+    let legacy_root_guard = common::test_tempdir_in("/tmp", "itd-lfr-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let legacy_root = legacy_root_guard.path().to_path_buf();
     for i in 0..WORKSPACES {
         write_synthetic_workspace(
             &legacy_root,
@@ -244,8 +236,6 @@ async fn serves_rpcs_while_first_boot_import_is_in_flight() {
     let socket = data_dir.join("intentd.sock");
     let mut daemon = Daemon {
         child: spawn_daemon(&data_dir, &legacy_root, Some(&hold)),
-        data_dir: data_dir.clone(),
-        legacy_root,
     };
     await_socket(&socket).await;
 

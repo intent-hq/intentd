@@ -207,6 +207,7 @@ impl MemTabs {
                 owner_agent_name: None,
                 visibility: BrowserTabVisibility::Visible,
                 emulated_size: None,
+                displayed: Some(true),
                 created_at: "2026-09-06T00:00:00Z".to_string(),
                 updated_at: "2026-09-06T00:00:00Z".to_string(),
             },
@@ -268,6 +269,7 @@ impl WorkspaceApi for MemTabs {
                     owner_agent_name: input.owner_agent_name.clone(),
                     visibility: input.visibility,
                     emulated_size: input.emulated_size,
+                    displayed: input.displayed,
                     created_at: "now".to_string(),
                     updated_at: "now".to_string(),
                 };
@@ -546,6 +548,7 @@ async fn list_tabs_decorates_host_presence() {
         BrowserTab {
             tab_id: "tab-2".to_string(),
             host_client_id: client("client-offline"),
+            displayed: None,
             ..template
         },
     );
@@ -567,6 +570,7 @@ async fn list_tabs_decorates_host_presence() {
     assert_eq!(live["hostName"], "Desktop A");
     assert_eq!(live["url"], "https://a.test/");
     assert_eq!(live["visibility"], "visible");
+    assert_eq!(live["displayed"], true);
     assert!(
         live.get("requestedUrl").is_none(),
         "unset optionals are omitted"
@@ -576,6 +580,10 @@ async fn list_tabs_decorates_host_presence() {
     assert!(
         offline.get("hostName").is_none(),
         "offline host has no name"
+    );
+    assert!(
+        offline.get("displayed").is_none(),
+        "an unreported displayed is omitted, never false"
     );
     // Listing needs no hello (viewers and un-hello'd clients may read).
     assert_eq!(api.calls.lock().unwrap().as_slice(), ["list:ws-1"]);

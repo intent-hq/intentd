@@ -3,6 +3,8 @@
 //! injected so the slice never touches the network (no `SENTRY_API_TOKEN`, no
 //! REST call) and the request/param plumbing is asserted deterministically.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::{Path, PathBuf};

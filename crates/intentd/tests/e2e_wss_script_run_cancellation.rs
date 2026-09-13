@@ -14,7 +14,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +30,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
@@ -40,11 +39,8 @@ const LIVENESS: Duration = Duration::from_secs(120);
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-scrun-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-scrun-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path) -> Child {
@@ -226,9 +222,9 @@ fn stop(mut child: Child) {
 
 /// A minimal committed git repo for `workspace.create` (the store row is what
 /// `script.run` needs; `skipWorktree` keeps provisioning out of the test).
-fn create_test_repo() -> PathBuf {
-    let repo_path = std::env::temp_dir().join(format!("scrun-repo-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&repo_path).expect("create temp repo dir");
+fn create_test_repo() -> tempfile::TempDir {
+    let repo = common::test_tempdir("scrun-repo-");
+    let repo_path = repo.path().to_path_buf();
     let git = |args: &[&str]| {
         let status = Command::new("git")
             .args(args)
@@ -244,7 +240,7 @@ fn create_test_repo() -> PathBuf {
     std::fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
     git(&["add", "."]);
     git(&["commit", "-m", "initial commit"]);
-    repo_path
+    repo
 }
 
 /// Create a workspace (skipWorktree) and a command-mode script, returning the
@@ -338,8 +334,10 @@ fn pid_alive(pid: i64) -> bool {
 /// observes `script.status = exited` and the recorded pid is gone.
 #[tokio::test]
 async fn script_run_client_disconnect_reaps_and_marks_exited() {
-    let data_dir = scratch_dir("disc");
-    let repo_path = create_test_repo();
+    let data_dir_guard = scratch_dir("disc");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let repo_guard = create_test_repo();
+    let repo_path = repo_guard.path().to_path_buf();
     let (child, port, cfg) = boot(&data_dir).await;
 
     // Conn A: create the workspace + script, then fire script.run (10s
@@ -401,8 +399,6 @@ async fn script_run_client_disconnect_reaps_and_marks_exited() {
 
     drop(conn_c);
     stop(child);
-    let _ = std::fs::remove_dir_all(&repo_path);
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Regression (monorepo#1155): `script.run` while the script is already
@@ -411,8 +407,10 @@ async fn script_run_client_disconnect_reaps_and_marks_exited() {
 /// warning? }` — only `output` (empty) + `warning`, no `exitCode`/`timedOut`.
 #[tokio::test]
 async fn script_run_while_running_returns_warning_envelope() {
-    let data_dir = scratch_dir("warn");
-    let repo_path = create_test_repo();
+    let data_dir_guard = scratch_dir("warn");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let repo_guard = create_test_repo();
+    let repo_path = repo_guard.path().to_path_buf();
     let (child, port, cfg) = boot(&data_dir).await;
 
     // Conn A: fire a long script.run (backstop script-level timeout far
@@ -510,6 +508,4 @@ async fn script_run_while_running_returns_warning_envelope() {
     drop(conn_a);
     drop(conn_b);
     stop(child);
-    let _ = std::fs::remove_dir_all(&repo_path);
-    let _ = std::fs::remove_dir_all(&data_dir);
 }

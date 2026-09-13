@@ -2,9 +2,11 @@
 //! (undo-commit / undo-push / reset-to-trunk / rebase-onto-trunk / merge): drive
 //! each action against a real worktree through the daemon over a temp UDS.
 
+#![cfg(unix)]
+
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -177,14 +179,14 @@ async fn serve(
     (handle, tx, ws_root)
 }
 
-fn tmp_base(tag: &str) -> PathBuf {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    Path::new("/tmp").join(format!("intentd-ac-{tag}-{}", &short[..8]))
+fn tmp_base(tag: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("intentd-ac-{tag}-"))
 }
 
 #[tokio::test]
 async fn undo_commit_soft_resets_and_restores_staging() {
-    let base = tmp_base("undo-commit");
+    let base_guard = tmp_base("undo-commit");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo = base.join("repo");
@@ -230,12 +232,12 @@ async fn undo_commit_soft_resets_and_restores_staging() {
 
     let _ = tx.send(());
     let _ = handle.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 #[tokio::test]
 async fn reset_to_trunk_guards_dirty_then_hard_resets() {
-    let base = tmp_base("reset");
+    let base_guard = tmp_base("reset");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo = base.join("repo");
@@ -274,12 +276,12 @@ async fn reset_to_trunk_guards_dirty_then_hard_resets() {
 
     let _ = tx.send(());
     let _ = handle.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 #[tokio::test]
 async fn rebase_onto_trunk_replays_branch() {
-    let base = tmp_base("rebase");
+    let base_guard = tmp_base("rebase");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo = base.join("repo");
@@ -310,12 +312,12 @@ async fn rebase_onto_trunk_replays_branch() {
 
     let _ = tx.send(());
     let _ = handle.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 #[tokio::test]
 async fn merge_local_fast_forwards_trunk() {
-    let base = tmp_base("merge");
+    let base_guard = tmp_base("merge");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo = base.join("repo");
@@ -342,12 +344,12 @@ async fn merge_local_fast_forwards_trunk() {
 
     let _ = tx.send(());
     let _ = handle.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 #[tokio::test]
 async fn merge_squash_creates_single_commit_on_trunk() {
-    let base = tmp_base("squash");
+    let base_guard = tmp_base("squash");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo = base.join("repo");
@@ -377,13 +379,13 @@ async fn merge_squash_creates_single_commit_on_trunk() {
 
     let _ = tx.send(());
     let _ = handle.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 #[tokio::test]
 async fn undo_push_rewinds_remote_branch() {
-    let base = tmp_base("undo-push");
+    let base_guard = tmp_base("undo-push");
+    let base = base_guard.path().to_path_buf();
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo = base.join("repo");
@@ -417,5 +419,4 @@ async fn undo_push_rewinds_remote_branch() {
 
     let _ = tx.send(());
     let _ = handle.await;
-    std::fs::remove_dir_all(&base).ok();
 }

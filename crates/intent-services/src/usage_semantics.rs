@@ -7,9 +7,10 @@
 //! (per-turn counters), while codex-acp, opencode and the opencode-based
 //! unsloth report only the LAST request's counters. Treating those as
 //! cumulative snapshots made REPLACE drop every earlier turn — the multi-turn
-//! undercount of #3794/#3795. This module classifies each provider so the
-//! accounting seam (`persist_turn_token_usage` / `record_turn_usage_stats`
-//! in `agent_session.rs`) folds reports with the right operation; the quirk
+//! undercount of #3794/#3795 (codex) and #3801 (opencode/unsloth). This
+//! module classifies each provider so the accounting seam
+//! (`persist_turn_token_usage` / `record_turn_usage_stats` in
+//! `agent_session.rs`) folds reports with the right operation; the quirk
 //! knowledge lives here and nowhere else.
 //!
 //! grok never populates the standard `usage` field but attaches a complete
@@ -68,7 +69,7 @@ impl UsageReportSemantics {
 /// - `claude-code` resets its tally every turn → `PerTurn`
 /// - `grok` bills per prompt via `_meta.usage` (#3803, synthesized by
 ///   [`prompt_meta_usage_bill`]) → `PerTurn`
-/// - `codex`, `opencode`, `unsloth` report the last request → `LastRequest`
+/// - `codex` (#3795), `opencode`, `unsloth` (#3801) report the last request → `LastRequest`
 /// - `pi`, `auggie`, `droid`, `cortex` never report → `NoReport`
 /// - everything else (incl. `mock`) → `Cumulative`
 pub(crate) fn usage_report_semantics(provider_id: Option<&str>) -> UsageReportSemantics {

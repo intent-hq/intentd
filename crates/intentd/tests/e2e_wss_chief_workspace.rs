@@ -58,28 +58,22 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::{timeout, timeout_at};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-chief-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-chief-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -319,13 +313,11 @@ where
 /// not just at the service layer.
 #[tokio::test]
 async fn chief_workspace_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -526,7 +518,8 @@ async fn chief_agent_spawns_in_dedicated_cwd_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let behavior = json!({ "response": "done", "echoCwd": true }).to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -535,10 +528,7 @@ async fn chief_agent_spawns_in_dedicated_cwd_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -614,7 +604,7 @@ async fn chief_agent_spawns_in_dedicated_cwd_over_wss() {
     );
     assert_ne!(
         actual,
-        Path::new("/tmp"),
+        Path::new("/tmp"), // tmp-hygiene: allow (assertion comparand, not a scratch dir)
         "chief child must never spawn in /tmp"
     );
     if let Ok(shared_tmp) = std::fs::canonicalize("/tmp") {
@@ -642,13 +632,11 @@ async fn chief_agent_spawns_in_dedicated_cwd_over_wss() {
 /// persistence is covered by `e2e_mock_agent_ws_app::chief_agent_ws_app_proposal_resource_persisted`.
 #[tokio::test]
 async fn ws_app_surface_events_and_gating_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -824,7 +812,8 @@ async fn chief_cross_workspace_completion_wake_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let behavior = json!({ "response": "done" }).to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -833,10 +822,7 @@ async fn chief_cross_workspace_completion_wake_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1198,7 +1184,8 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // The REGISTER_WAITS turn discovers the seeded targets by their
     // test-controlled names, registers immediate-mode waits on both, then
     // immediately retries the same registration — the duplicate must be
@@ -1253,10 +1240,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
@@ -1617,7 +1601,8 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
               const targets = listing.threads.filter((t) => String(t.agentName).startsWith('Target ')).map((t) => t.agentId);\n\
               return await ws.app.agents.waitFor({ agentIds: targets, waitMode: 'after_all' });";
@@ -1641,10 +1626,7 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
@@ -1825,7 +1807,8 @@ async fn chief_scoped_group_cancel_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
               const targets = listing.threads.filter((t) => String(t.agentName).startsWith('Target ')).map((t) => t.agentId);\n\
               return await ws.app.agents.waitFor({ agentIds: targets, waitMode: 'after_all' });";
@@ -1849,10 +1832,7 @@ async fn chief_scoped_group_cancel_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1992,7 +1972,8 @@ async fn non_chief_waitfor_gated_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let js = "try {\n\
                 const result = await ws.app.agents.waitFor({ agentIds: ['agent-in-another-workspace'] });\n\
                 return { success: true, result };\n\
@@ -2019,10 +2000,7 @@ async fn non_chief_waitfor_gated_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
@@ -2116,7 +2094,8 @@ async fn workspace_archive_unarchive_bridge_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let js = "const archived = await ws.workspace.archive();\n\
               const afterArchive = await ws.workspace.details();\n\
               const unarchived = await ws.workspace.unarchive();\n\
@@ -2142,10 +2121,7 @@ async fn workspace_archive_unarchive_bridge_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
@@ -2265,7 +2241,8 @@ async fn chief_workspace_archive_gated_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let js = "const out = {};\n\
               try { out.archive = { ok: true, result: await ws.workspace.archive() }; }\n\
               catch (e) { out.archive = { ok: false, error: e.message }; }\n\
@@ -2292,10 +2269,7 @@ async fn chief_workspace_archive_gated_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
@@ -2387,7 +2361,8 @@ async fn chief_agent_send_cross_workspace_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
               const target = listing.threads.find((t) => t.agentName === 'Chief Send Target');\n\
               return await ws.app.agents.send(target.agentId, 'Please report your status');";
@@ -2411,10 +2386,7 @@ async fn chief_agent_send_cross_workspace_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
@@ -2528,7 +2500,8 @@ async fn chief_agent_ask_completed_target_wakes_once_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
               const target = listing.threads.find((t) => t.agentName === 'Chief Ask Target');\n\
               return await ws.app.agents.ask(target.agentId, 'Complete the requested work');";
@@ -2576,10 +2549,7 @@ async fn chief_agent_ask_completed_target_wakes_once_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;

@@ -6,6 +6,8 @@
 //! call**. A real read is performed only when `INTENTD_GH_LIVE_TEST=1` and a
 //! token (`GITHUB_TOKEN`/`GH_TOKEN`) are present.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::Path;

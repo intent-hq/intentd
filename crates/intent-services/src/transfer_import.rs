@@ -2714,6 +2714,7 @@ mod tests {
     /// `.intent` symlink riding the git bundle) must not let an attachment
     /// escape the workspace root: the canonical-ancestor re-check fails the
     /// commit and nothing lands outside.
+    #[cfg(unix)]
     #[tokio::test]
     async fn import_commit_rejects_symlinked_attachment_ancestor() {
         let ws = WorkspaceId("ws-att-symlink".to_string());

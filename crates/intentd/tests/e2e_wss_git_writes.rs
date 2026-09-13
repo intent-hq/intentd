@@ -40,7 +40,8 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    _data_dir_guard: tempfile::TempDir,
+    _scratch_guard: tempfile::TempDir,
     scratch: PathBuf,
 }
 
@@ -48,16 +49,11 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-        let _ = std::fs::remove_dir_all(&self.scratch);
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-gitw-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-gitw-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -282,8 +278,10 @@ fn make_source_repo_with_submodule(dir: &Path) -> PathBuf {
 }
 
 async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = scratch_dir("data");
-    let scratch = scratch_dir("scratch");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let scratch_guard = scratch_dir("scratch");
+    let scratch = scratch_guard.path().to_path_buf();
     let root_s = workspaces_root.to_string_lossy().to_string();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -293,7 +291,8 @@ async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        _data_dir_guard: data_dir_guard,
+        _scratch_guard: scratch_guard,
         scratch,
     };
     let socket = data_dir.join("intentd.sock");
@@ -351,7 +350,8 @@ async fn git_branch_ops_round_trip_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-branch");
+    let root_guard = scratch_dir("root-branch");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
 
@@ -455,7 +455,6 @@ async fn git_branch_ops_round_trip_over_wss() {
     .await;
     assert_eq!(resp["error"]["code"], json!(-32602));
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -467,7 +466,8 @@ async fn git_stage_tolerates_stale_path_in_valid_batch_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-stage-stale");
+    let root_guard = scratch_dir("root-stage-stale");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
 
@@ -596,7 +596,6 @@ async fn git_stage_tolerates_stale_path_in_valid_batch_over_wss() {
         .unwrap_or_default();
     assert!(message.contains("pathspec 'still-missing.txt' did not match any files"));
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -605,7 +604,8 @@ async fn git_status_force_refresh_bypasses_cached_status_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-status-force-refresh");
+    let root_guard = scratch_dir("root-status-force-refresh");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
     let mut ws = connect_ws(port, cfg).await;
@@ -648,7 +648,6 @@ async fn git_status_force_refresh_bypasses_cached_status_over_wss() {
         .iter()
         .all(|file| file["path"] != json!("transient.txt")));
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -660,7 +659,8 @@ async fn git_push_and_fetch_round_trip_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-remote");
+    let root_guard = scratch_dir("root-remote");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
 
@@ -739,7 +739,6 @@ async fn git_push_and_fetch_round_trip_over_wss() {
     );
     assert_eq!(tracked, advanced_sha);
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -755,7 +754,8 @@ async fn git_hunk_and_lockfile_ops_round_trip_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-hunk");
+    let root_guard = scratch_dir("root-hunk");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
 
@@ -907,7 +907,6 @@ async fn git_hunk_and_lockfile_ops_round_trip_over_wss() {
     assert_eq!(resp["result"]["removed"], json!(true));
     assert!(!lock.exists(), "index.lock deleted from linked gitdir");
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -923,7 +922,8 @@ async fn git_agent_commit_rejects_submodule_internal_file_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-submodule");
+    let root_guard = scratch_dir("root-submodule");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo_with_submodule(&daemon.scratch);
 
@@ -985,7 +985,6 @@ async fn git_agent_commit_rejects_submodule_internal_file_over_wss() {
         "gitlink entry intact, got: {ls:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -1001,7 +1000,8 @@ async fn git_discard_rejects_submodule_internal_path_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root-submodule-discard");
+    let root_guard = scratch_dir("root-submodule-discard");
+    let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo_with_submodule(&daemon.scratch);
 
@@ -1056,6 +1056,5 @@ async fn git_discard_rejects_submodule_internal_path_over_wss() {
         "gitlink entry intact, got: {ls:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }

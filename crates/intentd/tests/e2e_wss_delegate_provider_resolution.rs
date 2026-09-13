@@ -34,28 +34,22 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-delegprov-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-delegprov-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -243,7 +237,8 @@ async fn delegate_resolves_configured_default_provider_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let behavior = json!({ "response": "mock response" }).to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -252,10 +247,7 @@ async fn delegate_resolves_configured_default_provider_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -323,14 +315,12 @@ async fn delegate_resolves_configured_default_provider_over_wss() {
 /// default provider (Auggie).
 #[tokio::test]
 async fn delegate_errors_not_auggie_when_configured_default_unavailable_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Deliberately no MOCK_AGENT_SCRIPT_PATH: "mock" stays gated off/unavailable.
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -394,13 +384,11 @@ async fn delegate_errors_not_auggie_when_configured_default_unavailable_over_wss
 /// positional fallback (Auggie).
 #[tokio::test]
 async fn delegate_errors_when_no_default_provider_configured_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -465,7 +453,8 @@ async fn delegate_explicit_provider_param_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let behavior = json!({ "response": "mock response" }).to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -474,10 +463,7 @@ async fn delegate_explicit_provider_param_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -637,15 +623,13 @@ fn seed_opencode_path_override(data_dir: &Path, stub: &Path) {
 /// keeping the test hermetic.
 #[tokio::test]
 async fn create_and_delegate_reject_hard_false_auth_verdict_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let stub = write_failing_auth_probe(&data_dir);
     seed_opencode_path_override(&data_dir, &stub);
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

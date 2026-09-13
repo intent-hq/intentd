@@ -36,12 +36,12 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
     child: Child,
+    _data_dir_guard: tempfile::TempDir,
     data_dir: PathBuf,
 }
 
@@ -49,15 +49,11 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-lastact-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-lastact-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -323,7 +319,8 @@ where
 }
 
 async fn boot(mock_script: &str, behavior: &str) -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = scratch_dir("data");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Override debounce to 500ms for fast test execution (large enough that
     // CI scheduler stalls between activity touches don't split the window).
     let env: [(&str, &str); 5] = [
@@ -336,6 +333,7 @@ async fn boot(mock_script: &str, behavior: &str) -> (Daemon, u16, Arc<ClientConf
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");

@@ -15,7 +15,7 @@
 mod common;
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,11 +30,8 @@ use tokio::net::UnixStream;
 
 /// Short `/tmp` data dir so `data_dir/intentd.sock` fits within `SUN_LEN`
 /// (~104 bytes on macOS); a deep `temp_dir()` would overflow the UDS bind.
-fn temp_data_dir(tag: &str) -> PathBuf {
-    let id = uuid::Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-sec-{tag}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir(tag: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-sec-{tag}-"))
 }
 
 /// Wait (up to ~1s) for the listener to create the socket file.
@@ -50,7 +47,8 @@ async fn await_socket(socket: &Path) -> bool {
 
 #[tokio::test]
 async fn uds_socket_is_owner_only_0600() {
-    let dir = temp_data_dir("uds");
+    let dir_guard = temp_data_dir("uds");
+    let dir = dir_guard.path().to_path_buf();
     let socket = dir.join("intentd.sock");
 
     let store = Store::open(&dir.join("intentd.db"))
@@ -85,7 +83,6 @@ async fn uds_socket_is_owner_only_0600() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Transport size-limit regression (monorepo#472): a single UDS line past the
@@ -93,7 +90,8 @@ async fn uds_socket_is_owner_only_0600() {
 /// closes, while an under-limit frame on a fresh connection still round-trips.
 #[tokio::test]
 async fn uds_oversized_line_rejected_and_connection_closed() {
-    let dir = temp_data_dir("maxline");
+    let dir_guard = temp_data_dir("maxline");
+    let dir = dir_guard.path().to_path_buf();
     let socket = dir.join("intentd.sock");
 
     let store = Store::open(&dir.join("intentd.db"))
@@ -167,7 +165,6 @@ async fn uds_oversized_line_rejected_and_connection_closed() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -178,7 +175,7 @@ fn doctor_reports_secret_presence_as_boolean_not_value() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("doctor")
-        .env("INTENTD_DATA_DIR", &dir)
+        .env("INTENTD_DATA_DIR", dir.path())
         .env("GITHUB_TOKEN", SENTINEL)
         .output()
         .expect("run intentd doctor");
@@ -198,6 +195,4 @@ fn doctor_reports_secret_presence_as_boolean_not_value() {
         !stderr.contains(SENTINEL),
         "doctor leaked the GitHub token VALUE into stderr (§11.3)",
     );
-
-    std::fs::remove_dir_all(&dir).ok();
 }

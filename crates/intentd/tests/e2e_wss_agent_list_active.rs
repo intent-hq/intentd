@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
@@ -21,7 +21,6 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
@@ -33,7 +32,6 @@ impl Drop for Daemon {
             Signal::SIGKILL,
         );
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -113,13 +111,8 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-fn temp_data_dir() -> PathBuf {
-    let dir = PathBuf::from("/tmp").join(format!(
-        "itd-wss-active-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-active-")
 }
 
 fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
@@ -143,10 +136,7 @@ fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
         .stderr(Stdio::from(log));
     command.process_group(0);
     let child = command.spawn().expect("spawn intentd serve");
-    Daemon {
-        child,
-        data_dir: data_dir.to_path_buf(),
-    }
+    Daemon { child }
 }
 
 fn mock_agent_script() -> Option<String> {
@@ -255,7 +245,8 @@ async fn list_active_tracks_only_mid_turn_agents_over_real_wss() {
     let Some(script) = mock_agent_script() else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let workspace_id = seed_workspace(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "parked" }).to_string();
     let _daemon = spawn_serve(&data_dir, &script, &behavior);

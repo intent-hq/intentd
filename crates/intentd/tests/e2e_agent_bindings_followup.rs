@@ -9,7 +9,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use intent_core::{
@@ -68,25 +67,18 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
     }
 }
 
-fn cleanup_db(db: &PathBuf) {
-    std::fs::remove_file(db).ok();
-    std::fs::remove_file(db.with_extension("db-wal")).ok();
-    std::fs::remove_file(db.with_extension("db-shm")).ok();
-}
-
-async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-agent-bind-{}.db",
-        uuid::Uuid::new_v4()
-    ));
-    let ws_root =
-        std::env::temp_dir().join(format!("itd-e2e-agent-bind-ws-{}", uuid::Uuid::new_v4()));
+/// Scratch layout: `<tmp>/intentd.db` plus the workspace checkout at
+/// `<tmp>/ws`; the returned guard removes both on drop.
+async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
+    let tmp = common::test_tempdir("intentd-e2e-agent-bind-");
+    let db = tmp.path().join("intentd.db");
+    let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(&ws_root).expect("create ws root");
 
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(ws_root.parent().unwrap().to_path_buf())
+        .with_workspaces_root(tmp.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(&ws_root))
         .with_event_bus(bus.clone());
 
@@ -96,12 +88,12 @@ async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
         .await
         .expect("insert ws");
 
-    (Arc::new(services), ws, ws_root, db)
+    (Arc::new(services), ws, tmp)
 }
 
 #[tokio::test]
 async fn agent_subscribe_creates_event_subscription() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     // Call agent.subscribe
     let result = services
@@ -132,13 +124,11 @@ async fn agent_subscribe_creates_event_subscription() {
     assert!(unsub_result["success"].as_bool().unwrap());
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn agent_diagnostics_returns_workspace_snapshot() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     services
         .agent_create(
@@ -166,14 +156,12 @@ async fn agent_diagnostics_returns_workspace_snapshot() {
     assert!(!result["text"].as_str().unwrap().is_empty());
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn agent_status_returns_full_metadata() {
     use intent_core::AgentStatus;
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     let agent_val = services
         .agent_create(
@@ -203,13 +191,11 @@ async fn agent_status_returns_full_metadata() {
     assert!(!result.metadata.is_background);
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn agent_list_returns_created_agents() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     let agent1 = services
         .agent_create(
@@ -248,13 +234,11 @@ async fn agent_list_returns_created_agents() {
     assert!(result.iter().any(|a| a.id == id2 && a.name == "ListTest2"));
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn agent_read_conversation_returns_messages() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     let agent_val = services
         .agent_create(
@@ -320,13 +304,11 @@ async fn agent_read_conversation_returns_messages() {
     assert!(first_msg["contentBlocks"].is_array());
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn agent_summary_returns_shape() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     let agent_val = services
         .agent_create(
@@ -358,6 +340,4 @@ async fn agent_summary_returns_shape() {
     assert!(result["messageCount"].is_number());
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }

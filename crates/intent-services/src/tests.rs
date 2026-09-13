@@ -68,41 +68,25 @@ impl Drop for DebounceEnvGuard {
     }
 }
 
-/// Create a temp dir with a recognizable `prefix` under the system temp root.
-/// The returned guard removes the dir on drop (including on panic); set
-/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
-pub(crate) fn test_tempdir(prefix: &str) -> tempfile::TempDir {
-    let mut dir = tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir()
-        .expect("create test tempdir");
-    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
-        dir.disable_cleanup(true);
-    }
-    dir
-}
+pub(crate) use crate::test_support::test_tempdir;
 
+/// `SQLite` db inside an RAII temp dir (see [`test_tempdir`]): the dir sweep on
+/// drop also covers the `-wal`/`-shm` sidecars and the `.config.toml` sibling.
 pub(crate) struct TempDb {
     pub(crate) path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     pub(crate) fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("intentd-svc-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
+        let dir = test_tempdir("intentd-svc-");
+        let path = dir.path().join("svc.db");
+        Self { path, _dir: dir }
     }
 }
 
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm", ".config.toml"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
-    }
-}
-
-/// A settings registry (backed by a config file next to the temp db, removed
-/// by [`TempDb`]'s drop) seeding `model.defaultProvider = "auggie"`: since
+/// A settings registry (backed by a config file next to the temp db, swept
+/// with [`TempDb`]'s dir) seeding `model.defaultProvider = "auggie"`: since
 /// monorepo#3044 there is no positional provider fallback, so tests that
 /// create/delegate agents without an explicit provider or model need a
 /// configured default to resolve to. The `providers.paths` override points
@@ -134,23 +118,15 @@ pub(crate) fn test_registry_with_default_provider(
 /// test that constructs a `Services` reachable from workspace provisioning
 /// **must** attach one via `.with_workspaces_root(root.path().to_path_buf())`;
 /// otherwise the guard panics rather than writing under `~/intent/workspaces`.
-pub(crate) struct WorkspacesRoot(PathBuf);
+pub(crate) struct WorkspacesRoot(tempfile::TempDir);
 
 impl WorkspacesRoot {
     pub(crate) fn new() -> Self {
-        let p = std::env::temp_dir().join(format!("intentd-wss-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).expect("mkdir hermetic workspaces root");
-        Self(p)
+        Self(test_tempdir("intentd-wss-"))
     }
 
     pub(crate) fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for WorkspacesRoot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        self.0.path()
     }
 }
 
@@ -2881,7 +2857,8 @@ async fn read_asset_reads_base64_from_assets_root() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
-    let root = std::env::temp_dir().join(format!("intentd-assets-{}", uuid::Uuid::new_v4()));
+    let root_guard = test_tempdir("intentd-assets-");
+    let root = root_guard.path().to_path_buf();
     std::fs::create_dir_all(root.join(&ws.0)).expect("mkdir");
     std::fs::write(root.join(&ws.0).join("img.png"), b"hello").expect("write asset");
     let svc = Services::new(store).with_assets_root(root.clone());
@@ -2893,7 +2870,6 @@ async fn read_asset_reads_base64_from_assets_root() {
     assert_eq!(r.asset_id, "img.png");
     assert_eq!(r.mime_type, "image/png");
     assert_eq!(r.data, "aGVsbG8="); // base64("hello")
-    let _ = std::fs::remove_dir_all(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -12637,7 +12613,7 @@ mod pr {
     use intent_store::Store;
     use serde_json::json;
 
-    use super::{workspace, TempDb};
+    use super::{test_tempdir, workspace, TempDb};
     use crate::Services;
 
     // Test stub: one independent bool per scripted scenario.
@@ -14554,18 +14530,8 @@ mod pr {
     // stubbed forge.
     // ------------------------------------------------------------------------
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn unique_dir(prefix: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn unique_dir(prefix: &str) -> tempfile::TempDir {
+        test_tempdir(&format!("{prefix}-"))
     }
 
     /// Commit everything in the worktree on the current branch, returning the oid.
@@ -14591,12 +14557,21 @@ mod pr {
     /// `feature` with an `origin` bare remote and a linked `o/r` repository.
     async fn ac_setup(
         forge: StubForge,
-    ) -> (TempDb, TempDir, TempDir, Services, WorkspaceId, PathBuf) {
+    ) -> (
+        TempDb,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Services,
+        WorkspaceId,
+        PathBuf,
+    ) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
 
-        let work = unique_dir("intentd-ac-work");
-        let bare = unique_dir("intentd-ac-bare");
+        let work_dir = unique_dir("intentd-ac-work");
+        let work = work_dir.path().to_path_buf();
+        let bare_dir = unique_dir("intentd-ac-bare");
+        let bare = bare_dir.path().to_path_buf();
         let mut opts = git2::RepositoryInitOptions::new();
         opts.initial_head("feature");
         let repo = git2::Repository::init_opts(&work, &opts).unwrap();
@@ -14620,7 +14595,7 @@ mod pr {
         store.insert_workspace(&ws).await.expect("ws");
 
         let svc = Services::new(store).with_source_control(Arc::new(forge));
-        (tmp, TempDir(work.clone()), TempDir(bare), svc, ws_id, work)
+        (tmp, work_dir, bare_dir, svc, ws_id, work)
     }
 
     #[tokio::test]
@@ -14674,7 +14649,7 @@ mod pr {
         assert_eq!(st["existingPR"]["number"], 7);
 
         // The bare remote now carries the feature branch.
-        let bare_repo = git2::Repository::open_bare(bare.0.clone()).unwrap();
+        let bare_repo = git2::Repository::open_bare(bare.path()).unwrap();
         assert!(bare_repo.find_reference("refs/heads/feature").is_ok());
 
         // mergePR via the stubbed forge.
@@ -14799,11 +14774,11 @@ mod pr {
     async fn add_remote_initializes_and_returns_status() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("store");
-        let dir = TempDir(unique_dir("intentd-ac-addremote"));
+        let dir = unique_dir("intentd-ac-addremote");
         let ws_id = WorkspaceId::new();
         let mut ws = workspace(&ws_id);
         ws.branch = "feature".into();
-        ws.worktree_path = Some(dir.0.to_string_lossy().to_string());
+        ws.worktree_path = Some(dir.path().to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
         let svc = Services::new(store).with_source_control(Arc::new(StubForge::default()));
 
@@ -15051,24 +15026,19 @@ mod pr {
     /// (`current_branch_at` reads the symbolic target, so no commit is needed).
     struct SweepRepo {
         dir: PathBuf,
+        _guard: tempfile::TempDir,
     }
 
     impl SweepRepo {
         fn init(branch: &str, origin: Option<&str>) -> Self {
-            let dir = std::env::temp_dir().join(format!("intentd-groot-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = test_tempdir("intentd-groot-");
+            let dir = guard.path().to_path_buf();
             let repo = git2::Repository::init(&dir).unwrap();
             repo.set_head(&format!("refs/heads/{branch}")).unwrap();
             if let Some(url) = origin {
                 repo.remote("origin", url).unwrap();
             }
-            Self { dir }
-        }
-    }
-
-    impl Drop for SweepRepo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            Self { dir, _guard: guard }
         }
     }
 
@@ -15134,8 +15104,8 @@ mod pr {
         let (_t, svc, ws) = sweep_setup(&parent.dir).await;
 
         // Seed a root whose directory no longer exists (auto-prune target).
-        let gone_dir = std::env::temp_dir().join(format!("intentd-gone-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&gone_dir).unwrap();
+        let gone_guard = test_tempdir("intentd-gone-");
+        let gone_dir = gone_guard.path().to_path_buf();
         let gone = sweep_root(&ws.id, &gone_dir, None);
         svc.store().upsert_workspace_git_root(&gone).await.unwrap();
         std::fs::remove_dir_all(&gone_dir).unwrap();
@@ -15357,7 +15327,8 @@ mod pr {
 
         // Root at guard/repo where `guard` is later made unsearchable, so a
         // stat of the root's path fails with PermissionDenied, not NotFound.
-        let guard = std::env::temp_dir().join(format!("intentd-guard-{}", uuid::Uuid::new_v4()));
+        let guard_dir = test_tempdir("intentd-guard-");
+        let guard = guard_dir.path().to_path_buf();
         let repo_dir = guard.join("repo");
         std::fs::create_dir_all(&repo_dir).unwrap();
         let root = sweep_root(&ws.id, &repo_dir, None);
@@ -15374,7 +15345,6 @@ mod pr {
 
         // Restore permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&guard);
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "root must survive the transient error");
@@ -15785,8 +15755,8 @@ mod pr {
         let primary = SweepRepo::init("main", None);
         let (_t, svc, ws) = sweep_setup(&primary.dir).await;
         // A plain directory, not a git repo: current-branch read fails.
-        let plain = std::env::temp_dir().join(format!("intentd-plain-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&plain).unwrap();
+        let plain_dir = test_tempdir("intentd-plain-");
+        let plain = plain_dir.path().to_path_buf();
         let mut root = sweep_root(&ws.id, &plain, Some(("o", "r")));
         root.pull_requests = Some(vec![pool_entry(
             43,
@@ -15797,7 +15767,6 @@ mod pr {
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
         let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
-        let _ = std::fs::remove_dir_all(&plain);
         assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
@@ -16341,23 +16310,18 @@ mod file_tracking {
     /// A self-cleaning git repository seeded with one commit.
     struct GitRepo {
         dir: PathBuf,
-    }
-
-    impl Drop for GitRepo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
+        _guard: tempfile::TempDir,
     }
 
     fn init_git_repo() -> GitRepo {
-        let dir = std::env::temp_dir().join(format!("intentd-ft-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard = test_tempdir("intentd-ft-");
+        let dir = guard.path().to_path_buf();
         let repo = Repository::init(&dir).unwrap();
         let mut cfg = repo.config().unwrap();
         cfg.set_str("user.name", "Test").unwrap();
         cfg.set_str("user.email", "test@example.com").unwrap();
         commit_file(&dir, "seed.txt", "seed\n", "seed commit");
-        GitRepo { dir }
+        GitRepo { dir, _guard: guard }
     }
 
     fn commit_file(dir: &std::path::Path, rel: &str, contents: &str, message: &str) {
@@ -19423,51 +19387,6 @@ mod file_tracking {
         assert_eq!(details["fileDetails"], serde_json::json!([]));
     }
 
-    /// `parse_github_owner_repo` accepts the `ssh://` URL form (with
-    /// optional user and numeric port) alongside https and scp-like remotes,
-    /// and keeps the strict `github.com` host check for all three
-    /// (monorepo#2053 review).
-    #[test]
-    fn parse_github_owner_repo_handles_ssh_url_form() {
-        let parse = Services::parse_github_owner_repo;
-        let ok = Some(("intent-hq".to_string(), "intentd".to_string()));
-
-        // ssh:// forms.
-        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git"), ok);
-        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd"), ok);
-        assert_eq!(parse("ssh://github.com/intent-hq/intentd.git"), ok);
-        assert_eq!(parse("ssh://git@github.com:22/intent-hq/intentd.git"), ok);
-        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git/"), ok);
-
-        // Strict host check on ssh:// too.
-        assert_eq!(
-            parse("ssh://git@github.com.evil.com/intent-hq/intentd.git"),
-            None
-        );
-        assert_eq!(parse("ssh://git@gitlab.com/intent-hq/intentd.git"), None);
-        // A non-numeric "port" stays part of the host and is rejected.
-        assert_eq!(
-            parse("ssh://git@github.com.evil/intent-hq/intentd.git"),
-            None
-        );
-        assert_eq!(
-            parse("ssh://git@github.com:evil/intent-hq/intentd.git"),
-            None
-        );
-        // No owner/repo path.
-        assert_eq!(parse("ssh://git@github.com"), None);
-        assert_eq!(parse("ssh://git@github.com/intentd.git"), None);
-
-        // The existing https and scp-like forms still parse.
-        assert_eq!(parse("https://github.com/intent-hq/intentd.git"), ok);
-        assert_eq!(parse("git@github.com:intent-hq/intentd.git"), ok);
-        assert_eq!(
-            parse("https://github.com.evil.com/intent-hq/intentd.git"),
-            None
-        );
-        assert_eq!(parse("git@github.com.evil:intent-hq/intentd.git"), None);
-    }
-
     /// `register_git_root` emits `gitRoot:registered` on first registration
     /// and `gitRoot:updated` on re-registration; `unregister_git_root` emits
     /// `gitRoot:unregistered` (monorepo#2053).
@@ -19664,17 +19583,15 @@ mod file_tracking {
         assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
 
         // Directory without a `.git` entry.
-        let plain = std::env::temp_dir().join(format!("intentd-ft-plain-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&plain).unwrap();
+        let plain = test_tempdir("intentd-ft-plain-");
         let err = svc
             .git_root_register(
                 ws_id.clone(),
-                plain.to_string_lossy().into_owned(),
+                plain.path().to_string_lossy().into_owned(),
                 agent.clone(),
             )
             .await
             .unwrap_err();
-        let _ = std::fs::remove_dir_all(&plain);
         assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
 
         // The workspace's own primary root is tracked implicitly.
@@ -22255,22 +22172,17 @@ mod rules {
     use intent_store::Store;
     use serde_json::Value;
 
-    use super::{workspace, TempDb};
+    use super::{test_tempdir, workspace, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
-    struct TempTree(std::path::PathBuf);
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    struct TempTree(std::path::PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     /// A worktree containing a `CLAUDE.md` workspace rule file.
     fn worktree() -> TempTree {
-        let dir = std::env::temp_dir().join(format!("intentd-rules-svc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard = test_tempdir("intentd-rules-svc-");
+        let dir = guard.path().to_path_buf();
         std::fs::write(dir.join("CLAUDE.md"), "ALWAYS run the linter.").unwrap();
-        TempTree(dir)
+        TempTree(dir, guard)
     }
 
     async fn setup(dir: &std::path::Path) -> (TempDb, Store, Services, WorkspaceId) {
@@ -24130,12 +24042,7 @@ mod known_repo {
     async fn create_workspace_derives_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
-        struct TempRepo(PathBuf);
-        impl Drop for TempRepo {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
+        struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -24144,8 +24051,8 @@ mod known_repo {
 
         // Helper: init a git repo with an origin remote and an initial commit.
         let make_repo = |remote_url: &str| -> TempRepo {
-            let dir = std::env::temp_dir().join(format!("intentd-origin-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = test_tempdir("intentd-origin-");
+            let dir = guard.path().to_path_buf();
             let repo = Repository::init(&dir).unwrap();
             let mut cfg = repo.config().unwrap();
             cfg.set_str("user.name", "Test").unwrap();
@@ -24160,7 +24067,7 @@ mod known_repo {
             let sig = Signature::now("Test", "test@example.com").unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
                 .unwrap();
-            TempRepo(dir)
+            TempRepo(dir, guard)
         };
 
         // GitHub https remote → owner and name derived.
@@ -24238,9 +24145,8 @@ mod known_repo {
 
         // No origin remote → owner stays None, name falls back to basename.
         let no_remote = {
-            let dir =
-                std::env::temp_dir().join(format!("intentd-noremote-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = test_tempdir("intentd-noremote-");
+            let dir = guard.path().to_path_buf();
             let repo = Repository::init(&dir).unwrap();
             let mut cfg = repo.config().unwrap();
             cfg.set_str("user.name", "Test").unwrap();
@@ -24254,7 +24160,7 @@ mod known_repo {
             let sig = Signature::now("Test", "test@example.com").unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
                 .unwrap();
-            TempRepo(dir)
+            TempRepo(dir, guard)
         };
         let noremote_ws = svc
             .create_workspace(
@@ -24388,12 +24294,7 @@ mod known_repo {
     async fn startup_prewarm_backfills_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
-        struct TempRepo(PathBuf);
-        impl Drop for TempRepo {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
+        struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -24406,14 +24307,8 @@ mod known_repo {
         // Manually create a workspace row with repository_path but missing owner/name
         // (simulates old workspace created before the create derivation landed).
         let make_repo = |url: &str| -> TempRepo {
-            let dir = std::env::temp_dir().join(format!(
-                "intentd-backfill-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = test_tempdir("intentd-backfill-");
+            let dir = guard.path().to_path_buf();
             let repo = Repository::init(&dir).unwrap();
             repo.remote("origin", url).unwrap();
             let mut index = repo.index().unwrap();
@@ -24422,7 +24317,7 @@ mod known_repo {
             let sig = Signature::now("Test", "test@example.com").unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
                 .unwrap();
-            TempRepo(dir)
+            TempRepo(dir, guard)
         };
 
         let repo_path = make_repo("https://github.com/octocat/hello-world.git");
@@ -24679,18 +24574,12 @@ mod worktree_provisioning {
     use super::*;
     use intent_core::WorkspaceCreate;
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Temp directory tree swept on drop (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
+        let guard = test_tempdir(&format!("{prefix}-"));
+        TempDir(guard.path().to_path_buf(), guard)
     }
 
     /// Commit everything in the worktree on the current branch, returning the oid.
@@ -26864,21 +26753,15 @@ mod setup_lifecycle_events {
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::TempDb;
+    use super::{test_tempdir, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Temp directory tree swept on drop (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
+        let guard = test_tempdir(&format!("{prefix}-"));
+        TempDir(guard.path().to_path_buf(), guard)
     }
 
     /// Init a git repo with one commit; returns (guard, head branch).
@@ -27180,9 +27063,8 @@ mod file_ops_service {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
 
-        let dir = std::env::temp_dir().join(format!("intentd-fileapi-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir_guard = test_tempdir("intentd-fileapi-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
@@ -27221,8 +27103,6 @@ mod file_ops_service {
             .file_read(ws.clone(), "../escape".to_string(), None)
             .await;
         assert!(matches!(denied, Err(Error::Internal(_))));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `file.placeAttachment` wired through `WorkspaceApi`: a base64 payload
@@ -27238,9 +27118,8 @@ mod file_ops_service {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
 
-        let dir = std::env::temp_dir().join(format!("intentd-placeatt-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir_guard = test_tempdir("intentd-placeatt-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
         git2::Repository::init(&dir).unwrap();
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
@@ -27256,6 +27135,7 @@ mod file_ops_service {
                 Some(format!("data:application/json;base64,{b64}")),
                 None,
                 Some("application/json".to_string()),
+                None,
             )
             .await
             .expect("place");
@@ -27297,6 +27177,7 @@ mod file_ops_service {
                 Some(base64::engine::general_purpose::STANDARD.encode(b"{}")),
                 None,
                 None,
+                None,
             )
             .await
             .expect("place config.json");
@@ -27320,6 +27201,7 @@ mod file_ops_service {
                 None,
                 Some(src.to_string_lossy().into_owned()),
                 None,
+                None,
             )
             .await
             .expect("place from sourcePath");
@@ -27337,12 +27219,17 @@ mod file_ops_service {
             (None, Some("relative/path.txt".to_string())),
         ] {
             let res = svc
-                .file_place_attachment(ws.clone(), "f.bin".to_string(), data, source_path, None)
+                .file_place_attachment(
+                    ws.clone(),
+                    "f.bin".to_string(),
+                    data,
+                    source_path,
+                    None,
+                    None,
+                )
                 .await;
             assert!(matches!(res, Err(Error::InvalidParams(_))), "{res:?}");
         }
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `file.getAttachmentInfo` (PROTOCOL §5.9): serves the registry row with
@@ -27355,9 +27242,8 @@ mod file_ops_service {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
-        let dir = std::env::temp_dir().join(format!("intentd-attinfo-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir_guard = test_tempdir("intentd-attinfo-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
@@ -27370,6 +27256,7 @@ mod file_ops_service {
                 Some(base64::engine::general_purpose::STANDARD.encode(b"hello")),
                 None,
                 Some("text/plain".to_string()),
+                None,
             )
             .await
             .expect("place");
@@ -27397,8 +27284,398 @@ mod file_ops_service {
         std::fs::remove_file(dir.join(".intent/attachments/notes.txt")).unwrap();
         let info2 = svc.file_get_attachment_info(id).await.expect("info 2");
         assert_eq!(info2["exists"], serde_json::json!(false));
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    /// Idempotent `file.placeAttachment` (intent-hq/intent#4691): a same-key
+    /// retry with the same payload replays the ORIGINAL result plus
+    /// `replayed: true` and places nothing; a different payload under the
+    /// same key is `InvalidParams`; keys are per-workspace; the binding is
+    /// durable across a store reopen (daemon restart); `getAttachmentInfo`
+    /// resolves a key (unknown → `InvalidParams`); a binding older than the
+    /// 7-day retention is swept lazily and the retry places afresh; the
+    /// `sourcePath` arm fingerprints on `(fileName, size)` only; and an
+    /// absent key is byte-identical to today (no `replayed` marker).
+    #[tokio::test]
+    async fn file_place_attachment_idempotency_key_replay_conflict_restart_expiry() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let other_ws = WorkspaceId::new();
+        let dir_guard = test_tempdir("intentd-attidem-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
+        let other_guard = test_tempdir("intentd-attidem-other-");
+        let other_dir = std::fs::canonicalize(other_guard.path()).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let mut w2 = workspace(&other_ws);
+        w2.worktree_path = Some(other_dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w2).await.expect("other ws");
+        let svc = Services::new(store);
+
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let attachments = |root: &std::path::Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(root.join(".intent/attachments"))
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| n != ".gitignore")
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+
+        // Absent key: unchanged shape, no `replayed` marker.
+        let plain = svc
+            .file_place_attachment(
+                ws.clone(),
+                "plain.txt".to_string(),
+                Some(b64(b"plain")),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("plain place");
+        assert!(plain.get("replayed").is_none(), "{plain}");
+
+        // First keyed placement: same result shape as an unkeyed one.
+        let first = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                Some("text/plain".to_string()),
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("first keyed place");
+        assert!(first.get("replayed").is_none(), "{first}");
+        let first_id = first["attachmentId"].as_str().unwrap().to_string();
+        assert_eq!(
+            first["path"],
+            serde_json::json!(".intent/attachments/report.txt")
+        );
+        assert_eq!(attachments(&dir), vec!["plain.txt", "report.txt"]);
+
+        // Lost-reply replay: identical result + `replayed: true`, nothing new
+        // on disk, same registry row.
+        let replay = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                Some("text/plain".to_string()),
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("replay");
+        let mut expected = first.clone();
+        expected["replayed"] = serde_json::json!(true);
+        assert_eq!(replay, expected);
+        assert_eq!(attachments(&dir), vec!["plain.txt", "report.txt"]);
+
+        // Same key, different bytes → conflict (nothing placed).
+        let conflict = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v2")),
+                None,
+                None,
+                Some("key-A".to_string()),
+            )
+            .await;
+        match conflict {
+            Err(Error::InvalidParams(m)) => {
+                assert!(m.contains("different payload"), "{m}");
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        // Same key, same bytes, different fileName → also a conflict.
+        let renamed = svc
+            .file_place_attachment(
+                ws.clone(),
+                "renamed.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                None,
+                Some("key-A".to_string()),
+            )
+            .await;
+        assert!(
+            matches!(renamed, Err(Error::InvalidParams(_))),
+            "{renamed:?}"
+        );
+        assert_eq!(attachments(&dir), vec!["plain.txt", "report.txt"]);
+
+        // Cross-workspace isolation: the same key in another workspace is a
+        // fresh binding.
+        let other = svc
+            .file_place_attachment(
+                other_ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"other bytes")),
+                None,
+                None,
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("other ws place");
+        assert!(other.get("replayed").is_none(), "{other}");
+        assert_ne!(other["attachmentId"], first["attachmentId"]);
+
+        // Lookup by key: found (per workspace) / unknown.
+        let by_key = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-A".to_string())
+            .await
+            .expect("lookup by key");
+        assert_eq!(by_key["attachmentId"], serde_json::json!(first_id));
+        assert_eq!(by_key["fileName"], serde_json::json!("report.txt"));
+        assert_eq!(by_key["mimeType"], serde_json::json!("text/plain"));
+        assert_eq!(by_key["exists"], serde_json::json!(true));
+        let other_by_key = svc
+            .file_get_attachment_info_by_key(other_ws.clone(), "key-A".to_string())
+            .await
+            .expect("lookup other ws");
+        assert_eq!(other_by_key["attachmentId"], other["attachmentId"]);
+        let unknown = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-nope".to_string())
+            .await;
+        match unknown {
+            Err(Error::InvalidParams(m)) => {
+                assert!(m.contains("unknown idempotency key"), "{m}");
+            }
+            other => panic!("expected unknown key, got {other:?}"),
+        }
+
+        // Key validation: empty / padded / oversized keys are rejected.
+        for bad in ["", " key", "key ", &"k".repeat(129)] {
+            let res = svc
+                .file_place_attachment(
+                    ws.clone(),
+                    "v.txt".to_string(),
+                    Some(b64(b"v")),
+                    None,
+                    None,
+                    Some(bad.to_string()),
+                )
+                .await;
+            assert!(
+                matches!(res, Err(Error::InvalidParams(_))),
+                "{bad:?}: {res:?}"
+            );
+        }
+        let empty_lookup = svc
+            .file_get_attachment_info_by_key(ws.clone(), String::new())
+            .await;
+        assert!(matches!(empty_lookup, Err(Error::InvalidParams(_))));
+
+        // `sourcePath` arm: `(fileName, size)` fingerprint — same name and
+        // size replays even when the bytes differ; a different size conflicts.
+        let src = dir.join("src-a.bin");
+        std::fs::write(&src, b"AAAA").unwrap();
+        let sp_first = svc
+            .file_place_attachment(
+                ws.clone(),
+                "copied.bin".to_string(),
+                None,
+                Some(src.to_string_lossy().into_owned()),
+                None,
+                Some("key-SP".to_string()),
+            )
+            .await
+            .expect("sourcePath place");
+        std::fs::write(&src, b"BBBB").unwrap();
+        let sp_replay = svc
+            .file_place_attachment(
+                ws.clone(),
+                "copied.bin".to_string(),
+                None,
+                Some(src.to_string_lossy().into_owned()),
+                None,
+                Some("key-SP".to_string()),
+            )
+            .await
+            .expect("sourcePath replay");
+        assert_eq!(sp_replay["replayed"], serde_json::json!(true));
+        assert_eq!(sp_replay["attachmentId"], sp_first["attachmentId"]);
+        std::fs::write(&src, b"CCCCC").unwrap();
+        let sp_conflict = svc
+            .file_place_attachment(
+                ws.clone(),
+                "copied.bin".to_string(),
+                None,
+                Some(src.to_string_lossy().into_owned()),
+                None,
+                Some("key-SP".to_string()),
+            )
+            .await;
+        assert!(
+            matches!(sp_conflict, Err(Error::InvalidParams(_))),
+            "{sp_conflict:?}"
+        );
+        // A missing source under a key still classifies as the source error.
+        let sp_missing = svc
+            .file_place_attachment(
+                ws.clone(),
+                "gone.bin".to_string(),
+                None,
+                Some(dir.join("gone.bin").to_string_lossy().into_owned()),
+                None,
+                Some("key-GONE".to_string()),
+            )
+            .await;
+        match sp_missing {
+            Err(Error::InvalidParams(m)) => assert!(m.contains("does not exist"), "{m}"),
+            other => panic!("expected source error, got {other:?}"),
+        }
+
+        // Daemon restart: the binding lives in the store, so a reopened
+        // service stack replays it.
+        drop(svc);
+        let store = Store::open(&tmp.path).await.expect("reopen store");
+        let svc = Services::new(store);
+        let after_restart = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                Some("text/plain".to_string()),
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("replay after restart");
+        assert_eq!(after_restart, expected);
+        assert_eq!(
+            attachments(&dir),
+            vec!["copied.bin", "plain.txt", "report.txt"]
+        );
+
+        // Expiry: back-date the binding past the 7-day retention. The next
+        // keyed call sweeps it and places afresh (collision-suffixed, new
+        // id, no `replayed`); the key now resolves to the new row.
+        sqlx::query("UPDATE attachment_idempotency_keys SET created_at = ? WHERE key = ?")
+            .bind(intent_core::iso_minutes_ago(8 * 24 * 60))
+            .bind("key-A")
+            .execute(svc.store().write_pool())
+            .await
+            .expect("back-date binding");
+        let expired_lookup = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-A".to_string())
+            .await;
+        assert!(
+            matches!(expired_lookup, Err(Error::InvalidParams(_))),
+            "{expired_lookup:?}"
+        );
+        let fresh = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                Some("text/plain".to_string()),
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("place after expiry");
+        assert!(fresh.get("replayed").is_none(), "{fresh}");
+        assert_ne!(fresh["attachmentId"], serde_json::json!(first_id));
+        assert_eq!(fresh["fileName"], serde_json::json!("report-2.txt"));
+        let rebound = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-A".to_string())
+            .await
+            .expect("lookup rebound key");
+        assert_eq!(rebound["attachmentId"], fresh["attachmentId"]);
+        // The original row is untouched by the sweep.
+        let original = svc
+            .file_get_attachment_info(first_id)
+            .await
+            .expect("original row survives");
+        assert_eq!(original["fileName"], serde_json::json!("report.txt"));
+    }
+
+    /// Concurrent same-key placements (intent-hq/intent#4691) yield exactly
+    /// one registry row and one file: the per-`(workspace, key)` in-flight
+    /// guard serializes the callers, so one places and the rest replay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_place_attachment_idempotency_key_concurrent_callers_yield_one_row() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let dir_guard = test_tempdir("intentd-attidem-race-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let svc = std::sync::Arc::new(Services::new(store));
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"racing bytes");
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let svc = svc.clone();
+            let ws = ws.clone();
+            let b64 = b64.clone();
+            handles.push(tokio::spawn(async move {
+                svc.file_place_attachment(
+                    ws,
+                    "race.bin".to_string(),
+                    Some(b64),
+                    None,
+                    None,
+                    Some("key-race".to_string()),
+                )
+                .await
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.expect("join").expect("keyed place"));
+        }
+
+        let ids: std::collections::BTreeSet<String> = results
+            .iter()
+            .map(|r| r["attachmentId"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 1, "{results:?}");
+        let placed = results
+            .iter()
+            .filter(|r| r.get("replayed").is_none())
+            .count();
+        assert_eq!(placed, 1, "exactly one caller places: {results:?}");
+        assert!(
+            results
+                .iter()
+                .filter(|r| r["replayed"] == serde_json::json!(true))
+                .count()
+                == 7,
+            "{results:?}"
+        );
+        for r in &results {
+            assert_eq!(r["fileName"], serde_json::json!("race.bin"), "{r}");
+        }
+        let files: Vec<String> = std::fs::read_dir(dir.join(".intent/attachments"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != ".gitignore")
+            .collect();
+        assert_eq!(files, vec!["race.bin"]);
+        // The in-flight registry is drained once every caller has released.
+        assert!(svc
+            .attachment_idempotency_inflight
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
     /// `ws.file.getAttachment` backing op: copies the registered file into
@@ -27414,9 +27691,8 @@ mod file_ops_service {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
-        let dir = std::env::temp_dir().join(format!("intentd-attget-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir_guard = test_tempdir("intentd-attget-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
@@ -27429,6 +27705,7 @@ mod file_ops_service {
                 Some(base64::engine::general_purpose::STANDARD.encode(b"pdf bytes")),
                 None,
                 Some("application/pdf".to_string()),
+                None,
             )
             .await
             .expect("place");
@@ -27498,8 +27775,6 @@ mod file_ops_service {
         }
         // No partial copy left behind.
         assert!(!dir.join("elsewhere/spec.pdf").exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Containment: a tampered registry row (escaping `stored_path` or
@@ -27512,7 +27787,10 @@ mod file_ops_service {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
-        let dir = std::env::temp_dir().join(format!("intentd-atttamper-{}", uuid::Uuid::new_v4()));
+        // The workspace root is a child of the swept tempdir so the escape
+        // targets below (siblings of the root) are swept with it.
+        let base = test_tempdir("intentd-atttamper-");
+        let dir = base.path().join("ws");
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
         let mut w = workspace(&ws);
@@ -27520,10 +27798,7 @@ mod file_ops_service {
         store.insert_workspace(&w).await.expect("ws");
 
         // A file OUTSIDE the workspace root that a tampered row points at.
-        let outside = dir.parent().unwrap().join(format!(
-            "intentd-atttamper-outside-{}.txt",
-            uuid::Uuid::new_v4()
-        ));
+        let outside = dir.parent().unwrap().join("outside.txt");
         std::fs::write(&outside, b"secret").unwrap();
 
         let escaping = intent_store::AttachmentRecord {
@@ -27600,9 +27875,6 @@ mod file_ops_service {
             Err(Error::NotFound(msg)) => assert!(msg.contains("unknown attachment id"), "{msg}"),
             other => panic!("expected NotFound, got {other:?}"),
         }
-
-        let _ = std::fs::remove_file(&outside);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
@@ -27779,6 +28051,7 @@ mod file_ops_service {
                     ws_id.clone(),
                     "brief.md".to_string(),
                     Some(base64::engine::general_purpose::STANDARD.encode(b"# brief")),
+                    None,
                     None,
                     None,
                 )
@@ -29223,21 +29496,15 @@ mod clone_orchestration {
     use intent_core::{WorkspaceApi, WorkspaceCreate, WorkspaceId};
     use intent_store::Store;
 
-    use super::TempDb;
+    use super::{test_tempdir, TempDb};
     use crate::{Error, EventBus, Services, SubscriptionFilter};
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Temp directory tree swept on drop (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
+        let guard = test_tempdir(&format!("{prefix}-"));
+        TempDir(guard.path().to_path_buf(), guard)
     }
 
     /// Init a small git repo with one commit; returns the guard.
@@ -29245,6 +29512,17 @@ mod clone_orchestration {
         let dir = unique_dir(prefix);
         seed_repo_at(&dir.0);
         dir
+    }
+
+    /// Init a small git repo at `<tmp>/Mixed-Owner/Mixed-Repo`: explicitly
+    /// mixed-case owner/repo segments so the raw `file://` pair always
+    /// differs from the case-folded cache slot, regardless of the tempdir's
+    /// random suffix. Returns the guard and the repo path.
+    fn seed_mixed_case_repo(prefix: &str) -> (TempDir, PathBuf) {
+        let dir = unique_dir(prefix);
+        let repo_dir = dir.0.join("Mixed-Owner").join("Mixed-Repo");
+        seed_repo_at(&repo_dir);
+        (dir, repo_dir)
     }
 
     /// Init a small git repo with one commit at `dir` (created if missing).
@@ -29281,19 +29559,27 @@ mod clone_orchestration {
     }
 
     /// Expected `<root>/.repo-cache/<owner>/<repo>` slot for `url`. The cache
-    /// key comes from the host-agnostic URL parse; persisted owner/name do
-    /// not (only strict `github.com` URLs seed them), so tests must not
-    /// derive the slot from the workspace row.
+    /// key comes from the host-agnostic URL parse and is folded by the same
+    /// `cache_path_for` helper the daemon uses; persisted owner/name do not
+    /// (only strict `github.com` URLs seed them), so tests must not derive
+    /// the slot from the workspace row.
     fn expected_cache_dir(root: &std::path::Path, url: &str) -> PathBuf {
-        let (owner, repo) = crate::clone_ops::parse_owner_repo(url).expect("owner/repo");
-        root.join(".repo-cache").join(owner).join(repo)
+        let (owner, repo) = intent_core::GitRemoteUrl::parse(url)
+            .and_then(|u| u.repo_slug())
+            .expect("owner/repo")
+            .identity_parts();
+        intent_git::repo_cache::cache_path_for(
+            &intent_git::repo_cache::cache_root_for(root),
+            &owner,
+            &repo,
+        )
     }
 
     /// `githubUrl` → daemon clones via `file://` (fast, hermetic), sets
     /// `repositoryPath` to the clone target, and streams `git:clone:progress`
     /// + `git:clone:done` under the new workspace id before the row insert
     /// and `workspace:created`. Owner/name derivation from a real GitHub URL
-    /// is covered by `clone_ops::tests::parse_owner_repo_handles_https_and_ssh`.
+    /// is covered by `intent_core::git_remote_url` goldens.
     #[tokio::test]
     async fn create_clones_github_url_before_worktree() {
         let source = seed_repo("intentd-clone-src");
@@ -29364,8 +29650,8 @@ mod clone_orchestration {
         // Sanity: the host-agnostic parse (cache key) does yield acme/widget,
         // so the persisted row must be distinguishing on the host alone.
         assert_eq!(
-            crate::clone_ops::parse_owner_repo(&url),
-            Some(("acme".to_string(), "widget".to_string()))
+            intent_core::GitRemoteUrl::parse(&url).and_then(|u| u.repo_slug()),
+            Some(intent_core::RepoRef::new("acme", "widget"))
         );
 
         let root = unique_dir("intentd-nongh-root");
@@ -29591,7 +29877,7 @@ mod clone_orchestration {
     /// does not seed `repositoryOwner` (basename fallback still names the row).
     #[tokio::test]
     async fn create_hydrates_from_cache_on_miss() {
-        let source = seed_repo("intentd-hydrate-src");
+        let (_source, source_dir) = seed_mixed_case_repo("intentd-hydrate-src");
         let root = unique_dir("intentd-hydrate-root");
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29601,7 +29887,7 @@ mod clone_orchestration {
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
 
-        let url = format!("file://{}", source.0.to_string_lossy());
+        let url = format!("file://{}", source_dir.to_string_lossy());
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
@@ -29657,7 +29943,7 @@ mod clone_orchestration {
     /// and hydrates a second, independent checkout.
     #[tokio::test]
     async fn second_create_hydrates_from_refreshed_cache_without_reclone() {
-        let source = seed_repo("intentd-hydrate2-src");
+        let (_source, source_dir) = seed_mixed_case_repo("intentd-hydrate2-src");
         let root = unique_dir("intentd-hydrate2-root");
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29666,7 +29952,7 @@ mod clone_orchestration {
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
-        let url = format!("file://{}", source.0.to_string_lossy());
+        let url = format!("file://{}", source_dir.to_string_lossy());
         let ws1 = svc
             .create_workspace(
                 WorkspaceCreate {
@@ -29885,7 +30171,7 @@ mod clone_orchestration {
             "worktree is distinct from the cloned repo"
         );
         assert!(
-            !root.0.join(".repo-cache").exists(),
+            !intent_git::repo_cache::cache_root_for(&root.0).exists(),
             "explicit clonePath must not touch the repo cache"
         );
     }
@@ -29895,7 +30181,7 @@ mod clone_orchestration {
     /// untouched for future creates.
     #[tokio::test]
     async fn delete_hydrated_workspace_removes_checkout_keeps_cache() {
-        let source = seed_repo("intentd-hydrate-del-src");
+        let (_source, source_dir) = seed_mixed_case_repo("intentd-hydrate-del-src");
         let root = unique_dir("intentd-hydrate-del-root");
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29904,7 +30190,7 @@ mod clone_orchestration {
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
-        let url = format!("file://{}", source.0.to_string_lossy());
+        let url = format!("file://{}", source_dir.to_string_lossy());
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
@@ -30459,26 +30745,30 @@ mod repo_warm_cache {
     use std::time::Duration;
 
     use intent_core::{Error, WorkspaceApi};
+    use intent_git::repo_cache::{cache_path_for, cache_root_for};
     use intent_store::Store;
 
-    use super::TempDb;
+    use super::{test_tempdir, TempDb};
     use crate::Services;
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Temp directory tree swept on drop (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
+        let guard = test_tempdir(&format!("{prefix}-"));
+        TempDir(guard.path().to_path_buf(), guard)
     }
 
-    /// Init a small git repo with one commit; returns the guard.
+    /// The on-disk cache slot for `owner`/`repo`: the daemon case-folds both
+    /// segments while the warm result echoes the raw case, so derive the
+    /// slot through the daemon's own `cache_path_for` rather than joining.
+    fn cache_slot(root: &std::path::Path, owner: &str, repo: &str) -> PathBuf {
+        cache_path_for(&cache_root_for(root), owner, repo)
+    }
+
+    /// Init a small git repo with one commit; returns the guard. Pass a
+    /// mixed-case `prefix` so the repo segment (the dir name) always differs
+    /// from its case-folded cache slot.
     fn seed_repo(prefix: &str) -> TempDir {
         let dir = unique_dir(prefix);
         let repo = git2::Repository::init(&dir.0).unwrap();
@@ -30514,10 +30804,11 @@ mod repo_warm_cache {
         loop {
             match svc.repo_warm_cache(url.to_string()).await {
                 Ok(v) => {
-                    let cache = root
-                        .join(".repo-cache")
-                        .join(v["owner"].as_str().unwrap())
-                        .join(v["repo"].as_str().unwrap());
+                    let cache = cache_slot(
+                        root,
+                        v["owner"].as_str().unwrap(),
+                        v["repo"].as_str().unwrap(),
+                    );
                     // The accepted re-warm proves the flag cleared; the
                     // populated cache proves the first ensure ran.
                     assert!(cache.join(".git").exists(), "repo cache populated");
@@ -30540,7 +30831,7 @@ mod repo_warm_cache {
     /// in-flight flag so a later warm is accepted again.
     #[tokio::test]
     async fn warm_starts_populates_cache_and_clears_flag() {
-        let source = seed_repo("intentd-warm-src");
+        let source = seed_repo("Intentd-Warm-Src");
         let root = unique_dir("intentd-warm-root");
         let (svc, _db) = services_with_root(&root).await;
 
@@ -30569,16 +30860,18 @@ mod repo_warm_cache {
     /// while the lock holder runs on the blocking pool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn second_warm_rejected_while_in_flight() {
-        let source = seed_repo("intentd-warm-busy-src");
+        let source = seed_repo("Intentd-Warm-Busy-Src");
         let root = unique_dir("intentd-warm-busy-root");
         let (svc, _db) = services_with_root(&root).await;
 
         let url = format!("file://{}", source.0.to_string_lossy());
-        let (owner, repo) = crate::clone_ops::parse_owner_repo(&url).unwrap();
-        let cache_path = root.0.join(".repo-cache").join(&owner).join(&repo);
+        let slot = intent_core::GitRemoteUrl::parse(&url)
+            .and_then(|u| u.repo_slug())
+            .unwrap();
+        let cache_path = cache_slot(&root.0, &slot.owner, &slot.name);
 
-        // Park the warm's ensure behind the per-repo cache lock so the
-        // in-flight window is deterministic.
+        // Park the warm's ensure behind the per-repo cache lock (keyed by
+        // the case-folded slot) so the in-flight window is deterministic.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
         let lock_holder = tokio::spawn(async move {
@@ -30602,8 +30895,8 @@ mod repo_warm_cache {
                 owner: busy_owner,
                 repo: busy_repo,
             }) => {
-                assert_eq!(busy_owner, owner, "busy error names the warming owner");
-                assert_eq!(busy_repo, repo, "busy error names the warming repo");
+                assert_eq!(busy_owner, slot.owner, "busy error names the warming owner");
+                assert_eq!(busy_repo, slot.name, "busy error names the warming repo");
             }
             other => panic!("expected WarmInFlight, got {other:?}"),
         }
@@ -31701,7 +31994,8 @@ mod browser_routing {
     /// Register an open tab of `ws` on `host`, owned by `owner` when given.
     /// Both the workspace and the host client are foreign keys of the row,
     /// so they are created on demand (`setup` already knows `desktop-a` /
-    /// `desktop-b` and the primary workspace).
+    /// `desktop-b` and the primary workspace). User tabs report
+    /// `displayed: true`, agent tabs `false` (hidden).
     async fn register_tab(
         svc: &Services,
         ws: &WorkspaceId,
@@ -31737,6 +32031,7 @@ mod browser_routing {
                 "ownerAgentId": owner,
                 "visibility": "hidden",
                 "emulatedSize": owner.map(|_| json!({ "width": 1280, "height": 800 })),
+                "displayed": owner.is_none(),
             }))
             .unwrap(),
         )
@@ -31841,13 +32136,14 @@ mod browser_routing {
             json!({
                 "tabId": "t-user", "workspaceId": ws.0, "url": "https://t-user.test/",
                 "title": "t-user", "ownerAgentId": null, "mode": "native",
-                "visibility": "hidden", "hostClientId": "desktop-a",
+                "visibility": "hidden", "displayed": true, "hostClientId": "desktop-a",
                 "hostName": "Desktop A", "hostConnected": true
             })
         );
         assert_eq!(tabs[1]["ownerAgentId"], "agent-1");
         assert_eq!(tabs[1]["mode"], "emulated");
         assert_eq!(tabs[1]["width"], 1280);
+        assert_eq!(tabs[1]["displayed"], false);
         assert_eq!(tabs[1]["hostClientId"], "desktop-b");
         assert_eq!(tabs[1]["hostConnected"], false, "desktop-b is not live");
         assert!(tabs[1].get("hostName").is_none());
@@ -31933,9 +32229,74 @@ mod browser_routing {
         assert_eq!(scoped["success"], true);
     }
 
+    /// intent-hq/intent#4835: `displayed` rides the registry-answered
+    /// `listTabs` entry exactly as the host last reported it — a host that
+    /// never reported it yields no key (never a default `false`), and a
+    /// later report flipping it is diffed into `browser:tab-updated {
+    /// changes: { displayed } }` and reflected on the next list.
+    #[tokio::test]
+    async fn list_tabs_carries_displayed_as_reported() {
+        let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
+        let (_t, _r, svc, bus, ws) = setup(reg).await;
+        let host = ClientId::from_string("desktop-a");
+        let report = |displayed: Option<bool>| -> intent_core::BrowserTabInput {
+            serde_json::from_value(json!({
+                "tabId": "t-legacy",
+                "workspaceId": ws.0,
+                "url": "https://t-legacy.test/",
+                "visibility": "visible",
+                "displayed": displayed,
+            }))
+            .unwrap()
+        };
+        svc.browser_upsert_tab(host.clone(), report(None))
+            .await
+            .expect("registered without displayed");
+        let list = || {
+            svc.browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+        };
+        let out = list().await.expect("list");
+        assert_eq!(out["result"][0]["tabId"], "t-legacy");
+        assert!(
+            out["result"][0].get("displayed").is_none(),
+            "never reported ⇒ omitted, not false: {}",
+            out["result"][0]
+        );
+
+        let events = tokio::spawn({
+            let bus = bus.clone();
+            let ws = ws.clone();
+            async move { tab_events(&bus, &ws, 1).await }
+        });
+        tokio::task::yield_now().await;
+        let updated = svc
+            .browser_upsert_tab(host.clone(), report(Some(true)))
+            .await
+            .expect("re-reported with displayed");
+        assert_eq!(updated.displayed, Some(true));
+        let evs = events.await.unwrap();
+        assert_eq!(evs[0]["type"], "browser:tab-updated");
+        assert_eq!(evs[0]["data"]["changes"], json!({ "displayed": true }));
+        assert_eq!(evs[0]["data"]["tab"]["displayed"], true);
+        assert_eq!(list().await.unwrap()["result"][0]["displayed"], true);
+
+        svc.browser_upsert_tab(host, report(Some(false)))
+            .await
+            .expect("flipped displayed");
+        assert_eq!(list().await.unwrap()["result"][0]["displayed"], false);
+    }
+
     /// Model 5: a `claimTab` the driving client executed on a tab another
     /// client hosted re-homes the row (host + owner) with one
-    /// `browser:tab-updated`; a failed claim moves nothing.
+    /// `browser:tab-updated`; a failed claim moves nothing. The move clears
+    /// the previous host's `displayed` fact (`changes.displayed: null`, absent
+    /// on the event `tab` and the next list) until the new host reports it;
+    /// a same-host owner-only claim keeps it (intent-hq/intent#4835).
     #[tokio::test]
     async fn successful_claim_migrates_the_tab_to_the_driving_client() {
         let reg = two_clients();
@@ -31964,6 +32325,7 @@ mod browser_routing {
             .unwrap();
         assert_eq!(row.host_client_id, ClientId::from_string("desktop-b"));
         assert!(row.owner_agent_id.is_none());
+        assert_eq!(row.displayed, Some(true), "desktop-b reported the fact");
 
         // Now drive the migration the way a confirmed `claimTab` does.
         let events = tokio::spawn({
@@ -31987,12 +32349,28 @@ mod browser_routing {
             .unwrap();
         assert_eq!(row.host_client_id, ClientId::from_string("desktop-a"));
         assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
+        assert_eq!(
+            row.displayed, None,
+            "desktop-a has not reported the layout fact yet"
+        );
         let evs = events.await.unwrap();
         assert_eq!(evs[0]["type"], "browser:tab-updated");
         assert_eq!(
             evs[0]["data"]["changes"],
-            json!({ "hostClientId": "desktop-a", "ownerAgentId": "agent-1" })
+            json!({ "hostClientId": "desktop-a", "ownerAgentId": "agent-1", "displayed": null })
         );
+        assert!(evs[0]["data"]["tab"].get("displayed").is_none());
+        let listed = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed["result"][0]["tabId"], "user-tab");
+        assert!(listed["result"][0].get("displayed").is_none());
         // Re-homing the same tab to its current host and owner is a no-op
         // (no event).
         svc.browser_tab_claim_migrate(
@@ -32012,7 +32390,7 @@ mod browser_routing {
 
         // A claim of a tab the driving client already hosts records the
         // owner immediately (no wait for the host's own report) with
-        // `changes: { ownerAgentId }` only.
+        // `changes: { ownerAgentId }` only — the host's `displayed` stays.
         register_tab(&svc, &ws, "local-tab", "desktop-a", None).await;
         let events = tokio::spawn({
             let bus = bus.clone();
@@ -32035,9 +32413,11 @@ mod browser_routing {
             .unwrap();
         assert_eq!(row.host_client_id, ClientId::from_string("desktop-a"));
         assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
+        assert_eq!(row.displayed, Some(true), "same-host claim keeps the fact");
         let evs = events.await.unwrap();
         assert_eq!(evs[0]["type"], "browser:tab-updated");
         assert_eq!(evs[0]["data"]["tab"]["tabId"], "local-tab");
+        assert_eq!(evs[0]["data"]["tab"]["displayed"], true);
         assert_eq!(
             evs[0]["data"]["changes"],
             json!({ "ownerAgentId": "agent-1" })
@@ -32313,9 +32693,11 @@ mod browser_routing {
         let evs = events.await.unwrap();
         assert_eq!(evs[0]["type"], "browser:tab-updated");
         assert_eq!(evs[0]["data"]["tab"]["tabId"], "tab-on-a");
+        // The re-homed row drops desktop-a's `displayed` fact; the same-host
+        // row keeps desktop-b's.
         assert_eq!(
             evs[0]["data"]["changes"],
-            json!({ "hostClientId": "desktop-b", "ownerAgentId": "agent-1" })
+            json!({ "hostClientId": "desktop-b", "ownerAgentId": "agent-1", "displayed": null })
         );
         assert_eq!(evs[1]["type"], "browser:tab-updated");
         assert_eq!(evs[1]["data"]["tab"]["tabId"], "tab-on-b");
@@ -32339,8 +32721,10 @@ mod browser_routing {
     }
 
     /// Model 10: setting the pin moves every claimed tab of the workspace to
-    /// the new driving client (one `browser:tab-updated` each); unclaimed
-    /// tabs and other workspaces stay put; clearing the pin moves nothing.
+    /// the new driving client (one `browser:tab-updated` each, clearing the
+    /// old host's `displayed` fact: `changes.displayed: null`); unclaimed
+    /// tabs and other workspaces stay put (fact retained); clearing the pin
+    /// moves nothing.
     #[tokio::test]
     async fn set_browser_client_migrates_claimed_tabs() {
         let reg = two_clients();
@@ -32375,26 +32759,30 @@ mod browser_routing {
             assert_eq!(ev["type"], "browser:tab-updated");
             assert_eq!(
                 ev["data"]["changes"],
-                json!({ "hostClientId": "desktop-b" })
+                json!({ "hostClientId": "desktop-b", "displayed": null })
             );
+            assert!(ev["data"]["tab"].get("displayed").is_none());
         }
-        let host_of = |id: &str| {
+        let row_of = |id: &str| {
             let svc = svc.clone();
             let id = id.to_string();
-            async move {
-                svc.store
-                    .get_browser_tab(&id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .host_client_id
-                    .0
-            }
+            async move { svc.store.get_browser_tab(&id).await.unwrap().unwrap() }
+        };
+        let host_of = |id: &str| {
+            let row = row_of(id);
+            async move { row.await.host_client_id.0 }
         };
         assert_eq!(host_of("user-tab").await, "desktop-a");
         assert_eq!(host_of("mine-1").await, "desktop-b");
         assert_eq!(host_of("mine-2").await, "desktop-b");
         assert_eq!(host_of("elsewhere").await, "desktop-a");
+        assert_eq!(row_of("user-tab").await.displayed, Some(true), "not moved");
+        assert_eq!(row_of("mine-1").await.displayed, None, "moved: unknown");
+        assert_eq!(
+            row_of("elsewhere").await.displayed,
+            Some(false),
+            "not moved"
+        );
 
         svc.set_workspace_browser_client(ws.clone(), None)
             .await
@@ -33222,20 +33610,41 @@ mod last_activity_events {
     /// its own entry before the delete's sweep runs, so the sweep finds no
     /// handle to abort) — must not emit the spurious `{ idle }` event, and
     /// must still remove its own map entry.
+    ///
+    /// The interleaving is made explicit (intent#4846): the row delete is
+    /// awaited BEFORE `agent_activity_end` arms the timer. Arming first and
+    /// deleting second let the debounce window expire while the real store
+    /// delete was still in flight under package load, so the timer's
+    /// existence probe found the row and emitted the `{ idle }` this test
+    /// forbids. Deleting first produces the same fire-time state the guard
+    /// is for — entry still present, gen/count guards pass, row gone —
+    /// without the timer racing the delete's I/O.
     #[tokio::test]
     async fn idle_timer_firing_against_deleted_workspace_skips_emit() {
         let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
         let mut sub = subscribe(&h);
 
-        // Last in-flight session ends → idle flip scheduled.
+        // Session enters flight (emits the agent_running flip) while the row
+        // still exists.
         h.services.agent_activity_begin(&h.ws).await;
-        h.services.agent_activity_end(&h.ws);
 
         // Delete the row directly in the store, bypassing the services-layer
-        // sweep — the interleaving where the timer fires while the delete is
-        // mid-flight (entry still present, gen/count guards pass, row gone).
+        // sweep, and await it before the timer is armed: the fire is then
+        // guaranteed to observe the deleted row.
         h.store.delete_workspace(&h.ws).await.expect("row delete");
+
+        // Last in-flight session ends → idle flip scheduled against the
+        // already-deleted id.
+        h.services.agent_activity_end(&h.ws);
+        assert!(
+            h.services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "idle flip must be pending before the timer fires"
+        );
 
         // Bounded poll: the timer fires, hits the emit-time existence guard,
         // and must still sweep its map entry on the way out.
@@ -35592,6 +36001,63 @@ mod turn_token_usage {
         }
         let ws = h.store.get_workspace(&h.ws).await.expect("reload");
         assert_eq!(ws.token_usage.unwrap().totals.output_tokens, 30);
+    }
+
+    /// #3801: opencode (and the opencode-based unsloth) report the turn's
+    /// LAST-REQUEST counters exactly like codex — both seams fold them with
+    /// SUM keyed on the resolved provider id, so a second, smaller report
+    /// adds to the tally instead of replacing it (and records in full in
+    /// the hourly delta instead of clamping to zero).
+    #[tokio::test]
+    async fn opencode_and_unsloth_last_request_reports_sum_at_both_seams() {
+        for provider in ["opencode", "unsloth"] {
+            let h = harness().await;
+            let agent = AgentId::new();
+            let mut session = agent_session(&agent, &h.ws, "gemma-3-27b-it");
+            session.provider = Some(provider.into());
+            h.store
+                .insert_agent_session(&session)
+                .await
+                .expect("insert session");
+            let now = time::OffsetDateTime::now_utc();
+
+            // Turn 1: the final request of a tool loop cost 70/50.
+            // Turn 2: a short turn whose final request cost 30/20 — REPLACE
+            // would leave the tally at 30/20, cumulative subtraction would
+            // clamp the hourly delta to zero.
+            for (input, output) in [(70, 50), (30, 20)] {
+                h.services
+                    .record_turn_usage_stats(
+                        &agent,
+                        &h.ws,
+                        Some(&acp_usage(input, output, 0, 0)),
+                        Duration::from_secs(1),
+                        now,
+                        true,
+                    )
+                    .await;
+                h.services
+                    .persist_turn_token_usage(
+                        &agent,
+                        &h.ws,
+                        Some(&acp_usage(input, output, 0, 0)),
+                        None,
+                    )
+                    .await;
+            }
+
+            let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+            let usage = ws.token_usage.expect("usage persisted");
+            assert_eq!(usage.totals.input_tokens, 100, "{provider}: sum, not last");
+            assert_eq!(usage.totals.output_tokens, 70, "{provider}");
+            assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100, "{provider}");
+
+            let rows = h.store.list_usage_stats_hourly().await.expect("stats rows");
+            let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+            let output: u64 = rows.iter().map(|r| r.output_tokens).sum();
+            assert_eq!(input, 100, "{provider}: each report is its own delta");
+            assert_eq!(output, 70, "{provider}");
+        }
     }
 
     /// #3795: a codex totals-only report (`totalTokens > 0`, every breakdown
@@ -39048,23 +39514,16 @@ mod local_changes {
     use intent_core::{now_iso, Error, WorkspaceId};
     use intent_store::Store;
 
-    use super::{workspace, TempDb};
+    use super::{test_tempdir, workspace, TempDb};
     use crate::Services;
 
-    /// Self-cleaning temp directory.
-    struct TempDir(PathBuf);
+    /// Self-cleaning temp directory (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     impl TempDir {
         fn new() -> Self {
-            let p = std::env::temp_dir().join(format!("intentd-lc-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&p).unwrap();
-            Self(p)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let guard = test_tempdir("intentd-lc-");
+            Self(guard.path().to_path_buf(), guard)
         }
     }
 
@@ -39186,8 +39645,8 @@ mod local_changes {
         let wt = TempDir::new();
         empty_repo(&wt.0);
         let (_t, svc, ws) = setup(Some(&wt.0), false).await;
-        let gone = std::env::temp_dir().join(format!("intentd-lc-gone-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&gone).unwrap();
+        let gone_guard = test_tempdir("intentd-lc-gone-");
+        let gone = gone_guard.path().to_path_buf();
         let root = git_root(&ws.id, &gone);
         svc.store().upsert_workspace_git_root(&root).await.unwrap();
         std::fs::remove_dir_all(&gone).unwrap();

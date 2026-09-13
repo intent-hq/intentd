@@ -4086,15 +4086,20 @@ pub enum ScriptMode {
 }
 
 /// Runtime status of a script process (ported from the TS `ScriptStatus`,
-/// plus `restarting` — new in intentd, monorepo#1318). `restarting` covers the
-/// restart-in-flight window (the auto-restart backoff and the `script.restart`
-/// stop→start gap) so clients can distinguish it from a final exit; the
-/// respawn flips it back to `running`.
+/// plus `restarting` — new in intentd, monorepo#1318 — and `starting` —
+/// intent-hq/intent#4858). `restarting` covers the restart-in-flight window
+/// (the auto-restart backoff and the `script.restart` stop→start gap) so
+/// clients can distinguish it from a final exit; the respawn flips it back to
+/// `running`. `starting` covers the `script.start` launch window: it is set
+/// synchronously before `script.start` replies and holds until the spawn's
+/// `running` (or `exited` on a spawn failure), so a status read after `start`
+/// returns never observes the pre-launch `idle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptStatus {
     #[default]
     Idle,
+    Starting,
     Running,
     Restarting,
     Exited,
@@ -4511,6 +4516,13 @@ pub struct BrowserTabSize {
 /// `url` / `title`; every other client is a viewer. `tab_id` is minted by the
 /// host and unique per daemon. Panel geometry is client-local and never
 /// stored.
+///
+/// `displayed` is the host-reported **layout fact** of the hidden-by-default
+/// contract (§5.9, monorepo#3045): `true` when the tab is not hidden AND is
+/// the active tab of the panel holding it in the workspace's saved layout.
+/// `None` means the host has never reported it (a pre-`displayed` host, or
+/// no report yet since the daemon started — see the store's process-local
+/// overlay); it is never `false` by default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserTab {
@@ -4530,6 +4542,8 @@ pub struct BrowserTab {
     pub visibility: BrowserTabVisibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emulated_size: Option<BrowserTabSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed: Option<bool>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -4590,6 +4604,9 @@ impl BrowserTab {
                 serde_json::json!(input.emulated_size),
             );
         }
+        if self.displayed != input.displayed {
+            changes.insert("displayed".to_string(), serde_json::json!(input.displayed));
+        }
         changes
     }
 
@@ -4606,6 +4623,7 @@ impl BrowserTab {
             owner_agent_name,
             visibility,
             emulated_size,
+            displayed,
         } = input;
         self.workspace_id = workspace_id;
         self.url = url;
@@ -4615,6 +4633,7 @@ impl BrowserTab {
         self.owner_agent_name = owner_agent_name;
         self.visibility = visibility;
         self.emulated_size = emulated_size;
+        self.displayed = displayed;
     }
 }
 
@@ -4640,6 +4659,10 @@ pub struct BrowserTabInput {
     pub visibility: BrowserTabVisibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emulated_size: Option<BrowserTabSize>,
+    /// Layout fact (see [`BrowserTab::displayed`]); omitted / `null` when
+    /// the host does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed: Option<bool>,
 }
 
 /// Outcome of a host-reported `browser.upsertTab`: the persisted row plus

@@ -28,24 +28,16 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
     workspaces_root: PathBuf,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-srv-id-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-srv-id-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -66,7 +58,7 @@ async fn boot() -> Fixture {
         _ws: ws,
         port,
         workspaces_root,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -252,8 +244,8 @@ async fn workspace_create_with_initial_agent_id_leaves_no_partial_workspace() {
 
     // A real git repo so worktree provisioning WOULD run if the create got
     // past the agentId rejection guard.
-    let repo_dir =
-        std::env::temp_dir().join(format!("srv-id-repo-{}", uuid::Uuid::new_v4().simple()));
+    let repo_guard = common::test_tempdir("srv-id-repo-");
+    let repo_dir = repo_guard.path().to_path_buf();
     init_git_repo(&repo_dir);
 
     let list_before = wss_rpc_raw(&mut rpc, 3, "workspace.list", json!({})).await;
@@ -318,6 +310,4 @@ async fn workspace_create_with_initial_agent_id_leaves_no_partial_workspace() {
         evt["workspaceId"], sentinel_id,
         "first observed workspace:created must be the sentinel's (no leak from the failed create): {evt}"
     );
-
-    let _ = std::fs::remove_dir_all(&repo_dir);
 }

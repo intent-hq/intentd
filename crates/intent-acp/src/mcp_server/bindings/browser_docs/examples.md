@@ -135,20 +135,24 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
 // → { tabId: "tab-ui1", url: "http://localhost:5173/", displayed: true, ... }
 // `displayed` is optional on openTab results: when the layout state could not be
 // confirmed (stale tab list, tab not listed) the field is omitted — absent means
-// unknown, not false. Re-check with listTabs, which always reports it:
+// unknown, not false. Re-check with listTabs, which carries the host's current
+// report when the daemon holds one (also absent = unknown, never false):
 // → { tabId: "tab-ui1", url: "http://localhost:5173/", ... }   (no displayed)
 ```
 
 ## Visible but Not Displayed
 
-`visibility: "visible"` means the tab is mounted in the user's panel layout; it does
-not mean the tab can paint. Only a panel's active tab renders, so a visible tab that
-the user (or another open) pushed behind a sibling is `displayed: false` — and a
-screenshot of it fails with a not-painting error. Check `displayed` and bring the tab
-to the front with `showTab` (no focus change) before capturing. `displayed` is a
-saved-layout fact (visible AND active in its panel), not a paint guarantee: a
-`displayed: true` tab still paints only while its workspace is in view and its panel
-is not hidden by zoom, so a not-painting error can occur on a displayed tab too.
+`visibility: "visible"` means the tab is in the user's panel layout; it does not mean
+the tab can paint. Only a panel's active tab renders, so a visible tab that the user
+(or another open) pushed behind a sibling is `displayed: false`. A capture op mounts
+such a tab on demand, but if its surface still does not paint (the capture times out
+at its own cap, or returns an empty image) the op fails with
+`errorCode: "not-painting"`. Check `displayed` and bring the tab to the front
+with `showTab` (no focus change) before capturing. `displayed` is a saved-layout fact
+(visible AND active in its panel), not a paint guarantee: a `displayed: true` tab
+whose panel is hidden by zoom can fail with `not-painting` too, and the field is
+absent (unknown, not `false`) whenever the daemon holds no current host report for
+it.
 
 ```json
 {
@@ -184,7 +188,14 @@ All of this works even when the workspace is not currently visible in the app: t
 operations succeed and apply their effects to the persisted layout state, and
 `showTab { focus: true }` / `focusTab` / `openTab { visible: true }` skip the actual
 UI focus attempt, carrying a workspace-not-visible `warning` string in the action
-result.
+result. A capture op (`screenshot`, `getAccessibilityTree`, `evaluate`) on an unmounted
+tab of a not-in-view workspace mounts the tab on demand under the request deadline and
+succeeds with the same `warning`; when the mount, settle, or paint cannot happen it
+fails with a structured `errorCode` (`workspace-not-visible`, `deadline-exhausted`,
+`still-loading`, `navigated-away`, `not-painting`). `navigate` mounts on demand too but
+without the deadline, settle, or origin check, so of these mount/capture codes it can
+only yield `workspace-not-visible` (ownership and uncoded failures still apply) — see
+the overview topic.
 
 ## Opening Local HTML Files
 
