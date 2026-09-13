@@ -10,7 +10,7 @@
 //! ([`OutboundSender`] / [`OutboundReceiver`], priority lane first).
 
 use intent_core::events::{NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, WORKSPACE_UPDATED};
-use intent_core::{AgentId, ClientId, NoteId, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, ClientId, Event, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -1055,11 +1055,13 @@ pub(crate) async fn handle_sub_fast_path(
                         return false;
                     }
                 }
+                let membership = ChannelMembership::for_current_caller(api, bus, &workspace_id);
                 let handle = spawn_forwarder(forward_note_subscription(
                     api.clone(),
                     WorkspaceId::from(workspace_id),
                     projection,
                     subscription,
+                    membership,
                     subscription_id.clone(),
                     out_tx.clone(),
                     timer,
@@ -1201,6 +1203,12 @@ pub(crate) async fn handle_sub_fast_path(
                         collaborator_only: crate::context::is_non_administrator_caller(),
                         ..Default::default()
                     });
+                    // The global `workspace` channel re-reads its rows and
+                    // scopes its tombstones itself (see the forwarder); the
+                    // workspace-scoped channels take the membership boundary.
+                    let membership = workspace_id
+                        .as_deref()
+                        .and_then(|ws| ChannelMembership::for_current_caller(api, bus, ws));
                     let subscription_id = events::next_subscription_id();
                     if id.present {
                         let frame = events::success_frame(
@@ -1218,6 +1226,7 @@ pub(crate) async fn handle_sub_fast_path(
                             .map_or_else(|| WorkspaceId::from(String::new()), WorkspaceId::from),
                         note_id.map(NoteId::from),
                         subscription,
+                        membership,
                         subscription_id.clone(),
                         out_tx.clone(),
                         timer,
@@ -1259,6 +1268,94 @@ where
     ))
 }
 
+/// A non-administrator subscriber's delivery-time membership boundary on a
+/// workspace-scoped collection channel (`note` / `task` / `agent` /
+/// `comment`, multiplayer w3). The channels' `added` / `updated` rows come
+/// from guarded re-reads, but their `removedIds` tombstones are mapped from
+/// the event alone, so every event is checked against the
+/// [`events::MembershipGate`] before mapping; the side subscription on the
+/// workspace's `workspace:updated` feeds membership changes to the gate, and
+/// the subscriber's own unshare ends the forwarder.
+struct ChannelMembership {
+    gate: events::MembershipGate,
+    events: Option<Subscription>,
+    workspace_id: String,
+}
+
+impl ChannelMembership {
+    /// The boundary for the current request's caller on `workspace_id`, or
+    /// `None` for an administrator (or unbound) caller.
+    fn for_current_caller(
+        api: &Arc<dyn WorkspaceApi>,
+        bus: &EventBus,
+        workspace_id: &str,
+    ) -> Option<Self> {
+        let gate = events::MembershipGate::for_current_caller(api)?;
+        let events = bus.subscribe(SubscriptionFilter {
+            event_types: vec![WORKSPACE_UPDATED.to_string()],
+            workspace_id: Some(workspace_id.to_string()),
+            batch_window: None,
+            collaborator_only: true,
+            ..Default::default()
+        });
+        Some(Self {
+            gate,
+            events: Some(events),
+            workspace_id: workspace_id.to_string(),
+        })
+    }
+}
+
+/// The next batch of `subscription` a channel forwarder may map, with the
+/// events `membership` refuses removed (every event when the subscriber is
+/// no member). `None` once the bus closes or the subscriber's own unshare of
+/// the channel's workspace arrives — the forwarder ends.
+async fn recv_visible(
+    subscription: &mut Subscription,
+    membership: &mut Option<ChannelMembership>,
+) -> Option<Vec<Event>> {
+    let Some(ChannelMembership {
+        gate,
+        events,
+        workspace_id,
+    }) = membership.as_mut()
+    else {
+        return subscription.recv().await;
+    };
+    loop {
+        tokio::select! {
+            biased;
+            maybe = async { events.as_mut().expect("guarded").recv().await },
+                if events.is_some() =>
+            {
+                match maybe {
+                    Some(batch) => {
+                        for event in &batch {
+                            gate.observe_membership_event(event);
+                            if gate.is_own_unshare(event)
+                                && event.workspace_id.as_str() == workspace_id
+                            {
+                                return None;
+                            }
+                        }
+                    }
+                    None => *events = None,
+                }
+            },
+            maybe = subscription.recv() => {
+                let batch = maybe?;
+                let mut visible = Vec::with_capacity(batch.len());
+                for event in batch {
+                    if gate.allows(&event).await {
+                        visible.push(event);
+                    }
+                }
+                return Some(visible);
+            }
+        }
+    }
+}
+
 /// Per-subscription forwarder for the `note` collection channel. Materializes
 /// the snapshot (seq 0) from `list_notes`, then maps each `note:*` change event
 /// to a `{ added, updated, removedIds }` delta (re-reading the entity, §2.2) at
@@ -1268,11 +1365,13 @@ where
 /// at subscribe time: slim serves bounded `note_list_slim_row`s on the seq-0
 /// snapshot AND every `added`/`updated` delta, so no note-channel frame class
 /// escapes the bound; full (`None`) keeps the rows byte-identical to before.
+#[expect(clippy::too_many_arguments)]
 async fn forward_note_subscription(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     projection: Option<intent_core::NoteListProjection>,
     mut subscription: Subscription,
+    mut membership: Option<ChannelMembership>,
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
@@ -1295,7 +1394,7 @@ async fn forward_note_subscription(
     }
     timer.snapshot_emitted();
     let mut seq: u64 = 1;
-    while let Some(batch) = subscription.recv().await {
+    while let Some(batch) = recv_visible(&mut subscription, &mut membership).await {
         for event in batch {
             if let Some(delta) =
                 subscriptions::note_delta(api.as_ref(), &workspace_id, &event, projection).await
@@ -1740,6 +1839,7 @@ async fn forward_channel_subscription(
     workspace_id: WorkspaceId,
     note_id: Option<NoteId>,
     mut subscription: Subscription,
+    mut membership: Option<ChannelMembership>,
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
@@ -1788,7 +1888,7 @@ async fn forward_channel_subscription(
     }
     timer.snapshot_emitted();
     let mut seq: u64 = 1;
-    while let Some(batch) = subscription.recv().await {
+    while let Some(batch) = recv_visible(&mut subscription, &mut membership).await {
         for event in batch {
             let delta = if channel == Channel::Task {
                 subscriptions::task_delta(api.as_ref(), &workspace_id, &event, &mut spec_links)

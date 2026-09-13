@@ -4172,7 +4172,8 @@ mod channel_membership {
 
     use futures::future::BoxFuture;
     use intent_core::events::{
-        AGENT_TOOL_CALL, CHAT_STREAM_DELTA, WORKSPACE_DELETED, WORKSPACE_UPDATED,
+        AGENT_DELETED, AGENT_TOOL_CALL, CHAT_STREAM_DELTA, NOTE_DELETED, WORKSPACE_DELETED,
+        WORKSPACE_UPDATED,
     };
     use intent_core::{
         ActorType, AgentId, Caller, Error, EventActor, PrincipalId, Workspace, WorkspaceApi,
@@ -4187,14 +4188,28 @@ mod channel_membership {
 
     /// The service layer as a collaborator sees it: `workspace.get` /
     /// `workspace.list` answer only the `members` workspaces, and
-    /// `agent.getConversation` is an empty page (the guarded read).
+    /// `agent.getConversation` is the guarded read — an empty page for a
+    /// member's agent, `NotFound` otherwise (agent `agent-N` lives in
+    /// `ws-N`) — while the live-turn overlay reads (`agent_live_turn`,
+    /// `agent_is_busy`) are NOT gated, exactly as in production.
     struct MembershipApi {
         members: Arc<Mutex<HashSet<String>>>,
     }
 
+    impl MembershipApi {
+        fn allowed(&self, workspace_id: &str) -> bool {
+            !crate::context::is_non_administrator_caller()
+                || self.members.lock().unwrap().contains(workspace_id)
+        }
+    }
+
+    fn agent_workspace(agent_id: &str) -> String {
+        agent_id.replacen("agent-", "ws-", 1)
+    }
+
     impl WorkspaceApi for MembershipApi {
         fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, intent_core::Result<Workspace>> {
-            let allowed = self.members.lock().unwrap().contains(id.as_str());
+            let allowed = self.allowed(id.as_str());
             Box::pin(async move {
                 if allowed {
                     Ok(Workspace {
@@ -4235,7 +4250,11 @@ mod channel_membership {
             _projection: Option<intent_core::ConversationProjection>,
             _include_in_progress: bool,
         ) -> BoxFuture<'_, intent_core::Result<Value>> {
+            let allowed = self.allowed(&agent_workspace(agent_id.as_str()));
             Box::pin(async move {
+                if !allowed {
+                    return Err(Error::NotFound(format!("agent {agent_id}")));
+                }
                 Ok(json!({
                     "agentId": agent_id.as_str(),
                     "messages": [],
@@ -4244,6 +4263,19 @@ mod channel_membership {
                     "nextToken": Value::Null,
                 }))
             })
+        }
+
+        fn agent_is_busy(&self, _agent_id: AgentId) -> bool {
+            true
+        }
+
+        fn agent_live_turn(&self, _agent_id: AgentId) -> Option<Value> {
+            Some(json!({
+                "messageId": "msg-live",
+                "contentBlocks": [
+                    { "id": "msg-live:0", "type": "text", "text": "live secret" }
+                ],
+            }))
         }
     }
 
@@ -4389,6 +4421,37 @@ mod channel_membership {
 
     fn chat_subscribe(agent_id: &str) -> Value {
         json!({"jsonrpc":"2.0","id":1,"method":"chat.subscribe","params":{"agentId":agent_id}})
+    }
+
+    /// The seq-0 snapshot's live overlay follows the guarded page read: a
+    /// member connecting mid-turn gets the in-flight message, a non-member
+    /// gets the bare empty page — no live message, no streaming flag —
+    /// even though the overlay reads themselves are not gated.
+    #[tokio::test]
+    async fn chat_seq0_live_overlay_follows_the_guarded_read() {
+        let (_, caller) = guest();
+        let member = subscribe(caller.clone(), &["ws-1"], chat_subscribe("agent-1")).await;
+        assert_eq!(member.snapshot["messages"][0]["id"], "msg-live");
+        assert_eq!(
+            member.snapshot["messages"][0]["contentBlocks"][0]["text"],
+            "live secret"
+        );
+        drop(member.subs);
+
+        let stranger = subscribe(caller, &["ws-1"], chat_subscribe("agent-2")).await;
+        assert_eq!(
+            stranger.snapshot["messages"],
+            json!([]),
+            "{}",
+            stranger.snapshot
+        );
+        assert_eq!(stranger.snapshot["totalMessages"], 0);
+        assert!(
+            stranger.snapshot.get("isStreaming").is_none(),
+            "{}",
+            stranger.snapshot
+        );
+        drop(stranger.subs);
     }
 
     /// A non-member's `chat.subscribe` to a private workspace's agent gets
@@ -4576,6 +4639,130 @@ mod channel_membership {
             vec![json!({ "removedIds": ["ws-2"] })]
         );
         drop(h.subs);
+    }
+
+    fn channel_subscribe(method: &str, workspace_id: &str) -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":method,"params":{"workspaceId":workspace_id}})
+    }
+
+    fn note_deleted(workspace_id: &str, note_id: &str) -> NewEvent {
+        event(
+            NOTE_DELETED,
+            workspace_id,
+            None,
+            json!({ "workspaceId": workspace_id, "noteId": note_id }),
+        )
+    }
+
+    /// The workspace-scoped collection channels map `removedIds` from the
+    /// event alone, so a non-member's `note.subscribe` to a private
+    /// workspace must not receive its `note:deleted` tombstones.
+    #[tokio::test]
+    async fn note_deleted_tombstone_is_refused_to_a_non_member() {
+        let (_, caller) = guest();
+        let mut h = subscribe(
+            caller,
+            &["ws-1"],
+            channel_subscribe("note.subscribe", "ws-2"),
+        )
+        .await;
+        assert_eq!(h.snapshot, json!([]));
+        h.bus
+            .publish(&note_deleted("ws-2", "n-private"))
+            .await
+            .unwrap();
+        assert!(deltas(&mut h.rx).await.is_empty(), "no tombstone leaks");
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+        drop(h.subs);
+    }
+
+    /// A member's note channel tombstones deletions until its own removal
+    /// from the workspace, which ends the forwarder; another member's
+    /// removal leaves it live.
+    #[tokio::test]
+    async fn note_member_channel_ends_on_own_removal() {
+        let (principal_id, caller) = guest();
+        let mut h = subscribe(
+            caller,
+            &["ws-1"],
+            channel_subscribe("note.subscribe", "ws-1"),
+        )
+        .await;
+        h.bus.publish(&note_deleted("ws-1", "n-1")).await.unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["n-1"] })]
+        );
+
+        h.bus
+            .publish(&unshare("ws-1", "someone-else"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus.publish(&note_deleted("ws-1", "n-2")).await.unwrap();
+        assert_eq!(deltas(&mut h.rx).await.len(), 1);
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+
+        h.members.lock().unwrap().remove("ws-1");
+        h.bus
+            .publish(&unshare("ws-1", principal_id.as_str()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus.publish(&note_deleted("ws-1", "n-3")).await.unwrap();
+        assert!(deltas(&mut h.rx).await.is_empty(), "nothing after removal");
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(true));
+        drop(h.subs);
+    }
+
+    /// The generic TB-5 forwarder (`agent` channel here) takes the same
+    /// boundary: a private workspace's `agent:deleted` is silent for a
+    /// non-member and tombstoned for a member.
+    #[tokio::test]
+    async fn agent_deleted_tombstone_is_scoped_to_members() {
+        let (_, caller) = guest();
+        let deleted = |ws: &str, agent: &str| {
+            event(
+                AGENT_DELETED,
+                ws,
+                Some(agent),
+                json!({ "workspaceId": ws, "agentId": agent }),
+            )
+        };
+
+        let mut stranger = subscribe(
+            caller.clone(),
+            &["ws-1"],
+            channel_subscribe("agent.subscribe", "ws-2"),
+        )
+        .await;
+        stranger
+            .bus
+            .publish(&deleted("ws-2", "agent-2"))
+            .await
+            .unwrap();
+        assert!(
+            deltas(&mut stranger.rx).await.is_empty(),
+            "no tombstone leaks"
+        );
+        drop(stranger.subs);
+
+        let mut member = subscribe(
+            caller,
+            &["ws-1"],
+            channel_subscribe("agent.subscribe", "ws-1"),
+        )
+        .await;
+        member
+            .bus
+            .publish(&deleted("ws-1", "agent-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut member.rx).await,
+            vec![json!({ "removedIds": ["agent-1"] })]
+        );
+        drop(member.subs);
     }
 
     /// The administrator's global channel still tombstones every deletion.
