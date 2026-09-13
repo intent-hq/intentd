@@ -2554,7 +2554,7 @@ async fn set_content_retry_exhaustion_conflicts_without_writing() {
     assert_eq!((ok.new_content.as_str(), ok.rev), ("body accepted", 1));
 }
 
-/// Legacy history (snapshots from before migration 0120 carry `rev = NULL`)
+/// Legacy history (snapshots from before migration 0121 carry `rev = NULL`)
 /// transitions to recoverable revisions on its own: while no snapshot for the
 /// writer's rev exists, a stale `expectedVersion` is the documented
 /// last-writer-wins replace, and each such write records a snapshot at its
