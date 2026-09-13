@@ -1941,6 +1941,7 @@ async fn process_cap_events_queued_resumed_evicted() {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.unwrap();
     let (a, b) = (AgentId::from("a"), AgentId::from("b"));
@@ -4374,6 +4375,7 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.unwrap();
 
@@ -5187,6 +5189,7 @@ async fn seed_agent_with_task_graph(
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     let session = AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -11341,6 +11344,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store
         .insert_workspace(&workspace)
@@ -15878,6 +15882,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("existing workspace path resolves");
@@ -15993,6 +15998,7 @@ async fn resolve_spawn_falls_back_to_repository_path() {
         checkout_mode: Some(intent_core::CheckoutMode::Direct),
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("repository_path fallback resolves");
@@ -16411,6 +16417,7 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.unwrap();
 
@@ -16780,6 +16787,7 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
 
     assert_eq!(

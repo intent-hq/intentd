@@ -435,9 +435,10 @@ pub(crate) async fn process_frame(
             let bus = bus.clone();
             let reverse = reverse.clone();
             let is_tcp = crate::context::is_tcp_connection();
+            let caller = crate::context::current_caller();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                crate::context::with_connection_context(is_tcp, async {
+                crate::context::with_request_context(is_tcp, caller, async {
                     finish_slow_path_rpc(
                         permit,
                         panic_guard::guard_frame(
@@ -491,9 +492,10 @@ pub(crate) async fn process_frame(
                 .flatten();
             let registry = reverse_guard.registry();
             let is_tcp = crate::context::is_tcp_connection();
+            let caller = crate::context::current_caller();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                crate::context::with_connection_context(is_tcp, async {
+                crate::context::with_request_context(is_tcp, caller, async {
                     let tabs = browser::TabContext {
                         api: api.as_ref(),
                         client_id: host_client_id.as_ref(),
@@ -635,8 +637,9 @@ pub(crate) async fn process_frame(
     let api = api.clone();
     let raw = raw.to_string();
     let is_tcp = crate::context::is_tcp_connection();
+    let caller = crate::context::current_caller();
     tokio::spawn(async move {
-        crate::context::with_connection_context(is_tcp, async {
+        crate::context::with_request_context(is_tcp, caller, async {
             finish_slow_path_rpc(
                 permit,
                 panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)),

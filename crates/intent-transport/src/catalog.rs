@@ -218,6 +218,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "primitive.addCli",
     "primitive.addPatch",
     "primitive.addReference",
+    "principal.me",
     "providers.catalog",
     "repo.list",
     "repo.remove",

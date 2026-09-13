@@ -27,8 +27,23 @@
 //! The fallback (`unwrap_or(true)`) is fail-closed: missing context is treated
 //! as remote/untrusted. Request-handling paths are guaranteed to establish context;
 //! other code (e.g., background tasks) may call this without established context.
+//!
+//! ## Caller binding
+//!
+//! The same scopes carry the request's [`Caller`] (`intent_core::caller`):
+//! the transport binds it once per connection at admission (UDS → primary
+//! principal, administrator; WSS → the principal the upgrade credential
+//! resolved to) and [`with_request_context`] establishes both the origin flag
+//! and the caller per frame. Spawn sites capture [`current_caller`] alongside
+//! `is_tcp_connection()` and re-establish both. A connection whose principal
+//! could not be resolved runs with no caller bound, which consumers treat as
+//! forbidden (fail-closed).
 
 use std::cell::RefCell;
+use std::future::Future;
+
+use futures::future::Either;
+pub use intent_core::{current_caller, with_caller, Caller};
 
 tokio::task_local! {
     /// Connection origin for the current request task. Set by the transport layer
@@ -47,9 +62,32 @@ pub fn is_tcp_connection() -> bool {
 
 /// Run a future within a connection-context scope. The `is_tcp` flag will be
 /// visible to all code running within `f` via `is_tcp_connection()`.
-pub async fn with_connection_context<F, R>(is_tcp: bool, f: F) -> R
+///
+/// Returns the scope future directly (not an `async fn`): the wrapped
+/// per-frame request futures are very large, and an `async fn` wrapper
+/// would hold `f` twice (argument + scope), overflowing the tokio worker
+/// stack in debug builds.
+pub fn with_connection_context<F, R>(is_tcp: bool, f: F) -> impl Future<Output = R>
 where
-    F: std::future::Future<Output = R>,
+    F: Future<Output = R>,
 {
-    IS_TCP.scope(RefCell::new(is_tcp), f).await
+    IS_TCP.scope(RefCell::new(is_tcp), f)
+}
+
+/// Run a future within a connection-context scope that also binds the
+/// request's [`Caller`]. `None` establishes the origin flag only, leaving no
+/// caller bound (fail-closed for principal-gated consumers).
+pub fn with_request_context<F, R>(
+    is_tcp: bool,
+    caller: Option<Caller>,
+    f: F,
+) -> impl Future<Output = R>
+where
+    F: Future<Output = R>,
+{
+    let inner = match caller {
+        Some(caller) => Either::Left(with_caller(caller, f)),
+        None => Either::Right(f),
+    };
+    with_connection_context(is_tcp, inner)
 }

@@ -327,6 +327,7 @@ async fn seed_workspace(data_dir: &Path) -> String {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.expect("insert ws");
     id.0

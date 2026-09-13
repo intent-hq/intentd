@@ -411,6 +411,7 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.expect("insert ws");
     let note = services

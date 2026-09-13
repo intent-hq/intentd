@@ -5,9 +5,11 @@
 //! SHA-256 of the presented token — the service layer hashes, this module
 //! never sees plaintext.
 
+use std::collections::HashMap;
+
 use intent_core::{
     now_iso, Error, Principal, PrincipalCredential, PrincipalId, Result, WorkspaceId,
-    WorkspaceMember, WorkspaceRole,
+    WorkspaceMember, WorkspaceMembership, WorkspaceRole,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -145,6 +147,59 @@ impl Store {
         Ok(row
             .and_then(|r| r.get::<Option<String>, _>("owner_principal_id"))
             .map(PrincipalId))
+    }
+
+    /// Membership summaries for `workspace.get` / `workspace.list`
+    /// (multiplayer w1): owner, member count and `viewer`'s role, computed
+    /// in SQL in ONE query for every workspace (or just `workspace_id`),
+    /// keyed by workspace id. `viewer = None` yields no `my_role`.
+    /// `open_invite_count` is `0` until invitations exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn workspace_membership_summaries(
+        &self,
+        viewer: Option<&PrincipalId>,
+        workspace_id: Option<&WorkspaceId>,
+    ) -> Result<HashMap<WorkspaceId, WorkspaceMembership>> {
+        let mut sql = String::from(
+            "SELECT w.id AS workspace_id, w.owner_principal_id, \
+                (SELECT COUNT(*) FROM workspace_member m WHERE m.workspace_id = w.id) AS member_count, \
+                (SELECT m.role FROM workspace_member m \
+                    WHERE m.workspace_id = w.id AND m.principal_id = ?) AS my_role \
+             FROM workspace w",
+        );
+        if workspace_id.is_some() {
+            sql.push_str(" WHERE w.id = ?");
+        }
+        let mut query = sqlx::query(&sql).bind(viewer.map(|p| p.0.as_str()));
+        if let Some(id) = workspace_id {
+            query = query.bind(&id.0);
+        }
+        let rows = query
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("workspace membership summaries failed: {e}")))?;
+        rows.iter()
+            .map(|r| {
+                let my_role = r
+                    .get::<Option<String>, _>("my_role")
+                    .map(|role| enum_from_db::<WorkspaceRole>(&role))
+                    .transpose()?;
+                Ok((
+                    WorkspaceId(r.get("workspace_id")),
+                    WorkspaceMembership {
+                        owner_principal_id: r
+                            .get::<Option<String>, _>("owner_principal_id")
+                            .map(PrincipalId),
+                        my_role,
+                        member_count: u64::try_from(r.get::<i64, _>("member_count")).unwrap_or(0),
+                        open_invite_count: 0,
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// List a workspace's members, owners first then by `added_at`.
