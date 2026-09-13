@@ -9295,8 +9295,12 @@ impl Services {
     /// `cancelled` and the caller is the task's OWN linked agent (session
     /// `task_note_id` names the task, or the agent is in the task's
     /// `assignedAgentIds`), a move to a different status is refused as a
-    /// no-op — the result echoes the unchanged task plus `advisory`, no
-    /// event fires, and only the checkbox materialization still runs. Every
+    /// no-op — the result echoes the unchanged task plus `advisory` and none
+    /// of the task's own events (`task:status-changed`,
+    /// `task:ready-tasks-changed`, dependent `note:updated`) fire. The
+    /// checkbox materialization still runs, so a linked line whose marker
+    /// had drifted from the terminal status is healed with one parent write
+    /// and its `note:updated`; an already-correct marker stays untouched. Every
     /// other caller (unlinked agent, the caller-less router path) is
     /// unaffected. [`Self::terminal_guard_blocks`] is the predicate; the
     /// `task.update` redirect consults it before its parent write so the
@@ -22601,6 +22605,17 @@ impl WorkspaceApi for Services {
             // `cancelled` task) leaves the task where it is, so the line
             // projects the CURRENT status — the parent is never rewritten
             // with a marker the task write will not produce.
+            //
+            // Accepted window (intent-hq/intentd#1857): this projection and the
+            // parent write below are not serialized against the task note —
+            // no per-note or per-workspace write lock exists, and `set_task_note_status`
+            // re-reads the task itself. A task closed by another caller
+            // between this read and the parent write can leave the parent
+            // carrying the requested non-terminal marker for one revision;
+            // the guarded `set_task_note_status` then refuses the word and
+            // its materialization rewrites the terminal marker (one extra
+            // parent revision + `note:updated`). The task status itself is
+            // never wrong, and the parent self-heals within the same call.
             let redirect = match linked {
                 Some((task_id, task)) => {
                     let current = task.status;
