@@ -2742,6 +2742,25 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
         .map(str::to_string)
 }
 
+/// Metadata key under which the daemon stamps the authoring principal on
+/// every user-origin message row and queue entry (multiplayer w2). A key of
+/// its own, distinct from the agent-origin `fromAgentId` / `fromAgentName`
+/// stamp, so client user-authorship predicates keyed on those fields are
+/// unaffected. Daemon-authoritative: a client-supplied value is always
+/// overwritten (wire caller) or stripped (agent / daemon caller).
+pub const FROM_PRINCIPAL_ID_KEY: &str = "fromPrincipalId";
+
+/// Lift the stamped authoring principal out of a persisted `metadata`
+/// payload: `Some` only when the metadata is an object carrying a non-empty
+/// string under [`FROM_PRINCIPAL_ID_KEY`].
+pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<PrincipalId> {
+    metadata
+        .and_then(|m| m.get(FROM_PRINCIPAL_ID_KEY))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| PrincipalId(s.to_string()))
+}
+
 /// The harness version stamped on every newly created agent session
 /// (intent-hq/monorepo#2459). Single-source constant: session creation
 /// (`agent.create` and everything funneling through it — delegate,
