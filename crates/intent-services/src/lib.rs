@@ -66,6 +66,7 @@ mod auggie_cli;
 mod auto_commit;
 pub mod browser_ops;
 mod browser_tabs;
+mod capability;
 mod clone_ops;
 mod complete_ops;
 #[cfg(test)]
@@ -15824,6 +15825,7 @@ impl WorkspaceApi for Services {
                 Db,
                 Registry,
             }
+            Self::require_administrator("settings.update")?;
             let _revision_guard = self.settings_revision_gate.write().await;
             // A default-provider switch re-resolves `model.default` for the
             // new provider (monorepo#3177). Appended BEFORE the old-value
@@ -16103,6 +16105,7 @@ impl WorkspaceApi for Services {
 
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            Self::require_administrator("settings.reset")?;
             let _revision_guard = self.settings_revision_gate.write().await;
             let (result, changed) = self.settings_service().reset_with_change(&path).await?;
             let revision = if changed {
@@ -16200,6 +16203,9 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(ws) = workspace_id.as_ref() {
+                self.require_member(ws).await?;
+            }
             let path = match &workspace_id {
                 Some(ws) => ft_worktree(&self.store, ws).await,
                 None => None,
@@ -16229,6 +16235,7 @@ impl WorkspaceApi for Services {
         enabled: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let _revision_guard = self.settings_revision_gate.write().await;
             let path = ft_worktree(&self.store, &workspace_id).await;
             let (rules, changed) = rules::RulesService::new(&self.store)
@@ -16336,6 +16343,7 @@ impl WorkspaceApi for Services {
 
     fn skill_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Resolve workspace path (required for skills discovery)
             let ws = self.store.get_workspace(&workspace_id).await?;
             let workspace_path = crate::git_ops::worktree_path(&ws).ok_or_else(|| {
@@ -16371,6 +16379,7 @@ impl WorkspaceApi for Services {
         // (monorepo#4148).
         let service = self.specialists_service();
         Box::pin(async move {
+            Self::require_administrator("specialist.create")?;
             tokio::task::spawn_blocking(move || {
                 service.create(
                     &id,
@@ -16393,6 +16402,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let service = self.specialists_service();
         Box::pin(async move {
+            Self::require_administrator("specialist.edit")?;
             tokio::task::spawn_blocking(move || {
                 service.edit(&id, &spec, &scope, workspace_path.as_deref().map(Path::new))
             })
@@ -16409,6 +16419,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let service = self.specialists_service();
         Box::pin(async move {
+            Self::require_administrator("specialist.delete")?;
             tokio::task::spawn_blocking(move || {
                 service.delete(&id, &scope, workspace_path.as_deref().map(Path::new))
             })
@@ -16422,6 +16433,7 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            Self::require_administrator("mcp.serversList")?;
             self.mcp_servers_service()
                 .list(workspace_id.as_ref().map(WorkspaceId::as_str))
                 .await
@@ -16432,7 +16444,10 @@ impl WorkspaceApi for Services {
         &self,
         config: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.mcp_servers_service().create(config).await })
+        Box::pin(async move {
+            Self::require_administrator("mcp.serversCreate")?;
+            self.mcp_servers_service().create(config).await
+        })
     }
 
     fn mcp_servers_update(
@@ -16440,11 +16455,17 @@ impl WorkspaceApi for Services {
         server_id: String,
         config: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.mcp_servers_service().update(&server_id, config).await })
+        Box::pin(async move {
+            Self::require_administrator("mcp.serversUpdate")?;
+            self.mcp_servers_service().update(&server_id, config).await
+        })
     }
 
     fn mcp_servers_delete(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.mcp_servers_service().delete(&server_id).await })
+        Box::pin(async move {
+            Self::require_administrator("mcp.serversDelete")?;
+            self.mcp_servers_service().delete(&server_id).await
+        })
     }
 
     fn mcp_servers_toggle(
@@ -16454,6 +16475,7 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            Self::require_administrator("mcp.serversToggle")?;
             match workspace_id {
                 Some(ws) => {
                     let out = self
@@ -16484,22 +16506,34 @@ impl WorkspaceApi for Services {
     }
 
     fn mcp_servers_restart(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.mcp_servers_service().restart(&server_id).await })
+        Box::pin(async move {
+            Self::require_administrator("mcp.serversRestart")?;
+            self.mcp_servers_service().restart(&server_id).await
+        })
     }
 
     fn mcp_servers_get_status(
         &self,
         server_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.mcp_servers_service().get_status(&server_id).await })
+        Box::pin(async move {
+            Self::require_administrator("mcp.serversGetStatus")?;
+            self.mcp_servers_service().get_status(&server_id).await
+        })
     }
 
     fn mcp_oauth_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.mcp_oauth_service().list().await })
+        Box::pin(async move {
+            Self::require_administrator("mcp.oauthList")?;
+            self.mcp_oauth_service().list().await
+        })
     }
 
     fn mcp_oauth_get(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.mcp_oauth_service().get(&server_id).await })
+        Box::pin(async move {
+            Self::require_administrator("mcp.oauthGet")?;
+            self.mcp_oauth_service().get(&server_id).await
+        })
     }
 
     fn mcp_oauth_set(
@@ -16507,11 +16541,17 @@ impl WorkspaceApi for Services {
         server_id: String,
         token_bag: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.mcp_oauth_service().set(&server_id, token_bag).await })
+        Box::pin(async move {
+            Self::require_administrator("mcp.oauthSet")?;
+            self.mcp_oauth_service().set(&server_id, token_bag).await
+        })
     }
 
     fn mcp_oauth_delete(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.mcp_oauth_service().delete(&server_id).await })
+        Box::pin(async move {
+            Self::require_administrator("mcp.oauthDelete")?;
+            self.mcp_oauth_service().delete(&server_id).await
+        })
     }
 
     fn mcp_test_connection(
@@ -16521,6 +16561,7 @@ impl WorkspaceApi for Services {
         server_name: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            Self::require_administrator("mcp.testConnection")?;
             let mut headers = mcp_servers::header_pairs(headers.as_ref());
             // Inject the stored OAuth bag as the Authorization header when the
             // caller names a server and did not supply one explicitly (the raw
@@ -16552,6 +16593,7 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            Self::require_administrator("mcp.listServers")?;
             self.mcp_servers_service()
                 .agent_list_servers(workspace_id.as_ref().map(WorkspaceId::as_str))
                 .await
@@ -16564,6 +16606,7 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            Self::require_administrator("mcp.listTools")?;
             self.mcp_servers_service()
                 .agent_list_tools(workspace_id.as_ref().map(WorkspaceId::as_str), &server_id)
                 .await
@@ -16579,6 +16622,7 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            Self::require_administrator("mcp.callTool")?;
             self.mcp_servers_service()
                 .agent_call_tool(
                     workspace_id.as_ref().map(WorkspaceId::as_str),
@@ -16601,6 +16645,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let registry = self.search_cancels.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let opts = search_ops::parse_opts(opts)?;
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
@@ -16641,6 +16686,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let registry = self.search_cancels.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let limit = limit.and_then(|n| usize::try_from(n).ok());
             let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
@@ -16692,6 +16738,9 @@ impl WorkspaceApi for Services {
         let registry = self.search_cancels.clone();
         let services = self.clone();
         Box::pin(async move {
+            if let Some(ws) = workspace_id.as_ref() {
+                self.require_member(ws).await?;
+            }
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let token = registry.register(&request_id);
             // User-typed queries are never handed to the FTS5 parser verbatim
@@ -16728,6 +16777,9 @@ impl WorkspaceApi for Services {
         let registry = self.search_cancels.clone();
         let services = self.clone();
         Box::pin(async move {
+            if let Some(ws) = workspace_id.as_ref() {
+                self.require_member(ws).await?;
+            }
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let token = registry.register(&request_id);
             let limit = limit.and_then(|n| usize::try_from(n).ok());
@@ -16777,6 +16829,7 @@ impl WorkspaceApi for Services {
         let engine = self.context_engine.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
                 return Ok(serde_json::json!({ "requestId": request_id, "matches": [] }));
@@ -16852,6 +16905,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let settings = self.settings_registry.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             terminal_ops::create(
                 pty,
                 bus,
@@ -16904,7 +16958,10 @@ impl WorkspaceApi for Services {
     fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         let boot_id = self.daemon_boot_id.clone();
-        Box::pin(async move { terminal_ops::list(&pty, &workspace_id, &boot_id) })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            terminal_ops::list(&pty, &workspace_id, &boot_id)
+        })
     }
 
     fn terminal_read_output(
@@ -16917,6 +16974,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             terminal_ops::read_output(
                 &pty,
                 &workspace_id,
@@ -16936,6 +16994,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             file_ops::read(&root, &path)
@@ -16952,6 +17011,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             // Blocking thread: a 16 MiB window read should not stall the
@@ -16971,6 +17031,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             let result = file_ops::write(&root, &path, &content)?;
@@ -16996,6 +17057,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             // Containment checks and directory enumeration both touch the
@@ -17019,6 +17081,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             let result = file_ops::delete(&root, &path)?;
@@ -17040,6 +17103,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             file_ops::mkdir(&root, &path)
@@ -17055,6 +17119,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             let result = file_ops::rename(&root, &old_path, &new_path)?;
@@ -17138,6 +17203,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let root = file_ops::resolve_root(&store, &workspace_id, None).await;
             tokio::task::spawn_blocking(move || file_ops::tree(&root, &path))
                 .await
@@ -17152,6 +17218,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let root = file_ops::resolve_root(&store, &workspace_id, None).await;
             file_ops::exists(&root, &path)
         })
@@ -17164,6 +17231,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let root = file_ops::resolve_root(&store, &workspace_id, None).await;
             file_ops::stat(&root, &path)
         })
@@ -17179,6 +17247,7 @@ impl WorkspaceApi for Services {
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let idempotency_key = attachment_upload::validate_idempotency_key(idempotency_key)?;
             let decoded;
             let source = match (&data, &source_path) {
@@ -17260,6 +17329,7 @@ impl WorkspaceApi for Services {
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             self.file_attachment_upload_begin_op(
                 workspace_id,
                 file_name,
@@ -17324,6 +17394,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let key = attachment_upload::validate_idempotency_key(Some(idempotency_key))?
                 .unwrap_or_default();
             let bound = store
@@ -17353,6 +17424,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let record = store
                 .get_attachment(&attachment_id)
                 .await
@@ -17399,6 +17471,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let id = new_uuid();
             let created_at = now_iso();
             let primitive = primitive_ops::reference(
@@ -17432,6 +17505,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let id = new_uuid();
             let created_at = now_iso();
             let primitive = primitive_ops::cli(
@@ -17465,6 +17539,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let id = new_uuid();
             let created_at = now_iso();
             let primitive = primitive_ops::patch(&id, &created_at, &file_path, &diff, &description);
@@ -17492,6 +17567,8 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            self.require_agent_member(&AgentId::from_string(agent_id.clone()))
+                .await?;
             let id = new_uuid();
             let created_at = now_iso();
             let primitive =
@@ -17515,6 +17592,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let current = match store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(Error::NotFound(_)) => {
@@ -17527,7 +17605,8 @@ impl WorkspaceApi for Services {
                     "Current workspace is not associated with a repository".to_string(),
                 ));
             }
-            let all = store.list_workspaces(true).await?;
+            let mut all = store.list_workspaces(true).await?;
+            self.retain_member_workspaces(&mut all).await?;
             let siblings: Vec<serde_json::Value> = all
                 .into_iter()
                 .filter(|w| w.id != workspace_id && workspaces_share_repository(&current, w))
@@ -17553,6 +17632,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            self.require_member(&target_workspace_id).await?;
             sibling_workspace_or_throw(&store, &workspace_id, &target_workspace_id).await?;
             let notes = store.list_notes(&target_workspace_id).await?;
             let out: Vec<serde_json::Value> = notes
@@ -17578,6 +17659,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            self.require_member(&target_workspace_id).await?;
             let target =
                 sibling_workspace_or_throw(&store, &workspace_id, &target_workspace_id).await?;
             let note = match store.get_note(&target_workspace_id, &note_id).await {
@@ -17606,7 +17689,10 @@ impl WorkspaceApi for Services {
 
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.list(&workspace_id).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            mgr.list(&workspace_id).await
+        })
     }
 
     fn script_create(
@@ -17615,7 +17701,10 @@ impl WorkspaceApi for Services {
         params: ScriptCreateParams,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.create(workspace_id, params).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            mgr.create(workspace_id, params).await
+        })
     }
 
     fn script_remove(
@@ -17624,7 +17713,10 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.remove(&workspace_id, &script_id).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            mgr.remove(&workspace_id, &script_id).await
+        })
     }
 
     fn script_start(
@@ -17633,7 +17725,10 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.start(&workspace_id, &script_id) })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            mgr.start(&workspace_id, &script_id)
+        })
     }
 
     fn script_stop(
@@ -17642,7 +17737,10 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.stop(&workspace_id, &script_id).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            mgr.stop(&workspace_id, &script_id).await
+        })
     }
 
     fn script_restart(
@@ -17651,7 +17749,10 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.restart(&workspace_id, &script_id).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            mgr.restart(&workspace_id, &script_id).await
+        })
     }
 
     fn script_output(
@@ -17664,6 +17765,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             mgr.output(
                 &workspace_id,
                 &script_id,
@@ -17680,7 +17782,10 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.status(&workspace_id, &script_id) })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            mgr.status(&workspace_id, &script_id)
+        })
     }
 
     fn script_run(
@@ -17692,6 +17797,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             mgr.run(&workspace_id, &script_id, max_lines, timeout_seconds)
                 .await
         })
@@ -17702,6 +17808,9 @@ impl WorkspaceApi for Services {
         let this = self.clone();
         Box::pin(async move {
             let mut list = store.list_workspaces(include_archived).await?;
+            // Membership filter (multiplayer w3) before any enrichment, so a
+            // collaborator's rows never cost more than what it can see.
+            this.retain_member_workspaces(&mut list).await?;
             // `activity` is derived from live agent state, never persisted (§9.9);
             // the card aggregates are computed fresh on the emit path (§9.1).
             // Every store-backed aggregate is fetched once for the requested ids
@@ -17777,6 +17886,7 @@ impl WorkspaceApi for Services {
             // `displayStatus` (same derivation as the enriched path), and
             // `cowSupported` (lifetime-cached probe, effectively free).
             let mut list = store.list_workspaces(include_archived).await?;
+            this.retain_member_workspaces(&mut list).await?;
             let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
             let snapshot = this
                 .workspace_aggregate_snapshot(&workspace_ids, include_archived)
@@ -17809,6 +17919,9 @@ impl WorkspaceApi for Services {
             // than whatever the seeded row holds. `activity` still tracks live
             // Chief-of-Staff agents; card aggregates stay omitted (Chief has
             // no notes/tasks/PRs/diff to roll up).
+            // Membership gate (multiplayer w3): a non-member reads NotFound,
+            // the same answer as a workspace that does not exist.
+            this.require_member(&id).await?;
             if id.is_chief() {
                 let mut ws = chief_workspace();
                 ws.activity = this.workspace_activity(&id);
@@ -17830,18 +17943,27 @@ impl WorkspaceApi for Services {
     }
 
     fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.workspace_disk_usage_op(id).await })
+        Box::pin(async move {
+            self.require_member(&id).await?;
+            self.workspace_disk_usage_op(id).await
+        })
     }
 
     fn workspace_local_changes(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.workspace_local_changes_op(id).await })
+        Box::pin(async move {
+            self.require_member(&id).await?;
+            self.workspace_local_changes_op(id).await
+        })
     }
 
     fn workspace_transfer_plan(
         &self,
         id: WorkspaceId,
     ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
-        Box::pin(async move { self.workspace_transfer_plan_op(id).await })
+        Box::pin(async move {
+            self.require_owner(&id, "workspace.transferPlan").await?;
+            self.workspace_transfer_plan_op(id).await
+        })
     }
 
     fn workspace_import_begin(
@@ -17851,6 +17973,7 @@ impl WorkspaceApi for Services {
         archive_sha256: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            Self::require_administrator("workspace.importBegin")?;
             self.workspace_import_begin_op(manifest, archive_size_bytes, archive_sha256)
                 .await
         })
@@ -17862,25 +17985,37 @@ impl WorkspaceApi for Services {
         seq: u64,
         data: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.workspace_import_chunk_op(import_id, seq, data).await })
+        Box::pin(async move {
+            Self::require_administrator("workspace.importChunk")?;
+            self.workspace_import_chunk_op(import_id, seq, data).await
+        })
     }
 
     fn workspace_import_commit(
         &self,
         import_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.workspace_import_commit_op(import_id).await })
+        Box::pin(async move {
+            Self::require_administrator("workspace.importCommit")?;
+            self.workspace_import_commit_op(import_id).await
+        })
     }
 
     fn workspace_import_abort(
         &self,
         import_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.workspace_import_abort_op(import_id).await })
+        Box::pin(async move {
+            Self::require_administrator("workspace.importAbort")?;
+            self.workspace_import_abort_op(import_id).await
+        })
     }
 
     fn workspace_export_start(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.workspace_export_start_op(id).await })
+        Box::pin(async move {
+            self.require_owner(&id, "workspace.export.start").await?;
+            self.workspace_export_start_op(id).await
+        })
     }
 
     fn workspace_export_read(
@@ -20085,6 +20220,7 @@ impl WorkspaceApi for Services {
         }
         let changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
+            self.require_member(&id).await?;
             // Captured before the `if let` arms below move the fields out.
             let pr_fields_changed = update.pr_number.is_some()
                 || update.pr_url.is_some()
@@ -20270,6 +20406,7 @@ impl WorkspaceApi for Services {
         // Clone — the same capture pattern the spawn helpers use).
         let services = self.clone();
         Box::pin(async move {
+            self.require_owner(&id, "workspace.delete").await?;
             // Chief is virtual and never appears in `workspace.list`; delete is
             // a no-op success (TS `workspace.repository.delete` / virtual-guard
             // parity — the seeded row is not torn down and no cascade fires).
@@ -20818,6 +20955,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_owner(&id, "workspace.delete").await?;
             // Chief is virtual: mirror the immediate-delete no-op guard —
             // report a deadline but never arm a timer (the commit would be a
             // no-op anyway, and a pending marker on Chief makes no sense).
@@ -20883,6 +21021,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_owner(&id, "workspace.delete").await?;
             let cancelled = services.pending_workspace_deletes.cancel(id.as_str());
             if cancelled {
                 publish_event(bus.as_ref(), workspace_delete_cancelled_event(&id)).await;
@@ -20904,6 +21043,7 @@ impl WorkspaceApi for Services {
         // skips the sweep and still archives.
         let manager = self.agent_manager();
         Box::pin(async move {
+            self.require_owner(&id, "workspace.archive").await?;
             // Chief cannot be archived: it is a fixed virtual workspace, so
             // return the synthesized shape unchanged rather than mutating the
             // seeded row (TS virtual-workspace guard parity).
@@ -21050,6 +21190,7 @@ impl WorkspaceApi for Services {
         // no `autoUnarchive` stamp on the emitted delta (absent ≠
         // present-false, PROTOCOL §6.5). The flip bool is auto-path-only.
         Box::pin(async move {
+            self.require_owner(&id, "workspace.unarchive").await?;
             this.unarchive_workspace_inner(id, None)
                 .await
                 .map(|(ws, _)| ws)
@@ -21076,6 +21217,7 @@ impl WorkspaceApi for Services {
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
         Box::pin(async move {
+            self.require_owner(&id, "workspace.duplicate").await?;
             // Chief is virtual and never carries user content; duplication is
             // not meaningful (TS parity: coverflow never exposes a duplicate
             // affordance on the seeded row).
@@ -21674,6 +21816,7 @@ impl WorkspaceApi for Services {
             .unwrap_or_else(default_workspaces_root);
         let worktrees_location = self.configured_worktrees_location();
         Box::pin(async move {
+            self.require_owner(&id, "workspace.cleanup").await?;
             // Chief is virtual: no on-disk cache and no worktree — TS parity's
             // `isVirtualWorkspace` guard.
             if id.is_chief() {
@@ -21809,6 +21952,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let this = self.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             // Chief has no attention state to dismiss (synthesized as `None`).
             if id.is_chief() {
                 return Ok(chief_workspace());
@@ -21852,6 +21996,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let this = self.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             if id.is_chief() {
                 return Ok(chief_workspace());
             }
@@ -21952,6 +22097,7 @@ impl WorkspaceApi for Services {
     fn get_token_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<TokenUsage>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             // The scan job is daemon-internal; this is the wire read. Surface a
             // default (empty, `lastScanAt: null`) snapshot before the first scan;
             // `NotFound` propagates so the router maps it to `-32602` (§5.23).
@@ -21967,6 +22113,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let this = self.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             // Chief's seeded row is excluded from reads and never commits, so
             // force `source: "global"` regardless of the row's column — without
             // this guard a stray write to the seeded row would flip the source
@@ -21994,6 +22141,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            self.require_owner(&id, "workspace.setAutoCommit").await?;
             // Chief is virtual: nothing to persist and the toggle is not
             // meaningful for a workspace that never commits.
             if id.is_chief() {
@@ -22026,7 +22174,10 @@ impl WorkspaceApi for Services {
         &self,
         id: WorkspaceId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.browser_client_state(&id).await })
+        Box::pin(async move {
+            self.require_member(&id).await?;
+            self.browser_client_state(&id).await
+        })
     }
 
     fn set_workspace_browser_client(
@@ -22037,6 +22188,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             // Chief is virtual: no row to pin and no agent browser work runs
             // there.
             if id.is_chief() {
@@ -22095,6 +22247,7 @@ impl WorkspaceApi for Services {
     fn get_setup_script(&self, id: WorkspaceId) -> BoxFuture<'_, Result<SetupScript>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             let ws = store.get_workspace(&id).await?;
             // Read from repo config (§5.25 sole source of truth); synthesize the
             // SetupScript record from the string. Legacy fallback: if repo config
@@ -22138,6 +22291,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<SetupScript>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_owner(&id, "workspace.saveSetupScript").await?;
             // Write to repo config instead of the DB row (§5.25 sole source of truth).
             let ws = store.get_workspace(&id).await?;
             // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
@@ -22168,6 +22322,7 @@ impl WorkspaceApi for Services {
     fn detect_project_type(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Option<ProjectType>>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             let ws = store.get_workspace(&id).await?;
             Ok(git_ops::worktree_path(&ws).and_then(|p| setup_scripts::detect(&p)))
         })
@@ -22176,6 +22331,8 @@ impl WorkspaceApi for Services {
     fn generate_setup_script(&self, id: WorkspaceId) -> BoxFuture<'_, Result<SetupScript>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_owner(&id, "workspace.generateSetupScript")
+                .await?;
             // AI-assisted draft: the provider/agent path is not wired into this
             // service, so generation falls back to the deterministic per-project
             // template generator. Returned (not persisted) with `generatedBy:
@@ -22189,6 +22346,7 @@ impl WorkspaceApi for Services {
     fn get_repo_config(&self, id: WorkspaceId) -> BoxFuture<'_, Result<intent_core::RepoConfig>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             let ws = store.get_workspace(&id).await?;
             let Some(repo_path) = git_ops::worktree_path(&ws) else {
                 // No repo path → return empty config (tolerant, FE parity)
@@ -22205,6 +22363,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::RepoConfig>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_owner(&id, "repoConfig.save").await?;
             let ws = store.get_workspace(&id).await?;
             let Some(repo_path) = git_ops::worktree_path(&ws) else {
                 return Err(Error::Internal(
@@ -22218,6 +22377,7 @@ impl WorkspaceApi for Services {
     fn has_repo_config(&self, id: WorkspaceId) -> BoxFuture<'_, Result<bool>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             let ws = store.get_workspace(&id).await?;
             let Some(repo_path) = git_ops::worktree_path(&ws) else {
                 return Ok(false);
@@ -22229,6 +22389,7 @@ impl WorkspaceApi for Services {
     fn ensure_repo_intent_dir(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             let ws = store.get_workspace(&id).await?;
             let Some(repo_path) = git_ops::worktree_path(&ws) else {
                 return Err(Error::Internal(
@@ -22242,6 +22403,7 @@ impl WorkspaceApi for Services {
     fn get_workspace_context(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Vec<ContextItem>>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             // `NotFound` on missing workspace propagates so the router maps to
             // `-32602`; an empty list is the pre-first-save default (§5.1).
             store.get_workspace(&id).await?;
@@ -22257,6 +22419,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             store.get_workspace(&id).await?;
             let persisted = store.replace_workspace_context_items(&id, &items).await?;
             publish_event(
@@ -22274,6 +22437,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Option<serde_json::Value>>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             // `NotFound` on missing workspace propagates so the router maps to
             // `-32602`; `None` is the pre-first-save default (§5.1).
             store.get_workspace(&id).await?;
@@ -22288,6 +22452,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&id).await?;
             store.get_workspace(&id).await?;
             store.update_workspace_ui_context(&id, &ui_context).await
         })
@@ -22304,6 +22469,8 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            self.require_agent_member(&AgentId::from_string(agent_id.clone()))
+                .await?;
             store.get_workspace(&workspace_id).await?;
             let link = TaskAgentLink {
                 workspace_id: workspace_id.clone(),
@@ -22328,6 +22495,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             store.get_workspace(&workspace_id).await?;
             let removed = store
                 .delete_task_agent_link(&workspace_id, &note_id, &task_key)
@@ -22349,6 +22517,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Vec<TaskAgentLink>>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             store.get_workspace(&workspace_id).await?;
             store.list_task_agent_links(&workspace_id).await
         })
@@ -22417,6 +22586,7 @@ impl WorkspaceApi for Services {
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // Project `unmetDependsOn` (monorepo#1979). The dep-status index
             // is only needed — and only fetched — when the note actually has
@@ -22445,6 +22615,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if let Some(content) = input.content.as_deref() {
                 note_ops::reject_numbered_read_presentation(content)?;
             }
@@ -22530,6 +22701,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if let Some(content) = input.content.as_deref() {
                 note_ops::reject_numbered_read_presentation(content)?;
             }
@@ -22624,6 +22796,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             note_ops::reject_numbered_read_presentation(&input.content)?;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let (incoming, position) = note_ops::apply_add(
@@ -22711,6 +22884,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if input.old.is_empty() {
                 return Err(Error::Internal(
                     "old is required and cannot be empty".to_string(),
@@ -22802,6 +22976,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             note_ops::reject_numbered_read_presentation(&input.content)?;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let incoming =
@@ -22889,6 +23064,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Guard before the merge so a rejected write touches neither the
             // store nor the merge state.
             note_ops::reject_numbered_read_presentation(&content)?;
@@ -22978,6 +23154,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if title.is_none() && tags.is_none() {
                 return Err(Error::Internal(
                     "At least one of title or tags must be provided".to_string(),
@@ -23046,6 +23223,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Scope-check first so a foreign/absent note yields the peer message.
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             // Snapshot the pre-delete note list for the ready-set comparison
@@ -23142,6 +23320,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Vec<NoteTaskRow>>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let mut rows = note_ops::parse_tasks(&note.content);
             // Mirror linked task notes' relations onto their rows. One
@@ -23177,6 +23356,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<ReadAssetResult>> {
         let assets_root = self.assets_root.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let asset_id = note_ops::parse_asset_id(&asset)?;
             let root = assets_root
                 .ok_or_else(|| Error::Internal("asset storage is not configured".to_string()))?;
@@ -23207,6 +23387,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<SaveAssetResult>> {
         let assets_root = self.assets_root.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if intent_core::asset_extension_from_mime(&mime_type).is_none() {
                 return Err(Error::InvalidParams(format!(
                     "unsupported asset MIME type: {mime_type}"
@@ -23257,6 +23438,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Vec<NoteVersionSummary>>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Scope check: 404 if the note is missing or in another workspace.
             fetch_note(&store, &workspace_id, &note_id).await?;
             store.list_note_versions(&workspace_id, &note_id).await
@@ -23271,6 +23453,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<NoteVersion>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             fetch_note(&store, &workspace_id, &note_id).await?;
             store.get_note_version(&workspace_id, &note_id, v).await
         })
@@ -23287,6 +23470,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             let version = store.get_note_version(&workspace_id, &note_id, v).await?;
             note.title = version.title;
@@ -23334,6 +23518,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Option<LineAttributionData>>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Scope check: 404 if the note is missing or in another workspace.
             fetch_note(&store, &workspace_id, &note_id).await?;
             store
@@ -23349,6 +23534,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<LineAttributionComputeResult>> {
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             services
                 .compute_and_persist_line_attribution(&workspace_id, &note_id)
                 .await?;
@@ -23368,6 +23554,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if task_text.is_empty() {
                 return Err(Error::Internal(
                     "Task text is required to identify the task".to_string(),
@@ -23463,6 +23650,7 @@ impl WorkspaceApi for Services {
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let new_status = parse_task_status_strict(&status)?;
             self.set_task_note_status(
                 &workspace_id,
@@ -23489,6 +23677,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if text.is_none() && status.is_none() {
                 return Err(Error::Internal(
                     "Either text or status (or both) must be provided".to_string(),
@@ -23695,6 +23884,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskListResult>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let filter = match status.as_deref() {
                 Some(s) => Some(parse_task_status_strict(s)?),
                 None => None,
@@ -23720,6 +23910,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<WorkspaceTask>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let note = match store.get_note(&workspace_id, &task_note_id).await {
                 Ok(n) => n,
                 Err(Error::NotFound(_)) => {
@@ -23762,6 +23953,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskGetMyTaskResult>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let note = match store.get_note(&workspace_id, &task_note_id).await {
                 Ok(n) => n,
                 Err(Error::NotFound(_)) => {
@@ -23817,6 +24009,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let new_status =
                 serde_json::from_value::<TaskStatus>(serde_json::Value::String(status.clone()))
                     .map_err(|_| Error::Internal(format!("Invalid status: {status}")))?;
@@ -24030,6 +24223,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let Some(mut task) = note.metadata.task.clone() else {
                 return Err(Error::Internal("Note is not a task".to_string()));
@@ -24131,6 +24325,7 @@ impl WorkspaceApi for Services {
         // the outer write's caller-agent context.
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             services
                 .convert_task_blocks_op(workspace_id, note_id, caller_agent_id.as_ref())
                 .await
@@ -24148,6 +24343,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskCreatePrerequisiteResult>> {
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if let Some(content) = content.as_deref() {
                 note_ops::reject_numbered_read_presentation(content)?;
             }
@@ -24204,6 +24400,8 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_agent_member(&AgentId::from_string(agent_id.clone()))
+                .await?;
             if !is_valid_agent_id(&agent_id) {
                 return Err(Error::Internal(format!(
                     "Invalid agentId format: \"{agent_id}\". Agent IDs must be in format \"agent-{{uuid}}\" (e.g., \"agent-b0a8044a-5eac-4b52-8456-15d3b784decb\"). To create a new agent and assign it to this task, use create_agent with taskNoteId=\"{note_id}\" instead."
@@ -24345,6 +24543,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskRemoveAgentFromAllTasksResult>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             let notes = store.list_notes(&workspace_id).await?;
             let now = now_iso();
             let mut updated_count: u32 = 0;
@@ -24385,6 +24584,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
             let warn_note_id = note_id.clone();
@@ -24668,6 +24868,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<CommentListResult>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let since_dt = match &since {
                 Some(s) => match parse_iso(s) {
                     Some(dt) => Some(dt),
@@ -24787,6 +24988,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<CommentGetThreadResult>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if thread_id.is_none() && comment_id.is_none() {
                 return Err(Error::InvalidParams(
                     "Either threadId or commentId must be provided".to_string(),
@@ -24852,6 +25054,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if thread_id.is_none() && comment_id.is_none() {
                 return Err(Error::InvalidParams(
                     "Either threadId or commentId must be provided".to_string(),
@@ -24979,6 +25182,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<CommentDeleteResult>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             match store.delete_comment(&workspace_id, &comment_id).await {
                 Ok(()) => Ok(CommentDeleteResult {
                     success: true,
@@ -25003,6 +25207,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if thread_id.is_none() && comment_id.is_none() {
                 return Err(Error::InvalidParams(
                     "Either threadId or commentId must be provided".to_string(),
@@ -25055,6 +25260,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if let Some(agent_id) = agent_id {
                 // `getAgentFiles(agentId, 100)`: file:changed by that agent.
                 let mut q = EventQuery {
@@ -25102,6 +25308,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<WorkspaceEventSummary>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // TS `workspaceSummary(minutesAgo || 60)`.
             let minutes = minutes_ago.filter(|&m| m != 0).unwrap_or(60);
             let mut q = EventQuery {
@@ -25127,6 +25334,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Opt-in pagination (TA-2 / §5.5): the `{ items, nextToken }` envelope
             // is returned only when the caller engages pagination (`paginate` or a
             // `page_token`); otherwise the legacy bare array is preserved verbatim.
@@ -25253,6 +25461,7 @@ impl WorkspaceApi for Services {
         batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if event_types.is_empty() {
                 return Err(Error::Internal(
                     "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\".".to_string(),
@@ -25327,6 +25536,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitStatus>> {
         let svc = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Unknown workspace / remote / non-repo all return the empty status
             // (the TS `getStatus` fallbacks), never an error — but an unknown
             // `gitRootId` is `-32602` (monorepo#2053). The root resolves
@@ -25376,6 +25586,7 @@ impl WorkspaceApi for Services {
     fn git_root_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // A missing workspace is `NotFound` (router → -32602); a workspace
             // with no registered roots is an empty list (monorepo#2053).
             let _ = store.get_workspace(&workspace_id).await?;
@@ -25398,6 +25609,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             let ws = svc.store.get_workspace(&workspace_id).await?;
             let trimmed = path.trim();
             if trimmed.is_empty() {
@@ -25499,6 +25711,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let ws = svc.store.get_workspace(&workspace_id).await?;
             let trimmed = path.trim();
             if trimmed.is_empty() {
@@ -25543,6 +25756,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<String>> {
         let svc = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Unlike the workspace-scoped reads, a missing workspace is an
             // error here (the caller explicitly named a root to resolve).
             let ws = svc.store.get_workspace(&workspace_id).await?;
@@ -25556,6 +25770,7 @@ impl WorkspaceApi for Services {
     fn git_get_config(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<String>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // `NotFound` if the workspace is absent (router maps to `-32602`).
             // Remote workspaces return an empty string. For local workspaces,
             // attempts to read `.git/config` (resolving linked-worktree pointers),
@@ -25646,6 +25861,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Reject `.`/`*`/`--all` and parse first (TS `ws.git.stage` order).
             let path_list = git_ops::parse_stage_paths(&paths)?;
             // All stage failures surface as `-32603` (TS wraps the whole path in
@@ -25673,6 +25889,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Same `.`/`*`/`--all` rejection + CSV/array parse as `git.stage`.
             let path_list = git_ops::parse_stage_paths(&paths)?;
             // Mirror `git.stage`: every failure surfaces as `-32603`, so a
@@ -25699,6 +25916,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Discard-specific parser: `.`/`*`/`--all` rejected in BOTH the
             // top-level string and every array element (closes the array-form
             // bypass that would otherwise let `["*"]` / `["--all"]` devolve
@@ -25736,6 +25954,7 @@ impl WorkspaceApi for Services {
         let locks = self.worktree_locks.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Wire policy mirrors `git.stage`: every failure surfaces as
             // `-32603`. A missing workspace/worktree stays `Internal`.
             let ws = store
@@ -25778,6 +25997,7 @@ impl WorkspaceApi for Services {
         let locks = self.worktree_locks.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -25812,6 +26032,7 @@ impl WorkspaceApi for Services {
         let registry = self.settings_registry.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -25878,6 +26099,7 @@ impl WorkspaceApi for Services {
         let registry = self.settings_registry.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -25930,6 +26152,7 @@ impl WorkspaceApi for Services {
         let locks = self.worktree_locks.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams("branchName is required".to_string()));
             }
@@ -25977,6 +26200,7 @@ impl WorkspaceApi for Services {
         let locks = self.worktree_locks.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams("branchName is required".to_string()));
             }
@@ -26020,6 +26244,7 @@ impl WorkspaceApi for Services {
         let locks = self.worktree_locks.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if old_branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams(
                     "oldBranchName cannot be empty".to_string(),
@@ -26082,6 +26307,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let locks = self.worktree_locks.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Unknown workspace → surface as `-32603`; a bare `NotFound` here
             // would be misleading given the FE's `Result` shape.
             let ws = store
@@ -26211,6 +26437,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let registry = self.settings_registry.clone();
         Box::pin(async move {
+            Self::require_administrator("git.clone")?;
             if url.trim().is_empty() {
                 return Err(Error::InvalidParams("url is required".to_string()));
             }
@@ -26302,6 +26529,7 @@ impl WorkspaceApi for Services {
     fn repo_remove(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            Self::require_administrator("repo.remove")?;
             let removed = store.remove_known_repo(&path).await?;
             Ok(serde_json::json!({ "removed": removed }))
         })
@@ -26335,6 +26563,7 @@ impl WorkspaceApi for Services {
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 }
             }
+            Self::require_administrator("repo.warmCache")?;
             let url = github_url.trim().to_string();
             let Some(RepoRef { owner, name: repo }) =
                 GitRemoteUrl::parse(&url).and_then(|u| u.repo_slug())
@@ -26428,6 +26657,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let this = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // TS `ws.git.commit` gates on auto-commit (no userRequested
             // bypass), resolved per-workspace (override → global fallback).
             let auto_commit_enabled = this.effective_auto_commit(&workspace_id).await;
@@ -26504,6 +26734,9 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let this = self.clone();
         Box::pin(async move {
+            if let Some(agent) = agent_id.as_ref() {
+                self.require_agent_member(agent).await?;
+            }
             let auto_commit_enabled = this.effective_auto_commit(&workspace_id).await;
             // With a `git_root_id` the commit targets the registered
             // secondary root (monorepo#2053); resolution shares
@@ -26752,6 +26985,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitMergeConflicts>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // TS throws 'Could not find workspace git info' when the workspace or
             // its worktree can't be resolved.
             let ws = store
@@ -26815,6 +27049,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Same empty fallbacks as `git_status` (unknown/remote/non-repo →
             // empty list), but projecting only the working-tree file list.
             let empty = serde_json::json!([]);
@@ -26856,6 +27091,7 @@ impl WorkspaceApi for Services {
         let slow_warns = Arc::clone(&self.git_diffs_slow_warns);
         let walk_probe = self.git_diffs_walk_probe.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let empty = serde_json::json!([]);
             let ws = match store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
@@ -27000,6 +27236,7 @@ impl WorkspaceApi for Services {
         let svc = self.clone();
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let empty = git_ops::empty_commit_details(&commit_hash);
             let ws = match store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
@@ -27041,6 +27278,7 @@ impl WorkspaceApi for Services {
         let svc = self.clone();
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // §5.5 paginated read: clamp the page size to [1,200] (default 50)
             // and walk backward through the (newest-first) first-parent history
             // via an opaque skip token; the envelope is `{ items, nextToken }`.
@@ -27107,6 +27345,7 @@ impl WorkspaceApi for Services {
         let svc = self.clone();
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Same empty fallbacks as the other `git.*` reads (unknown/remote/
             // non-repo → empty content); a missing path at the ref is also
             // empty (legacy `git:show-file` parity), while a bad ref errors.
@@ -27143,6 +27382,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let empty = serde_json::json!([]);
             let ws = match store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
@@ -27183,6 +27423,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Router already rejects the missing-both-bases case as -32602
             // (see the `git.branchDiff` arm); this is a defense-in-depth
             // check for direct trait callers.
@@ -27253,6 +27494,7 @@ impl WorkspaceApi for Services {
         parent_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if let Some(model) = input.model.as_deref() {
                 reject_compound_model("model", model)?;
             }
@@ -27271,25 +27513,37 @@ impl WorkspaceApi for Services {
     }
 
     fn agent_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
-        Box::pin(async move { self.agent_list_op(workspace_id).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            self.agent_list_op(workspace_id).await
+        })
     }
 
     fn agent_list_including_retired(
         &self,
         workspace_id: WorkspaceId,
     ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
-        Box::pin(async move { self.agent_list_including_retired_op(workspace_id).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            self.agent_list_including_retired_op(workspace_id).await
+        })
     }
 
     fn agent_list_retired_only(
         &self,
         workspace_id: WorkspaceId,
     ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
-        Box::pin(async move { self.agent_list_retired_only_op(workspace_id).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            self.agent_list_retired_only_op(workspace_id).await
+        })
     }
 
     fn agent_retired_count(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<u64>> {
-        Box::pin(async move { self.agent_retired_count_op(workspace_id).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            self.agent_retired_count_op(workspace_id).await
+        })
     }
 
     fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -27301,7 +27555,10 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<AgentLite>> {
-        Box::pin(async move { self.agent_get_op(agent_id, workspace_id).await })
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_get_op(agent_id, workspace_id).await
+        })
     }
 
     fn agent_get_conversation(
@@ -27316,6 +27573,7 @@ impl WorkspaceApi for Services {
         include_in_progress: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.agent_get_conversation_op(
                 agent_id,
                 limit,
@@ -27338,6 +27596,7 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.agent_get_message_block_op(agent_id, message_id, block_id, workspace_id)
                 .await
         })
@@ -27350,6 +27609,7 @@ impl WorkspaceApi for Services {
         preview_chars: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.agent_list_user_messages_op(agent_id, workspace_id, preview_chars)
                 .await
         })
@@ -27360,7 +27620,10 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         _workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<AgentSession>> {
-        Box::pin(async move { self.agent_get_session_op(agent_id).await })
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_get_session_op(agent_id).await
+        })
     }
 
     fn agent_update(
@@ -27369,7 +27632,10 @@ impl WorkspaceApi for Services {
         _workspace_id: Option<WorkspaceId>,
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_update_op(agent_id, changes).await })
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_update_op(agent_id, changes).await
+        })
     }
 
     fn agent_append_message(
@@ -27381,6 +27647,7 @@ impl WorkspaceApi for Services {
         metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             // Principal stamp (multiplayer w2): a `user` row appended by a
             // wire caller is human-authored; any other role only has a
             // client-supplied stamp stripped.
@@ -27400,7 +27667,10 @@ impl WorkspaceApi for Services {
         _workspace_id: Option<WorkspaceId>,
         messages: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_replace_messages_op(agent_id, messages).await })
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_replace_messages_op(agent_id, messages).await
+        })
     }
 
     fn agent_live_turn(&self, agent_id: AgentId) -> Option<serde_json::Value> {
@@ -27485,6 +27755,7 @@ impl WorkspaceApi for Services {
         extra: intent_core::AgentCreateExtra,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if let Some(model) = model.as_deref() {
                 reject_compound_model("model", model)?;
             }
@@ -27526,6 +27797,7 @@ impl WorkspaceApi for Services {
         message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let message_metadata =
                 crate::principal_ops::stamp_principal_attribution(message_metadata)?;
             self.agent_send_to_task_op(
@@ -27555,6 +27827,7 @@ impl WorkspaceApi for Services {
         origin: intent_core::MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             // Principal stamp (multiplayer w2), applied once here so the
             // runtime path (direct persist, busy enqueue, quarantine park,
             // auto-queue) and the store-only fallback persist the same
@@ -27632,6 +27905,7 @@ impl WorkspaceApi for Services {
         message_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             match self.agent_manager() {
                 Some(manager) => {
                     manager
@@ -27656,6 +27930,7 @@ impl WorkspaceApi for Services {
         message_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.agent_dismiss_questions_op(workspace_id, agent_id, message_id)
                 .await
         })
@@ -27670,6 +27945,7 @@ impl WorkspaceApi for Services {
         detail: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.agent_resolve_proposal_op(workspace_id, agent_id, proposal_id, outcome, detail)
                 .await
         })
@@ -27682,6 +27958,7 @@ impl WorkspaceApi for Services {
         message_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.agent_mark_seen_op(workspace_id, agent_id, message_id)
                 .await
         })
@@ -27698,6 +27975,7 @@ impl WorkspaceApi for Services {
         model: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             if let Some(model) = model.as_deref() {
                 reject_compound_model("model", model)?;
             }
@@ -27776,6 +28054,7 @@ impl WorkspaceApi for Services {
         message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             // Principal stamp (multiplayer w2): captured on the queue entry
             // so the drain-time persist and every `agent:queue:*` payload
             // carry it.
@@ -27800,6 +28079,7 @@ impl WorkspaceApi for Services {
         editing: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.agent_edit_queued_message_op(agent_id, message_id, content, editing)
                 .await
         })
@@ -27811,6 +28091,7 @@ impl WorkspaceApi for Services {
         message_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.agent_remove_queued_message_op(agent_id, message_id)
                 .await
         })
@@ -27823,6 +28104,7 @@ impl WorkspaceApi for Services {
         caller_agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.agent_remove_queued_message_owned_op(agent_id, message_id, caller_agent_id)
                 .await
         })
@@ -27833,11 +28115,15 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_get_queue_op(agent_id, workspace_id).await })
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_get_queue_op(agent_id, workspace_id).await
+        })
     }
 
     fn agent_stop(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             // Interrupt the in-flight turn while KEEPING the child alive (TS
             // `agent.stop` keep-alive: `provider.interrupt()`), emitting the
             // terminal `agent:stream:end`; falls back to a hard kill only when no
@@ -27855,6 +28141,7 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             if let Some(manager) = self.agent_manager() {
                 manager.agent_retry(agent_id, workspace_id).await
             } else {
@@ -27871,6 +28158,7 @@ impl WorkspaceApi for Services {
         provider_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             reject_compound_model("modelId", &model_id)?;
             self.agent_set_model_op(agent_id, model_id, provider_id)
                 .await
@@ -27931,6 +28219,9 @@ impl WorkspaceApi for Services {
         timeout_ms: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(ws) = workspace_id.as_ref() {
+                self.require_member(ws).await?;
+            }
             if let Some(model) = model.as_deref() {
                 reject_compound_model("model", model)?;
             }
@@ -27949,6 +28240,9 @@ impl WorkspaceApi for Services {
         timeout_ms: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(ws) = workspace_id.as_ref() {
+                self.require_member(ws).await?;
+            }
             if let Some(model) = model.as_deref() {
                 reject_compound_model("model", model)?;
             }
@@ -27994,6 +28288,9 @@ impl WorkspaceApi for Services {
         agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(agent) = agent_id.as_ref() {
+                self.require_agent_member(agent).await?;
+            }
             // No manager ⇒ no outstanding prompts. Otherwise snapshot the registry
             // and, when an `agentId` filter is given, keep only that session's
             // prompts (`session_id` == intentd `agentId`, PROTOCOL §8).
@@ -28016,6 +28313,7 @@ impl WorkspaceApi for Services {
         skip_if_explicitly_set: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.agent_rename_op(agent_id, name, skip_if_explicitly_set)
                 .await
         })
@@ -28026,7 +28324,10 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_delete_op(agent_id, workspace_id).await })
+        Box::pin(async move {
+            self.require_agent_owner(&agent_id, "agent.delete").await?;
+            self.agent_delete_op(agent_id, workspace_id).await
+        })
     }
 
     fn agent_is_retired(&self, agent_id: AgentId) -> BoxFuture<'_, bool> {
@@ -28048,7 +28349,10 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
         reason: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_retire_op(agent_id, workspace_id, reason).await })
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_retire_op(agent_id, workspace_id, reason).await
+        })
     }
 
     fn agent_restore(
@@ -28056,7 +28360,10 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_restore_op(agent_id, workspace_id).await })
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_restore_op(agent_id, workspace_id).await
+        })
     }
 
     fn agent_schedule_delete(
@@ -28066,6 +28373,8 @@ impl WorkspaceApi for Services {
         undo_delay_ms: u64,
     ) -> BoxFuture<'_, Result<String>> {
         Box::pin(async move {
+            self.require_agent_owner(&agent_id, "agent.scheduleDelete")
+                .await?;
             self.agent_schedule_delete_op(agent_id, workspace_id, undo_delay_ms)
                 .await
         })
@@ -28076,7 +28385,11 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<bool>> {
-        Box::pin(async move { self.agent_cancel_delete_op(agent_id, workspace_id).await })
+        Box::pin(async move {
+            self.require_agent_owner(&agent_id, "agent.cancelDelete")
+                .await?;
+            self.agent_cancel_delete_op(agent_id, workspace_id).await
+        })
     }
 
     fn agent_wake_or_create(
@@ -28087,6 +28400,7 @@ impl WorkspaceApi for Services {
         mut input: intent_core::AgentWakeOrCreateInput,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             if let Some(model) = input.model.as_deref() {
                 reject_compound_model("model", model)?;
             }
@@ -28108,6 +28422,7 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&session_id).await?;
             self.agent_get_session_stats_op(session_id, workspace_id)
                 .await
         })
@@ -28118,7 +28433,10 @@ impl WorkspaceApi for Services {
         _workspace_id: WorkspaceId,
         agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_summary_op(agent_id).await })
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_summary_op(agent_id).await
+        })
     }
 
     fn agent_report_to_parent(
@@ -28128,6 +28446,7 @@ impl WorkspaceApi for Services {
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             self.agent_report_to_parent_op(workspace_id, report, caller_agent_id)
                 .await
         })
@@ -28141,6 +28460,7 @@ impl WorkspaceApi for Services {
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             self.agent_request_attention_op(workspace_id, kind, reason, caller_agent_id)
                 .await
         })
@@ -28152,6 +28472,7 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.agent_get_subscriptions_op(workspace_id, agent_id)
                 .await
         })
@@ -28164,6 +28485,7 @@ impl WorkspaceApi for Services {
         child_agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             self.agent_watch_completion_op(workspace_id, parent_agent_id, child_agent_id)
                 .await
         })
@@ -28176,6 +28498,7 @@ impl WorkspaceApi for Services {
         target_agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             self.agent_watch_completion_for_sender_op(
                 workspace_id,
                 caller_agent_id,
@@ -28192,6 +28515,7 @@ impl WorkspaceApi for Services {
         target_agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             self.agent_watch_op(workspace_id, caller_agent_id, target_agent_id)
                 .await
         })
@@ -28205,6 +28529,7 @@ impl WorkspaceApi for Services {
         target_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             self.agent_unwatch_op(
                 workspace_id,
                 caller_agent_id,
@@ -28223,6 +28548,7 @@ impl WorkspaceApi for Services {
         wait_mode: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             self.app_agents_wait_op(workspace_id, caller_agent_id, agent_ids, wait_mode)
                 .await
         })
@@ -28237,6 +28563,7 @@ impl WorkspaceApi for Services {
         priority: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             self.app_agents_send_op(
                 workspace_id,
                 caller_agent_id,
@@ -28257,6 +28584,7 @@ impl WorkspaceApi for Services {
         priority: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             self.app_agents_ask_op(
                 workspace_id,
                 caller_agent_id,
@@ -28270,7 +28598,11 @@ impl WorkspaceApi for Services {
 
     fn agent_list_interrupted(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
-            let rows = self.store.list_interrupted_agents().await?;
+            let mut rows = self.store.list_interrupted_agents().await?;
+            // Cross-workspace surface: a collaborator sees only member workspaces.
+            if let Some(visible) = self.visible_workspace_ids().await? {
+                rows.retain(|ia| visible.contains(&ia.workspace_id));
+            }
             let agents: Vec<serde_json::Value> = rows
                 .into_iter()
                 .map(|ia| {
@@ -28351,6 +28683,9 @@ impl WorkspaceApi for Services {
         stale_responding_after_ms: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(agent) = agent_id.as_ref() {
+                self.require_agent_member(agent).await?;
+            }
             self.agent_diagnostics_op(
                 workspace_id,
                 agent_id,
@@ -28366,7 +28701,10 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_snapshot_op(workspace_id, agent_id).await })
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_snapshot_op(workspace_id, agent_id).await
+        })
     }
 
     fn agent_cancel_subscriptions(
@@ -28377,6 +28715,7 @@ impl WorkspaceApi for Services {
         group_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.agent_cancel_subscriptions_op(workspace_id, agent_id, subscription_id, group_id)
                 .await
         })
@@ -28391,6 +28730,7 @@ impl WorkspaceApi for Services {
         batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Same empty-types guard as `event.subscribe`: an empty filter
             // would match EVERY event (and persist that across restarts).
             if event_types.is_empty() {
@@ -28452,6 +28792,8 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
             use intent_store::SandboxStatus;
+
+            self.require_agent_member(&sandbox_id).await?;
 
             // Claim the merge atomically (current status → merging) so the RPC
             // never merges concurrently with the completion path or the
@@ -28572,6 +28914,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_agent_member(&sandbox_id).await?;
             crate::sandbox_ops::discard_sandbox(&store, &workspace_id, &sandbox_id).await?;
             Ok(serde_json::json!({ "ok": true }))
         })
@@ -28587,6 +28930,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let injected = self.source_control.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             let repo_ref = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
@@ -28620,6 +28964,7 @@ impl WorkspaceApi for Services {
     fn pr_refresh(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let this = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // `refresh_workspace_pr` owns persistence and the
             // `pr:linked`/`pr:updated`/`pr:unlinked` emission — no duplicate
             // event logic here; the RPC just reports the post-refresh state.
@@ -28647,6 +28992,7 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         let this = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             // Cross-repo override (`{ repo: "owner/name" }`) wins over the
             // workspace repo; either way the resolved repo is echoed in the
@@ -28784,6 +29130,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.pullsCreate")?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             // `head` is forwarded VERBATIM (no `owner:branch` login prefix) —
@@ -28814,6 +29161,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.pullsGet")?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc
@@ -28847,6 +29195,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.pullsList")?;
             let state = github_ops::parse_pr_state(state.as_deref())?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
@@ -28890,6 +29239,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.pullsSearch")?;
             let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
             let search = github_ops::normalize_search_query(query);
             // Search defaults to open PRs (FE `searchGitHubPullRequests`); a
@@ -28950,6 +29300,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.pullsMerge")?;
             let method = pr_ops::validate_merge_method(merge_method.as_deref())?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
@@ -28989,6 +29340,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.reposList")?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected).await?;
@@ -29012,6 +29364,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.pullsUpdateBranch")?;
             // `expectedHeadSha` is accepted for FE shape parity; the engine
             // `update_branch` does not take a race guard, so it is unused.
             let _ = expected_head_sha;
@@ -29035,6 +29388,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.reposSearch")?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected).await?;
@@ -29057,6 +29411,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.issuesGet")?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let issue = sc
@@ -29080,6 +29435,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.issuesList")?;
             let state = github_ops::parse_issue_state(state.as_deref())?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
@@ -29124,6 +29480,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.issuesSearch")?;
             // Validate `filter` against the issues value set from PROTOCOL §5
             // (no PR-only `review-requested`). The host-agnostic engine
             // cannot express `@me` involvement for issues (v1 limitation —
@@ -29182,6 +29539,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.listReviewComments")?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected).await?;
@@ -29216,6 +29574,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.replyReviewComment")?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let rc = sc
@@ -29236,6 +29595,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.getReviewThreads")?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected).await?;
@@ -29263,6 +29623,7 @@ impl WorkspaceApi for Services {
     fn github_resolve_thread(&self, thread_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.resolveThread")?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let is_resolved = sc
                 .resolve_thread(&thread_id)
@@ -29278,6 +29639,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.unresolveThread")?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let is_resolved = sc
                 .unresolve_thread(&thread_id)
@@ -29294,6 +29656,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.reposGet")?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             match sc.get_repo(&owner, &repo).await {
                 Ok(r) => Ok(serde_json::json!({ "repo": github_browse_ops::repo_to_wire(&r) })),
@@ -29317,6 +29680,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.branchesList")?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             // A blank/whitespace `prefix` keeps the unfiltered listing
@@ -29357,6 +29721,7 @@ impl WorkspaceApi for Services {
         let registry = self.settings_registry.clone();
         let ls_remote_base = self.branches_ls_remote_base.clone();
         Box::pin(async move {
+            Self::require_administrator("github.branchesListCached")?;
             let cache_root = intent_git::repo_cache::cache_root_for(&cache_parent);
             if let Some(cached) =
                 intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await?
@@ -29418,6 +29783,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.repoConfigGet")?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
             let source = format!(
@@ -29508,6 +29874,7 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         let state = self.github_auth_flow.clone();
         Box::pin(async move {
+            Self::require_administrator("github.authStatus")?;
             // A missing/invalid token is the graceful "not configured" state,
             // NOT an error: report `isConfigured: false` instead of throwing.
             let is_configured = match pr_ops::resolve_source_control(injected).await {
@@ -29537,6 +29904,7 @@ impl WorkspaceApi for Services {
         let base_uri =
             github_auth_ops::resolve_login_base_uri(self.github_login_base_uri.as_deref());
         Box::pin(async move {
+            Self::require_administrator("github.connect")?;
             // Short critical section: reuse a live flow / clear a terminal
             // one. The lock is NOT held across the network start below, so
             // cancelAuth / revoke / authStatus stay responsive meanwhile.
@@ -29602,6 +29970,7 @@ impl WorkspaceApi for Services {
     fn github_cancel_auth(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let state = self.github_auth_flow.clone();
         Box::pin(async move {
+            Self::require_administrator("github.cancelAuth")?;
             let mut slot = state.lock().await;
             // Only a pending flow is cancellable. A terminal slot (expired /
             // denied / error) is left intact so authStatus keeps surfacing
@@ -29636,6 +30005,7 @@ impl WorkspaceApi for Services {
             &github_auth_ops::resolve_login_base_uri(self.github_login_base_uri.as_deref()),
         );
         Box::pin(async move {
+            Self::require_administrator("github.revoke")?;
             // Capture the stored token BEFORE it is deleted so the detached
             // logout can match it against gh's active login. Fail-soft: a
             // load failure only skips the logout, never the revoke. 🔒 The
@@ -29675,6 +30045,7 @@ impl WorkspaceApi for Services {
     fn github_get_user(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.getUser")?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let user = sc.get_user().await.map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({ "user": github_browse_ops::user_to_wire(&user) }))
@@ -29687,6 +30058,26 @@ impl WorkspaceApi for Services {
 
     fn principal_me(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.principal_me_op().await })
+    }
+
+    // `workspace.members.*` (multiplayer w3) — see `capability`.
+
+    fn workspace_members_list(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_members_list_op(&workspace_id).await })
+    }
+
+    fn workspace_members_remove(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: intent_core::PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_members_remove_op(&workspace_id, &principal_id)
+                .await
+        })
     }
 
     fn primary_principal_id(&self) -> BoxFuture<'_, Result<intent_core::PrincipalId>> {
@@ -29715,6 +30106,7 @@ impl WorkspaceApi for Services {
     fn linear_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("linear.authStatus")?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let status = engine
                 .auth_status()
@@ -29733,6 +30125,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("linear.listIssues")?;
             let filter = linear_ops::parse_filter(filter.as_deref())?;
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let engine = linear_ops::resolve_engine(injected).await?;
@@ -29757,6 +30150,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("linear.searchIssues")?;
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let engine = linear_ops::resolve_engine(injected).await?;
             let page = engine
@@ -29778,6 +30172,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("linear.getIssue")?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let issue = engine
                 .get_issue(&id_or_identifier)
@@ -29791,6 +30186,7 @@ impl WorkspaceApi for Services {
     fn linear_viewer(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("linear.viewer")?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let user = engine
                 .viewer()
@@ -29804,6 +30200,7 @@ impl WorkspaceApi for Services {
     fn linear_list_teams(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("linear.listTeams")?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let teams = engine
                 .list_teams(linear_ops::wire_limit(limit))
@@ -29820,6 +30217,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("linear.listWorkflowStates")?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let states = engine
                 .list_workflow_states(linear_ops::wire_limit(limit))
@@ -29833,6 +30231,7 @@ impl WorkspaceApi for Services {
     fn linear_list_projects(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("linear.listProjects")?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let projects = engine
                 .list_projects(linear_ops::wire_limit(limit))
@@ -29846,6 +30245,7 @@ impl WorkspaceApi for Services {
     fn linear_list_labels(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("linear.listLabels")?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let labels = engine
                 .list_labels(linear_ops::wire_limit(limit))
@@ -29862,6 +30262,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("linear.createIssue")?;
             let req = linear_ops::parse_create_issue(request)?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let issue = engine
@@ -29879,6 +30280,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("linear.updateIssue")?;
             let req = linear_ops::parse_update_issue(request)?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let issue = engine
@@ -29902,6 +30304,7 @@ impl WorkspaceApi for Services {
     fn sentry_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("sentry.authStatus")?;
             let engine = sentry_ops::resolve_engine(injected).await?;
             let status = engine
                 .auth_status()
@@ -29922,6 +30325,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("sentry.listIssues")?;
             let status = sentry_ops::parse_status(status.as_deref())?;
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let engine = sentry_ops::resolve_engine(injected).await?;
@@ -29954,6 +30358,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("sentry.searchIssues")?;
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let engine = sentry_ops::resolve_engine(injected).await?;
             let page = engine
@@ -29977,6 +30382,7 @@ impl WorkspaceApi for Services {
     fn sentry_list_projects(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("sentry.listProjects")?;
             let engine = sentry_ops::resolve_engine(injected).await?;
             let projects = engine
                 .list_projects(sentry_ops::wire_limit(limit))
@@ -29990,6 +30396,7 @@ impl WorkspaceApi for Services {
     fn sentry_get_issue(&self, id_or_short_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("sentry.getIssue")?;
             let engine = sentry_ops::resolve_engine(injected).await?;
             let issue = engine
                 .get_issue(&id_or_short_id)
@@ -30003,6 +30410,7 @@ impl WorkspaceApi for Services {
     fn sentry_resolve_issue(&self, id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("sentry.resolveIssue")?;
             let engine = sentry_ops::resolve_engine(injected).await?;
             let issue = engine
                 .resolve_issue(&id)
@@ -30016,6 +30424,7 @@ impl WorkspaceApi for Services {
     fn sentry_ignore_issue(&self, id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("sentry.ignoreIssue")?;
             let engine = sentry_ops::resolve_engine(injected).await?;
             let issue = engine
                 .ignore_issue(&id)
@@ -30033,6 +30442,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
+            Self::require_administrator("sentry.assignIssue")?;
             let engine = sentry_ops::resolve_engine(injected).await?;
             let issue = engine
                 .assign_issue(&id, assigned_to.as_deref())
@@ -30135,6 +30545,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let vocab_cache = self.workspace_vocabulary.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // Unlike the tolerant `workspaceId?` on `voice.transcribe`, the
             // param here is required and validated: an unknown workspace is
             // the standard not-found error (PROTOCOL §5.41, v4.6).
@@ -30154,6 +30565,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let parsed = file_tracking_ops::parse_filter(filter.as_ref());
             let worktree = ft_worktree(&store, &workspace_id).await;
             let Ok(rows) = store.list_tracked_changes(&workspace_id).await else {
@@ -30173,6 +30585,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let this = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // On-demand hydration read for `changes:agent-locks` (§5.19);
             // store failures inside degrade to an empty (unlocked) snapshot.
             let snap = this.compute_agent_locks(&workspace_id).await;
@@ -30189,6 +30602,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             // TA-2 / §5.5: clamp the page size to [1,200] (default 50) and walk
             // backward through the (newest-first) first-parent history via an
             // opaque skip token. `nextToken` is additive to the existing object.
@@ -30311,6 +30725,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let rows = store
                 .list_tracked_changes(&workspace_id)
                 .await
@@ -30332,6 +30747,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let path_list = file_tracking_ops::parse_paths(&paths)?;
             let ws = store
                 .get_workspace(&workspace_id)
@@ -30360,6 +30776,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let path_list = file_tracking_ops::parse_paths(&paths)?;
             let ws = store
                 .get_workspace(&workspace_id)
@@ -30387,6 +30804,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             let Some(ws) = store.get_workspace_metrics(&workspace_id).await? else {
                 return Ok(serde_json::Value::Null);
             };
@@ -30403,6 +30821,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_agent_member(&AgentId::from_string(agent_id.clone()))
+                .await?;
             let rows = store.list_agent_metrics(&agent_id).await?;
             Ok(crate::metrics::agent_metrics_value(&rows))
         })
@@ -30432,6 +30852,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            self.require_agent_member(&AgentId::from_string(agent_id.clone()))
+                .await?;
             store.delete_agent_metrics(&agent_id).await?;
             Ok(serde_json::json!({ "success": true }))
         })
@@ -30446,7 +30868,10 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
-        Box::pin(async move { svc.ac_get_status(workspace_id).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            svc.ac_get_status(workspace_id).await
+        })
     }
 
     fn accept_changes_prepare(
@@ -30456,7 +30881,10 @@ impl WorkspaceApi for Services {
         files: Option<Vec<String>>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
-        Box::pin(async move { svc.ac_prepare(workspace_id, action, files).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            svc.ac_prepare(workspace_id, action, files).await
+        })
     }
 
     fn accept_changes_execute(
@@ -30465,7 +30893,10 @@ impl WorkspaceApi for Services {
         params: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
-        Box::pin(async move { svc.ac_execute(workspace_id, params).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            svc.ac_execute(workspace_id, params).await
+        })
     }
 
     fn accept_changes_merge_pr(
@@ -30478,6 +30909,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
         Box::pin(async move {
+            self.require_member(&workspace_id).await?;
             svc.ac_merge_pr(
                 workspace_id,
                 pr_number,
@@ -30495,7 +30927,10 @@ impl WorkspaceApi for Services {
         remote_url: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
-        Box::pin(async move { svc.ac_add_remote(workspace_id, remote_url).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            svc.ac_add_remote(workspace_id, remote_url).await
+        })
     }
 
     fn upsert_client(
@@ -30524,7 +30959,10 @@ impl WorkspaceApi for Services {
         client_id: ClientId,
     ) -> BoxFuture<'_, Result<Option<Draft>>> {
         let svc = self.clone();
-        Box::pin(async move { svc.drafts_get(workspace_id, agent_id, client_id).await })
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            svc.drafts_get(workspace_id, agent_id, client_id).await
+        })
     }
 
     fn draft_set(
@@ -30537,6 +30975,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Option<String>>> {
         let svc = self.clone();
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             svc.drafts_set(workspace_id, agent_id, client_id, text, attachments)
                 .await
         })
@@ -30549,7 +30988,10 @@ impl WorkspaceApi for Services {
         client_id: ClientId,
     ) -> BoxFuture<'_, Result<()>> {
         let svc = self.clone();
-        Box::pin(async move { svc.drafts_clear(workspace_id, agent_id, client_id).await })
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            svc.drafts_clear(workspace_id, agent_id, client_id).await
+        })
     }
 
     fn browser_list_tabs(
@@ -30557,7 +30999,10 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
     ) -> BoxFuture<'_, Result<Vec<intent_core::BrowserTab>>> {
         let svc = self.clone();
-        Box::pin(async move { svc.browser_tabs_list(workspace_id).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            svc.browser_tabs_list(workspace_id).await
+        })
     }
 
     fn browser_upsert_tab(
@@ -30627,6 +31072,9 @@ impl WorkspaceApi for Services {
         agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(agent) = agent_id.as_ref() {
+                self.require_agent_member(agent).await?;
+            }
             if actions.is_empty() {
                 return Err(Error::InvalidParams(
                     "browser.exec: actions must be a non-empty array".to_string(),
@@ -30820,7 +31268,10 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         params: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { host_exec::run_for_workspace(self, workspace_id, params).await })
+        Box::pin(async move {
+            Self::require_administrator("host.exec")?;
+            host_exec::run_for_workspace(self, workspace_id, params).await
+        })
     }
 
     /// `hook.schedule`: validate + immediate real run + persist + spawn the
@@ -30832,6 +31283,7 @@ impl WorkspaceApi for Services {
         params: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.hook_schedule_op(&workspace_id, &agent_id, &params)
                 .await
         })
@@ -30846,6 +31298,9 @@ impl WorkspaceApi for Services {
         include_retired: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(agent) = agent_id.as_ref() {
+                self.require_agent_member(agent).await?;
+            }
             self.hook_list_op(&workspace_id, agent_id.as_ref(), include_retired)
                 .await
         })
@@ -30858,7 +31313,10 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         hook_id: intent_core::HookId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.hook_get_op(&workspace_id, &hook_id).await })
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            self.hook_get_op(&workspace_id, &hook_id).await
+        })
     }
 
     /// `hook.cancel`: stop an active hook; an agent caller may only cancel
@@ -30871,6 +31329,7 @@ impl WorkspaceApi for Services {
         caller: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_owner(&workspace_id, "hook.cancel").await?;
             self.hook_cancel_op(&workspace_id, &hook_id, caller.as_ref())
                 .await
         })
@@ -30882,7 +31341,10 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         hook_id: intent_core::HookId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.hook_run_now_op(&workspace_id, &hook_id).await })
+        Box::pin(async move {
+            self.require_owner(&workspace_id, "hook.runNow").await?;
+            self.hook_run_now_op(&workspace_id, &hook_id).await
+        })
     }
 
     /// `ws.pr.monitor`: register (idempotently) a centralized PR monitor.
@@ -30894,6 +31356,7 @@ impl WorkspaceApi for Services {
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.pr_monitor_start_op(&workspace_id, &agent_id, pr_number, repo)
                 .await
         })
@@ -30908,6 +31371,7 @@ impl WorkspaceApi for Services {
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
             self.pr_monitor_stop_op(&workspace_id, &agent_id, pr_number, repo)
                 .await
         })
@@ -30921,6 +31385,9 @@ impl WorkspaceApi for Services {
         agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(agent) = agent_id.as_ref() {
+                self.require_agent_member(agent).await?;
+            }
             self.pr_monitor_list_op(&workspace_id, agent_id.as_ref())
                 .await
         })
@@ -30933,6 +31400,8 @@ impl WorkspaceApi for Services {
         monitor_id: intent_core::PrMonitorId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_owner(&workspace_id, "prMonitor.cancel")
+                .await?;
             self.pr_monitor_cancel_by_id_op(&workspace_id, &monitor_id)
                 .await
         })
@@ -30947,6 +31416,7 @@ impl WorkspaceApi for Services {
         check: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            self.require_owner(&workspace_id, "prMonitor.flush").await?;
             self.pr_monitor_flush_op(&workspace_id, &monitor_id, check)
                 .await
         })

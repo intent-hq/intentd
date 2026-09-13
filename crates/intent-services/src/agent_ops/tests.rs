@@ -12598,6 +12598,10 @@ async fn queue_reads_and_queue_updated_carry_resolved_author() {
         })
         .await
         .expect("principal");
+    svc.store()
+        .add_workspace_member(&ws, &guest, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .expect("guest membership");
     let expected_author = json!({
         "principalId": guest.0,
         "login": "guest",
@@ -13021,6 +13025,10 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
             })
             .await
             .expect("principal");
+        svc.store()
+            .add_workspace_member(&ws, id, intent_core::WorkspaceRole::Collaborator)
+            .await
+            .expect("membership");
     }
     let wire = |p: &PrincipalId| Caller::Wire {
         principal_id: p.clone(),
@@ -13472,7 +13480,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
 /// served as the workspace's legacy author / owner, not its sender).
 #[tokio::test]
 async fn non_object_message_metadata_is_rejected_on_every_user_origin_entry_point() {
-    use intent_core::{with_caller, AgentWakeOrCreateInput, Caller, PrincipalId};
+    use intent_core::{with_caller, AgentWakeOrCreateInput, Caller, Principal, PrincipalId};
 
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "Strict").await;
@@ -13480,8 +13488,26 @@ async fn non_object_message_metadata_is_rejected_on_every_user_origin_entry_poin
     svc.assign_agent(ws.clone(), note_id.clone(), agent.0.clone(), None)
         .await
         .expect("assign");
+    let strict = PrincipalId::new();
+    svc.store()
+        .upsert_principal(&Principal {
+            id: strict.clone(),
+            github_user_id: None,
+            login: Some("strict".into()),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("principal");
+    svc.store()
+        .add_workspace_member(&ws, &strict, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .expect("membership");
     let caller = Caller::Wire {
-        principal_id: PrincipalId::new(),
+        principal_id: strict,
         is_administrator: false,
     };
     let is_invalid = |label: &str, r: Result<serde_json::Value, Error>| {
@@ -13584,7 +13610,7 @@ async fn non_object_message_metadata_is_rejected_on_every_user_origin_entry_poin
 /// and that a later queue write would persist.
 #[tokio::test]
 async fn edit_queued_message_restamp_rejection_leaves_entry_untouched() {
-    use intent_core::{with_caller, Caller, PrincipalId};
+    use intent_core::{with_caller, Caller, Principal, PrincipalId};
 
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let agent = create_agent(&svc, &ws, "Legacy").await;
@@ -13610,9 +13636,29 @@ async fn edit_queued_message_restamp_rejection_leaves_entry_untouched() {
         event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
         ..Default::default()
     });
+    // The wire editor is a collaborator member: the membership gate runs
+    // before the restamp, so a non-member would be `NotFound` instead.
+    let editor = PrincipalId::new();
+    svc.store()
+        .upsert_principal(&Principal {
+            id: editor.clone(),
+            github_user_id: None,
+            login: Some("editor".into()),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("principal");
+    svc.store()
+        .add_workspace_member(&ws, &editor, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .expect("membership");
     let err = with_caller(
         Caller::Wire {
-            principal_id: PrincipalId::new(),
+            principal_id: editor,
             is_administrator: false,
         },
         async {
