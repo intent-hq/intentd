@@ -1634,8 +1634,9 @@ fn caller_pending_entry<'a>(queue: &'a [Value], caller: &AgentId) -> Option<&'a 
 ///   they sort to the end, explicitly flagged `editing: true`.
 /// - **Attribution lifted top-level** — `fromAgentId?` / `fromAgentName?` are
 ///   surfaced from `messageMetadata` when present (absent for user/FE-origin
-///   entries), and the bulky `messageMetadata` / `imageBlocks` / `fileBlocks`
-///   payloads are dropped.
+///   entries), the daemon-resolved `author` (an object or an explicit
+///   `null`, never absent) is kept as-is, and the bulky `messageMetadata` /
+///   `imageBlocks` / `fileBlocks` payloads are dropped.
 /// - **`position` renumbered** to the presented order (0 = next delivery).
 fn present_queue(raw: Vec<Value>) -> Vec<Value> {
     let mut entries = raw;
@@ -1656,7 +1657,7 @@ fn present_queue(raw: Vec<Value>) -> Vec<Value> {
         .enumerate()
         .map(|(i, e)| {
             let mut out = serde_json::Map::new();
-            for key in ["id", "content", "queuedAt", "turnId"] {
+            for key in ["id", "content", "queuedAt", "turnId", "author"] {
                 if let Some(v) = e.get(key) {
                     out.insert(key.to_string(), v.clone());
                 }
