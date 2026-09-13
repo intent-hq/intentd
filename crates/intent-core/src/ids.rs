@@ -135,3 +135,9 @@ id_newtype!(
     /// repository tracked for a workspace).
     WorkspaceGitRootId
 );
+id_newtype!(
+    /// Identifier for a principal (a person, keyed locally; stable across
+    /// GitHub identity linking). The daemon's primary user is minted by
+    /// migration `0125_principals`.
+    PrincipalId
+);
