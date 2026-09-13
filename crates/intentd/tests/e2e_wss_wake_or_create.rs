@@ -1476,4 +1476,116 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
             .all(|m| m.get("author").is_none()),
         "non-user rows carry no author on agent.getSession: {session}"
     );
+
+    // agent.retry by a DIFFERENT caller (the owner) redrives the guest's
+    // requeued kickoff. Rule: the retrier is not the author — the redriven
+    // entry keeps the guest's stamp, and when the redrive fails the same way
+    // the second requeue still carries it (never re-stamped to the owner).
+    let retried = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.retry",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(retried["ok"], true, "owner agent.retry: {retried}");
+    assert_eq!(
+        retried["redriven"], true,
+        "retry redrove the requeued kickoff: {retried}"
+    );
+
+    let mut saw_pending = false;
+    let mut saw_second_error = false;
+    let mut second_requeue: Option<Value> = None;
+    for _ in 0..200 {
+        if saw_second_error && second_requeue.is_some() {
+            break;
+        }
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        // The retry's own `pending` flip fences the first cycle's events off.
+        if event["type"] == "agent:status-changed" && event["data"]["status"] == "pending" {
+            saw_pending = true;
+            continue;
+        }
+        if !saw_pending {
+            continue;
+        }
+        if event["type"] == "agent:status-changed" && event["data"]["status"] == "error" {
+            saw_second_error = true;
+        }
+        if event["type"] == "agent:queue:updated"
+            && event["data"]["queue"]
+                .as_array()
+                .is_some_and(|q| q.iter().any(|m| m["content"] == "guest kickoff"))
+        {
+            second_requeue = Some(event["data"].clone());
+        }
+    }
+    assert!(
+        saw_second_error,
+        "the redriven turn failed again after retry"
+    );
+    let second_requeue = second_requeue.expect("agent:queue:updated announcing the second requeue");
+    let redriven = second_requeue["queue"]
+        .as_array()
+        .expect("queue array")
+        .iter()
+        .find(|m| m["content"] == "guest kickoff")
+        .expect("kickoff in the second requeue");
+    assert_eq!(
+        redriven["messageMetadata"]["fromPrincipalId"],
+        json!(guest.id.0),
+        "the entry redriven by the owner's retry keeps the guest's stamp: {redriven}"
+    );
+    assert_eq!(redriven["author"], expected_author, "{redriven}");
+    assert_eq!(redriven["requeuedAfterFailure"], true, "{redriven}");
+
+    let queue_after_retry = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getQueue",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let kickoff_after_retry = queue_after_retry["queue"]
+        .as_array()
+        .expect("queue array")
+        .iter()
+        .find(|m| m["content"] == "guest kickoff")
+        .unwrap_or_else(|| panic!("kickoff requeued after the retry: {queue_after_retry}"));
+    assert_eq!(
+        kickoff_after_retry["messageMetadata"]["fromPrincipalId"],
+        json!(guest.id.0),
+        "agent.getQueue after retry: {kickoff_after_retry}"
+    );
+    assert_eq!(kickoff_after_retry["author"], expected_author);
+
+    // The transcript never gains a row attributed to the retrier: every
+    // user row still carries the guest's principal.
+    let session_after_retry = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let user_rows: Vec<&Value> = session_after_retry["session"]["messages"]
+        .as_array()
+        .expect("session messages")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .collect();
+    assert!(!user_rows.is_empty(), "{session_after_retry}");
+    for row in user_rows {
+        assert_eq!(
+            row["metadata"]["fromPrincipalId"],
+            json!(guest.id.0),
+            "a user row was re-attributed by the retry: {row}"
+        );
+        assert_eq!(row["author"], expected_author, "{row}");
+    }
 }

@@ -12598,6 +12598,58 @@ async fn queue_reads_and_queue_updated_carry_resolved_author() {
     assert_eq!(peer.get("author"), Some(&serde_json::Value::Null), "{peer}");
 }
 
+/// `agent.getQueue` never omits `author`: an unscoped read whose session
+/// lookup fails (no session row for the agent — the branch that skips the
+/// resolver) still returns every queued entry with an explicit `author: null`,
+/// including a human-stamped entry the resolver would otherwise have
+/// projected. A scoped read surfaces the lookup failure instead.
+#[tokio::test]
+async fn get_queue_without_session_carries_null_author_on_every_row() {
+    let (_t, svc, ws) = setup().await;
+    let ghost = AgentId::from("agent-without-session");
+    let stamped = json!({ "fromPrincipalId": intent_core::PrincipalId::new().0, "kind": "reply" });
+    svc.enqueue_message(
+        &ghost,
+        "stamped".into(),
+        None,
+        None,
+        Some(stamped),
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    svc.enqueue_message(
+        &ghost,
+        "plain".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+
+    let q = svc
+        .agent_get_queue_op(ghost.clone(), None)
+        .await
+        .expect("unscoped getQueue tolerates a missing session");
+    let entries = q["queue"].as_array().expect("queue array");
+    assert_eq!(entries.len(), 2, "{q}");
+    for entry in entries {
+        assert_eq!(
+            entry.get("author"),
+            Some(&serde_json::Value::Null),
+            "author key must be present (null) when no session resolves it: {entry}"
+        );
+    }
+
+    let err = svc
+        .agent_get_queue_op(ghost, Some(ws))
+        .await
+        .expect_err("a scoped read surfaces the missing session");
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+}
+
 #[tokio::test]
 async fn remove_queued_message_emits_queue_updated_only_when_present() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
@@ -13105,8 +13157,11 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
         bob.0,
         "an agent edit never changes the author"
     );
-    // … and agent.sendQueuedMessageNow / agent.retry re-deliver the entry
-    // with the stamp captured at enqueue (the drainer is not the author).
+    // … and agent.sendQueuedMessageNow re-delivers the entry with the stamp
+    // captured at enqueue (the drainer is not the author). agent.retry needs
+    // a manager-driven failure/redrive and is covered end to end by
+    // `guest_wake_stamp_survives_terminal_failure_requeue_over_wss`
+    // (crates/intentd/tests/e2e_wss_wake_or_create.rs).
     let drained = with_caller(wire(&alice), async {
         svc.agent_send_queued_message_now(ws.clone(), agent.clone(), queued_id.clone())
             .await
