@@ -173,6 +173,64 @@ async fn primary_identity_locked_once_another_principal_exists() {
     assert_eq!(refreshed.login.as_deref(), Some("first-renamed"));
 }
 
+/// While locked, a profile without a stable account id is unverifiable and
+/// refused: the cached identity stays.
+#[tokio::test]
+async fn locked_identity_refuses_a_missing_account_id() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services = Services::new(store.clone());
+    let mut primary = store.get_primary_principal().await.expect("primary");
+    primary.github_user_id = Some(10);
+    primary.login = Some("original-owner".into());
+    store
+        .upsert_principal(&primary)
+        .await
+        .expect("seed identity");
+    store
+        .upsert_principal(&principal("existing-guest", Some(20)))
+        .await
+        .expect("second principal");
+    let mut unverified = identity("different-account", 30);
+    unverified.id = None;
+
+    let err = services
+        .apply_primary_identity(primary.clone(), &unverified)
+        .await;
+    assert_eq!(invite_kind(&err), InviteErrorKind::IdentityLocked);
+    let stored = store.get_primary_principal().await.expect("primary");
+    assert_eq!(stored.github_user_id, primary.github_user_id);
+    assert_eq!(stored.login, primary.login);
+}
+
+/// The pre-persist guard fails closed: when the lock state cannot be read
+/// (the invite table is unavailable) the grant is refused and the cached
+/// identity stays, so no token is written on an unverified account.
+#[tokio::test]
+async fn connect_guard_refuses_when_the_lock_state_is_unreadable() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services = Services::new(store.clone());
+    let mut primary = store.get_primary_principal().await.expect("primary");
+    primary.github_user_id = Some(10);
+    primary.login = Some("original-owner".into());
+    store
+        .upsert_principal(&primary)
+        .await
+        .expect("seed identity");
+    sqlx::query("ALTER TABLE workspace_invite RENAME TO unavailable_invites")
+        .execute(store.write_pool())
+        .await
+        .expect("inject query failure");
+
+    let guard = services.connect_identity_guard();
+    let result = guard(Arc::new(StubForge::default())).await;
+    assert!(result.is_err(), "{result:?}");
+    let stored = store.get_primary_principal().await.expect("primary");
+    assert_eq!(stored.github_user_id, primary.github_user_id);
+    assert_eq!(stored.login, primary.login);
+}
+
 /// An open invite alone (still a single principal row) locks the identity
 /// too: the link was minted from it. Revoking the invite unlocks the switch.
 #[tokio::test]
@@ -632,6 +690,300 @@ async fn revoke_self_revokes_credentials_memberships_and_broadcasts() {
         None
     );
     assert_eq!(revocations.try_recv().expect("broadcast"), f.collaborator);
+}
+
+// --- verifier probes (adopted as regression tests) --------------------------
+
+/// The primary's cached `github_user_id` does not admit an invite when the
+/// live credential check fails: a real forge client pointed at a closed
+/// loopback port reports `isConfigured: false`, the mint is refused with
+/// `GithubIdentityRequired`, and no invite row is written.
+#[tokio::test]
+async fn cached_primary_identity_requires_live_auth() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let mut primary = f.store.get_principal(&f.primary).await.expect("primary");
+    primary.github_user_id = Some(10);
+    f.store
+        .upsert_principal(&primary)
+        .await
+        .expect("seed identity");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    drop(listener);
+    let sc = intent_sourcecontrol::GitHubSourceControl::new("dummy-offline-token", Some(&base))
+        .expect("offline forge");
+    let services = f.services.with_source_control(Arc::new(sc));
+    let status = with_caller(Caller::Daemon, services.github_auth_status())
+        .await
+        .expect("auth status");
+    assert_eq!(status["isConfigured"], false);
+    let r = with_caller(
+        Caller::Daemon,
+        services.workspace_invite_create_op(&f.ws, None, None),
+    )
+    .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GithubIdentityRequired);
+    assert_eq!(
+        f.store.count_open_workspace_invites().await.expect("count"),
+        0
+    );
+}
+
+/// Fixture with an event bus and one note created by the collaborator.
+async fn attribution_fixture() -> (TempDb, Fixture, intent_core::NoteId) {
+    let tmp = TempDb::new();
+    let mut f = fixture(&tmp).await;
+    f.services = f
+        .services
+        .with_event_bus(crate::events::EventBus::new(f.store.clone()));
+    let created = with_caller(
+        wire(&f.collaborator),
+        f.services.create_note(
+            f.ws.clone(),
+            intent_core::NoteCreate {
+                title: "Attribution probe".into(),
+                content: Some("Probe anchor text".into()),
+                ..Default::default()
+            },
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("create note");
+    (tmp, f, created.note.id)
+}
+
+/// A collaborator's `comment.add` is attributed to its principal: the
+/// client-supplied `author`/`authorType` are ignored.
+#[tokio::test]
+async fn comment_author_cannot_be_spoofed_by_a_collaborator() {
+    let (_tmp, f, note_id) = attribution_fixture().await;
+    with_caller(
+        wire(&f.collaborator),
+        f.services.comment_add(
+            f.ws.clone(),
+            note_id.clone(),
+            "Probe anchor text".into(),
+            "anchor".into(),
+            "Verifier comment".into(),
+            None,
+            Some("owner".into()),
+            Some("agent".into()),
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("add comment");
+    let rows = f
+        .store
+        .list_comments_in_workspace(&f.ws, &note_id)
+        .await
+        .expect("comments");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].author, "collab");
+    assert_eq!(rows[0].author_type, intent_core::AuthorType::User);
+}
+
+/// Same for `comment.respond`: the reply carries the collaborator, not the
+/// claimed author.
+#[tokio::test]
+async fn reply_author_cannot_be_spoofed_by_a_collaborator() {
+    let (_tmp, f, note_id) = attribution_fixture().await;
+    let added = with_caller(
+        wire(&f.collaborator),
+        f.services.comment_add(
+            f.ws.clone(),
+            note_id.clone(),
+            "Probe anchor text".into(),
+            "anchor".into(),
+            "Verifier root".into(),
+            None,
+            Some("collab".into()),
+            Some("user".into()),
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("add comment");
+    with_caller(
+        wire(&f.collaborator),
+        f.services.comment_respond(
+            f.ws.clone(),
+            note_id.clone(),
+            None,
+            Some(added.comment_id),
+            "Verifier reply".into(),
+            None,
+            Some("owner".into()),
+            Some("agent".into()),
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("reply");
+    let rows = f
+        .store
+        .list_comments_in_workspace(&f.ws, &note_id)
+        .await
+        .expect("comments");
+    let reply = rows
+        .iter()
+        .find(|row| row.parent_id.is_some())
+        .expect("reply row");
+    assert_eq!(reply.author, "collab");
+    assert_eq!(reply.author_type, intent_core::AuthorType::User);
+}
+
+/// A system-actored event emitted inside a collaborator's request carries
+/// `{ type: user, id: principalId, name: login }`.
+#[tokio::test]
+async fn event_actor_is_the_acting_collaborator() {
+    let (_tmp, f, _) = attribution_fixture().await;
+    let rows = f
+        .store
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(f.ws.clone()),
+            event_types: vec!["note:created".into()],
+            ..Default::default()
+        })
+        .await
+        .expect("events");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].actor.actor_type, intent_core::ActorType::User);
+    assert_eq!(rows[0].actor.id.as_deref(), Some(f.collaborator.as_str()));
+    assert_eq!(rows[0].actor.name.as_deref(), Some("collab"));
+}
+
+/// The administrator's events keep the actor the operation supplied.
+#[tokio::test]
+async fn event_actor_is_untouched_for_the_administrator() {
+    let tmp = TempDb::new();
+    let mut f = fixture(&tmp).await;
+    f.services = f
+        .services
+        .with_event_bus(crate::events::EventBus::new(f.store.clone()));
+    with_caller(
+        Caller::Wire {
+            principal_id: f.primary.clone(),
+            is_administrator: true,
+        },
+        f.services.create_note(
+            f.ws.clone(),
+            intent_core::NoteCreate {
+                title: "Administrator note".into(),
+                ..Default::default()
+            },
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("create note");
+    let rows = f
+        .store
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(f.ws.clone()),
+            event_types: vec!["note:created".into()],
+            ..Default::default()
+        })
+        .await
+        .expect("events");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].actor.actor_type, intent_core::ActorType::System);
+}
+
+/// Invite rows survive a reopen of the migrated store.
+#[tokio::test]
+async fn migration_reopen_preserves_invites() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let id = id_of(&created);
+    let reopened = Store::open(&tmp.path).await.expect("reopen migrated store");
+    assert!(reopened
+        .get_workspace_invite(&id)
+        .await
+        .expect("read invite")
+        .is_some());
+    assert_eq!(
+        reopened
+            .count_open_workspace_invites()
+            .await
+            .expect("count"),
+        1
+    );
+}
+
+/// Removing a member drops only that member's queued messages, publishes
+/// the changed queue, and revokes the member's read access.
+#[tokio::test]
+async fn member_removal_drops_only_the_guest_queue() {
+    let (_tmp, f, _) = attribution_fixture().await;
+    let id = intent_core::AgentId::new();
+    let session: intent_core::AgentSession = serde_json::from_value(json!({
+        "id": id, "workspaceId": f.ws, "name": "Queue probe", "status": "idle",
+        "createdAt": now_iso(), "updatedAt": now_iso()
+    }))
+    .expect("session fixture");
+    f.store
+        .insert_agent_session(&session)
+        .await
+        .expect("session");
+    for (principal, message) in [
+        (&f.owner, "owner survives"),
+        (&f.collaborator, "guest removed"),
+    ] {
+        with_caller(
+            wire(principal),
+            f.services
+                .agent_queue_message(id.clone(), message.into(), None, None, None),
+        )
+        .await
+        .expect("queue message");
+    }
+    let queue_query = intent_store::EventQuery {
+        workspace_id: Some(f.ws.clone()),
+        event_types: vec!["agent:queue:updated".into()],
+        ..Default::default()
+    };
+    let before_events = f
+        .store
+        .query_events(&queue_query)
+        .await
+        .expect("before events")
+        .len();
+    with_caller(
+        wire(&f.owner),
+        f.services
+            .workspace_members_remove(f.ws.clone(), f.collaborator.clone()),
+    )
+    .await
+    .expect("remove member");
+    let queue = with_caller(
+        wire(&f.owner),
+        f.services.agent_get_queue(id.clone(), Some(f.ws.clone())),
+    )
+    .await
+    .expect("queue");
+    assert_eq!(queue["queue"].as_array().expect("entries").len(), 1);
+    assert_eq!(queue["queue"][0]["content"], "owner survives");
+    let events = f
+        .store
+        .query_events(&queue_query)
+        .await
+        .expect("queue events");
+    assert_eq!(events.len(), before_events + 1);
+    let r = with_caller(
+        wire(&f.collaborator),
+        f.services.get_workspace(f.ws.clone()),
+    )
+    .await;
+    assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
 }
 
 /// The API-base seam accepts loopback cleartext and https overrides and
