@@ -8280,3 +8280,62 @@ async fn principal_credential_insert_lookup_touch_revoke() {
         Some(other_hash.as_str())
     );
 }
+
+/// `resolve_active_principal_credential` is the single-statement
+/// resolve+touch behind the WSS bearer seam: an active hash resolves to its
+/// principal and records the use; an unknown or revoked hash resolves to
+/// `None` and leaves `last_used_at` untouched (intent-hq/intentd#1868).
+#[tokio::test]
+async fn resolve_active_principal_credential_touches_active_and_rejects_revoked() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let hash = "d".repeat(64);
+    store
+        .insert_principal_credential(&primary.id, &hash)
+        .await
+        .expect("insert");
+
+    assert_eq!(
+        store
+            .resolve_active_principal_credential("unknown")
+            .await
+            .expect("resolve unknown"),
+        None
+    );
+    assert_eq!(
+        store
+            .resolve_active_principal_credential(&hash)
+            .await
+            .expect("resolve active"),
+        Some(primary.id.clone())
+    );
+    let touched = store
+        .lookup_principal_credential(&hash)
+        .await
+        .expect("lookup")
+        .expect("present");
+    assert!(touched.last_used_at.is_some(), "resolve records the use");
+
+    assert!(store
+        .revoke_principal_credential(&hash)
+        .await
+        .expect("revoke"));
+    assert_eq!(
+        store
+            .resolve_active_principal_credential(&hash)
+            .await
+            .expect("resolve revoked"),
+        None,
+        "a revoked credential never resolves"
+    );
+    let after = store
+        .lookup_principal_credential(&hash)
+        .await
+        .expect("lookup")
+        .expect("row kept after revoke");
+    assert_eq!(
+        after.last_used_at, touched.last_used_at,
+        "a rejected resolve does not touch the row"
+    );
+}

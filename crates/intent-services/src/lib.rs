@@ -29702,16 +29702,9 @@ impl WorkspaceApi for Services {
         token_hash: String,
     ) -> BoxFuture<'_, Result<Option<intent_core::PrincipalId>>> {
         let store = self.store.clone();
-        Box::pin(async move {
-            let Some(cred) = store.lookup_principal_credential(&token_hash).await? else {
-                return Ok(None);
-            };
-            if !cred.is_active() {
-                return Ok(None);
-            }
-            let _ = store.touch_principal_credential(&token_hash).await?;
-            Ok(Some(cred.principal_id))
-        })
+        // One atomic resolve+touch: a credential revoked between a separate
+        // lookup and touch must not be admitted (intent-hq/intentd#1868).
+        Box::pin(async move { store.resolve_active_principal_credential(&token_hash).await })
     }
 
     // ========================================================================

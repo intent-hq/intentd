@@ -216,6 +216,61 @@ pub(super) async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, Note
     (tmp, services, ws, id)
 }
 
+/// The transport bearer seam resolves an active credential to its principal
+/// and records the use, and rejects a revoked one — through the single
+/// atomic store statement, so no lookup-then-touch window exists in which a
+/// concurrent revoke is still admitted (intent-hq/intentd#1868).
+#[tokio::test]
+async fn resolve_principal_credential_admits_active_and_rejects_revoked() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let hash = "e".repeat(64);
+    store
+        .insert_principal_credential(&primary.id, &hash)
+        .await
+        .expect("insert");
+    let services = Services::new(store.clone());
+
+    assert_eq!(
+        services
+            .resolve_principal_credential("f".repeat(64))
+            .await
+            .expect("resolve unknown"),
+        None
+    );
+    assert_eq!(
+        services
+            .resolve_principal_credential(hash.clone())
+            .await
+            .expect("resolve active"),
+        Some(primary.id.clone())
+    );
+    assert!(
+        store
+            .lookup_principal_credential(&hash)
+            .await
+            .expect("lookup")
+            .expect("present")
+            .last_used_at
+            .is_some(),
+        "an admitted credential records last_used_at"
+    );
+
+    assert!(store
+        .revoke_principal_credential(&hash)
+        .await
+        .expect("revoke"));
+    assert_eq!(
+        services
+            .resolve_principal_credential(hash)
+            .await
+            .expect("resolve revoked"),
+        None,
+        "a revoked credential is never admitted"
+    );
+}
+
 #[tokio::test]
 async fn settings_revision_gate_orders_mutation_before_snapshot() {
     let tmp = TempDb::new();
