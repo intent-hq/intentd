@@ -111,6 +111,7 @@ pub mod pi_cli;
 mod pr_monitor;
 mod pr_ops;
 mod primitive_ops;
+mod principal_ops;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_models;
@@ -951,6 +952,10 @@ pub struct Services {
     /// Unit tests inject an invalid/mock URI so `github.connect` never
     /// reaches github.com.
     github_login_base_uri: Option<String>,
+    /// When the primary principal's GitHub profile was last refreshed from
+    /// `GET /user` on a `principal.me` read (multiplayer w1); shared across
+    /// clones so the rate limit spans every RPC handle.
+    principal_identity_refreshed_at: principal_ops::IdentityRefreshState,
     /// Shared cache + offload gates for git-derived aggregates that are still
     /// computed on demand (`diffSummary` for explicit callers, `CoW` support
     /// probes on list/get). Diff rollups are **not** attached to the high-
@@ -1312,6 +1317,7 @@ impl Services {
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
+            principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
             disk_usage: Arc::new(disk_usage::DiskUsageCache::new()),
             agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
@@ -17779,6 +17785,9 @@ impl WorkspaceApi for Services {
             for ws in &mut list {
                 ws.slim_for_list();
             }
+            // Membership summary (multiplayer w1): one SQL query for the
+            // whole list, relative to the request's bound caller.
+            this.attach_workspace_memberships(&mut list).await;
             Ok(list)
         })
     }
@@ -17819,6 +17828,7 @@ impl WorkspaceApi for Services {
             for ws in &mut list {
                 ws.slim_for_list();
             }
+            this.attach_workspace_memberships(&mut list).await;
             Ok(list)
         })
     }
@@ -17835,6 +17845,7 @@ impl WorkspaceApi for Services {
             if id.is_chief() {
                 let mut ws = chief_workspace();
                 ws.activity = this.workspace_activity(&id);
+                this.attach_workspace_membership(&mut ws).await;
                 return Ok(ws);
             }
             let mut ws = store.get_workspace(&id).await?;
@@ -17861,6 +17872,8 @@ impl WorkspaceApi for Services {
             // at — uncapped and unslimmed: `workspace.get` keeps every
             // field for detail reads.
             Self::merge_workspace_external_pull_requests(&mut ws, external);
+            // Membership summary (multiplayer w1), relative to the caller.
+            this.attach_workspace_membership(&mut ws).await;
             Ok(ws)
         })
     }
@@ -18929,6 +18942,7 @@ impl WorkspaceApi for Services {
                         checkout_mode: None,
                         disk_usage: None,
                         pending_delete_at: None,
+                        membership: None,
                     };
                     // Provision the workspace checkout (TS `createGitWorktree`
                     // parity): a local workspace created off a local git repo
@@ -21207,6 +21221,7 @@ impl WorkspaceApi for Services {
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,
+                membership: None,
             };
             // Provision the checkout for the duplicate (TS
             // `duplicateWorkspace` parity, mirroring the `workspace.create`
@@ -29666,6 +29681,36 @@ impl WorkspaceApi for Services {
             let sc = pr_ops::resolve_source_control(injected).await?;
             let user = sc.get_user().await.map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({ "user": github_browse_ops::user_to_wire(&user) }))
+        })
+    }
+
+    // ========================================================================
+    // principal.* (multiplayer w1) — see `principal_ops`.
+    // ========================================================================
+
+    fn principal_me(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.principal_me_op().await })
+    }
+
+    fn primary_principal_id(&self) -> BoxFuture<'_, Result<intent_core::PrincipalId>> {
+        let store = self.store.clone();
+        Box::pin(async move { Ok(store.get_primary_principal().await?.id) })
+    }
+
+    fn resolve_principal_credential(
+        &self,
+        token_hash: String,
+    ) -> BoxFuture<'_, Result<Option<intent_core::PrincipalId>>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let Some(cred) = store.lookup_principal_credential(&token_hash).await? else {
+                return Ok(None);
+            };
+            if !cred.is_active() {
+                return Ok(None);
+            }
+            let _ = store.touch_principal_credential(&token_hash).await?;
+            Ok(Some(cred.principal_id))
         })
     }
 

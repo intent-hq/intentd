@@ -132,12 +132,12 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// 355 → 366: `extract_router_methods` rejected `-` in method names, so the 11
 /// already-shipped `accept-changes.*` / `file-tracking.*` router arms were never
 /// frozen here. No protocol bump — the wire surface did not change.
-const EXPECTED_TOTAL_METHODS: usize = 366;
+const EXPECTED_TOTAL_METHODS: usize = 367;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 315;
+const EXPECTED_ROUTER_METHODS: usize = 316;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 49;

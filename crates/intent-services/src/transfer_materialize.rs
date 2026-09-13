@@ -1067,6 +1067,7 @@ mod tests {
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
+            membership: None,
         }
     }
 

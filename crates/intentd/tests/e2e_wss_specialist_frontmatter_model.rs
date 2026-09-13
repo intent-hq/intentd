@@ -1172,5 +1172,6 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }

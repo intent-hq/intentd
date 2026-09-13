@@ -642,7 +642,13 @@ async fn run_hook_script(
         timeout,
         ..intent_js::EvalOptions::default()
     };
-    match intent_js::eval(&full_code, &opts, Some(host)).await {
+    // Hook runs are daemon-internal work: every `ws.*` call the script makes
+    // is bound to the `Daemon` caller (multiplayer w1).
+    let eval = intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        intent_js::eval(&full_code, &opts, Some(host)),
+    );
+    match eval.await {
         Ok(v) => {
             let logs = v
                 .get("__logs")
@@ -2377,6 +2383,7 @@ mod tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 
@@ -3337,6 +3344,69 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Multiplayer w1: every `ws.*` call a hook script makes runs with the
+    /// task-local `Caller::Daemon` bound (hook runs are daemon-internal
+    /// work, never the owning agent's wire identity).
+    #[tokio::test]
+    async fn hook_run_binds_daemon_caller() {
+        struct ProbeApi {
+            ws: Workspace,
+            seen: std::sync::Mutex<(bool, Option<intent_core::Caller>)>,
+        }
+        impl WorkspaceApi for ProbeApi {
+            fn get_workspace(
+                &self,
+                _id: WorkspaceId,
+            ) -> intent_core::BoxFuture<'_, intent_core::Result<Workspace>> {
+                *self.seen.lock().unwrap() = (true, intent_core::current_caller());
+                let snapshot = self.ws.clone();
+                Box::pin(async move { Ok(snapshot) })
+            }
+        }
+        let ws = WorkspaceId::new();
+        let api = Arc::new(ProbeApi {
+            ws: workspace(&ws),
+            seen: std::sync::Mutex::new((false, None)),
+        });
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws,
+            agent_id: AgentId::from("agent-hooks"),
+            name: "caller-probe".to_string(),
+            code: "await ws.workspace.info(); return { dispatch: false };".to_string(),
+            delay_ms: 10_000,
+            cron: None,
+            run_at: None,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: None,
+            perpetual: false,
+            dispatch_count: 0,
+        };
+        let outcome = run_hook_script(
+            api.clone(),
+            &hook,
+            Duration::from_secs(10),
+            &AgentFeaturesSettings::default(),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(outcome, RunOutcome::Continue { .. }),
+            "probe script must complete without dispatching"
+        );
+        assert_eq!(
+            api.seen.lock().unwrap().clone(),
+            (true, Some(intent_core::Caller::Daemon))
+        );
     }
 
     #[tokio::test]

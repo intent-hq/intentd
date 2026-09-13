@@ -3206,6 +3206,157 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     srv.ws.stop().await;
 }
 
+/// Multiplayer w1: the WSS upgrade binds the connection to a principal and
+/// `principal.me` reports it. The legacy file token resolves to the primary
+/// principal as administrator; a per-principal credential (matched by hex
+/// SHA-256) resolves to its principal, not an administrator, and never to the
+/// primary user. `workspace.get` / `workspace.list` rows carry the flattened
+/// membership summary relative to the caller: the primary user is `owner` of
+/// a workspace it created, an added collaborator sees `collaborator`, and a
+/// non-member sees no `myRole` at all. An unknown token is still refused.
+#[tokio::test]
+async fn wss_principal_me_and_workspace_membership_by_caller() {
+    use intent_core::{Principal, PrincipalId, WorkspaceRole};
+
+    let srv = start(WsOptions::default()).await;
+    let primary = srv
+        .store
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+
+    // Legacy token → primary principal, administrator.
+    let me = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"principal.me","params":{}}"#,
+    )
+    .await;
+    assert_eq!(me["jsonrpc"], "2.0");
+    assert_eq!(me["id"], 1);
+    assert!(
+        me.get("error").is_none(),
+        "principal.me over legacy token: {me}"
+    );
+    assert_eq!(me["result"]["id"], primary.id.0);
+    assert_eq!(me["result"]["isAdministrator"], true);
+    assert!(me["result"]["login"].is_null() || me["result"]["login"].is_string());
+
+    // A second principal with its own credential (hashed at rest).
+    let guest_token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    srv.store.upsert_principal(&guest).await.expect("guest");
+    srv.store
+        .insert_principal_credential(&guest.id, &sha256_hex(guest_token.as_bytes()))
+        .await
+        .expect("guest credential");
+
+    let guest_ws_call = |frame: String| {
+        let port = srv.port;
+        let cfg = srv.cfg.clone();
+        async move {
+            let url = format!("wss://localhost:{port}/ws?token={guest_token}");
+            let mut ws = common::wss_connect_with_retry(port, cfg, &url).await;
+            ws.send(Message::Text(frame.into())).await.expect("send");
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        return serde_json::from_str::<Value>(&text).expect("json")
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        }
+    };
+
+    let me = guest_ws_call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"principal.me","params":{}}"#.to_string(),
+    )
+    .await;
+    assert!(me.get("error").is_none(), "principal.me over guest: {me}");
+    assert_eq!(me["result"]["id"], guest.id.0);
+    assert_eq!(me["result"]["login"], "guest");
+    assert_eq!(me["result"]["isAdministrator"], false);
+    assert_ne!(me["result"]["id"], primary.id.0);
+
+    // An unknown token is refused at the upgrade (401).
+    let unknown = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+    let resp = https_request(
+        srv.port,
+        srv.cfg.clone(),
+        &upgrade_req("/ws", None, Some(unknown)),
+    )
+    .await;
+    assert_eq!(status_code(&resp), 401, "unknown token upgrade: {resp}");
+
+    // Membership summary relative to the caller.
+    let ws_id = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws_id))
+        .await
+        .expect("insert workspace");
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.get","params":{{"workspaceId":"{}"}}}}"#,
+        ws_id.0
+    );
+
+    let owner_view = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    assert!(owner_view.get("error").is_none(), "{owner_view}");
+    let owner_ws = &owner_view["result"]["workspace"];
+    assert_eq!(owner_ws["ownerPrincipalId"], primary.id.0);
+    assert_eq!(owner_ws["myRole"], "owner");
+    assert_eq!(owner_ws["memberCount"], 1);
+    assert_eq!(owner_ws["openInviteCount"], 0);
+
+    let non_member_view = guest_ws_call(get_frame.clone()).await;
+    assert!(non_member_view.get("error").is_none(), "{non_member_view}");
+    let non_member_ws = &non_member_view["result"]["workspace"];
+    assert_eq!(non_member_ws["ownerPrincipalId"], primary.id.0);
+    assert!(
+        non_member_ws.get("myRole").is_none(),
+        "non-member must not carry myRole: {non_member_ws}"
+    );
+    assert_eq!(non_member_ws["memberCount"], 1);
+
+    srv.store
+        .add_workspace_member(&ws_id, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("add collaborator");
+
+    let collaborator_view = guest_ws_call(get_frame).await;
+    let collaborator_ws = &collaborator_view["result"]["workspace"];
+    assert_eq!(collaborator_ws["myRole"], "collaborator");
+    assert_eq!(collaborator_ws["memberCount"], 2);
+
+    let list = guest_ws_call(
+        r#"{"jsonrpc":"2.0","id":4,"method":"workspace.list","params":{}}"#.to_string(),
+    )
+    .await;
+    assert!(list.get("error").is_none(), "{list}");
+    let row = list["result"]["workspaces"]
+        .as_array()
+        .expect("list array")
+        .iter()
+        .find(|w| w["id"] == ws_id.0)
+        .expect("listed workspace");
+    assert_eq!(row["ownerPrincipalId"], primary.id.0);
+    assert_eq!(row["myRole"], "collaborator");
+    assert_eq!(row["memberCount"], 2);
+    assert_eq!(row["openInviteCount"], 0);
+
+    srv.ws.stop().await;
+}
+
 /// monorepo#564: `agent.sendMessage` to a nonexistent agent id (e.g. a
 /// truncated id) fails closed with `-32602` naming the unknown id — it must
 /// NOT auto-queue a phantom message (`queued: true`) the sender then waits on
@@ -8438,6 +8589,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
