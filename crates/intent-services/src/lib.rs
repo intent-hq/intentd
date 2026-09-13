@@ -8823,8 +8823,10 @@ fn check_set_content_reduction(
 /// text it persists.
 #[derive(Clone, Copy)]
 enum ContentWritePolicy {
-    /// `note.setContent`: the reduction guard (measured against the writer's
-    /// base when known, else the stored current) then the set-content cleaner.
+    /// `note.setContent`: the set-content cleaner runs once on the writer's
+    /// text before any merge, then each attempt applies the reduction guard
+    /// (measured against the writer's base when known, else the stored
+    /// current).
     SetContent { confirm_replacement: bool },
     /// `note.add` / `note.edit` / `note.editLines`: the surgical transform
     /// already ran against the content the caller read; the merged text
@@ -8876,6 +8878,12 @@ struct ContentWrite<'a> {
 /// gated on the rev it read via [`persist_note_content`] — so a write that
 /// lands in between is merged into on the next attempt rather than
 /// overwritten. The last attempt's `Conflict` propagates unchanged.
+///
+/// The `SetContent` cleaner runs on `incoming` once, before any merge: the
+/// merge (and the checkbox repair) then sees the shape that will persist —
+/// a quoted payload no longer hides a bullet behind its quote — and the
+/// merged text is persisted without a second pass, so current text that
+/// legitimately starts with a quote is not stripped by someone else's write.
 async fn persist_merged_content(
     store: &Store,
     workspace_id: &WorkspaceId,
@@ -8890,6 +8898,14 @@ async fn persist_merged_content(
         author,
         op,
     } = write;
+    let cleaned;
+    let merge_input = match policy {
+        ContentWritePolicy::SetContent { .. } => {
+            cleaned = note_ops::clean_set_content(incoming)?;
+            cleaned.as_str()
+        }
+        ContentWritePolicy::Surgical => incoming,
+    };
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -8904,23 +8920,21 @@ async fn persist_merged_content(
             workspace_id,
             note_id,
             &note,
-            incoming,
+            merge_input,
             expected_version,
         )
         .await?;
-        let text = match policy {
-            ContentWritePolicy::SetContent {
+        if let ContentWritePolicy::SetContent {
+            confirm_replacement,
+        } = policy
+        {
+            check_set_content_reduction(
+                merge.base.as_deref().unwrap_or(&old_content),
+                incoming,
                 confirm_replacement,
-            } => {
-                check_set_content_reduction(
-                    merge.base.as_deref().unwrap_or(&old_content),
-                    incoming,
-                    confirm_replacement,
-                )?;
-                note_ops::clean_set_content(&merge.text)?
-            }
-            ContentWritePolicy::Surgical => merge.text,
-        };
+            )?;
+        }
+        let text = merge.text;
         tracing::debug!(
             note = %note_id.0,
             op,

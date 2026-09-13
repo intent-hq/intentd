@@ -687,9 +687,16 @@ mod tests {
             repair_checkbox_markers("- [x ] t", &after_run),
             ("- [x ] t".to_string(), 0)
         );
-        let last_marker_char: Vec<Range<usize>> = std::iter::once(5..6).collect();
+        // Partial overlap with the bracket run qualifies: the last marker
+        // character (`4..5`) and the closing bracket (`5..6`) both repair.
+        let last_marker_char: Vec<Range<usize>> = std::iter::once(4..5).collect();
         assert_eq!(
             repair_checkbox_markers("- [x ] t", &last_marker_char),
+            ("- [x] t".to_string(), 1)
+        );
+        let closing_bracket: Vec<Range<usize>> = std::iter::once(5..6).collect();
+        assert_eq!(
+            repair_checkbox_markers("- [x ] t", &closing_bracket),
             ("- [x] t".to_string(), 1)
         );
     }

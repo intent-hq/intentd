@@ -3143,6 +3143,108 @@ async fn set_content_stale_expected_version_repairs_conflicting_marker() {
     assert_eq!(rows[0].status, "in-progress");
 }
 
+/// Same stale-`expectedVersion` race with the incoming text wrapped in the
+/// quotes the set-content cleaner strips. The cleaner runs before the merge,
+/// so the bullet is visible to the conflict-scoped repair and the persisted
+/// line is `- [/] alpha`, not `- [/x] alpha`.
+#[tokio::test]
+async fn set_content_quoted_stale_expected_version_repairs_conflicting_marker() {
+    let (_tmp, svc, ws, id) = setup_versioned("- [ ] alpha\nbeta\ngamma").await;
+
+    let b = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "- [/] alpha\nbeta\ngamma".into(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("B write");
+    assert_eq!(b.rev, 1);
+
+    let a = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "\"- [x] alpha\nbeta\ngamma\ndelta\"".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("quoted stale expectedVersion merges");
+    assert_eq!(a.new_content, "- [/] alpha\nbeta\ngamma\ndelta");
+    assert_eq!(a.rev, 2);
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "- [/] alpha\nbeta\ngamma\ndelta");
+    let rows = svc
+        .list_note_tasks(ws.clone(), id.clone())
+        .await
+        .expect("listTasks");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].text, "alpha");
+    assert_eq!(rows[0].status, "in-progress");
+}
+
+/// Controls for the pre-merge cleaner: an exact-rev quoted write still
+/// persists the unquoted text byte-for-byte, and a non-conflicting stale
+/// merge onto current text that legitimately starts with a quote keeps that
+/// quote — only the writer's own payload is cleaned.
+#[tokio::test]
+async fn set_content_cleaner_runs_once_on_the_incoming_text() {
+    let (_tmp, svc, ws, id) = setup_versioned("alpha\nbeta\ngamma").await;
+
+    let exact = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "\"alpha\nbeta\ngamma\ndelta\"".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("exact quoted write");
+    assert_eq!(exact.new_content, "alpha\nbeta\ngamma\ndelta");
+    assert_eq!(exact.rev, 1);
+
+    // The surgical path does not clean, so the current text can start with a
+    // quote the set-content cleaner would otherwise strip.
+    svc.add_to_note(
+        ws.clone(),
+        id.clone(),
+        NoteAddInput {
+            content: "\"quoted\" lead".into(),
+            heading: None,
+            position: Some("start".into()),
+        },
+        None,
+    )
+    .await
+    .expect("prepend");
+    let current = svc.store.get_note(&ws, &id).await.expect("get").content;
+    assert!(current.starts_with('"'), "{current:?}");
+
+    let stale = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "alpha\nbeta\ngamma\ndelta\nepsilon".into(),
+            false,
+            Some(1),
+            None,
+        )
+        .await
+        .expect("stale expectedVersion merges");
+    assert_eq!(stale.new_content, format!("{current}\nepsilon"));
+    assert_eq!(stale.rev, 3);
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, format!("{current}\nepsilon"));
+}
+
 /// Same race for `task.update` on a plain checkbox line: the line edit
 /// merges onto the user's save.
 #[tokio::test]
