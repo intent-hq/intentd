@@ -49,13 +49,11 @@ use tokio::sync::mpsc;
 
 use super::{request_timeout, ReverseChannel};
 
-/// Global event (empty `workspaceId`, like `settings:changed`) published when
-/// a logical client gains its first live hello'd connection (REV-2, §6).
-pub const CLIENT_CONNECTED: &str = "client:connected";
-
-/// Global event published when a logical client loses its last live hello'd
-/// connection (REV-2, §6).
-pub const CLIENT_DISCONNECTED: &str = "client:disconnected";
+/// Global events (empty `workspaceId`, like `settings:changed`) published
+/// when a logical client gains its first / loses its last live hello'd
+/// connection (REV-2, §6). Defined in the canonical taxonomy so the
+/// collaborator allowlist golden classifies them (owner-only, multiplayer w3).
+pub use intent_core::events::{CLIENT_CONNECTED, CLIENT_DISCONNECTED};
 
 /// Which listener accepted a registered connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

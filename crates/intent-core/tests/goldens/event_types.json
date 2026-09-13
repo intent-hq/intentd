@@ -57,6 +57,8 @@
     "changes:metrics-changed",
     "changes:tracked",
     "chat:stream:delta",
+    "client:connected",
+    "client:disconnected",
     "comment:added",
     "comment:resolved",
     "draft:changed",
