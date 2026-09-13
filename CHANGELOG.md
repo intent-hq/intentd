@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.53] - 2026-09-13
+
+### 🚀 Features
+
+- *(transport)* Log chat subscription lifecycle and attribute ACP parse failures ([#1853](https://github.com/intent-hq/intentd/pull/1853))
+
+
 ## [0.9.52] - 2026-09-13
 
 ### 🚀 Features
