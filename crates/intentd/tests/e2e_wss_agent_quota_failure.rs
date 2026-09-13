@@ -38,7 +38,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,26 +79,24 @@ const DISK_QUOTA_BODY: &str = r#"{"type":"error","error":{"message":"failed to w
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    /// Owned by the guard so the tree is swept only after the daemon log is
+    /// dumped; `TempDir` handles the sweep (and `INTENTD_TEST_KEEP_TMP`).
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let log_path = self.data_dir.join("daemon.log");
+        let log_path = self.data_dir.path().join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-quota-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-quota-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -362,7 +360,8 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 /// `providerId` has a known expected value.
 async fn failed_event_data(test: &str, agent_name: &str, error_data: &str) -> Option<Value> {
     let script = gate(test)?;
-    let data_dir = temp_data_dir();
+    let tmp = temp_data_dir();
+    let data_dir = tmp.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({
         "promptRpcError": {
@@ -383,7 +382,7 @@ async fn failed_event_data(test: &str, agent_name: &str, error_data: &str) -> Op
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: tmp,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -502,7 +501,8 @@ async fn startup_quota_failure_names_the_attempted_provider_over_wss() {
     let Some(script) = gate(test) else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let tmp = temp_data_dir();
+    let data_dir = tmp.path().to_path_buf();
     let (ws_id, agent_id) = seed_switched_session(&data_dir).await;
     let behavior = json!({
         "sessionNewRpcError": {
@@ -523,7 +523,7 @@ async fn startup_quota_failure_names_the_attempted_provider_over_wss() {
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: tmp,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
