@@ -124,6 +124,16 @@ pub enum Error {
     /// "source control auth error" (monorepo#2961). Surfaces as `-32603`.
     #[error("source control rate limited: {0}")]
     RateLimited(String),
+
+    /// The bound caller lacks the capability for this operation (multiplayer
+    /// w3 capability matrix: an Owner-only or administrator-only method
+    /// invoked by a collaborator). Surfaces as `-32003 Forbidden` — the same
+    /// code the transport's default-deny allowlist uses — so a client cannot
+    /// tell a service-layer refusal from a transport one. A non-member is
+    /// answered with `NotFound`, never `Forbidden`, so membership itself is
+    /// not disclosed.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 }
 
 /// Machine-readable category for a failed clone/provisioning step, surfaced
@@ -202,6 +212,7 @@ impl Error {
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,
+            Error::Forbidden(_) => -32003,
         }
     }
 }

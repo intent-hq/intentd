@@ -2022,6 +2022,15 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
         | PR_LINKED
         | PR_UPDATED
         | PR_UNLINKED => {
+            // Unshare (multiplayer w3): the forwarder runs under the
+            // subscriber's caller, so the member named by
+            // `changes.removedPrincipalId` sees its own removal as a
+            // `removedIds` delta. Any other subscriber falls through to the
+            // re-read, which is `NotFound` for non-members (no delta) — a
+            // non-member workspace id is never disclosed.
+            if is_unshare_of_current_caller(event) {
+                return Some(json!({ "removedIds": [workspace_id] }));
+            }
             let ws = api
                 .get_workspace(WorkspaceId::from(workspace_id))
                 .await
@@ -2030,6 +2039,23 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
         }
         _ => None,
     }
+}
+
+/// Whether `event` is a `workspace:updated` unshare whose
+/// `changes.removedPrincipalId` is the current request's wire principal.
+fn is_unshare_of_current_caller(event: &Event) -> bool {
+    let Some(removed) = event
+        .data
+        .get("changes")
+        .and_then(|c| c.get("removedPrincipalId"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    matches!(
+        intent_core::current_caller(),
+        Some(intent_core::Caller::Wire { principal_id, .. }) if principal_id.as_str() == removed
+    )
 }
 
 /// Map a `comment` channel event by re-reading the affected thread summary. A
