@@ -5,6 +5,7 @@
 //! exercised without a forge: the identity is passed in directly.
 
 use super::*;
+use crate::tests::pr::StubForge;
 use crate::tests::{workspace, TempDb};
 use intent_core::{with_caller, WorkspaceApi};
 use intent_store::Store;
@@ -178,7 +179,7 @@ async fn primary_identity_locked_once_another_principal_exists() {
 async fn primary_identity_locked_while_an_invite_is_open() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store.clone());
+    let services = Services::new(store.clone()).with_source_control(Arc::new(StubForge::default()));
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let mut primary = store.get_primary_principal().await.expect("primary");
@@ -208,6 +209,38 @@ async fn primary_identity_locked_while_an_invite_is_open() {
         .await
         .expect("switch applies once no invite is open");
     assert_eq!(updated.github_user_id, Some(20));
+}
+
+/// The primary's cached `github_user_id` survives `github.revoke`, so the
+/// cache alone must not mint: with no working credential the create is
+/// `GithubIdentityRequired`, and no invite row is written.
+#[tokio::test]
+async fn primary_cannot_mint_without_a_live_credential() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services =
+        Services::new(store.clone()).with_source_control(Arc::new(StubForge::unauthenticated()));
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let mut primary = store.get_primary_principal().await.expect("primary");
+    primary.github_user_id = Some(10);
+    store
+        .upsert_principal(&primary)
+        .await
+        .expect("seed identity");
+    let r = with_caller(
+        Caller::Daemon,
+        services.workspace_invite_create_op(&ws, None, None),
+    )
+    .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GithubIdentityRequired);
+    assert_eq!(
+        store
+            .count_open_workspace_invites()
+            .await
+            .expect("count invites"),
+        0
+    );
 }
 
 // --- create / list / revoke ------------------------------------------------

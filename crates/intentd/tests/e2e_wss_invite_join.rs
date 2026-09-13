@@ -3,7 +3,9 @@
 //! over the unauthenticated `/invite` endpoint → a pin mismatch is refused →
 //! the pinned account joins and receives its own credential → that credential
 //! connects to `/ws`, `principal.me` shows the GitHub identity and
-//! `workspace.get` the collaborator role → the owner removes the member →
+//! `workspace.get` the collaborator role → the owner's `github.connect`
+//! authorised as a different account is refused (`identity-locked`) while
+//! the guest depends on the primary identity → the owner removes the member →
 //! `workspace.get` is `NotFound` → `principal.revokeSelf` closes the
 //! connection and the credential no longer authenticates.
 //!
@@ -264,6 +266,35 @@ async fn await_workspace_updated(ws: &mut Ws, what: &str, pred: impl Fn(&Value) 
                 if v["method"] == json!("events.event")
                     && v["params"]["event"]["type"] == json!("workspace:updated")
                     && pred(&v["params"]["event"]["data"]["changes"])
+                {
+                    return v["params"]["event"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// Wait for a `github:auth-changed` event carrying `status`.
+async fn await_auth_changed(ws: &mut Ws, status: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_else(|| panic!("timed out waiting for github:auth-changed ({status})"));
+        let next = timeout(remaining, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for github:auth-changed ({status})"));
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == json!("events.event")
+                    && v["params"]["event"]["type"] == json!("github:auth-changed")
+                    && v["params"]["event"]["data"]["status"] == json!(status)
                 {
                     return v["params"]["event"].clone();
                 }
@@ -769,6 +800,37 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         json!(-32003),
         "collaborator minting: {v}"
     );
+
+    // 6b. Reconnect guard at the OAuth commit boundary: with the guest a
+    //     member, the primary identity is load-bearing. The owner runs
+    //     github.connect and a DIFFERENT account (the intruder) authorises →
+    //     the grant is refused before the token write: the poll reports
+    //     `identity-locked`, nothing lands in the secrets file, and the
+    //     primary still resolves as "owner".
+    let mut auth_sub = connect_ws(port, cfg.clone(), TOKEN).await;
+    let ack = wss_rpc(
+        &mut auth_sub,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["github:auth-changed"] }),
+    )
+    .await;
+    assert!(ack.get("error").is_none(), "subscribe failed: {ack}");
+    let v = wss_rpc(&mut owner, 14, "github.connect", json!({})).await;
+    assert!(v.get("error").is_none(), "github.connect: {v}");
+    assert_eq!(v["result"]["userCode"], json!(USER_CODE));
+    mock.authorize(2, INTRUDER_TOKEN);
+    let ev = await_auth_changed(&mut auth_sub, "identity-locked").await;
+    assert_eq!(ev["data"]["status"], json!("identity-locked"));
+    if let Ok(secrets) = std::fs::read_to_string(&secrets_file) {
+        assert!(
+            !secrets.contains(INTRUDER_TOKEN),
+            "refused grant persisted: {secrets}"
+        );
+    }
+    let v = wss_rpc(&mut owner, 15, "principal.me", json!({})).await;
+    assert_eq!(v["result"]["login"], json!("owner"), "{v}");
+    drop(auth_sub);
 
     // 7. The owner removes the member: the next read by the guest is
     //    NotFound and the owner's subscriber sees the count drop.
