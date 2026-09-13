@@ -264,6 +264,7 @@ mod collaborator_fan_out {
         rx: OutboundReceiver,
         subs: ConnSubs,
         members: Arc<Mutex<HashSet<String>>>,
+        subscription_id: String,
         _dir: tempfile::TempDir,
     }
 
@@ -300,17 +301,28 @@ mod collaborator_fan_out {
         .await;
         assert!(accepted);
         let reply: Value = serde_json::from_str(&rx.priority.recv().await.unwrap()).unwrap();
-        assert!(
-            reply["result"]["subscriptionId"].is_string(),
-            "a subscription id is returned whatever the patterns: {reply}"
-        );
+        let subscription_id = reply["result"]["subscriptionId"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("a subscription id is returned whatever the patterns: {reply}")
+            })
+            .to_string();
         Harness {
             bus,
             rx,
             subs,
             members,
+            subscription_id,
             _dir: dir,
         }
+    }
+
+    fn unshare(workspace_id: &str, principal_id: &str) -> NewEvent {
+        event_with(
+            WORKSPACE_UPDATED,
+            workspace_id,
+            json!({ "changes": { "members": true, "removedPrincipalId": principal_id } }),
+        )
     }
 
     async fn subscribe_and_publish(caller: Caller) -> Vec<String> {
@@ -371,6 +383,87 @@ mod collaborator_fan_out {
             "no delivery after removal"
         );
         drop(h.subs);
+    }
+
+    /// Own unshare ends a subscription scoped to that `workspaceId` (like
+    /// the scoped collection channels), while a global subscription stays
+    /// alive for the subscriber's other member workspaces.
+    #[tokio::test]
+    async fn own_unshare_ends_a_scoped_subscription_but_not_a_global_one() {
+        let principal_id = PrincipalId::new();
+        let guest = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: false,
+        };
+        let mut scoped = subscribe(
+            guest.clone(),
+            &["ws-1", "ws-2"],
+            json!({"eventTypes":["note:*"], "workspaceId":"ws-1"}),
+        )
+        .await;
+        scoped
+            .bus
+            .publish(&event(NOTE_UPDATED, "ws-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            delivered(&mut scoped.rx).await,
+            vec![(NOTE_UPDATED.to_string(), "ws-1".to_string())]
+        );
+        scoped
+            .bus
+            .publish(&unshare("ws-1", "someone-else"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            scoped.subs.forwarder_finished(&scoped.subscription_id),
+            Some(false),
+            "another member's unshare leaves the scoped stream live"
+        );
+        scoped.members.lock().unwrap().remove("ws-1");
+        scoped
+            .bus
+            .publish(&unshare("ws-1", principal_id.as_str()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            scoped.subs.forwarder_finished(&scoped.subscription_id),
+            Some(true),
+            "own unshare ends the scoped stream"
+        );
+        drop(scoped.subs);
+
+        let mut global =
+            subscribe(guest, &["ws-1", "ws-2"], json!({"eventTypes":["note:*"]})).await;
+        global.members.lock().unwrap().remove("ws-1");
+        global
+            .bus
+            .publish(&unshare("ws-1", principal_id.as_str()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        global
+            .bus
+            .publish(&event(NOTE_UPDATED, "ws-1"))
+            .await
+            .unwrap();
+        global
+            .bus
+            .publish(&event(NOTE_UPDATED, "ws-2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            delivered(&mut global.rx).await,
+            vec![(NOTE_UPDATED.to_string(), "ws-2".to_string())],
+            "the global stream keeps delivering the other member workspace"
+        );
+        assert_eq!(
+            global.subs.forwarder_finished(&global.subscription_id),
+            Some(false)
+        );
+        drop(global.subs);
     }
 
     /// The removed member's own unshare event is its final notification when
