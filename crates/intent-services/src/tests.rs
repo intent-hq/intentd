@@ -13428,6 +13428,207 @@ mod change_event_parity {
         assert_eq!(changed[0]["actor"]["type"], "system");
         assert_eq!(flipped().await, vec![(h.ws.clone(), t2)]);
     }
+
+    /// The caller-aware terminal guard through BOTH redirects: a task's own
+    /// linked agent writing `todo` / `in-progress` against its `complete` or
+    /// `cancelled` task via `task.updateStatus` (by text) or `task.update` (by
+    /// line) is a full no-op — task status, parent `rev`, `note:updated`
+    /// count, `task:status-changed`, `completedAt` and flipped completions
+    /// all unchanged. `task.update` resolves the guard BEFORE its parent
+    /// write, so a same-text write never persists the refused marker; a real
+    /// text edit still lands in exactly one parent write carrying the
+    /// terminal marker, and the result's `status` echoes that marker.
+    #[tokio::test]
+    async fn linked_line_redirects_by_linked_agent_are_no_ops_on_terminal_task() {
+        for start in [TaskStatus::Complete, TaskStatus::Cancelled] {
+            let h = harness().await;
+            insert_task_note(&h, T1, start).await;
+            let (marker, word) = match start {
+                TaskStatus::Complete => ("[x]", "done"),
+                _ => ("[ ]", "todo"),
+            };
+            h.store
+                .insert_note(&note(&h.ws, "spec", &linked(marker, "T", T1)))
+                .await
+                .expect("insert spec");
+            let agent = AgentId::from("agent-linked");
+            let mut session = auto_unarchive_session(&agent, &h.ws, "Linked");
+            session.task_note_id = Some(intent_core::NoteId::from(T1));
+            h.store
+                .insert_agent_session(&session)
+                .await
+                .expect("session");
+            let completed_at = || async {
+                h.store
+                    .get_note(&h.ws, &intent_core::NoteId::from(T1))
+                    .await
+                    .expect("task note")
+                    .metadata
+                    .task
+                    .expect("task")
+                    .completed_at
+            };
+            let flipped_before = h
+                .store
+                .list_agent_flipped_completions(&agent)
+                .await
+                .expect("flipped");
+            let completed_before = completed_at().await;
+            let (content_before, rev_before) = note_content(&h, "spec").await;
+            let link = format!("[T](intent://local/task/{T1})");
+
+            // Requested words that would move the task off its terminal status.
+            let attempts: &[&str] = match start {
+                TaskStatus::Complete => &["todo", "in-progress"],
+                _ => &["done", "in-progress"],
+            };
+            for requested in attempts {
+                // task.updateStatus (by text).
+                let mut sub = subscribe(&h);
+                let r = h
+                    .services
+                    .task_update_status(
+                        h.ws.clone(),
+                        spec_id(),
+                        "T".into(),
+                        (*requested).into(),
+                        Some(agent.clone()),
+                    )
+                    .await
+                    .expect("updateStatus blocked");
+                let events = drain_events(&mut sub).await;
+                assert!(r.ok);
+                assert_eq!(task_status(&h, T1).await, start, "{start:?}/{requested}");
+                assert_eq!(
+                    spec_updates(&events),
+                    0,
+                    "{start:?}/{requested}: {events:?}"
+                );
+                assert!(
+                    of_type(&events, "task:status-changed").is_empty(),
+                    "{start:?}/{requested}: {events:?}"
+                );
+
+                // task.update (by line), pure status.
+                let mut sub = subscribe(&h);
+                let r = h
+                    .services
+                    .task_update(
+                        h.ws.clone(),
+                        spec_id(),
+                        1,
+                        None,
+                        Some((*requested).into()),
+                        Some(link.clone()),
+                        Some(agent.clone()),
+                    )
+                    .await
+                    .expect("task.update blocked");
+                let events = drain_events(&mut sub).await;
+                assert!(r.ok);
+                assert_eq!(
+                    r.status, word,
+                    "{start:?}/{requested}: echoes the kept marker"
+                );
+                assert_eq!(r.new_text, link);
+                assert_eq!(task_status(&h, T1).await, start);
+                assert_eq!(
+                    spec_updates(&events),
+                    0,
+                    "{start:?}/{requested}: {events:?}"
+                );
+                assert!(of_type(&events, "task:status-changed").is_empty());
+
+                // task.update (by line), same text + blocked status: the
+                // parent is not written for the refused marker.
+                let mut sub = subscribe(&h);
+                let r = h
+                    .services
+                    .task_update(
+                        h.ws.clone(),
+                        spec_id(),
+                        1,
+                        Some(link.clone()),
+                        Some((*requested).into()),
+                        None,
+                        Some(agent.clone()),
+                    )
+                    .await
+                    .expect("task.update same text blocked");
+                let events = drain_events(&mut sub).await;
+                assert!(r.ok);
+                assert_eq!(r.status, word);
+                assert_eq!(task_status(&h, T1).await, start);
+                assert_eq!(
+                    spec_updates(&events),
+                    0,
+                    "{start:?}/{requested}: {events:?}"
+                );
+                assert!(of_type(&events, "task:status-changed").is_empty());
+            }
+            let (content, rev) = note_content(&h, "spec").await;
+            assert_eq!(content, content_before, "{start:?}: marker untouched");
+            assert_eq!(rev, rev_before, "{start:?}: no parent write at all");
+            assert_eq!(completed_at().await, completed_before, "{start:?}");
+            assert_eq!(
+                h.store
+                    .list_agent_flipped_completions(&agent)
+                    .await
+                    .expect("flipped"),
+                flipped_before,
+                "{start:?}"
+            );
+
+            // A legitimate text edit with a blocked status word still lands in
+            // ONE parent write carrying the terminal marker; the task is untouched.
+            let new_text = format!("[Renamed](intent://local/task/{T1})");
+            let mut sub = subscribe(&h);
+            let r = h
+                .services
+                .task_update(
+                    h.ws.clone(),
+                    spec_id(),
+                    1,
+                    Some(new_text.clone()),
+                    Some(attempts[0].into()),
+                    None,
+                    Some(agent.clone()),
+                )
+                .await
+                .expect("task.update text edit");
+            let events = drain_events(&mut sub).await;
+            assert_eq!(r.status, word, "{start:?}");
+            assert_eq!(r.new_text, new_text);
+            assert_eq!(task_status(&h, T1).await, start);
+            let (content, rev) = note_content(&h, "spec").await;
+            assert_eq!(content, format!("- {marker} {new_text}"), "{start:?}");
+            assert_eq!(rev, rev_before + 1, "{start:?}: exactly one parent write");
+            assert_eq!(spec_updates(&events), 1, "{start:?}: {events:?}");
+            assert!(of_type(&events, "task:status-changed").is_empty());
+
+            // An unlinked caller through the same line redirect still reopens.
+            let r = h
+                .services
+                .task_update(
+                    h.ws.clone(),
+                    spec_id(),
+                    1,
+                    None,
+                    Some("in-progress".into()),
+                    None,
+                    Some(AgentId::from("agent-outsider")),
+                )
+                .await
+                .expect("outsider reopens");
+            assert_eq!(r.status, "in-progress");
+            assert_eq!(task_status(&h, T1).await, TaskStatus::InProgress);
+            assert_eq!(
+                note_content(&h, "spec").await.0,
+                format!("- [/] {new_text}"),
+                "{start:?}"
+            );
+        }
+    }
 }
 
 /// End-to-end §6.8 "one impl, two front doors": an agent (via the in-process MCP

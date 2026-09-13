@@ -9253,6 +9253,36 @@ impl Services {
         }
     }
 
+    /// The caller-aware terminal guard predicate: `true` when moving `task`
+    /// (the note `note_id`) to `next` must be refused — the task is already
+    /// `complete` / `cancelled`, `next` differs, and `caller` is the task's
+    /// OWN linked agent (in its `assignedAgentIds`, or the agent whose session
+    /// `task_note_id` names the task). `None` caller and every other agent
+    /// are never blocked.
+    async fn terminal_guard_blocks(
+        &self,
+        task: &TaskMetadata,
+        note_id: &NoteId,
+        next: TaskStatus,
+        caller: Option<&AgentId>,
+    ) -> bool {
+        if task.status == next
+            || !matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled)
+        {
+            return false;
+        }
+        let Some(agent_id) = caller else {
+            return false;
+        };
+        task.assigned_agent_ids.contains(agent_id)
+            || self
+                .store
+                .get_agent_session(agent_id)
+                .await
+                .ok()
+                .is_some_and(|s| s.task_note_id.as_ref() == Some(note_id))
+    }
+
     /// Write a task note's metadata status — the single implementation behind
     /// `task.updateNoteStatus` and the checkbox-level writes (`task.updateStatus`
     /// / `task.update`) redirected from a linked line (intent-hq/intent#4255).
@@ -9268,7 +9298,9 @@ impl Services {
     /// no-op — the result echoes the unchanged task plus `advisory`, no
     /// event fires, and only the checkbox materialization still runs. Every
     /// other caller (unlinked agent, the caller-less router path) is
-    /// unaffected.
+    /// unaffected. [`Self::terminal_guard_blocks`] is the predicate; the
+    /// `task.update` redirect consults it before its parent write so the
+    /// line projects the status this write actually leaves.
     pub(crate) async fn set_task_note_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -9286,38 +9318,26 @@ impl Services {
             ));
         };
         let previous_status = task.status;
-        if previous_status != new_status
-            && matches!(
-                previous_status,
-                TaskStatus::Complete | TaskStatus::Cancelled
-            )
+        if self
+            .terminal_guard_blocks(&task, &note.id, new_status, caller_agent_id.as_ref())
+            .await
         {
-            if let Some(agent_id) = caller_agent_id.as_ref() {
-                let linked = task.assigned_agent_ids.contains(agent_id)
-                    || store
-                        .get_agent_session(agent_id)
-                        .await
-                        .ok()
-                        .is_some_and(|s| s.task_note_id.as_ref() == Some(&note.id));
-                if linked {
-                    let word = match previous_status {
-                        TaskStatus::Cancelled => "cancelled",
-                        _ => "complete",
-                    };
-                    self.materialize_linked_checkboxes(&note.workspace_id, &note.id)
-                        .await;
-                    return Ok(TaskUpdateNoteStatusResult {
-                        ok: true,
-                        note_id: note.id.clone(),
-                        status: previous_status,
-                        note,
-                        advisory: Some(format!(
-                            "Task is {word}; a task's own linked agent cannot reopen it. \
-                             Ask the coordinator or user to reopen the task if more work is needed."
-                        )),
-                    });
-                }
-            }
+            let word = match previous_status {
+                TaskStatus::Cancelled => "cancelled",
+                _ => "complete",
+            };
+            self.materialize_linked_checkboxes(&note.workspace_id, &note.id)
+                .await;
+            return Ok(TaskUpdateNoteStatusResult {
+                ok: true,
+                note_id: note.id.clone(),
+                status: previous_status,
+                note,
+                advisory: Some(format!(
+                    "Task is {word}; a task's own linked agent cannot reopen it. \
+                     Ask the coordinator or user to reopen the task if more work is needed."
+                )),
+            });
         }
         let now = now_iso();
         apply_status_transition(&mut task, new_status, &now);
@@ -11603,18 +11623,18 @@ impl Services {
     }
 }
 
-/// Resolve the task note a checkbox line links to: `Some((id, status))` when
+/// Resolve the task note a checkbox line links to: `Some((id, task))` when
 /// `task_id` names a task note in `workspace_id`. Dangling links and links to
 /// non-task notes yield `None`, keeping the raw checkbox write.
 async fn resolve_linked_task(
     store: &Store,
     workspace_id: &WorkspaceId,
     task_id: &str,
-) -> Option<(NoteId, TaskStatus)> {
+) -> Option<(NoteId, TaskMetadata)> {
     let id = NoteId::from(task_id);
     let note = store.get_note(workspace_id, &id).await.ok()?;
-    let status = note.metadata.task.as_ref()?.status;
-    Some((id, status))
+    let task = note.metadata.task?;
+    Some((id, task))
 }
 
 /// Task-note status a checkbox word (`todo` / `in-progress` / `done`) written
@@ -22433,7 +22453,7 @@ impl WorkspaceApi for Services {
                 Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
                 None => None,
             };
-            if let Some((task_id, current)) = linked {
+            if let Some((task_id, task)) = linked {
                 // The line links a task note: the task's metadata status is
                 // the source of truth and the char is its projection, so the
                 // write goes to the task (events, ready-task recompute) and
@@ -22441,7 +22461,7 @@ impl WorkspaceApi for Services {
                 // line that had drifted from the task's status.
                 // Materialization schedules the attribution recompute of
                 // every parent it rewrites.
-                match redirected_task_status(&status, current) {
+                match redirected_task_status(&status, task.status) {
                     Some(next) => {
                         services
                             .set_task_note_status(
@@ -22576,17 +22596,33 @@ impl WorkspaceApi for Services {
             // status: the status write is redirected to the task and the line
             // edit carries the word that status projects to — with no status
             // word, the task's current one (a text-only retarget renders the
-            // new target's marker).
-            let redirect = linked.map(|(task_id, current)| {
-                let next = status
-                    .as_deref()
-                    .and_then(|word| redirected_task_status(word, current));
-                (task_id, next, current)
-            });
+            // new target's marker). A write the terminal guard will refuse
+            // (the task's own linked agent reopening a `complete` /
+            // `cancelled` task) leaves the task where it is, so the line
+            // projects the CURRENT status — the parent is never rewritten
+            // with a marker the task write will not produce.
+            let redirect = match linked {
+                Some((task_id, task)) => {
+                    let current = task.status;
+                    let next = status
+                        .as_deref()
+                        .and_then(|word| redirected_task_status(word, current));
+                    let projected = match next {
+                        Some(n)
+                            if !services
+                                .terminal_guard_blocks(&task, &task_id, n, caller_agent_id.as_ref())
+                                .await =>
+                        {
+                            n
+                        }
+                        _ => current,
+                    };
+                    Some((task_id, next, projected))
+                }
+                None => None,
+            };
             let line_status = match &redirect {
-                Some((_, next, current)) => Some(note_ops::status_word_for_task_status(
-                    next.unwrap_or(*current),
-                )),
+                Some((_, _, projected)) => Some(note_ops::status_word_for_task_status(*projected)),
                 None => status.as_deref(),
             };
             let update = note_ops::apply_task_line_update(
@@ -22599,11 +22635,18 @@ impl WorkspaceApi for Services {
             // A redirected pure-status write leaves the char to materialization
             // so the parent's `note:updated` follows the task's own emissions;
             // a text edit (or a drifted char with nothing to write on the task)
-            // lands in one direct parent write instead.
+            // lands in one direct parent write instead. A guard-refused
+            // status word writes the parent only when the text edit actually
+            // changed the line.
             let write_parent = match &redirect {
                 None => true,
-                Some((_, next, _)) => {
-                    text.is_some() || (next.is_none() && update.content != note.content)
+                Some((_, next, projected)) => {
+                    let refused = next.is_some_and(|n| n != *projected);
+                    if refused {
+                        text.is_some() && update.content != note.content
+                    } else {
+                        text.is_some() || (next.is_none() && update.content != note.content)
+                    }
                 }
             };
             if write_parent {
@@ -22641,6 +22684,10 @@ impl WorkspaceApi for Services {
                     .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
                     .await;
             }
+            // A guard-refused write still goes through the guarded path so the
+            // refusal and its materialization stay single-sourced; the task is
+            // unchanged and the line already projects it, so nothing is
+            // rewritten.
             if let Some((task_id, Some(next), _)) = redirect {
                 services
                     .set_task_note_status(&note.workspace_id, &task_id, next, None, caller_agent_id)
