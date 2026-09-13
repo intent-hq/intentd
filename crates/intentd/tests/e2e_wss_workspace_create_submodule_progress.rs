@@ -37,7 +37,6 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
@@ -49,24 +48,19 @@ const CLONE_SEGMENT_END: i64 = 85;
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
-    scratch: PathBuf,
+    _data_dir: tempfile::TempDir,
+    scratch: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-        let _ = std::fs::remove_dir_all(&self.scratch);
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-createsub-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-createsub-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -359,7 +353,8 @@ fn make_source_repo_with_submodule(dir: &Path) -> PathBuf {
 /// credential-helper entries after any inherited value, so this coexists
 /// with production behavior).
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = scratch_dir("data");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let scratch = scratch_dir("scratch");
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -369,7 +364,7 @@ async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
         scratch,
     };
     let socket = data_dir.join("intentd.sock");
@@ -442,7 +437,7 @@ async fn workspace_create_local_worktree_streams_progress_over_wss() {
         return;
     }
     let (daemon, port, cfg) = boot().await;
-    let repo = daemon.scratch.join("local-src");
+    let repo = daemon.scratch.path().join("local-src");
     std::fs::create_dir_all(&repo).unwrap();
     run_git(&["init", "-q", "-b", "main"], &repo);
     run_git(&["config", "user.name", "e2e"], &repo);
@@ -510,8 +505,8 @@ async fn workspace_create_clone_with_submodule_streams_normalized_progress_over_
         return;
     }
     let (daemon, port, cfg) = boot().await;
-    let src = make_source_repo_with_submodule(&daemon.scratch);
-    let clone_path = daemon.scratch.join("checkout").join("source-repo");
+    let src = make_source_repo_with_submodule(daemon.scratch.path());
+    let clone_path = daemon.scratch.path().join("checkout").join("source-repo");
 
     let mut sub = connect_ws(port, cfg.clone()).await;
     subscribe_clone_events(&mut sub, 1).await;
@@ -594,7 +589,7 @@ async fn workspace_create_clone_failure_emits_done_ok_false_over_wss() {
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
     let progress_id = "prog-wss-fail-1";
-    let missing = daemon.scratch.join("definitely-not-a-repo.git");
+    let missing = daemon.scratch.path().join("definitely-not-a-repo.git");
     let resp = wss_rpc_raw(
         &mut rpc,
         2,
@@ -602,7 +597,7 @@ async fn workspace_create_clone_failure_emits_done_ok_false_over_wss() {
         json!({
             "title": "WSS Failure Progress",
             "githubUrl": format!("file://{}", missing.display()),
-            "clonePath": daemon.scratch.join("fail-checkout").to_string_lossy(),
+            "clonePath": daemon.scratch.path().join("fail-checkout").to_string_lossy(),
             "progressId": progress_id,
         }),
     )

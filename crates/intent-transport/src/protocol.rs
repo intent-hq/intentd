@@ -430,12 +430,20 @@
 //! Version 9.12 adds the `auth_required` external MCP-server lifecycle state
 //! (additive; §5.22): HTTP 401/403 from a remote probe or forwarded call tells
 //! clients to authenticate. No method-catalog change.
+//!
+//! Version 9.13 adds idempotent attachment placement (additive; §5.9,
+//! intent-hq/intent#4691): the optional `idempotencyKey` param on
+//! `file.placeAttachment` and `file.attachmentUpload.begin`, the presence-
+//! detected `replayed: true` result marker on a same-key replay, and the
+//! `{ workspaceId, idempotencyKey }` selector arm on `file.getAttachmentInfo`
+//! (exactly one of `attachmentId` | the key pair). Bindings are per
+//! workspace, retained 7 days. No method-catalog change.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.12";
+pub const PROTOCOL_VERSION: &str = "9.13";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

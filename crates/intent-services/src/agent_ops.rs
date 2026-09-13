@@ -264,46 +264,46 @@ impl AgentSnapshotPrs {
 }
 
 /// Group tracked PR pools into the snapshot's `prs` object. `pools` yields
-/// `(owner, name, prs)` per repo; a pool with a blank (empty/whitespace)
-/// owner or name is skipped entirely — no meaningful label can be formed —
-/// matching the identity-less-root skip upstream. A merged/closed entry in
-/// ANY pool suppresses that `(repo, number)` entirely: the freshest terminal
-/// state wins over a stale open duplicate regardless of which pool carries
-/// it. Among surviving open duplicates the workspace pool (yielded first)
-/// wins the grouping. The repo half of the key is the case-insensitive
+/// `(repo, prs)` per repo; a pool with a blank (empty/whitespace) owner or
+/// name is skipped entirely — no meaningful label can be formed — matching
+/// the identity-less-root skip upstream. A merged/closed entry in ANY pool
+/// suppresses that `(repo, number)` entirely: the freshest terminal state
+/// wins over a stale open duplicate regardless of which pool carries it.
+/// Among surviving open duplicates the workspace pool (yielded first) wins
+/// the grouping. The repo half of the key is the case-insensitive
 /// [`RepoRef`] identity, so case-variant pools of one repository dedupe
 /// together. Returns `None` when no open PR survives (the field is then
 /// omitted).
 fn grouped_open_prs<'a>(
-    pools: impl IntoIterator<Item = (&'a str, &'a str, &'a [PullRequestInfo])>,
+    pools: impl IntoIterator<Item = (RepoRef, &'a [PullRequestInfo])>,
 ) -> Option<AgentSnapshotPrs> {
-    let pools: Vec<(&str, &str, &[PullRequestInfo])> = pools
+    let pools: Vec<(RepoRef, &[PullRequestInfo])> = pools
         .into_iter()
-        .filter(|(owner, name, _)| !owner.trim().is_empty() && !name.trim().is_empty())
+        .filter(|(repo, _)| !repo.owner.trim().is_empty() && !repo.name.trim().is_empty())
         .collect();
     // Seed the seen-set with every merged/closed key so a terminal state in
     // any pool suppresses stale open duplicates of the same PR.
     let mut seen: HashSet<(RepoRef, u64)> = HashSet::new();
-    for &(owner, name, prs) in &pools {
-        for pr in prs {
+    for (repo, prs) in &pools {
+        for pr in *prs {
             if matches!(
                 pr.status,
                 PullRequestStatus::Merged | PullRequestStatus::Closed
             ) {
-                seen.insert((RepoRef::new(owner, name), pr.number));
+                seen.insert((repo.clone(), pr.number));
             }
         }
     }
     let mut groups = AgentSnapshotPrs::default();
-    for &(owner, name, prs) in &pools {
-        for pr in prs {
-            if !seen.insert((RepoRef::new(owner, name), pr.number)) {
+    for (repo, prs) in &pools {
+        for pr in *prs {
+            if !seen.insert((repo.clone(), pr.number)) {
                 continue;
             }
             if let Some(group) = groups.group_for(pr) {
                 group.push(crate::harness::latest().pr_monitor_label(
-                    owner,
-                    name,
+                    &repo.owner,
+                    &repo.name,
                     pr.number.cast_signed(),
                 ));
             }
@@ -4206,6 +4206,54 @@ impl Services {
                 &pid,
                 &model_id,
             )?;
+            // Availability gate for a genuine CROSS-provider switch: hold the
+            // target to the same bar as the create/delegate front door
+            // (`ensure_provider_available`: disabled → not-authenticated →
+            // not-installed, one distinct `-32602` each). `ensure_known_provider`
+            // above only says the id is in the catalog — without this a client
+            // could park the session on a provider that is switched off, logged
+            // out, or not installed at all, and the failure would surface a turn
+            // later as a raw spawn error with nothing tying it back to the
+            // `setModel` that caused it.
+            //
+            // Scoped to a switch that actually MOVES the session: an explicit
+            // `providerId` naming a different provider than the session's
+            // current one. Deliberately NOT applied to a same-provider model
+            // change (nor to the no-`providerId` form, which cannot move the
+            // session anywhere) — an agent already running on a provider must
+            // stay able to change its model even while the availability probe
+            // is unhappy (a hard-false cached auth verdict, a provider disabled
+            // in settings after the agent was created), and gating that would
+            // regress behavior that works today.
+            //
+            // Runs AFTER the model-ownership check so the existing error
+            // precedence is unchanged: a request naming a model the target
+            // provider does not own is still rejected for THAT reason,
+            // installed or not.
+            //
+            // "Current" is the session's EFFECTIVE provider — the one the next
+            // spawn would actually run — not the raw column: a legacy alias
+            // (`acp`/`default`/`augment`) normalizes through `provider_config`
+            // exactly as `resolve_spawn` and the ownership check above do, and
+            // a NULL column resolves to the settings-derived default. Comparing
+            // the raw column would treat an explicit `providerId` naming that
+            // same effective provider as a cross-provider switch and gate a
+            // same-provider model change — the very exemption above.
+            let current_effective = session
+                .provider
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(|p| intent_providers::provider_config(p).id.to_string())
+                .or_else(|| {
+                    crate::agent_session::derived_default_provider(&self.effective_settings())
+                });
+            if current_effective.as_deref() != Some(pid.as_str()) {
+                ensure_provider_available(
+                    "agent.setModel",
+                    &pid,
+                    &self.effective_settings().providers,
+                )?;
+            }
             Some(pid)
         } else {
             // Without an explicit providerId the model is validated against
@@ -10774,23 +10822,15 @@ impl Services {
                 Vec::new()
             }
         };
-        let mut pools: Vec<(&str, &str, &[PullRequestInfo])> = Vec::new();
+        let mut pools: Vec<(RepoRef, &[PullRequestInfo])> = Vec::new();
         if let Some(ws) = &workspace {
-            if let (Some(owner), Some(name), Some(prs)) = (
-                ws.repository_owner.as_deref(),
-                ws.repository_name.as_deref(),
-                ws.pull_requests.as_deref(),
-            ) {
-                pools.push((owner, name, prs));
+            if let (Some(repo), Some(prs)) = (ws.repo(), ws.pull_requests.as_deref()) {
+                pools.push((repo, prs));
             }
         }
         for root in &roots {
-            if let (Some(owner), Some(name), Some(prs)) = (
-                root.repo_owner.as_deref(),
-                root.repo_name.as_deref(),
-                root.pull_requests.as_deref(),
-            ) {
-                pools.push((owner, name, prs));
+            if let (Some(repo), Some(prs)) = (root.repo(), root.pull_requests.as_deref()) {
+                pools.push((repo, prs));
             }
         }
         grouped_open_prs(pools)

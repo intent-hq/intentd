@@ -47,7 +47,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -55,22 +54,17 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-xprov-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-xprov-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -360,7 +354,8 @@ async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let wrapper = write_provider_wrapper(&data_dir, &script);
     seed_grok_path_override(&data_dir, &wrapper);
     let prompt_log = data_dir.join("prompt-log.jsonl");
@@ -376,10 +371,7 @@ async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
     ];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -597,6 +589,7 @@ struct LoadSessionHarness {
     agent_id: String,
     prompt_log: PathBuf,
     session_log: PathBuf,
+    _data_dir: tempfile::TempDir,
 }
 
 async fn load_session_harness(
@@ -605,7 +598,8 @@ async fn load_session_harness(
     model: &str,
     provider: &str,
 ) -> LoadSessionHarness {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let wrapper = write_provider_wrapper(&data_dir, script);
     seed_grok_path_override(&data_dir, &wrapper);
     let prompt_log = data_dir.join("prompt-log.jsonl");
@@ -628,10 +622,7 @@ async fn load_session_harness(
         ("MOCK_AGENT_SESSION_LOG", &session_log_str),
     ];
     let child = spawn_serve(&data_dir, &env);
-    let daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -699,6 +690,7 @@ async fn load_session_harness(
         agent_id,
         prompt_log,
         session_log,
+        _data_dir: data_dir_guard,
     };
     await_stream_end(&mut harness.sub, &harness.agent_id).await;
     harness

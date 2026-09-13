@@ -198,9 +198,8 @@ fn build_command(auggie_path: &Path, args: &[&str]) -> Command {
     let lower = auggie_path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    let needs_shell =
-        !auggie_path.is_absolute() || matches!(lower.as_deref(), Some("cmd") | Some("bat"));
+        .map(str::to_ascii_lowercase);
+    let needs_shell = !auggie_path.is_absolute() || matches!(lower.as_deref(), Some("cmd" | "bat"));
     if needs_shell {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(auggie_path).args(args);
@@ -310,6 +309,7 @@ mod tests {
     /// `WATCHER_TEST_SERIAL` (events/mod.rs) precedents. `unwrap_or_else(
     /// into_inner)` recovers from a poisoned lock so one panicking test does not
     /// cascade into the rest.
+    #[cfg(unix)]
     static CHILD_SPAWN_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]

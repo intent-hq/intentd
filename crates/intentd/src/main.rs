@@ -1969,6 +1969,14 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     tokio::spawn(async move {
         services_export_sweep.sweep_stale_export_staging().await;
     });
+    // Sweep expired attachment idempotency-key bindings (7-day retention,
+    // intent-hq/intent#4691); also swept lazily by keyed placements/begins.
+    let services_idempotency_sweep = services.clone();
+    tokio::spawn(async move {
+        services_idempotency_sweep
+            .sweep_expired_attachment_idempotency_keys()
+            .await;
+    });
     // Background PR refresh (§7.6): periodically re-fetch linked PRs (and
     // discover/link PRs for workspaces without one), persist any change, and
     // emit `pr:*` events so clients update without polling.
@@ -4438,6 +4446,7 @@ async fn uds_is_live(socket_path: &Path) -> bool {
 }
 
 #[cfg(windows)]
+#[expect(clippy::unused_async)] // signature parity with the unix UDS probe; pipe open is sync
 async fn uds_is_live(socket_path: &Path) -> bool {
     use tokio::net::windows::named_pipe::ClientOptions;
     const ERROR_PIPE_BUSY: i32 = 231;
@@ -4580,6 +4589,7 @@ fn lock_holder_detail(pid_path: &Path, errno: nix::errno::Errno) -> String {
 /// Non-unix has no `flock`; the lock is a no-op success (the socket/pidfile
 /// guards remain the single-instance enforcement on those platforms).
 #[cfg(not(unix))]
+#[expect(clippy::unnecessary_wraps)] // signature parity with the unix flock impl
 fn acquire_data_dir_lock(_config: &Config) -> anyhow::Result<DataDirLock> {
     Ok(DataDirLock)
 }
@@ -5610,44 +5620,47 @@ async fn cmd_stop() -> ExitCode {
     };
 
     // (2)-(4) Wait, then escalate SIGTERM → SIGKILL with timeouts.
-    let outcome = run_stop_escalation(pid, graceful).await;
-    match outcome {
-        StopOutcome::AlreadyDown => println!("intentd: stopped"),
-        StopOutcome::Graceful => println!("intentd: stopped gracefully"),
-        StopOutcome::Terminated => println!("intentd: stopped (SIGTERM)"),
-        StopOutcome::Killed => println!("intentd: stopped (SIGKILL)"),
-        StopOutcome::Failed => {
-            eprintln!("error: could not confirm intentd shutdown (pid {pid})");
-            return ExitCode::FAILURE;
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-/// Run the escalation with production timeouts, using the real OS signaller on
-/// unix. On non-unix there is no UDS daemon to signal, so report failure.
-async fn run_stop_escalation(pid: u32, graceful: bool) -> StopOutcome {
     #[cfg(unix)]
     {
-        escalate_stop(
-            &NixSignaller,
-            pid,
-            graceful,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_secs(3),
-            Duration::from_millis(100),
-        )
-        .await
+        match run_stop_escalation(pid, graceful).await {
+            StopOutcome::AlreadyDown => println!("intentd: stopped"),
+            StopOutcome::Graceful => println!("intentd: stopped gracefully"),
+            StopOutcome::Terminated => println!("intentd: stopped (SIGTERM)"),
+            StopOutcome::Killed => println!("intentd: stopped (SIGKILL)"),
+            StopOutcome::Failed => {
+                eprintln!("error: could not confirm intentd shutdown (pid {pid})");
+                return ExitCode::FAILURE;
+            }
+        }
+        ExitCode::SUCCESS
     }
+    // On non-unix there is no process signalling to escalate through, so
+    // shutdown cannot be confirmed.
     #[cfg(not(unix))]
     {
-        let _ = (pid, graceful);
-        StopOutcome::Failed
+        let _ = graceful;
+        eprintln!("error: could not confirm intentd shutdown (pid {pid})");
+        ExitCode::FAILURE
     }
+}
+
+/// Run the escalation with production timeouts, using the real OS signaller.
+#[cfg(unix)]
+async fn run_stop_escalation(pid: u32, graceful: bool) -> StopOutcome {
+    escalate_stop(
+        &NixSignaller,
+        pid,
+        graceful,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        Duration::from_secs(3),
+        Duration::from_millis(100),
+    )
+    .await
 }
 
 /// The terminal result of a stop escalation (§5.7).
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum StopOutcome {
     /// The process was already gone before any escalation.
@@ -5664,6 +5677,7 @@ enum StopOutcome {
 
 /// Process-signalling seam so the escalation logic is unit-testable with a fake
 /// (§5.7 verification). The real impl uses `nix` signal-0/SIGTERM/SIGKILL.
+#[cfg(unix)]
 trait Signaller {
     fn is_alive(&self, pid: u32) -> bool;
     fn term(&self, pid: u32);
@@ -5673,6 +5687,7 @@ trait Signaller {
 /// SIGTERM → SIGKILL escalation. The caller has already issued the graceful
 /// control RPC; `graceful_requested` says whether to first wait for a polite
 /// exit. Each phase polls liveness up to its timeout before escalating.
+#[cfg(unix)]
 async fn escalate_stop<S: Signaller>(
     sig: &S,
     pid: u32,
@@ -5700,6 +5715,7 @@ async fn escalate_stop<S: Signaller>(
 }
 
 /// Poll `is_alive` until the process exits or `timeout` elapses; `true` on exit.
+#[cfg(unix)]
 async fn wait_for_exit<S: Signaller>(sig: &S, pid: u32, timeout: Duration, poll: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -7721,6 +7737,7 @@ mod tests {
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn refuses_when_uds_is_live() {
         let config = temp_config();
@@ -7919,11 +7936,13 @@ mod tests {
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
 
+    #[cfg(unix)]
     use std::sync::Mutex;
 
     /// A scriptable [`Signaller`] for the stop-escalation unit tests: it models
     /// process death either after N liveness polls (a "graceful" exit) or in
     /// response to SIGTERM / SIGKILL, and records which signals were sent.
+    #[cfg(unix)]
     #[derive(Default)]
     struct FakeState {
         term_called: bool,
@@ -7931,6 +7950,7 @@ mod tests {
         polls: u32,
     }
 
+    #[cfg(unix)]
     struct FakeSignaller {
         inner: Mutex<FakeState>,
         die_after_polls: Option<u32>,
@@ -7938,6 +7958,7 @@ mod tests {
         die_on_kill: bool,
     }
 
+    #[cfg(unix)]
     impl FakeSignaller {
         fn new(die_after_polls: Option<u32>, die_on_term: bool, die_on_kill: bool) -> Self {
             Self {
@@ -7949,6 +7970,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Signaller for FakeSignaller {
         fn is_alive(&self, _pid: u32) -> bool {
             let mut s = self.inner.lock().unwrap();
@@ -7975,11 +7997,16 @@ mod tests {
     }
 
     // Tiny timeouts keep the escalation tests fast while exercising real waits.
+    #[cfg(unix)]
     const GRACE: Duration = Duration::from_millis(200);
+    #[cfg(unix)]
     const TERM_T: Duration = Duration::from_millis(60);
+    #[cfg(unix)]
     const KILL_T: Duration = Duration::from_millis(60);
+    #[cfg(unix)]
     const POLL: Duration = Duration::from_millis(2);
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_already_down_when_not_alive() {
         // Dead on the very first liveness probe.
@@ -7990,6 +8017,7 @@ mod tests {
         assert!(!sig.inner.lock().unwrap().kill_called);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_graceful_when_exits_before_signal() {
         // Alive for the first couple of polls, then exits during the grace wait.
@@ -7999,6 +8027,7 @@ mod tests {
         assert!(!sig.inner.lock().unwrap().term_called, "no signal needed");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_escalates_to_sigterm() {
         // Never exits on its own; dies on SIGTERM. No graceful wait requested.
@@ -8009,6 +8038,7 @@ mod tests {
         assert!(!sig.inner.lock().unwrap().kill_called);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_escalates_to_sigkill() {
         // Survives SIGTERM, dies on SIGKILL.
@@ -8019,6 +8049,7 @@ mod tests {
         assert!(sig.inner.lock().unwrap().kill_called);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_fails_when_process_never_dies() {
         let sig = FakeSignaller::new(None, false, false);

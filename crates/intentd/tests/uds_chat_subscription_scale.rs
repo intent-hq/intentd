@@ -14,6 +14,8 @@
 //! the assertion is deliberately lenient (a generous upper bound) because the
 //! test is diagnostic — the measured numbers are the deliverable.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;
@@ -37,13 +39,14 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+impl TempDb {
+    fn new() -> Self {
+        let dir = common::test_tempdir("intentd-uds-scale-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -100,9 +103,7 @@ async fn boot() -> (
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
-    let tmp = TempDb {
-        path: std::env::temp_dir().join(format!("intentd-uds-scale-{}.db", Uuid::new_v4())),
-    };
+    let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let sock_dir = common::test_tempdir_in("/tmp", "itd-uds-");

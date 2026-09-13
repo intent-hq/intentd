@@ -47,7 +47,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,16 +65,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Owns the fixture's scratch directory and removes it on drop so a panicking
-/// test does not leak files under the system tempdir (matches the pattern
-/// used by `TempDir` in `uds_specialist.rs`).
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
     ws: WsApiServer,
     api: Arc<dyn WorkspaceApi>,
@@ -84,7 +73,7 @@ struct Fixture {
     /// test can poll `len()` until the closing client's guard has actually
     /// dropped, instead of waiting on an arbitrary sleep.
     registry: Arc<PrimaryReverseRegistry>,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
@@ -94,9 +83,8 @@ async fn boot() -> Fixture {
 /// [`boot`] with caller-supplied listener options (`base_port` and
 /// `bind_addresses` are always overridden to an ephemeral loopback port).
 async fn boot_with(opts: WsOptions) -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-sticky-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-sticky-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -120,7 +108,7 @@ async fn boot_with(opts: WsOptions) -> Fixture {
         api,
         port,
         registry,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -865,11 +853,18 @@ async fn client_connected_and_disconnected_events_are_published_per_logical_clie
 /// normal epilogue — the registry entry is dropped by RAII. That departure
 /// must still be announced: `client:disconnected` reaches the subscriber and
 /// the client is gone from `live_clients()`.
+///
+/// The abort is forced, not raced: [`WsOptions::heartbeat_gate`] holds the
+/// reaper's abort back until the test has observed the connected state, so
+/// no amount of scheduling delay between the hello and that observation can
+/// let the 200ms pong deadline win (intent-hq/intent#4851).
 #[tokio::test]
 async fn heartbeat_abort_publishes_client_disconnected() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
     let fx = boot_with(WsOptions {
         heartbeat_interval: Duration::from_millis(100),
         heartbeat_timeout: Duration::from_millis(200),
+        heartbeat_gate: Some(gate_rx),
         ..WsOptions::default()
     })
     .await;
@@ -883,8 +878,11 @@ async fn heartbeat_abort_publishes_client_disconnected() {
     .await;
     assert!(ack.get("error").is_none(), "subscribe failed: {ack}");
 
-    // Hello with the capability, then never poll the socket again so no
-    // pong is ever answered; the reaper aborts the server task.
+    // Hello with the capability, then never poll the socket again, so no
+    // pong is ever answered. The gate is still closed: the reaper keeps
+    // pinging but cannot abort, so the connected state is observed on a
+    // connection that is guaranteed to still be registered — however long
+    // the hello reply or the subscriber's frame took to arrive.
     let silent = {
         let mut silent = connect(fx.port).await;
         let _ = wss_rpc(&mut silent, 1, "client.hello", hello("desktop-a", true)).await;
@@ -893,7 +891,17 @@ async fn heartbeat_abort_publishes_client_disconnected() {
     let ev = await_event(&mut sub, "client:connected", Duration::from_secs(2)).await;
     assert_eq!(ev["data"]["clientId"], "desktop-a");
     assert!(fx.registry.is_connected());
+    // Well past the pong deadline the held-back reaper has still not fired.
+    assert!(
+        try_read_text(&mut sub, Duration::from_millis(600))
+            .await
+            .is_none(),
+        "reaper aborted while gated"
+    );
+    assert!(fx.registry.is_connected());
 
+    // Release the reaper; the next tick past the deadline aborts the task.
+    gate_tx.send(true).expect("gate receiver alive");
     let ev = await_event(&mut sub, "client:disconnected", Duration::from_secs(5)).await;
     assert_eq!(
         ev["data"],

@@ -11,7 +11,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,15 +28,11 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-gitignore-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-gitignore-{prefix}-"))
 }
 
 /// Spawn `intentd serve` with a hermetic HOME so host git config (global
@@ -319,7 +315,8 @@ async fn expect_suppressed_over_wss<S>(
 /// full daemon transport (watcher → bus → WSS fan-out), not just in-crate.
 #[tokio::test]
 async fn gitignored_write_is_suppressed_over_wss() {
-    let data_dir = scratch_dir("data");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let home_dir = data_dir.join("home");
     std::fs::create_dir_all(&home_dir).expect("mkdir hermetic home");
     // On-disk checkout: a git repo whose .gitignore suppresses generated/.
@@ -331,7 +328,7 @@ async fn gitignored_write_is_suppressed_over_wss() {
     std::fs::create_dir_all(checkout.join("generated")).expect("mkdir generated");
 
     let child = spawn_serve(&data_dir, &home_dir);
-    let _guard = common::DaemonGuard::new(child, data_dir.clone(), true);
+    let _guard = common::DaemonGuard::process_only(child);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

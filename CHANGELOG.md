@@ -2,6 +2,95 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.51] - 2026-09-13
+
+### 🚀 Features
+
+- *(attachments)* IdempotencyKey on placement/begin with 7-day key bindings ([#1841](https://github.com/intent-hq/intentd/pull/1841))
+
+### 🐛 Bug Fixes
+
+- Prune copied submodule worktrees the sandbox tip does not track ([#1831](https://github.com/intent-hq/intentd/pull/1831))
+- *(scripts)* Script.start reports `starting` before it replies ([#1839](https://github.com/intent-hq/intentd/pull/1839))
+
+### 🔧 Refactor
+
+- *(git)* Single repo-cache path helper plus test-side guard ([#1837](https://github.com/intent-hq/intentd/pull/1837))
+
+### 📚 Documentation
+
+- *(acp)* Align ws.browser docs with mount-on-demand capture contract ([#1838](https://github.com/intent-hq/intentd/pull/1838))
+
+### 🧪 Testing
+
+- *(events)* Bound and deflake the notify-watcher tests that hang to the nextest kill ([#1830](https://github.com/intent-hq/intentd/pull/1830))
+- *(services)* Seam-level regression for opencode/unsloth last-request usage SUM ([#1827](https://github.com/intent-hq/intentd/pull/1827))
+
+
+## [0.9.50] - 2026-09-13
+
+### 🔧 Refactor
+
+- *(core)* Single GitRemoteUrl parser for GitHub remote URLs ([#1836](https://github.com/intent-hq/intentd/pull/1836))
+
+
+## [0.9.49] - 2026-09-12
+
+### 🚀 Features
+
+- *(browser)* Carry displayed on registry rows so listTabs includes it ([#1834](https://github.com/intent-hq/intentd/pull/1834))
+
+### 🧪 Testing
+
+- *(services)* Await the row delete before arming the idle timer ([#1829](https://github.com/intent-hq/intentd/pull/1829))
+- *(intentd)* Gate the heartbeat reaper in the heartbeat-abort e2e ([#1828](https://github.com/intent-hq/intentd/pull/1828))
+
+
+## [0.9.48] - 2026-09-12
+
+### 🐛 Bug Fixes
+
+- *(intent-git)* Make test atexit cleanup compile on Windows ([#1835](https://github.com/intent-hq/intentd/pull/1835))
+
+### 🧪 Testing
+
+- *(script-ops)* Bound harness waits inside nextest's terminate budget and reap PTYs on drop ([#1833](https://github.com/intent-hq/intentd/pull/1833))
+- Make test scratch dirs self-cleaning ([#1825](https://github.com/intent-hq/intentd/pull/1825))
+
+### ⚙️ Miscellaneous Tasks
+
+- Lint Windows-gated code with clippy on the windows-msvc build job ([#1820](https://github.com/intent-hq/intentd/pull/1820))
+
+
+## [0.9.47] - 2026-09-12
+
+### 🐛 Bug Fixes
+
+- *(transfer)* Recurse into nested submodules when normalizing CoW sandboxes ([#1818](https://github.com/intent-hq/intentd/pull/1818))
+- *(script)* Export PAGER=cat GIT_PAGER=cat to saved-script PTYs ([#1822](https://github.com/intent-hq/intentd/pull/1822))
+
+### 🧪 Testing
+
+- *(services)* Deflake timing tests under host load ([#1826](https://github.com/intent-hq/intentd/pull/1826))
+- *(core)* Lint raw repo-slug case folding outside RepoRef ([#1821](https://github.com/intent-hq/intentd/pull/1821))
+
+
+## [0.9.46] - 2026-09-12
+
+### 🐛 Bug Fixes
+
+- *(transfer)* Move CoW-copied sandbox submodules to the sandbox gitlinks ([#1810](https://github.com/intent-hq/intentd/pull/1810))
+- Route remaining repo-slug comparisons through RepoRef ([#1815](https://github.com/intent-hq/intentd/pull/1815))
+
+### 🧪 Testing
+
+- *(intentd)* PTY background-process-group job-control e2e harness ([#1816](https://github.com/intent-hq/intentd/pull/1816))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(lint)* Enable clippy::allow_attributes and migrate allows to expect ([#1813](https://github.com/intent-hq/intentd/pull/1813))
+
+
 ## [0.9.45] - 2026-09-12
 
 ### 🚀 Features

@@ -14,7 +14,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +29,6 @@ use sha2::{Digest, Sha256};
 use tokio::net::UnixStream;
 use tokio::time::{timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
-use uuid::Uuid;
 
 use common::TlsWs;
 
@@ -37,22 +36,18 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-tabs-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-tabs-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -166,12 +161,13 @@ struct Fixture {
 }
 
 async fn boot() -> Fixture {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -336,7 +332,10 @@ fn hello(client_id: &str) -> Value {
 }
 
 fn tab(tab_id: &str, url: &str) -> Value {
-    json!({ "tabId": tab_id, "url": url, "title": "Page", "visibility": "visible" })
+    json!({
+        "tabId": tab_id, "url": url, "title": "Page", "visibility": "visible",
+        "displayed": true,
+    })
 }
 
 #[tokio::test]
@@ -391,6 +390,10 @@ async fn browser_tab_registry_round_trip_over_wss() {
     assert_eq!(opened["url"], "https://a.test/");
     assert_eq!(opened["title"], "Page");
     assert_eq!(opened["visibility"], "visible");
+    assert_eq!(
+        opened["displayed"], true,
+        "host-reported layout fact: {res}"
+    );
     assert!(opened["createdAt"].is_string() && opened["updatedAt"].is_string());
     assert!(opened.get("requestedUrl").is_none());
     let ev = next_tab_event(&mut sub, Duration::from_secs(2))
@@ -420,6 +423,7 @@ async fn browser_tab_registry_round_trip_over_wss() {
     assert_eq!(tabs[0]["hostClientId"], "desktop-a");
     assert_eq!(tabs[0]["hostConnected"], true);
     assert_eq!(tabs[0]["hostName"], "Intent Desktop @ desktop-a");
+    assert_eq!(tabs[0]["displayed"], true, "{res}");
     let res = wss_rpc(
         &mut rpc,
         2,
@@ -462,6 +466,30 @@ async fn browser_tab_registry_round_trip_over_wss() {
             .is_none(),
         "no event for an unchanged report"
     );
+    //    The `displayed` layout fact is diffed like every other host field.
+    let mut behind = tab("tab-1", "https://a.test/next");
+    behind["displayed"] = json!(false);
+    let res = wss_rpc(
+        &mut host,
+        11,
+        "browser.upsertTab",
+        json!({ "workspaceId": ws_id, "tab": behind }),
+    )
+    .await;
+    assert_eq!(res["result"]["tab"]["displayed"], false, "{res}");
+    let ev = next_tab_event(&mut sub, Duration::from_secs(2))
+        .await
+        .expect("tab-updated event for displayed");
+    assert_eq!(ev["type"], "browser:tab-updated");
+    assert_eq!(ev["data"]["changes"], json!({ "displayed": false }));
+    let res = wss_rpc(
+        &mut viewer,
+        12,
+        "browser.listTabs",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(res["result"]["tabs"][0]["displayed"], false, "{res}");
 
     // 4. Host-only: another client and an un-hello'd connection are refused.
     let res = wss_rpc(
@@ -599,14 +627,15 @@ async fn browser_tab_registry_round_trip_over_wss() {
         .unwrap()
         .contains("client.hello"));
 
-    // 5. Snapshot reconciliation: tab-1 unchanged, tab-2 new → opened; a
-    //    later snapshot without tab-2 closes it.
+    // 5. Snapshot reconciliation: tab-1 unchanged (the snapshot re-reports
+    //    its `displayed` layout fact), tab-2 new → opened; a later snapshot
+    //    without tab-2 closes it.
     let res = wss_rpc(
         &mut host,
         5,
         "browser.syncTabs",
         json!({ "tabs": [
-            { "tabId": "tab-1", "workspaceId": ws_id, "url": "https://a.test/next", "title": "Page" },
+            { "tabId": "tab-1", "workspaceId": ws_id, "url": "https://a.test/next", "title": "Page", "displayed": false },
             { "tabId": "tab-2", "workspaceId": ws_id, "url": "https://a.test/two" }
         ] }),
     )
@@ -622,7 +651,7 @@ async fn browser_tab_registry_round_trip_over_wss() {
         6,
         "browser.syncTabs",
         json!({ "tabs": [
-            { "tabId": "tab-1", "workspaceId": ws_id, "url": "https://a.test/next", "title": "Page" }
+            { "tabId": "tab-1", "workspaceId": ws_id, "url": "https://a.test/next", "title": "Page", "displayed": false }
         ] }),
     )
     .await;

@@ -135,7 +135,7 @@ impl TunnelSupervisor {
     }
 
     /// Test seam: shorten the address wait so failure paths don't stall tests.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_address_timeout(mut self, timeout: Duration) -> Self {
         self.address_timeout = timeout;
         self

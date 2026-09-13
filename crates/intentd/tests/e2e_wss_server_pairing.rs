@@ -28,29 +28,23 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use uuid::Uuid;
 
 /// Fixed 64-char hex token (matching generated token shape) for e2e test.
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-server-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-server-")
 }
 
 fn spawn_serve(data_dir: &Path) -> Child {
@@ -269,10 +263,10 @@ async fn boot(data_dir: &Path) -> (u16, String) {
 
 #[tokio::test]
 async fn server_pairing_info_over_uds() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -324,10 +318,10 @@ async fn server_pairing_info_over_uds() {
 
 #[tokio::test]
 async fn server_rotate_token_env_fixed_rejects() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (_port, _fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -347,10 +341,10 @@ async fn server_rotate_token_env_fixed_rejects() {
 
 #[tokio::test]
 async fn server_pairing_info_over_wss_rejects() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
@@ -369,10 +363,10 @@ async fn server_pairing_info_over_wss_rejects() {
 
 #[tokio::test]
 async fn pairing_get_info_loopback_default_errors_without_tunnel() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -405,11 +399,11 @@ async fn pairing_get_info_loopback_default_errors_without_tunnel() {
 
 #[tokio::test]
 async fn pairing_surfaces_report_tc_address_when_tunnel_up() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Persist server.tunnel.enabled BEFORE boot so the daemon auto-starts the
     // (fake) sidecar; enable_ws_api inside the spawn helper appends the
     // [server.wsApi] section to the same config.
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     std::fs::write(
         data_dir.join("config.toml"),
         "[server.tunnel]\nenabled = true\n",
@@ -418,7 +412,6 @@ async fn pairing_surfaces_report_tc_address_when_tunnel_up() {
     let tailcat_bin = write_fake_tailcat(&data_dir);
     let mut daemon = Daemon {
         child: spawn_serve_with_tailcat(&data_dir, &tailcat_bin),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -458,7 +451,8 @@ async fn pairing_surfaces_report_tc_address_when_tunnel_up() {
 
 #[tokio::test]
 async fn pairing_get_info_explicit_wide_bind_honored() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Persist an explicit wide bind BEFORE boot: the loopback default only
     // governs unset configs — an intentional 0.0.0.0 keeps the historical
     // behavior (bind all interfaces, advertise enumerated local IPs).
@@ -469,7 +463,6 @@ async fn pairing_get_info_explicit_wide_bind_honored() {
     .expect("seed config.toml with wide bindAddress");
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -509,10 +502,10 @@ async fn pairing_get_info_explicit_wide_bind_honored() {
 
 #[tokio::test]
 async fn pairing_get_info_listener_down_over_uds() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve_wss_disabled(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -536,10 +529,10 @@ async fn pairing_get_info_listener_down_over_uds() {
 
 #[tokio::test]
 async fn pairing_get_info_over_wss_rejects() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
@@ -559,10 +552,10 @@ async fn pairing_get_info_over_wss_rejects() {
 
 #[tokio::test]
 async fn server_rotate_token_over_wss_rejects() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
@@ -581,10 +574,10 @@ async fn server_rotate_token_over_wss_rejects() {
 
 #[tokio::test]
 async fn system_import_legacy_over_wss_rejects() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let frame = json!({
@@ -606,10 +599,10 @@ async fn system_import_legacy_over_wss_rejects() {
 
 #[tokio::test]
 async fn system_git_credential_over_wss_rejects() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     // system.gitCredential over WSS (TCP) is rejected with -32001: the
@@ -633,10 +626,10 @@ async fn system_git_credential_over_wss_rejects() {
 
 #[tokio::test]
 async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);

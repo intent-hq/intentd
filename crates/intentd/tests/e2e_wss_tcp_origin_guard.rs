@@ -20,7 +20,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,28 +37,23 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-tcp-guard-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-tcp-guard-")
 }
 
 fn spawn_serve(data_dir: &Path) -> Child {
@@ -244,10 +239,11 @@ async fn boot(data_dir: &Path) -> (u16, String) {
 /// visible at the call site (conn.rs:138).
 #[tokio::test]
 async fn tcp_client_refused_server_rotate_token_fast_path() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
@@ -276,10 +272,11 @@ async fn tcp_client_refused_server_rotate_token_fast_path() {
 /// proving the origin context survives into the spawned `handle_message` task.
 #[tokio::test]
 async fn tcp_client_refused_settings_disable_wss_slow_path() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
@@ -315,10 +312,11 @@ async fn tcp_client_refused_settings_disable_wss_slow_path() {
 /// Positive control: UDS client CAN disable `server.wsApi.enabled` (local origin).
 #[tokio::test]
 async fn uds_client_allowed_settings_disable_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
     let (_port, _fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -351,7 +349,8 @@ async fn uds_client_allowed_settings_disable_wss() {
 /// `is_tcp_connection()` rather than deriving it from the locality flag.
 #[tokio::test]
 async fn tcp_client_refused_settings_disable_wss_when_mode_local() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Spawn daemon with --mode local
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
@@ -374,7 +373,7 @@ async fn tcp_client_refused_settings_disable_wss_when_mode_local() {
 
     let mut daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
     };
 
     let (port, fp) = boot(&data_dir).await;

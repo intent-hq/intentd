@@ -23,8 +23,10 @@ use intent_core::{
 };
 use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
 use intent_store::Store;
+#[cfg(unix)]
+use intent_transport::serve_uds;
 use intent_transport::{
-    ensure_tls_certificate, serve_uds, AsyncTokenStore, FileWatchStatus, PrimaryReverseRegistry,
+    ensure_tls_certificate, AsyncTokenStore, FileWatchStatus, PrimaryReverseRegistry,
     SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions, MAX_INBOUND_MESSAGE_BYTES,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -218,6 +220,7 @@ struct Server {
     port: u16,
     cfg: Arc<ClientConfig>,
     api: Arc<dyn WorkspaceApi>,
+    #[cfg_attr(not(unix), expect(dead_code))]
     bus: EventBus,
     store: Store,
     registry: Arc<intent_services::SettingsRegistry>,
@@ -3300,6 +3303,10 @@ async fn wss_agent_set_model_provider_id_param() {
         Some(dir.path().to_path_buf()),
     )
     .await;
+    // Hermeticity (monorepo#3162): the cross-provider switch onto grok below
+    // runs the availability gate, so point discovery at a deterministic
+    // executable instead of depending on a real grok on the test host.
+    srv.set_setting("providers.paths", serde_json::json!({ "grok": "/bin/sh" }));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3397,6 +3404,30 @@ async fn wss_agent_set_model_provider_id_param() {
             .contains("agent.setModel: providerId must be a string"),
         "error must name the malformed param: {rejected}"
     );
+
+    // A cross-provider switch onto an UNAVAILABLE target is -32602 at the
+    // front door (the same availability bar as create/delegate), naming the
+    // target. Disabled in settings rather than "uninstalled" so the
+    // precondition does not depend on what the test host has on PATH.
+    srv.set_setting("providers.enabled", serde_json::json!({ "grok": false }));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":10,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast","providerId":"grok"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&rejected, 10);
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "switch onto a disabled provider must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent.setModel: provider \"grok\" (Grok Build) is not enabled"),
+        "availability rejection must name the target provider: {rejected}"
+    );
+    srv.set_setting("providers.enabled", serde_json::json!({}));
 
     // All rejections left the session untouched.
     let get_frame = format!(
@@ -10804,8 +10835,8 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
 
     // workspace.findRepositories returns { repositories: string[] }. Seed a
     // scratch dir with a fake `.git` folder so the scan produces a match.
-    let scratch =
-        std::env::temp_dir().join(format!("itd-find-repos-{}", uuid::Uuid::new_v4().simple()));
+    let scratch_guard = common::test_tempdir("itd-find-repos-");
+    let scratch = scratch_guard.path().to_path_buf();
     let repo_a = scratch.join("repo-a");
     std::fs::create_dir_all(repo_a.join(".git")).expect("mkdir repo-a/.git");
     std::fs::create_dir_all(scratch.join("plain")).expect("mkdir plain");
@@ -10827,7 +10858,6 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
             .any(|r| r.as_str() == Some(repo_a.to_str().unwrap())),
         "repo-a must be in {repos:?}"
     );
-    let _ = std::fs::remove_dir_all(&scratch);
 
     // workspace.findRepositories without `directory` → -32602.
     let find_missing = wss_call(
@@ -10848,8 +10878,9 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
         .status()
         .is_ok_and(|s| s.success())
     {
-        let init_path =
-            std::env::temp_dir().join(format!("itd-init-{}", uuid::Uuid::new_v4().simple()));
+        // The RPC creates `init_path` itself; only its parent pre-exists.
+        let init_guard = common::test_tempdir("itd-init-");
+        let init_path = init_guard.path().join("repo");
         let init = wss_call(
             srv.port,
             srv.cfg.clone(),
@@ -10863,7 +10894,6 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
         assert!(init_path.join(".git").exists(), ".git directory seeded");
         assert!(init_path.join("README.md").exists(), "README seeded");
         assert!(init_path.join(".gitignore").exists(), ".gitignore seeded");
-        let _ = std::fs::remove_dir_all(&init_path);
     }
 
     // workspace.initializeRepository without `path` → -32602.
@@ -13221,6 +13251,213 @@ async fn wss_file_place_attachment_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Idempotent attachment placement over the real WSS wire (PROTOCOL §5.9
+/// "Idempotent placement", intent-hq/intent#4691): a keyed
+/// `file.placeAttachment` retried with the same payload answers the
+/// ORIGINAL result plus `replayed: true` and places no second file; a
+/// different payload under the key is `-32602`; `file.getAttachmentInfo`
+/// resolves `{ workspaceId, idempotencyKey }` (unknown key, both/neither
+/// selector, and a non-string key are `-32602`); and a keyed
+/// `file.attachmentUpload.begin` replays a live session's `uploadId`, then
+/// after `commit` rejects a re-begin shape-stably ("already committed") while
+/// the key resolves to the committed attachment.
+#[tokio::test]
+async fn wss_file_attachment_idempotency_key_round_trip() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-attidem-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"idempotent bytes");
+    let place = |id: u64, data: &str, key: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"idem.bin","data":"{data}","mimeType":"application/octet-stream","idempotencyKey":{key}}}}}"#,
+            ws.0
+        )
+    };
+
+    // First keyed placement: the plain success shape (no `replayed`).
+    let first = wss_call(srv.port, srv.cfg.clone(), &place(1, &b64, "\"k-1\"")).await;
+    assert_eq!(first["jsonrpc"], "2.0", "{first}");
+    assert_eq!(first["id"], 1, "{first}");
+    assert_eq!(first["result"]["ok"], serde_json::json!(true), "{first}");
+    assert_eq!(
+        first["result"]["path"],
+        serde_json::json!(".intent/attachments/idem.bin"),
+        "{first}"
+    );
+    assert!(first["result"].get("replayed").is_none(), "{first}");
+    let attachment_id = first["result"]["attachmentId"]
+        .as_str()
+        .expect("attachmentId")
+        .to_string();
+
+    // Lost-reply retry: identical result + `replayed: true`, no `idem-2.bin`.
+    let replay = wss_call(srv.port, srv.cfg.clone(), &place(2, &b64, "\"k-1\"")).await;
+    let mut expected = first["result"].clone();
+    expected["replayed"] = serde_json::json!(true);
+    assert_eq!(replay["result"], expected, "{replay}");
+    assert!(!root.join(".intent/attachments/idem-2.bin").exists());
+
+    // Same key, different bytes → -32602 naming the conflict.
+    let other_b64 = base64::engine::general_purpose::STANDARD.encode(b"different bytes!");
+    let conflict = wss_call(srv.port, srv.cfg.clone(), &place(3, &other_b64, "\"k-1\"")).await;
+    assert_eq!(
+        conflict["error"]["code"].as_i64(),
+        Some(-32602),
+        "{conflict}"
+    );
+    assert!(
+        conflict["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("different payload")),
+        "{conflict}"
+    );
+
+    // A non-string key is -32602, never silently treated as "no key".
+    let bad_key = wss_call(srv.port, srv.cfg.clone(), &place(4, &b64, "42")).await;
+    assert_eq!(bad_key["error"]["code"].as_i64(), Some(-32602), "{bad_key}");
+    assert!(
+        bad_key["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("idempotencyKey must be a string")),
+        "{bad_key}"
+    );
+    // An explicit `null` key is the unkeyed path (collision-suffixed copy).
+    let unkeyed = wss_call(srv.port, srv.cfg.clone(), &place(5, &b64, "null")).await;
+    assert_eq!(unkeyed["result"]["fileName"], "idem-2.bin", "{unkeyed}");
+    assert!(unkeyed["result"].get("replayed").is_none(), "{unkeyed}");
+
+    // `file.getAttachmentInfo` by key resolves the bound attachment.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"file.getAttachmentInfo","params":{{"workspaceId":"{}","idempotencyKey":"k-1"}}}}"#,
+        ws.0
+    );
+    let info = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        info["result"]["attachmentId"],
+        serde_json::json!(attachment_id),
+        "{info}"
+    );
+    assert_eq!(info["result"]["fileName"], "idem.bin", "{info}");
+    assert_eq!(info["result"]["exists"], serde_json::json!(true), "{info}");
+
+    // Unknown key → -32602 "unknown idempotency key".
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"file.getAttachmentInfo","params":{{"workspaceId":"{}","idempotencyKey":"k-nope"}}}}"#,
+        ws.0
+    );
+    let unknown = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(unknown["error"]["code"].as_i64(), Some(-32602), "{unknown}");
+    assert!(
+        unknown["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unknown idempotency key")),
+        "{unknown}"
+    );
+
+    // Exactly one selector: both and neither are -32602.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"file.getAttachmentInfo","params":{{"workspaceId":"{}","attachmentId":"{attachment_id}","idempotencyKey":"k-1"}}}}"#,
+        ws.0
+    );
+    let both = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(both["error"]["code"].as_i64(), Some(-32602), "{both}");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"file.getAttachmentInfo","params":{{"workspaceId":"{}"}}}}"#,
+        ws.0
+    );
+    let neither = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(neither["error"]["code"].as_i64(), Some(-32602), "{neither}");
+    // A key without a workspaceId is -32602 too (the selector needs both).
+    let frame = r#"{"jsonrpc":"2.0","id":10,"method":"file.getAttachmentInfo","params":{"idempotencyKey":"k-1"}}"#;
+    let no_ws = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(no_ws["error"]["code"].as_i64(), Some(-32602), "{no_ws}");
+
+    // Keyed chunked upload: a same-key re-begin replays the live session.
+    let payload = b"keyed chunked bytes".to_vec();
+    let sha = sha256_hex(&payload);
+    let begin_frame = |id: u64| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"keyed.bin","sizeBytes":{},"sha256":"{sha}","idempotencyKey":"k-up"}}}}"#,
+            ws.0,
+            payload.len()
+        )
+    };
+    let opened = wss_call(srv.port, srv.cfg.clone(), &begin_frame(11)).await;
+    let upload_id = opened["result"]["uploadId"]
+        .as_str()
+        .expect("uploadId")
+        .to_string();
+    assert!(opened["result"].get("replayed").is_none(), "{opened}");
+    let reopened = wss_call(srv.port, srv.cfg.clone(), &begin_frame(12)).await;
+    assert_eq!(
+        reopened["result"]["uploadId"],
+        serde_json::json!(upload_id),
+        "{reopened}"
+    );
+    assert_eq!(
+        reopened["result"]["maxChunkBytes"], opened["result"]["maxChunkBytes"],
+        "{reopened}"
+    );
+    assert_eq!(
+        reopened["result"]["replayed"],
+        serde_json::json!(true),
+        "{reopened}"
+    );
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":13,"method":"file.attachmentUpload.chunk","params":{{"uploadId":"{upload_id}","seq":0,"data":"{}"}}}}"#,
+        base64::engine::general_purpose::STANDARD.encode(&payload)
+    );
+    let chunk = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        chunk["result"]["receivedBytes"].as_u64(),
+        Some(payload.len() as u64),
+        "{chunk}"
+    );
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":14,"method":"file.attachmentUpload.commit","params":{{"uploadId":"{upload_id}"}}}}"#
+    );
+    let committed = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        committed["result"]["ok"],
+        serde_json::json!(true),
+        "{committed}"
+    );
+    assert_eq!(committed["result"]["fileName"], "keyed.bin", "{committed}");
+    assert!(committed["result"].get("replayed").is_none(), "{committed}");
+
+    // Committed key: re-begin is -32602 "already committed; look it up",
+    // and the lookup resolves to the committed attachment.
+    let after = wss_call(srv.port, srv.cfg.clone(), &begin_frame(15)).await;
+    assert_eq!(after["error"]["code"].as_i64(), Some(-32602), "{after}");
+    assert!(
+        after["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("already committed")),
+        "{after}"
+    );
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":16,"method":"file.getAttachmentInfo","params":{{"workspaceId":"{}","idempotencyKey":"k-up"}}}}"#,
+        ws.0
+    );
+    let up_info = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        up_info["result"]["attachmentId"], committed["result"]["attachmentId"],
+        "{up_info}"
+    );
+    assert_eq!(up_info["result"]["fileName"], "keyed.bin", "{up_info}");
+
+    srv.ws.stop().await;
+}
+
 /// `file.readChunk` over the real WSS wire (PROTOCOL §5.9, v6.18,
 /// monorepo#2458): raw bytes of a binary workspace file are served as
 /// offset-windowed base64 chunks `{ content, bytesRead, size }` and
@@ -13355,7 +13592,9 @@ async fn wss_file_ops_unknown_workspace_fail_closed() {
     let w = fixture_workspace(&pathless);
     srv.store.insert_workspace(&w).await.expect("insert ws");
 
-    let escape = std::env::temp_dir().join(format!("intentd-wss-escape-{}", uuid::Uuid::new_v4()));
+    // `escape` is never created: the guarded parent exists, the file must not.
+    let escape_guard = common::test_tempdir("intentd-wss-escape-");
+    let escape = escape_guard.path().join("escape.txt");
     let escape_s = escape.to_string_lossy().into_owned();
 
     for ws_id in ["ws-does-not-exist", pathless.0.as_str()] {

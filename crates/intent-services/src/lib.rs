@@ -31,13 +31,13 @@ use intent_core::{
     CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
     CommentWire, ContentType, ContextItem, CreatedTaskEntry, Draft, Event, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, LineAttributionAuthor,
-    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitRemoteUrl,
+    LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
-    ProjectType, PullRequestInfo, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
+    ProjectType, PullRequestInfo, ReadAssetResult, RepoRef, SaveAssetResult, ScriptCreateParams,
     SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
     TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
@@ -143,6 +143,8 @@ mod workspace_aggregates;
 mod workspace_status;
 pub mod workspace_vocabulary;
 
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod test_tracing;
 #[cfg(test)]
@@ -672,11 +674,9 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
-    /// Test park seams (monorepo#1180, monorepo#1194) for the `script.*` race
-    /// windows (supervisor pre-registration, `start()` spawn-to-registration).
-    /// All `None` in production wiring; tests inject via the
-    /// `#[cfg(test)]`-only `with_script_supervise_park` /
-    /// `with_script_start_registration_park`.
+    /// Test park seam (monorepo#1180) for the `script.*` supervisor
+    /// pre-registration race window. `None` in production wiring; tests
+    /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
     script_parks: script_ops::ScriptParks,
     /// Test park seam (issue intent-hq/monorepo#1468 follow-up) for the
     /// completion-delivery classify→mark window: parks
@@ -1074,6 +1074,12 @@ pub struct Services {
     /// lazily by the next `begin`), and the client simply restarts the
     /// upload.
     attachment_uploads: Arc<Mutex<HashMap<String, attachment_upload::AttachmentUploadSession>>>,
+    /// Per-`(workspace, idempotencyKey)` in-flight guard for keyed attachment
+    /// placements (intent-hq/intent#4691): a same-key caller racing the
+    /// first placement waits on the key's lock and then replays the binding
+    /// instead of racing it to the store (whose primary key is the last line
+    /// of defence). Entries are dropped once no caller holds them.
+    attachment_idempotency_inflight: Arc<Mutex<attachment_upload::IdempotencyInflight>>,
     /// In-flight source-side exports (`workspace.export.*`, keyed by
     /// `exportId`): build state + sealed archive + WIP bookkeeping between
     /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
@@ -1250,6 +1256,7 @@ impl Services {
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
             attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
+            attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
@@ -1842,19 +1849,6 @@ impl Services {
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
         self.script_parks.supervise = Some(park);
-        self
-    }
-
-    /// Test seam (monorepo#1194): park `script.start` between spawning the
-    /// supervisor task and taking the registration lock so remove+recreate
-    /// races inside that window are deterministic. Production wiring keeps
-    /// `None` (no parking).
-    #[cfg(test)]
-    pub(crate) fn with_script_start_registration_park(
-        mut self,
-        park: Arc<script_ops::SupervisePark>,
-    ) -> Self {
-        self.script_parks.start_registration = Some(park);
         self
     }
 
@@ -2844,62 +2838,6 @@ impl Services {
         }
     }
 
-    /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
-    /// `github.com`. Rejects URLs with hosts like `github.com.evil.com`.
-    fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
-        let trimmed = url.trim();
-
-        // HTTPS: extract host from scheme://host/... form.
-        if let Some(rest) = trimmed
-            .strip_prefix("https://")
-            .or_else(|| trimmed.strip_prefix("http://"))
-        {
-            let host_end = rest.find('/').unwrap_or(rest.len());
-            let host = &rest[..host_end];
-            if host != "github.com" {
-                return None;
-            }
-            let path = &rest[host_end..];
-            return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
-        }
-
-        // SSH URL: ssh://[user@]host[:port]/owner/repo(.git) form.
-        if let Some(rest) = trimmed.strip_prefix("ssh://") {
-            let rest = rest.split_once('@').map_or(rest, |(_, r)| r);
-            let host_end = rest.find('/').unwrap_or(rest.len());
-            let host = &rest[..host_end];
-            // Strip a numeric port; a non-numeric suffix stays part of the
-            // host and fails the strict check below.
-            let host = host.split_once(':').map_or(host, |(h, port)| {
-                if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
-                    h
-                } else {
-                    host
-                }
-            });
-            if host != "github.com" {
-                return None;
-            }
-            let path = &rest[host_end..];
-            return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
-        }
-
-        // SSH scp-like: git@host:path form. Extract host before the colon.
-        if let Some(at_idx) = trimmed.find('@') {
-            let after_at = &trimmed[at_idx + 1..];
-            if let Some(colon_idx) = after_at.find(':') {
-                let host = &after_at[..colon_idx];
-                if host != "github.com" {
-                    return None;
-                }
-                let path = &after_at[colon_idx + 1..];
-                return clone_ops::parse_owner_repo(&format!("git@github.com:{path}"));
-            }
-        }
-
-        None
-    }
-
     /// Start the one-time repository owner/name backfill after daemon listeners
     /// are live. The daemon invokes this from a detached readiness task, so the
     /// candidate read and every git/filesystem probe stay off startup and RPC
@@ -2987,11 +2925,11 @@ impl Services {
             intent_git::remote::origin_url(&repo_path)
                 .ok()
                 .flatten()
-                .and_then(|url| Self::parse_github_owner_repo(&url))
+                .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
         })
         .await
         .map_err(|error| Error::Internal(format!("repository metadata probe failed: {error}")))?;
-        let Some((owner, name)) = metadata else {
+        let Some(RepoRef { owner, name }) = metadata else {
             return Ok(());
         };
 
@@ -3925,8 +3863,9 @@ impl Services {
 
     /// Override the auto-commit message generation timeout (defaults to the
     /// ~30s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
-    /// the timeout-fallback path completes in milliseconds.
-    #[cfg(test)]
+    /// the timeout-fallback path completes in milliseconds. Its only callers
+    /// spawn a fake CLI via a shell script, so they (and it) are unix-only.
+    #[cfg(all(test, unix))]
     pub(crate) fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
         self.auto_commit_timeout_ms = Some(ms);
         self
@@ -4176,8 +4115,8 @@ impl Services {
                 .ok()
                 .and_then(std::result::Result::ok)
                 .flatten()
-                .and_then(|url| Self::parse_github_owner_repo(&url))
-                .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+                .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+                .map_or((None, None), |r| (Some(r.owner), Some(r.name)));
                 // Stamp the root's HEAD at registration time (fail-soft:
                 // unreadable HEAD ⇒ NULL, backfilled by a later sweep pass).
                 let registered_commit_sha = Self::read_git_root_head_sha(&canonical).await;
@@ -4386,10 +4325,9 @@ impl Services {
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
         use pr_ops::PrRefreshOutcome;
-        let (Some(owner), Some(name)) = (root.repo_owner.clone(), root.repo_name.clone()) else {
+        let Some(repo_ref) = root.repo() else {
             return Ok(PrRefreshOutcome::Skipped);
         };
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, name);
         // The live HEAD read is git I/O (roots may live on network/FUSE
         // mounts), so it runs on the blocking pool — never inline on the
         // runtime.
@@ -4633,10 +4571,9 @@ impl Services {
         if ws.is_remote || ws.archived {
             return Ok(PrRefreshOutcome::Skipped);
         }
-        let Ok((owner, repo)) = pr_ops::repo_of(&ws) else {
+        let Ok(repo_ref) = pr_ops::repo_of(&ws) else {
             return Ok(PrRefreshOutcome::Skipped);
         };
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         if let Some(number) = ws.pr_number {
             let pr = sc
@@ -9590,14 +9527,14 @@ async fn sibling_workspace_or_throw(
 /// `None` when the workspace has no complete GitHub identity (local-only
 /// repo, or not yet backfilled).
 fn github_repository_identity(ws: &Workspace) -> Option<(String, String)> {
-    let owner = ws.repository_owner.as_deref()?.trim();
-    let name = ws.repository_name.as_deref()?.trim();
-    let (owner, name) = intent_sourcecontrol::RepoRef::new(owner, name).identity_parts();
-    let name = name.strip_suffix(".git").unwrap_or(&name);
+    let (owner, name) = ws.repo()?.identity_parts();
+    let owner = owner.trim();
+    let name = name.trim();
+    let name = name.strip_suffix(".git").unwrap_or(name);
     if owner.is_empty() || name.is_empty() {
         return None;
     }
-    Some((owner, name.to_string()))
+    Some((owner.to_string(), name.to_string()))
 }
 
 fn nonempty_repository_path(ws: &Workspace) -> Option<&str> {
@@ -9644,6 +9581,34 @@ fn number_lines(content: &str) -> String {
 /// Fresh v4 uuid string for an agent-authored primitive id (TS `uuidv4()`).
 fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// `file.getAttachmentInfo` result for one registry row (PROTOCOL §5.9):
+/// `{ attachmentId, fileName, mimeType?, size, uploadedAt, path, exists }`.
+/// `exists` reflects the file on disk NOW (the user may have deleted it
+/// out-of-band); resolved against the canonical workspace root, never a
+/// sandbox, with the same within-root containment guard as the copy path —
+/// a tampered `stored_path` must not probe file existence outside the store.
+async fn attachment_info_result(
+    store: &Store,
+    record: &intent_store::AttachmentRecord,
+) -> serde_json::Value {
+    let root = file_ops::resolve_root(store, &record.workspace_id, None).await;
+    let exists = !root.is_empty()
+        && file_ops::resolve_attachment_source(&root, &record.stored_path)
+            .is_ok_and(|p| p.is_file());
+    let mut result = serde_json::json!({
+        "attachmentId": record.id,
+        "fileName": record.file_name,
+        "size": record.size,
+        "uploadedAt": record.uploaded_at,
+        "path": record.stored_path,
+        "exists": exists,
+    });
+    if let Some(mime) = &record.mime_type {
+        result["mimeType"] = serde_json::json!(mime);
+    }
+    result
 }
 
 /// Whitespace-only strings collapse to `None` (TS truthy-string parity for
@@ -10636,6 +10601,7 @@ fn write_workspace_metadata_file(root: &Path, ws: &Workspace) -> Result<()> {
 /// `"repo"` fallback.
 pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
     let mut slug = String::new();
+    // repo-slug-fold: allow — folder-name slugifier, not repo identity
     for c in repo_name.chars().flat_map(char::to_lowercase) {
         if slug.len() >= 50 {
             break;
@@ -16281,9 +16247,10 @@ impl WorkspaceApi for Services {
         data: Option<String>,
         source_path: Option<String>,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
         Box::pin(async move {
+            let idempotency_key = attachment_upload::validate_idempotency_key(idempotency_key)?;
             let decoded;
             let source = match (&data, &source_path) {
                 (Some(b64), None) => {
@@ -16315,61 +16282,42 @@ impl WorkspaceApi for Services {
                     ))
                 }
             };
-            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
-            if root.is_empty() {
-                return Err(Error::Internal(
-                    "workspace has no resolved filesystem root".to_string(),
-                ));
-            }
-            // The exclusion contract (monorepo#1948) rides on the default
-            // `.intent/.gitignore` (ignore everything except config.json), so
-            // make sure the directory + gitignore exist before placing.
-            // `place_attachment` additionally drops an ignore-all `.gitignore`
-            // inside `attachments/` to cover repos with a customized
-            // `.intent/.gitignore`.
-            repo_config::ensure_intent_dir(std::path::Path::new(&root)).await?;
-            let mut result =
-                file_ops::place_attachment(&root, &file_name, &source).map_err(|e| {
-                    // Surface placement failures in the daemon log so field
-                    // reports are diagnosable without a client-side trace
-                    // (monorepo#2144).
-                    tracing::warn!(
-                        workspace = %workspace_id.as_str(),
-                        file_name = %file_name,
-                        error = %e,
-                        "file.placeAttachment failed"
-                    );
-                    e
-                })?;
-            // Attachment registry (PROTOCOL §5.9): record the placed file
-            // under a daemon-minted UUID so agents can retrieve it later via
-            // `ws.file.getAttachment`, and return the registry fields
-            // additively (presence-detected; old clients unaffected).
-            let record = intent_store::AttachmentRecord {
-                id: new_uuid(),
+            // Payload identity for the idempotency lookup: the base64 arm
+            // hashes the decoded bytes; the sourcePath arm fingerprints on
+            // `(fileName, size)` only (a possibly huge local file is not
+            // re-read for a hash; b31e decision D). An unreadable source
+            // leaves the lookup fingerprint unset and lets placement
+            // classify it. The BOUND fingerprint takes its size from the
+            // placed bytes (see `KeyedPlacement`).
+            let idempotency = idempotency_key.map(|key| match &source {
+                file_ops::AttachmentSource::Bytes(bytes) => {
+                    let sha = attachment_upload::sha256_hex(bytes);
+                    attachment_upload::KeyedPlacement {
+                        key,
+                        lookup_fingerprint: Some(attachment_upload::attachment_fingerprint(
+                            &file_name,
+                            bytes.len() as u64,
+                            Some(&sha),
+                        )),
+                        sha256: Some(sha),
+                    }
+                }
+                file_ops::AttachmentSource::CopyFrom(src) => attachment_upload::KeyedPlacement {
+                    key,
+                    lookup_fingerprint: std::fs::metadata(src).ok().map(|md| {
+                        attachment_upload::attachment_fingerprint(&file_name, md.len(), None)
+                    }),
+                    sha256: None,
+                },
+            });
+            self.place_attachment_registered(
                 workspace_id,
-                file_name: result["fileName"]
-                    .as_str()
-                    .unwrap_or(&file_name)
-                    .to_string(),
-                mime_type: mime_type.filter(|m| !m.trim().is_empty()),
-                size: result["size"].as_i64().unwrap_or_default(),
-                uploaded_at: now_iso(),
-                stored_path: result["path"].as_str().unwrap_or_default().to_string(),
-            };
-            if let Err(e) = store.insert_attachment(&record).await {
-                // Don't leave a durable-but-unregistered file behind: a
-                // retry would place a collision-suffixed second copy that
-                // no attachmentId can ever retrieve.
-                let _ = std::fs::remove_file(std::path::Path::new(&root).join(&record.stored_path));
-                return Err(e);
-            }
-            result["attachmentId"] = serde_json::json!(record.id);
-            result["uploadedAt"] = serde_json::json!(record.uploaded_at);
-            if let Some(mime) = &record.mime_type {
-                result["mimeType"] = serde_json::json!(mime);
-            }
-            Ok(result)
+                &file_name,
+                &source,
+                mime_type,
+                idempotency,
+            )
+            .await
         })
     }
 
@@ -16380,6 +16328,7 @@ impl WorkspaceApi for Services {
         size_bytes: u64,
         sha256: String,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.file_attachment_upload_begin_op(
@@ -16388,6 +16337,7 @@ impl WorkspaceApi for Services {
                 size_bytes,
                 sha256,
                 mime_type,
+                idempotency_key,
             )
             .await
         })
@@ -16434,27 +16384,34 @@ impl WorkspaceApi for Services {
                     }
                     other => other,
                 })?;
-            // `exists` reflects the file on disk NOW (the user may have
-            // deleted it out-of-band); resolved against the canonical
-            // workspace root, never a sandbox, with the same within-root
-            // containment guard as the copy path — a tampered stored_path
-            // must not probe file existence outside the store.
-            let root = file_ops::resolve_root(&store, &record.workspace_id, None).await;
-            let exists = !root.is_empty()
-                && file_ops::resolve_attachment_source(&root, &record.stored_path)
-                    .is_ok_and(|p| p.is_file());
-            let mut result = serde_json::json!({
-                "attachmentId": record.id,
-                "fileName": record.file_name,
-                "size": record.size,
-                "uploadedAt": record.uploaded_at,
-                "path": record.stored_path,
-                "exists": exists,
-            });
-            if let Some(mime) = &record.mime_type {
-                result["mimeType"] = serde_json::json!(mime);
-            }
-            Ok(result)
+            Ok(attachment_info_result(&store, &record).await)
+        })
+    }
+
+    fn file_get_attachment_info_by_key(
+        &self,
+        workspace_id: WorkspaceId,
+        idempotency_key: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let key = attachment_upload::validate_idempotency_key(Some(idempotency_key))?
+                .unwrap_or_default();
+            let bound = store
+                .get_attachment_by_idempotency_key(
+                    &workspace_id,
+                    &key,
+                    &attachment_upload::idempotency_retention_cutoff(),
+                )
+                .await?;
+            let Some((_, record)) = bound else {
+                // Never committed, another workspace's key, or past
+                // retention — all read as unknown (fail closed).
+                return Err(Error::InvalidParams(format!(
+                    "unknown idempotency key: {key}"
+                )));
+            };
+            Ok(attachment_info_result(&store, &record).await)
         })
     }
 
@@ -16747,7 +16704,7 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.start(&workspace_id, &script_id).await })
+        Box::pin(async move { mgr.start(&workspace_id, &script_id) })
     }
 
     fn script_stop(
@@ -17240,9 +17197,9 @@ impl WorkspaceApi for Services {
                             {
                                 None
                             } else {
-                                clone_ops::parse_owner_repo(url)
+                                GitRemoteUrl::parse(url).and_then(|u| u.repo_slug())
                             };
-                            if let Some((owner, name)) = cache_owner_repo {
+                            if let Some(RepoRef { owner, name }) = cache_owner_repo {
                                 let request_id = uuid::Uuid::new_v4().to_string();
                                 // Stream the same `git:clone:*` frames as a
                                 // network clone so the FE initializer shows
@@ -17287,7 +17244,8 @@ impl WorkspaceApi for Services {
                                     url,
                                 )
                                 .await;
-                                let cache_root = workspaces_root.join(".repo-cache");
+                                let cache_root =
+                                    intent_git::repo_cache::cache_root_for(&workspaces_root);
                                 // Real streaming progress for the ensure: the
                                 // callback forwards raw git output to a pump
                                 // task that parses it (submodule-aware) and
@@ -17409,8 +17367,10 @@ impl WorkspaceApi for Services {
                                 // trusts them), so only a strict `github.com`
                                 // URL seeds them; the host-agnostic pair above
                                 // keys the cache slot only.
-                                if let Some((gh_owner, gh_name)) =
-                                    Self::parse_github_owner_repo(url)
+                                if let Some(RepoRef {
+                                    owner: gh_owner,
+                                    name: gh_name,
+                                }) = GitRemoteUrl::parse(url).and_then(|u| u.github_repo())
                                 {
                                     if input.repository_owner.is_none() {
                                         input.repository_owner = Some(gh_owner);
@@ -17506,7 +17466,9 @@ impl WorkspaceApi for Services {
                             // Strict `github.com` host only: persisted owner/name
                             // are trusted as GitHub identity by the
                             // `crossWorkspace.*` sibling predicate.
-                            if let Some((owner, name)) = Self::parse_github_owner_repo(url) {
+                            if let Some(RepoRef { owner, name }) =
+                                GitRemoteUrl::parse(url).and_then(|u| u.github_repo())
+                            {
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
                                 }
@@ -17582,7 +17544,7 @@ impl WorkspaceApi for Services {
                         intent_git::remote::origin_url(&repo_path)
                             .ok()
                             .flatten()
-                            .and_then(|url| Self::parse_github_owner_repo(&url))
+                            .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
                     } else {
                         None
                     };
@@ -17591,8 +17553,8 @@ impl WorkspaceApi for Services {
                         .repository_owner
                         .as_deref().is_none_or(str::is_empty)
                     {
-                        if let Some((owner, _)) = origin_derived.as_ref() {
-                            input.repository_owner = Some(owner.clone());
+                        if let Some(derived) = origin_derived.as_ref() {
+                            input.repository_owner = Some(derived.owner.clone());
                         }
                     }
                     // Apply derived name when caller left it blank; fall back to
@@ -17601,8 +17563,8 @@ impl WorkspaceApi for Services {
                         .repository_name
                         .as_deref().is_none_or(str::is_empty)
                     {
-                        if let Some((_, name)) = origin_derived {
-                            input.repository_name = Some(name);
+                        if let Some(derived) = origin_derived {
+                            input.repository_name = Some(derived.name);
                         } else if let Some(name) = input
                             .repository_path
                             .as_deref()
@@ -24403,8 +24365,8 @@ impl WorkspaceApi for Services {
                     .ok()
                     .and_then(std::result::Result::ok)
                     .flatten()
-                    .and_then(|url| Self::parse_github_owner_repo(&url))
-                    .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+                    .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+                    .map_or((None, None), |r| (Some(r.owner), Some(r.name)));
             // Stamp the root's HEAD at registration time (fail-soft:
             // unreadable HEAD ⇒ NULL; the store merge never overwrites an
             // existing value on re-registration).
@@ -25283,7 +25245,9 @@ impl WorkspaceApi for Services {
                 }
             }
             let url = github_url.trim().to_string();
-            let Some((owner, repo)) = clone_ops::parse_owner_repo(&url) else {
+            let Some(RepoRef { owner, name: repo }) =
+                GitRemoteUrl::parse(&url).and_then(|u| u.repo_slug())
+            else {
                 return Err(Error::InvalidParams(format!(
                     "githubUrl carries no owner/repo pair: {url}"
                 )));
@@ -25306,12 +25270,11 @@ impl WorkspaceApi for Services {
                     )));
                 }
             }
-            let cache_root = resolve_workspaces_parent(
+            let cache_root = intent_git::repo_cache::cache_root_for(&resolve_workspaces_parent(
                 workspaces_root,
                 workspaces_root_pinned,
                 &worktrees_location,
-            )?
-            .join(".repo-cache");
+            )?);
             // Global single-flight: claim the slot or reject immediately with
             // the busy error naming the warm already in flight (never queue).
             {
@@ -27499,10 +27462,9 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         Box::pin(async move {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let repo_ref = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc
                 .get_pr(&repo_ref, number)
                 .await
@@ -27562,13 +27524,15 @@ impl WorkspaceApi for Services {
             // Cross-repo override (`{ repo: "owner/name" }`) wins over the
             // workspace repo; either way the resolved repo is echoed in the
             // result so a wrong-repo read is detectable.
-            let (owner, repo) = match repo {
-                Some(slug) => pr_ops::parse_repo_slug(&slug)?,
+            let repo_ref = match repo {
+                Some(slug) => {
+                    let (owner, repo) = pr_ops::parse_repo_slug(&slug)?;
+                    intent_sourcecontrol::RepoRef::new(owner, repo)
+                }
                 None => pr_ops::repo_of(&ws)?,
             };
-            let repo_slug = format!("{owner}/{repo}");
+            let repo_slug = format!("{}/{}", repo_ref.owner, repo_ref.name);
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
                 intent_sourcecontrol::Error::NotFound(_) => {
                     Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
@@ -28219,7 +28183,7 @@ impl WorkspaceApi for Services {
         let registry = self.settings_registry.clone();
         let ls_remote_base = self.branches_ls_remote_base.clone();
         Box::pin(async move {
-            let cache_root = cache_parent.join(".repo-cache");
+            let cache_root = intent_git::repo_cache::cache_root_for(&cache_parent);
             if let Some(cached) =
                 intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await?
             {
@@ -30511,10 +30475,9 @@ impl Services {
         if let Some(number) = ws.pr_number {
             return Ok((number, ws.pr_url.clone().unwrap_or_default()));
         }
-        let (owner, repo) = pr_ops::repo_of(&ws)
+        let repo_ref = pr_ops::repo_of(&ws)
             .map_err(|_| Error::Internal("No remote configured for this repository".to_string()))?;
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         let branch = ws.branch.clone();
         let target_branch = target
@@ -30565,9 +30528,8 @@ impl Services {
         let mut ws = self.store.get_workspace(&workspace_id).await.map_err(|_| {
             Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
         })?;
-        let (owner, repo) = pr_ops::repo_of(&ws)?;
+        let repo_ref = pr_ops::repo_of(&ws)?;
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
         let options = intent_sourcecontrol::MergeOptions {
             commit_title,
             commit_message,

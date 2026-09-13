@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -17,17 +17,13 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 mod common;
 use common::DaemonGuard;
 
 /// Short data dir so `data_dir/intentd.sock` stays under `SUN_LEN`.
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-cfgprec-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-cfgprec-")
 }
 
 /// Spawn `intentd serve` (UDS always serves) with the hermetic env seams plus `env`.
@@ -86,7 +82,8 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
 /// reads report per-key origins (`flag` | `file` | `default`).
 #[tokio::test]
 async fn env_pins_beat_file_and_reject_wire_mutation() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // File claims idleReapMinutes=7 and autoCommit=false; env pins the reap
     // knob to 3. The pinned key must read 3/flag, the file key 7 is ignored,
     // and the unpinned file key autoCommit=false stays effective.
@@ -97,7 +94,7 @@ async fn env_pins_beat_file_and_reject_wire_mutation() {
     .expect("seed config.toml");
 
     let child = spawn_serve(&data_dir, &[("INTENTD_IDLE_REAP_MINUTES", "3")]);
-    let _daemon = DaemonGuard::new(child, data_dir.clone(), true);
+    let _daemon = DaemonGuard::process_only(child);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
@@ -202,12 +199,13 @@ async fn env_pins_beat_file_and_reject_wire_mutation() {
 /// legacy file value.
 #[tokio::test]
 async fn legacy_listen_mode_is_discarded_and_stripped_on_boot() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_path = data_dir.join("config.toml");
     std::fs::write(&config_path, "[server]\nlistenMode = \"both\"\n").expect("seed config.toml");
 
     let child = spawn_serve(&data_dir, &[]);
-    let _daemon = DaemonGuard::new(child, data_dir.clone(), true);
+    let _daemon = DaemonGuard::process_only(child);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
@@ -254,7 +252,8 @@ async fn legacy_listen_mode_is_discarded_and_stripped_on_boot() {
 /// compatibility). A second boot then reads the clean file untouched.
 #[tokio::test]
 async fn legacy_workspace_overrides_discards_and_strips_on_boot() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_path = data_dir.join("config.toml");
     std::fs::write(
         &config_path,
@@ -266,7 +265,7 @@ async fn legacy_workspace_overrides_discards_and_strips_on_boot() {
     let child = spawn_serve(&data_dir, &[]);
     let socket = data_dir.join("intentd.sock");
     {
-        let _daemon = DaemonGuard::new(child, data_dir.clone(), false);
+        let _daemon = DaemonGuard::process_only(child);
         assert!(await_uds(&socket).await, "daemon did not start");
 
         // The retired key has no catalog entry: settings.get rejects it as
@@ -323,7 +322,7 @@ async fn legacy_workspace_overrides_discards_and_strips_on_boot() {
     // Second boot: clean file, still no retired key on the wire.
     let stripped_text = std::fs::read_to_string(&config_path).expect("read config");
     let child = spawn_serve(&data_dir, &[]);
-    let _daemon = DaemonGuard::new(child, data_dir.clone(), true);
+    let _daemon = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "second boot did not start");
     let get = uds_rpc(
         &socket,
@@ -360,10 +359,10 @@ fn invalid_config_refuses_startup_with_key_in_error() {
         ),
     ] {
         let data_dir = temp_data_dir();
-        std::fs::write(data_dir.join("config.toml"), body).expect("seed config.toml");
+        std::fs::write(data_dir.path().join("config.toml"), body).expect("seed config.toml");
         let out = Command::new(env!("CARGO_BIN_EXE_intentd"))
             .args(["serve"])
-            .env("INTENTD_DATA_DIR", &data_dir)
+            .env("INTENTD_DATA_DIR", data_dir.path())
             .output()
             .expect("run intentd serve");
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -379,7 +378,6 @@ fn invalid_config_refuses_startup_with_key_in_error() {
             stderr.contains("config.toml"),
             "stderr must name the file: {stderr}"
         );
-        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
 
@@ -391,7 +389,7 @@ fn out_of_range_env_pin_refuses_startup() {
     let data_dir = temp_data_dir();
     let out = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .args(["serve"])
-        .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_DATA_DIR", data_dir.path())
         .env("INTENTD_TCP_PORT", "80")
         .output()
         .expect("run intentd serve");
@@ -404,5 +402,4 @@ fn out_of_range_env_pin_refuses_startup() {
         stderr.contains("INTENTD_TCP_PORT"),
         "stderr must name the flag: {stderr}"
     );
-    let _ = std::fs::remove_dir_all(&data_dir);
 }

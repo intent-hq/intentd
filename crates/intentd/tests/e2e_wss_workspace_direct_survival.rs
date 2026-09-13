@@ -51,24 +51,19 @@ const UNSUPPORTED_NEEDLE: &str = "direct-src";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
-    scratch: PathBuf,
+    _data_dir: tempfile::TempDir,
+    scratch: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-        let _ = std::fs::remove_dir_all(&self.scratch);
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-dup-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-dup-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -256,7 +251,8 @@ fn run_git(args: &[&str], cwd: &Path) -> String {
 /// Boot a live daemon with the workspaces root at `workspaces_root` and the
 /// CoW-clone seam armed, returning the WSS port + pinned TLS config.
 async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = scratch_dir("data");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let scratch = scratch_dir("scratch");
     let root_s = workspaces_root.to_string_lossy().to_string();
     let child = spawn_serve(
@@ -273,7 +269,7 @@ async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     );
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
         scratch,
     };
     let socket = data_dir.join("intentd.sock");
@@ -300,14 +296,15 @@ async fn workspace_duplicate_of_direct_survives_original_deletion_over_wss() {
     if !git_gate(TEST) {
         return;
     }
-    let root = scratch_dir("droot");
+    let root_dir = scratch_dir("droot");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     // `isNewRepo` gives a standalone `direct` source: the daemon initializes
     // the folder and the workspace works directly in it (no worktree, no CoW
     // clone). The folder name carries `UNSUPPORTED_NEEDLE`, so a CoW clone OF
     // THIS SOURCE reports Unsupported and the duplicate lands on the plain
     // local-clone (`direct`) arm regardless of host CoW support.
-    let source_repo = daemon.scratch.join(UNSUPPORTED_NEEDLE);
+    let source_repo = daemon.scratch.path().join(UNSUPPORTED_NEEDLE);
 
     let mut ws = connect_ws(port, cfg).await;
     let created = wss_rpc(
@@ -432,6 +429,5 @@ async fn workspace_duplicate_of_direct_survives_original_deletion_over_wss() {
     assert_eq!(run_git(&["remote"], &wt_path), "");
     assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), source_head);
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }

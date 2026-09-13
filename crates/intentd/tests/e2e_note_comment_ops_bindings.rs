@@ -8,7 +8,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use intent_core::{
@@ -67,25 +66,18 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
     }
 }
 
-fn cleanup_db(db: &PathBuf) {
-    std::fs::remove_file(db).ok();
-    std::fs::remove_file(db.with_extension("db-wal")).ok();
-    std::fs::remove_file(db.with_extension("db-shm")).ok();
-}
-
-async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-note-comment-{}.db",
-        uuid::Uuid::new_v4()
-    ));
-    let ws_root =
-        std::env::temp_dir().join(format!("itd-e2e-note-comment-ws-{}", uuid::Uuid::new_v4()));
+/// Scratch layout: `<tmp>/intentd.db` plus the workspace checkout at
+/// `<tmp>/ws`; the returned guard removes both on drop.
+async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
+    let tmp = common::test_tempdir("intentd-e2e-note-comment-");
+    let db = tmp.path().join("intentd.db");
+    let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(&ws_root).expect("create ws root");
 
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(ws_root.parent().unwrap().to_path_buf())
+        .with_workspaces_root(tmp.path().to_path_buf())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -94,12 +86,12 @@ async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
         .await
         .expect("insert ws");
 
-    (Arc::new(services), ws, ws_root, db)
+    (Arc::new(services), ws, tmp)
 }
 
 #[tokio::test]
 async fn note_add_appends_content_at_end() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     let note = services
         .create_note(
@@ -143,13 +135,11 @@ async fn note_add_appends_content_at_end() {
     assert!(result.created_task_note_ids.is_empty());
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn note_edit_replaces_first_exact_match() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     let note = services
         .create_note(
@@ -192,13 +182,11 @@ async fn note_edit_replaces_first_exact_match() {
     assert!(result.created_task_note_ids.is_empty());
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn note_edit_lines_replaces_line_range() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     let note = services
         .create_note(
@@ -245,13 +233,11 @@ async fn note_edit_lines_replaces_line_range() {
     assert!(result.created_task_note_ids.is_empty());
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn comment_add_anchors_to_text() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     let note = services
         .create_note(
@@ -304,13 +290,11 @@ async fn comment_add_anchors_to_text() {
     assert_eq!(note_after.rev, result.note_rev);
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn comment_list_returns_threads() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     let note = services
         .create_note(
@@ -356,13 +340,11 @@ async fn comment_list_returns_threads() {
     assert!(result.total_comments >= 1);
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
 #[tokio::test]
 async fn comment_respond_adds_reply_to_thread() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     let note = services
         .create_note(
@@ -420,6 +402,4 @@ async fn comment_respond_adds_reply_to_thread() {
     assert!(!result.message.is_empty());
 
     drop(services);
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }

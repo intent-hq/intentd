@@ -15,7 +15,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,13 +41,6 @@ use common::TlsWs;
 
 /// A fixed 64-char hex token (valid shape) shared by server + client.
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
@@ -145,7 +137,7 @@ struct Fixture {
     cfg: Arc<ClientConfig>,
     ws_id: WorkspaceId,
     skip_ws_id: WorkspaceId,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 /// Seed a minimal workspace row. `worktree_path` decides whether the row has
@@ -204,9 +196,8 @@ fn seed_workspace(title: &str, worktree_path: Option<String>, skip_worktree: boo
 /// (`<root>/<id>/repo` checkout containing a file of known size) and one
 /// direct-mode (`skipWorktree: true`, no directory at all).
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-disk-usage-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = common::test_tempdir("intentd-disk-usage-");
+    let dir = tmp.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -252,7 +243,7 @@ async fn boot() -> Fixture {
         cfg,
         ws_id: managed.id,
         skip_ws_id: skip.id,
-        _dir: TempDir(dir),
+        _dir: tmp,
     }
 }
 

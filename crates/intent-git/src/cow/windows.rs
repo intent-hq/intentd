@@ -1,14 +1,14 @@
-//! Windows CoW implementation using ReFS block cloning.
+//! Windows `CoW` implementation using `ReFS` block cloning.
 
 use intent_core::{Error, Result};
 use std::path::Path;
 
 use super::CowSupport;
 
-pub fn probe(_src_dir: &Path, _dst_dir: &Path) -> Result<CowSupport> {
+pub fn probe(_src_dir: &Path, _dst_dir: &Path) -> CowSupport {
     // Windows implementation would check FILE_SUPPORTS_BLOCK_REFCOUNTING via
     // GetVolumeInformation, then do a live probe. For now, return Unsupported.
-    Ok(CowSupport::Unsupported)
+    CowSupport::Unsupported
 }
 
 pub fn clone(_src: &Path, _dst: &Path) -> Result<()> {

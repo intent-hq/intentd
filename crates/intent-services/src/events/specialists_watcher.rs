@@ -115,16 +115,29 @@ impl SpecialistsWatcher {
         }
     }
 
-    /// Await the user-tier root watch actually being established. Its
-    /// registration is deferred off the caller's thread (monorepo#1572), so
-    /// tests must wait for it before mutating that directory. The project tier
-    /// rides the shared stream and needs no separate sync point — subscribing is
-    /// synchronous bookkeeping.
+    /// Await the user-tier root watch and every project-tier shared watch
+    /// actually being established. Both registrations are deferred off the
+    /// caller's thread (monorepo#1572) — subscribing to the shared stream is
+    /// synchronous bookkeeping, but the OS `watch()` behind it is not — so
+    /// tests must wait for both before mutating either tier
+    /// (intent-hq/intent#4852). Panics with a diagnostic on a dead watch or on
+    /// `timeout`, which bounds ALL the tiers together, not each one afresh.
     #[cfg(test)]
     #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: Duration) {
+        let budget = crate::events::TestBudget::new(timeout);
         for watch in &self._user_watchers {
-            watch.wait_established(timeout).await;
+            watch.wait_established(budget.remaining()).await;
+        }
+        let probes: Vec<_> = self
+            .workspace_watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(TierWatch::probe)
+            .collect();
+        for probe in &probes {
+            probe.wait_live(budget.remaining()).await;
         }
     }
 
@@ -522,6 +535,10 @@ mod tests {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Registration recovery and the event wait share ONE liveness budget
+        // so the test always fails with a diagnostic before nextest's 180s
+        // kill (intent-hq/intent#4852).
+        let budget = crate::events::TestBudget::liveness();
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("rmdir-user");
         let ws = TempDir::new("rmdir-ws");
@@ -539,14 +556,15 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        watcher.wait_established(LIVENESS).await;
+        watcher.wait_established(budget.remaining()).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // `rm -rf` of the whole tier directory: possibly only directory-level
         // events surface, which the filter must still forward (#612).
         std::fs::remove_dir_all(&proj).expect("remove tier dir");
 
-        let events = drain_specialists_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
+        let events =
+            drain_specialists_events(&mut sub, Duration::from_secs(2), budget.remaining()).await;
         assert_eq!(
             events.len(),
             1,

@@ -7,8 +7,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+#[cfg(unix)]
 use std::time::Duration;
 
 use directories::BaseDirs;

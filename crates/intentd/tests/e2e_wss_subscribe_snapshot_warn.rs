@@ -29,20 +29,18 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -181,15 +179,14 @@ async fn connect_ws(
 /// return the guard, WSS port, pinned client config, UDS socket path, and
 /// stderr log path.
 async fn boot(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, u16, Arc<ClientConfig>, PathBuf) {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", &format!("{prefix}-"));
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     env.extend_from_slice(envs);
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -391,7 +388,7 @@ async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
         ],
     )
     .await;
-    let log_path = daemon.data_dir.join("daemon.log");
+    let log_path = daemon.data_dir.path().join("daemon.log");
     let mut seeded = 0;
     let mut observed = Vec::new();
 
@@ -500,7 +497,7 @@ async fn lowered_threshold_fires_snapshot_warn_over_wss() {
 
     // The WARN is emitted just after the seq-0 frame is queued; poll briefly
     // to absorb stderr write scheduling.
-    let log_path = daemon.data_dir.join("daemon.log");
+    let log_path = daemon.data_dir.path().join("daemon.log");
     let deadline = tokio::time::Instant::now() + common::rpc_read_timeout();
     let needles: [&str; 4] = [
         "subscribe fast-path snapshot exceeded duration budget",
@@ -545,7 +542,7 @@ async fn default_threshold_stays_quiet_over_wss() {
 
     // The WARN (were it wrongly emitted) lands on stderr before the seq-0
     // frame is written, so a single read after the snapshot is sufficient.
-    let log_path = daemon.data_dir.join("daemon.log");
+    let log_path = daemon.data_dir.path().join("daemon.log");
     let log = std::fs::read_to_string(&log_path).expect("read daemon log");
     assert_eq!(
         count_lines(&log, &["intent_transport::subscribe_profile"]),

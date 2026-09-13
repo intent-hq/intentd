@@ -13,7 +13,8 @@
 //! intent-hq/monorepo#1572), which stalled daemon startup before the UDS
 //! socket was bound. Every registration is therefore performed on a detached
 //! OS thread — not the blocking pool, which the runtime waits for on shutdown
-//! — and failures are logged rather than returned.
+//! — and failures are logged rather than returned, then retried with capped
+//! backoff (see [`promote_loop`]).
 //!
 //! Event filtering also lives here: an event is forwarded when any of its
 //! paths falls under the canonical root and either matches the caller's
@@ -29,11 +30,15 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use super::shared_watch::{os_watch_limits, CREATE_RETRY_CAP, CREATE_RETRY_INITIAL};
+
 /// A watch on a single intended root that may not exist yet.
 /// Dropping this tears down the watcher and any pending promotion task.
 pub(super) struct RootWatch {
     inner: Arc<Mutex<Inner>>,
     task: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    root: PathBuf,
 }
 
 #[derive(Default)]
@@ -70,14 +75,33 @@ impl RootWatch {
     /// is the ancestor watch (the correct sync point for creation detection),
     /// not the recursive watch on the intended root, which only exists after
     /// promotion. Panics on timeout so a wedged registration is diagnosed
-    /// here rather than as a downstream "no event" failure.
+    /// here rather than as a downstream "no event" failure — and immediately
+    /// once the watch loop has ended without storing a watch (a registration
+    /// thread that never reported), since nothing will establish it later.
+    /// A registration that merely *failed* is retried by the loop
+    /// (intent-hq/intent#4852), so that case waits, up to `timeout`.
+    ///
+    /// The loop ends *normally* right after a successful store, so a finished
+    /// task is only a failure if `watched()` is still `None` when observed
+    /// after `is_finished()` — the store happens-before the task ends.
     #[cfg(test)]
     pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
         while self.watched().is_none() {
+            if self.task.as_ref().is_some_and(JoinHandle::is_finished) {
+                assert!(
+                    self.watched().is_some(),
+                    "watch loop for {} ended without establishing a watch (registration failed; see WARN logs); {}",
+                    self.root.display(),
+                    os_watch_limits()
+                );
+                return;
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "watch registration did not establish within {timeout:?}"
+                "watch registration for {} did not establish within {timeout:?}; {}",
+                self.root.display(),
+                os_watch_limits()
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
@@ -98,6 +122,8 @@ pub(super) fn watch_root(
 ) -> RootWatch {
     let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(on_change);
     let inner = Arc::new(Mutex::new(Inner::default()));
+    #[cfg(test)]
+    let intended_root = root.clone();
     let task = tokio::spawn(watch_loop(
         root,
         filename_matches,
@@ -107,6 +133,8 @@ pub(super) fn watch_root(
     RootWatch {
         inner,
         task: Some(task),
+        #[cfg(test)]
+        root: intended_root,
     }
 }
 
@@ -225,13 +253,28 @@ fn recursive_watcher(
 /// non-recursively until the root (or a nearer ancestor) appears, then
 /// promote to a recursive watch on the actual root. Storing the promoted
 /// watcher replaces — and thereby tears down — the ancestor watch.
+///
+/// A failed registration (recursive or ancestor) is retried with the same
+/// capped exponential backoff the shared hub uses for watcher creation
+/// (intent-hq/intent#3708) rather than abandoning the root: the dominant
+/// failure is transient — inotify instance exhaustion, `EMFILE` — and a
+/// watch given up on there stays dead for the process lifetime with only a
+/// WARN to show for it (intent-hq/intent#4852). Dropping the [`RootWatch`]
+/// aborts the loop, retries included.
+///
+/// Ancestor events are level-triggered wake hints — the loop re-reads the
+/// filesystem after each — so the wake channel holds at most one pending
+/// hint. While a recursive registration keeps failing the stored ancestor
+/// watch stays live and keeps firing without anyone receiving; a bounded
+/// channel keeps that traffic from accumulating for the watch's lifetime.
 async fn promote_loop(
     root: PathBuf,
     filename_matches: fn(&Path) -> bool,
     on_change: Arc<dyn Fn() + Send + Sync>,
     inner: Arc<Mutex<Inner>>,
 ) {
-    let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<()>();
+    let (wake_tx, mut wake_rx) = mpsc::channel::<()>(1);
+    let mut backoff = CREATE_RETRY_INITIAL;
     loop {
         if root.exists() {
             match spawn_recursive_watcher(root.clone(), filename_matches, Arc::clone(&on_change))
@@ -242,8 +285,13 @@ async fn promote_loop(
                     tracing::warn!(
                         root = %root.display(),
                         error = %e,
-                        "recursive watch on newly created root failed; leaving stale ancestor watch"
+                        retry_in = ?backoff,
+                        os_watch_limits = %os_watch_limits(),
+                        "recursive watch on existing root failed; retrying"
                     );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(CREATE_RETRY_CAP);
+                    continue;
                 }
                 None => return,
             }
@@ -262,7 +310,9 @@ async fn promote_loop(
             let mut watcher =
                 notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
                     Ok(_) => {
-                        let _ = tx.send(());
+                        // Full means a hint is already pending; Closed means
+                        // the loop is gone. Neither needs more than a drop.
+                        let _ = tx.try_send(());
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -281,9 +331,13 @@ async fn promote_loop(
                     root = %root.display(),
                     ancestor = %ancestor.display(),
                     error = %e,
-                    "ancestor watch failed; root creation will not be detected"
+                    retry_in = ?backoff,
+                    os_watch_limits = %os_watch_limits(),
+                    "ancestor watch failed; retrying"
                 );
-                return;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(CREATE_RETRY_CAP);
+                continue;
             }
             None => return,
         }
@@ -506,6 +560,90 @@ mod tests {
             wait_for(|| hits.load(Ordering::SeqCst) > before, LIVENESS).await,
             "file changes under the promoted root must be detected"
         );
+    }
+
+    /// A recursive registration that keeps failing after the root appears
+    /// must neither abandon the root nor tear down the ancestor watch, and
+    /// ancestor traffic during the retries must not break recovery: once
+    /// the registration can succeed the watch promotes, catches up, and
+    /// detects later changes. An unreadable root reproduces the failure
+    /// deterministically: `exists()` needs only search permission on the
+    /// parent, but `inotify_add_watch` needs read permission on the
+    /// directory itself, so every attempt fails with `EACCES` until the mode
+    /// is restored. Linux only: `FSEvents` on macOS has no such read check and
+    /// registers the unreadable root successfully.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn failed_promotion_keeps_ancestor_watch_and_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = TempDir::new("promote-fail");
+        let root = dir.path.join(".intent").join("specialists");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        let watch = watch_root(root.clone(), md_only, move || {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(
+            wait_for(|| watch.watched().is_some(), LIVENESS).await,
+            "ancestor watch must establish"
+        );
+        let ancestor = watch.watched().expect("watched").0;
+
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod root");
+        let restore = || {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
+                .expect("restore root mode");
+        };
+        if std::fs::read_dir(&root).is_ok() {
+            // A privileged user reads a mode-000 directory; the failure cannot
+            // be provoked here.
+            restore();
+            return;
+        }
+
+        // Let the first attempt and at least one retry fail while the
+        // ancestor keeps producing events (each is one wake hint; the loop's
+        // wake channel must not grow with them).
+        for i in 0..CREATE_RETRY_INITIAL.as_millis() / 10 {
+            std::fs::write(ancestor.join(format!("noise-{i}")), "x").expect("write noise");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert_eq!(
+            watch.watched(),
+            Some((ancestor.clone(), false)),
+            "a failing recursive registration must keep the ancestor watch, not drop it"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no promotion may be reported yet"
+        );
+
+        restore();
+        assert!(
+            wait_for(|| watch.watched() == Some((root.clone(), true)), LIVENESS).await,
+            "watch must promote once registration can succeed, got {:?}",
+            watch.watched()
+        );
+        assert!(
+            wait_for(|| hits.load(Ordering::SeqCst) >= 1, LIVENESS).await,
+            "recovered promotion must fire a catch-up notification"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = hits.load(Ordering::SeqCst);
+        std::fs::write(root.join("new.md"), "x").expect("write md");
+        assert!(
+            wait_for(|| hits.load(Ordering::SeqCst) > before, LIVENESS).await,
+            "file changes under the recovered root must be detected"
+        );
+        drop(watch);
     }
 
     #[tokio::test]

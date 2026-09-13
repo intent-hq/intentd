@@ -134,8 +134,7 @@ pub(crate) struct ScriptManager {
 
 /// Test seam for a race window: lets a test hold a task inside a window
 /// (signal `entered`, await `release`). Used for `supervise()`'s
-/// pre-registration window (monorepo#1180) and `start()`'s
-/// spawn-to-registration window (monorepo#1194).
+/// pre-registration window (monorepo#1180).
 #[derive(Default)]
 pub(crate) struct SupervisePark {
     /// Signaled by the parked task on entering the window.
@@ -151,9 +150,6 @@ pub(crate) struct ScriptParks {
     /// Parks `supervise()` in its pre-registration window — after
     /// `pty.spawn`, before `mark_running` records the id (monorepo#1180).
     pub(crate) supervise: Option<Arc<SupervisePark>>,
-    /// Parks `start()` between spawning the supervisor task and taking the
-    /// registration lock (monorepo#1194).
-    pub(crate) start_registration: Option<Arc<SupervisePark>>,
 }
 
 /// Cancellation guard for the `script.run` reservation window (reserve →
@@ -578,55 +574,63 @@ impl ScriptManager {
     }
 
     /// `script.start`: spawn the script and run its supervisor loop. A script
-    /// already running is a no-op (mirrors the TS warn-and-return). Scoped to
-    /// `workspace_id`.
-    pub(crate) async fn start(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
+    /// already running (or already launching) is a no-op (mirrors the TS
+    /// warn-and-return). Scoped to `workspace_id`.
+    ///
+    /// The guard check, the `starting` reservation, the supervisor spawn and
+    /// its registration all happen under one lock acquisition — the function
+    /// is synchronous, so there is no await between the reservation and the
+    /// registration (intent-hq/intent#4858): a `script.status` read after `start` replies
+    /// never observes the pre-launch `idle`; a second `start` racing the
+    /// launch window hits the guard instead of spawning a second supervisor;
+    /// a `stop` / `remove` racing it always finds the owned supervisor handle
+    /// to await, so it can never clear the reservation while a launch is
+    /// still pending; and dropping the `start` future cannot strand the
+    /// reservation, because the spawned task owns the launch from the moment
+    /// the status flips. The stale terminal fields (`exitCode`, `stoppedAt`,
+    /// `error`, ...) of a previous run are cleared with the flip so the
+    /// launch-window snapshot is internally consistent. The supervisor task
+    /// publishes the `starting` transition itself before it supervises, so it
+    /// strictly precedes the spawn's `running` / `exited` on the bus; a
+    /// `stop` inside the window settles the status back to `idle`. The
+    /// `script.restart` gap keeps its own `restarting` status.
+    pub(crate) fn start(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
         let key = (workspace_id.clone(), script_id.to_string());
-        let (def, generation) = {
-            let mut guard = self.scripts.lock().unwrap();
-            let m = guard
-                .get_mut(&key)
-                .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
-            if m.state.status == ScriptStatus::Running {
-                return Ok(json!({ "ok": true, "scriptId": script_id }));
-            }
-            m.stopped_by_user = false;
-            (m.def.clone(), m.generation)
+        let mut guard = self.scripts.lock().unwrap();
+        let m = guard
+            .get_mut(&key)
+            .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
+        if matches!(
+            m.state.status,
+            ScriptStatus::Running | ScriptStatus::Starting
+        ) {
+            return Ok(json!({ "ok": true, "scriptId": script_id }));
+        }
+        m.stopped_by_user = false;
+        let launching = if m.state.status == ScriptStatus::Restarting {
+            None
+        } else {
+            m.state.status = ScriptStatus::Starting;
+            m.state.pid = None;
+            m.state.started_at = None;
+            m.state.exit_code = None;
+            m.state.stopped_at = None;
+            m.state.error = None;
+            m.state.detected_url = None;
+            Some(m.state.clone())
         };
+        let def = m.def.clone();
+        let generation = m.generation;
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let sid = script_id.to_string();
-        let handle = tokio::spawn(async move { mgr.supervise(ws, sid, def, generation).await });
-        // Test seam (monorepo#1194): park here so a test can remove+recreate
-        // the entry while the supervisor task exists but is not yet
-        // registered.
-        if let Some(park) = &self.parks.start_registration {
-            park.entered.notify_one();
-            park.release.notified().await;
-        }
-        let orphan = {
-            let mut guard = self.scripts.lock().unwrap();
-            match guard.get_mut(&key) {
-                // Only install the handle if the entry is still the same
-                // incarnation the supervisor was spawned for (monorepo#1194):
-                // a removed+recreated entry has a new generation, and the
-                // stale supervisor must not become its supervisor.
-                Some(m) if m.generation == generation => {
-                    m.supervisor = Some(handle);
-                    None
-                }
-                _ => Some(handle),
+        m.supervisor = Some(tokio::spawn(async move {
+            if let Some(state) = launching {
+                mgr.emit_state(&ws, &sid, &state).await;
             }
-        };
-        // Removed (or recreated) concurrently between spawn and registration:
-        // *await* the supervisor (outside the lock) instead of aborting it
-        // (monorepo#1180) — `mark_running` fails the generation check and the
-        // supervisor reaps any PTY it spawned before returning.
-        if let Some(handle) = orphan {
-            if let Err(e) = handle.await {
-                tracing::warn!(script = %script_id, error = %e, "script supervisor join failed during orphan teardown");
-            }
-        }
+            mgr.supervise(ws, sid, def, generation).await;
+        }));
+        drop(guard);
         Ok(json!({ "ok": true, "scriptId": script_id }))
     }
 
@@ -638,6 +642,12 @@ impl ScriptManager {
     /// clears the `was_running` marker, publishes the cleared state as
     /// `script:state` so subscribers drop the marker too, and returns ok (a
     /// stopped script is exactly the requested state, not an error).
+    ///
+    /// A stop inside the `starting` launch window (intent-hq/intent#4858) has
+    /// no recorded PTY yet: the flag makes the supervisor's `mark_running`
+    /// refuse and reap its fresh PTY, and once it has settled the status is
+    /// returned to `idle` and published so subscribers never retain a stale
+    /// `starting`.
     pub(crate) async fn stop(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
         let key = (workspace_id.clone(), script_id.to_string());
         let (handle, pty_id, was_running) = {
@@ -659,21 +669,28 @@ impl ScriptManager {
             let _ = handle.await;
         }
         if !was_running {
-            let dismissed_state = {
+            let (settled_state, dismissed) = {
                 let mut guard = self.scripts.lock().unwrap();
                 match guard.get_mut(&key) {
                     Some(m) => {
+                        let launch_aborted = m.state.status == ScriptStatus::Starting;
                         if m.state.status != ScriptStatus::Running {
                             m.state.status = ScriptStatus::Idle;
                         }
-                        m.state.previously_running.take().map(|_| m.state.clone())
+                        let dismissed = m.state.previously_running.take().is_some();
+                        (
+                            (dismissed || launch_aborted).then(|| m.state.clone()),
+                            dismissed,
+                        )
                     }
-                    None => None,
+                    None => (None, false),
                 }
             };
-            if let Some(state) = dismissed_state {
-                self.persist_was_running(workspace_id, script_id, false)
-                    .await;
+            if let Some(state) = settled_state {
+                if dismissed {
+                    self.persist_was_running(workspace_id, script_id, false)
+                        .await;
+                }
                 self.emit_state(workspace_id, script_id, &state).await;
             }
         }
@@ -788,14 +805,15 @@ impl ScriptManager {
             m.state.clone()
         };
         self.emit_state(workspace_id, script_id, &state).await;
-        self.start(workspace_id, script_id).await
+        self.start(workspace_id, script_id)
     }
 
     /// `script.run`: run a command-mode script to completion (optional timeout),
     /// returning its captured output + exit code; service scripts return a
     /// `warning` directing callers to `script.start`, and a script already
-    /// running warn-and-returns (mirrors `start()`'s guard) so a second run
-    /// can never overwrite `pty_id` and orphan the first run's PTY
+    /// running — or inside a `script.start` launch window (`starting`) —
+    /// warn-and-returns (mirrors `start()`'s guard) so a second run can never
+    /// overwrite `pty_id` and orphan the first run's PTY
     /// (monorepo#1155). The `running` status is reserved under the same lock
     /// acquisition as the guard check, so two concurrent entries cannot both
     /// pass the guard during the pre-`mark_running` window (`resolve_cwd`
@@ -818,7 +836,10 @@ impl ScriptManager {
                     "warning": "Script is a service; use script.start instead of script.run.",
                 }));
             }
-            if m.state.status == ScriptStatus::Running {
+            if matches!(
+                m.state.status,
+                ScriptStatus::Running | ScriptStatus::Starting
+            ) {
                 return Ok(json!({
                     "output": "",
                     "warning": "Script is already running; wait for it to finish or use script.stop.",
@@ -1305,10 +1326,10 @@ impl ScriptManager {
     }
 
     /// Build the [`SpawnSpec`] for a run: login shell + `-c command`, workspace
-    /// scope, and the `FORCE_COLOR/TERM` + enhanced-PATH + commit-identity +
-    /// script env overlay, with an inherited `npm_config_prefix` scrubbed so
-    /// nvm's login-shell init succeeds. An explicit script env value is
-    /// preserved.
+    /// scope, and the `FORCE_COLOR/TERM` + `PAGER/GIT_PAGER=cat` +
+    /// enhanced-PATH + commit-identity + script env overlay, with an inherited
+    /// `npm_config_prefix` scrubbed so nvm's login-shell init succeeds. An
+    /// explicit script env value is preserved.
     fn build_spec(ws: &WorkspaceId, def: &Script, cwd: Option<&PathBuf>) -> SpawnSpec {
         let shell = default_shell();
         let mut spec = SpawnSpec::new(ws.as_str(), shell.clone());
@@ -1321,15 +1342,22 @@ impl ScriptManager {
     }
 }
 
-/// Build the env overlay for a spawned script/agent shell: `FORCE_COLOR/TERM`, an
-/// enhanced PATH (essential system dirs + homebrew + node/version-manager dirs),
-/// the commit-identity `GIT_*` vars resolved from `cwd`'s repository (so a
-/// `git commit` in the script uses the user's real identity —
-/// intent-hq/intent#4142; nothing is exported when no identity resolves, and
-/// a var already in the daemon's own env is inherited untouched), then the
-/// script's own `env` last so it can override. The enhanced PATH keeps
-/// git/node resolvable even when the daemon inherited a sparse Finder/launchd
-/// PATH or the login-shell init is degraded.
+/// Build the env overlay for a spawned script shell: `FORCE_COLOR/TERM`,
+/// `PAGER=cat` + `GIT_PAGER=cat` (the PTY has no keyboard, so a pager opened
+/// by a `PAGER`-honouring tool would hold the run open forever; `GIT_PAGER`
+/// also outranks a repo's `core.pager`), an enhanced PATH (essential system
+/// dirs + homebrew + node/version-manager dirs), the commit-identity `GIT_*`
+/// vars resolved from `cwd`'s repository (so a `git commit` in the script
+/// uses the user's real identity — intent-hq/intent#4142; nothing is exported
+/// when no identity resolves, and a var already in the daemon's own env is
+/// inherited untouched), then the script's own `env` last so it can override.
+/// The enhanced PATH keeps git/node resolvable even when the daemon inherited
+/// a sparse Finder/launchd PATH or the login-shell init is degraded.
+///
+/// Like every var here, the pager defaults are daemon-side defaults, not a
+/// hard guarantee: a tool-specific var the daemon inherited (e.g. `GH_PAGER`,
+/// `MANPAGER`) still takes precedence for that tool, and the login shell's
+/// startup files run after this overlay and may re-export any of it.
 fn spawn_env_overlay(
     cwd: Option<&std::path::Path>,
     def_env: Option<&std::collections::BTreeMap<String, String>>,
@@ -1337,6 +1365,8 @@ fn spawn_env_overlay(
     let mut env = vec![
         ("FORCE_COLOR".to_string(), "1".to_string()),
         ("TERM".to_string(), "xterm-256color".to_string()),
+        ("PAGER".to_string(), "cat".to_string()),
+        ("GIT_PAGER".to_string(), "cat".to_string()),
     ];
     if let Some(path) = enhanced_shell_path() {
         env.push(("PATH".to_string(), path));
@@ -1523,16 +1553,129 @@ mod tests {
     /// below return as soon as the awaited event arrives, so this bound only
     /// has to outlast a worst-case multi-suite machine stall (login-shell
     /// spawn + exit-poll + bus delivery), never a passing run.
-    const LIVENESS: Duration = Duration::from_secs(300);
+    ///
+    /// Invariant (intent-hq/intentd#1822): every harness-bounded wait must
+    /// fail THROUGH the harness — its own diagnostic naming the stalled step,
+    /// then teardown — strictly before nextest's `slow-timeout` terminate
+    /// budget (`period × terminate-after` in `.config/nextest.toml`, 180s)
+    /// SIGKILLs the test. At 300s the bound could never fire: the kill landed
+    /// first, the run reported a bare "test timed out", and leaked script
+    /// children had to be reaped by hand. `LIVENESS + TEARDOWN_MARGIN` must
+    /// stay under that budget; `liveness_deadline_fits_inside_nextest_terminate_budget`
+    /// reads the real config and pins the ordering.
+    const LIVENESS: Duration = Duration::from_secs(150);
+    /// Headroom between a `LIVENESS` expiry and nextest's kill so the failing
+    /// wait's diagnostic and process teardown complete before the SIGKILL.
+    const TEARDOWN_MARGIN: Duration = Duration::from_secs(30);
     /// Service command lifetime long enough that a service under test cannot
     /// exit (and auto-restart, killing its PTY) mid-assertion under load
-    /// (monorepo#515). Strictly outlives `LIVENESS` so negative checks bounded
-    /// by it (e.g. the upsert orphan `kill -0` poll) can still hard-fail on a
-    /// leaked process instead of the command exiting first. Every test that
-    /// starts one stops or removes it.
+    /// (monorepo#515). Outlives `LIVENESS` so a negative check bounded by it
+    /// (e.g. the upsert orphan `kill -0` poll) observes a genuinely leaked
+    /// process rather than the command exiting on its own; the check itself
+    /// hard-fails via the `LIVENESS` deadline. Every test that starts one
+    /// stops or removes it.
     const SERVICE_CMD: &str = "sleep 3600";
 
     // ---- pure-helper tests (no PTY, no event bus) --------------------------
+
+    /// Parse a nextest duration literal (`"90s"`, `"2m"`, `"1h"`, `"500ms"`).
+    fn parse_nextest_duration(raw: &str) -> Duration {
+        let raw = raw.trim();
+        let split = raw
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or_else(|| panic!("duration {raw:?} has no unit suffix"));
+        let (num, unit) = raw.split_at(split);
+        let num: f64 = num
+            .parse()
+            .unwrap_or_else(|e| panic!("duration {raw:?} has a non-numeric magnitude: {e}"));
+        let secs = match unit.trim() {
+            "ms" => num / 1000.0,
+            "s" => num,
+            "m" => num * 60.0,
+            "h" => num * 3600.0,
+            other => panic!("duration {raw:?} has an unsupported unit {other:?}"),
+        };
+        Duration::from_secs_f64(secs)
+    }
+
+    /// Pins the ordering `LIVENESS` relies on (intent-hq/intentd#1822): a
+    /// stalled harness wait must expire, print its diagnostic, and tear down
+    /// before nextest's `slow-timeout` kill (`period × terminate-after`) from
+    /// the real `.config/nextest.toml`, so the two numbers cannot drift apart
+    /// silently. No `[[profile.default.overrides]]` entry sets `slow-timeout`
+    /// (none matches `intent-services` tests either), so the `[profile.default]`
+    /// budget is the one that applies; the test fails loudly if that changes so
+    /// it can be taught which override governs this crate.
+    #[test]
+    fn liveness_deadline_fits_inside_nextest_terminate_budget() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.config/nextest.toml");
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read nextest config {path}: {e} — LIVENESS is bounded by its slow-timeout"
+            )
+        });
+        let doc: toml_edit::DocumentMut = raw
+            .parse()
+            .unwrap_or_else(|e| panic!("cannot parse nextest config {path}: {e}"));
+        let profile = doc
+            .get("profile")
+            .and_then(|p| p.get("default"))
+            .unwrap_or_else(|| panic!("{path}: no [profile.default] table"));
+
+        let overrides_with_slow_timeout: Vec<String> = profile
+            .get("overrides")
+            .and_then(|o| o.as_array_of_tables())
+            .map(|tables| {
+                tables
+                    .iter()
+                    .filter(|t| t.contains_key("slow-timeout"))
+                    .map(|t| {
+                        t.get("filter")
+                            .and_then(|f| f.as_str())
+                            .unwrap_or("<no filter>")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            overrides_with_slow_timeout.is_empty(),
+            "{path}: [[profile.default.overrides]] entries now carry `slow-timeout` \
+             (filters: {overrides_with_slow_timeout:?}); extend this test to determine \
+             which override applies to intent-services tests before trusting the \
+             [profile.default] budget"
+        );
+
+        let slow = profile
+            .get("slow-timeout")
+            .unwrap_or_else(|| panic!("{path}: [profile.default] has no slow-timeout"));
+        let period = slow
+            .get("period")
+            .and_then(toml_edit::Item::as_str)
+            .map_or_else(
+                || panic!("{path}: slow-timeout.period is not a duration string"),
+                parse_nextest_duration,
+            );
+        let terminate_after = slow
+            .get("terminate-after")
+            .and_then(toml_edit::Item::as_integer)
+            .unwrap_or_else(|| panic!("{path}: slow-timeout.terminate-after is not an integer"));
+        let terminate_after = u32::try_from(terminate_after).expect("terminate-after fits in u32");
+        let budget = period * terminate_after;
+
+        assert!(
+            TEARDOWN_MARGIN >= Duration::from_secs(20),
+            "TEARDOWN_MARGIN ({TEARDOWN_MARGIN:?}) must leave at least 20s for the \
+             harness diagnostic and teardown"
+        );
+        assert!(
+            LIVENESS + TEARDOWN_MARGIN <= budget,
+            "LIVENESS ({LIVENESS:?}) + TEARDOWN_MARGIN ({TEARDOWN_MARGIN:?}) exceeds \
+             nextest's terminate budget {budget:?} (slow-timeout period {period:?} × \
+             terminate-after {terminate_after} in {path}); nextest would SIGKILL a \
+             stalled test before the harness deadline fires"
+        );
+    }
 
     #[test]
     fn clamp_line_count_clamps_extremes_and_uses_fallback() {
@@ -1675,6 +1818,41 @@ mod tests {
         def_env.insert("MY_VAR".to_string(), "1".to_string());
         let env = spawn_env_overlay(None, Some(&def_env));
         assert_eq!(env.last(), Some(&("MY_VAR".to_string(), "1".to_string())));
+    }
+
+    /// The base overlay disables pagers (`PAGER`/`GIT_PAGER=cat`) for the
+    /// keyboard-less script PTY; an explicit script env value still wins
+    /// (applied last).
+    #[test]
+    fn spawn_overlay_disables_pagers_script_env_wins() {
+        let env = spawn_env_overlay(None, None);
+        for key in ["PAGER", "GIT_PAGER"] {
+            assert!(
+                env.iter().any(|(k, v)| k == key && v == "cat"),
+                "missing {key}=cat in {env:?}"
+            );
+        }
+
+        let mut def_env = std::collections::BTreeMap::new();
+        def_env.insert("PAGER".to_string(), "less".to_string());
+        def_env.insert("GIT_PAGER".to_string(), "delta".to_string());
+        let env = spawn_env_overlay(None, Some(&def_env));
+        let last = |key: &str| {
+            env.iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            last("PAGER"),
+            Some("less"),
+            "script env wins (applied last)"
+        );
+        assert_eq!(
+            last("GIT_PAGER"),
+            Some("delta"),
+            "script env wins (applied last)"
+        );
     }
 
     /// #4142: a script spawned inside a repo with a configured identity
@@ -1841,6 +2019,19 @@ mod tests {
         _worktree: Option<WorktreeDir>,
     }
 
+    /// Reap every PTY the test started, on normal and panicking unwinds
+    /// alike, so a stalled wait that fails through the `LIVENESS` deadline
+    /// cannot leak the script's process group past the test
+    /// (intent-hq/intentd#1822 left `git`/`sh`/`sleep 3600` behind). Drop is
+    /// synchronous and runs while the test runtime is unwinding, so this uses
+    /// the no-await SIGKILL sweep; it also latches the host closed, which
+    /// refuses a supervisor respawn racing the sweep.
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.services.pty().kill_all_sync();
+        }
+    }
+
     async fn harness() -> Harness {
         harness_with_worktree(false).await
     }
@@ -1899,39 +2090,62 @@ mod tests {
         .await
     }
 
+    /// Wait for the next `script:state` event satisfying `pred`. On timeout
+    /// the panic names the deadline and the last `script:state` event seen
+    /// (the status the run stalled at), so a harness failure is diagnosable
+    /// from the test output rather than only from nextest's slow-timeout kill.
     async fn await_state<F>(sub: &mut Subscription, timeout: Duration, mut pred: F) -> Value
     where
         F: FnMut(&Value) -> bool,
     {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut seen = 0usize;
+        let mut last_state: Option<Value> = None;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let batch = tokio::time::timeout(remaining, sub.recv())
-                .await
-                .expect("event delivered before deadline")
-                .expect("subscription open");
-            for ev in &batch {
+            let Ok(batch) = tokio::time::timeout(remaining, sub.recv()).await else {
+                panic!(
+                    "await_state timed out after {timeout:?}: {seen} script:* event(s) seen, \
+                     none matched the predicate; last script:state event: {}",
+                    last_state
+                        .as_ref()
+                        .map_or_else(|| "<none>".to_string(), Value::to_string)
+                );
+            };
+            for ev in &batch.expect("subscription open") {
                 let v = serde_json::to_value(ev).expect("serialize");
-                if v["type"] == "script:state" && pred(&v) {
-                    return v;
+                seen += 1;
+                if v["type"] == "script:state" {
+                    if pred(&v) {
+                        return v;
+                    }
+                    last_state = Some(v);
                 }
             }
         }
     }
 
+    /// Wait for the `script:changed` event carrying `action`; the timeout
+    /// panic names the action and the last `script:*` event seen.
     async fn await_script_change(sub: &mut Subscription, action: &str) -> Value {
         let deadline = tokio::time::Instant::now() + LIVENESS;
+        let mut last: Option<Value> = None;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let batch = tokio::time::timeout(remaining, sub.recv())
-                .await
-                .expect("script change delivered before liveness deadline")
-                .expect("subscription open");
-            for ev in &batch {
+            let Ok(batch) = tokio::time::timeout(remaining, sub.recv()).await else {
+                panic!(
+                    "await_script_change timed out after {LIVENESS:?} waiting for \
+                     script:changed action={action:?}; last script:* event: {}",
+                    last.as_ref()
+                        .map_or_else(|| "<none>".to_string(), Value::to_string)
+                );
+            };
+            for ev in &batch.expect("subscription open") {
                 let value = serde_json::to_value(ev).expect("serialize");
                 if value["type"] == "script:changed" && value["data"]["action"] == action {
                     return value;
                 }
+                last = Some(value);
             }
         }
     }
@@ -2533,6 +2747,363 @@ mod tests {
             .expect("stop");
     }
 
+    /// Regression for intent-hq/intent#4858: a `script.status` read issued
+    /// right after `script.start` replies — with no intervening yield, so the
+    /// supervisor task has not run yet on the current-thread runtime — must
+    /// never report the pre-launch `idle` (pre-fix, the status only left
+    /// `idle` at the supervisor's `mark_running`).
+    #[tokio::test]
+    async fn script_start_replies_only_after_status_leaves_idle() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_ne!(st["status"], "idle", "status after start: {st}");
+        assert!(
+            st["status"] == "starting" || st["status"] == "running",
+            "status after start: {st}"
+        );
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
+    }
+
+    /// The launch window reports `starting` (intent-hq/intent#4858): the
+    /// status flips synchronously in `start()` and holds until the spawn's
+    /// `mark_running`. The supervise park holds the respawn pre-`mark_running`
+    /// so the window is open deterministically; `starting` precedes `running`
+    /// on the bus, and a second `start` inside the window is a no-op (no
+    /// second `starting`, no second supervisor).
+    #[tokio::test]
+    async fn script_start_launch_window_reports_starting() {
+        let h = harness().await;
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let st = services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "starting", "status after start: {st}");
+        assert!(st["pid"].is_null(), "no pid before the spawn: {st}");
+        let ev = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] != "idle").await;
+        assert_eq!(ev["data"]["status"], "starting", "first transition: {ev}");
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("spawn parked");
+        let st = services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "starting", "parked pre-mark_running: {st}");
+        let v = services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("second start");
+        assert_eq!(v["ok"], true);
+        park.release.notify_one();
+        let ev = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] != "starting").await;
+        assert_eq!(
+            ev["data"]["status"], "running",
+            "no second `starting` from the redundant start: {ev}"
+        );
+        services.script_stop(h.ws.clone(), id).await.expect("stop");
+    }
+
+    /// A synchronous launch failure (here a cwd escaping the workspace root,
+    /// rejected by `resolve_cwd` before any spawn) surfaces through the
+    /// status as `exited` + `error` — never as a stale `idle`
+    /// (intent-hq/intent#4858).
+    #[tokio::test]
+    async fn script_start_spawn_failure_surfaces_exited_not_idle() {
+        let h = harness_with_worktree(true).await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "bad-cwd".into(),
+                command: "echo never".into(),
+                mode: ScriptMode::Command,
+                cwd: Some("../escape".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_ne!(st["status"], "idle", "status after start: {st}");
+        let ev = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        assert!(
+            ev["data"]["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("escapes workspace root"),
+            "spawn failure recorded on state: {ev}"
+        );
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "exited", "settled: {st}");
+        assert!(st["error"].is_string(), "error retained: {st}");
+    }
+
+    /// A `script.stop` inside the launch window (intent-hq/intent#4858) has no
+    /// recorded PTY yet: the supervisor's `mark_running` refuses on the stop
+    /// flag and reaps its PTY, and the status settles back to `idle` with a
+    /// `script:state` so subscribers never retain `starting`.
+    #[tokio::test]
+    async fn script_stop_during_launch_window_settles_idle() {
+        let h = harness().await;
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "starting").await;
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("spawn parked");
+        // `stop` awaits the (parked) supervisor, so it runs alongside the
+        // release.
+        let svc = services.clone();
+        let ws = h.ws.clone();
+        let sid = id.clone();
+        let stop_task = tokio::spawn(async move { svc.script_stop(ws, sid).await });
+        tokio::task::yield_now().await;
+        park.release.notify_one();
+        tokio::time::timeout(LIVENESS, stop_task)
+            .await
+            .expect("stop settled")
+            .expect("join")
+            .expect("stop");
+        let ev = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] != "starting").await;
+        assert_eq!(ev["data"]["status"], "idle", "aborted launch: {ev}");
+        let st = services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "idle", "settled: {st}");
+        assert!(st["pid"].is_null(), "refused spawn never recorded: {st}");
+    }
+
+    /// `script.run` inside a `script.start` launch window hits the
+    /// already-running guard (intent-hq/intent#4858): the reserved `starting`
+    /// status is as exclusive as `running`, so a run can never spawn a second
+    /// PTY that the supervisor's `mark_running` would then overwrite.
+    #[tokio::test]
+    async fn script_run_during_launch_window_hits_running_guard() {
+        let h = harness().await;
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "cmd", SERVICE_CMD, ScriptMode::Command).await;
+        services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let v = services
+            .script_run(h.ws.clone(), id.clone(), None, Some(5))
+            .await
+            .expect("run");
+        assert!(
+            v["warning"]
+                .as_str()
+                .unwrap_or("")
+                .contains("already running"),
+            "run inside the launch window: {v}"
+        );
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("spawn parked");
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        services.script_stop(h.ws.clone(), id).await.expect("stop");
+    }
+
+    /// The `starting` reservation and the supervisor registration are one
+    /// atomic step (intent-hq/intent#4858 review): the `script.start` future
+    /// completes on its first poll, so a caller dropping it can never strand
+    /// the registry at `starting` with no supervisor to move it on.
+    #[tokio::test]
+    async fn script_start_completes_on_first_poll_so_cancellation_cannot_strand_starting() {
+        let h = harness().await;
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        let mut fut = services.script_start(h.ws.clone(), id.clone());
+        let first_poll =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx))).await;
+        assert!(
+            matches!(first_poll, std::task::Poll::Ready(Ok(_))),
+            "start replies on its first poll: {first_poll:?}"
+        );
+        drop(fut);
+        let st = services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "starting", "reserved: {st}");
+        // The owned supervisor task carries the launch through on its own.
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "starting").await;
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("spawn parked");
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        services.script_stop(h.ws.clone(), id).await.expect("stop");
+    }
+
+    /// A `stop` that lands while a `start` is still launching finds the owned
+    /// supervisor handle and awaits it (intent-hq/intent#4858 review): it can
+    /// never clear the `starting` reservation while that launch is pending,
+    /// so a follow-up `start` admits exactly one launch — the bus carries one
+    /// `running`, never a second supervisor's `mark_running` overwriting the
+    /// first one's pid. Pre-fix the reservation and the registration were
+    /// separated by an await, and this sequence spawned two supervisors under
+    /// the same generation.
+    #[tokio::test]
+    async fn script_stop_racing_a_pending_start_never_admits_a_second_launch() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        let svc = h.services.clone();
+        let ws = h.ws.clone();
+        let sid = id.clone();
+        let first = tokio::spawn(async move { svc.script_start(ws, sid).await });
+        tokio::task::yield_now().await;
+        h.services
+            .script_stop(h.ws.clone(), id.clone())
+            .await
+            .expect("stop");
+        tokio::time::timeout(LIVENESS, first)
+            .await
+            .expect("first start settled")
+            .expect("join")
+            .expect("first start ok");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "idle", "aborted launch settled: {st}");
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("second start");
+        let running = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let pid = running["data"]["pid"].as_i64().expect("running pid");
+        // Nothing but the second launch's `running` may follow: a stale first
+        // supervisor would publish a second `running` with a different pid.
+        let next = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(
+            next.is_err(),
+            "no further transition after the single running: {next:?}"
+        );
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "running", "{st}");
+        assert_eq!(st["pid"].as_i64(), Some(pid), "single owned pid: {st}");
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
+        assert_reaped(pid, "after stopping the single launch").await;
+    }
+
+    /// Relaunching a script that previously exited publishes `starting` with
+    /// the previous run's terminal fields already cleared (intent-hq/intent#4858
+    /// review): the launch-window snapshot never pairs `status: "starting"`
+    /// with a stale `exitCode` / `stoppedAt` / `error` / `startedAt`.
+    #[tokio::test]
+    async fn script_start_clears_stale_terminal_fields_with_starting() {
+        let h = harness().await;
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "cmd", "exit 3", ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("first start");
+        let exited = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        assert_eq!(exited["data"]["exitCode"], 3, "{exited}");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["exitCode"], 3, "terminal fields recorded: {st}");
+        assert!(st["stoppedAt"].is_string(), "{st}");
+        assert!(st["startedAt"].is_string(), "{st}");
+
+        services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("relaunch");
+        let st = services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "starting", "{st}");
+        for field in [
+            "pid",
+            "exitCode",
+            "stoppedAt",
+            "startedAt",
+            "error",
+            "detectedUrl",
+        ] {
+            assert!(
+                st[field].is_null(),
+                "stale `{field}` in the launch window: {st}"
+            );
+        }
+        let ev = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "starting").await;
+        for field in ["pid", "exitCode", "stoppedAt", "startedAt", "error"] {
+            assert!(
+                ev["data"][field].is_null(),
+                "stale `{field}` on the starting event: {ev}"
+            );
+        }
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("spawn parked");
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+    }
+
     #[tokio::test]
     async fn running_script_is_hidden_from_terminal_list_but_output_remains_available() {
         let h = harness().await;
@@ -2674,7 +3245,7 @@ mod tests {
     #[tokio::test]
     async fn auto_restart_backoff_window_reports_restarting() {
         let mut h = harness().await;
-        h.services = h.services.with_script_too_fast_ms(0);
+        h.services = h.services.clone().with_script_too_fast_ms(0);
         let park = Arc::new(SupervisePark::default());
         let services = h.services.clone().with_script_supervise_park(park.clone());
         let mut sub = subscribe(&h);
@@ -3052,7 +3623,7 @@ mod tests {
     #[tokio::test]
     async fn stop_all_during_respawn_window_refuses_registration_and_reaps() {
         let mut h = harness().await;
-        h.services = h.services.with_script_too_fast_ms(0);
+        h.services = h.services.clone().with_script_too_fast_ms(0);
         let park = Arc::new(SupervisePark::default());
         let services = h.services.clone().with_script_supervise_park(park.clone());
         let mut sub = subscribe(&h);
@@ -3148,6 +3719,88 @@ mod tests {
             .await
             .expect("status");
         assert_eq!(st["status"], "exited");
+    }
+
+    /// A saved script runs in a PTY with no keyboard, so a pager launched by
+    /// `git` (or any `PAGER`-honouring tool) would hold the run open forever.
+    /// The spawn env exports `GIT_PAGER=cat`/`PAGER=cat`, which outrank
+    /// `core.pager`, so a `git log` with a stdin-blocking pager forced through
+    /// config still exits 0. The two vars are unset for the test's lifetime so
+    /// an inheriting harness cannot mask a missing overlay.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_git_log_with_blocking_config_pager_exits_cleanly() {
+        let _env =
+            crate::agent_manager::tests::EnvGuard::apply(&[("GIT_PAGER", None), ("PAGER", None)]);
+        let h = harness_with_worktree(true).await;
+        let workspace = h
+            .services
+            .store()
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace");
+        let root = crate::git_ops::worktree_path(&workspace).expect("worktree");
+        let repo = git2::Repository::init(&root).expect("init repo");
+        {
+            let sig = git2::Signature::now("Script Test", "script@example.com").expect("sig");
+            let tree_id = repo.index().expect("index").write_tree().expect("tree");
+            let tree = repo.find_tree(tree_id).expect("find tree");
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .expect("commit");
+        }
+        let mut sub = subscribe(&h);
+        // The forced pager drains git's output, then blocks: with no
+        // `GIT_PAGER` override the run would never reach `exited`.
+        let cmd = "git -c core.pager='sh -c \"cat >/dev/null; sleep 3600\"' log -1";
+        let id = create_simple(&h, "pager", cmd, ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let exited = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        assert_eq!(exited["data"]["exitCode"], 0, "got: {exited}");
+    }
+
+    /// Whether the process group led by `pgid` still has any member (a zombie
+    /// leader counts until reaped), via `kill -0 -- -<pgid>`.
+    #[cfg(unix)]
+    fn pgroup_alive(pgid: i64) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", "--", &format!("-{pgid}")])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run kill -0")
+            .success()
+    }
+
+    /// Dropping the `Harness` reaps every script PTY it started
+    /// (intent-hq/intentd#1822): a running service's whole process group is
+    /// gone shortly after the drop, and the supervisor's respawn is refused,
+    /// so a test that panics mid-wait cannot leak `sleep 3600` past nextest.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn harness_drop_kills_tracked_script_process_groups() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id)
+            .await
+            .expect("start");
+        let running = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let pid = running["data"]["pid"].as_i64().expect("pid");
+        assert!(pgroup_alive(pid), "service group {pid} alive before drop");
+
+        drop(h);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while pgroup_alive(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "service process group {pid} survived harness drop"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Regression (monorepo#1155): a `resolve_cwd` failure after the running
@@ -3563,126 +4216,6 @@ mod tests {
             .await
             .expect("status");
         assert_eq!(st["status"], "idle", "fresh entry starts idle");
-    }
-
-    /// Regression (monorepo#1194): `script.remove` + `script.create` with the
-    /// same `scriptId` racing `script.start`'s spawn-to-registration window
-    /// must not let the stale supervisor latch onto the recreated entry. Both
-    /// park seams hold the race open deterministically: the supervisor parks
-    /// pre-`mark_running` (PTY spawned) and `start()` parks pre-registration,
-    /// while the test removes and recreates the entry. Pre-fix, registration
-    /// installed the stale handle (entry present under the same key) and
-    /// `mark_running` flipped the recreated entry to `running` with the old
-    /// command's pid, leaking the old PTY.
-    #[tokio::test]
-    async fn script_recreate_in_start_registration_window_is_not_adopted() {
-        let h = harness().await;
-        let supervise_park = Arc::new(SupervisePark::default());
-        let start_park = Arc::new(SupervisePark::default());
-        let services = h
-            .services
-            .clone()
-            .with_script_supervise_park(supervise_park.clone())
-            .with_script_start_registration_park(start_park.clone());
-        let old_pidfile = std::env::temp_dir().join(format!(
-            "intentd-scriptops-pid-{}.txt",
-            uuid::Uuid::new_v4()
-        ));
-        let _old_pidfile = PidFile(old_pidfile.clone());
-        let old_cmd = format!("echo $$ > \"{}\" && exec sleep 3600", old_pidfile.display());
-        let id = create(
-            &h,
-            ScriptCreateParams {
-                name: "old".into(),
-                command: old_cmd,
-                mode: ScriptMode::Service,
-                script_id: Some("gen-race".into()),
-                ..Default::default()
-            },
-        )
-        .await;
-
-        // Drive `start()` into its parked pre-registration window; the
-        // supervisor task independently parks pre-`mark_running` with the old
-        // command's PTY already spawned.
-        let svc = services.clone();
-        let ws = h.ws.clone();
-        let sid = id.clone();
-        let start_task = tokio::spawn(async move { svc.script_start(ws, sid).await });
-        tokio::time::timeout(LIVENESS, start_park.entered.notified())
-            .await
-            .expect("start parked before registration");
-        tokio::time::timeout(LIVENESS, supervise_park.entered.notified())
-            .await
-            .expect("supervise parked before mark_running");
-        let old_pid = read_pid(&old_pidfile).await;
-
-        // Remove + recreate the same id while both windows are held open.
-        h.services
-            .script_remove(h.ws.clone(), id.clone())
-            .await
-            .expect("remove");
-        let new_pidfile = std::env::temp_dir().join(format!(
-            "intentd-scriptops-pid-{}.txt",
-            uuid::Uuid::new_v4()
-        ));
-        let _new_pidfile = PidFile(new_pidfile.clone());
-        let new_cmd = format!("echo $$ > \"{}\" && exec sleep 3600", new_pidfile.display());
-        let recreated = create(
-            &h,
-            ScriptCreateParams {
-                name: "new".into(),
-                command: new_cmd,
-                mode: ScriptMode::Service,
-                script_id: Some(id.clone()),
-                ..Default::default()
-            },
-        )
-        .await;
-        assert_eq!(recreated, id, "recreate keeps the id");
-
-        // Release both windows. The stale supervisor must fail the generation
-        // check, reap its own PTY, and exit; `start()`'s registration must
-        // treat the handle as an orphan and await it, so once `start()`
-        // returns the stale supervisor is fully drained.
-        supervise_park.release.notify_one();
-        start_park.release.notify_one();
-        tokio::time::timeout(LIVENESS, start_task)
-            .await
-            .expect("start returned before deadline")
-            .expect("join")
-            .expect("start ok");
-        assert_reaped(old_pid, "after remove+recreate in the registration window").await;
-
-        // The recreated entry never adopted the stale supervisor's PTY/pid.
-        let st = h
-            .services
-            .script_status(h.ws.clone(), id.clone())
-            .await
-            .expect("status");
-        assert_eq!(st["status"], "idle", "recreated entry stays idle: {st:?}");
-        assert!(st["pid"].is_null(), "no stale pid latched: {st:?}");
-
-        // A follow-up start on the recreated entry is not blocked by a
-        // phantom `running` status and runs the NEW command.
-        let mut sub = subscribe(&h);
-        h.services
-            .script_start(h.ws.clone(), id.clone())
-            .await
-            .expect("start recreated");
-        let running = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
-        let new_pid = read_pid(&new_pidfile).await;
-        assert_ne!(new_pid, old_pid, "new command's process, not the old one");
-        assert_eq!(
-            running["data"]["pid"].as_i64(),
-            Some(new_pid),
-            "running state reports the new command's pid"
-        );
-        h.services
-            .script_stop(h.ws.clone(), id)
-            .await
-            .expect("stop");
-        assert_reaped(new_pid, "after stopping the recreated script").await;
     }
 
     /// Two workspaces mint the same client-supplied `scriptId` concurrently
