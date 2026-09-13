@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.52] - 2026-09-13
+
+### 🚀 Features
+
+- *(notes)* Three-way merge note.setContent on stale expectedVersion and retire the yrs write path ([#1817](https://github.com/intent-hq/intentd/pull/1817))
+
+
 ## [0.9.51] - 2026-09-13
 
 ### 🚀 Features
