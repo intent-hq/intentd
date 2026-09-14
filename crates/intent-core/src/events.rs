@@ -366,6 +366,22 @@ pub const COMMENT_ADDED: &str = "comment:added";
 // the thread's resolved state without a follow-up read.
 pub const COMMENT_RESOLVED: &str = "comment:resolved";
 
+// Presence events (multiplayer w5). Both are **transient** (broadcast, never
+// persisted — `event.query` has no presence rows) and workspace-scoped, so
+// the collaborator gate narrows them by membership like any other row.
+// `presence:changed` → `{ workspaceId, members: [{ principalId, login?,
+// displayName?, avatarUrl?, online, focus: [{ workspaceId, agentId?,
+// noteId? }], typing: [agentId] }] }` — the workspace's currently-online
+// members with their focus items *in this workspace* and the agents they
+// are typing to; emitted on every connect / disconnect / `presence.update`
+// that changes the aggregate. `note:presence` → `{ workspaceId, noteId,
+// principalId, login?, displayName?, avatarUrl?, kind: "joined" | "updated"
+// | "left", cursor?: { rev, anchor, head } }` — a per-note viewer delta
+// (the `note.presence` channel filters by `data.noteId`); the daemon stamps
+// `principalId` and coalesces `updated` to ≤10/s per (principal, note).
+pub const PRESENCE_CHANGED: &str = "presence:changed";
+pub const NOTE_PRESENCE: &str = "note:presence";
+
 // Code-changes-review events (new in intentd; PROTOCOL §5.18–§5.20, §6.5). The
 // BE records attribution internally (there is no `file-tracking.trackChange`
 // RPC), so these self-sufficient payloads let the FE re-render without polling:
@@ -608,6 +624,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     GOAL_UPDATED,
     COMMENT_ADDED,
     COMMENT_RESOLVED,
+    PRESENCE_CHANGED,
+    NOTE_PRESENCE,
     CHANGES_TRACKED,
     CHANGES_GIT_STATUS,
     CHANGES_METRICS_CHANGED,
@@ -821,6 +839,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (LINE_ATTRIBUTION_UPDATED, "Note: per-line authorship of a note changed."),
     (NOTE_CREATED, "Note: a note was created."),
     (NOTE_DELETED, "Note: a note was deleted."),
+    (NOTE_PRESENCE, "Presence: a member joined / moved its caret in / left a note the guest is a member of; principal profile fields and a caret position (rev/anchor/head) only. Transient."),
     (NOTE_UPDATED, "Note: note content or metadata changed."),
     (PR_LINKED, "PR: a pull request was linked to the workspace; PR number/url/state."),
     (PR_UNLINKED, "PR: the workspace PR link was removed."),
@@ -830,6 +849,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (PR_MONITOR_COMPLETED, "PR monitor: the PR merged/closed; PR identity."),
     (PR_MONITOR_EMITTED, "PR monitor: a debounced report was delivered; PR checklist state."),
     (PR_MONITOR_REGISTERED, "PR monitor: a monitor was registered; monitor and PR identity."),
+    (PRESENCE_CHANGED, "Presence: the online members of a member workspace with their focus in that workspace and typing targets; principal profile fields already exposed by workspace.members.list. Transient."),
     (SEARCH_DONE, "Search: a workspace-scoped search finished; correlated by the caller's requestId."),
     (SEARCH_RESULT, "Search: a page of workspace-scoped search matches; correlated by the caller's requestId."),
     (SKILLS_CHANGED, "Skills: the discovered skill set of a workspace changed; { workspaceId } only."),
