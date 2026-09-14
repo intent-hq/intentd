@@ -1689,7 +1689,12 @@ async fn display_status_folds_git_root_prs_on_every_read_surface() {
 /// as that open/clean snapshot next to `pr_ready` (never `draft` +
 /// `pr_ready`). Identity fields stay the workspace's; the lifecycle fields
 /// (`status`, `updatedAt`, `isDraft`, `mergeable`, `mergeableState`) move
-/// together; every copy of the URL agrees on every surface.
+/// together; every copy of the URL agrees on every surface. Two more for
+/// equal (rank, `updatedAt`) copies, which resolve by readiness rather
+/// than root order: a root-only blocked/clean pair read at one instant
+/// (repro C) and a linked `open(blocked)` + pooled `open(clean)` at one
+/// instant beside an older root copy (repro D) both serve the clean
+/// snapshot next to `pr_ready` in either root order.
 #[tokio::test]
 async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
     use intent_core::{
@@ -1818,6 +1823,59 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
         repro_b.push((label, ws));
     }
 
+    // Repro C, both root orders: no workspace copy; two roots read the
+    // open PR at the SAME instant, one blocked and one clean. Canonical =
+    // the clean snapshot (readiness breaks the tie), never the first root.
+    let tied_at = "2026-01-02T00:00:00Z";
+    let tied_blocked = ready("Root blocked", "blocked", tied_at, false);
+    let tied_clean = ready("Root clean", "clean", tied_at, false);
+    let tied_canonical = lifecycle(&tied_clean);
+    let mut repro_c = Vec::new();
+    for (label, first, second) in [
+        ("blocked root first", &tied_blocked, &tied_clean),
+        ("clean root first", &tied_clean, &tied_blocked),
+    ] {
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("repro C ws");
+        for (nth, info) in [(1, first), (2, second)] {
+            store
+                .upsert_workspace_git_root(&git_root(&ws, nth, info.clone()))
+                .await
+                .expect("repro C root");
+        }
+        repro_c.push((label, ws));
+    }
+
+    // Repro D, both root orders: the linked copy is `open(blocked)` and the
+    // pooled copy `open(clean)`, both at the same instant; one root is an
+    // older blocked copy, one a same-instant blocked copy. Canonical = the
+    // pooled clean snapshot, applied to the linked copy too.
+    let linked_blocked = ready("Workspace linked", "blocked", tied_at, false);
+    let pooled_clean = ready("Workspace pooled", "clean", tied_at, false);
+    let older_root = ready("Root older", "blocked", "2026-01-01T00:00:00Z", false);
+    let pooled_canonical = lifecycle(&pooled_clean);
+    let mut repro_d = Vec::new();
+    for (label, first, second) in [
+        ("older root first", &older_root, &tied_blocked),
+        ("same-time root first", &tied_blocked, &older_root),
+    ] {
+        let ws = WorkspaceId::new();
+        let mut row = workspace(&ws);
+        row.active_pull_request = Some(linked_blocked.clone());
+        row.pull_requests = Some(vec![pooled_clean.clone()]);
+        store.insert_workspace(&row).await.expect("repro D ws");
+        for (nth, info) in [(1, first), (2, second)] {
+            store
+                .upsert_workspace_git_root(&git_root(&ws, nth, info.clone()))
+                .await
+                .expect("repro D root");
+        }
+        repro_d.push((label, ws));
+    }
+
     let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
     let full = svc.list_workspaces(false).await.expect("full list");
     let lite = svc.list_workspaces_lite(false).await.expect("lite list");
@@ -1881,6 +1939,68 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
             );
             assert_eq!(prs[0].title, "Workspace copy", "{ctx}: identity kept");
             assert_eq!(lifecycle(&prs[0]), clean_canonical, "{ctx}: pullRequests");
+        }
+    }
+
+    for (label, ws) in &repro_c {
+        let got = svc.get_workspace(ws.clone()).await.expect("workspace.get");
+        for (surface, ws) in [
+            ("workspace.list", row(&full, ws)),
+            ("lite list", row(&lite, ws)),
+            ("workspace.get", got),
+        ] {
+            let ctx = format!("repro C ({label}) on {surface}");
+            assert_eq!(
+                ws.display_status,
+                Some(WorkspaceDisplayStatus::PrReady),
+                "{ctx}"
+            );
+            assert!(ws.active_pull_request.is_none(), "{ctx}");
+            // Root-only URLs are appended by the list paths' external merge
+            // only; `workspace.get` has no workspace-owned copy to serve.
+            if surface == "workspace.get" {
+                assert!(ws.pull_requests.is_none(), "{ctx}");
+                continue;
+            }
+            let prs = ws.pull_requests.as_ref().expect("pullRequests");
+            assert_eq!(prs.len(), 1, "{ctx}: root copies dedupe into one entry");
+            assert_eq!(lifecycle(&prs[0]), tied_canonical, "{ctx}: pullRequests");
+        }
+    }
+
+    for (label, ws) in &repro_d {
+        let got = svc.get_workspace(ws.clone()).await.expect("workspace.get");
+        for (surface, ws) in [
+            ("workspace.list", row(&full, ws)),
+            ("lite list", row(&lite, ws)),
+            ("workspace.get", got),
+        ] {
+            let ctx = format!("repro D ({label}) on {surface}");
+            assert_eq!(
+                ws.display_status,
+                Some(WorkspaceDisplayStatus::PrReady),
+                "{ctx}"
+            );
+            let active = ws.active_pull_request.as_ref().expect("linked PR");
+            assert_eq!(active.title, "Workspace linked", "{ctx}: identity kept");
+            assert_eq!(
+                lifecycle(active),
+                pooled_canonical,
+                "{ctx}: activePullRequest"
+            );
+            let prs = ws.pull_requests.as_ref().expect("pullRequests");
+            assert_eq!(
+                prs.len(),
+                1,
+                "{ctx}: root copies dedupe into the pooled copy"
+            );
+            assert_eq!(prs[0].title, "Workspace pooled", "{ctx}: identity kept");
+            assert_eq!(lifecycle(&prs[0]), pooled_canonical, "{ctx}: pullRequests");
+            assert_eq!(
+                lifecycle(active),
+                lifecycle(&prs[0]),
+                "{ctx}: linked and pooled copies agree"
+            );
         }
     }
 

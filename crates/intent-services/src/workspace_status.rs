@@ -810,29 +810,86 @@ pub(crate) fn upgrade_pr_lifecycle(present: &mut PullRequestInfo, candidate: &Pu
     }
 }
 
+/// Step-4 readiness rung of a same-URL copy, the tie-break behind
+/// [`pr_lifecycle_key`] for copies of equal (rank, `updated_at`). Mirrors
+/// the `pr_queued > pr_ready > pr_open` precedence of
+/// [`rollup_over_pr_pool`] with the same predicates: a non-draft
+/// `mergeableState: "queued"` copy ranks highest, then a non-draft
+/// `mergeable: true` + `"clean"` copy, then any other `mergeable: true`,
+/// then unknown mergeability (`None`), then `mergeable: false` lowest; a
+/// draft copy never ranks as queued/ready (step 4 reads it `pr_open`).
+fn pr_readiness_rank(info: &PullRequestInfo) -> u8 {
+    let draft = info.status == PullRequestStatus::Draft || info.is_draft == Some(true);
+    let state = info.mergeable_state.as_deref();
+    if !draft && state == Some("queued") {
+        5
+    } else if !draft && info.mergeable == Some(true) && state == Some("clean") {
+        4
+    } else {
+        match info.mergeable {
+            Some(true) => 3,
+            None => 2,
+            Some(false) => 1,
+        }
+    }
+}
+
+/// [`pr_lifecycle_key`]'s shape: (rank, `updated_at`, readiness rank,
+/// non-draft, `mergeableState`, `mergeable`, `isDraft`, status-not-draft).
+type PrLifecycleKey<'a> = (
+    u8,
+    &'a str,
+    u8,
+    bool,
+    Option<&'a str>,
+    Option<bool>,
+    Option<bool>,
+    bool,
+);
+
 /// Canonicalization key of a same-URL copy inside [`fold_git_root_prs`]:
 /// the lifecycle rank first, then the latest `updated_at` among equal
 /// ranks, so two merged (or two open) copies of one PR agree on the
-/// timestamp step 6 compares, whichever copy the fold visits first.
-fn pr_lifecycle_key(info: &PullRequestInfo) -> (u8, &str) {
-    (pr_status_rank(info.status), info.updated_at.as_str())
+/// timestamp step 6 compares, whichever copy the fold visits first. Ties
+/// on (rank, `updated_at`) — two open copies of one PR read at the same
+/// instant with different mergeability — resolve by readiness
+/// ([`pr_readiness_rank`]: queued > ready > open, mirroring step 4), then
+/// non-draft over draft, then the raw `mergeableState` / `mergeable` /
+/// `isDraft` / `status` fields so the order is total over every lifecycle
+/// field: equal keys mean identical lifecycle snapshots, and the selected
+/// copy never depends on the order the copies are visited in.
+fn pr_lifecycle_key(info: &PullRequestInfo) -> PrLifecycleKey<'_> {
+    let draft = info.status == PullRequestStatus::Draft || info.is_draft == Some(true);
+    (
+        pr_status_rank(info.status),
+        info.updated_at.as_str(),
+        pr_readiness_rank(info),
+        !draft,
+        info.mergeable_state.as_deref(),
+        info.mergeable,
+        info.is_draft,
+        info.status != PullRequestStatus::Draft,
+    )
 }
 
 /// The same-URL rule of the fold: identity fields keep `present`, a
 /// higher-ranked `canonical` moves the lifecycle fields, and an
 /// equal-ranked `canonical` with a newer `updated_at` advances the
-/// timestamp too. The readiness fields (`isDraft`, `mergeable`,
-/// `mergeableState`) travel with the selected snapshot, so `present` reads
-/// as one coherent copy — the one chosen by (rank, `updated_at`) — rather
-/// than a newer status over whichever copy's mergeability the fold visited
-/// first (step 4's `pr_ready` / `pr_queued` would otherwise depend on
-/// git-root order). A lower rank never moves anything — `closed` cannot
-/// downgrade `merged`.
+/// timestamp too; equal (rank, `updated_at`) copies converge on the
+/// readier one ([`pr_lifecycle_key`]). The readiness fields (`isDraft`,
+/// `mergeable`, `mergeableState`) travel with the selected snapshot, so
+/// `present` reads as one coherent copy — the one chosen by the key —
+/// rather than a newer status over whichever copy's mergeability the fold
+/// visited first (step 4's `pr_ready` / `pr_queued` would otherwise depend
+/// on git-root order). `present` is moved whenever `canonical` does not
+/// key below it (an equal key is the same snapshot, so the copy is a
+/// no-op); a lower key never moves anything — `closed` cannot downgrade
+/// `merged`.
 pub(crate) fn canonicalize_pr_lifecycle(
     present: &mut PullRequestInfo,
     canonical: &PullRequestInfo,
 ) {
-    if pr_lifecycle_key(canonical) > pr_lifecycle_key(present) {
+    if pr_lifecycle_key(canonical) >= pr_lifecycle_key(present) {
         present.status = canonical.status;
         present.updated_at.clone_from(&canonical.updated_at);
         present.is_draft = canonical.is_draft;
@@ -846,8 +903,9 @@ pub(crate) fn canonicalize_pr_lifecycle(
 /// Outcome of one same-URL step ([`canonicalize_pr_url_copies`]).
 pub(crate) struct PrUrlCopies {
     /// The snapshot every copy of the URL was canonicalized to: the copy
-    /// with the highest (rank, `updated_at`) among the git-root record and
-    /// the workspace's own copies.
+    /// with the highest [`pr_lifecycle_key`] — (rank, `updated_at`), ties
+    /// broken by readiness — among the git-root record and the workspace's
+    /// own copies.
     pub(crate) canonical: PullRequestInfo,
     /// The linked `activePullRequest` carries the URL.
     pub(crate) linked: bool,
@@ -861,8 +919,10 @@ pub(crate) struct PrUrlCopies {
 /// `Services::merge_external_pull_requests`), so the served
 /// `activePullRequest` / `pullRequests` and the derived `displayStatus` can
 /// never disagree on a PR's lifecycle: for the git-root record `info`,
-/// select the copy with the highest (rank, `updated_at`) among `info`, the
-/// linked `active` (when it carries the URL) and the pooled entry (when one
+/// select the copy with the highest [`pr_lifecycle_key`] — (rank,
+/// `updated_at`), ties on both broken by readiness then `mergeableState`,
+/// so the pick is total and order-independent — among `info`, the linked
+/// `active` (when it carries the URL) and the pooled entry (when one
 /// does), and canonicalize both workspace-owned copies to it with
 /// [`canonicalize_pr_lifecycle`] — identity fields stay, the lifecycle
 /// fields move together, `merged` is irreversible. A URL the workspace does
@@ -935,8 +995,9 @@ struct FoldedPrLinkage {
 /// For every URL a git-root PR carries, the effective lifecycle is the
 /// highest rank across ALL copies — linked `activePullRequest`, pooled
 /// `pullRequests` entry, and every git-root record — with the latest
-/// `updated_at` among the copies of that rank, and each copy is
-/// canonicalized to it, in both directions: a merged pool copy lifts a
+/// `updated_at` among the copies of that rank (ties on both resolve by
+/// readiness, then `mergeableState` — [`pr_lifecycle_key`]), and each copy
+/// is canonicalized to it, in both directions: a merged pool copy lifts a
 /// stale `open` linked copy just as a merged root lifts either, and a
 /// `closed` copy never downgrades `merged`. Same-URL copies therefore
 /// agree on status, timestamp AND readiness (`isDraft` / `mergeable` /
@@ -2792,6 +2853,134 @@ mod display_status {
                     )]
                 );
             }
+        }
+    }
+
+    /// Equal (rank, `updated_at`) copies — two open reads of one PR at the
+    /// same instant differing only in mergeability — resolve by readiness,
+    /// never by visiting order: a root-only blocked/clean pair at one
+    /// timestamp reads `pr_ready` (and a blocked/queued pair `pr_queued`)
+    /// in both root orders, and the pooled copy carries the readier
+    /// snapshot. A same-timestamp draft copy loses to the non-draft one.
+    #[test]
+    fn equal_timestamp_same_url_copies_resolve_by_readiness_in_either_order() {
+        const AT: &str = "2026-01-02T00:00:00Z";
+        for (lower, higher, expected) in [
+            ("blocked", "clean", WorkspaceDisplayStatus::PrReady),
+            ("blocked", "queued", WorkspaceDisplayStatus::PrQueued),
+            ("clean", "queued", WorkspaceDisplayStatus::PrQueued),
+        ] {
+            let low = open_pr(lower, AT);
+            let high = open_pr(higher, AT);
+            for roots in [[low.clone(), high.clone()], [high.clone(), low.clone()]] {
+                let order: Vec<_> = roots.iter().map(|p| p.mergeable_state.as_deref()).collect();
+                assert_eq!(
+                    with_git_root_prs(None, &[], &roots, None),
+                    expected,
+                    "roots {order:?}"
+                );
+                let folded = super::fold_git_root_prs(None, &[], &roots, None);
+                assert_eq!(
+                    folded
+                        .pool
+                        .iter()
+                        .map(|p| (
+                            p.status,
+                            p.updated_at.as_str(),
+                            p.mergeable_state.as_deref()
+                        ))
+                        .collect::<Vec<_>>(),
+                    vec![(PullRequestStatus::Open, AT, Some(higher))],
+                    "roots {order:?}"
+                );
+            }
+        }
+
+        let clean = open_pr("clean", AT);
+        let mut draft_clean = clean.clone();
+        draft_clean.status = PullRequestStatus::Draft;
+        draft_clean.is_draft = Some(true);
+        for roots in [
+            [clean.clone(), draft_clean.clone()],
+            [draft_clean.clone(), clean.clone()],
+        ] {
+            assert_eq!(
+                with_git_root_prs(None, &[], &roots, None),
+                WorkspaceDisplayStatus::PrReady
+            );
+            let folded = super::fold_git_root_prs(None, &[], &roots, None);
+            assert_eq!(
+                folded
+                    .pool
+                    .iter()
+                    .map(|p| (p.status, p.is_draft))
+                    .collect::<Vec<_>>(),
+                vec![(PullRequestStatus::Open, None)]
+            );
+        }
+    }
+
+    /// The same tie rule across a workspace's own copies: a linked
+    /// `open(blocked)` and a pooled `open(clean)` of one URL at the same
+    /// timestamp, plus an older same-URL root copy (and a same-timestamp
+    /// blocked root copy), converge on the clean snapshot — `pr_ready`, and
+    /// linked == pooled — in both root orders, so an equal-key copy cannot
+    /// sit out the canonicalization.
+    #[test]
+    fn equal_timestamp_owned_copies_converge_on_the_readier_snapshot() {
+        const AT: &str = "2026-01-02T00:00:00Z";
+        let linked_blocked = open_pr("blocked", AT);
+        let pooled_clean = open_pr("clean", AT);
+        let older_root = open_pr("blocked", "2026-01-01T00:00:00Z");
+        let same_time_root = open_pr("blocked", AT);
+        for roots in [
+            [older_root.clone(), same_time_root.clone()],
+            [same_time_root.clone(), older_root.clone()],
+        ] {
+            let order: Vec<_> = roots.iter().map(|p| p.updated_at.as_str()).collect();
+            let pool = [pooled_clean.clone()];
+            assert_eq!(
+                with_git_root_prs(Some(&linked_blocked), &pool, &roots, None),
+                WorkspaceDisplayStatus::PrReady,
+                "roots {order:?}"
+            );
+            let folded = super::fold_git_root_prs(Some(&linked_blocked), &pool, &roots, None);
+            let active = folded.active.expect("linked PR kept");
+            let lifecycle = |p: &PullRequestInfo| {
+                (
+                    p.status,
+                    p.updated_at.clone(),
+                    p.is_draft,
+                    p.mergeable,
+                    p.mergeable_state.clone(),
+                )
+            };
+            assert_eq!(active.id, linked_blocked.id, "identity kept");
+            assert_eq!(
+                lifecycle(&active),
+                lifecycle(&pooled_clean),
+                "linked copy, roots {order:?}"
+            );
+            assert_eq!(folded.pool.len(), 1, "roots {order:?}");
+            assert_eq!(
+                lifecycle(&folded.pool[0]),
+                lifecycle(&pooled_clean),
+                "pooled copy, roots {order:?}"
+            );
+
+            let mut active = linked_blocked.clone();
+            let mut pool = vec![pooled_clean.clone()];
+            super::canonicalize_workspace_pr_copies(Some(&mut active), &mut pool, &roots);
+            assert_eq!(
+                lifecycle(&active),
+                lifecycle(&pooled_clean),
+                "emit path, roots {order:?}"
+            );
+            assert_eq!(
+                lifecycle(&pool[0]),
+                lifecycle(&pooled_clean),
+                "emit path, roots {order:?}"
+            );
         }
     }
 
