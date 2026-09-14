@@ -16102,19 +16102,19 @@ mod agent_retry_tests {
         .await;
     }
 
-    /// Persisted `(status, stop_reason)` — the state a refused redrive must
-    /// leave untouched.
+    /// Persisted `(status, is_active, stop_reason)` — the state a refused
+    /// redrive must leave untouched.
     async fn persisted_state(
         mgr: &AgentManager,
         agent_id: &AgentId,
-    ) -> (AgentStatus, Option<String>) {
+    ) -> (AgentStatus, bool, Option<String>) {
         let session = mgr
             .services
             .store
             .get_agent_session(agent_id)
             .await
             .expect("session row");
-        (session.status, session.stop_reason)
+        (session.status, session.is_active, session.stop_reason)
     }
 
     /// A redrive awaits its gates before claiming the slot; a competing
@@ -16303,7 +16303,7 @@ mod agent_retry_tests {
         let parked = persisted_state(&mgr, &agent_id).await;
         assert_eq!(
             parked,
-            (AgentStatus::Error, Some("context_size".to_string()))
+            (AgentStatus::Error, false, Some("context_size".to_string()))
         );
 
         // The parked redrive resumes with the slot free.
@@ -16320,7 +16320,7 @@ mod agent_retry_tests {
         assert_eq!(
             persisted_state(&mgr, &agent_id).await,
             parked,
-            "a refused claim runs no turn-start side effect: Error and stop_reason stand"
+            "a refused claim runs no turn-start side effect: Error, inactive and stop_reason stand"
         );
         assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
         // The STAB-52 gate holds for ordinary drains.
