@@ -400,7 +400,7 @@ fn gate(test: &str) -> Option<String> {
 /// C1d-10a: exercise the four wire-contract slices of the widened
 /// `agent.wakeOrCreate` over one pinned WSS connection, all on a single
 /// daemon boot. Bundled to keep the (expensive) daemon spawn under one test.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_widened_wire_contract_over_wss() {
     let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task("WOC Task").await;
     let cfg = client_config(&fp);
@@ -581,7 +581,7 @@ async fn wake_or_create_widened_wire_contract_over_wss() {
 /// message line, and `agent.getSubscriptions` for the caller must list the
 /// completion watch on the created agent immediately — SUB-1 parity with the
 /// wake/queued branches. Hermetic (no ACP provider needed).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_created_new_subscribes_caller_over_wss() {
     let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task("WOC 926 Task").await;
     let cfg = client_config(&fp);
@@ -672,7 +672,7 @@ async fn wake_or_create_created_new_subscribes_caller_over_wss() {
 /// preamble bytes at delegate time — but the daemon needs the mock env gate
 /// satisfied so `agent.delegate`'s availability gate accepts the mock
 /// provider's `default` model.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_with_task_note_id_appends_preamble_over_wss() {
     const TITLE: &str = "TASK-C preamble task";
     let Some(script) = gate("WSS delegate preamble E2E") else {
@@ -738,7 +738,7 @@ This note is your workspace for this task. Update it with your progress, finding
 /// unrelated agent stays out of scope, and a nonexistent note id yields an
 /// empty (not erroring) snapshot. No ACP turn is driven, but the mock env
 /// gate must be satisfied for `agent.delegate`'s availability gate.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn diagnostics_task_note_filter_matches_delegated_agent_over_wss() {
     let Some(script) = gate("WSS diagnostics task filter E2E") else {
         return;
@@ -826,7 +826,7 @@ async fn diagnostics_task_note_filter_matches_delegated_agent_over_wss() {
 /// over the real WSS wire — the opt-out only gates the idle subscriber.
 /// No ACP turn is driven, but the mock env gate must be satisfied for
 /// `agent.delegate`'s availability gate.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_with_skip_auto_commit_stays_status_neutral_over_wss() {
     const TITLE: &str = "TASK-C skipAutoCommit task";
     let Some(script) = gate("WSS delegate skipAutoCommit E2E") else {
@@ -892,7 +892,7 @@ This note is your workspace for this task. Update it with your progress, finding
 /// stays idempotent-ok. No ACP turn is driven — the guard fires before any
 /// turn starts — but the mock env gate must be satisfied for
 /// `agent.delegate`'s availability gate.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn occupancy_guard_delegate_and_assign_agent_over_wss() {
     let Some(script) = gate("WSS occupancy guard E2E") else {
         return;
@@ -1030,7 +1030,7 @@ async fn occupancy_guard_delegate_and_assign_agent_over_wss() {
 /// the replacement agent ALSO parks in Error after migration — its queue is
 /// deterministically un-drained when we read it back (a session-fatal turn
 /// never drains the queue).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn parked_messages_survive_wake_or_create_replacement() {
     let Some(script) = gate("WSS wakeOrCreate queue-migration E2E") else {
         return;
@@ -1267,7 +1267,7 @@ async fn parked_messages_survive_wake_or_create_replacement() {
 /// (not the owner's, not none) plus the resolved `author` projection, and
 /// `agent.getSession` serves the same `author` on the persisted row as
 /// `agent.getConversation`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
     use intent_core::{now_iso, Principal, PrincipalId};
     use intent_store::Store;

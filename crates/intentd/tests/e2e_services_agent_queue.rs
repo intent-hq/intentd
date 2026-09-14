@@ -94,8 +94,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
     (Arc::new(services), ws, tmp)
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_queue_add_get_remove_lifecycle() {
     let (services, ws, _tmp) = setup().await;
 
@@ -169,7 +168,7 @@ async fn agent_queue_add_get_remove_lifecycle() {
     drop(services); // Drop store handles before DB cleanup
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_conversation_and_summary() {
     let (services, ws, _tmp) = setup().await;
 
@@ -244,7 +243,7 @@ async fn agent_conversation_and_summary() {
     drop(services); // Drop store handles before DB cleanup
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_diagnostics_baseline() {
     let (services, ws, _tmp) = setup().await;
 

@@ -230,7 +230,7 @@ fn assert_progress_stream(events: &[Value], progress_id: &str) {
 /// streams milestone frames — a path that historically emitted nothing —
 /// each echoing the id, ending in `complete 100` + one `done { ok:true }`,
 /// all observed over the real WSS transport.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_progress_id_streams_milestones_over_wss() {
     let fx = boot().await;
     let repo = seed_repo("wt-src");
@@ -286,7 +286,7 @@ async fn workspace_create_progress_id_streams_milestones_over_wss() {
 /// path) fails the create with a JSON-RPC error AND still closes the
 /// progress stream with exactly one `git:clone:done { ok:false }` echoing
 /// the `progressId`, with a sanitized error detail.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_progress_id_failure_emits_done_ok_false_over_wss() {
     let fx = boot().await;
 
@@ -328,7 +328,7 @@ async fn workspace_create_progress_id_failure_emits_done_ok_false_over_wss() {
 
 /// Rollback safety over the wire: the same worktree-mode create WITHOUT a
 /// `progressId` emits no `git:clone:*` frames at all (legacy behavior).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_without_progress_id_stays_silent_over_wss() {
     let fx = boot().await;
     let repo = seed_repo("legacy-src");

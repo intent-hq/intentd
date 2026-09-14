@@ -199,7 +199,7 @@ async fn boot(max_outstanding: u32) -> Fixture {
     let socket = dir.path().join("intentd.sock");
     let (uds_shutdown, rx) = tokio::sync::oneshot::channel::<()>();
     let socket_for_task = socket.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let _ = serve_uds_with_reverse(
             api,
             bus,
@@ -377,7 +377,7 @@ fn assert_overload(id: i64, frame: &Value) {
 /// With the cap at 1, a second concurrent slow request is rejected with the
 /// exact `-32011` envelope while the first is still in flight; when the
 /// in-flight request drains, the freed slot serves a new request normally.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn over_limit_requests_are_rejected_and_slots_are_reusable() {
     let fx = boot(1).await;
     let mut conn = Conn::connect(&fx).await;
@@ -405,7 +405,7 @@ async fn over_limit_requests_are_rejected_and_slots_are_reusable() {
 
 /// A notification-shaped frame (no `id`) rejected at the cap gets NO response
 /// (PROTOCOL §9), and the connection keeps serving subsequent requests.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn over_limit_notifications_get_no_response() {
     let fx = boot(1).await;
     let mut conn = Conn::connect(&fx).await;
@@ -435,7 +435,7 @@ async fn over_limit_notifications_get_no_response() {
 /// The `browser.*` arm is gated by the same limiter: with the cap saturated a
 /// `browser.exec` is rejected with `-32011` rather than waiting on a reverse
 /// RPC (no FE is attached here, so an ungated call would hang until timeout).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn browser_exec_is_rejected_at_the_cap() {
     let fx = boot(1).await;
     let mut conn = Conn::connect(&fx).await;
@@ -462,7 +462,7 @@ async fn browser_exec_is_rejected_at_the_cap() {
 /// malformed JSON still answers `-32700` and an invalid envelope still answers
 /// `-32600` — including an invalid notification-shaped frame, which the router
 /// must answer even though valid notifications get no response.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn invalid_frames_keep_their_error_codes_at_the_cap() {
     let fx = boot(1).await;
     let mut conn = Conn::connect(&fx).await;
@@ -497,7 +497,7 @@ async fn invalid_frames_keep_their_error_codes_at_the_cap() {
 
 /// With the cap unset (`0` = unlimited) a concurrent burst is unaffected: every
 /// request succeeds and none is rejected.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn unlimited_cap_never_rejects() {
     let fx = boot(0).await;
     let mut conn = Conn::connect(&fx).await;
@@ -516,7 +516,7 @@ async fn unlimited_cap_never_rejects() {
 
 /// Normal traffic below the cap is unaffected: a burst smaller than the limit
 /// all succeeds.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn traffic_under_the_limit_is_unaffected() {
     let fx = boot(8).await;
     let mut conn = Conn::connect(&fx).await;
@@ -536,7 +536,7 @@ async fn traffic_under_the_limit_is_unaffected() {
 /// The cap is daemon-wide, not per-transport: a WSS request that occupies the
 /// only slot makes a UDS request on the same daemon answer `-32011`, and the
 /// UDS connection stays usable once the slot drains.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn the_cap_is_shared_across_uds_and_wss() {
     let fx = boot(1).await;
     let mut conn = Conn::connect(&fx).await;

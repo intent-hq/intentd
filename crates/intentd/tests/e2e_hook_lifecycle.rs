@@ -466,9 +466,8 @@ async fn await_conversation_contains<S>(
     }
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Full background-hook lifecycle over the real WSS wire (see module docs).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn hook_lifecycle_over_wss() {
     let Some(script) = gate("WSS hook lifecycle E2E") else {
         return;
