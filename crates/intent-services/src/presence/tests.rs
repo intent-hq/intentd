@@ -98,6 +98,213 @@ fn coalescer_leading_edge_then_defers_remainder() {
     );
 }
 
+/// A store with one workspace and one collaborator member, plus the services
+/// and the wire caller for that member.
+async fn member_services(
+    tmp: &crate::tests::TempDb,
+    root: &crate::tests::WorkspacesRoot,
+) -> (
+    intent_store::Store,
+    crate::Services,
+    intent_core::WorkspaceId,
+    intent_core::Caller,
+) {
+    use intent_core::{Caller, Principal, PrincipalId, WorkspaceId, WorkspaceRole};
+    let store = intent_store::Store::open(&tmp.path)
+        .await
+        .expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&crate::tests::workspace(&ws))
+        .await
+        .expect("workspace");
+    let principal = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("collab".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: intent_core::now_iso(),
+        updated_at: intent_core::now_iso(),
+    };
+    store.upsert_principal(&principal).await.expect("principal");
+    store
+        .add_workspace_member(&ws, &principal.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("member");
+    let services = crate::Services::new(store.clone())
+        .with_workspaces_root(root.path().to_path_buf())
+        .with_event_bus(crate::events::EventBus::new(store.clone()));
+    let caller = Caller::Wire {
+        principal_id: principal.id,
+        is_administrator: false,
+    };
+    (store, services, ws, caller)
+}
+
+/// A viewer that left and rejoined inside a deferred flush's window gets a
+/// fresh generation: the stale timer must not flush the replacement's
+/// pending caret ahead of the replacement's own deadline.
+#[tokio::test]
+async fn stale_trailing_flush_never_touches_a_rejoined_viewer() {
+    use super::{spawn_trailing_flush, Viewer};
+    let tmp = crate::tests::TempDb::new();
+    let root = crate::tests::WorkspacesRoot::new();
+    let (_store, services, ws, _caller) = member_services(&tmp, &root).await;
+    let principal = intent_core::PrincipalId::from("viewer");
+    let key = (ws, intent_core::NoteId::from("spec"));
+
+    let mut old = Viewer::default();
+    let old_start = Instant::now()
+        .checked_sub(Duration::from_millis(50))
+        .expect("clock is past its first 50ms");
+    assert_eq!(old.throttle.offer(cursor(1), old_start), Offer::Publish);
+    let Offer::Defer(old_delay) = old.throttle.offer(cursor(2), Instant::now()) else {
+        panic!("second caret inside the floor defers");
+    };
+    let old_generation = old.generation;
+    services
+        .presence
+        .lock()
+        .viewers
+        .entry(key.clone())
+        .or_default()
+        .insert(principal.clone(), old);
+    spawn_trailing_flush(
+        services.clone(),
+        Some(intent_core::Caller::Daemon),
+        key.clone(),
+        principal.clone(),
+        old_generation,
+        old_delay,
+    );
+
+    services.presence.lock().viewers.remove(&key);
+    let mut replacement = Viewer::default();
+    assert_ne!(replacement.generation, old_generation);
+    assert_eq!(
+        replacement.throttle.offer(cursor(3), Instant::now()),
+        Offer::Publish
+    );
+    assert!(matches!(
+        replacement.throttle.offer(cursor(4), Instant::now()),
+        Offer::Defer(_)
+    ));
+    services
+        .presence
+        .lock()
+        .viewers
+        .entry(key.clone())
+        .or_default()
+        .insert(principal.clone(), replacement);
+
+    tokio::time::sleep(old_delay + Duration::from_millis(30)).await;
+    assert_eq!(
+        services.presence.lock().viewers[&key][&principal]
+            .throttle
+            .pending,
+        Some(cursor(4)),
+        "the old generation's timer fired but left the replacement's pending caret alone"
+    );
+}
+
+/// A lease outlives a membership removal, so the caret path is gated on
+/// every call: a removed collaborator's next update is `NotFound` and a
+/// caret already deferred when the membership ended is dropped, not
+/// published after the gate closed.
+#[tokio::test]
+async fn caret_updates_are_member_gated_including_the_deferred_flush() {
+    use crate::events::SubscriptionFilter;
+    use intent_core::{with_caller, Error, NoteId};
+    let tmp = crate::tests::TempDb::new();
+    let root = crate::tests::WorkspacesRoot::new();
+    let (store, services, ws, caller) = member_services(&tmp, &root).await;
+    let principal = caller.principal_id().cloned().expect("wire caller");
+    let note = NoteId::from("spec");
+    let mut sub = services
+        .event_bus
+        .as_ref()
+        .expect("bus")
+        .subscribe(SubscriptionFilter {
+            event_types: vec![intent_core::events::NOTE_PRESENCE.to_string()],
+            workspace_id: Some(ws.to_string()),
+            ..Default::default()
+        });
+    let next_kinds = |batch: Option<Vec<intent_core::Event>>| -> Vec<(String, Value)> {
+        batch
+            .expect("bus open")
+            .into_iter()
+            .map(|e| {
+                (
+                    e.data["kind"].as_str().unwrap().to_string(),
+                    e.data["cursor"].clone(),
+                )
+            })
+            .collect()
+    };
+
+    with_caller(caller.clone(), async {
+        services
+            .note_presence_join_op("conn-1".into(), "lease-1".into(), ws.clone(), note.clone())
+            .await
+            .expect("subscribe as a member");
+        services
+            .note_presence_update_op("conn-1", ws.clone(), note.clone(), &cursor(1))
+            .await
+            .expect("leading caret");
+        services
+            .note_presence_update_op("conn-1", ws.clone(), note.clone(), &cursor(2))
+            .await
+            .expect("deferred caret");
+    })
+    .await;
+    assert_eq!(
+        next_kinds(sub.recv().await),
+        vec![("joined".to_string(), Value::Null)]
+    );
+    assert_eq!(
+        next_kinds(sub.recv().await),
+        vec![("updated".to_string(), cursor(1))]
+    );
+    assert_eq!(
+        services.presence.lock().viewers[&(ws.clone(), note.clone())][&principal]
+            .throttle
+            .pending,
+        Some(cursor(2)),
+        "the second caret waits for the trailing flush"
+    );
+
+    store
+        .remove_workspace_member(&ws, &principal)
+        .await
+        .expect("remove member");
+
+    let refused = with_caller(
+        caller.clone(),
+        services.note_presence_update_op("conn-1", ws.clone(), note.clone(), &cursor(3)),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(Error::NotFound(_))),
+        "a removed collaborator's caret is refused even with a live lease: {refused:?}"
+    );
+
+    tokio::time::sleep(CURSOR_MIN_INTERVAL + Duration::from_millis(50)).await;
+    assert_eq!(
+        services.presence.lock().viewers[&(ws.clone(), note.clone())][&principal]
+            .throttle
+            .pending,
+        None,
+        "the flush fired and dropped the pending caret"
+    );
+    let leaked = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await;
+    assert!(
+        leaked.is_err(),
+        "no caret leaves after the membership ended: {leaked:?}"
+    );
+}
+
 #[test]
 fn parse_update_accepts_focus_set_and_optional_typing() {
     let (focus, typing) = parse_update(&json!({
