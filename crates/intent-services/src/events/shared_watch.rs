@@ -111,15 +111,17 @@ type WatcherFactory =
 /// (1-based) call whose root's file name is `name`. Attempts on other roots
 /// pass through untouched, so the fault can target a RE-registration — e.g.
 /// the second `watch()` of a root, after its first went live — while the
-/// surrounding registrations succeed for real.
-#[cfg(test)]
+/// surrounding registrations succeed for real. Linux-only alongside the
+/// tests that use it: survivor re-registration exists only in the global
+/// inotify group.
+#[cfg(all(test, target_os = "linux"))]
 pub(super) struct WatchFault {
     name: std::ffi::OsString,
     fail_attempt: usize,
     attempts: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl WatchFault {
     pub(super) fn nth(name: &str, fail_attempt: usize) -> Arc<Self> {
         Arc::new(Self {
@@ -150,13 +152,13 @@ impl WatchFault {
 
 /// Real backend wrapped by a [`WatchFault`]; see
 /// [`SharedWatchHub::with_watch_fault`].
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 struct FaultyWatcher {
     inner: notify::RecommendedWatcher,
     fault: Arc<WatchFault>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Watcher for FaultyWatcher {
     fn new<F: notify::EventHandler>(handler: F, config: notify::Config) -> notify::Result<Self> {
         Ok(Self {
@@ -698,7 +700,7 @@ impl SharedWatchHub {
     /// Hub whose watchers fail the `watch()` calls `fault` selects, so a test
     /// can fail one specific (re-)registration deterministically while every
     /// other call reaches the real backend.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn with_watch_fault(fault: &Arc<WatchFault>) -> Arc<Self> {
         let fault = Arc::clone(fault);
         Self::with_factory(Arc::new(move |callback: EventCallback| {
