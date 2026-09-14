@@ -522,7 +522,7 @@ impl Services {
                 _permit: permit,
             },
         );
-        tokio::spawn(
+        intent_core::spawn_daemon(
             self.clone()
                 .poll_invite_flow(flow_id.clone(), flow, deadline),
         );

@@ -105,7 +105,7 @@ impl GitMetadataWatcher {
             // `/private/var/...`).
             let (sub, mut rx, root) = hub.subscribe(root);
             let git_dir = root.join(".git");
-            let task = tokio::spawn(async move {
+            let task = intent_core::spawn_daemon(async move {
                 while let Some(event) = rx.recv().await {
                     if is_mutation_kind(event.kind)
                         && event
@@ -142,7 +142,7 @@ impl GitMetadataWatcher {
         let (sub, mut rx, gitdir) = hub.subscribe_git_dir(&gitdir);
         let ws_id = workspace_id.clone();
         let gitdir_refresher = Arc::clone(&refresher);
-        let task = tokio::spawn(async move {
+        let task = intent_core::spawn_daemon(async move {
             while let Some(event) = rx.recv().await {
                 if is_mutation_kind(event.kind)
                     && event
@@ -273,7 +273,7 @@ impl GitCommonDirWatches {
             let workspaces: Arc<Mutex<HashMap<WorkspaceId, Registration>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let fan_out = Arc::clone(&workspaces);
-            let task = tokio::spawn(async move {
+            let task = intent_core::spawn_daemon(async move {
                 while let Some(event) = rx.recv().await {
                     if is_mutation_kind(event.kind)
                         && event

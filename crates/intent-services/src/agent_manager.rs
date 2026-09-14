@@ -1381,7 +1381,7 @@ impl ProcessRegistry {
             );
             if let Some(ref f) = self.event_fn {
                 let fut = f(&resumed_id, "agent:process:resumed", used, self.cap, reason);
-                tokio::spawn(fut);
+                intent_core::spawn_daemon(fut);
             }
         }
         true
@@ -1459,7 +1459,7 @@ impl ProcessRegistry {
             );
             if let Some(ref f) = self.event_fn {
                 let fut = f(&resumed_id, "agent:process:resumed", used, self.cap, reason);
-                tokio::spawn(fut);
+                intent_core::spawn_daemon(fut);
             }
         }
     }
@@ -1482,7 +1482,7 @@ impl ProcessRegistry {
         );
         if let Some(ref f) = self.event_fn {
             let fut = f(agent_id, "agent:process:resumed", used, self.cap, reason);
-            tokio::spawn(fut);
+            intent_core::spawn_daemon(fut);
         }
     }
 
@@ -1620,7 +1620,7 @@ impl ProcessRegistry {
                     }
                     if let Some(ref f) = self.event_fn {
                         let fut = f(agent_id, "agent:process:queued", used, self.cap, reason);
-                        tokio::spawn(fut);
+                        intent_core::spawn_daemon(fut);
                     }
                     owed_resume = Some(reason);
                     // A claim-contention wait re-checks on a timer too: the
@@ -1672,7 +1672,7 @@ impl ProcessRegistry {
                         );
                         if let Some(ref f) = self.event_fn {
                             let fut = f(&id, "agent:process:evicted", used, self.cap, reason);
-                            tokio::spawn(fut);
+                            intent_core::spawn_daemon(fut);
                         }
                         kill().await;
                         self.deregister(&id);
@@ -1806,7 +1806,7 @@ impl ProcessRegistry {
                                 self.cap,
                                 REASON_MEMORY_BUDGET,
                             );
-                            tokio::spawn(fut);
+                            intent_core::spawn_daemon(fut);
                         }
                         owed_resume = Some(REASON_MEMORY_BUDGET);
                         Action::Wait(rx)
@@ -1858,7 +1858,7 @@ impl ProcessRegistry {
                                 self.cap,
                                 REASON_MEMORY_BUDGET,
                             );
-                            tokio::spawn(fut);
+                            intent_core::spawn_daemon(fut);
                         }
                         kill().await;
                         self.deregister(&id);
@@ -2038,7 +2038,7 @@ impl ProcessRegistry {
                     self.cap,
                     REASON_IDLE_TTL,
                 );
-                tokio::spawn(fut);
+                intent_core::spawn_daemon(fut);
             }
             kill().await;
             self.deregister(&id);
@@ -2133,7 +2133,7 @@ impl ProcessRegistry {
                     self.cap,
                     REASON_MEMORY_BUDGET,
                 );
-                tokio::spawn(fut);
+                intent_core::spawn_daemon(fut);
             }
             kill().await;
             self.deregister(&id);
@@ -3247,7 +3247,7 @@ impl AgentManager {
             .with_terminal_host(terminal_host),
         );
         let serve_conn = connection.clone();
-        let serve_task = tokio::spawn(async move {
+        let serve_task = intent_core::spawn_daemon(async move {
             while let Some(req) = req_rx.recv().await {
                 if let Err(e) = handler.serve(serve_conn.as_ref(), req).await {
                     tracing::warn!(error = %e, "client-served request failed");
@@ -7649,7 +7649,7 @@ impl AgentManager {
         }
         let mgr = self.clone();
         let id = agent_id.clone();
-        let handle = tokio::spawn(async move {
+        let handle = intent_core::spawn_daemon(async move {
             // Clear the durable stop-redelivery mirror before the turn runs
             // (intent-hq/monorepo#1899): the payload was consumed into this
             // turn's prompt above, so a restart after this point must not
@@ -7691,7 +7691,7 @@ impl AgentManager {
     /// or the manager was dropped/never attached (bare test wiring).
     fn spawn_wake_listener(&self, agent_id: AgentId, workspace_id: WorkspaceId) -> JoinHandle<()> {
         let services = self.services.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             loop {
                 tokio::time::sleep(HARNESS_WAKE_POLL).await;
                 let Some(mgr) = services.agent_manager() else {
@@ -7862,7 +7862,7 @@ impl AgentManager {
         // turn is open.
         let mgr = self.clone();
         let (id, ws) = (agent_id.clone(), workspace_id.clone());
-        let drive = tokio::spawn(async move {
+        let drive = intent_core::spawn_daemon(async move {
             let outcome = mgr
                 .services
                 .run_harness_wake_turn(&mut guard, first, &id, &ws, HARNESS_WAKE_SETTLE)
@@ -8447,7 +8447,7 @@ impl AgentManager {
                 let services = self.services.clone();
                 let ws = workspace_id.clone();
                 let aid = agent_id.clone();
-                tokio::spawn(async move {
+                intent_core::spawn_daemon(async move {
                     while let Some((level, message)) = status_rx.recv().await {
                         services
                             .publish_status_event(&ws, &aid, "launch", &message, level.as_str())
@@ -8940,7 +8940,7 @@ impl AgentManager {
         let registry = Arc::downgrade(&self.registry);
         let busy = Arc::downgrade(&self.busy);
         let stderr_dir = self.agent_stderr_log_dir(&agent_id);
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             loop {
                 tokio::time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
                 let (Some(handles), Some(registry), Some(busy)) =
@@ -9148,7 +9148,7 @@ async fn kill_child_trees(children: Vec<(Child, Option<u32>)>) {
                 let _ = killpg(pgid, Signal::SIGTERM);
                 pgids.push(pgid);
                 // Reap on a task so all waits run concurrently.
-                waits.push(tokio::spawn(async move {
+                waits.push(intent_core::spawn_daemon(async move {
                     let _ = child.wait().await;
                 }));
             }

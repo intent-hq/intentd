@@ -218,7 +218,7 @@ pub(crate) struct CloneJob {
 /// spawn. Never returns an error — spawn failures are surfaced on the terminal
 /// event so the caller only correlates by `requestId`.
 pub(crate) fn spawn_clone(job: CloneJob) {
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let _ = run_clone(job).await;
     });
 }
@@ -417,7 +417,8 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
     };
 
     let sink_reader = sink.clone();
-    let reader_task = tokio::spawn(async move { stream_stderr(stderr, sink_reader).await });
+    let reader_task =
+        intent_core::spawn_daemon(async move { stream_stderr(stderr, sink_reader).await });
 
     // Wait for the child under a hard timeout so a stalled clone never wedges
     // the daemon. On timeout, reap the process group and emit `ok:false`.

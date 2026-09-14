@@ -82,14 +82,15 @@ impl GitStatusRefresher {
         });
         let (trigger_tx, trigger_rx) = mpsc::unbounded_channel::<WorkspaceId>();
         let forward_tx = trigger_tx.clone();
-        let forward_task = tokio::spawn(async move {
+        let forward_task = intent_core::spawn_daemon(async move {
             while let Some(batch) = sub.recv().await {
                 for ev in batch {
                     let _ = forward_tx.send(ev.workspace_id.clone());
                 }
             }
         });
-        let refresh_task = tokio::spawn(refresh_loop(bus, services, status_cache, trigger_rx));
+        let refresh_task =
+            intent_core::spawn_daemon(refresh_loop(bus, services, status_cache, trigger_rx));
         Self {
             trigger_tx,
             forward_task,
