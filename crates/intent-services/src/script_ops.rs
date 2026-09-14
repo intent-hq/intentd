@@ -1164,17 +1164,19 @@ impl ScriptManager {
     /// dies while the service runs hydrates it as previously running.
     /// Command-mode scripts never set the marker.
     ///
-    /// The marker is persisted *before* the in-memory flip to `running`
+    /// The marker write is awaited *before* the in-memory flip to `running`
     /// (monorepo#4952): `script.status` / `script.list` read the registry
-    /// directly, so a `running` they report must already be durable — a
-    /// daemon killed right after a client observed `running` must hydrate
-    /// the script as previously running. The eligibility check therefore
-    /// runs twice: once to decide whether to write, once under the flip. A
-    /// same-generation entry that a `stop`/`stop_all` flagged during the
-    /// write is refused with the marker cleared again (the fresh PTY is
-    /// reaped by the caller, so nothing is running); a removed or recreated
-    /// entry is left alone — `script.remove` deleted the row and the
-    /// create-upsert's `INSERT OR REPLACE` reset it.
+    /// directly, so a `running` they report is never ahead of the store —
+    /// on a successful write (the best-effort error policy of
+    /// `persist_was_running` is unchanged) a daemon killed right after a
+    /// client observed `running` hydrates the script as previously running.
+    /// The eligibility check therefore runs twice: once to decide whether to
+    /// write, once under the flip. A same-generation entry that a
+    /// `stop`/`stop_all` flagged during the write is refused with the marker
+    /// cleared again (the fresh PTY is reaped by the caller, so nothing is
+    /// running); a removed or recreated entry is left alone — `script.remove`
+    /// and the create-upsert await this supervisor and then delete/reset the
+    /// row themselves.
     async fn mark_running(
         &self,
         ws: &WorkspaceId,
