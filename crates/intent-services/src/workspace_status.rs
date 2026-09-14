@@ -3748,7 +3748,7 @@ mod workspace_needs_attention {
         assert!(signals(&svc, &ws).await.needs_attention);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn question_marker_shapes_match_across_get_list_and_lite_snapshot() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -3814,7 +3814,7 @@ mod workspace_needs_attention {
         }
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn batch_tail_failure_falls_back_without_hiding_pending_questions() {
         let (svc, ws, _tmp) = setup().await;
         let pending = mk_session(&ws, "agent-pending-batch-fallback");
@@ -4093,7 +4093,7 @@ mod display_status_events {
     /// A task-completion transition (`in_progress` → complete over
     /// `task.updateNoteStatus`) emits the event with the self-sufficient
     /// `{ workspaceId, displayStatus }` payload.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_completion_transition_emits() {
         let h = harness().await;
         h.store
@@ -4194,7 +4194,7 @@ mod display_status_events {
     /// A task-status change that does not move the derived rollup (a second
     /// task flipping `not_started` → `in_progress` while the rollup is already
     /// `in_progress`) publishes no displayStatus event.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_op_recompute_stays_silent() {
         let h = harness().await;
         h.store
@@ -4244,7 +4244,7 @@ mod display_status_events {
     /// last-observed baseline the same way the enriched path does — a seed
     /// never emits — so the first post-boot mutation emits the transition
     /// against that baseline.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn lite_list_seeds_baseline_then_first_mutation_emits() {
         let h = harness().await;
         // Hermetic root: the lite path probes the workspaces root for
@@ -4288,7 +4288,7 @@ mod display_status_events {
     /// (complete → idle once the only completed task is gone) emits the
     /// transition event: `note.delete` goes through the same
     /// recompute+maybe-emit hook as the task-status mutations.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_note_delete_transition_emits() {
         let h = harness().await;
         h.store
@@ -4688,7 +4688,7 @@ mod display_status_events {
 
     /// G3: a spec-body write over `note.update` that changes the linked task
     /// set moves the link-gated `taskStats` rollup and emits the transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn spec_body_update_transition_emits() {
         let h = harness().await;
         h.store
@@ -4728,7 +4728,7 @@ mod display_status_events {
 
     /// G4: `note.restoreVersion` on the spec re-gates `taskStats` from the
     /// restored body and emits the transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn spec_restore_version_transition_emits() {
         let h = harness().await;
         h.store
@@ -4784,7 +4784,7 @@ mod display_status_events {
 
     /// G5: a spec checkbox-line rewrite over `task.update` that strips a
     /// task link re-gates `taskStats` and emits the transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn spec_task_line_update_transition_emits() {
         let h = harness().await;
         h.store
@@ -4825,7 +4825,7 @@ mod display_status_events {
 
     /// G6: `task.createPrerequisite` with the spec as dependent adds a fresh
     /// open spec-child task and emits the transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_prerequisite_on_spec_transition_emits() {
         let h = harness().await;
         h.store
@@ -4861,7 +4861,7 @@ mod display_status_events {
 
     /// G7: `workspace.delete` evicts the last-observed baseline so the
     /// in-memory cache does not leak deleted-workspace entries.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_delete_evicts_baseline() {
         let h = harness().await;
         // Hermetic root: the delete path sweeps the workspaces root, and
@@ -4935,7 +4935,7 @@ mod display_status_events {
 
     /// G8: `workspace.update` carrying a PR field recomputes — a `prStatus`
     /// flip to open moves the derived rollup to `pr_open` and emits.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_update_pr_status_transition_emits() {
         let h = harness().await;
         // Baseline: no tasks, no PR → not_started → idle.
@@ -5302,7 +5302,7 @@ mod display_status_events {
     /// `workspace.markSeen` both leave the derived rollup at `idle` — no
     /// `workspace:displayStatus-changed` — while the flag's own
     /// `workspace:attention-changed` events still fire on raise and clear.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unread_raise_and_mark_seen_never_move_display_status() {
         let h = harness().await;
         // Seed: idle baseline (no agents, no PR, no tasks).
@@ -5356,7 +5356,7 @@ mod display_status_events {
     /// Regression: a terminal `complete` base with the unread flag raised
     /// serves `displayStatus: complete` — the turn-end blue dot never masks
     /// the real terminal state (raise and markSeen both stay silent).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unread_flag_never_masks_complete() {
         let h = harness().await;
         h.store
@@ -5388,7 +5388,7 @@ mod display_status_events {
     /// guarded no-op (no `attention-changed`), and a later
     /// `workspace.markSeen` (guarded on `unread`) leaves the review-required
     /// attention in place.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unread_raise_never_downgrades_review_required() {
         let h = harness().await;
         h.services
@@ -5431,7 +5431,7 @@ mod display_status_events {
     /// carrying `attention: review_required` promotes the derived rollup to
     /// `needs_attention` and emits; `workspace.dismissAttention` retires it
     /// and emits the demotion.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn review_required_flag_transitions_emit() {
         let h = harness().await;
         // Seed: idle baseline.

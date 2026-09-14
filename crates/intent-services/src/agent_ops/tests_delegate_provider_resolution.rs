@@ -487,7 +487,7 @@ async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
 /// `-32602` before the classification loop can start ANY task — never a
 /// partial batch where earlier rows spawned before a later row surfaced the
 /// same shared failure.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_bad_top_level_provider_rejects_before_any_start() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     let t1 = seed_task(&svc, &ws, "First").await;
@@ -529,7 +529,7 @@ async fn batch_delegate_bad_top_level_provider_rejects_before_any_start() {
 /// — and, being per-entry, a bad override surfaces as that row's `error`
 /// disposition without failing rows that already started (the documented
 /// non-transactional batch contract, same as `model`/`specialist`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_provider_top_level_inherited_and_per_entry_override_wins() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     let t1 = seed_task(&svc, &ws, "Inherits").await;

@@ -1066,7 +1066,7 @@ mod tests {
     /// reassemble to the exact archive (idempotent re-reads included); the
     /// archive round-trips through the import extractor's own layout
     /// expectations; the in-flight agent gained a pending interrupted row.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn export_builds_readable_archive() {
         let ws_root = TempDir::new("export-ws-root");
         let assets_root = TempDir::new("export-assets-root");

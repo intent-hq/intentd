@@ -11745,7 +11745,7 @@ mod tests {
     /// `cancelled`, `prMonitor:cancelled` emitted, owner told why — while
     /// terminal monitors are untouched, so an archived workspace never
     /// reads `waiting` off a stale monitor signal indefinitely.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn archive_cancels_active_pr_monitors_and_drops_waiting() {
         use intent_core::WorkspaceApi;
         let (_db, _root, svc, forge, ws, owner) = setup().await;
