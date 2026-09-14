@@ -37279,7 +37279,11 @@ async fn group_rehydration_settles_retired_child() {
             Some(gid.clone()),
         )
         .expect("grouped watch");
-        // Persist the open group before the "crash".
+        // Persist the open group before the "crash". Group creation and the
+        // enrollment are two separate lane upserts (intent#5007): the row
+        // exists after the first (no members yet), so wait for the second —
+        // the row carrying the enrolled child — or the restarted instance
+        // rehydrates a memberless group that can never be complete.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             let rows = svc
@@ -37287,12 +37291,19 @@ async fn group_rehydration_settles_retired_child() {
                 .list_undelivered_groups(&ws)
                 .await
                 .expect("list groups");
-            if rows.iter().any(|r| r.group_id == gid) {
+            if rows
+                .iter()
+                .any(|r| r.group_id == gid && r.expected_agent_ids.contains(&child))
+            {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "group row persisted");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "group row persisted with the enrolled child"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        wait_for_persisted_watches(&svc, 1).await;
         (parent, child)
     };
 
