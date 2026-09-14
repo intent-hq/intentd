@@ -625,6 +625,99 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     BROWSER_TAB_CLOSED,
 ];
 
+/// How an [`EventDiscriminator`]'s `values` relate to the field at its `path`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscriminatorKind {
+    /// The field is a string drawn from `values`.
+    Value,
+    /// The field is an object whose keys are drawn from `values`.
+    Keys,
+}
+
+impl DiscriminatorKind {
+    /// The golden's `kind` string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Value => "value",
+            Self::Keys => "keys",
+        }
+    }
+}
+
+/// A payload value clients classify on inside one event type's `data`.
+/// Mirrored into the checked-in golden `tests/goldens/event_types.json`
+/// (`discriminators`), which downstream clients copy verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventDiscriminator {
+    /// The event type whose payload carries the discriminator.
+    pub event_type: &'static str,
+    /// Dotted path from the event envelope to the discriminating field.
+    pub path: &'static str,
+    pub kind: DiscriminatorKind,
+    /// Sorted, deduplicated.
+    pub values: &'static [&'static str],
+    /// What a payload WITHOUT the field means, when the daemon emits that
+    /// shape too; `None` when the field is always present.
+    pub absent: Option<&'static str>,
+}
+
+/// Every payload discriminator the daemon emits. `task:ready-tasks-changed`
+/// carries `triggeredBy.reason` only for non-status triggers (a status
+/// change emits `triggeredBy: { noteId, previousStatus, newStatus }`
+/// instead); `workspace:updated` carries the applied delta under `changes`,
+/// whose keys are the camelCase `WorkspaceUpdate` fields plus the ad-hoc
+/// keys of the archive / unarchive / auto-commit / browser-client /
+/// MCP-toggle emitters.
+pub const EVENT_DISCRIMINATORS: &[EventDiscriminator] = &[
+    EventDiscriminator {
+        event_type: TASK_READY_TASKS_CHANGED,
+        path: "data.triggeredBy.reason",
+        kind: DiscriminatorKind::Value,
+        values: &["note-deleted", "relations-changed"],
+        absent: Some("status change: triggeredBy is { noteId, previousStatus, newStatus }"),
+    },
+    EventDiscriminator {
+        event_type: WORKSPACE_UPDATED,
+        path: "data.changes",
+        kind: DiscriminatorKind::Keys,
+        values: &[
+            "activePullRequest",
+            "archived",
+            "archivedAt",
+            "attention",
+            "autoCommitEnabled",
+            "autoUnarchive",
+            "baseCommitSha",
+            "baseRef",
+            "branch",
+            "browserClientId",
+            "defaultModel",
+            "isRemote",
+            "lastActivity",
+            "mcpServerToggled",
+            "path",
+            "prNumber",
+            "prStatus",
+            "prUrl",
+            "pullRequests",
+            "repositoryName",
+            "repositoryOwner",
+            "repositoryPath",
+            "scope",
+            "setupScript",
+            "skipIsolation",
+            "status",
+            "statusImageAssetId",
+            "statusMessage",
+            "tags",
+            "title",
+            "worktreePath",
+        ],
+        absent: None,
+    },
+];
+
 /// True iff `event_type` is part of the canonical taxonomy.
 #[must_use]
 pub fn is_known_event_type(event_type: &str) -> bool {

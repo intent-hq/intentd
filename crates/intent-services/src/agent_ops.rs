@@ -7792,9 +7792,11 @@ impl Services {
             let mut metadata = json!({
                 "type": "event_notification",
                 "eventCount": 1,
+                // event-type-lint: allow — wake-metadata pseudo-type; never published on the bus
                 "eventTypes": ["agent:reportToParent"],
                 "events": [{
                     "id": uuid::Uuid::new_v4().to_string(),
+                    // event-type-lint: allow — wake-metadata pseudo-type; never published on the bus
                     "type": "agent:reportToParent",
                     "timestamp": saved_at,
                     "data": {
@@ -13230,6 +13232,7 @@ impl Services {
         };
         !events.is_empty()
             && events.iter().all(|e| {
+                // event-type-lint: allow — matches the wake-metadata pseudo-type above
                 e.get("type").and_then(|t| t.as_str()) == Some("agent:reportToParent")
                     && e.get("data")
                         .and_then(|d| d.get("agentId"))

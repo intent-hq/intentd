@@ -217,6 +217,16 @@ A flagged site that is not slug identity opts out with
 `// repo-slug-fold: allow — <reason>` on the line immediately above the statement, and
 the reason is required.
 
+The same job runs the event-type literal lint,
+`cargo test -p intent-core --test event_type_lint`: `intent_core::events::ALL_EVENT_TYPES`
+is mirrored into the checked-in golden `crates/intent-core/tests/goldens/event_types.json`
+(`cargo test -p intent-core --test events` fails naming the drift; regenerate with
+`INTENTD_UPDATE_GOLDENS=1`), and the lint fails naming `file:line` for every
+`note:` / `task:` / `workspace:` / `agent:` string literal outside test code that is not
+in the catalog. A new event type goes into `ALL_EVENT_TYPES` (then regenerate the golden)
+and is emitted via its constant; a string that is not an emitted event type opts out with
+`// event-type-lint: allow — <reason>` on the line immediately above the literal.
+
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.
 
