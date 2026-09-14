@@ -4996,11 +4996,12 @@ async fn wss_presence_heartbeat_drop_removes_viewer_and_marks_offline() {
 /// Multiplayer w5: typing is per CLIENT, keyed by an opaque daemon-minted
 /// source, and the roster is readable on demand. Two connections of one
 /// principal (same `clientId`) get distinct `typingSource`s from
-/// `presence.update`; the roster lists one `{ source, agentId, since }` per
-/// typing connection (never merged), so a client suppresses only the entry
-/// carrying its own handle; a `since` stays put across an unrelated roster
-/// refresh (a receiver's expiry timer never restarts) and each source clears
-/// independently (typing `null`, then the connection's close). Sources never
+/// `presence.update`; the roster lists one `{ source, agentId, since, pulse }`
+/// per typing connection (never merged), so a client suppresses only the
+/// entry carrying its own handle; a repeated pulse to the same agent advances
+/// `pulse` and keeps `since`, an unrelated roster refresh changes neither (a
+/// receiver restarts its expiry timer only on an unseen pulse) and each
+/// source clears independently (typing `null`, then the close). Sources never
 /// expose the client id or host. `presence.snapshot` answers the current
 /// roster to a client that hello'd before attaching any subscription and to
 /// a second connection of an already-online principal (whose hello
@@ -5192,9 +5193,29 @@ async fn wss_presence_typing_sources_and_snapshot() {
         .as_str()
         .unwrap_or_else(|| panic!("since: {ev}"))
         .to_string();
+    let pulse1 = row["typing"][0]["pulse"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("pulse: {ev}"));
 
-    // A2 types too: a second, distinct source; A1's entry keeps its `since`.
-    // A1 suppressing its own handle is left with exactly A2's entry.
+    // A1 keeps typing to the same agent: the pulse advances (the receiver's
+    // freshness signal) while `since` stays the episode start.
+    let v = a1.call(3, "presence.update", typing.clone()).await;
+    assert_eq!(v["result"]["typingSource"], s1, "{v}");
+    let ev = owner.event(PRESENCE_CHANGED).await;
+    let row = alice_row(&ev);
+    assert_eq!(row["typing"].as_array().map(Vec::len), Some(1), "{ev}");
+    assert_eq!(row["typing"][0]["since"], since1, "same episode: {ev}");
+    let pulse1 = {
+        let next = row["typing"][0]["pulse"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("pulse: {ev}"));
+        assert!(next > pulse1, "a repeated pulse is fresher: {ev}");
+        next
+    };
+
+    // A2 types too: a second, distinct source; A1's entry keeps its `since`
+    // and `pulse`. A1 suppressing its own handle is left with exactly A2's
+    // entry.
     let v = a2.call(3, "presence.update", typing.clone()).await;
     let s2 = v["result"]["typingSource"]
         .as_str()
@@ -5212,14 +5233,19 @@ async fn wss_presence_typing_sources_and_snapshot() {
         .find(|t| t["source"] == s1)
         .expect("a1 entry");
     assert_eq!(mine["since"], since1, "a1's since is stable: {ev}");
+    assert_eq!(
+        mine["pulse"], pulse1,
+        "another source's pulse is not a1's activity: {ev}"
+    );
     let others: Vec<&Value> = entries.iter().filter(|t| t["source"] != s1).collect();
     assert_eq!(others.len(), 1, "{ev}");
     assert_eq!(others[0]["source"], s2, "{ev}");
     assert_eq!(others[0]["agentId"], "agent-typing", "{ev}");
     let since2 = others[0]["since"].as_str().expect("since").to_string();
+    let pulse2 = others[0]["pulse"].as_u64().expect("pulse");
 
     // An unrelated roster change (Bob's focus) re-sends both entries with
-    // their original `since` stamps — no timer restarts.
+    // their original `since` stamps and pulses — no timer restarts.
     let v = bob_c
         .call(
             4,
@@ -5229,7 +5255,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
         .await;
     assert_eq!(v["result"]["ok"], true, "{v}");
     let ev = owner.event(PRESENCE_CHANGED).await;
-    let mut stamps: Vec<(String, String)> = alice_row(&ev)["typing"]
+    let mut stamps: Vec<(String, String, u64)> = alice_row(&ev)["typing"]
         .as_array()
         .expect("typing")
         .iter()
@@ -5237,11 +5263,15 @@ async fn wss_presence_typing_sources_and_snapshot() {
             (
                 t["source"].as_str().expect("source").to_string(),
                 t["since"].as_str().expect("since").to_string(),
+                t["pulse"].as_u64().expect("pulse"),
             )
         })
         .collect();
     stamps.sort();
-    let mut expected = vec![(s1.clone(), since1.clone()), (s2.clone(), since2)];
+    let mut expected = vec![
+        (s1.clone(), since1.clone(), pulse1),
+        (s2.clone(), since2, pulse2),
+    ];
     expected.sort();
     assert_eq!(stamps, expected, "unrelated update keeps the stamps: {ev}");
 
@@ -5256,7 +5286,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
     let ev = owner.event(PRESENCE_CHANGED).await;
     assert_eq!(
         alice_row(&ev)["typing"],
-        json!([{ "source": s1, "agentId": "agent-typing", "since": since1 }]),
+        json!([{ "source": s1, "agentId": "agent-typing", "since": since1, "pulse": pulse1 }]),
         "{ev}"
     );
 
