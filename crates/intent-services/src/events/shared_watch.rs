@@ -845,11 +845,14 @@ impl SharedWatchHub {
         }
     }
 
-    /// Which shared stream `root` rides, as that stream's group key, or `None`
-    /// when nothing watches it. The per-group consolidation invariant under
-    /// test: sibling roots resolve to the same key regardless of how many other
-    /// groups the hub supervises (the count differs per OS — see
-    /// [`group_key`]). Path is canonicalized to match the form
+    /// Which shared stream `root` rides, as the key of the group whose root
+    /// table holds a subscription for it, or `None` when no such entry exists.
+    /// Group membership only: a root stays in the table while its registration
+    /// is pending or failed, so `Some(key)` says nothing about a live OS watch
+    /// — that is [`Self::root_established`]'s job. The per-group consolidation
+    /// invariant under test: sibling roots resolve to the same key regardless
+    /// of how many other groups the hub supervises (the count differs per OS —
+    /// see [`group_key`]). Path is canonicalized to match the form
     /// [`Self::subscribe`] keys roots by.
     #[cfg(test)]
     pub(super) fn stream_for_root(&self, root: &Path) -> Option<PathBuf> {
