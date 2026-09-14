@@ -789,14 +789,20 @@ async fn last_activity_debounce_coalesces_burst() {
     burst_debounce_case(&script, json!({ "response": "burst" }), None).await;
 }
 
-/// Same debounce case, with the first burst turn held open by a file barrier
-/// until the remaining two messages have provably queued behind it, so they
-/// drain as ONE combined flush turn. Pins the turn-identity wait in
+/// Same burst, with the first burst turn held open by a file barrier until
+/// the remaining two messages have provably queued behind it, so they drain
+/// as ONE combined flush turn. Pins the turn-identity wait in
 /// [`await_user_turns_ended`]: this is the interleaving a loaded host produces
 /// nondeterministically (intent-hq/intent#4947), and a fixed count of three
 /// `agent:stream:end` events times out here. A barrier rather than a timer:
 /// the msg 0 turn cannot end before the test releases it, so the queued sends
 /// and the two-turn folding are asserted, not hoped for.
+///
+/// The barrier deliberately spreads the burst over wall-clock time the test
+/// does not bound (three RPC round trips plus the release), so this variant
+/// asserts `lastActivity` convergence — the announced value advanced past the
+/// pre-burst value and matches `workspace.get` — not the one-window
+/// coalescing count, which only the genuinely rapid plain burst above pins.
 #[tokio::test]
 async fn last_activity_debounce_coalesces_burst_with_queued_flush() {
     let Some(script) = gate("WSS lastActivity debounce (queued flush)") else {
@@ -817,7 +823,8 @@ async fn last_activity_debounce_coalesces_burst_with_queued_flush() {
 
 /// `release_file`: when set, the mock holds the msg 0 turn open until this
 /// file exists; the burst then asserts msgs 1 and 2 queued behind it and folded
-/// into exactly one combined turn.
+/// into exactly one combined turn, and asserts `lastActivity` convergence
+/// instead of the single-window coalescing count.
 async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option<&Path>) {
     let behavior = behavior.to_string();
     let (daemon, port, cfg) = boot(script, &behavior).await;
@@ -899,6 +906,19 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
         );
     }
 
+    // Pre-burst baseline the burst's announced lastActivity must advance past.
+    let before = wss_rpc(
+        &mut rpc,
+        5,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let before_activity = before["workspace"]["lastActivity"]
+        .as_str()
+        .expect("pre-burst lastActivity")
+        .to_string();
+
     // Drive a rapid burst: 3 messages within the 500ms debounce window
     let mut sends = Vec::new();
     for i in 0..3 {
@@ -960,15 +980,47 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
         }
     }
 
-    // Assert exactly one event (debounce coalesced the burst into a single
-    // non-vacuous emission).
+    // Non-vacuous: the burst announced a lastActivity at all.
     assert!(
         !last_activity_events.is_empty(),
         "expected the burst to emit a workspace:updated {{ lastActivity }}"
     );
+
+    if release_file.is_none() {
+        // Plain rapid burst: the three sends land well inside one 500ms
+        // debounce window, so the debounce must coalesce them into ONE
+        // emission.
+        assert!(
+            last_activity_events.len() <= 1,
+            "expected at most 1 workspace:updated, got {}",
+            last_activity_events.len()
+        );
+    }
+
+    // Convergence (both variants): the latest announced value advanced past
+    // the pre-burst baseline and is what workspace.get now serves.
+    let announced = last_activity_events
+        .last()
+        .and_then(|evt| evt["data"]["changes"]["lastActivity"].as_str())
+        .expect("lastActivity string");
+    let before_dt =
+        DateTime::parse_from_rfc3339(&before_activity).expect("parse pre-burst lastActivity");
+    let announced_dt =
+        DateTime::parse_from_rfc3339(announced).expect("parse announced lastActivity");
     assert!(
-        last_activity_events.len() <= 1,
-        "expected at most 1 workspace:updated, got {}",
-        last_activity_events.len()
+        announced_dt > before_dt,
+        "lastActivity did not advance across the burst: {before_activity} -> {announced}"
+    );
+    let get = wss_rpc(
+        &mut rpc,
+        6,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        get["workspace"]["lastActivity"].as_str(),
+        Some(announced),
+        "workspace.get must serve the last announced lastActivity"
     );
 }
