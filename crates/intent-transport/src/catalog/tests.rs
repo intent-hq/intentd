@@ -445,8 +445,14 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
 ///   and `agent.stop` drive turn control without appending a chat row
 ///   (question answers travel as `agent.sendMessage` content).
 /// - `note.*`, `comment.*`, `task.*`, `github.*` write notes, comments and
-///   forge objects — never the agent transcript.
+///   forge objects — never the agent transcript; `accept-changes.*` and
+///   `file-tracking.*` drive the worktree / PR flow the same way.
 const NON_USER_ORIGIN_METHODS: &[&str] = &[
+    "accept-changes.addRemote",
+    "accept-changes.execute",
+    "accept-changes.getStatus",
+    "accept-changes.mergePR",
+    "accept-changes.prepare",
     "agent.cancelDelete",
     "agent.cancelSubscriptions",
     "agent.completeOnce",
@@ -510,6 +516,12 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "event.workspaceSummary",
     "events.subscribe",
     "events.unsubscribe",
+    "file-tracking.getAgentLocks",
+    "file-tracking.getChanges",
+    "file-tracking.getLineStats",
+    "file-tracking.loadCommits",
+    "file-tracking.stage",
+    "file-tracking.unstage",
     "file.attachmentUpload.abort",
     "file.attachmentUpload.begin",
     "file.attachmentUpload.chunk",
@@ -575,6 +587,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "github.pulls.merge",
     "github.pulls.search",
     "github.pulls.updateBranch",
+    "github.relatedRepos.list",
     "github.replyReviewComment",
     "github.repoConfig.get",
     "github.repos.get",
