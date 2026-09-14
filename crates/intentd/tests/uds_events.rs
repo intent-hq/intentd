@@ -98,7 +98,7 @@ async fn wait_for_subscriber_count(bus: &EventBus, target: usize) {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn subscribe_push_filter_unsubscribe_and_disconnect_cleanup() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -112,7 +112,7 @@ async fn subscribe_push_filter_unsubscribe_and_disconnect_cleanup() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -237,7 +237,7 @@ async fn primary_actor(bus: &EventBus) -> Value {
 /// CRUD across workspace/note/task/comment over JSON-RPC; the subscriber receives
 /// the matching `events.event` notifications with the camelCase envelope + payload
 /// shapes the iOS client expects (PROTOCOL §6.5).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn crud_mutations_emit_change_events_over_uds() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -255,7 +255,7 @@ async fn crud_mutations_emit_change_events_over_uds() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -481,7 +481,7 @@ async fn crud_mutations_emit_change_events_over_uds() {
 /// on the `workspace:*` family (no workspace filter — the id is minted by the
 /// create) receives the event with the self-sufficient `{ workspaceId,
 /// workspace }` payload (§6.7) matching the RPC result.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_emits_workspace_created() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -498,7 +498,7 @@ async fn workspace_create_emits_workspace_created() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -555,7 +555,7 @@ async fn workspace_create_emits_workspace_created() {
 /// carries the applied `WorkspaceUpdate` delta as `changes` (reference-parity
 /// FE emitter), so a subscriber can mirror the mutation without a follow-up
 /// `workspace.get` read.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_update_emits_workspace_updated_with_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -572,7 +572,7 @@ async fn workspace_update_emits_workspace_updated_with_delta() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -648,7 +648,7 @@ async fn workspace_update_emits_workspace_updated_with_delta() {
 /// `workspace.delete` emits `workspace:deleted` (PROTOCOL §6.5): minimal
 /// `{ workspaceId }` payload (reference-parity FE emitter). The event fires
 /// only after the store row is actually removed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_delete_emits_workspace_deleted() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -665,7 +665,7 @@ async fn workspace_delete_emits_workspace_deleted() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {

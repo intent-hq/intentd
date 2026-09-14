@@ -95,7 +95,7 @@ fn gate() -> Option<String> {
 // Event bindings coverage
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn event_bindings_query_and_subscribe() {
     let Some(script) = gate() else { return };
 
@@ -205,7 +205,7 @@ async fn event_bindings_query_and_subscribe() {
 // File bindings coverage
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn file_bindings_read_write_list() {
     let Some(script) = gate() else { return };
 
@@ -370,7 +370,7 @@ async fn file_bindings_read_write_list() {
 // Agent bindings coverage (read-side: list, status)
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_bindings_list_and_status() {
     let Some(script) = gate() else { return };
 
@@ -488,7 +488,7 @@ async fn agent_bindings_list_and_status() {
 /// compact dispatch shape (no prompt bodies), and `defaultModel` reflects
 /// per-specialist resolution — a compound-`model` pin wins over the settings
 /// default provider (auggie in this harness).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_bindings_list_specialists() {
     let Some(script) = gate() else { return };
 
@@ -648,7 +648,7 @@ async fn agent_bindings_list_specialists() {
 /// next-delivery-first (interrupt ahead of normal FIFO), removal of the
 /// caller's own entry succeeds, and removal of a foreign entry is rejected
 /// by the ownership guard.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_bindings_get_queue_and_remove_queued_message() {
     let Some(script) = gate() else { return };
 
@@ -950,7 +950,7 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
 /// the same target are refused with `ok: false` + the full queue echo
 /// (drain order, 200-char truncation); after `removeQueuedMessage` retracts
 /// the caller's entry, a re-send parks again.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_bindings_send_single_pending_message_guard() {
     let Some(script) = gate() else { return };
 
@@ -1348,7 +1348,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
 // Git bindings coverage
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn git_bindings_commit() {
     let Some(script) = gate() else { return };
 
@@ -1500,7 +1500,7 @@ async fn git_bindings_commit() {
 /// attributed path — a pre-existing unattributed dirty file stays in the
 /// worktree. This drives the full ingest → filter loop over the real MCP
 /// bridge (the same path idle auto-commit takes).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn git_bindings_agent_commit_filters_to_attributed_paths() {
     let Some(script) = gate() else { return };
 
@@ -1683,7 +1683,7 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
 // Note bindings - deepen coverage beyond basic ws.note.add
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_bindings_edit_and_edit_lines() {
     let Some(script) = gate() else { return };
 

@@ -45,7 +45,7 @@ async fn await_socket(socket: &Path) -> bool {
     false
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_socket_is_owner_only_0600() {
     let dir_guard = temp_data_dir("uds");
     let dir = dir_guard.path().to_path_buf();
@@ -61,7 +61,7 @@ async fn uds_socket_is_owner_only_0600() {
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket_for_task = socket.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket_for_task, None, async move {
             let _ = rx.await;
         })
@@ -88,7 +88,7 @@ async fn uds_socket_is_owner_only_0600() {
 /// Transport size-limit regression (monorepo#472): a single UDS line past the
 /// 40 MiB cap yields a `-32600` error frame with `id: null` and the connection
 /// closes, while an under-limit frame on a fresh connection still round-trips.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_oversized_line_rejected_and_connection_closed() {
     let dir_guard = temp_data_dir("maxline");
     let dir = dir_guard.path().to_path_buf();
@@ -104,7 +104,7 @@ async fn uds_oversized_line_rejected_and_connection_closed() {
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket_for_task = socket.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket_for_task, None, async move {
             let _ = rx.await;
         })

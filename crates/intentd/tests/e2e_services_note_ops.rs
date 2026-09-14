@@ -92,7 +92,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
     (Arc::new(services), ws, tmp)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_add_edit_edit_lines() {
     let (services, ws, _tmp) = setup().await;
 
@@ -174,7 +174,7 @@ async fn note_add_edit_edit_lines() {
     drop(services); // Drop store handles before DB cleanup
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_list_tasks() {
     let (services, ws, _tmp) = setup().await;
 
@@ -210,7 +210,7 @@ async fn note_list_tasks() {
     drop(services); // Drop store handles before DB cleanup
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_update_metadata() {
     let (services, ws, _tmp) = setup().await;
 

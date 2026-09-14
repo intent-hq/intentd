@@ -50,6 +50,8 @@ intent-acp = { path = "../intent-acp", version = "0.9.83" }
 intent-providers = { path = "../intent-providers", version = "0.9.83" }
 intent-core = { path = "../intent-core", version = "0.9.83" }
 intent-store = { path = "../intent-store", version = "0.9.83" }
+# In-process `Services` tests run as `Caller::Daemon` (fail-closed gates).
+intent-test-macros = { path = "../intent-test-macros" }
 # `uds_linear.rs` injects a stub `LinearEngine` so the `linear.*` e2e slice
 # never touches the network (no `LINEAR_API_KEY`, no GraphQL call).
 intent-linear = { path = "../intent-linear", version = "0.9.83" }
