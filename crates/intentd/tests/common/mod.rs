@@ -22,9 +22,17 @@ use std::time::Duration;
 /// (see `assert_hermetic_root_absent` in intent-services). Spawned daemons
 /// inherit the variable, which is the already-supported hermetic mode: the
 /// spawn helpers set `INTENTD_WORKSPACES_DIR` to a tempdir.
+///
+/// The same ctor arms the bound-caller guard: every daemon the suite spawns
+/// inherits `INTENTD_ASSERT_BOUND_CALLER`, so a capability gate evaluated
+/// without a bound `Caller` (a `tokio::spawn` that dropped the binding)
+/// panics in the daemon instead of quietly refusing — the fail-closed
+/// service layer must never be reached unbound from a production entry point
+/// (see `intent_services::capability`).
 #[ctor::ctor(unsafe)]
 fn force_hermetic_root_guard() {
     std::env::set_var("INTENTD_ASSERT_HERMETIC_ROOT", "1");
+    std::env::set_var("INTENTD_ASSERT_BOUND_CALLER", "1");
     // Node children spawned by tests (mock ACP agents, MCP fixtures) inherit
     // this and skip `module.enableCompileCache()`, which would otherwise leave
     // a `node-compile-cache/` residue at the TMPDIR root after the suite.
