@@ -17,7 +17,8 @@ use std::fmt::Write as _;
 ///
 /// Assumptions: router.rs uses single-line match arms of the form `"method.name" => ...`
 /// or `"alias1" | "alias2" => ...`; no escaped quotes in method names; assumes inline
-/// comments (if any) appear after the match arm and are tolerated.
+/// comments (if any) appear after the match arm and are tolerated. Namespaces may be
+/// hyphenated (`accept-changes.*`, `file-tracking.*`).
 fn extract_router_methods() -> HashSet<String> {
     // Read source at runtime to detect drift even after the test is compiled
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -40,7 +41,7 @@ fn extract_router_methods() -> HashSet<String> {
                     if trimmed.contains('.')
                         && trimmed
                             .chars()
-                            .all(|c| c.is_alphanumeric() || c == '.' || c == '_')
+                            .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
                     {
                         methods.insert(trimmed.to_string());
                     }
@@ -100,7 +101,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
                         if method.starts_with(prefix)
                             && method
                                 .chars()
-                                .all(|c| c.is_alphanumeric() || c == '.' || c == '_')
+                                .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
                         {
                             methods.insert(method.to_string());
                         }
@@ -127,12 +128,16 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`browser.listTabs` / `browser.upsertTab` / `browser.removeTab` /
 /// `browser.syncTabs`), protocol 9.10. REV-2 routing: +2 fast-path methods
 /// (`browser.navigateTab` / `browser.closeTab`), protocol 9.11.
-const EXPECTED_TOTAL_METHODS: usize = 355;
+///
+/// 355 → 366: `extract_router_methods` rejected `-` in method names, so the 11
+/// already-shipped `accept-changes.*` / `file-tracking.*` router arms were never
+/// frozen here. No protocol bump — the wire surface did not change.
+const EXPECTED_TOTAL_METHODS: usize = 366;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 304;
+const EXPECTED_ROUTER_METHODS: usize = 315;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 49;

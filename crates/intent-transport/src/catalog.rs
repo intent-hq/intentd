@@ -11,13 +11,18 @@ mod tests;
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 304 canonical methods routed through the main dispatch match in
+/// These are the 315 canonical methods routed through the main dispatch match in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
 /// error code (never `-32601`) when the method is recognized but fails for other reasons.
 #[cfg(test)]
 pub(crate) const ROUTER_METHODS: &[&str] = &[
+    "accept-changes.addRemote",
+    "accept-changes.execute",
+    "accept-changes.getStatus",
+    "accept-changes.mergePR",
+    "accept-changes.prepare",
     "agent.appendMessage",
     "agent.cancelDelete",
     "agent.cancelSubscriptions",
@@ -78,6 +83,12 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "event.agentActivity",
     "event.query",
     "event.workspaceSummary",
+    "file-tracking.getAgentLocks",
+    "file-tracking.getChanges",
+    "file-tracking.getLineStats",
+    "file-tracking.loadCommits",
+    "file-tracking.stage",
+    "file-tracking.unstage",
     "file.attachmentUpload.abort",
     "file.attachmentUpload.begin",
     "file.attachmentUpload.chunk",
