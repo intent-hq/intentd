@@ -6173,8 +6173,12 @@ impl AgentManager {
     /// the slot held leaves the marker for the holder's exit re-check, and a
     /// probe that loses the claim across the drain's gate awaits has nothing
     /// to hand back — the winner's release happens-before its own exit
-    /// probe, so one of the two sides claims the marker.
-    async fn redrive_parked_recovery_send(
+    /// probe, so one of the two sides claims the marker. A `Deferred` claim
+    /// (entry under edit / popped provisionally) keeps the marker for the
+    /// probe that follows the deferring state: the edit's `editing: false`
+    /// release (`agent_edit_queued_message_op`) or the provisional
+    /// holder's hand-back (`send_queued_message_now`).
+    pub(crate) async fn redrive_parked_recovery_send(
         self: &Arc<Self>,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
@@ -16584,12 +16588,16 @@ mod agent_retry_tests {
     /// A recovery send flipped to `editing = true` while its redrive is
     /// pending is a draft: the redrive must not dispatch it. The exact-id
     /// pop checks readiness under the queue lock, so the marker stays for
-    /// the edit to finish and a later probe delivers it.
+    /// the edit to finish — and finishing the edit (`editing: false`) is
+    /// itself the probe that delivers it: the holder exited while the entry
+    /// was a draft, so no worker or exit probe remains, and the ordinary
+    /// self-drain alone would refuse the `Error` session (STAB-52).
     #[tokio::test]
     async fn recovery_send_under_edit_is_not_redriven() {
         let agent_id = AgentId::from("agent-4962-editing");
         let ws = WorkspaceId::from("ws-4962");
         let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        mgr.services.attach_agent_manager(&mgr);
         hold_slot(&mgr, &agent_id, &ws);
         let sent = mgr
             .send_message(
@@ -16611,8 +16619,12 @@ mod agent_retry_tests {
             )
             .await
             .expect("flip to editing");
-        mgr.release_in_flight_slot(&agent_id);
 
+        // The holder fails terminally while the entry is a draft: its exit
+        // probe defers, and nothing else is left to probe.
+        mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
+            .await;
+        mgr.release_in_flight_slot(&agent_id);
         mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
         assert!(!mgr.is_busy(&agent_id), "a draft is not dispatched");
         assert_eq!(
@@ -16621,6 +16633,7 @@ mod agent_retry_tests {
             "the marker waits for the edit to finish"
         );
 
+        // Finishing the edit is the probe: no manual redrive follows.
         mgr.services
             .agent_edit_queued_message_op(
                 agent_id.clone(),
@@ -16630,9 +16643,50 @@ mod agent_retry_tests {
             )
             .await
             .expect("finish editing");
-        mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
-        assert!(mgr.is_busy(&agent_id), "the finished entry is redriven");
+        assert!(
+            mgr.is_busy(&agent_id),
+            "the edit release redrives the finished entry"
+        );
         assert!(!mgr.services.is_message_queued(&agent_id, &id));
+        assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
+    }
+
+    /// The edit-release probe lifts the gate only through a marker: an
+    /// unmarked entry (a plain `agent.queueMessage`) finishing its edit on
+    /// an `Error` session still parks behind STAB-52.
+    #[tokio::test]
+    async fn edit_release_without_marker_keeps_error_gate() {
+        let agent_id = AgentId::from("agent-4962-editing-unmarked");
+        let ws = WorkspaceId::from("ws-4962");
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        mgr.services.attach_agent_manager(&mgr);
+        let (queued, _) = mgr.services.enqueue_message(
+            &agent_id,
+            "draft".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::Automatic,
+        );
+        let id = queued.id;
+        for editing in [true, false] {
+            mgr.services
+                .agent_edit_queued_message_op(
+                    agent_id.clone(),
+                    id.clone(),
+                    "draft".to_string(),
+                    Some(editing),
+                )
+                .await
+                .expect("edit");
+        }
+        assert!(
+            !mgr.is_busy(&agent_id),
+            "STAB-52: an unmarked entry does not redrive an Error session"
+        );
+        assert!(mgr.services.is_message_queued(&agent_id, &id));
         assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
     }
 

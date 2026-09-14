@@ -5748,6 +5748,10 @@ impl Services {
     /// editing) we additionally fire `try_drain_queue` so the message
     /// self-drains as if it had just been enqueued — honouring the user's
     /// "re-queued on save, which self-drains" semantics (PROTOCOL §5.5/§6.5).
+    /// A parked recovery send (intent-hq/intent#4962) whose redrive deferred
+    /// while it was under edit is probed first: its marker lifts the STAB-52
+    /// `Error` gate for that entry alone, and an unmarked entry still meets
+    /// the ordinary gate.
     pub(crate) async fn agent_edit_queued_message_op(
         &self,
         agent_id: AgentId,
@@ -5780,6 +5784,9 @@ impl Services {
         if was_editing && !now_editing {
             if let Some(manager) = self.agent_manager() {
                 if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                    manager
+                        .redrive_parked_recovery_send(&agent_id, &session.workspace_id)
+                        .await;
                     manager
                         .try_drain_queue(agent_id, session.workspace_id)
                         .await;
