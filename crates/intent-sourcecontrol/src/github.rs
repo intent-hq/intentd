@@ -93,11 +93,14 @@ impl GitHubSourceControl {
     /// with 422 ("The listed users and repositories cannot be searched either
     /// because the resources do not exist or you do not have permission to
     /// view them" → [`Error::Conflict`]) when any `repo:` qualifier names a
-    /// repo the token cannot read. On that rejection each scoped repo is probed
-    /// (`GET /repos/{o}/{r}`), the ones answering not-found/forbidden are
-    /// dropped (debug log), and the search is retried ONCE over the readable
-    /// remainder. A single-repo scope never probes, so its behavior is
-    /// unchanged; a scope with nothing droppable surfaces the original error.
+    /// repo the token cannot read. On THAT rejection — recognized by its
+    /// message via [`is_unsearchable_scope_rejection`]; other 422s (query over
+    /// 256 characters, a page past the 1000-result window) surface unchanged —
+    /// each scoped repo is probed (`GET /repos/{o}/{r}`), the ones answering
+    /// not-found/forbidden are dropped (debug log), and the search is retried
+    /// ONCE over the readable remainder. A single-repo scope never probes, so
+    /// its behavior is unchanged; a scope with nothing droppable surfaces the
+    /// original error.
     async fn search_issues_scoped(
         &self,
         scope: &[RepoRef],
@@ -110,8 +113,12 @@ impl GitHubSourceControl {
             .await
         {
             Ok(items) => return Ok(items),
-            Err(err @ Error::Conflict(_)) if scope.len() > 1 => err,
-            Err(err) => return Err(err),
+            Err(err) => match &err {
+                Error::Conflict(msg) if scope.len() > 1 && is_unsearchable_scope_rejection(msg) => {
+                    err
+                }
+                _ => return Err(err),
+            },
         };
         let mut readable: Vec<RepoRef> = Vec::with_capacity(scope.len());
         for repo in scope {
@@ -137,6 +144,14 @@ impl GitHubSourceControl {
         self.search_issues_page(build(&readable), per_page, page_no)
             .await
     }
+}
+
+/// Whether a search 422's message is GitHub's whole-search rejection for a
+/// `repo:` qualifier the token cannot read ("The listed users and repositories
+/// cannot be searched either because the resources do not exist or you do not
+/// have permission to view them"), as opposed to any other validation failure.
+fn is_unsearchable_scope_rejection(msg: &str) -> bool {
+    msg.contains("cannot be searched")
 }
 
 /// Capabilities of the GitHub host (everything the trait models is supported).

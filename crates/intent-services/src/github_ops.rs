@@ -70,6 +70,12 @@ pub(crate) fn hit_repo(scope: &[RepoRef], html_url: &str) -> RepoRef {
         return primary;
     }
     let Some(parsed) = repo_from_html_url(html_url) else {
+        tracing::debug!(
+            html_url,
+            owner = %primary.owner,
+            repo = %primary.name,
+            "search hit html_url is empty or unparsable; attributing the item to the addressed repo"
+        );
         return primary;
     };
     scope
@@ -517,10 +523,6 @@ mod tests {
         assert_eq!(
             hit_repo(&single, "https://github.com/other/repo/issues/1"),
             RepoRef::new("Intent-HQ", "IntentD")
-        );
-        assert_eq!(
-            hit_repo(&single, "https://github.com/other/repo/issues/1").owner,
-            "Intent-HQ"
         );
 
         let scope = [

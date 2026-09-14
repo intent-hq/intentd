@@ -380,6 +380,50 @@ async fn multi_repo_search_surfaces_rejection_when_nothing_helps() {
     let seen = seen.lock().unwrap().clone();
     assert_eq!(seen.len(), 1, "one search, no probes: {seen:?}");
     assert!(seen[0].starts_with("/search/issues"), "{seen:?}");
+
+    // A 422 unrelated to scope readability (here: a page past GitHub's
+    // 1000-result window) on a multi-repo scope surfaces as-is — no probes,
+    // no retry — and its detail is carried on the error message.
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mock = spawn_mock_with(recording(seen.clone(), |_| {
+        (
+            422,
+            json!({
+                "message": "Validation Failed",
+                "errors": [{
+                    "message": "Only the first 1000 search results are available",
+                    "resource": "Search",
+                    "field": "q",
+                    "code": "invalid"
+                }],
+                "documentation_url": "https://docs.github.com/v3/search/"
+            })
+            .to_string(),
+        )
+    }))
+    .await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+        .expect("build github client");
+    let err = sc
+        .list_prs(
+            &RepoRef::new("a", "b"),
+            PrQuery {
+                extra_repos: vec![RepoRef::new("c", "d")],
+                ..PrQuery::default()
+            },
+        )
+        .await
+        .expect_err("an unrelated 422 surfaces without probing");
+    match &err {
+        Error::Conflict(msg) => assert!(
+            msg.contains("Only the first 1000 search results are available"),
+            "422 detail folded into the message: {msg}"
+        ),
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "one search, no probes, no retry: {seen:?}");
+    assert!(seen[0].starts_with("/search/issues"), "{seen:?}");
 }
 
 fn review_threads_envelope() -> Value {
