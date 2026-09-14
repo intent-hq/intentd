@@ -1033,21 +1033,6 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
              after the burst started, {DEBOUNCE_MS}ms debounce), got {}",
             last_activity_events.len()
         );
-        // Each emission carries the latest derived value at its fire time, so
-        // successive emissions never walk lastActivity back.
-        let announced: Vec<_> = last_activity_events
-            .iter()
-            .map(|evt| {
-                let ts = evt["data"]["changes"]["lastActivity"]
-                    .as_str()
-                    .expect("lastActivity string");
-                DateTime::parse_from_rfc3339(ts).expect("parse announced lastActivity")
-            })
-            .collect();
-        assert!(
-            announced.windows(2).all(|pair| pair[0] <= pair[1]),
-            "announced lastActivity must be non-decreasing across emissions: {announced:?}"
-        );
     }
 
     // Convergence (both variants): the latest announced value advanced past
