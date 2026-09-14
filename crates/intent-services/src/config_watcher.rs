@@ -565,6 +565,11 @@ mod tests {
             .wait_live(LIVENESS)
             .await;
         assert_eq!(fault.attempts(), 1);
+        // Let the spawned loop observe the live registration and park in its
+        // debounce before the ancestor retires, so the recovery under test is
+        // the closed-channel path rather than a first poll that already finds
+        // the registration reset.
+        tokio::task::yield_now().await;
 
         drop(sub_ancestor);
 
