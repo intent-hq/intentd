@@ -226,7 +226,9 @@ impl ConfigWatcher {
 /// loop drops the dead subscription and re-subscribes with the hub's capped
 /// backoff, as [`super::events::root_watch`] does — parking on the closed
 /// channel would end config live-reload for the process lifetime after a
-/// transient failure. Runs until the [`ConfigWatcher`] aborts it.
+/// transient failure. Each live subscription starts with a catch-up read
+/// (see [`debounce`]) so an edit made while unwatched is not left stale.
+/// Runs until the [`ConfigWatcher`] aborts it.
 #[expect(clippy::too_many_arguments)]
 async fn watch_loop<F, Fut>(
     hub: Arc<SharedWatchHub>,
@@ -279,6 +281,12 @@ async fn watch_loop<F, Fut>(
 
 /// The debounce loop over one live subscription; returns when its channel
 /// closes.
+///
+/// Entry arms one catch-up read: an edit that landed while the directory was
+/// unwatched (between `start` and the deferred registration going live, or
+/// inside a lost watch's backoff) produced no event, so it is read here
+/// through the same revision gate, strict reload, and self-write check as an
+/// event-triggered read — a no-op when nothing changed.
 async fn debounce<F, Fut>(
     registry: &SettingsRegistry,
     revision_gate: &tokio::sync::RwLock<()>,
@@ -289,7 +297,7 @@ async fn debounce<F, Fut>(
     F: Fn(SettingsChanged) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let mut deadline: Option<tokio::time::Instant> = None;
+    let mut deadline: Option<tokio::time::Instant> = Some(tokio::time::Instant::now() + DEBOUNCE);
     loop {
         tokio::select! {
             maybe = raw_rx.recv() => match maybe {
@@ -598,5 +606,84 @@ mod tests {
             .expect("watcher task alive");
         assert!(notice.changed.contains("git.autoCommit"), "{notice:?}");
         assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));
+    }
+
+    /// An edit made while the directory is unwatched — after the survivor
+    /// re-registration failed, during the watcher's backoff — produces no
+    /// event. The re-subscription's catch-up read must apply it without a
+    /// second edit.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn watcher_catches_up_on_an_edit_made_while_unwatched() {
+        use crate::events::shared_watch::WatchFault;
+        use crate::events::LIVENESS;
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = tempfile::tempdir().expect("tempdir");
+        let ancestor = base.path().join("parent");
+        let cfg_dir = ancestor.join("cfg");
+        std::fs::create_dir_all(&cfg_dir).expect("mk cfg");
+        let path = cfg_dir.join("config.toml");
+        std::fs::write(&path, "[git]\nautoCommit = true\n").expect("seed config");
+        let reg = Arc::new(SettingsRegistry::load(&path).expect("load"));
+
+        let fault = WatchFault::nth("cfg", 2);
+        let hub = SharedWatchHub::with_watch_fault(&fault);
+        let (sub_ancestor, _rx_ancestor, _) =
+            hub.subscribe_with(&ancestor, RecursiveMode::NonRecursive);
+        sub_ancestor.wait_established(LIVENESS).await;
+        let (sub_wide, _rx_wide, _) = hub.subscribe_with(&ancestor, RecursiveMode::Recursive);
+        sub_wide.wait_established(LIVENESS).await;
+        drop(sub_wide);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
+        let watcher = ConfigWatcher::start(
+            &hub,
+            reg.clone(),
+            Arc::new(tokio::sync::RwLock::new(())),
+            move |notice| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(notice);
+                }
+            },
+        )
+        .expect("start watcher");
+        watcher
+            .probe()
+            .expect("subscribed")
+            .wait_live(LIVENESS)
+            .await;
+        assert_eq!(fault.attempts(), 1);
+        tokio::task::yield_now().await;
+
+        drop(sub_ancestor);
+
+        // The loop has dropped its dead handle and is sleeping out the backoff
+        // before the third `watch()`: nothing watches `cfg` right now.
+        tokio::time::timeout(LIVENESS, async {
+            while !(fault.attempts() == 2 && watcher.probe().is_none()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watcher must enter its re-subscription backoff");
+        std::fs::write(&path, "[git]\nautoCommit = false\n").expect("edit while unwatched");
+
+        // No second edit: only the catch-up read on re-establishment can
+        // surface the change.
+        let notice = tokio::time::timeout(LIVENESS, rx.recv())
+            .await
+            .expect("the re-subscribed watcher must catch up on the unwatched edit")
+            .expect("watcher task alive");
+        assert!(notice.changed.contains("git.autoCommit"), "{notice:?}");
+        assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));
+        assert!(
+            fault.attempts() >= 3,
+            "catch-up must ride the re-subscription"
+        );
     }
 }
