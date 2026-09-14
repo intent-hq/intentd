@@ -24,8 +24,9 @@
 //!   never receives rows outside its membership. An unbound refusal also
 //!   logs one `tracing::warn!` per gate, and under the
 //!   [`ASSERT_BOUND_CALLER_ENV`] test seam (armed for every daemon the
-//!   intentd integration suite spawns) it panics, so a missed binding fails
-//!   the e2e suite instead of degrading a background path silently.
+//!   intentd integration suite spawns) it aborts the process, so a missed
+//!   binding — even on a detached task nothing awaits — fails the e2e suite
+//!   instead of degrading a background path silently.
 //!
 //! Classes: *Member+* (Read / Steer & edit) → [`Services::require_member`];
 //! *Owner-only* (`workspace.delete` / `archive` / `export.*`,
@@ -56,17 +57,20 @@ use crate::Services;
 pub const UNBOUND_GATE_LOG: &str = "capability gate evaluated without a bound Caller; refusing";
 
 /// Test seam (same shape as `INTENTD_ASSERT_HERMETIC_ROOT`): when set, an
-/// unbound gate evaluation panics instead of merely refusing, so a missed
-/// spawn binding fails the e2e suite loudly rather than degrading a
-/// background path into a swallowed `Forbidden`. The integration-test
-/// `common` module sets it for every daemon it spawns; production binaries
-/// never see it.
+/// unbound gate evaluation aborts the process instead of merely refusing,
+/// so a missed spawn binding fails the e2e suite loudly rather than
+/// degrading a background path into a swallowed `Forbidden`. An abort, not
+/// a panic: a panic only unwinds the evaluating Tokio task, so a miss on a
+/// detached task (a dropped `JoinHandle`) would leave the daemon running
+/// and the test green. The integration-test `common` module sets it for
+/// every daemon it spawns; production binaries never see it.
 pub const ASSERT_BOUND_CALLER_ENV: &str = "INTENTD_ASSERT_BOUND_CALLER";
 
 /// The bound collaborator principal, or `None` when the caller is not
 /// constrained by the matrix (administrator, agent, daemon). An unbound
 /// request is refused: `Forbidden`, logged once per `gate` per process so a
-/// missed spawn binding shows up in the daemon log.
+/// missed spawn binding shows up in the daemon log — and, under
+/// [`ASSERT_BOUND_CALLER_ENV`], fatal to the process.
 pub(crate) fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId>> {
     match current_caller() {
         Some(Caller::Wire {
@@ -76,17 +80,22 @@ pub(crate) fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId
         Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) => Ok(None),
         None => {
             static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-            assert!(
-                std::env::var_os(ASSERT_BOUND_CALLER_ENV).is_none(),
-                "{ASSERT_BOUND_CALLER_ENV}: capability gate `{gate}` evaluated without a bound \
-                 Caller — bind the entry point (`with_caller` / `spawn_daemon`)"
-            );
             let first = WARNED
                 .get_or_init(Mutex::default)
                 .lock()
                 .is_ok_and(|mut seen| seen.insert(gate.to_string()));
             if first {
                 tracing::warn!(gate, "{UNBOUND_GATE_LOG}");
+            }
+            if std::env::var_os(ASSERT_BOUND_CALLER_ENV).is_some() {
+                // stderr, not tracing: the abort below never flushes a
+                // non-blocking log writer.
+                eprintln!(
+                    "{ASSERT_BOUND_CALLER_ENV}: capability gate `{gate}` evaluated without a \
+                     bound Caller — bind the entry point (`with_caller` / `spawn_daemon`); \
+                     aborting"
+                );
+                std::process::abort();
             }
             Err(Error::Forbidden(format!("{gate}: no caller is bound")))
         }
@@ -763,6 +772,12 @@ mod tests {
     /// and not the fixture.
     #[tokio::test]
     async fn unbound_caller_is_forbidden_on_every_gate() {
+        // Unarmed: the production behaviour under test is the refusal, not
+        // the test seam's abort.
+        assert!(
+            std::env::var_os(ASSERT_BOUND_CALLER_ENV).is_none(),
+            "{ASSERT_BOUND_CALLER_ENV} must be unset for this test"
+        );
         let tmp = TempDb::new();
         let f = fixture(&tmp).await;
         assert_eq!(intent_core::current_caller(), None);
@@ -851,6 +866,96 @@ mod tests {
             .await
             .expect("visible ids")
             .is_none());
+    }
+
+    /// Set by [`armed_seam_aborts_on_detached_unbound_gate`] when it
+    /// re-executes this test binary; [`detached_unbound_probe_child`] is a
+    /// no-op without it.
+    const PROBE_CHILD_ENV: &str = "INTENTD_CALLER_PROBE_CHILD";
+
+    /// Child half of the abort probe: evaluates a gate unbound on a
+    /// *detached* task — the `JoinHandle` is dropped, nothing awaits it —
+    /// and then reports that the process is still alive. Unarmed, the task's
+    /// `Forbidden` is swallowed and the child exits 0, which is exactly the
+    /// silent degradation the seam exists to catch.
+    #[tokio::test]
+    async fn detached_unbound_probe_child() {
+        if std::env::var_os(PROBE_CHILD_ENV).is_none() {
+            return;
+        }
+        let tmp = TempDb::new();
+        let f = fixture(&tmp).await;
+        let services = f.services.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(tokio::spawn(async move {
+            let outcome = services.list_workspaces(true).await.map(|w| w.len());
+            let _ = tx.send(format!("{outcome:?}"));
+        }));
+        let outcome = rx.await.expect("detached task reported");
+        println!("probe-alive: {outcome}");
+    }
+
+    /// Armed, the seam aborts the whole process on an unbound gate even when
+    /// the miss happens on a detached task: a panic would only unwind that
+    /// task and leave the daemon running (and an e2e suite green). Runs the
+    /// probe child twice — unarmed as the positive control (alive, plain
+    /// `Forbidden`), then armed (dies by `SIGABRT` naming the seam).
+    #[test]
+    fn armed_seam_aborts_on_detached_unbound_gate() {
+        let exe = std::env::current_exe().expect("test binary");
+        // An aborted child never sweeps its `TempDb`; root it under a dir
+        // the parent sweeps.
+        let scratch = crate::test_support::test_tempdir("intentd-caller-probe-");
+        let run = |armed: bool| {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args([
+                "--exact",
+                "capability::tests::detached_unbound_probe_child",
+                "--nocapture",
+            ])
+            .env(PROBE_CHILD_ENV, "1")
+            .env("TMPDIR", scratch.path())
+            .env_remove(ASSERT_BOUND_CALLER_ENV);
+            if armed {
+                cmd.env(ASSERT_BOUND_CALLER_ENV, "1");
+            }
+            cmd.output().expect("run probe child")
+        };
+
+        let unarmed = run(false);
+        let stdout = String::from_utf8_lossy(&unarmed.stdout);
+        assert!(
+            unarmed.status.success(),
+            "unarmed probe: {:?}\n{stdout}\n{}",
+            unarmed.status,
+            String::from_utf8_lossy(&unarmed.stderr)
+        );
+        assert!(
+            stdout.contains("probe-alive: Err(Forbidden("),
+            "unarmed probe stdout: {stdout}"
+        );
+
+        let armed = run(true);
+        let stderr = String::from_utf8_lossy(&armed.stderr);
+        assert!(!armed.status.success(), "armed probe survived: {stderr}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                armed.status.signal(),
+                Some(libc::SIGABRT),
+                "armed probe: {:?}\n{stderr}",
+                armed.status
+            );
+        }
+        assert!(
+            !String::from_utf8_lossy(&armed.stdout).contains("probe-alive"),
+            "armed probe reported alive"
+        );
+        assert!(
+            stderr.contains(ASSERT_BOUND_CALLER_ENV) && stderr.contains("aborting"),
+            "armed probe stderr: {stderr}"
+        );
     }
 
     /// Cross-workspace visibility: a collaborator caller sees exactly its
