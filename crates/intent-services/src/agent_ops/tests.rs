@@ -13497,7 +13497,19 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
         ],
         now,
     );
+    // Plan-time state: auggie enabled (no `providers.enabled` opt-out) and
+    // observed logged-in — not merely cached-unknown.
     let _auth_reset = AuthVerdictReset("auggie");
+    crate::provider_auth::seed_auth_verdict_for_tests("auggie", Some(true));
+    assert_ne!(
+        svc.effective_settings()
+            .providers
+            .enabled
+            .as_ref()
+            .and_then(|m| m.get("auggie")),
+        Some(&false),
+        "auggie must be enabled at plan time"
+    );
     let extra = || intent_core::AgentCreateExtra {
         provider: Some("auggie".into()),
         reasoning_effort: Some("high".into()),
@@ -13574,15 +13586,21 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
 /// Tier parity (intentd#1882 gap 2): the plan's project-tier root is the
 /// single decider for specialist acceptance. With a specialist present only
 /// in one root's `.intent/specialists`, `agent.create` (stored workspace's
-/// worktree root) and `workspace.create` (the `repositoryPath` checkout root)
-/// each reject the OTHER root's specialist before any side effect — no
-/// session, workspace row, spec note, or `workspace:created` event — while a
-/// specialist known at the plan's own root is accepted, alias included, with
-/// the canonical id persisted on the session row.
+/// worktree root) and an isolated `workspace.create` (the `repositoryPath`
+/// checkout root) each reject the OTHER root's specialist before any side
+/// effect — no session, workspace row, spec note, `workspace:created` event,
+/// workspaces-root entry, or git worktree — while a specialist known at the
+/// plan's own root is accepted, alias included, with the canonical id
+/// persisted on the session row. The checkout's specialist is untracked, so
+/// the worktree `workspace.create` provisions at `baseRef` does not carry it:
+/// the persist half's non-failing prompt snapshot reads that worktree, finds
+/// nothing, and the create still succeeds — the snapshot root has no say.
 #[tokio::test]
 async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
     let (tmp, svc, _ws, _bus) = setup_with_bus().await;
-    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
+    let workspaces_root = tmp.path.with_extension("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("workspaces root");
+    let svc = svc.with_workspaces_root(workspaces_root.clone());
     // Hermetic user + bundled tiers (one empty dir) so only the per-root
     // project tiers below can supply the two specialists.
     let empty_tier = tmp.path.with_extension("specialists");
@@ -13599,9 +13617,48 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
         )
         .expect("write project specialist");
     };
-    // Root A: the checkout `workspace.create` adopts via `repositoryPath`.
+    // Root A: a local git repo (one commit) that `workspace.create` adopts via
+    // `repositoryPath` and provisions a worktree from. Its specialist is
+    // written AFTER the commit and never staged, so no ref carries it.
     let checkout_root = tmp.path.with_extension("checkout");
+    let head_branch = {
+        let repo = git2::Repository::init(&checkout_root).expect("init checkout repo");
+        let mut cfg = repo.config().expect("repo config");
+        cfg.set_str("user.name", "Tester").expect("user.name");
+        cfg.set_str("user.email", "t@e.dev").expect("user.email");
+        std::fs::write(checkout_root.join("README.md"), "init\n").expect("README");
+        let mut index = repo.index().expect("index");
+        index
+            .add_path(std::path::Path::new("README.md"))
+            .expect("add README");
+        index.write().expect("write index");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write tree"))
+            .expect("tree");
+        let sig = git2::Signature::now("Tester", "t@e.dev").expect("signature");
+        repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+            .expect("initial commit");
+        let branch = repo
+            .head()
+            .expect("head")
+            .shorthand()
+            .expect("branch name")
+            .to_string();
+        branch
+    };
     project_specialist(&checkout_root, "checkout-only", "Checkout Only", "co");
+    let checkout_worktrees = || {
+        git2::Repository::open(&checkout_root)
+            .expect("open checkout repo")
+            .worktrees()
+            .expect("list worktrees")
+            .len()
+    };
+    let workspaces_root_entries = || {
+        std::fs::read_dir(&workspaces_root)
+            .expect("read workspaces root")
+            .count()
+    };
     // Root B: the stored workspace's worktree `agent.create` resolves against.
     let worktree_root = tmp.path.with_extension("worktree");
     project_specialist(&worktree_root, "worktree-only", "Worktree Only", "wo");
@@ -13641,8 +13698,9 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
             &svc,
             intent_core::WorkspaceCreate {
                 title: Some("W".into()),
-                skip_isolation: Some(true),
                 repository_path: Some(checkout_root.to_string_lossy().into_owned()),
+                repository_name: Some("Checkout".into()),
+                base_ref: Some(head_branch.clone()),
                 initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                     model: Some("sonnet4.5".into()),
                     provider: Some("auggie".into()),
@@ -13702,6 +13760,8 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
             .len()
     };
     let events_before = created_events().await;
+    let entries_before = workspaces_root_entries();
+    let worktrees_before = checkout_worktrees();
     let err = workspace_create("worktree-only")
         .await
         .expect_err("workspace.create must not see root B's specialist");
@@ -13732,6 +13792,16 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
         events_before,
         "rejection must precede workspace:created"
     );
+    assert_eq!(
+        workspaces_root_entries(),
+        entries_before,
+        "rejection must leave the workspaces root untouched"
+    );
+    assert_eq!(
+        checkout_worktrees(),
+        worktrees_before,
+        "rejection must provision no worktree"
+    );
     let result = workspace_create("co")
         .await
         .expect("workspace.create accepts root A's alias");
@@ -13750,6 +13820,36 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
     );
     assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
     assert_eq!(session.provider.as_deref(), Some("auggie"));
+    // The snapshot root is the provisioned worktree at `baseRef`, which does
+    // not carry the untracked specialist the plan accepted at the checkout
+    // root — so the frozen identity snapshot is absent while the create
+    // succeeded on the plan root's verdict alone.
+    let worktree = PathBuf::from(
+        result
+            .workspace
+            .worktree_path
+            .as_deref()
+            .expect("isolated create provisions a worktree"),
+    );
+    assert!(
+        worktree.starts_with(&workspaces_root),
+        "worktree {} must live under the workspaces root",
+        worktree.display()
+    );
+    assert_eq!(checkout_worktrees(), worktrees_before + 1);
+    let specialist_rel = std::path::Path::new(".intent")
+        .join("specialists")
+        .join("checkout-only.md");
+    assert!(checkout_root.join(&specialist_rel).is_file());
+    assert!(
+        !worktree.join(&specialist_rel).exists(),
+        "the specialist must be absent at the snapshot root"
+    );
+    let meta = session.metadata.expect("harness stamps write metadata");
+    assert!(
+        meta.get("specialistName").is_none() && meta.get("behaviorPrompt").is_none(),
+        "no identity snapshot from the specialist-less snapshot root: {meta}"
+    );
 }
 
 /// Blank comments and string / char literals in Rust source, length- and
@@ -13837,13 +13937,20 @@ fn blank_rust_non_code(src: &str) -> String {
 }
 
 /// `(body_start, body)` of the first fn whose signature starts with
-/// `signature` in `blanked`: the text between the body's braces, matched on
-/// the comment- and literal-free text.
-fn fn_body<'a>(blanked: &'a str, signature: &str) -> (usize, &'a str) {
+/// `signature` in `blanked` (the comment- and literal-free text of `file`):
+/// the text between the body's braces. A vanished signature panics naming
+/// `file:1` so the guard's failure always carries a `file:line` anchor.
+fn fn_body<'a>(file: &str, blanked: &'a str, signature: &str) -> (usize, &'a str) {
     let sig = blanked
         .find(signature)
-        .unwrap_or_else(|| panic!("signature not found: {signature}"));
-    let open = sig + blanked[sig..].find('{').expect("fn body open brace");
+        .unwrap_or_else(|| panic!("{file}:1: signature not found: `{signature}`"));
+    let open = sig
+        + blanked[sig..].find('{').unwrap_or_else(|| {
+            panic!(
+                "{file}:{}: no body after `{signature}`",
+                line_of(blanked, sig)
+            )
+        });
     let mut depth = 0usize;
     for (off, c) in blanked[open..].char_indices() {
         match c {
@@ -13857,15 +13964,20 @@ fn fn_body<'a>(blanked: &'a str, signature: &str) -> (usize, &'a str) {
             _ => {}
         }
     }
-    panic!("unbalanced fn body for {signature}");
+    panic!(
+        "{file}:{}: unbalanced body for `{signature}`",
+        line_of(blanked, sig)
+    );
 }
 
 fn line_of(blanked: &str, offset: usize) -> usize {
     blanked[..offset].matches('\n').count() + 1
 }
 
-/// Every `-32602` producer the plan half owns; none may appear in the persist
-/// half or after `workspace.create`'s row insert.
+/// Every `-32602` producer the plan half owns, plus the pre-split wrapper
+/// (`agent_create_op`, which plans AND persists — an invocation after the
+/// row insert re-validates input past the first side effect); none may
+/// appear in the persist half or after `workspace.create`'s row insert.
 const PERSIST_FORBIDDEN: &[&str] = &[
     "ensure_effort_supported_by_model(",
     "canonical_id_or_err(",
@@ -13873,6 +13985,7 @@ const PERSIST_FORBIDDEN: &[&str] = &[
     "validate_file_blocks(",
     "validate_image_blocks(",
     "validate_image_block_refs(",
+    "agent_create_op(",
     "InvalidParams",
 ];
 
@@ -13880,18 +13993,21 @@ const PERSIST_FORBIDDEN: &[&str] = &[
 /// `persist_agent_create` (`agent_ops.rs`) calls none of the plan half's
 /// `-32602` producers, and `create_workspace` (`lib.rs`) runs
 /// `plan_agent_create` BEFORE its single `insert_workspace_with_auto_commit`
-/// and `persist_agent_create` AFTER it, with no producer (and no re-plan)
-/// anywhere after the insert. Scans the code with comments and literals
-/// blanked, and names `file:line` on a hit. Moving
-/// `resolve_create_model_and_effort` into the persist half fails the first
-/// assertion; moving the plan call below the insert fails the ordering one.
+/// and `persist_agent_create` AFTER it, with no producer, no re-plan and no
+/// `agent_create_op` wrapper anywhere after the insert. Scans the code with
+/// comments and literals blanked; every failure names `file:line` (a missing
+/// anchor names the fn body's first line, a vanished signature `file:1`).
+/// Moving `resolve_create_model_and_effort` into the persist half fails the
+/// first assertion; moving the plan call below the insert fails the ordering
+/// one; adding an `agent_create_op(...)` call after the insert fails the
+/// post-insert scan.
 #[test]
 fn persist_agent_create_and_workspace_create_carry_no_input_validation_after_the_plan() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let agent_ops = blank_rust_non_code(
         &std::fs::read_to_string(src.join("agent_ops.rs")).expect("read agent_ops.rs"),
     );
-    let (start, body) = fn_body(&agent_ops, "async fn persist_agent_create(");
+    let (start, body) = fn_body("agent_ops.rs", &agent_ops, "async fn persist_agent_create(");
     for token in PERSIST_FORBIDDEN.iter().chain(&["plan_agent_create("]) {
         if let Some(hit) = body.find(token) {
             panic!(
@@ -13903,20 +14019,25 @@ fn persist_agent_create_and_workspace_create_carry_no_input_validation_after_the
 
     let lib =
         blank_rust_non_code(&std::fs::read_to_string(src.join("lib.rs")).expect("read lib.rs"));
-    let (start, body) = fn_body(&lib, "fn create_workspace(");
+    let (start, body) = fn_body("lib.rs", &lib, "fn create_workspace(");
     let at = |needle: &str| {
-        body.find(needle)
-            .unwrap_or_else(|| panic!("create_workspace must call `{needle}`"))
+        body.find(needle).unwrap_or_else(|| {
+            panic!(
+                "lib.rs:{}: create_workspace must call `{needle}`",
+                line_of(&lib, start)
+            )
+        })
     };
     let plan = at(".plan_agent_create(");
     let insert = at(".insert_workspace_with_auto_commit(");
     let persist = at(".persist_agent_create(");
-    assert!(
-        body[insert + 1..]
-            .find(".insert_workspace_with_auto_commit(")
-            .is_none(),
-        "create_workspace must insert its row exactly once"
-    );
+    if let Some(dup) = body[insert + 1..].find(".insert_workspace_with_auto_commit(") {
+        panic!(
+            "lib.rs:{}: second row insert — create_workspace must insert its row exactly once (first at lib.rs:{})",
+            line_of(&lib, start + insert + 1 + dup),
+            line_of(&lib, start + insert)
+        );
+    }
     assert!(
         plan < insert,
         "lib.rs:{}: plan_agent_create must run before the row insert (lib.rs:{})",
