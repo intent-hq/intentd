@@ -84,18 +84,27 @@ pub enum PollStatus {
     Refused,
 }
 
+/// Opaque value an [`IdentityGuard`] returns on admission. The flow holds
+/// it across the token write and drops it right after, so whatever the
+/// guard pinned while deciding (the daemon's identity transition lock)
+/// stays pinned until the credential and the identity it verified are
+/// both on disk — no invite or concurrent switch can land in between.
+pub type IdentityLease = Box<dyn std::any::Any + Send>;
+
 /// Pre-persist hook of a [`DeviceFlow`] (multiplayer w4): once a grant
 /// arrives, the hook receives a forge client bound to the *new* token —
 /// never the token itself — and decides before anything is written.
-/// `Ok(())` persists the token; `Err(reason)` discards it and the poll
-/// reports [`PollStatus::Refused`]. The daemon uses it to verify `GET /user`
-/// against the primary principal's reconnect guard so a different GitHub
-/// account cannot replace the publishing credential while collaborators or
-/// open invites depend on the cached identity.
+/// `Ok(lease)` persists the token while the [`IdentityLease`] is held;
+/// `Err(reason)` discards it and the poll reports [`PollStatus::Refused`].
+/// The daemon uses it to verify `GET /user` against the primary
+/// principal's reconnect guard so a different GitHub account cannot
+/// replace the publishing credential while collaborators or open invites
+/// depend on the cached identity.
 pub type IdentityGuard = Arc<
     dyn Fn(
             Arc<dyn SourceControl>,
-        ) -> Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send>>
+        )
+            -> Pin<Box<dyn Future<Output = std::result::Result<IdentityLease, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -205,7 +214,8 @@ impl DeviceFlow {
     /// `sourceControl.github.token` — it is never returned to the caller.
     /// With an [`IdentityGuard`] installed, the grant is first handed to the
     /// guard as a token-bound client; a refusal drops the token unpersisted
-    /// and reports [`PollStatus::Refused`].
+    /// and reports [`PollStatus::Refused`], and an admission's
+    /// [`IdentityLease`] is held until the token write has completed.
     ///
     /// # Errors
     ///
@@ -230,22 +240,28 @@ impl DeviceFlow {
             .await?;
         match parse_poll_response(&body)? {
             PollResponse::Authorized { access_token } => {
+                let mut lease: Option<IdentityLease> = None;
                 if let Some((api_base_uri, guard)) = &self.identity_guard {
                     let client: Arc<dyn SourceControl> =
                         Arc::new(crate::github::GitHubSourceControl::new(
                             access_token.expose_secret(),
                             api_base_uri.as_deref(),
                         )?);
-                    if let Err(reason) = guard(client).await {
-                        drop(access_token);
-                        tracing::warn!(
-                            reason,
-                            "github device flow grant refused by identity guard"
-                        );
-                        return Ok(PollStatus::Refused);
+                    match guard(client).await {
+                        Ok(held) => lease = Some(held),
+                        Err(reason) => {
+                            drop(access_token);
+                            tracing::warn!(
+                                reason,
+                                "github device flow grant refused by identity guard"
+                            );
+                            return Ok(PollStatus::Refused);
+                        }
                     }
                 }
-                persist_token(self.store.clone(), access_token).await?;
+                let persisted = persist_token(self.store.clone(), access_token).await;
+                drop(lease);
+                persisted?;
                 Ok(PollStatus::Authorized)
             }
             PollResponse::Pending => Ok(PollStatus::Pending),
