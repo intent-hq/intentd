@@ -13,19 +13,19 @@
 //!   every workspace in v1 (no transfer RPC) and administers the daemon.
 //! - `Caller::Agent` / `Caller::Daemon` — act with the owner's capabilities
 //!   (decided: an agent steered by a collaborator still runs `ws.host.exec`).
-//! - An unbound request (`current_caller() == None`) is treated as
-//!   unconstrained. **Interim deviation** from the w3 brief (AC: an
-//!   owner-only method with no caller context is `Forbidden`): `Caller` is a
-//!   `tokio::task_local!`, so every `tokio::spawn` drops the binding and the
-//!   event fan-out, git status refresher, PR-monitor flush, scheduled-delete
-//!   timer and the subscription snapshot/delta reads all reach these gates
-//!   unbound today. Failing closed here before those sites bind an explicit
-//!   `Caller::Daemon` (or the subscriber's wire caller) would break them, so
-//!   the permit stays and every unbound evaluation of a protected gate logs
-//!   one `tracing::warn!` per gate (a runtime inventory for the follow-up
-//!   task "Fail-closed unbound caller in the service layer",
-//!   `70c04ac1-d8d4-4195-a1a1-29d5e862685d`). Matches the transport's
-//!   `is_non_administrator_caller` and the event narrowing.
+//! - An unbound request (`current_caller() == None`) is **refused**
+//!   (`Forbidden`, the w3 brief AC) by every protected gate and every
+//!   membership-narrowing read. `Caller` is a `tokio::task_local!`, so every
+//!   `tokio::spawn` drops the binding: daemon-internal work that reaches a
+//!   gate (event fan-out, git status refresher, PR-monitor flush, the
+//!   scheduled-delete timer, export finalisers, startup) binds
+//!   `Caller::Daemon` explicitly, and the wire subscription snapshot / delta
+//!   readers re-bind the *subscriber's* caller so a collaborator's channel
+//!   never receives rows outside its membership. An unbound refusal also
+//!   logs one `tracing::warn!` per gate, and under the
+//!   [`ASSERT_BOUND_CALLER_ENV`] test seam (armed for every daemon the
+//!   intentd integration suite spawns) it panics, so a missed binding fails
+//!   the e2e suite instead of degrading a background path silently.
 //!
 //! Classes: *Member+* (Read / Steer & edit) → [`Services::require_member`];
 //! *Owner-only* (`workspace.delete` / `archive` / `export.*`,
@@ -52,37 +52,51 @@ use serde_json::{json, Value};
 
 use crate::Services;
 
+/// The log line an unbound gate evaluation emits (once per gate per process).
+pub const UNBOUND_GATE_LOG: &str = "capability gate evaluated without a bound Caller; refusing";
+
+/// Test seam (same shape as `INTENTD_ASSERT_HERMETIC_ROOT`): when set, an
+/// unbound gate evaluation panics instead of merely refusing, so a missed
+/// spawn binding fails the e2e suite loudly rather than degrading a
+/// background path into a swallowed `Forbidden`. The integration-test
+/// `common` module sets it for every daemon it spawns; production binaries
+/// never see it.
+pub const ASSERT_BOUND_CALLER_ENV: &str = "INTENTD_ASSERT_BOUND_CALLER";
+
 /// The bound collaborator principal, or `None` when the caller is not
-/// constrained by the matrix (administrator, agent, daemon, unbound).
-pub(crate) fn collaborator_caller() -> Option<PrincipalId> {
+/// constrained by the matrix (administrator, agent, daemon). An unbound
+/// request is refused: `Forbidden`, logged once per `gate` per process so a
+/// missed spawn binding shows up in the daemon log.
+pub(crate) fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId>> {
     match current_caller() {
         Some(Caller::Wire {
             principal_id,
             is_administrator: false,
-        }) => Some(principal_id),
-        Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) | None => None,
+        }) => Ok(Some(principal_id)),
+        Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) => Ok(None),
+        None => {
+            static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+            assert!(
+                std::env::var_os(ASSERT_BOUND_CALLER_ENV).is_none(),
+                "{ASSERT_BOUND_CALLER_ENV}: capability gate `{gate}` evaluated without a bound \
+                 Caller — bind the entry point (`with_caller` / `spawn_daemon`)"
+            );
+            let first = WARNED
+                .get_or_init(Mutex::default)
+                .lock()
+                .is_ok_and(|mut seen| seen.insert(gate.to_string()));
+            if first {
+                tracing::warn!(gate, "{UNBOUND_GATE_LOG}");
+            }
+            Err(Error::Forbidden(format!("{gate}: no caller is bound")))
+        }
     }
 }
 
-/// [`collaborator_caller`] for a protected gate: when the request is unbound
-/// the interim permit (module docs) is logged once per `gate` per process so
-/// the fail-closed follow-up has a runtime inventory of unbound call sites.
-fn gated_collaborator_caller(gate: &str) -> Option<PrincipalId> {
-    if current_caller().is_none() {
-        static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-        let first = WARNED
-            .get_or_init(Mutex::default)
-            .lock()
-            .is_ok_and(|mut seen| seen.insert(gate.to_string()));
-        if first {
-            tracing::warn!(
-                gate,
-                "capability gate evaluated without a bound Caller; permitting (interim, see capability.rs)"
-            );
-        }
-        return None;
-    }
-    collaborator_caller()
+/// [`gated_collaborator_caller`] for the membership-narrowing reads that
+/// have no `what` of their own.
+pub(crate) fn collaborator_caller() -> Result<Option<PrincipalId>> {
+    gated_collaborator_caller("member")
 }
 
 fn not_a_member(workspace_id: &WorkspaceId) -> Error {
@@ -92,9 +106,10 @@ fn not_a_member(workspace_id: &WorkspaceId) -> Error {
 /// The owner tag a search registers its cancel token under: the collaborator
 /// principal, or `None` for an unconstrained caller. `search.cancel` from a
 /// collaborator flips only tokens registered under its own tag; an
-/// unconstrained caller cancels any (`CancelRegistry::cancel_as`).
-pub(crate) fn search_owner() -> Option<String> {
-    collaborator_caller().map(|principal_id| principal_id.0)
+/// unconstrained caller cancels any (`CancelRegistry::cancel_as`). An
+/// unbound caller is refused like every other gate.
+pub(crate) fn search_owner() -> Result<Option<String>> {
+    Ok(collaborator_caller()?.map(|principal_id| principal_id.0))
 }
 
 /// The `workspace.update` fields a member (collaborator) may set: the
@@ -130,7 +145,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         gate: &str,
     ) -> Result<Option<(PrincipalId, Option<WorkspaceRole>)>> {
-        let Some(principal_id) = gated_collaborator_caller(gate) else {
+        let Some(principal_id) = gated_collaborator_caller(gate)? else {
             return Ok(None);
         };
         let role = self
@@ -164,7 +179,7 @@ impl Services {
     /// Administrator-only gate: a per-principal (collaborator) wire caller is
     /// refused regardless of workspace roles.
     pub(crate) fn require_administrator(what: &str) -> Result<()> {
-        match gated_collaborator_caller(what) {
+        match gated_collaborator_caller(what)? {
             None => Ok(()),
             Some(_) => Err(Error::Forbidden(format!(
                 "{what} requires the daemon administrator"
@@ -187,7 +202,7 @@ impl Services {
     /// read, collaborator callers only) and requires membership there. An
     /// unknown agent is `NotFound` either way.
     pub(crate) async fn require_agent_member(&self, agent_id: &AgentId) -> Result<()> {
-        if gated_collaborator_caller("member").is_none() {
+        if gated_collaborator_caller("member")?.is_none() {
             return Ok(());
         }
         let workspace_id = self.agent_workspace(agent_id).await?;
@@ -206,7 +221,7 @@ impl Services {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<()> {
-        if gated_collaborator_caller("member").is_none() {
+        if gated_collaborator_caller("member")?.is_none() {
             return Ok(());
         }
         let agent_workspace = self.agent_workspace(agent_id).await?;
@@ -218,7 +233,7 @@ impl Services {
 
     /// Owner-only gate keyed by agent (see [`Self::require_agent_member`]).
     pub(crate) async fn require_agent_owner(&self, agent_id: &AgentId, what: &str) -> Result<()> {
-        if gated_collaborator_caller(what).is_none() {
+        if gated_collaborator_caller(what)?.is_none() {
             return Ok(());
         }
         let workspace_id = self.agent_workspace(agent_id).await?;
@@ -279,7 +294,7 @@ impl Services {
     /// The workspace ids a collaborator caller may see, or `None` when the
     /// caller is unconstrained. One query, independent of the list length.
     pub(crate) async fn visible_workspace_ids(&self) -> Result<Option<HashSet<WorkspaceId>>> {
-        let Some(principal_id) = collaborator_caller() else {
+        let Some(principal_id) = collaborator_caller()? else {
             return Ok(None);
         };
         Ok(Some(
@@ -295,7 +310,7 @@ impl Services {
     /// The workspace ids a collaborator caller *owns*, or `None` when the
     /// caller is unconstrained.
     pub(crate) async fn owned_workspace_ids(&self) -> Result<Option<HashSet<WorkspaceId>>> {
-        let Some(principal_id) = collaborator_caller() else {
+        let Some(principal_id) = collaborator_caller()? else {
             return Ok(None);
         };
         Ok(Some(
@@ -576,8 +591,9 @@ mod tests {
             .add_workspace_member(&ws, &collaborator.id, WorkspaceRole::Collaborator)
             .await
             .expect("collaborator");
+        let workspaces_root = tmp.path.parent().expect("temp db dir").join("workspaces");
         Fixture {
-            services: Services::new(store),
+            services: Services::new(store).with_workspaces_root(workspaces_root),
             ws,
             other_ws,
             primary,
@@ -624,8 +640,8 @@ mod tests {
         }
     }
 
-    /// Member+ (Read / Steer & edit): every member and every unconstrained
-    /// caller passes; a non-member is `NotFound`.
+    /// Member+ (Read / Steer & edit): every member and every bound
+    /// unconstrained caller passes; a non-member is `NotFound`.
     #[tokio::test]
     async fn member_class_by_role() {
         let tmp = TempDb::new();
@@ -660,7 +676,7 @@ mod tests {
         assert_eq!(cell(&missing), "not-found");
     }
 
-    /// Owner-only: the owner and every unconstrained caller pass; a
+    /// Owner-only: the owner and every bound unconstrained caller pass; a
     /// collaborator member is `Forbidden`; a non-member stays `NotFound`.
     #[tokio::test]
     async fn owner_class_by_role() {
@@ -738,9 +754,103 @@ mod tests {
                 ),
             }
         }
-        // An unbound context is not a collaborator (matches the transport's
-        // `is_non_administrator_caller`).
-        assert_eq!(cell(&Services::require_administrator("git.clone")), "ok");
+    }
+
+    /// Brief AC (multiplayer w3): an unbound context — no entry point bound a
+    /// `Caller` — is `Forbidden` (`-32003`) on every gate class and every
+    /// membership-narrowing read, never treated as the primary user. The
+    /// same calls pass as the daemon, so the refusal is the missing binding
+    /// and not the fixture.
+    #[tokio::test]
+    async fn unbound_caller_is_forbidden_on_every_gate() {
+        let tmp = TempDb::new();
+        let f = fixture(&tmp).await;
+        assert_eq!(intent_core::current_caller(), None);
+        let agent = AgentId::new();
+        let unbound: Vec<(&str, Result<()>)> = vec![
+            ("require_member", f.services.require_member(&f.ws).await),
+            (
+                "require_owner",
+                f.services.require_owner(&f.ws, "workspace.delete").await,
+            ),
+            (
+                "require_administrator",
+                Services::require_administrator("git.clone"),
+            ),
+            (
+                "require_agent_member",
+                f.services.require_agent_member(&agent).await,
+            ),
+            (
+                "require_agent_owner",
+                f.services.require_agent_owner(&agent, "agent.delete").await,
+            ),
+            (
+                "require_member_repo_path",
+                f.services.require_member_repo_path("/", "git.pull").await,
+            ),
+            (
+                "visible_workspace_ids",
+                f.services.visible_workspace_ids().await.map(drop),
+            ),
+            (
+                "owned_workspace_ids",
+                f.services.owned_workspace_ids().await.map(drop),
+            ),
+            (
+                "workspace.get",
+                f.services.get_workspace(f.ws.clone()).await.map(drop),
+            ),
+            (
+                "workspace.list",
+                f.services.list_workspaces(true).await.map(drop),
+            ),
+            (
+                "workspace.delete",
+                f.services.delete_workspace(f.ws.clone()).await.map(drop),
+            ),
+            (
+                "workspace.archive",
+                f.services
+                    .archive_workspace(f.ws.clone(), None)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "workspace.members.remove",
+                f.services
+                    .workspace_members_remove(f.ws.clone(), f.outsider.clone())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "host.exec",
+                f.services
+                    .host_exec(f.ws.clone(), json!({}))
+                    .await
+                    .map(drop),
+            ),
+        ];
+        for (gate, outcome) in unbound {
+            assert_eq!(cell(&outcome), "forbidden", "{gate} unbound: {outcome:?}");
+            assert_eq!(outcome.unwrap_err().code(), -32003, "{gate} unbound");
+        }
+        // The fixture itself is fine: the daemon passes the same gates.
+        assert_eq!(
+            cell(
+                &f.run(
+                    Role::Daemon,
+                    f.services.require_owner(&f.ws, "workspace.delete")
+                )
+                .await
+            ),
+            "ok"
+        );
+        assert!(f
+            .run(Role::Daemon, f.services.visible_workspace_ids())
+            .await
+            .expect("visible ids")
+            .is_none());
     }
 
     /// Cross-workspace visibility: a collaborator caller sees exactly its
