@@ -9,8 +9,9 @@
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ClientId, ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate,
-    NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode,
-    TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId, WorkspaceUpdate,
+    NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, RepoRef, ScriptCreateParams,
+    ScriptMode, TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId,
+    WorkspaceUpdate,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -2780,10 +2781,11 @@ async fn dispatch(
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let query = opt_str(params, "query");
+            let repos = opt_repo_refs(params, "repos")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_pulls_search(owner, repo, filter, state, query, limit, next_token)
+                .github_pulls_search(owner, repo, filter, state, query, repos, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2838,10 +2840,11 @@ async fn dispatch(
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let query = opt_str(params, "query");
+            let repos = opt_repo_refs(params, "repos")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_issues_search(owner, repo, filter, state, query, limit, next_token)
+                .github_issues_search(owner, repo, filter, state, query, repos, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -4148,6 +4151,39 @@ fn require_present(params: &Map<String, Value>, name: &str) -> Result<(), RpcErr
 /// Optional string param (absent/null/non-string → `None`).
 fn opt_str(params: &Map<String, Value>, name: &str) -> Option<String> {
     params.get(name).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Optional `[{ owner, repo }]` param (the `github.*.search` `repos` extras,
+/// §5.27): absent/null → empty. Anything else must be an array whose every
+/// entry is an object with non-empty string `owner` and `repo` → `-32602`
+/// naming the entry index otherwise. Dedup and the total-repo cap are applied
+/// downstream by the services layer.
+fn opt_repo_refs(params: &Map<String, Value>, name: &str) -> Result<Vec<RepoRef>, RpcErr> {
+    let entries = match params.get(name) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err(invalid_params(format!(
+                "{name} must be an array of {{ owner, repo }} objects"
+            )))
+        }
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let field = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        invalid_params(format!("{name}[{idx}].{key} must be a non-empty string"))
+                    })
+            };
+            Ok(RepoRef::new(field("owner")?, field("repo")?))
+        })
+        .collect()
 }
 
 /// Like [`opt_str`] but treats empty and whitespace-only values as absent, so

@@ -14795,7 +14795,7 @@ mod pr {
     use serde_json::json;
 
     use super::{test_tempdir, workspace, TempDb};
-    use crate::Services;
+    use crate::{github_ops, Services};
 
     // Test stub: one independent bool per scripted scenario.
     #[expect(clippy::struct_excessive_bools)]
@@ -14879,6 +14879,30 @@ mod pr {
         rate_limit_reset: Option<u64>,
         /// How many times `rate_limit_reset_at` was probed.
         seen_reset_probes: std::sync::Mutex<u64>,
+        /// Every [`PrQuery`] handed to `list_prs`, in call order (the
+        /// `github.pulls.search` `repos` tests assert `extra_repos`).
+        seen_pr_queries: std::sync::Mutex<Vec<PrQuery>>,
+        /// Every [`IssueQuery`] handed to `list_issues`, in call order.
+        seen_issue_queries: std::sync::Mutex<Vec<IssueQuery>>,
+    }
+
+    /// The blended multi-repo page a forge answers for a search whose
+    /// `extra_repos` is non-empty: one hit per scoped repo (the addressed
+    /// `repo` first, then the extras), each hit's URL naming ITS OWN repo,
+    /// newest-updated first, with a continuation cursor.
+    fn multi_repo_hits(repo: &RepoRef, extra_repos: &[RepoRef]) -> Vec<(u64, String, String)> {
+        std::iter::once(repo)
+            .chain(extra_repos.iter())
+            .enumerate()
+            .map(|(i, r)| {
+                let number = 100 + i as u64;
+                (
+                    number,
+                    format!("https://github.com/{}/{}", r.owner, r.name),
+                    format!("2026-01-0{}T00:00:00Z", 9 - i),
+                )
+            })
+            .collect()
     }
 
     fn sample_pr() -> PullRequest {
@@ -15072,7 +15096,8 @@ mod pr {
             }
             Ok(pr)
         }
-        async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
+        async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> ScResult<Page<PullRequest>> {
+            self.seen_pr_queries.lock().unwrap().push(query.clone());
             if self.rate_limited || self.rate_limited_list_prs {
                 return Err(ScError::RateLimited(
                     "API rate limit exceeded for user ID 526899.".into(),
@@ -15080,6 +15105,21 @@ mod pr {
             }
             if self.fail_list_prs {
                 return Err(intent_sourcecontrol::Error::Api("list_prs down".into()));
+            }
+            if !query.extra_repos.is_empty() {
+                let items = multi_repo_hits(repo, &query.extra_repos)
+                    .into_iter()
+                    .map(|(number, repo_url, updated_at)| PullRequest {
+                        number,
+                        url: format!("{repo_url}/pull/{number}"),
+                        updated_at,
+                        ..sample_pr()
+                    })
+                    .collect();
+                return Ok(Page {
+                    items,
+                    next_cursor: Some("2".into()),
+                });
             }
             let mut items = if self.discover {
                 vec![sample_pr()]
@@ -15354,7 +15394,23 @@ mod pr {
                 ..stub_issue()
             })
         }
-        async fn list_issues(&self, _: &RepoRef, _: IssueQuery) -> ScResult<Page<Issue>> {
+        async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> ScResult<Page<Issue>> {
+            self.seen_issue_queries.lock().unwrap().push(query.clone());
+            if !query.extra_repos.is_empty() {
+                let items = multi_repo_hits(repo, &query.extra_repos)
+                    .into_iter()
+                    .map(|(number, repo_url, updated_at)| Issue {
+                        number,
+                        url: format!("{repo_url}/issues/{number}"),
+                        updated_at,
+                        ..stub_issue()
+                    })
+                    .collect();
+                return Ok(Page {
+                    items,
+                    next_cursor: Some("2".into()),
+                });
+            }
             Ok(Page {
                 items: vec![stub_issue()],
                 next_cursor: None,
@@ -15387,6 +15443,15 @@ mod pr {
     }
 
     async fn setup_with(forge: StubForge, with_pr: bool) -> (TempDb, Services, WorkspaceId) {
+        setup_with_shared(Arc::new(forge), with_pr).await
+    }
+
+    /// [`setup_with`] over a shared forge handle, so a test can keep reading
+    /// the stub's recorders after the services took their clone.
+    async fn setup_with_shared(
+        forge: Arc<StubForge>,
+        with_pr: bool,
+    ) -> (TempDb, Services, WorkspaceId) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_id = WorkspaceId::new();
@@ -15398,7 +15463,7 @@ mod pr {
             ws.pr_number = Some(42);
         }
         store.insert_workspace(&ws).await.expect("ws");
-        let services = Services::new(store).with_source_control(Arc::new(forge));
+        let services = Services::new(store).with_source_control(forge);
         (tmp, services, ws_id)
     }
 
@@ -17143,12 +17208,16 @@ mod pr {
                 Some("created".into()),
                 Some("open".into()),
                 None,
+                Vec::new(),
                 Some(10),
                 None,
             )
             .await
             .unwrap();
         assert_eq!(s["pulls"][0]["number"], 42);
+        // Single-repo search pulls echo the addressed repo.
+        assert_eq!(s["pulls"][0]["owner"], "o");
+        assert_eq!(s["pulls"][0]["repo"], "r");
 
         assert!(svc
             .github_pulls_search(
@@ -17157,11 +17226,254 @@ mod pr {
                 Some("nope".into()),
                 None,
                 None,
+                Vec::new(),
                 None,
                 None
             )
             .await
             .is_err());
+    }
+
+    /// `github.pulls.search` with `repos` extras: the normalized extras
+    /// (primary + repeats dropped, order kept) reach the engine as
+    /// `PrQuery.extra_repos` in ONE call, every returned pull carries the
+    /// `owner` / `repo` of ITS OWN hit (caller casing echoed for scoped
+    /// repos), the blended page keeps the engine's updated-desc order, and
+    /// the continuation cursor round-trips as `nextToken`.
+    #[tokio::test]
+    async fn github_pulls_search_multi_repo_attributes_each_hit() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let s = svc
+            .github_pulls_search(
+                "Intent-HQ".into(),
+                "intent".into(),
+                None,
+                None,
+                None,
+                vec![
+                    RepoRef::new("intent-hq", "Intent"),
+                    RepoRef::new("intent-hq", "intentd"),
+                    RepoRef::new("INTENT-HQ", "INTENTD"),
+                    RepoRef::new("intent-hq", "cloudlands-fe"),
+                ],
+                Some(10),
+                None,
+            )
+            .await
+            .unwrap();
+        let pulls = s["pulls"].as_array().unwrap();
+        assert_eq!(pulls.len(), 3, "one blended hit per scoped repo: {s}");
+        let attributed: Vec<(&str, &str, u64)> = pulls
+            .iter()
+            .map(|p| {
+                (
+                    p["owner"].as_str().unwrap(),
+                    p["repo"].as_str().unwrap(),
+                    p["number"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            attributed,
+            vec![
+                ("Intent-HQ", "intent", 100),
+                ("intent-hq", "intentd", 101),
+                ("intent-hq", "cloudlands-fe", 102),
+            ]
+        );
+        let updated: Vec<&str> = pulls
+            .iter()
+            .map(|p| p["updatedAt"].as_str().unwrap())
+            .collect();
+        let mut sorted = updated.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(updated, sorted, "blended page is updated-desc");
+        assert_eq!(
+            github_ops::decode_next_token(s["nextToken"].as_str()).as_deref(),
+            Some("2")
+        );
+
+        let queries = forge.seen_pr_queries.lock().unwrap();
+        assert_eq!(queries.len(), 1, "ONE engine call, no fan-out");
+        assert_eq!(
+            queries[0].extra_repos,
+            vec![
+                RepoRef::new("intent-hq", "intentd"),
+                RepoRef::new("intent-hq", "cloudlands-fe"),
+            ]
+        );
+        // A blank query with extras still routes through search (the engine
+        // sees `search: None` + extras; it owns the search routing).
+        assert_eq!(queries[0].search, None);
+    }
+
+    /// `github.issues.search` with `repos` extras mirrors the pulls surface:
+    /// ONE engine call carrying `IssueQuery.extra_repos`, each issue's
+    /// `owner` / `repo` derived from its own hit (not echoed from the request
+    /// params), updated-desc order preserved, cursor round-tripped.
+    #[tokio::test]
+    async fn github_issues_search_multi_repo_attributes_each_hit() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let s = svc
+            .github_issues_search(
+                "intent-hq".into(),
+                "intent".into(),
+                Some("all".into()),
+                Some("open".into()),
+                Some("  crash  ".into()),
+                vec![
+                    RepoRef::new("intent-hq", "intentd"),
+                    RepoRef::new("intent-hq", "intent"),
+                ],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let issues = s["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 2, "{s}");
+        assert_eq!(issues[0]["owner"], "intent-hq");
+        assert_eq!(issues[0]["repo"], "intent");
+        assert_eq!(issues[0]["number"], 100);
+        assert_eq!(issues[1]["owner"], "intent-hq");
+        assert_eq!(issues[1]["repo"], "intentd");
+        assert_eq!(issues[1]["number"], 101);
+        assert_eq!(
+            issues[1]["htmlUrl"],
+            "https://github.com/intent-hq/intentd/issues/101"
+        );
+        assert!(issues[0]["updatedAt"].as_str() > issues[1]["updatedAt"].as_str());
+        assert_eq!(
+            github_ops::decode_next_token(s["nextToken"].as_str()).as_deref(),
+            Some("2")
+        );
+
+        let queries = forge.seen_issue_queries.lock().unwrap();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(
+            queries[0].extra_repos,
+            vec![RepoRef::new("intent-hq", "intentd")]
+        );
+        assert_eq!(queries[0].search.as_deref(), Some("crash"));
+        assert_eq!(queries[0].state.as_deref(), Some("open"));
+    }
+
+    /// `repos` absent/empty leaves both searches on the pre-existing path:
+    /// the engine sees an empty `extra_repos`, the single-repo item shapes
+    /// echo the request params.
+    #[tokio::test]
+    async fn github_search_without_repos_is_unchanged() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        svc.github_issues_search(
+            "o".into(),
+            "r".into(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        svc.github_pulls_search(
+            "o".into(),
+            "r".into(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(forge.seen_issue_queries.lock().unwrap()[0]
+            .extra_repos
+            .is_empty());
+        assert!(forge.seen_pr_queries.lock().unwrap()[0]
+            .extra_repos
+            .is_empty());
+    }
+
+    /// The `repos` extras are capped so the whole search spans at most 6
+    /// repositories: a seventh distinct repo is `-32602`, and the engine is
+    /// never called.
+    #[tokio::test]
+    async fn github_search_rejects_more_than_six_repos() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let six_extras: Vec<RepoRef> = (1..=6)
+            .map(|i| RepoRef::new("o", format!("r{i}")))
+            .collect();
+        let err = svc
+            .github_pulls_search(
+                "o".into(),
+                "r".into(),
+                None,
+                None,
+                None,
+                six_extras.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        let err = svc
+            .github_issues_search(
+                "o".into(),
+                "r".into(),
+                None,
+                None,
+                None,
+                six_extras.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        assert!(forge.seen_pr_queries.lock().unwrap().is_empty());
+        assert!(forge.seen_issue_queries.lock().unwrap().is_empty());
+
+        // Exactly six (primary + 5 extras) passes.
+        let five_extras = six_extras[..5].to_vec();
+        svc.github_pulls_search(
+            "o".into(),
+            "r".into(),
+            None,
+            None,
+            None,
+            five_extras.clone(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        svc.github_issues_search(
+            "o".into(),
+            "r".into(),
+            None,
+            None,
+            None,
+            five_extras.clone(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            forge.seen_pr_queries.lock().unwrap()[0].extra_repos,
+            five_extras
+        );
+        assert_eq!(
+            forge.seen_issue_queries.lock().unwrap()[0].extra_repos,
+            five_extras
+        );
     }
 
     #[tokio::test]
@@ -17240,6 +17552,7 @@ mod pr {
                 Some("assigned".into()),
                 Some("open".into()),
                 None,
+                Vec::new(),
                 None,
                 None,
             )
@@ -17256,6 +17569,7 @@ mod pr {
                 Some("review-requested".into()),
                 None,
                 None,
+                Vec::new(),
                 None,
                 None,
             )

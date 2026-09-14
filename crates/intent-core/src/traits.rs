@@ -25,6 +25,7 @@ use crate::model::{
     TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
     WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
+use crate::repo_ref::RepoRef;
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
 /// as `Arc<dyn WorkspaceApi>` (the agent→BE callback handle, §6.8).
@@ -3941,7 +3942,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `github.pulls.search`: `GET /search/issues` (`is:pr` + `@me`
-    /// involvement + free-text `query`) → `{ pulls, nextToken }`.
+    /// involvement + free-text `query`, optionally spanning the `repos`
+    /// extras in one request) → `{ pulls, nextToken }`; every pull carries
+    /// its own `owner` / `repo`.
     #[expect(clippy::too_many_arguments)]
     fn github_pulls_search(
         &self,
@@ -3950,10 +3953,11 @@ pub trait WorkspaceApi: Send + Sync {
         filter: Option<String>,
         state: Option<String>,
         query: Option<String>,
+        repos: Vec<RepoRef>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, filter, state, query, limit, next_token);
+        let _ = (owner, repo, filter, state, query, repos, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_pulls_search not implemented".to_string(),
@@ -4146,7 +4150,8 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `github.issues.search`: `GET /search/issues` (`is:issue` + free-text
-    /// `query`) → `{ issues, nextToken }`.
+    /// `query`, optionally spanning the `repos` extras in one request) →
+    /// `{ issues, nextToken }`; every issue carries its own `owner` / `repo`.
     #[expect(clippy::too_many_arguments)]
     fn github_issues_search(
         &self,
@@ -4155,10 +4160,11 @@ pub trait WorkspaceApi: Send + Sync {
         filter: Option<String>,
         state: Option<String>,
         query: Option<String>,
+        repos: Vec<RepoRef>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, filter, state, query, limit, next_token);
+        let _ = (owner, repo, filter, state, query, repos, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_issues_search not implemented".to_string(),
