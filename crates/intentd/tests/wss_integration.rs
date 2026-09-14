@@ -5055,9 +5055,13 @@ async fn multi_bind_serves_every_configured_address() {
 ///   `SO_REUSEADDR` listen on it still succeeds (two reuse-address sockets may
 ///   share an endpoint when the earlier one is not listening). What it does
 ///   NOT exclude is another explicit `SO_REUSEADDR` bind+listen on `::1:port`
-///   — and nothing in this suite performs one: every remembered-port rebind
-///   (`free_port()` callers, the daemon's default bind set) targets
-///   `127.0.0.1`, which is why the IPv6 side is the one meant to succeed.
+///   — and no remembered-port rebind in this suite can reach one: the
+///   IPv4-only rebinders (`free_port()` callers, the daemon's default bind
+///   set) never touch `::1`, and the dual-stack rebinders
+///   (`runtime_bind_address_list_applies_and_validates`,
+///   `multi_bind_serves_every_configured_address`) bind `127.0.0.1` first, so
+///   the listening blocker fails them before their `::1` bind runs. That is
+///   why the IPv6 side is the one meant to succeed.
 ///
 /// Reservation of the pair is retried on a fresh ephemeral port when
 /// `::1:port` happens to be taken already; the server bind itself is never
