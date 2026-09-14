@@ -4424,7 +4424,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// whole) and typing target → `{ ok: true, typingSource }`, where
     /// `typingSource` is the connection's own opaque, daemon-minted typing
     /// source handle (the `source` its typing entry carries in
-    /// `presence:changed`, so the client can suppress only itself). Requires
+    /// `presence:changed`, so the client can suppress only itself). Every
+    /// update naming a typing agent is a keystroke pulse: the entry's
+    /// `pulse` counter advances (a receiver restarts its expiry timer on an
+    /// unseen `(source, pulse)`, never on wall clocks) while `since` stays
+    /// the episode start; other connections' updates re-project the entry
+    /// unchanged. Requires
     /// a hello'd connection; every focused workspace and the typing agent's
     /// workspace must be a member workspace (`NotFound` otherwise). Publishes
     /// `presence:changed` to each workspace whose aggregate changed.

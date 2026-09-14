@@ -15,9 +15,15 @@
 //!   `typing` entry per connection typing to an agent there — keyed by an
 //!   opaque, daemon-minted per-connection *typing source* (random, never
 //!   derived from the client id, host or device) so a receiver can suppress
-//!   its own keystrokes and expire each source independently by its `since`
-//!   stamp; the connection learns its own handle from the `presence.update`
-//!   reply. Emitted per workspace on every transition that can change the
+//!   its own keystrokes and expire each source independently. Freshness is
+//!   the entry's `pulse`: a per-connection counter bumped by every
+//!   `presence.update` that names a typing agent (the client's throttled
+//!   keystroke pulse) and left alone when another connection's update, a
+//!   hello or a focus change merely re-projects the roster — a receiver
+//!   restarts its expiry timer on a `(source, pulse)` it has not seen and
+//!   never compares wall clocks; `since` is the episode start only. The
+//!   connection learns its own handle from the `presence.update` reply.
+//!   Emitted per workspace on every transition that can change the
 //!   roster: a principal's first hello'd connection / last connection gone
 //!   (to every member workspace), and a `presence.update` (to the workspaces
 //!   it left and entered). `presence.snapshot` reads the same roster on
@@ -153,13 +159,15 @@ impl Focus {
 }
 
 /// The connection's typing target: `agent` (in `workspace`) since `since`
-/// (ISO-8601; kept across repeated `presence.update`s naming the same agent
-/// so an unrelated roster refresh never restarts a receiver's expiry timer).
+/// (ISO-8601 episode start, kept across repeated `presence.update`s naming
+/// the same agent) at activity `pulse` (the connection's typing-pulse count
+/// when this entry was last asserted — the receiver's freshness signal).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Typing {
     agent: String,
     workspace: String,
     since: String,
+    pulse: u64,
 }
 
 /// One live connection's presence row.
@@ -171,6 +179,8 @@ struct Conn {
     /// The connection's opaque typing source handle: a fresh random id per
     /// connection, unrelated to the client id, host or device.
     typing_source: String,
+    /// `presence.update`s naming a typing agent seen on this connection.
+    typing_pulses: u64,
     focus: Vec<Focus>,
     typing: Option<Typing>,
     /// Note-presence leases held by this connection: lease id → note.
@@ -183,6 +193,7 @@ impl Conn {
             principal,
             hello: false,
             typing_source: format!("ts-{}", uuid::Uuid::new_v4().simple()),
+            typing_pulses: 0,
             focus: Vec::new(),
             typing: None,
             leases: HashMap::new(),
@@ -263,8 +274,8 @@ impl State {
     /// The `presence:changed` roster of `workspace_id`: its online members
     /// (`members` is the store's membership list) with their focus items in
     /// this workspace aggregated over connections and one typing entry
-    /// `{ source, agentId, since }` per typing connection (never merged:
-    /// two clients of one person stay two sources).
+    /// `{ source, agentId, since, pulse }` per typing connection (never
+    /// merged: two clients of one person stay two sources).
     fn roster(&self, workspace_id: &str, members: &[PrincipalId]) -> Vec<Value> {
         members
             .iter()
@@ -286,7 +297,12 @@ impl State {
                 let typing: Vec<Value> = typing
                     .into_iter()
                     .map(|(source, t)| {
-                        json!({ "source": source, "agentId": t.agent, "since": t.since })
+                        json!({
+                            "source": source,
+                            "agentId": t.agent,
+                            "since": t.since,
+                            "pulse": t.pulse,
+                        })
                     })
                     .collect();
                 let profile = self.profile(p);
@@ -581,8 +597,11 @@ impl Services {
             let before = conn.workspaces();
             conn.focus = focus;
             conn.typing = typing.map(|(agent, workspace)| {
-                // The same target keeps its `since`: a receiver's expiry
-                // timer only restarts on a genuinely new typing episode.
+                // Every update naming a typing agent is a keystroke pulse:
+                // it bumps this connection's `pulse` (the receiver's
+                // freshness signal) while the same target keeps its
+                // episode-start `since`.
+                conn.typing_pulses += 1;
                 let since = match &conn.typing {
                     Some(t) if t.agent == agent => t.since.clone(),
                     _ => now_iso(),
@@ -591,6 +610,7 @@ impl Services {
                     agent,
                     workspace,
                     since,
+                    pulse: conn.typing_pulses,
                 }
             });
             (
