@@ -4416,7 +4416,9 @@ async fn wss_collaborator_event_fan_out_and_query_are_allowlisted() {
 /// that keeps the stream polled (so tungstenite answers every server ping and
 /// the connection is never reaped while the test talks to another client)
 /// and forwards each text frame. Aborting the reader makes the connection
-/// go silent — the heartbeat-drop scenario.
+/// go silent — the heartbeat-drop scenario. Every frame a matcher skips is
+/// kept in `skipped`, so a negative check ("this client never received X")
+/// covers the whole session, not only the tail.
 struct PresenceClient {
     tx: futures_util::stream::SplitSink<
         tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
@@ -4424,6 +4426,7 @@ struct PresenceClient {
     >,
     rx: tokio::sync::mpsc::UnboundedReceiver<Value>,
     reader: tokio::task::JoinHandle<()>,
+    skipped: Vec<Value>,
 }
 
 impl PresenceClient {
@@ -4442,7 +4445,12 @@ impl PresenceClient {
                 }
             }
         });
-        Self { tx, rx, reader }
+        Self {
+            tx,
+            rx,
+            reader,
+            skipped: Vec::new(),
+        }
     }
 
     /// The next frame, or `None` after `wait`.
@@ -4469,6 +4477,7 @@ impl PresenceClient {
             if v["id"] == id {
                 return v;
             }
+            self.skipped.push(v);
         }
     }
 
@@ -4483,6 +4492,7 @@ impl PresenceClient {
             if v["method"] == "subscription.push" && v["params"]["subscriptionId"] == sub {
                 return v["params"].clone();
             }
+            self.skipped.push(v);
         }
     }
 
@@ -4496,6 +4506,7 @@ impl PresenceClient {
             if v["method"] == "events.event" && v["params"]["event"]["type"] == event_type {
                 return v["params"]["event"].clone();
             }
+            self.skipped.push(v);
         }
     }
 
@@ -4507,6 +4518,18 @@ impl PresenceClient {
             out.push(v);
         }
         out
+    }
+
+    /// Every `events.event` of `event_type` this client has EVER received —
+    /// the frames the matchers skipped plus a final drain.
+    async fn all_events(&mut self, event_type: &str) -> Vec<Value> {
+        let tail = self.drain().await;
+        self.skipped
+            .iter()
+            .chain(tail.iter())
+            .filter(|v| v["method"] == "events.event" && v["params"]["event"]["type"] == event_type)
+            .map(|v| v["params"]["event"].clone())
+            .collect()
     }
 
     /// Clean close: a `Close` frame, then the reader ends with the stream.
@@ -4549,12 +4572,15 @@ async fn seed_principal(store: &Store, login: &str, token: &str) -> intent_core:
 /// `presence:changed` with its `presence.update` focus; `note.presence.subscribe`
 /// answers the seq-0 `{ viewers }` snapshot (the subscriber included) and
 /// then the `joined` / `updated` / `left` deltas of the other viewers of THAT
-/// note — a member subscribed to a different note receives none of them; a
-/// `note.presence.update` without a lease is `-32602 invalid-params`; a
-/// non-member's subscribe (and `presence.update` focus) is the same
-/// `-32602 { code: "not-found" }` as a nonexistent workspace; unsubscribe and
-/// a clean close both publish `left`, the close also taking the member
-/// offline; nothing is persisted — `event.query` has no presence rows.
+/// note — a member subscribed to a different note receives none of them, and
+/// neither does a raw `events.subscribe` on `note:*` / `note:presence`
+/// (owner or collaborator, lease or not): `note:presence` travels only on
+/// the note channel; a `note.presence.update` without a lease is `-32602
+/// invalid-params`; a non-member's subscribe (and `presence.update` focus) is
+/// the same `-32602 { code: "not-found" }` as a nonexistent workspace;
+/// unsubscribe and a clean close both publish `left`, the close also taking
+/// the member offline; nothing is persisted — `event.query` has no presence
+/// rows.
 #[intent_test_macros::daemon_test]
 async fn wss_presence_channel_join_delta_leave_and_gating() {
     use intent_core::events::{NOTE_PRESENCE, PRESENCE_CHANGED};
@@ -4582,18 +4608,21 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     let ws = ws_id.0.clone();
     let spec = json!({ "workspaceId": ws, "noteId": "spec" });
 
-    // The owner watches workspace presence and (later) a different note.
+    // The owner watches workspace presence — and, on the raw firehose, every
+    // `note:*` type plus `note:presence` by name — and (later) a different
+    // note's channel.
     let mut owner = PresenceClient::open(srv.port, srv.cfg.clone(), TOKEN).await;
     let v = owner
         .call(
             1,
             "events.subscribe",
-            json!({ "eventTypes": [PRESENCE_CHANGED], "workspaceId": ws }),
+            json!({ "eventTypes": [PRESENCE_CHANGED, "note:*", NOTE_PRESENCE], "workspaceId": ws }),
         )
         .await;
     assert!(v["result"]["subscriptionId"].is_string(), "{v}");
 
     // Alice comes online: hello → `presence:changed` lists her, no focus yet.
+    // She also raw-subscribes `note:*` as a collaborator.
     let mut alice_c = PresenceClient::open(srv.port, srv.cfg.clone(), &alice_token).await;
     let v = alice_c
         .call(
@@ -4603,6 +4632,14 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
         )
         .await;
     assert!(v.get("error").is_none(), "alice hello: {v}");
+    let v = alice_c
+        .call(
+            10,
+            "events.subscribe",
+            json!({ "eventTypes": ["note:*"], "workspaceId": ws }),
+        )
+        .await;
+    assert!(v["result"]["subscriptionId"].is_string(), "{v}");
     let ev = owner.event(PRESENCE_CHANGED).await;
     assert_eq!(ev["workspaceId"], ws, "{ev}");
     assert_eq!(
@@ -4620,7 +4657,13 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
             json!({ "focus": [{ "workspaceId": ws, "noteId": "spec" }] }),
         )
         .await;
-    assert_eq!(v["result"], json!({ "ok": true }), "{v}");
+    assert_eq!(v["result"]["ok"], true, "{v}");
+    assert!(
+        v["result"]["typingSource"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("ts-")),
+        "presence.update returns the connection's typing source: {v}"
+    );
     let ev = owner.event(PRESENCE_CHANGED).await;
     assert_eq!(ev["data"]["members"][0]["principalId"], alice.id.0, "{ev}");
     assert_eq!(
@@ -4810,16 +4853,30 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     );
     assert_eq!(ev["data"]["members"][0]["principalId"], alice.id.0, "{ev}");
 
-    // The owner never received a spec presence frame on its `other` channel.
-    let stray: Vec<Value> = owner
-        .drain()
-        .await
-        .into_iter()
+    // The owner never received a spec presence frame on its `other` channel,
+    // and the raw firehose carried no `note:presence` at all — not to the
+    // owner (`note:*` + exact type), not to Alice (`note:*`, lease holder) —
+    // even though the spec channel delivered joined / updated / left.
+    let tail = owner.drain().await;
+    let stray: Vec<&Value> = owner
+        .skipped
+        .iter()
+        .chain(tail.iter())
         .filter(|v| v["method"] == "subscription.push")
         .collect();
     assert!(
         stray.is_empty(),
         "a member subscribed to another note receives no note:presence frames: {stray:?}"
+    );
+    let raw_owner = owner.all_events(NOTE_PRESENCE).await;
+    assert!(
+        raw_owner.is_empty(),
+        "raw events.subscribe (owner) must never carry note:presence: {raw_owner:?}"
+    );
+    let raw_alice = alice_c.all_events(NOTE_PRESENCE).await;
+    assert!(
+        raw_alice.is_empty(),
+        "raw events.subscribe (collaborator) must never carry note:presence: {raw_alice:?}"
     );
 
     // Transient only: no presence rows in the durable log.
@@ -4933,6 +4990,299 @@ async fn wss_presence_heartbeat_drop_removes_viewer_and_marks_offline() {
 
     drop(bob_c);
     alice_c.close().await;
+    srv.ws.stop().await;
+}
+
+/// Multiplayer w5: typing is per CLIENT, keyed by an opaque daemon-minted
+/// source, and the roster is readable on demand. Two connections of one
+/// principal (same `clientId`) get distinct `typingSource`s from
+/// `presence.update`; the roster lists one `{ source, agentId, since }` per
+/// typing connection (never merged), so a client suppresses only the entry
+/// carrying its own handle; a `since` stays put across an unrelated roster
+/// refresh (a receiver's expiry timer never restarts) and each source clears
+/// independently (typing `null`, then the connection's close). Sources never
+/// expose the client id or host. `presence.snapshot` answers the current
+/// roster to a client that hello'd before attaching any subscription and to
+/// a second connection of an already-online principal (whose hello
+/// publishes nothing); a non-member gets `-32602 "Workspace not found"`.
+#[intent_test_macros::daemon_test]
+async fn wss_presence_typing_sources_and_snapshot() {
+    use intent_core::events::PRESENCE_CHANGED;
+    use intent_core::{AgentId, AgentSession, AgentStatus, WorkspaceRole};
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let ws_id = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws_id))
+        .await
+        .expect("insert workspace");
+    let ts = now_iso();
+    srv.store
+        .insert_agent_session(&AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId("agent-typing".to_string()),
+            workspace_id: ws_id.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Typing Target".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            messages: vec![],
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            retired_at: None,
+            notifications_muted: false,
+        })
+        .await
+        .expect("insert agent session");
+    let alice_token = "f6".repeat(32);
+    let bob_token = "a7".repeat(32);
+    let mallory_token = "b8".repeat(32);
+    let alice = seed_principal(&srv.store, "alice", &alice_token).await;
+    let bob = seed_principal(&srv.store, "bob", &bob_token).await;
+    let _mallory = seed_principal(&srv.store, "mallory", &mallory_token).await;
+    for member in [&alice.id, &bob.id] {
+        srv.store
+            .add_workspace_member(&ws_id, member, WorkspaceRole::Collaborator)
+            .await
+            .expect("add collaborator");
+    }
+    let ws = ws_id.0.clone();
+    let hello = json!({ "clientId": "cli-alice", "name": "Alice" });
+    let typing = json!({ "focus": [], "typing": { "agentId": "agent-typing" } });
+    let alice_row = |ev: &Value| -> Value {
+        ev["data"]["members"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .find(|m| m["principalId"] == alice.id.0)
+            .cloned()
+            .unwrap_or_else(|| panic!("alice missing from roster: {ev}"))
+    };
+
+    let mut owner = PresenceClient::open(srv.port, srv.cfg.clone(), TOKEN).await;
+    let v = owner
+        .call(
+            1,
+            "events.subscribe",
+            json!({ "eventTypes": [PRESENCE_CHANGED], "workspaceId": ws }),
+        )
+        .await;
+    assert!(v["result"]["subscriptionId"].is_string(), "{v}");
+
+    // Alice's first connection: hello → online.
+    let mut a1 = PresenceClient::open(srv.port, srv.cfg.clone(), &alice_token).await;
+    let v = a1.call(1, "client.hello", hello.clone()).await;
+    assert!(v.get("error").is_none(), "a1 hello: {v}");
+    let ev = owner.event(PRESENCE_CHANGED).await;
+    assert_eq!(alice_row(&ev)["typing"], json!([]), "{ev}");
+
+    // Bob hello's BEFORE attaching anything: his hello publishes to the
+    // owner, but nothing tells Bob who is online — the snapshot does.
+    let mut bob_c = PresenceClient::open(srv.port, srv.cfg.clone(), &bob_token).await;
+    let v = bob_c
+        .call(1, "client.hello", json!({ "clientId": "cli-bob" }))
+        .await;
+    assert!(v.get("error").is_none(), "bob hello: {v}");
+    let _ = owner.event(PRESENCE_CHANGED).await;
+    let v = bob_c
+        .call(
+            2,
+            "events.subscribe",
+            json!({ "eventTypes": [PRESENCE_CHANGED], "workspaceId": ws }),
+        )
+        .await;
+    assert!(v["result"]["subscriptionId"].is_string(), "{v}");
+    let v = bob_c
+        .call(3, "presence.snapshot", json!({ "workspaceId": ws }))
+        .await;
+    assert_eq!(v["result"]["workspaceId"], ws, "{v}");
+    let mut online: Vec<String> = v["result"]["members"]
+        .as_array()
+        .unwrap_or_else(|| panic!("snapshot members: {v}"))
+        .iter()
+        .map(|m| m["principalId"].as_str().expect("principalId").to_string())
+        .collect();
+    online.sort();
+    let mut both = vec![alice.id.0.clone(), bob.id.0.clone()];
+    both.sort();
+    assert_eq!(online, both, "hello-before-subscribe sees the roster: {v}");
+    assert_eq!(
+        alice_row(&json!({ "data": v["result"] })),
+        json!({ "principalId": alice.id.0, "login": "alice", "displayName": null,
+                "avatarUrl": null, "focus": [], "typing": [] }),
+        "snapshot rows match the presence:changed member shape: {v}"
+    );
+
+    // Alice's second connection, same clientId: already online, so the hello
+    // publishes nothing — the snapshot is how it learns the roster.
+    let mut a2 = PresenceClient::open(srv.port, srv.cfg.clone(), &alice_token).await;
+    let v = a2.call(1, "client.hello", hello).await;
+    assert!(v.get("error").is_none(), "a2 hello: {v}");
+    let v = a2
+        .call(2, "presence.snapshot", json!({ "workspaceId": ws }))
+        .await;
+    let mut online: Vec<String> = v["result"]["members"]
+        .as_array()
+        .unwrap_or_else(|| panic!("snapshot members: {v}"))
+        .iter()
+        .map(|m| m["principalId"].as_str().expect("principalId").to_string())
+        .collect();
+    online.sort();
+    assert_eq!(online, both, "second connection sees the roster: {v}");
+    assert!(
+        owner
+            .drain()
+            .await
+            .iter()
+            .all(|f| f["method"] != "events.event"),
+        "a second connection of an online principal publishes no roster change"
+    );
+
+    // A1 types: its own source comes back in the reply and in the roster.
+    let v = a1.call(2, "presence.update", typing.clone()).await;
+    assert_eq!(v["result"]["ok"], true, "{v}");
+    let s1 = v["result"]["typingSource"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a1 typingSource: {v}"))
+        .to_string();
+    assert!(s1.starts_with("ts-"), "{s1}");
+    assert!(
+        !s1.contains("cli-alice") && !s1.contains("Alice"),
+        "the source is opaque, not the client id: {s1}"
+    );
+    let ev = owner.event(PRESENCE_CHANGED).await;
+    let row = alice_row(&ev);
+    assert_eq!(row["typing"].as_array().map(Vec::len), Some(1), "{ev}");
+    assert_eq!(row["typing"][0]["source"], s1, "{ev}");
+    assert_eq!(row["typing"][0]["agentId"], "agent-typing", "{ev}");
+    let since1 = row["typing"][0]["since"]
+        .as_str()
+        .unwrap_or_else(|| panic!("since: {ev}"))
+        .to_string();
+
+    // A2 types too: a second, distinct source; A1's entry keeps its `since`.
+    // A1 suppressing its own handle is left with exactly A2's entry.
+    let v = a2.call(3, "presence.update", typing.clone()).await;
+    let s2 = v["result"]["typingSource"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a2 typingSource: {v}"))
+        .to_string();
+    assert_ne!(s1, s2, "two connections of one principal are two sources");
+    let ev = owner.event(PRESENCE_CHANGED).await;
+    let entries = alice_row(&ev)["typing"]
+        .as_array()
+        .cloned()
+        .expect("typing");
+    assert_eq!(entries.len(), 2, "not merged by principal: {ev}");
+    let mine = entries
+        .iter()
+        .find(|t| t["source"] == s1)
+        .expect("a1 entry");
+    assert_eq!(mine["since"], since1, "a1's since is stable: {ev}");
+    let others: Vec<&Value> = entries.iter().filter(|t| t["source"] != s1).collect();
+    assert_eq!(others.len(), 1, "{ev}");
+    assert_eq!(others[0]["source"], s2, "{ev}");
+    assert_eq!(others[0]["agentId"], "agent-typing", "{ev}");
+    let since2 = others[0]["since"].as_str().expect("since").to_string();
+
+    // An unrelated roster change (Bob's focus) re-sends both entries with
+    // their original `since` stamps — no timer restarts.
+    let v = bob_c
+        .call(
+            4,
+            "presence.update",
+            json!({ "focus": [{ "workspaceId": ws, "noteId": "spec" }] }),
+        )
+        .await;
+    assert_eq!(v["result"]["ok"], true, "{v}");
+    let ev = owner.event(PRESENCE_CHANGED).await;
+    let mut stamps: Vec<(String, String)> = alice_row(&ev)["typing"]
+        .as_array()
+        .expect("typing")
+        .iter()
+        .map(|t| {
+            (
+                t["source"].as_str().expect("source").to_string(),
+                t["since"].as_str().expect("since").to_string(),
+            )
+        })
+        .collect();
+    stamps.sort();
+    let mut expected = vec![(s1.clone(), since1.clone()), (s2.clone(), since2)];
+    expected.sort();
+    assert_eq!(stamps, expected, "unrelated update keeps the stamps: {ev}");
+
+    // A2 clears its typing: only its source disappears.
+    let v = a2
+        .call(4, "presence.update", json!({ "focus": [], "typing": null }))
+        .await;
+    assert_eq!(
+        v["result"]["typingSource"], s2,
+        "the handle is stable per connection: {v}"
+    );
+    let ev = owner.event(PRESENCE_CHANGED).await;
+    assert_eq!(
+        alice_row(&ev)["typing"],
+        json!([{ "source": s1, "agentId": "agent-typing", "since": since1 }]),
+        "{ev}"
+    );
+
+    // A1 closes: its source goes with it; Alice stays online through A2.
+    a1.close().await;
+    let ev = owner.event(PRESENCE_CHANGED).await;
+    let row = alice_row(&ev);
+    assert_eq!(
+        row["typing"],
+        json!([]),
+        "closed connection's source cleared: {ev}"
+    );
+
+    // A non-member sees no workspace.
+    let mut mallory_c = PresenceClient::open(srv.port, srv.cfg.clone(), &mallory_token).await;
+    let v = mallory_c
+        .call(1, "presence.snapshot", json!({ "workspaceId": ws }))
+        .await;
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert_eq!(v["error"]["message"], "Workspace not found", "{v}");
+    assert_eq!(v["error"]["data"]["code"], "not-found", "{v}");
+
+    a2.close().await;
+    bob_c.close().await;
+    mallory_c.close().await;
+    owner.close().await;
     srv.ws.stop().await;
 }
 

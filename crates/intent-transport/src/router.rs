@@ -3019,6 +3019,14 @@ async fn dispatch(
             let r = api.principal_revoke_self().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        // `presence.snapshot` (multiplayer w5): the current `presence:changed`
+        // roster of a member workspace, on demand. Member+; a non-member is
+        // `-32602 not-found` like any other membership-narrowed read.
+        "presence.snapshot" => {
+            let id = require_workspace_id(params)?;
+            let r = api.presence_snapshot(id).await.map_err(workspace_err)?;
+            Ok(r)
+        }
         // `linear.*` (§5.28) is daemon-owned and global: no `workspaceId`. A key
         // that is absent or fails the `viewer` probe ("not configured") and any
         // other Linear failure surface as `-32603`; an invalid `filter` is

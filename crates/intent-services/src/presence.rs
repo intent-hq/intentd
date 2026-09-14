@@ -11,11 +11,17 @@
 //! - **Workspace presence** — `presence:changed { workspaceId, members }` is
 //!   the roster of the workspace's currently-online members (a member is
 //!   online while it has at least one hello'd connection), each with the
-//!   focus items *in that workspace* and the agents it is typing to,
-//!   aggregated over its connections. Emitted per workspace on every
-//!   transition that can change the roster: a principal's first hello'd
-//!   connection / last connection gone (to every member workspace), and a
-//!   `presence.update` (to the workspaces it left and entered).
+//!   focus items *in that workspace* aggregated over its connections and one
+//!   `typing` entry per connection typing to an agent there — keyed by an
+//!   opaque, daemon-minted per-connection *typing source* (random, never
+//!   derived from the client id, host or device) so a receiver can suppress
+//!   its own keystrokes and expire each source independently by its `since`
+//!   stamp; the connection learns its own handle from the `presence.update`
+//!   reply. Emitted per workspace on every transition that can change the
+//!   roster: a principal's first hello'd connection / last connection gone
+//!   (to every member workspace), and a `presence.update` (to the workspaces
+//!   it left and entered). `presence.snapshot` reads the same roster on
+//!   demand for a client that attached its subscription after its hello.
 //! - **Note presence** — a `note.presence.subscribe` holds a *lease* on a
 //!   note for its connection; a principal is a viewer while any of its
 //!   leases is live. `note:presence { kind: joined | updated | left }`
@@ -144,15 +150,27 @@ impl Focus {
     }
 }
 
+/// The connection's typing target: `agent` (in `workspace`) since `since`
+/// (ISO-8601; kept across repeated `presence.update`s naming the same agent
+/// so an unrelated roster refresh never restarts a receiver's expiry timer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Typing {
+    agent: String,
+    workspace: String,
+    since: String,
+}
+
 /// One live connection's presence row.
 #[derive(Debug)]
 struct Conn {
     principal: PrincipalId,
     /// `client.hello` completed: the connection counts towards "online".
     hello: bool,
+    /// The connection's opaque typing source handle: a fresh random id per
+    /// connection, unrelated to the client id, host or device.
+    typing_source: String,
     focus: Vec<Focus>,
-    /// `(agentId, its workspaceId)` while the connection reports typing.
-    typing: Option<(String, String)>,
+    typing: Option<Typing>,
     /// Note-presence leases held by this connection: lease id → note.
     leases: HashMap<String, (WorkspaceId, NoteId)>,
 }
@@ -162,6 +180,7 @@ impl Conn {
         Self {
             principal,
             hello: false,
+            typing_source: format!("ts-{}", uuid::Uuid::new_v4().simple()),
             focus: Vec::new(),
             typing: None,
             leases: HashMap::new(),
@@ -173,7 +192,7 @@ impl Conn {
         self.focus
             .iter()
             .map(|f| f.workspace.clone())
-            .chain(self.typing.iter().map(|(_, ws)| ws.clone()))
+            .chain(self.typing.iter().map(|t| t.workspace.clone()))
             .collect()
     }
 
@@ -225,27 +244,33 @@ impl State {
 
     /// The `presence:changed` roster of `workspace_id`: its online members
     /// (`members` is the store's membership list) with their focus items in
-    /// this workspace and typing targets, aggregated over connections.
+    /// this workspace aggregated over connections and one typing entry
+    /// `{ source, agentId, since }` per typing connection (never merged:
+    /// two clients of one person stay two sources).
     fn roster(&self, workspace_id: &str, members: &[PrincipalId]) -> Vec<Value> {
         members
             .iter()
             .filter(|p| self.is_online(p))
             .map(|p| {
                 let mut focus: Vec<Focus> = Vec::new();
-                let mut typing: Vec<String> = Vec::new();
+                let mut typing: Vec<(&str, &Typing)> = Vec::new();
                 for c in self.conns.values().filter(|c| &c.principal == p) {
                     for f in c.focus.iter().filter(|f| f.workspace == workspace_id) {
                         if !focus.contains(f) {
                             focus.push(f.clone());
                         }
                     }
-                    if let Some((agent, ws)) = &c.typing {
-                        if ws == workspace_id && !typing.contains(agent) {
-                            typing.push(agent.clone());
-                        }
+                    if let Some(t) = c.typing.as_ref().filter(|t| t.workspace == workspace_id) {
+                        typing.push((c.typing_source.as_str(), t));
                     }
                 }
-                typing.sort();
+                typing.sort_by(|a, b| a.0.cmp(b.0));
+                let typing: Vec<Value> = typing
+                    .into_iter()
+                    .map(|(source, t)| {
+                        json!({ "source": source, "agentId": t.agent, "since": t.since })
+                    })
+                    .collect();
                 let profile = self.profile(p);
                 json!({
                     "principalId": p,
@@ -528,7 +553,7 @@ impl Services {
             self.require_member(&WorkspaceId::from(workspace_id.as_str()))
                 .await?;
         }
-        let affected: HashSet<String> = {
+        let (affected, typing_source): (HashSet<String>, String) = {
             let mut state = self.presence.lock();
             let Some(conn) = state.conns.get_mut(&connection_id) else {
                 return Err(Error::InvalidParams(
@@ -537,13 +562,43 @@ impl Services {
             };
             let before = conn.workspaces();
             conn.focus = focus;
-            conn.typing = typing;
-            before.union(&conn.workspaces()).cloned().collect()
+            conn.typing = typing.map(|(agent, workspace)| {
+                // The same target keeps its `since`: a receiver's expiry
+                // timer only restarts on a genuinely new typing episode.
+                let since = match &conn.typing {
+                    Some(t) if t.agent == agent => t.since.clone(),
+                    _ => now_iso(),
+                };
+                Typing {
+                    agent,
+                    workspace,
+                    since,
+                }
+            });
+            (
+                before.union(&conn.workspaces()).cloned().collect(),
+                conn.typing_source.clone(),
+            )
         };
         for workspace_id in affected {
             self.emit_presence_changed(&workspace_id).await;
         }
-        Ok(json!({ "ok": true }))
+        Ok(json!({ "ok": true, "typingSource": typing_source }))
+    }
+
+    /// See [`intent_core::WorkspaceApi::presence_snapshot`].
+    pub(crate) async fn presence_snapshot_op(&self, workspace_id: WorkspaceId) -> Result<Value> {
+        self.require_member(&workspace_id).await?;
+        self.store.get_workspace(&workspace_id).await?;
+        let members: Vec<PrincipalId> = self
+            .store
+            .list_workspace_members(&workspace_id)
+            .await?
+            .into_iter()
+            .map(|m| m.principal_id)
+            .collect();
+        let roster = self.presence.lock().roster(workspace_id.as_str(), &members);
+        Ok(json!({ "workspaceId": workspace_id.as_str(), "members": roster }))
     }
 
     /// See [`intent_core::WorkspaceApi::presence_disconnect`].

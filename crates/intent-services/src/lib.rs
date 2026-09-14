@@ -30400,6 +30400,13 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.presence_update_op(connection_id, params).await })
     }
 
+    fn presence_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.presence_snapshot_op(workspace_id).await })
+    }
+
     fn presence_disconnect(&self, connection_id: String) -> BoxFuture<'_, ()> {
         Box::pin(async move { self.presence_disconnect_op(connection_id).await })
     }
