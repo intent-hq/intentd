@@ -196,14 +196,20 @@ impl EventBus {
 
     /// The principal-stamped copy of a non-agent-actored `ev` when the
     /// current request is a bound wire principal's — `{ type: user, id:
-    /// principalId, name }`; `None` leaves `ev` as supplied, including when
-    /// the principal row cannot be read.
+    /// principalId, name }`; `None` only when there is no bound principal.
+    /// The type and id come from the caller binding alone: when the
+    /// principal row cannot be read the name falls back to the id, so an
+    /// unavailable read path never lets the supplied actor stand in for
+    /// the person who acted.
     async fn attribute_to_caller(&self, ev: &NewEvent) -> Option<NewEvent> {
         if ev.actor.actor_type == ActorType::Agent {
             return None;
         }
         let principal_id = crate::principal_ops::attributed_caller_id()?;
-        let name = self.attribution_name(&principal_id).await?;
+        let name = self
+            .attribution_name(&principal_id)
+            .await
+            .unwrap_or_else(|| principal_id.0.clone());
         let mut stamped = ev.clone();
         stamped.actor = EventActor {
             actor_type: ActorType::User,
