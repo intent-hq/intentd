@@ -18,6 +18,7 @@
 
 mod common;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -314,6 +315,61 @@ where
             });
         if evt["data"]["agentId"] == agent_id {
             seen += 1;
+        }
+    }
+}
+
+/// Wait until `user_rows` user messages for `agent_id` have been persisted AND
+/// every turn carrying one of them has ended.
+///
+/// Burst messages do not map 1:1 onto turns: a message sent while the agent is
+/// still mid-turn is queued, and the default `agents.flushQueuedMessages`
+/// mode (`all`) drains two or more queued entries into ONE combined turn. On a
+/// loaded host a 3-message burst can therefore legitimately end with 3, 2, or
+/// 1 `agent:stream:end` events, so counting stream:ends is a flake
+/// (intent-hq/intent#4947). Correlate on turn identity instead: every
+/// persisted user row emits `agent:message { role: "user", turnId }` before
+/// its turn's worker spawns (the combined turn stamps the head entry's id on
+/// each row), and the terminal `agent:stream:end` names the same `turnId`.
+/// Both ride the same event bus, so the row echo always precedes its turn's
+/// stream:end on the wire.
+async fn await_user_turns_ended<S>(ws: &mut WebSocketStream<S>, agent_id: &str, user_rows: usize)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    let mut rows_seen = 0usize;
+    let mut open_turns: HashSet<String> = HashSet::new();
+    let mut ended_turns: HashSet<String> = HashSet::new();
+    while rows_seen < user_rows || open_turns.iter().any(|t| !ended_turns.contains(t)) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let evt = try_next_event(ws, &["agent:message", "agent:stream:end"], remaining)
+            .await
+            .unwrap_or_else(|| {
+                let still_open = open_turns
+                    .iter()
+                    .filter(|t| !ended_turns.contains(*t))
+                    .count();
+                panic!(
+                    "timed out waiting for {user_rows} user rows and their turns to end \
+                     (saw {rows_seen} user rows, {still_open} turns still open)"
+                )
+            });
+        if evt["data"]["agentId"] != agent_id {
+            continue;
+        }
+        let turn_id = evt["data"]["turnId"].as_str().map(str::to_string);
+        match evt["type"].as_str() {
+            Some("agent:message") if evt["data"]["role"] == json!("user") => {
+                rows_seen += 1;
+                open_turns.insert(turn_id.expect("user agent:message carries turnId"));
+            }
+            Some("agent:stream:end") => {
+                if let Some(tid) = turn_id {
+                    ended_turns.insert(tid);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -707,9 +763,33 @@ async fn last_activity_debounce_coalesces_burst() {
     let Some(script) = gate("WSS lastActivity debounce") else {
         return;
     };
+    burst_debounce_case(&script, json!({ "response": "burst" })).await;
+}
 
-    let behavior = json!({ "response": "burst" }).to_string();
-    let (daemon, port, cfg) = boot(&script, &behavior).await;
+/// Same debounce case, with the first burst turn held open long enough that
+/// the remaining messages queue behind it and drain as ONE combined flush
+/// turn. Pins the turn-identity wait in [`await_user_turns_ended`]: this is
+/// the interleaving a loaded host produces nondeterministically
+/// (intent-hq/intent#4947), and a fixed count of three `agent:stream:end`
+/// events times out here.
+#[tokio::test]
+async fn last_activity_debounce_coalesces_burst_with_queued_flush() {
+    let Some(script) = gate("WSS lastActivity debounce (queued flush)") else {
+        return;
+    };
+    burst_debounce_case(
+        &script,
+        json!({
+            "response": "burst",
+            "rules": [{ "ifPromptContains": "msg 0", "delayMs": 400 }],
+        }),
+    )
+    .await;
+}
+
+async fn burst_debounce_case(script: &str, behavior: Value) {
+    let behavior = behavior.to_string();
+    let (daemon, port, cfg) = boot(script, &behavior).await;
 
     let socket = daemon.data_dir.join("intentd.sock");
     let create = uds_rpc(
@@ -800,8 +880,10 @@ async fn last_activity_debounce_coalesces_burst() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Wait (bounded) until all three burst turns completed.
-    await_stream_ends(&mut agent_sub, agent_id, 3).await;
+    // Wait (bounded) until every turn carrying a burst message has completed.
+    // Not "three stream:ends": messages that queue behind an in-flight turn
+    // drain as one combined turn, so the burst may end in fewer turns.
+    await_user_turns_ended(&mut agent_sub, agent_id, 3).await;
 
     // Collect workspace:updated events until the subscription has been quiet
     // for well over one debounce window (covers the trailing debounce fire).
