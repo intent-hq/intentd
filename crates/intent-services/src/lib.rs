@@ -10681,13 +10681,10 @@ fn assert_hermetic_root_absent() {
 /// workspace's agent streams and file paths with the new one's).
 async fn derive_workspace_id(
     store: &Store,
-    input: &WorkspaceCreate,
+    initial_prompt: Option<&str>,
     workspaces_root: &Path,
 ) -> WorkspaceId {
-    let base = input
-        .initial_agent
-        .as_ref()
-        .and_then(|a| a.prompt.as_deref())
+    let base = initial_prompt
         .and_then(intent_core::slug::extract_local_slug)
         .unwrap_or_else(intent_core::slug::generate_workspace_slug);
     let candidate = WorkspaceId::from_string(base.clone());
@@ -11029,118 +11026,31 @@ fn validate_context_links(links: Option<&[intent_core::ContextLink]>) -> Result<
 }
 
 impl Services {
-    /// Every `-32602` (`InvalidParams`) producer for `workspace.create`, in one
-    /// place. `create_workspace` calls this once at the top of its idempotency
-    /// closure — BEFORE the first store write, worktree provisioning, or event
-    /// publish — so a rejected request never leaves a workspace row, spec
-    /// note, or `workspace:created` event behind. Owns every `initialAgent`
-    /// and `contextLinks` check:
-    /// - compound `initialAgent.model` (`reject_compound_model`, PROTOCOL §5.5);
-    /// - `fileBlocks` / `imageBlocks` shape and attachment references
-    ///   (PROTOCOL §5.5, monorepo#3338) — same harvest as `agent_create_op`
-    ///   (top-level param wins over the `metadata.*Blocks` copy, `null`
-    ///   reads as absent);
-    /// - unknown `initialAgent.specialist` (monorepo#3497), canonicalized the
-    ///   way `agent_create_op` does — against the bundled + user tiers, plus
-    ///   the project tier of the tilde-expanded `repositoryPath` when it is an
-    ///   existing local directory (the same client-supplied path the create
-    ///   already trusts enough to provision a worktree from). No workspace
-    ///   row or worktree exists yet, so this is the only project tier
-    ///   available; `agent_create_op` later reads the new worktree at
-    ///   `baseRef`, so a project-tier-only specialist present in the checkout
-    ///   but absent at `baseRef` still fails late, and one present only at
-    ///   `baseRef` fails early here;
-    /// - provider / model / reasoning-effort resolution via the shared
-    ///   [`Self::resolve_create_model_and_effort`] chain (known provider →
-    ///   default present → enabled → authenticated → client-supplied bare
-    ///   model owned by the effective provider → specialist-derived effort
-    ///   supported by the resolved model), with the same project-tier hint;
+    /// The request-shape `-32602` (`InvalidParams`) producers of
+    /// `workspace.create` that are not agent-create planning. `create_workspace`
+    /// calls this once at the top of its idempotency closure — BEFORE the
+    /// first store write, worktree provisioning, or event publish:
+    /// - compound `initialAgent.model` (`reject_compound_model`, PROTOCOL §5.5
+    ///   — the wire-boundary guard the RPC layer applies to `agent.create`);
     /// - `contextLinks` (PROTOCOL §5.1).
     ///
-    /// `agent_create_op` re-runs its own checks unchanged when the initial
-    /// agent is created — harmless, since this preflight already accepted the
-    /// same input. The `workspace_create_rejects_every_invalid_input_before_side_effects`
+    /// Every other `initialAgent` check — blocks shape and attachment
+    /// references, specialist canonicalization, the provider / model /
+    /// reasoning-effort chain — is owned by [`Self::plan_agent_create`], which
+    /// the closure runs right after this preflight, still before the
+    /// workspaces-root resolution or any other state change; the plan is
+    /// then persisted after the row insert via
+    /// [`Self::persist_agent_create`], whose return type cannot express an
+    /// input rejection. The
+    /// `workspace_create_rejects_every_invalid_input_before_side_effects`
     /// test guards the ordering arm by arm.
-    pub(crate) async fn preflight_workspace_create(&self, input: &WorkspaceCreate) -> Result<()> {
-        if let Some(agent) = input.initial_agent.as_ref() {
-            if let Some(model) = agent.model.as_deref() {
-                reject_compound_model("initialAgent.model", model)?;
-            }
-            let effective_file_blocks = agent
-                .file_blocks
-                .clone()
-                .filter(|v| !v.is_null())
-                .or_else(|| {
-                    agent
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.get("fileBlocks").cloned())
-                })
-                .filter(|v| !v.is_null());
-            crate::agent_ops::validate_file_blocks(
-                "workspace.create",
-                effective_file_blocks.as_ref(),
-            )?;
-            let effective_image_blocks = agent
-                .image_blocks
-                .clone()
-                .filter(|v| !v.is_null())
-                .or_else(|| {
-                    agent
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.get("imageBlocks").cloned())
-                })
-                .filter(|v| !v.is_null());
-            crate::agent_ops::validate_image_blocks(
-                "workspace.create",
-                effective_image_blocks.as_ref(),
-            )?;
-            self.validate_image_block_refs("workspace.create", effective_image_blocks.as_ref())
-                .await?;
-
-            // Project-tier hint for the specialist lookups: the repository
-            // checkout, only when it is an existing local directory.
-            let spec_wp = input
-                .repository_path
-                .as_deref()
-                .map(intent_core::expand_tilde_string)
-                .map(PathBuf::from)
-                .filter(|p| p.is_dir());
-            let specialist = match nonempty_owned(agent.specialist.clone()) {
-                Some(spec_id) => {
-                    // Canonicalization walks the specialist tier directories —
-                    // blocking pool (monorepo#4148).
-                    let services = self.clone();
-                    let wp = spec_wp.clone();
-                    Some(
-                        tokio::task::spawn_blocking(move || {
-                            services
-                                .specialists_service()
-                                .canonical_id_or_err(&spec_id, wp.as_deref())
-                        })
-                        .await
-                        .map_err(|e| {
-                            Error::Internal(format!(
-                                "workspace.create specialist resolution task failed: {e}"
-                            ))
-                        })??,
-                    )
-                }
-                None => None,
-            };
-            // Provider / model / effort gates — the same chain
-            // `agent_create_op` runs (which receives the same
-            // `nonempty_owned` values and no caller-decided effort).
-            self.resolve_create_model_and_effort(
-                "workspace.create",
-                nonempty_owned(agent.model.clone()),
-                specialist.as_deref(),
-                nonempty_owned(agent.provider.clone()).as_deref(),
-                None,
-                spec_wp.as_deref(),
-            )
-            .await?;
+    pub(crate) fn preflight_workspace_create(input: &WorkspaceCreate) -> Result<()> {
+        if let Some(model) = input
+            .initial_agent
+            .as_ref()
+            .and_then(|agent| agent.model.as_deref())
+        {
+            reject_compound_model("initialAgent.model", model)?;
         }
         validate_context_links(input.context_links.as_deref())
     }
@@ -17292,12 +17202,13 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
-                    // Every request-validation `-32602` runs here, BEFORE
-                    // any state change (row / metadata file / event / spec
-                    // note / initial agent): `initialAgent` model, blocks,
-                    // attachment references and provider gates, plus
-                    // `contextLinks`. See `preflight_workspace_create`.
-                    services.preflight_workspace_create(&input).await?;
+                    // Request-shape `-32602`s run here, BEFORE any state
+                    // change (row / metadata file / event / spec note /
+                    // initial agent): compound `initialAgent.model` and
+                    // `contextLinks` (see `preflight_workspace_create`). The
+                    // remaining `initialAgent` checks are the agent-create
+                    // plan right below, still ahead of the first side effect.
+                    Services::preflight_workspace_create(&input)?;
                     // Caller-supplied paths may carry a leading `~` (the FE
                     // onboarding default is `~/Developer`); expand to `$HOME`
                     // before the existing-repo check, clone targeting, and
@@ -17322,6 +17233,135 @@ impl WorkspaceApi for Services {
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    // Initial-agent plan (§5.1): every remaining `-32602`
+                    // producer of the create — blocks shape and attachment
+                    // references, specialist canonicalization, the provider /
+                    // model / reasoning-effort chain — runs HERE, pure with
+                    // respect to the store and the filesystem, before the
+                    // workspaces-root resolution (which may create the
+                    // configured `worktreesLocation`), the first progress
+                    // frame, the clone, the row insert, or any other side
+                    // effect. The typed plan is carried across provisioning
+                    // and persisted after the insert by
+                    // `persist_agent_create`, which cannot raise an input
+                    // rejection, so a rejected `initialAgent` can never strand
+                    // a workspace row. The inputs are shaped to their final
+                    // form first so the plan sees exactly what is persisted;
+                    // the trimmed prompt and effective image blocks ride along
+                    // for id / branch naming and the first turn. The plan's
+                    // `workspace_id` is a passthrough the planner never reads,
+                    // so it is stamped once the id is derived below.
+                    let planned_initial_agent = match input.initial_agent.take() {
+                        Some(agent) => {
+                            let prompt = agent
+                                .prompt
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string);
+                            // Persist the prompt (when present) as
+                            // `AgentSession.initial_message` via the
+                            // `metadata.initialMessage` harvest key (delegate
+                            // parity: a wake-up can resume from it) and stamp the
+                            // reference-parity
+                            // `isInitialAgent`/`isFirstWorkspaceAgent` flags the
+                            // FE surface (`agent-backend-handler.service.ts`,
+                            // `instruction-service.ts` prompt-cache `':initial'`
+                            // suffix, `agent-persistence.ts`) uses to classify the
+                            // workspace's coordinator. Both flags are persisted on
+                            // the raw `AgentSession.metadata` JSON; the strict
+                            // `AgentLite.metadata` projection surfaces
+                            // `isInitialAgent` (presence-detected, `true`-only —
+                            // PROTOCOL §5.5). The caller's metadata object is
+                            // forwarded as-is; like agent.create, only the
+                            // harvested gap fields persist today (P2-12a) —
+                            // `behaviorPrompt` has no session column and the
+                            // behavior derives from the persisted `specialist`.
+                            let mut metadata = match agent.metadata {
+                                Some(serde_json::Value::Object(m)) => m,
+                                _ => serde_json::Map::new(),
+                            };
+                            metadata.insert("isInitialAgent".to_string(), serde_json::json!(true));
+                            metadata.insert(
+                                "isFirstWorkspaceAgent".to_string(),
+                                serde_json::json!(true),
+                            );
+                            // Own the initial-message invariant on the
+                            // `metadata.initialMessage` harvest key: when
+                            // the daemon has a non-empty prompt, stamp it (delegate
+                            // parity — a wake-up can resume from it); otherwise
+                            // drop any caller-supplied `initialMessage` so the
+                            // plan's metadata harvest cannot persist a stale
+                            // prompt for a no-prompt workspace.
+                            if let Some(ref p) = prompt {
+                                metadata.insert(
+                                    "initialMessage".to_string(),
+                                    serde_json::json!(p.clone()),
+                                );
+                            } else {
+                                metadata.remove("initialMessage");
+                            }
+                            // The effective session-level image blocks, mirroring
+                            // the plan's harvest (top-level param wins over the
+                            // `metadata.imageBlocks` fallback). Captured here
+                            // because the created `AgentLite` no longer serves
+                            // `imageBlocks` (list-projection cost contract) and
+                            // the first-turn threading below still needs them.
+                            let image_blocks = agent
+                                .image_blocks
+                                .or_else(|| metadata.get("imageBlocks").cloned())
+                                .filter(|v| !v.is_null());
+                            let extra = intent_core::AgentCreateExtra {
+                                provider: nonempty_owned(agent.provider),
+                                agent_type: nonempty_owned(agent.agent_type),
+                                metadata: Some(serde_json::Value::Object(metadata)),
+                                context_references: agent
+                                    .context_references
+                                    .filter(|v| !v.is_null()),
+                                image_blocks: image_blocks.clone(),
+                                file_blocks: agent.file_blocks.filter(|v| !v.is_null()),
+                                // The initial agent is the workspace's
+                                // foreground agent (top-level wins over any
+                                // metadata.isBackground copy).
+                                is_background: Some(false),
+                                ..Default::default()
+                            };
+                            // Project-tier root for the plan's failing
+                            // specialist reads: the (tilde-expanded)
+                            // repository checkout, only when it is an existing
+                            // local directory — the same client-supplied path
+                            // the create already trusts enough to provision a
+                            // worktree from. No worktree exists yet; the
+                            // non-failing prompt snapshot reads it at `baseRef`
+                            // in the persist half.
+                            let spec_wp = input
+                                .repository_path
+                                .as_deref()
+                                .map(PathBuf::from)
+                                .filter(|p| p.is_dir());
+                            // Post-plan inputs, stamped on the plan later:
+                            // `workspace_id` once the id is derived (right
+                            // below) and `skip_auto_commit`, which depends on
+                            // the workspace's effective auto-commit seeded by
+                            // the insert, right before persist.
+                            let plan = services
+                                .plan_agent_create(
+                                    "workspace.create",
+                                    WorkspaceId::from_string(String::new()),
+                                    nonempty_owned(agent.name),
+                                    nonempty_owned(agent.model),
+                                    nonempty_owned(agent.specialist),
+                                    None,
+                                    None,
+                                    false,
+                                    extra,
+                                    spec_wp,
+                                )
+                                .await?;
+                            Some((plan, prompt, image_blocks))
+                        }
+                        None => None,
+                    };
                     // Kept alongside the resolved parent below: the known-repo
                     // registration hook checks BOTH roots (a configured
                     // `worktreesLocation` may differ from the boot root, and a
@@ -17341,7 +17381,18 @@ impl WorkspaceApi for Services {
                     // tombstone, or leftover directory) so the on-disk
                     // directory reflects intent and deleted ids are never
                     // recycled.
-                    let id = derive_workspace_id(&store, &input, &workspaces_root).await;
+                    let id = derive_workspace_id(
+                        &store,
+                        planned_initial_agent
+                            .as_ref()
+                            .and_then(|(_, prompt, _)| prompt.as_deref()),
+                        &workspaces_root,
+                    )
+                    .await;
+                    let planned_initial_agent = planned_initial_agent.map(|(mut plan, prompt, image_blocks)| {
+                        plan.workspace_id = id.clone();
+                        (plan, prompt, image_blocks)
+                    });
                     let progress = progress_id.and_then(|pid| {
                         bus.clone().map(|b| {
                             std::sync::Arc::new(create_progress::CreateProgress::new(
@@ -17937,10 +17988,9 @@ impl WorkspaceApi for Services {
                     let branch_auto_generated =
                         input.branch.as_deref().is_none_or(str::is_empty);
                     let branch = if let Some(explicit) = input.branch.clone().filter(|b| !b.is_empty()) { explicit } else {
-                        let slug = input
-                            .initial_agent
+                        let slug = planned_initial_agent
                             .as_ref()
-                            .and_then(|a| a.prompt.as_deref())
+                            .and_then(|(_, prompt, _)| prompt.as_deref())
                             .and_then(intent_core::slug::extract_local_slug)
                             .unwrap_or_else(intent_core::slug::generate_workspace_slug);
                         // Branch prefix fallback: repo config > global setting
@@ -18811,7 +18861,8 @@ impl WorkspaceApi for Services {
                     // row (reference parity: `workspace.service.ts` persists the
                     // session whenever `initialAgent` is present — the turn only
                     // starts when a prompt exists). The agent is parentless,
-                    // non-background (delegate parity: `agent_create_op`). When
+                    // non-background (delegate parity: `agent_create_op`),
+                    // persisted from the plan derived above. When
                     // the prompt is non-empty it is stored as
                     // `AgentSession.initial_message` (harvested from the
                     // `metadata.initialMessage` create param; served by
@@ -18821,98 +18872,23 @@ impl WorkspaceApi for Services {
                     // prompt persists the row without a message; the FE first
                     // send starts the turn.
                     let mut initial_agent = None;
-                    if let Some(agent) = input.initial_agent {
-                        let prompt = agent
-                            .prompt
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string);
-                        // Persist the prompt (when present) as
-                        // `AgentSession.initial_message` via the
-                        // `metadata.initialMessage` harvest key (delegate
-                        // parity: a wake-up can resume from it) and stamp the
-                        // reference-parity
-                        // `isInitialAgent`/`isFirstWorkspaceAgent` flags the
-                        // FE surface (`agent-backend-handler.service.ts`,
-                        // `instruction-service.ts` prompt-cache `':initial'`
-                        // suffix, `agent-persistence.ts`) uses to classify the
-                        // workspace's coordinator. Both flags are persisted on
-                        // the raw `AgentSession.metadata` JSON; the strict
-                        // `AgentLite.metadata` projection surfaces
-                        // `isInitialAgent` (presence-detected, `true`-only —
-                        // PROTOCOL §5.5). The caller's metadata object is
-                        // forwarded as-is; like agent.create, only the
-                        // harvested gap fields persist today (P2-12a) —
-                        // `behaviorPrompt` has no session column and the
-                        // behavior derives from the persisted `specialist`.
-                        let mut metadata = match agent.metadata {
-                            Some(serde_json::Value::Object(m)) => m,
-                            _ => serde_json::Map::new(),
-                        };
-                        metadata.insert("isInitialAgent".to_string(), serde_json::json!(true));
-                        metadata.insert(
-                            "isFirstWorkspaceAgent".to_string(),
-                            serde_json::json!(true),
-                        );
-                        // Own the initial-message invariant on the
-                        // `metadata.initialMessage` harvest key: when
-                        // the daemon has a non-empty prompt, stamp it (delegate
-                        // parity — a wake-up can resume from it); otherwise
-                        // drop any caller-supplied `initialMessage` so
-                        // `agent_create_op`'s metadata harvest cannot persist
-                        // a stale prompt for a no-prompt workspace.
-                        if let Some(ref p) = prompt {
-                            metadata.insert(
-                                "initialMessage".to_string(),
-                                serde_json::json!(p.clone()),
-                            );
-                        } else {
-                            metadata.remove("initialMessage");
-                        }
-                        // The effective session-level image blocks, mirroring
-                        // the `agent_create_op` harvest (top-level param wins
-                        // over the `metadata.imageBlocks` fallback). Captured
-                        // here because the created `AgentLite` no longer
-                        // serves `imageBlocks` (list-projection cost contract)
-                        // and the first-turn threading below still needs them.
-                        let image_blocks = agent
-                            .image_blocks
-                            .or_else(|| metadata.get("imageBlocks").cloned())
-                            .filter(|v| !v.is_null());
-                        let extra = intent_core::AgentCreateExtra {
-                            provider: nonempty_owned(agent.provider),
-                            agent_type: nonempty_owned(agent.agent_type),
-                            metadata: Some(serde_json::Value::Object(metadata)),
-                            context_references: agent
-                                .context_references
-                                .filter(|v| !v.is_null()),
-                            image_blocks: image_blocks.clone(),
-                            file_blocks: agent.file_blocks.filter(|v| !v.is_null()),
-                            // The initial agent is the workspace's
-                            // foreground agent (top-level wins over any
-                            // metadata.isBackground copy).
-                            is_background: Some(false),
-                            ..Default::default()
-                        };
+                    if let Some((mut plan, prompt, image_blocks)) = planned_initial_agent {
                         // Harness-owned commits: same derivation as
                         // `agent.create` — the initial agent opts out of the
                         // idle subscriber when the workspace's effective
-                        // auto-commit (just seeded above) is off.
-                        let skip_auto_commit =
+                        // auto-commit (just seeded above) is off. The one
+                        // post-plan input (see `AgentCreatePlan`).
+                        plan.skip_auto_commit =
                             !services.effective_auto_commit(&ws.id).await;
-                        let created = services
-                            .agent_create_op(
-                                ws.id.clone(),
-                                nonempty_owned(agent.name),
-                                nonempty_owned(agent.model),
-                                nonempty_owned(agent.specialist),
-                                None,
-                                None,
-                                skip_auto_commit,
-                                extra,
-                            )
-                            .await?;
+                        // Persist half: the plan was validated before the
+                        // first side effect, so this can only fail on
+                        // infrastructure (`AgentPersistError` → `-32603`) —
+                        // never on input. The non-failing specialist prompt
+                        // snapshot reads the freshly provisioned worktree at
+                        // `baseRef` (agent.create parity: worktree, else the
+                        // repository path).
+                        let snapshot_wp = crate::git_ops::worktree_path(&ws);
+                        let created = services.persist_agent_create(plan, snapshot_wp).await?;
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );

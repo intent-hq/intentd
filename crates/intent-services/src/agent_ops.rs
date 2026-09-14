@@ -3665,11 +3665,11 @@ impl Services {
     }
 
     /// The creation-time provider / model / reasoning-effort chain, in one
-    /// place (no persistence, no event): [`Self::agent_create_op`] runs it
-    /// before the session insert and [`Services::preflight_workspace_create`]
-    /// runs the same chain for `workspace.create`'s `initialAgent` before the
-    /// workspace row exists, so every `-32602` it can produce fires ahead of
-    /// any side effect on both seams. In order:
+    /// place (no persistence, no event): [`Self::plan_agent_create`] runs it
+    /// on every create seam — before the session insert for `agent.create` /
+    /// delegate / wake, and before the workspace row exists for
+    /// `workspace.create`'s `initialAgent` — so every `-32602` it can produce
+    /// fires ahead of any side effect. In order:
     /// 1. Default-model resolution when the caller supplied no `model`
     ///    ([`resolve_agent_default_model_with_source`]: specialist pin →
     ///    settings chain → catalog default → CLI default), on the blocking
@@ -3880,8 +3880,11 @@ impl Services {
     /// [`AgentPersistError`] return type, cannot raise an input rejection.
     /// This op is the thin `plan → persist` wrapper for the store-backed
     /// seams (`agent.create`, `agent.delegate`, `agent.wakeOrCreate`);
-    /// `workspace.create` is expected to call the two phases directly, plan
-    /// before its workspace insert and persist after it.
+    /// `workspace.create` calls the two phases directly — plan right after
+    /// its request-shape preflight (before the workspaces root is resolved or
+    /// the workspace row is inserted; the plan's `workspace_id` is stamped
+    /// once the id is derived), persist after the insert (see the
+    /// `create_workspace` closure in `lib.rs`).
     ///
     /// Agent ids are server-assigned: the op always mints a fresh
     /// `agent-{uuid}` id (client-supplied ids are rejected `-32602` at the
