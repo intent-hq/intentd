@@ -465,28 +465,19 @@ pub(crate) struct CreateModelAndEffort {
 /// persist keep their own errors (e.g. `workspace.create`'s `ensure_spec_note`
 /// can still hit `NotFound` on a concurrent delete).
 ///
-/// Two fields are post-plan inputs that `workspace.create`'s `initialAgent`
-/// stamps on the plan between planning and persisting; neither is a
-/// validation. `skip_auto_commit` depends on the new workspace's effective
-/// auto-commit, known only once the workspace row exists. `workspace_id` is
-/// a pure passthrough: the planner forwards it untouched, no check consults
-/// it, and `workspace.create` plans with an empty placeholder and stamps
-/// the derived id before persist (see the field doc).
+/// The plan carries no workspace identity: none of the planner's checks
+/// consult it, and [`Services::persist_agent_create`] takes the
+/// [`WorkspaceId`] as an argument instead — which is what lets
+/// `workspace.create` plan before its id is derived. `skip_auto_commit` is
+/// the one post-plan input `workspace.create`'s `initialAgent` stamps on the
+/// plan between planning and persisting; it is a derivation, not a
+/// validation, and depends on the new workspace's effective auto-commit,
+/// known only once the workspace row exists.
 #[derive(Debug, Clone)]
 pub(crate) struct AgentCreatePlan {
     /// Error-label method (`agent.create` / `workspace.create`) for the
     /// persist half's infrastructure failures.
     pub(crate) method: &'static str,
-    /// Workspace the session row belongs to. Passthrough/stamping invariant:
-    /// [`Services::plan_agent_create`] only forwards this field — none of its
-    /// checks read it — so `workspace.create` passes an empty placeholder
-    /// (the id is derived only after the plan, from the initial prompt) and
-    /// stamps the derived id here before [`Services::persist_agent_create`].
-    /// Store-backed seams (`agent.create` & co.) pass the real id up front.
-    /// A future API could drop workspace identity from the plan and take the
-    /// `WorkspaceId` as a persist argument instead, removing the placeholder
-    /// without changing `agent_create_op`'s signature (note only; not done).
-    pub(crate) workspace_id: WorkspaceId,
     pub(crate) parent_agent_id: Option<AgentId>,
     pub(crate) task_note_id: Option<NoteId>,
     pub(crate) skip_auto_commit: bool,
@@ -3925,10 +3916,10 @@ impl Services {
     /// This op is the thin `plan → persist` wrapper for the store-backed
     /// seams (`agent.create`, `agent.delegate`, `agent.wakeOrCreate`);
     /// `workspace.create` calls the two phases directly — plan right after
-    /// its request-shape preflight (before the workspaces root is resolved or
-    /// the workspace row is inserted; the plan's `workspace_id` is stamped
-    /// once the id is derived), persist after the insert (see the
-    /// `create_workspace` closure in `lib.rs`).
+    /// its request-shape preflight (before the workspaces root is resolved,
+    /// the id is derived, or the workspace row is inserted), persist after
+    /// the insert with the derived id (see the `create_workspace` closure in
+    /// `lib.rs`).
     ///
     /// Agent ids are server-assigned: the op always mints a fresh
     /// `agent-{uuid}` id (client-supplied ids are rejected `-32602` at the
@@ -3981,7 +3972,6 @@ impl Services {
         let plan = self
             .plan_agent_create(
                 "agent.create",
-                workspace_id,
                 name,
                 model,
                 specialist,
@@ -3992,7 +3982,9 @@ impl Services {
                 spec_wp.clone(),
             )
             .await?;
-        Ok(self.persist_agent_create(plan, spec_wp).await?)
+        Ok(self
+            .persist_agent_create(plan, workspace_id, spec_wp)
+            .await?)
     }
 
     /// Plan half of an agent create: runs, in order, every `-32602` producer
@@ -4015,7 +4007,6 @@ impl Services {
     pub(crate) async fn plan_agent_create(
         &self,
         method: &'static str,
-        workspace_id: WorkspaceId,
         name: Option<String>,
         model: Option<String>,
         specialist: Option<String>,
@@ -4194,7 +4185,6 @@ impl Services {
             .await?;
         Ok(AgentCreatePlan {
             method,
-            workspace_id,
             parent_agent_id,
             task_note_id,
             skip_auto_commit,
@@ -4224,18 +4214,23 @@ impl Services {
     /// internal / join failures remain possible and map to `-32603`; what the
     /// caller itself does between insert and persist is outside this claim).
     ///
-    /// `snapshot_wp` is the project-tier root for the *non-failing* specialist
-    /// snapshot (`resolve_prompt_injection` / `resolve_is_orchestrator`): the
-    /// stored workspace's worktree for the store-backed seams, the freshly
-    /// provisioned worktree at `baseRef` for `workspace.create`.
+    /// `workspace_id` is the workspace the session row belongs to: the stored
+    /// workspace's id for the store-backed seams, the id derived after the
+    /// plan (from the initial prompt) for `workspace.create`. No planner check
+    /// consults it, which is why it is a persist argument rather than a plan
+    /// field. `snapshot_wp` is the project-tier root for the *non-failing*
+    /// specialist snapshot (`resolve_prompt_injection` /
+    /// `resolve_is_orchestrator`): the stored workspace's worktree for the
+    /// store-backed seams, the freshly provisioned worktree at `baseRef` for
+    /// `workspace.create`.
     pub(crate) async fn persist_agent_create(
         &self,
         plan: AgentCreatePlan,
+        workspace_id: WorkspaceId,
         snapshot_wp: Option<PathBuf>,
     ) -> std::result::Result<Value, AgentPersistError> {
         let AgentCreatePlan {
             method,
-            workspace_id,
             parent_agent_id,
             task_note_id,
             skip_auto_commit,

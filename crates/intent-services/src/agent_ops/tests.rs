@@ -13518,7 +13518,6 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
     let plan = svc
         .plan_agent_create(
             "agent.create",
-            ws.clone(),
             Some("Planned".into()),
             Some("sonnet4.5".into()),
             None,
@@ -13544,7 +13543,6 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
     let replan = svc
         .plan_agent_create(
             "agent.create",
-            ws.clone(),
             Some("Planned".into()),
             Some("sonnet4.5".into()),
             None,
@@ -13563,7 +13561,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
     );
 
     let created = svc
-        .persist_agent_create(plan, None)
+        .persist_agent_create(plan, ws.clone(), None)
         .await
         .unwrap_or_else(|e| {
             panic!(
