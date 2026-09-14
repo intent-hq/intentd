@@ -572,11 +572,11 @@ const VF_SPAWN_MARK: &str = "UNBLK_VF_SPAWN_VERIFIER";
 const VF_VERIFIER_MARK: &str = "UNBLK_VF_VERIFIER_TURN";
 
 /// Drive the verifier-flip flow over the real transport and return the
-/// parent's transcript messages once every parent turn has settled:
-/// delegate implementor (idle 1) → report wake spawns the verifier (idle 2)
-/// → verifier flips the implementor's task `complete`, idles, and its
-/// completion wake reaches the parent (idle 3). The daemon handle is
-/// returned so a failing assertion still dumps `daemon.log` on drop.
+/// parent's transcript messages once the verifier's completion wake has
+/// landed in it: delegate implementor → report wake spawns the verifier →
+/// verifier flips the implementor's task `complete`, idles, and its
+/// completion wake reaches the parent. The daemon handle is returned so a
+/// failing assertion still dumps `daemon.log` on drop.
 async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemon, Vec<Value>) {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
@@ -730,32 +730,48 @@ async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemo
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Three parent turns: delegate, report-wake (spawns verifier), and the
-    // verifier's completion wake.
-    let mut parent_idles = 0u32;
+    // The parent runs several turns (delegate, report wake that spawns the
+    // verifier, completion wakes). How many `agent:idle` events those produce
+    // is not fixed: an idle is suppressed while a ready-to-send entry is
+    // queued and queued wakes may batch into one turn, so counting idles can
+    // be satisfied before the verifier's completion wake has been delivered
+    // (intent-hq/intent#4967). Poll the observable condition instead: on each
+    // parent idle, re-read the transcript until the verifier's completion
+    // wake is in it (both taskGraph gate states deliver that wake).
+    let mut rpc_id = 20;
+    let mut messages: Vec<Value> = Vec::new();
+    let mut verifier_wake_seen = false;
     for _ in 0..400 {
         let frame = wss_event(&mut sub, 90).await;
         let ev = &frame["params"]["event"];
-        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == json!(parent_id) {
-            parent_idles += 1;
-            if parent_idles >= 3 {
-                break;
-            }
+        if ev["type"] != "agent:idle" || ev["data"]["agentId"] != json!(parent_id) {
+            continue;
+        }
+        let mut conv = wss_rpc(
+            &mut rpc,
+            rpc_id,
+            "agent.getConversation",
+            json!({ "agentId": &parent_id }),
+        )
+        .await;
+        rpc_id += 1;
+        messages = match conv["messages"].take() {
+            Value::Array(items) => items,
+            other => panic!("messages array, got {other}"),
+        };
+        if messages.iter().any(|m| {
+            let text = blocks_text(m);
+            text.contains("Child agent Verifier") && text.contains("completed")
+        }) {
+            verifier_wake_seen = true;
+            break;
         }
     }
     assert!(
-        parent_idles >= 3,
-        "parent idled after the delegate, spawn-verifier, and wake turns"
+        verifier_wake_seen,
+        "verifier completion wake delivered to the parent; transcript: {}",
+        serde_json::to_string_pretty(&messages).unwrap_or_default()
     );
-
-    let conv = wss_rpc(
-        &mut rpc,
-        20,
-        "agent.getConversation",
-        json!({ "agentId": &parent_id }),
-    )
-    .await;
-    let messages = conv["messages"].as_array().expect("messages array").clone();
     (daemon, messages)
 }
 
