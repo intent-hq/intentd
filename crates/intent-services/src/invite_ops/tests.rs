@@ -1159,6 +1159,56 @@ async fn event_actor_restamp_overrides_a_preset_non_system_actor() {
     assert_eq!(agent.actor.id.as_deref(), Some("agent-1"));
 }
 
+/// The stamped type and id come from the caller binding alone: with a cold
+/// name cache and the principal row unreadable, a bound collaborator's
+/// event still carries `{ type: user, id: principalId }` (the id doubles
+/// as the name) rather than the supplied System or other-user actor.
+#[tokio::test]
+async fn event_actor_is_still_the_bound_principal_when_the_row_is_unreadable() {
+    let (_tmp, f, _) = attribution_fixture().await;
+    let bus = crate::events::EventBus::new(f.store.clone());
+    sqlx::query("ALTER TABLE principal RENAME TO unavailable_principals")
+        .execute(f.store.write_pool())
+        .await
+        .expect("inject read failure");
+    let event = |actor: intent_core::EventActor| intent_store::NewEvent {
+        workspace_id: f.ws.clone(),
+        timestamp: intent_core::now_iso(),
+        event_type: "note:updated".to_string(),
+        actor,
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({}),
+    };
+    let (system, other_user) = with_caller(wire(&f.collaborator), async {
+        let system = bus
+            .publish(&event(crate::system_actor()))
+            .await
+            .expect("publish system-actored event");
+        let other_user = bus
+            .publish(&event(intent_core::EventActor {
+                actor_type: intent_core::ActorType::User,
+                id: Some(f.primary.0.clone()),
+                name: Some("owner".into()),
+                ..Default::default()
+            }))
+            .await
+            .expect("publish other-user event");
+        (system, other_user)
+    })
+    .await;
+    for published in [system, other_user] {
+        assert_eq!(published.actor.actor_type, intent_core::ActorType::User);
+        assert_eq!(published.actor.id.as_deref(), Some(f.collaborator.as_str()));
+        assert_eq!(
+            published.actor.name.as_deref(),
+            Some(f.collaborator.as_str())
+        );
+    }
+}
+
 /// The administrator — the owner over UDS or its own wire credential — is a
 /// bound principal like any other: its events carry `{ type: user, id:
 /// primaryPrincipalId, name }`, with the display name when no GitHub
