@@ -446,7 +446,7 @@ impl Services {
             *last = Some(Instant::now());
         }
         let this = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             if let Err(e) = this.refresh_primary_identity(principal).await {
                 tracing::debug!(error = %e, "principal.me: github identity refresh skipped");
             }

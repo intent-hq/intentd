@@ -648,7 +648,7 @@ impl Services {
         if changed || rearmed {
             let store = self.store.clone();
             let watch_id = id.clone();
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 if changed {
                     if let Err(e) = store
                         .update_completion_watch_parent(&watch_id, &name, &home_ws)
@@ -849,7 +849,7 @@ impl Services {
             // duplicate agent:idle wake after a restart.
             let store = self.store.clone();
             let watch_id = subscription_id.to_string();
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 if let Err(e) = store
                     .mark_completion_watch_report_delivered(&watch_id)
                     .await
@@ -908,7 +908,7 @@ impl Services {
             // Best-effort DB sweep of every persisted watch for this parent.
             let store = self.store.clone();
             let parent = parent_agent_id.clone();
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 if let Err(e) = store.delete_completion_watches_for_parent(&parent).await {
                     tracing::warn!("completion_watch parent sweep failed {}: {e}", parent.0);
                 }
@@ -1334,7 +1334,7 @@ impl Services {
         };
         if !watch_ids.is_empty() {
             let store = self.store.clone();
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 for id in watch_ids {
                     if let Err(e) = store.delete_completion_watch(&id).await {
                         tracing::warn!("completion_watch delete failed {id}: {e}");
@@ -1423,7 +1423,7 @@ impl Services {
     fn group_persist_sender(&self) -> &GroupPersistSender {
         self.group_persist_lane.get_or_init(|| {
             let (tx, rx) = mpsc::unbounded_channel();
-            tokio::spawn(run_group_persist_lane(self.store.clone(), rx));
+            intent_core::spawn_daemon(run_group_persist_lane(self.store.clone(), rx));
             tx
         })
     }
@@ -1486,7 +1486,7 @@ impl Services {
     fn persist_completion_watch(&self, watch: &CompletionWatch) {
         let store = self.store.clone();
         let persisted = completion_watch_to_persisted(watch);
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let id = persisted.id.clone();
             if let Err(e) = store.upsert_completion_watch(&persisted).await {
                 tracing::warn!("completion_watch upsert failed {id}: {e}");
@@ -1499,7 +1499,7 @@ impl Services {
     fn delete_persisted_watch(&self, subscription_id: &str) {
         let store = self.store.clone();
         let id = subscription_id.to_string();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             if let Err(e) = store.delete_completion_watch(&id).await {
                 tracing::warn!("completion_watch delete failed {id}: {e}");
             }

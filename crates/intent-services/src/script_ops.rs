@@ -692,7 +692,7 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let sid = script_id.to_string();
-        m.supervisor = Some(tokio::spawn(async move {
+        m.supervisor = Some(intent_core::spawn_daemon(async move {
             if let Some(state) = launching {
                 mgr.emit_state(&ws, &sid, &state).await;
             }
@@ -974,7 +974,7 @@ impl ScriptManager {
         let ws_task = ws.clone();
         let sid = script_id.to_string();
         reservation.armed = false;
-        let completion = tokio::spawn(async move {
+        let completion = intent_core::spawn_daemon(async move {
             // Removed or recreated concurrently (script.remove /
             // create-upsert) between the reservation and here: the entry is
             // gone or carries a new generation, so reap the fresh PTY

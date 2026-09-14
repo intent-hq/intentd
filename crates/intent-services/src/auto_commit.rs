@@ -160,10 +160,10 @@ impl Services {
     pub fn spawn_auto_commit_loop(&self) -> tokio::task::JoinHandle<()> {
         let Some(bus) = self.event_bus.clone() else {
             tracing::info!("auto-commit-on-idle loop disabled: no event bus");
-            return tokio::spawn(async {});
+            return intent_core::spawn_daemon(async {});
         };
         let services = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             // Span every workspace (workspace_id = None) and deliver each
             // matched event immediately (batch_window = None) so auto-commit
             // races no other turn-end work.

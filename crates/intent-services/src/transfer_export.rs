@@ -163,7 +163,7 @@ impl Services {
         }
         let svc = self.clone();
         let export_id_for_task = export_id.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             svc.run_export_build(export_id_for_task, ws).await;
         });
         Ok(serde_json::json!({
