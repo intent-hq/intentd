@@ -13729,6 +13729,22 @@ impl Services {
         }
     }
 
+    /// `true` iff the authorization `take` handed out for `message_id` is
+    /// still standing: the record exists, is consumed, and carries that id.
+    /// A redrive re-checks this AFTER winning the in-flight slot
+    /// (intent-hq/intent#4962): its `take` may predate a competitor's whole
+    /// turn — one whose drain delivered the entry (retiring the record) and
+    /// then requeued it under the ORIGINAL id on a context-size failure —
+    /// so the local id alone no longer proves the entry is undelivered. A
+    /// record replaced meanwhile by a newer marker voids it just the same.
+    pub(crate) fn parked_recovery_send_held(&self, agent_id: &AgentId, message_id: &str) -> bool {
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .get(agent_id)
+            .is_some_and(|marker| marker.consumed && marker.message_id == message_id)
+    }
+
     /// The marker a `take` would hand out right now: `None` while consumed.
     #[cfg(test)]
     pub(crate) fn parked_recovery_send(&self, agent_id: &AgentId) -> Option<String> {
