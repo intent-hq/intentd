@@ -717,10 +717,12 @@ pub(crate) struct MonitorPrSignals {
 /// derivation. A merged PR in history never masks an open PR (step 4 scans
 /// the PR pool and the monitor signals for open/draft entries) or open
 /// tasks (step 5 precedes the merged check). Git-root PRs are a same-rung
-/// input, not a separate rung: a closed (not merged) git-root PR never
-/// moves the rollup, a merged one reads `pr_merged` only once step 5 is
-/// clear, and an open one holds the PR-open rung even with every task
-/// complete.
+/// input, not a separate rung: a merged one reads `pr_merged` only once
+/// step 5 is clear, an open one holds the PR-open rung even with every task
+/// complete, and a closed (not merged) one never promotes on its own — a
+/// distinct, newer closed PR follows the latest-updated step-6 rule like
+/// any other pool entry, while a same-URL closed duplicate never downgrades
+/// a merged copy ([`fold_git_root_prs`]).
 #[expect(clippy::too_many_arguments)]
 fn compute_display_status(
     signals: AttentionSignals,
@@ -787,32 +789,41 @@ pub(crate) fn upgrade_pr_lifecycle(present: &mut PullRequestInfo, candidate: &Pu
 
 /// The workspace PR linkage after [`fold_git_root_prs`].
 struct FoldedPrLinkage {
-    /// The linked `activePullRequest`, lifecycle-upgraded in place by a
-    /// same-URL git-root duplicate.
+    /// The linked `activePullRequest`, canonicalized in place to the
+    /// effective lifecycle of its URL.
     active: Option<PullRequestInfo>,
-    /// `pullRequests` plus the distinct git-root PRs.
+    /// `pullRequests` (canonicalized the same way) plus the distinct
+    /// git-root PRs.
     pool: Vec<PullRequestInfo>,
-    /// The highest lifecycle a git-root duplicate upgraded a
-    /// workspace-owned entry (linked or pooled) to; `None` when the fold
-    /// only appended distinct git-root PRs. The workspace `prStatus`
-    /// scalar is a mirror of the same linkage, so a scalar ranking below
-    /// this is stale and must not undo the fold.
-    upgraded_to: Option<PullRequestStatus>,
+    /// The highest effective lifecycle among the workspace-owned entries
+    /// (linked or pooled `pullRequests`) whose URL a git-root PR also
+    /// carries; `None` when every git-root PR is distinct from the
+    /// workspace's own linkage. The workspace `prStatus` scalar mirrors
+    /// that linkage, so a scalar ranking below this is stale. Root-only
+    /// entries never feed it: a PR the workspace itself never linked says
+    /// nothing about the workspace's own scalar.
+    owned_lifecycle: Option<PullRequestStatus>,
 }
 
 /// Fold the workspace's git-root PRs into its own PR linkage for the PR
 /// rungs, with exactly the priority `merge_external_pull_requests` gives
-/// the wire `pullRequests`: dedup by `url`, the workspace entry wins, but a
-/// git-root duplicate with a higher lifecycle rank upgrades it in place
-/// (a stale `open` workspace entry cannot shadow a git-root record that
-/// already saw the PR merge). The linked `activePullRequest` stays first
-/// for the open scan and takes the same in-place upgrade; every same-URL
-/// copy of it shares its effective lifecycle — a duplicate of the linked
-/// PR is never appended to the pool (the linked entry already represents
-/// it on both PR rungs), and a pooled copy is upgraded to match — so a
-/// merged linked PR can never resurface as `open` through a stale root
-/// record. Only called when there is something to fold, so the empty case
-/// never allocates.
+/// the wire `pullRequests`: dedup by `url`, the workspace entry keeps its
+/// identity, and the lifecycle only moves up the [`pr_status_rank`] ladder.
+/// For every URL a git-root PR carries, the effective lifecycle is the
+/// highest rank across ALL copies — linked `activePullRequest`, pooled
+/// `pullRequests` entry, and every git-root record — and each copy is
+/// canonicalized to it, in both directions: a merged pool copy lifts a
+/// stale `open` linked copy just as a merged root lifts either, and a
+/// `closed` copy never downgrades `merged`. Same-URL copies therefore
+/// agree, so a merged PR cannot resurface as `open` through whichever copy
+/// step 4 happens to scan first, and the result is independent of git-root
+/// order. A git-root URL absent from the workspace linkage is appended
+/// once (root-only) and later same-URL roots upgrade that appended entry
+/// without counting as a workspace-owned upgrade. Copies of a URL no
+/// git-root PR carries keep the pre-existing linkage semantics (the linked
+/// entry wins). The linked `activePullRequest` still scans first for the
+/// open rung. Only called when there is something to fold, so the empty
+/// case never allocates.
 fn fold_git_root_prs(
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
@@ -820,38 +831,41 @@ fn fold_git_root_prs(
 ) -> FoldedPrLinkage {
     let mut active = active_pr.cloned();
     let mut pool = pull_requests.to_vec();
-    let mut upgraded_to: Option<PullRequestStatus> = None;
-    let mut note_upgrade = |before: PullRequestStatus, after: PullRequestStatus| {
-        if after != before && upgraded_to.is_none_or(|u| pr_status_rank(after) > pr_status_rank(u))
-        {
-            upgraded_to = Some(after);
-        }
-    };
+    let owned_pool_len = pull_requests.len();
+    let mut owned_lifecycle: Option<PullRequestStatus> = None;
     for info in git_root_prs {
-        let linked = active.as_mut().filter(|active| active.url == info.url);
-        let effective = match linked {
-            Some(active) => {
-                let before = active.status;
-                upgrade_pr_lifecycle(active, info);
-                note_upgrade(before, active.status);
-                &*active
-            }
-            None => info,
+        let linked = active.as_ref().filter(|active| active.url == info.url);
+        let pooled = pool.iter().position(|p| p.url == info.url);
+        if linked.is_none() && pooled.is_none() {
+            pool.push(info.clone());
+            continue;
+        }
+        let owned = linked.is_some() || pooled.is_some_and(|i| i < owned_pool_len);
+        let Some(canonical) = [Some(info), pooled.map(|i| &pool[i]), linked]
+            .into_iter()
+            .flatten()
+            .max_by_key(|p| pr_status_rank(p.status))
+            .cloned()
+        else {
+            continue;
         };
-        match pool.iter_mut().find(|p| p.url == info.url) {
-            None if active_pr.is_some_and(|active| active.url == info.url) => {}
-            None => pool.push(info.clone()),
-            Some(present) => {
-                let before = present.status;
-                upgrade_pr_lifecycle(present, effective);
-                note_upgrade(before, present.status);
-            }
+        if let Some(active) = active.as_mut().filter(|active| active.url == info.url) {
+            upgrade_pr_lifecycle(active, &canonical);
+        }
+        if let Some(i) = pooled {
+            upgrade_pr_lifecycle(&mut pool[i], &canonical);
+        }
+        if owned
+            && owned_lifecycle
+                .is_none_or(|current| pr_status_rank(canonical.status) > pr_status_rank(current))
+        {
+            owned_lifecycle = Some(canonical.status);
         }
     }
     FoldedPrLinkage {
         active,
         pool,
-        upgraded_to,
+        owned_lifecycle,
     }
 }
 
@@ -859,12 +873,17 @@ fn fold_git_root_prs(
 /// the caller applies the attention/agent-activity promotion/demotion
 /// around it. `git_root_prs` are folded into the workspace linkage first
 /// ([`fold_git_root_prs`]); an empty slice takes the allocation-free path.
-/// When the fold upgraded a workspace-owned PR, a `prStatus` scalar ranking
-/// below that lifecycle is the same stale record and moves up with it (a
-/// stale `open` column cannot hold `pr_open` over a PR the root already saw
-/// merge); the scalar is otherwise untouched, so the legacy
-/// column-only fallback survives for workspaces whose linkage carries no
-/// upgraded object.
+/// The `prStatus` scalar mirrors the workspace-owned linkage, so when a
+/// git-root PR shares a URL with a workspace-owned entry the scalar is
+/// normalized to that URL's effective lifecycle whenever it ranks below it
+/// — whether the fold changed the entry or the entry was already merged (a
+/// stale `open` column cannot hold `pr_open` over a PR the workspace's own
+/// linkage reads as merged). Root-only git-root PRs never touch the
+/// scalar: with no workspace-owned PR object at that URL, the column is
+/// the workspace's own PR-stage signal and keeps its step-4 fallback role,
+/// while the root-only PR still qualifies for step 6 on its own merits
+/// once step 4 is clear — so the legacy column-only fallback survives
+/// unchanged.
 fn compute_base_display_status(
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
@@ -877,9 +896,9 @@ fn compute_base_display_status(
         return rollup_over_pr_pool(active_pr, pull_requests, pr_status, monitor_prs, task_stats);
     }
     let folded = fold_git_root_prs(active_pr, pull_requests, git_root_prs);
-    let pr_status = match (pr_status, folded.upgraded_to) {
-        (Some(stale), Some(upgraded)) if pr_status_rank(upgraded) > pr_status_rank(stale) => {
-            Some(upgraded)
+    let pr_status = match (pr_status, folded.owned_lifecycle) {
+        (Some(stale), Some(effective)) if pr_status_rank(effective) > pr_status_rank(stale) => {
+            Some(effective)
         }
         _ => pr_status,
     };
@@ -1985,11 +2004,14 @@ mod display_status {
         );
     }
 
-    /// A CLOSED (not merged) git-root PR never moves the rollup: the
-    /// task-only outcome is exactly what it would be without any git-root
-    /// PR, on every branch of steps 5/7.
+    /// A CLOSED (not merged) git-root PR never promotes on its own: with
+    /// no other PR signal the task-only outcome is exactly what it would be
+    /// without any git-root PR, on every branch of steps 5/7. (A distinct,
+    /// newer closed PR still follows the latest-updated step-6 rule against
+    /// an older merged entry; a same-URL closed duplicate never downgrades
+    /// merged — see the same-URL tests below.)
     #[test]
-    fn closed_git_root_pr_leaves_the_rollup_unchanged() {
+    fn closed_git_root_pr_never_promotes_on_its_own() {
         let closed = [root_pr(PullRequestStatus::Closed, "2026-01-02T00:00:00Z")];
         for task_stats in [
             None,
@@ -2089,13 +2111,154 @@ mod display_status {
             Some(PullRequestStatus::Merged)
         );
         assert!(folded.pool.is_empty(), "{:?}", folded.pool);
-        assert_eq!(folded.upgraded_to, None);
+        assert_eq!(folded.owned_lifecycle, Some(PullRequestStatus::Merged));
         let folded = super::fold_git_root_prs(Some(&merged), &stale_open_pool, &stale_open_dup);
         assert_eq!(
             folded.pool.iter().map(|p| p.status).collect::<Vec<_>>(),
             vec![PullRequestStatus::Merged]
         );
-        assert_eq!(folded.upgraded_to, Some(PullRequestStatus::Merged));
+        assert_eq!(folded.owned_lifecycle, Some(PullRequestStatus::Merged));
+    }
+
+    /// Canonicalization is bidirectional: a merged POOL copy lifts a stale
+    /// `open` linked copy of the same URL when a git-root PR carries that
+    /// URL, whatever lifecycle the root record itself reads (`open` or
+    /// `closed` — neither can downgrade the merged copy), so the linked
+    /// copy cannot shadow the merged one on the step-4 scan or mask it on
+    /// step 6.
+    #[test]
+    fn merged_pool_copy_lifts_stale_open_linked_copy_of_same_url() {
+        let stale_open_active = pr(PullRequestStatus::Open, "2026-01-01T00:00:00Z");
+        let merged_pool = [pr(PullRequestStatus::Merged, "2026-01-03T00:00:00Z")];
+        for root in [
+            pr(PullRequestStatus::Open, "2026-01-01T00:00:00Z"),
+            pr(PullRequestStatus::Closed, "2026-01-04T00:00:00Z"),
+            pr(PullRequestStatus::Merged, "2026-01-03T00:00:00Z"),
+        ] {
+            let roots = [root];
+            assert_eq!(
+                with_git_root_prs(
+                    Some(&stale_open_active),
+                    &merged_pool,
+                    &roots,
+                    Some(&stats(2, 2, 0))
+                ),
+                WorkspaceDisplayStatus::PrMerged,
+                "root {:?} let the stale open linked copy shadow the merged pool copy",
+                roots[0].status
+            );
+            let folded = super::fold_git_root_prs(Some(&stale_open_active), &merged_pool, &roots);
+            assert_eq!(
+                folded.active.as_ref().map(|a| a.status),
+                Some(PullRequestStatus::Merged)
+            );
+            assert_eq!(
+                folded.pool.iter().map(|p| p.status).collect::<Vec<_>>(),
+                vec![PullRequestStatus::Merged]
+            );
+            assert_eq!(folded.owned_lifecycle, Some(PullRequestStatus::Merged));
+        }
+    }
+
+    /// The scalar is normalized from the EFFECTIVE lifecycle of the
+    /// workspace-owned URL, not only when the fold changed something: a
+    /// linked PR already merged whose git-root duplicate also reads merged
+    /// still lifts a stale `open` `prStatus`, so the column cannot hold
+    /// `pr_open` over a PR every copy agrees is merged.
+    #[test]
+    fn stale_pr_status_scalar_normalizes_to_already_merged_same_url_fold() {
+        let merged = pr(PullRequestStatus::Merged, "2026-01-03T00:00:00Z");
+        let merged_dup = [pr(PullRequestStatus::Merged, "2026-01-03T00:00:00Z")];
+        let rollup = |active_pr: Option<&PullRequestInfo>, pull_requests: &[PullRequestInfo]| {
+            super::compute_display_status(
+                sig(false),
+                false,
+                active_pr,
+                pull_requests,
+                &merged_dup,
+                Some(PullRequestStatus::Open),
+                MonitorPrSignals::default(),
+                Some(&stats(2, 2, 0)),
+            )
+        };
+        assert_eq!(rollup(Some(&merged), &[]), WorkspaceDisplayStatus::PrMerged);
+        assert_eq!(
+            rollup(None, std::slice::from_ref(&merged)),
+            WorkspaceDisplayStatus::PrMerged
+        );
+        let folded = super::fold_git_root_prs(Some(&merged), &[], &merged_dup);
+        assert_eq!(folded.owned_lifecycle, Some(PullRequestStatus::Merged));
+    }
+
+    /// Root-only git-root PRs are deduplicated among themselves without
+    /// ever counting as a workspace-owned upgrade: with no workspace-owned
+    /// PR object at that URL the legacy `prStatus` column stays the
+    /// workspace's own step-4 signal, so `open` still reads `pr_open` —
+    /// independent of git-root order — and the root-only merged PR only
+    /// reaches step 6 once the column no longer says open.
+    #[test]
+    fn root_only_same_url_dedupe_never_rewrites_legacy_scalar_and_is_order_independent() {
+        let open_first = [
+            pr(PullRequestStatus::Open, "2026-01-01T00:00:00Z"),
+            pr(PullRequestStatus::Merged, "2026-01-03T00:00:00Z"),
+        ];
+        let merged_first = [open_first[1].clone(), open_first[0].clone()];
+        for roots in [&open_first, &merged_first] {
+            assert_eq!(
+                super::compute_display_status(
+                    sig(false),
+                    false,
+                    None,
+                    &[],
+                    roots,
+                    Some(PullRequestStatus::Open),
+                    MonitorPrSignals::default(),
+                    Some(&stats(2, 2, 0)),
+                ),
+                WorkspaceDisplayStatus::PrOpen
+            );
+            assert_eq!(
+                with_git_root_prs(None, &[], roots, Some(&stats(2, 2, 0))),
+                WorkspaceDisplayStatus::PrMerged
+            );
+            let folded = super::fold_git_root_prs(None, &[], roots);
+            assert_eq!(folded.owned_lifecycle, None);
+            assert_eq!(
+                folded.pool.iter().map(|p| p.status).collect::<Vec<_>>(),
+                vec![PullRequestStatus::Merged]
+            );
+        }
+    }
+
+    /// The fold result is independent of git-root order for workspace-owned
+    /// URLs too: an `open` and a `merged` root copy of the linked PR
+    /// canonicalize to merged either way.
+    #[test]
+    fn same_url_fold_is_independent_of_git_root_order() {
+        let stale_open = pr(PullRequestStatus::Open, "2026-01-01T00:00:00Z");
+        let open_first = [
+            pr(PullRequestStatus::Open, "2026-01-01T00:00:00Z"),
+            pr(PullRequestStatus::Merged, "2026-01-03T00:00:00Z"),
+        ];
+        let merged_first = [open_first[1].clone(), open_first[0].clone()];
+        for roots in [&open_first, &merged_first] {
+            assert_eq!(
+                with_git_root_prs(Some(&stale_open), &[], roots, Some(&stats(2, 2, 0))),
+                WorkspaceDisplayStatus::PrMerged
+            );
+            assert_eq!(
+                with_git_root_prs(
+                    None,
+                    std::slice::from_ref(&stale_open),
+                    roots,
+                    Some(&stats(2, 2, 0))
+                ),
+                WorkspaceDisplayStatus::PrMerged
+            );
+            let folded = super::fold_git_root_prs(Some(&stale_open), &[], roots);
+            assert_eq!(folded.owned_lifecycle, Some(PullRequestStatus::Merged));
+            assert!(folded.pool.is_empty(), "{:?}", folded.pool);
+        }
     }
 
     /// Cost-contract guard: the list paths issue ONE bulk git-root read —
@@ -2134,11 +2297,11 @@ mod display_status {
         );
     }
 
-    /// The `prStatus` scalar mirrors the same linkage a git-root duplicate
-    /// upgraded, so a stale `open` scalar cannot hold `pr_open` over a
-    /// linked or pooled PR the root already saw merge. The scalar is only
-    /// touched by an upgrade: the legacy column-only fallback still reads
-    /// `pr_open` when the merged git-root PR is a different URL.
+    /// The `prStatus` scalar mirrors the workspace-owned linkage a git-root
+    /// duplicate upgraded, so a stale `open` scalar cannot hold `pr_open`
+    /// over a linked or pooled PR the root already saw merge. Only a
+    /// workspace-owned URL normalizes it: the legacy column-only fallback
+    /// still reads `pr_open` when the merged git-root PR is a different URL.
     #[test]
     fn stale_pr_status_scalar_follows_git_root_lifecycle_upgrade() {
         let with_scalar = |active_pr: Option<&PullRequestInfo>,
