@@ -445,6 +445,15 @@ pub(crate) enum DefaultModelSource {
     CliDefault,
 }
 
+/// Output of [`Services::resolve_create_model_and_effort`]: the model and
+/// reasoning effort a new session would persist, after every creation-time
+/// provider / model / effort gate has passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateModelAndEffort {
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+}
+
 /// Single daemon-side default-model resolver (spec "New resolution policy").
 /// Applied by every creation path — `agent.create`, `agent.delegate`,
 /// `agent.wakeOrCreate`, `workspace.create` initialAgent — via
@@ -3580,6 +3589,211 @@ impl Services {
         self.maybe_emit_waiting_changed(workspace_id).await;
     }
 
+    /// The creation-time provider / model / reasoning-effort chain, in one
+    /// place (no persistence, no event): [`Self::agent_create_op`] runs it
+    /// before the session insert and [`Services::preflight_workspace_create`]
+    /// runs the same chain for `workspace.create`'s `initialAgent` before the
+    /// workspace row exists, so every `-32602` it can produce fires ahead of
+    /// any side effect on both seams. In order:
+    /// 1. Default-model resolution when the caller supplied no `model`
+    ///    ([`resolve_agent_default_model_with_source`]: specialist pin →
+    ///    settings chain → catalog default → CLI default), on the blocking
+    ///    pool (monorepo#4148).
+    /// 2. Provider gates: known provider, a default present (monorepo#3044),
+    ///    enabled in settings (monorepo#3178), cached auth verdict not
+    ///    hard-false.
+    /// 3. Bare-model ownership (monorepo#607): a *client-supplied* mismatch
+    ///    hard-fails; a derived default's mismatch drops to the CLI default.
+    /// 4. Reasoning effort: a caller-decided value (even blank, meaning an
+    ///    explicit clear) wins; otherwise the specialist model-option /
+    ///    frontmatter rungs (`resolve_delegate_reasoning_effort`), keyed on
+    ///    the resolved model. The result is validated against the resolved
+    ///    model's cached `effortLevels` (`ensure_effort_supported_by_model`).
+    /// 5. The settings default effort, only when no rung decided and the
+    ///    model came from the settings chain.
+    ///
+    /// `method` labels the errors (`agent.create` / `workspace.create`);
+    /// `spec_wp` is the project-tier hint for the specialist lookups.
+    pub(crate) async fn resolve_create_model_and_effort(
+        &self,
+        method: &'static str,
+        model: Option<String>,
+        specialist: Option<&str>,
+        provider: Option<&str>,
+        reasoning_effort: Option<String>,
+        spec_wp: Option<&Path>,
+    ) -> Result<CreateModelAndEffort> {
+        // A present value — even blank — means the effort was decided by the
+        // caller or by an upstream rung (`resolve_delegate_reasoning_effort`),
+        // so the settings default below must not fill it in. Empty/whitespace
+        // then collapses to None (an explicit clear); a non-empty level is
+        // validated against the resolved model once the model resolution has
+        // settled.
+        let reasoning_effort_decided = reasoning_effort.is_some();
+        let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
+        let model_explicit = model.is_some();
+        // Step 1: explicit model from the client (user picked it); otherwise
+        // default-model resolution walks the specialist tier directories —
+        // blocking pool (monorepo#4148).
+        let (mut resolved_model, mut model_source) = if let Some(m) = model {
+            (Some(m), DefaultModelSource::Explicit)
+        } else {
+            let services = self.clone();
+            let specialist = specialist.map(str::to_string);
+            let spec_wp = spec_wp.map(Path::to_path_buf);
+            let provider = provider.map(str::to_string);
+            tokio::task::spawn_blocking(move || {
+                resolve_agent_default_model_with_source(
+                    &services,
+                    specialist.as_deref(),
+                    spec_wp.as_deref(),
+                    provider.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("{method} model resolution task failed: {e}")))?
+        };
+
+        // Validate the explicit provider before persisting anything: an
+        // unknown provider is -32602, never a session row that would
+        // silently spawn the default binary. Absent provider (defaulting)
+        // remains valid.
+        if let Some(p) = provider {
+            ensure_known_provider(method, p)?;
+        }
+        // monorepo#3044: with no explicit provider and no settings-derived
+        // default, no spawn provider could ever resolve for this session.
+        // Fail loudly at the front door — the former behavior persisted the
+        // row and the spawn silently bottomed out at the first registered
+        // provider (auggie), installed or not.
+        let derived_default =
+            crate::agent_session::derived_default_provider(&self.effective_settings());
+        if provider.is_none() && derived_default.is_none() {
+            return Err(crate::agent_session::no_default_provider_error(method));
+        }
+        // monorepo#3178: the provider this session would spawn on must not be
+        // one the user explicitly disabled in `providers.enabled` — fail fast
+        // with the distinct "not enabled" -32602 before any session row is
+        // persisted. Resolve it with the spawn path's own precedence
+        // (`resolve_provider_id`: `provider` field → settings-derived
+        // default). This one gate covers every create seam (`agent.create`,
+        // `agent.wakeOrCreate`, and delegate's child creation). The
+        // hard-false auth-verdict gate (`ensure_provider_authenticated`)
+        // rides the same seam: a provider the daemon already observed as
+        // not-logged-in must fail fast with the login remedy instead of
+        // persisting a session that dies auth-required on its first turn.
+        // Installed-ness stays delegate-only (`ensure_provider_available`):
+        // direct creates on a known, enabled-but-uninstalled provider keep
+        // their existing spawn-time failure mode.
+        if let Some(p) =
+            crate::agent_session::resolve_provider_id(provider, derived_default.as_deref())
+        {
+            ensure_provider_enabled(
+                method,
+                &p,
+                self.effective_settings().providers.enabled.as_ref(),
+            )?;
+            ensure_provider_authenticated(
+                method,
+                &p,
+                crate::provider_auth::cached_auth_verdict(&p),
+            )?;
+        }
+        // A bare model that provably belongs to a different provider (cached
+        // dynamic catalogs) must not be persisted: the spawn would feed the
+        // effective provider another provider's model id (monorepo#607). The
+        // effective provider mirrors `resolve_provider_id`: provider field →
+        // settings-derived default (guaranteed present by the guard above).
+        // Bare ids with no ownership evidence pass — ownership cannot be
+        // proven for model lists that were never fetched.
+        //
+        // Only a *client-supplied* mismatch hard-fails. A mismatch in a
+        // derived default (specialist frontmatter / settings chain — e.g. a
+        // global `model.default` naming an auggie model while the caller
+        // asked for `provider: "grok"` with no model param) would reject a
+        // model the caller never sent and make the provider uncreatable
+        // until settings change; drop it to the CLI default instead
+        // (session.model stays None).
+        if let Some(m) = resolved_model.as_deref() {
+            let effective = provider
+                .or(derived_default.as_deref())
+                .expect("guarded above: provider or derived default present");
+            match ensure_bare_model_matches_provider(method, &self.cached_models(), effective, m) {
+                Ok(()) => {}
+                Err(e) if model_explicit => return Err(e),
+                Err(e) => {
+                    tracing::warn!(
+                        model = m,
+                        provider = effective,
+                        error = %e,
+                        "configured default model belongs to another provider; \
+                         falling back to the CLI default"
+                    );
+                    resolved_model = None;
+                    model_source = DefaultModelSource::CliDefault;
+                }
+            }
+        }
+        // Reasoning effort (PROTOCOL §5.11), specialist rungs: a *direct*
+        // `agent.create` naming a specialist consults the same model-option >
+        // frontmatter order the delegate/wakeOrCreate seams do, keyed on the
+        // model that was actually resolved above. Those seams pre-decide the
+        // effort and pass it down as a param, so this only fires for callers
+        // that did not (`reasoning_effort_decided == false`) — which is also
+        // what keeps the specialist rungs ahead of the settings default below.
+        let reasoning_effort = if reasoning_effort_decided {
+            reasoning_effort
+        } else {
+            // Effort resolution re-reads specialist frontmatter — blocking
+            // pool (monorepo#4148).
+            let services = self.clone();
+            let specialist = specialist.map(str::to_string);
+            let effective_provider = provider
+                .map(str::to_string)
+                .or_else(|| derived_default.clone());
+            let resolved_model = resolved_model.clone();
+            let spec_wp = spec_wp.map(Path::to_path_buf);
+            tokio::task::spawn_blocking(move || {
+                resolve_delegate_reasoning_effort(
+                    &services,
+                    None,
+                    specialist.as_deref(),
+                    effective_provider.as_deref(),
+                    resolved_model.as_deref(),
+                    spec_wp.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("{method} effort resolution task failed: {e}")))?
+        };
+        // Validate the requested level (PROTOCOL §5.5) against the *resolved*
+        // model's cached `effortLevels`, with the same probe-free,
+        // evidence-only rule the delegate/wakeOrCreate seams use — no evidence
+        // means the value passes through, since providers own the vocabulary.
+        // Runs before the session is persisted so a `-32602` rejection is
+        // side-effect free.
+        if let Some(effort) = reasoning_effort.as_deref() {
+            ensure_effort_supported_by_model(
+                method,
+                &self.cached_models(),
+                resolved_model.as_deref(),
+                effort,
+            )?;
+        }
+        // Last rung: the settings default effort, applied only when no rung
+        // above decided the effort AND the model itself came from the settings
+        // default chain (see `resolve_settings_default_reasoning_effort`).
+        let reasoning_effort = if reasoning_effort.is_some() || reasoning_effort_decided {
+            reasoning_effort
+        } else {
+            resolve_settings_default_reasoning_effort(self, model_source, resolved_model.as_deref())
+        };
+        Ok(CreateModelAndEffort {
+            model: resolved_model,
+            reasoning_effort,
+        })
+    }
+
     /// `agent.create`: persist a new session; the process spawns lazily on first
     /// turn (PROTOCOL §5.5). `task_note_id`/`skip_auto_commit` are set by
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
@@ -3750,14 +3964,6 @@ impl Services {
             is_background,
             name_explicitly_set: _,
         } = extra;
-        // A present value — even blank — means the effort was decided by the
-        // caller or by an upstream rung (`resolve_delegate_reasoning_effort`),
-        // so the settings default below must not fill it in. Empty/whitespace
-        // then collapses to None (an explicit clear); a non-empty level is
-        // validated against the resolved model once the model resolution has
-        // settled.
-        let reasoning_effort_decided = reasoning_effort.is_some();
-        let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
         let meta = metadata.as_ref().and_then(Value::as_object);
@@ -3795,7 +4001,6 @@ impl Services {
         // session.model, pinning it for the agent's lifetime. Settings changes
         // only affect new agents created afterwards; existing agents change
         // model only via explicit agent.setModel.
-        let model_explicit = model.is_some();
         // SECURITY: derive workspace_path from the stored workspace record
         // rather than trusting the client-supplied value (review thread
         // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
@@ -3813,173 +4018,22 @@ impl Services {
         } else {
             None
         };
-        // Step 1: explicit model from the client (user picked it); otherwise
-        // default-model resolution walks the specialist tier directories —
-        // blocking pool (monorepo#4148).
-        let (mut resolved_model, mut model_source) = if let Some(m) = model {
-            (Some(m), DefaultModelSource::Explicit)
-        } else {
-            let services = self.clone();
-            let specialist = specialist.clone();
-            let spec_wp = spec_wp.clone();
-            let provider = provider.clone();
-            tokio::task::spawn_blocking(move || {
-                resolve_agent_default_model_with_source(
-                    &services,
-                    specialist.as_deref(),
-                    spec_wp.as_deref(),
-                    provider.as_deref(),
-                )
-            })
-            .await
-            .map_err(|e| {
-                Error::Internal(format!("agent.create model resolution task failed: {e}"))
-            })?
-        };
-
-        // Validate the explicit provider before persisting anything: an
-        // unknown provider is -32602, never a session row that would
-        // silently spawn the default binary. Absent provider (defaulting)
-        // remains valid.
-        if let Some(p) = provider.as_deref() {
-            ensure_known_provider("agent.create", p)?;
-        }
-        // monorepo#3044: with no explicit provider and no settings-derived
-        // default, no spawn provider could ever resolve for this session.
-        // Fail loudly at the front door — the former behavior persisted the
-        // row and the spawn silently bottomed out at the first registered
-        // provider (auggie), installed or not.
-        let derived_default =
-            crate::agent_session::derived_default_provider(&self.effective_settings());
-        if provider.is_none() && derived_default.is_none() {
-            return Err(crate::agent_session::no_default_provider_error(
+        // The provider / model / reasoning-effort chain (shared with the
+        // `workspace.create` preflight): every `-32602` it can raise fires
+        // here, before the session is persisted.
+        let CreateModelAndEffort {
+            model: resolved_model,
+            reasoning_effort,
+        } = self
+            .resolve_create_model_and_effort(
                 "agent.create",
-            ));
-        }
-        // monorepo#3178: the provider this session would spawn on must not be
-        // one the user explicitly disabled in `providers.enabled` — fail fast
-        // with the distinct "not enabled" -32602 before any session row is
-        // persisted. Resolve it with the spawn path's own precedence
-        // (`resolve_provider_id`: `provider` field → settings-derived
-        // default). This one gate covers every create seam (`agent.create`,
-        // `agent.wakeOrCreate`, and delegate's child creation). The
-        // hard-false auth-verdict gate (`ensure_provider_authenticated`)
-        // rides the same seam: a provider the daemon already observed as
-        // not-logged-in must fail fast with the login remedy instead of
-        // persisting a session that dies auth-required on its first turn.
-        // Installed-ness stays delegate-only (`ensure_provider_available`):
-        // direct creates on a known, enabled-but-uninstalled provider keep
-        // their existing spawn-time failure mode.
-        if let Some(p) = crate::agent_session::resolve_provider_id(
-            provider.as_deref(),
-            derived_default.as_deref(),
-        ) {
-            ensure_provider_enabled(
-                "agent.create",
-                &p,
-                self.effective_settings().providers.enabled.as_ref(),
-            )?;
-            ensure_provider_authenticated(
-                "agent.create",
-                &p,
-                crate::provider_auth::cached_auth_verdict(&p),
-            )?;
-        }
-        // A bare model that provably belongs to a different provider (cached
-        // dynamic catalogs) must not be persisted: the spawn would feed the
-        // effective provider another provider's model id (monorepo#607). The
-        // effective provider mirrors `resolve_provider_id`: provider field →
-        // settings-derived default (guaranteed present by the guard above).
-        // Bare ids with no ownership evidence pass — ownership cannot be
-        // proven for model lists that were never fetched.
-        //
-        // Only a *client-supplied* mismatch hard-fails. A mismatch in a
-        // derived default (specialist frontmatter / settings chain — e.g. a
-        // global `model.default` naming an auggie model while the caller
-        // asked for `provider: "grok"` with no model param) would reject a
-        // model the caller never sent and make the provider uncreatable
-        // until settings change; drop it to the CLI default instead
-        // (session.model stays None).
-        if let Some(m) = resolved_model.as_deref() {
-            let effective = provider
-                .as_deref()
-                .or(derived_default.as_deref())
-                .expect("guarded above: provider or derived default present");
-            match ensure_bare_model_matches_provider(
-                "agent.create",
-                &self.cached_models(),
-                effective,
-                m,
-            ) {
-                Ok(()) => {}
-                Err(e) if model_explicit => return Err(e),
-                Err(e) => {
-                    tracing::warn!(
-                        model = m,
-                        provider = effective,
-                        error = %e,
-                        "configured default model belongs to another provider; \
-                         falling back to the CLI default"
-                    );
-                    resolved_model = None;
-                    model_source = DefaultModelSource::CliDefault;
-                }
-            }
-        }
-        // Reasoning effort (PROTOCOL §5.11), specialist rungs: a *direct*
-        // `agent.create` naming a specialist consults the same model-option >
-        // frontmatter order the delegate/wakeOrCreate seams do, keyed on the
-        // model that was actually resolved above. Those seams pre-decide the
-        // effort and pass it down as a param, so this only fires for callers
-        // that did not (`reasoning_effort_decided == false`) — which is also
-        // what keeps the specialist rungs ahead of the settings default below.
-        let reasoning_effort = if reasoning_effort_decided {
-            reasoning_effort
-        } else {
-            // Effort resolution re-reads specialist frontmatter — blocking
-            // pool (monorepo#4148).
-            let services = self.clone();
-            let specialist = specialist.clone();
-            let effective_provider = provider.clone().or_else(|| derived_default.clone());
-            let resolved_model = resolved_model.clone();
-            let spec_wp = spec_wp.clone();
-            tokio::task::spawn_blocking(move || {
-                resolve_delegate_reasoning_effort(
-                    &services,
-                    None,
-                    specialist.as_deref(),
-                    effective_provider.as_deref(),
-                    resolved_model.as_deref(),
-                    spec_wp.as_deref(),
-                )
-            })
-            .await
-            .map_err(|e| {
-                Error::Internal(format!("agent.create effort resolution task failed: {e}"))
-            })?
-        };
-        // Validate the requested level (PROTOCOL §5.5) against the *resolved*
-        // model's cached `effortLevels`, with the same probe-free,
-        // evidence-only rule the delegate/wakeOrCreate seams use — no evidence
-        // means the value passes through, since providers own the vocabulary.
-        // Runs before the session is persisted so a `-32602` rejection is
-        // side-effect free.
-        if let Some(effort) = reasoning_effort.as_deref() {
-            ensure_effort_supported_by_model(
-                "agent.create",
-                &self.cached_models(),
-                resolved_model.as_deref(),
-                effort,
-            )?;
-        }
-        // Last rung: the settings default effort, applied only when no rung
-        // above decided the effort AND the model itself came from the settings
-        // default chain (see `resolve_settings_default_reasoning_effort`).
-        let reasoning_effort = if reasoning_effort.is_some() || reasoning_effort_decided {
-            reasoning_effort
-        } else {
-            resolve_settings_default_reasoning_effort(self, model_source, resolved_model.as_deref())
-        };
+                model,
+                specialist.as_deref(),
+                provider.as_deref(),
+                reasoning_effort,
+                spec_wp.as_deref(),
+            )
+            .await?;
         // Specialist prompt snapshot: freeze the resolved specialist injection
         // for the session's lifetime by persisting it into the metadata JSON,
         // so later edits/deletes of user/project-tier specialist files never

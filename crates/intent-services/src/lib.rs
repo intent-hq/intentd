@@ -11024,10 +11024,23 @@ impl Services {
     /// - compound `initialAgent.model` (`reject_compound_model`, PROTOCOL §5.5);
     /// - `fileBlocks` / `imageBlocks` shape and attachment references
     ///   (PROTOCOL §5.5, monorepo#3338) — same harvest as `agent_create_op`
-    ///   (top-level param wins over the `metadata.*Blocks` copy);
-    /// - provider / model resolution in `agent_create_op`'s exact precedence:
-    ///   known provider → default present → enabled → authenticated →
-    ///   client-supplied bare model owned by the effective provider;
+    ///   (top-level param wins over the `metadata.*Blocks` copy, `null`
+    ///   reads as absent);
+    /// - unknown `initialAgent.specialist` (monorepo#3497), canonicalized the
+    ///   way `agent_create_op` does — against the bundled + user tiers, plus
+    ///   the project tier of the tilde-expanded `repositoryPath` when it is an
+    ///   existing local directory (the same client-supplied path the create
+    ///   already trusts enough to provision a worktree from). No workspace
+    ///   row or worktree exists yet, so this is the only project tier
+    ///   available; `agent_create_op` later reads the new worktree at
+    ///   `baseRef`, so a project-tier-only specialist present in the checkout
+    ///   but absent at `baseRef` still fails late, and one present only at
+    ///   `baseRef` fails early here;
+    /// - provider / model / reasoning-effort resolution via the shared
+    ///   [`Self::resolve_create_model_and_effort`] chain (known provider →
+    ///   default present → enabled → authenticated → client-supplied bare
+    ///   model owned by the effective provider → specialist-derived effort
+    ///   supported by the resolved model), with the same project-tier hint;
     /// - `contextLinks` (PROTOCOL §5.1).
     ///
     /// `agent_create_op` re-runs its own checks unchanged when the initial
@@ -11042,6 +11055,7 @@ impl Services {
             let effective_file_blocks = agent
                 .file_blocks
                 .clone()
+                .filter(|v| !v.is_null())
                 .or_else(|| {
                     agent
                         .metadata
@@ -11056,6 +11070,7 @@ impl Services {
             let effective_image_blocks = agent
                 .image_blocks
                 .clone()
+                .filter(|v| !v.is_null())
                 .or_else(|| {
                     agent
                         .metadata
@@ -11070,49 +11085,48 @@ impl Services {
             self.validate_image_block_refs("workspace.create", effective_image_blocks.as_ref())
                 .await?;
 
-            // Provider / model gates, mirroring `agent_create_op` (which
-            // receives the same `nonempty_owned` values).
-            let provider = nonempty_owned(agent.provider.clone());
-            let model = nonempty_owned(agent.model.clone());
-            if let Some(p) = provider.as_deref() {
-                crate::agent_ops::ensure_known_provider("workspace.create", p)?;
-            }
-            let settings = self.effective_settings();
-            let derived_default = crate::agent_session::derived_default_provider(&settings);
-            if provider.is_none() && derived_default.is_none() {
-                return Err(crate::agent_session::no_default_provider_error(
-                    "workspace.create",
-                ));
-            }
-            if let Some(p) = crate::agent_session::resolve_provider_id(
-                provider.as_deref(),
-                derived_default.as_deref(),
-            ) {
-                crate::agent_ops::ensure_provider_enabled(
-                    "workspace.create",
-                    &p,
-                    settings.providers.enabled.as_ref(),
-                )?;
-                crate::agent_ops::ensure_provider_authenticated(
-                    "workspace.create",
-                    &p,
-                    crate::provider_auth::cached_auth_verdict(&p),
-                )?;
-            }
-            // Client-supplied bare model only: a derived default's mismatch
-            // is soft in `agent_create_op` (falls back to the CLI default).
-            if let Some(m) = model.as_deref() {
-                let effective = provider
-                    .as_deref()
-                    .or(derived_default.as_deref())
-                    .expect("guarded above: provider or derived default present");
-                crate::agent_ops::ensure_bare_model_matches_provider(
-                    "workspace.create",
-                    &self.cached_models(),
-                    effective,
-                    m,
-                )?;
-            }
+            // Project-tier hint for the specialist lookups: the repository
+            // checkout, only when it is an existing local directory.
+            let spec_wp = input
+                .repository_path
+                .as_deref()
+                .map(intent_core::expand_tilde_string)
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir());
+            let specialist = match nonempty_owned(agent.specialist.clone()) {
+                Some(spec_id) => {
+                    // Canonicalization walks the specialist tier directories —
+                    // blocking pool (monorepo#4148).
+                    let services = self.clone();
+                    let wp = spec_wp.clone();
+                    Some(
+                        tokio::task::spawn_blocking(move || {
+                            services
+                                .specialists_service()
+                                .canonical_id_or_err(&spec_id, wp.as_deref())
+                        })
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!(
+                                "workspace.create specialist resolution task failed: {e}"
+                            ))
+                        })??,
+                    )
+                }
+                None => None,
+            };
+            // Provider / model / effort gates — the same chain
+            // `agent_create_op` runs (which receives the same
+            // `nonempty_owned` values and no caller-decided effort).
+            self.resolve_create_model_and_effort(
+                "workspace.create",
+                nonempty_owned(agent.model.clone()),
+                specialist.as_deref(),
+                nonempty_owned(agent.provider.clone()).as_deref(),
+                None,
+                spec_wp.as_deref(),
+            )
+            .await?;
         }
         validate_context_links(input.context_links.as_deref())
     }

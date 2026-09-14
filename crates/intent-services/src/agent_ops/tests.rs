@@ -13205,10 +13205,22 @@ async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
     // insert fails on THIS test's side-effect assertions (naming the arm)
     // rather than on the hermetic-tests `default_workspaces_root()` guard.
     let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
+    // Hermetic specialist tiers (user + bundled both point at one temp dir):
+    // `no-such-specialist` is unknown, and `xhigh-pinned` pins `sonnet4.5`
+    // with a frontmatter effort the seeded catalog row below does not list.
+    let specialists_dir = tmp.path.with_extension("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("specialists dir");
+    std::fs::write(
+        specialists_dir.join("xhigh-pinned.md"),
+        "---\nname: \"xhigh-pinned\"\ndescription: \"Test specialist\"\nmodel: \"sonnet4.5\"\nreasoningEffort: \"xhigh\"\n---\n\nTest prompt",
+    )
+    .expect("write specialist");
+    let svc = svc.with_specialist_dirs(Some(specialists_dir.clone()), Some(specialists_dir));
     // Fixture for the provider/model arms (all keyed on providers no other
     // arm uses, so each arm trips exactly its own gate): opencode disabled
     // in settings, claude-code with a cached hard-false auth verdict, and
-    // cached catalogs proving `sonnet4.5` belongs to auggie and not grok.
+    // cached catalogs proving `sonnet4.5` belongs to auggie (with effort
+    // evidence `low`/`high`) and not grok.
     svc.settings_registry()
         .expect("registry")
         .apply(&[("providers.enabled".into(), json!({ "opencode": false }))])
@@ -13219,7 +13231,10 @@ async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
     svc.models_catalog.test_store(
         "auggie",
         crate::model_catalog::AUGGIE_CATALOG_VERSION,
-        vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
+        vec![
+            json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie",
+                     "effortLevels": ["low", "high"] }),
+        ],
         now,
     );
     svc.models_catalog.test_store(
@@ -13312,6 +13327,22 @@ async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
                 ..Default::default()
             }),
             "workspace.create: unknown attachment id: att-missing",
+        ),
+        arm(
+            "unknown specialist",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                specialist: Some("no-such-specialist".into()),
+                ..Default::default()
+            }),
+            "unknown specialist: no-such-specialist",
+        ),
+        arm(
+            "unsupported specialist-derived reasoning effort",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                specialist: Some("xhigh-pinned".into()),
+                ..Default::default()
+            }),
+            "workspace.create: reasoningEffort xhigh is not supported by model sonnet4.5",
         ),
         arm(
             "unknown provider",
