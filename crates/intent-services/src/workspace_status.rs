@@ -2427,11 +2427,11 @@ mod display_status {
             ("clean", "blocked", WorkspaceDisplayStatus::PrOpen),
         ];
         for (older_state, newer_state, expected) in cases {
-            let older = open_pr(older_state, "2026-01-01T00:00:00Z");
-            let newer = open_pr(newer_state, "2026-01-02T00:00:00Z");
-            let older_first = [older.clone(), newer.clone()];
-            let newer_first = [newer, older];
-            for roots in [&older_first, &newer_first] {
+            let stale_copy = open_pr(older_state, "2026-01-01T00:00:00Z");
+            let fresh_copy = open_pr(newer_state, "2026-01-02T00:00:00Z");
+            let stale_first = [stale_copy.clone(), fresh_copy.clone()];
+            let fresh_first = [fresh_copy, stale_copy];
+            for roots in [&stale_first, &fresh_first] {
                 let order: Vec<_> = roots
                     .iter()
                     .map(|p| (p.updated_at.as_str(), p.mergeable_state.as_deref()))
