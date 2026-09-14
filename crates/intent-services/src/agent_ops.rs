@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use intent_core::events::{
@@ -452,6 +452,81 @@ pub(crate) enum DefaultModelSource {
 pub(crate) struct CreateModelAndEffort {
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
+}
+
+/// Output of [`Services::plan_agent_create`]: every value the persist half
+/// ([`Services::persist_agent_create`]) needs that was derived from a
+/// *failing* check — the delegation-depth guard, specialist canonicalization,
+/// display-name derivation, attachment-block validation, and the provider /
+/// model / reasoning-effort chain. Once a plan exists, no `-32602` remains
+/// to be raised: persisting it can only fail on infrastructure
+/// ([`AgentPersistError`]).
+///
+/// `skip_auto_commit` is the one post-plan input: for `workspace.create`'s
+/// `initialAgent` it depends on the new workspace's effective auto-commit,
+/// known only once the workspace row exists, so callers may set it on the
+/// plan before persisting (it is not a validation).
+#[derive(Debug, Clone)]
+pub(crate) struct AgentCreatePlan {
+    /// Error-label method (`agent.create` / `workspace.create`) for the
+    /// persist half's infrastructure failures.
+    pub(crate) method: &'static str,
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) parent_agent_id: Option<AgentId>,
+    pub(crate) task_note_id: Option<NoteId>,
+    pub(crate) skip_auto_commit: bool,
+    pub(crate) name: String,
+    pub(crate) name_explicitly_set: bool,
+    /// Canonical specialist id (alias already rewritten).
+    pub(crate) specialist: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) metadata: Option<Value>,
+    pub(crate) delegation_depth: Option<i64>,
+    pub(crate) initial_message: Option<String>,
+    pub(crate) context_references: Option<Value>,
+    pub(crate) image_blocks: Option<Value>,
+    pub(crate) file_blocks: Option<Value>,
+    pub(crate) is_background: bool,
+}
+
+/// Why [`Services::persist_agent_create`] could not persist a planned session.
+/// Deliberately narrow — infrastructure only — so the persist half cannot
+/// express an input rejection: every variant maps to `-32603` via
+/// [`From<AgentPersistError> for Error`], and there is no `From<Error>` in the
+/// other direction, so a `?` on an [`Error`]-typed result does not compile
+/// inside the persist half.
+#[derive(Debug)]
+pub(crate) enum AgentPersistError {
+    /// The session insert failed.
+    Store(String),
+    /// Encoding the harness snapshot failed.
+    Internal(String),
+    /// The specialist-snapshot blocking task panicked or was cancelled.
+    Join(tokio::task::JoinError),
+}
+
+impl AgentPersistError {
+    fn store(e: Error) -> Self {
+        match e {
+            Error::Internal(msg) => AgentPersistError::Store(msg),
+            other => AgentPersistError::Store(other.to_string()),
+        }
+    }
+}
+
+impl From<AgentPersistError> for Error {
+    fn from(e: AgentPersistError) -> Self {
+        match e {
+            AgentPersistError::Store(msg) | AgentPersistError::Internal(msg) => {
+                Error::Internal(msg)
+            }
+            AgentPersistError::Join(e) => {
+                Error::Internal(format!("specialist snapshot task failed: {e}"))
+            }
+        }
+    }
 }
 
 /// Single daemon-side default-model resolver (spec "New resolution policy").
@@ -3799,6 +3874,14 @@ impl Services {
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
     /// resolve the `Linked-Note-Id:` trailer and honor the opt-out.
     ///
+    /// Two typed phases: [`Self::plan_agent_create`] owns every `-32602`
+    /// producer and yields an [`AgentCreatePlan`]; [`Self::persist_agent_create`]
+    /// turns the plan into a session row and, by its
+    /// [`AgentPersistError`] return type, cannot raise an input rejection.
+    /// This op is the thin `plan → persist` wrapper for the store-backed
+    /// seams (`agent.create`, `agent.delegate`, `agent.wakeOrCreate`);
+    /// `workspace.create` drives the two phases around its workspace insert.
+    ///
     /// Agent ids are server-assigned: the op always mints a fresh
     /// `agent-{uuid}` id (client-supplied ids are rejected `-32602` at the
     /// transport boundary before this op runs).
@@ -3830,6 +3913,70 @@ impl Services {
         skip_auto_commit: bool,
         extra: AgentCreateExtra,
     ) -> Result<Value> {
+        // SECURITY: the project tier resolves against the stored workspace
+        // record's path, never a client-supplied one (review thread
+        // PRRT_kwDOS9Wxuc6SIhDc — a malicious client could supply a spoofed
+        // `workspacePath` and read specialist files from other workspaces).
+        // Use worktree_path if available, otherwise repository_path. Read once
+        // and only when a specialist tier is actually consulted (specialist
+        // canonicalization / display name, model resolution, the specialist
+        // reasoning-effort rungs, and/or the specialist prompt snapshot).
+        let spec_wp = if model.is_none() || specialist.is_some() {
+            self.store
+                .get_workspace(&workspace_id)
+                .await
+                .ok()
+                .and_then(|w| crate::git_ops::worktree_path(&w))
+        } else {
+            None
+        };
+        let plan = self
+            .plan_agent_create(
+                "agent.create",
+                workspace_id,
+                name,
+                model,
+                specialist,
+                parent_agent_id,
+                task_note_id,
+                skip_auto_commit,
+                extra,
+                spec_wp.clone(),
+            )
+            .await?;
+        Ok(self.persist_agent_create(plan, spec_wp).await?)
+    }
+
+    /// Plan half of an agent create: runs, in order, every `-32602` producer
+    /// of the create seam and returns the [`AgentCreatePlan`] the persist half
+    /// consumes — the delegation-depth guard, specialist canonicalization,
+    /// display-name derivation, attachment-block harvest + validation, and the
+    /// provider / model / reasoning-effort chain
+    /// ([`Self::resolve_create_model_and_effort`]). Pure with respect to the
+    /// store: nothing is written, so a rejection here is side-effect free on
+    /// every seam, including `workspace.create`, which runs it BEFORE the
+    /// workspace row is inserted.
+    ///
+    /// `method` labels the errors (`agent.create` / `workspace.create`).
+    /// `spec_wp` is the single project-tier root for the plan's *failing*
+    /// specialist reads (canonical id, display name, model / effort).
+    /// SECURITY: callers pass the stored workspace's worktree path (never a
+    /// client-supplied one) or, for `workspace.create`, the `repositoryPath`
+    /// checkout being adopted.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn plan_agent_create(
+        &self,
+        method: &'static str,
+        workspace_id: WorkspaceId,
+        name: Option<String>,
+        model: Option<String>,
+        specialist: Option<String>,
+        parent_agent_id: Option<AgentId>,
+        task_note_id: Option<NoteId>,
+        skip_auto_commit: bool,
+        extra: AgentCreateExtra,
+        spec_wp: Option<PathBuf>,
+    ) -> Result<AgentCreatePlan> {
         // Depth guard at the service layer (LC-1): mirror the MCP `create_agent`
         // front-door check so every path that spawns a child for a parent
         // already at `MAX_DELEGATION_DEPTH` is refused — including RPC/service
@@ -3862,17 +4009,11 @@ impl Services {
         // `create_agent`/`ws.agent.create` tools, `agent.delegate`,
         // `agent.wakeOrCreate`'s create branch, `workspace.create`'s
         // `initialAgent`), so the validation covers them all.
-        // SECURITY: the project tier resolves against the stored workspace
-        // record's path, never a client-supplied one (same rationale as the
-        // model resolution below).
+        // The project tier resolves against `spec_wp` (see the doc comment:
+        // never a client-supplied path).
         let specialist = match specialist {
             Some(spec_id) => {
-                let wp = self
-                    .store
-                    .get_workspace(&workspace_id)
-                    .await
-                    .ok()
-                    .and_then(|w| crate::git_ops::worktree_path(&w));
+                let wp = spec_wp.clone();
                 // Canonicalization walks the specialist tier directories —
                 // blocking pool (monorepo#4148).
                 let services = self.clone();
@@ -3884,15 +4025,12 @@ impl Services {
                     })
                     .await
                     .map_err(|e| {
-                        Error::Internal(format!(
-                            "agent.create specialist resolution task failed: {e}"
-                        ))
+                        Error::Internal(format!("{method} specialist resolution task failed: {e}"))
                     })??,
                 )
             }
             None => None,
         };
-        let now = now_iso();
         // Derive an omitted name from the specialist's resolved display name
         // (frontmatter `name`, 3-tier project > user > bundled — the same
         // workspace-path-aware seam the model resolution below uses) so a
@@ -3903,15 +4041,7 @@ impl Services {
         // still applies.
         let specialist_display_name = match (&name, specialist.as_deref()) {
             (None, Some(spec_id)) => {
-                // SECURITY: derive workspace_path from the stored workspace
-                // record, never the client-supplied value (same rationale as
-                // the model resolution below).
-                let wp = self
-                    .store
-                    .get_workspace(&workspace_id)
-                    .await
-                    .ok()
-                    .and_then(|w| crate::git_ops::worktree_path(&w));
+                let wp = spec_wp.clone();
                 // Display-name resolution walks the specialist tiers —
                 // blocking pool (monorepo#4148); a JoinError degrades to the
                 // generic name fallback, never failing the create.
@@ -3944,7 +4074,6 @@ impl Services {
         let name = name
             .or(specialist_display_name)
             .unwrap_or_else(|| format!("Agent {}", &Uuid::new_v4().simple().to_string()[..6]));
-        let id = AgentId(format!("agent-{}", Uuid::new_v4()));
         // `metadata` is persisted (C1d-10a, closes the metadata half of the
         // P2-12a deferral) so `agent.wakeOrCreate` chains can read back the
         // parent's `delegationDepth`/`createdByAgentId`/`taskNoteId`/
@@ -3955,8 +4084,8 @@ impl Services {
             provider,
             reasoning_effort,
             agent_type: _,
-            mut metadata,
-            workspace_path: _, // Ignored; derived from workspace record for security
+            metadata,
+            workspace_path: _, // Ignored; `spec_wp` comes from the caller's trusted root
             workspace_context: _,
             context_references,
             image_blocks,
@@ -3987,9 +4116,9 @@ impl Services {
         // image references must name registered attachments in this
         // workspace (monorepo#3338). Runs before any side effect so a
         // `-32602` rejection persists nothing.
-        validate_file_blocks("agent.create", file_blocks.as_ref())?;
-        validate_image_blocks("agent.create", image_blocks.as_ref())?;
-        self.validate_image_block_refs("agent.create", image_blocks.as_ref())
+        validate_file_blocks(method, file_blocks.as_ref())?;
+        validate_image_blocks(method, image_blocks.as_ref())?;
+        self.validate_image_block_refs(method, image_blocks.as_ref())
             .await?;
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
@@ -4000,33 +4129,14 @@ impl Services {
         // `resolve_agent_default_model`). The resolved model is persisted to
         // session.model, pinning it for the agent's lifetime. Settings changes
         // only affect new agents created afterwards; existing agents change
-        // model only via explicit agent.setModel.
-        // SECURITY: derive workspace_path from the stored workspace record
-        // rather than trusting the client-supplied value (review thread
-        // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
-        // workspacePath and read specialist files from other workspaces.
-        // Use worktree_path if available, otherwise repository_path. Read once
-        // and only when a specialist tier is actually consulted (model
-        // resolution, the specialist reasoning-effort rungs, and/or the
-        // specialist prompt snapshot below).
-        let spec_wp = if model.is_none() || specialist.is_some() {
-            self.store
-                .get_workspace(&workspace_id)
-                .await
-                .ok()
-                .and_then(|w| crate::git_ops::worktree_path(&w))
-        } else {
-            None
-        };
-        // The provider / model / reasoning-effort chain (shared with the
-        // `workspace.create` preflight): every `-32602` it can raise fires
-        // here, before the session is persisted.
+        // model only via explicit agent.setModel. The provider / model /
+        // reasoning-effort chain is the last `-32602` producer of the plan.
         let CreateModelAndEffort {
             model: resolved_model,
             reasoning_effort,
         } = self
             .resolve_create_model_and_effort(
-                "agent.create",
+                method,
                 model,
                 specialist.as_deref(),
                 provider.as_deref(),
@@ -4034,6 +4144,66 @@ impl Services {
                 spec_wp.as_deref(),
             )
             .await?;
+        Ok(AgentCreatePlan {
+            method,
+            workspace_id,
+            parent_agent_id,
+            task_note_id,
+            skip_auto_commit,
+            name,
+            name_explicitly_set,
+            specialist,
+            model: resolved_model,
+            provider,
+            reasoning_effort,
+            metadata,
+            delegation_depth,
+            initial_message,
+            context_references,
+            image_blocks,
+            file_blocks,
+            is_background,
+        })
+    }
+
+    /// Persist half of an agent create: turns an [`AgentCreatePlan`] into a
+    /// session row and emits `agent:created`. Everything here is either
+    /// non-failing (the specialist prompt / orchestrator snapshot, usage
+    /// stats) or infrastructure ([`AgentPersistError`]) — by construction it
+    /// cannot raise a `-32602`, which is what lets `workspace.create` run it
+    /// AFTER the workspace row is inserted without risking a stranded row.
+    ///
+    /// `snapshot_wp` is the project-tier root for the *non-failing* specialist
+    /// snapshot (`resolve_prompt_injection` / `resolve_is_orchestrator`): the
+    /// stored workspace's worktree for the store-backed seams, the freshly
+    /// provisioned worktree at `baseRef` for `workspace.create`.
+    pub(crate) async fn persist_agent_create(
+        &self,
+        plan: AgentCreatePlan,
+        snapshot_wp: Option<PathBuf>,
+    ) -> std::result::Result<Value, AgentPersistError> {
+        let AgentCreatePlan {
+            method,
+            workspace_id,
+            parent_agent_id,
+            task_note_id,
+            skip_auto_commit,
+            name,
+            name_explicitly_set,
+            specialist,
+            model: resolved_model,
+            provider,
+            reasoning_effort,
+            mut metadata,
+            delegation_depth,
+            initial_message,
+            context_references,
+            image_blocks,
+            file_blocks,
+            is_background,
+        } = plan;
+        let now = now_iso();
+        let id = AgentId(format!("agent-{}", Uuid::new_v4()));
         // Specialist prompt snapshot: freeze the resolved specialist injection
         // for the session's lifetime by persisting it into the metadata JSON,
         // so later edits/deletes of user/project-tier specialist files never
@@ -4052,7 +4222,7 @@ impl Services {
             // directories — blocking pool (monorepo#4148).
             let services = self.clone();
             let spec_id_owned = spec_id.to_string();
-            let wp = spec_wp.clone();
+            let wp = snapshot_wp.clone();
             let (injection, frozen_is_orchestrator) = tokio::task::spawn_blocking(move || {
                 (
                     services
@@ -4064,9 +4234,7 @@ impl Services {
                 )
             })
             .await
-            .map_err(|e| {
-                Error::Internal(format!("agent.create specialist snapshot task failed: {e}"))
-            })?;
+            .map_err(AgentPersistError::Join)?;
             if let Some((body, spec_name, reminder)) = injection {
                 let meta_value =
                     metadata.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
@@ -4121,8 +4289,11 @@ impl Services {
         // wakeOrCreate children funnel through this op and mint the latest
         // version, never inheriting the parent's pinned one.
         let settings = self.effective_settings();
-        let harness_features = serde_json::to_value(&settings.agent_features)
-            .map_err(|e| Error::Internal(format!("encode agentFeatures snapshot failed: {e}")))?;
+        let harness_features = serde_json::to_value(&settings.agent_features).map_err(|e| {
+            AgentPersistError::Internal(format!(
+                "{method}: encode agentFeatures snapshot failed: {e}"
+            ))
+        })?;
         let session = AgentSession {
             id,
             workspace_id,
@@ -4193,7 +4364,8 @@ impl Services {
         let task_graph_enabled = settings.agent_features.task_graph;
         self.store
             .insert_agent_session_with_task_graph(&session, task_graph_enabled)
-            .await?;
+            .await
+            .map_err(AgentPersistError::store)?;
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Global usage-stats (D2): count this session start in the current UTC
         // hour bucket under the session's stats model key (normalized model,
