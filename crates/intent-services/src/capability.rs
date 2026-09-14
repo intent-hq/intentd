@@ -199,7 +199,7 @@ impl Services {
     /// The agent's workspace for a membership check: the metadata-only
     /// session row (no transcript hydration — monorepo#958); an unknown
     /// agent is `NotFound`.
-    async fn agent_workspace(&self, agent_id: &AgentId) -> Result<WorkspaceId> {
+    pub(crate) async fn agent_workspace(&self, agent_id: &AgentId) -> Result<WorkspaceId> {
         Ok(self
             .store
             .get_agent_session_summary(agent_id)

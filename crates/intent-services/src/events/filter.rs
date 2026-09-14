@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use intent_core::events::is_collaborator_event_type;
+use intent_core::events::{is_collaborator_event_type, NOTE_PRESENCE, PRESENCE_CHANGED};
 use intent_core::{parse_iso, ActorType, Event};
 
 /// Category wildcards that a bare `*` subscription expands to. Mirrors
@@ -52,10 +52,16 @@ pub(crate) const AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS: &[&str] = &[
 /// agent-owned event subscriptions (monorepo#1229): every `agent:`-prefixed
 /// type — transcript/tool/stream traffic, lifecycle, and the observability
 /// events the original TS hard-excluded as `INTERNAL_OBSERVABILITY_EVENTS` —
-/// plus `chat:stream:delta`, the one high-volume streaming type outside the
-/// `agent:` prefix. The prefix rule also covers the `agent:*` pattern itself.
+/// plus the high-volume streaming types outside the `agent:` prefix:
+/// `chat:stream:delta` and the transient presence pair (`presence:changed`,
+/// `note:presence` — up to ten caret moves a second per viewer, multiplayer
+/// w5; a `note:*` subscriber must not be woken by them). The prefix rule
+/// also covers the `agent:*` pattern itself.
 pub(crate) fn is_agent_restricted_event_type(event_type: &str) -> bool {
-    event_type.starts_with("agent:") || event_type == "chat:stream:delta"
+    event_type.starts_with("agent:")
+        || event_type == "chat:stream:delta"
+        || event_type == PRESENCE_CHANGED
+        || event_type == NOTE_PRESENCE
 }
 
 /// Default coalescing window applied when a subscriber requests batching
@@ -306,10 +312,17 @@ mod tests {
             "agent:woken-by-subscription",
             "agent:subscriptions-restored",
             "chat:stream:delta",
+            "presence:changed",
+            "note:presence",
         ] {
             assert!(is_agent_restricted_event_type(t), "{t} must be restricted");
         }
-        for t in ["file:changed", "task:status-changed", "chat:stream"] {
+        for t in [
+            "file:changed",
+            "task:status-changed",
+            "chat:stream",
+            "note:updated",
+        ] {
             assert!(!is_agent_restricted_event_type(t), "{t} must be allowed");
         }
     }
