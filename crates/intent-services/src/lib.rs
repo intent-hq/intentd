@@ -4041,7 +4041,10 @@ impl Services {
     /// persisted as supplied; on merge the existing value is always retained
     /// (the store upsert never touches the column). Returns the stored row.
     /// Callers (the `ws.git.registerRoot` MCP binding, submodule
-    /// auto-detection) validate the path before reaching this.
+    /// auto-detection) validate the path before reaching this. A fresh
+    /// insert that already carries PR data feeds the displayStatus
+    /// derivation, so it routes through the transition-only recompute
+    /// (a merge never touches the PR columns, so it cannot move the rung).
     pub(crate) async fn register_git_root(
         &self,
         root: &intent_core::WorkspaceGitRoot,
@@ -4057,12 +4060,18 @@ impl Services {
             git_root_changed_event(event_type, &stored),
         )
         .await;
+        if inserted && git_root_carries_pr_data(&stored) {
+            self.maybe_emit_display_status_changed(&stored.workspace_id)
+                .await;
+        }
         Ok(stored)
     }
 
     /// Delete a workspace git root and emit `gitRoot:unregistered`
     /// (monorepo#2053). `NotFound` when the id is unknown. Used by the
     /// `ws.git.unregisterRoot` MCP binding and the auto-prune sweep.
+    /// Removing a PR-bearing root can lapse the displayStatus PR rung, so
+    /// that case routes through the transition-only recompute.
     pub(crate) async fn unregister_git_root(&self, git_root_id: &WorkspaceGitRootId) -> Result<()> {
         let root = self.store.get_workspace_git_root(git_root_id).await?;
         self.store.delete_workspace_git_root(git_root_id).await?;
@@ -4071,6 +4080,10 @@ impl Services {
             git_root_unregistered_event(&root.workspace_id, &root.id, &root.path),
         )
         .await;
+        if git_root_carries_pr_data(&root) {
+            self.maybe_emit_display_status_changed(&root.workspace_id)
+                .await;
+        }
         Ok(())
     }
 
@@ -4359,7 +4372,10 @@ impl Services {
     /// [`PR_REFRESH_FETCH_TIMEOUT`] wrap, never RPC-time.
     ///
     /// Persists via the scoped `update_workspace_git_root_pr` and emits
-    /// `gitRoot:updated` once, only on change.
+    /// `gitRoot:updated` once, only on change. A persisted change also routes
+    /// through the transition-only displayStatus recompute, so a root PR
+    /// merging (or opening) regroups the sidebar live instead of waiting for
+    /// the next `workspace.list`.
     async fn refresh_git_root_pr(
         &self,
         mut root: intent_core::WorkspaceGitRoot,
@@ -4534,6 +4550,8 @@ impl Services {
                 git_root_changed_event(GIT_ROOT_UPDATED, &root),
             )
             .await;
+            self.maybe_emit_display_status_changed(&root.workspace_id)
+                .await;
         }
         // A relink discovery or heal re-fetch that hit the forge quota
         // surfaces AFTER the delta persist (the paid-for snapshots land)
@@ -12625,6 +12643,18 @@ pub(crate) fn git_root_changed_event(
             "gitRoot": root,
         }),
     }
+}
+
+/// Whether a git-root row carries any PR input the displayStatus derivation
+/// reads (a linked PR or a non-empty persisted pool), i.e. whether inserting
+/// or deleting the row can move the PR rung.
+fn git_root_carries_pr_data(root: &intent_core::WorkspaceGitRoot) -> bool {
+    root.pr_number.is_some()
+        || root.pr_status.is_some()
+        || root
+            .pull_requests
+            .as_deref()
+            .is_some_and(|items| !items.is_empty())
 }
 
 /// Serialize persisted [`intent_core::WorkspaceGitRoot`] rows into their wire

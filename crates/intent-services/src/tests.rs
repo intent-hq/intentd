@@ -17808,6 +17808,148 @@ mod pr {
         assert!(list.iter().any(|p| p.number == 77));
     }
 
+    /// A spec-child task note in `status`, so it counts into the workspace's
+    /// `taskStats` for the displayStatus derivation.
+    fn sweep_task_note(ws_id: &WorkspaceId, status: intent_core::TaskStatus) -> intent_core::Note {
+        let ts = now_iso();
+        intent_core::Note {
+            id: intent_core::NoteId::from("t1"),
+            workspace_id: ws_id.clone(),
+            title: "Task".into(),
+            content: String::new(),
+            content_type: intent_core::ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: Some(intent_core::NoteId::from("spec")),
+            visibility: intent_core::NoteVisibility::Workspace,
+            metadata: intent_core::NoteMetadata {
+                task: Some(intent_core::TaskMetadata {
+                    status,
+                    ..Default::default()
+                }),
+            },
+            created_at: ts.clone(),
+            rev: 0,
+            updated_at: ts,
+        }
+    }
+
+    /// Persisted `workspace:displayStatus-changed` payloads for `ws_id`, in
+    /// emission order (`events_by_type` returns newest-first).
+    async fn display_status_events(svc: &Services, ws_id: &WorkspaceId) -> Vec<serde_json::Value> {
+        svc.store()
+            .events_by_type(ws_id, "workspace:displayStatus-changed", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .rev()
+            .map(|e| e.data["displayStatus"].clone())
+            .collect()
+    }
+
+    /// The git-root PR sweep routes through the displayStatus recompute: with
+    /// every task complete (baseline `complete` seeded by a `workspace.list`
+    /// read), the root's linked PR being fetched as merged persists the
+    /// status delta and emits exactly one
+    /// `workspace:displayStatus-changed { displayStatus: "pr_merged" }`; an
+    /// identical re-sweep persists nothing and emits nothing.
+    #[tokio::test]
+    async fn root_refresh_merged_pr_emits_display_status_changed() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let wsroot = super::WorkspacesRoot::new();
+        let svc = svc.with_workspaces_root(wsroot.path().to_path_buf());
+        svc.store()
+            .insert_note(&sweep_task_note(&ws.id, intent_core::TaskStatus::Complete))
+            .await
+            .unwrap();
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        let mut open_info = crate::pr_ops::build_pr_info(&sample_pr());
+        open_info.status = intent_core::PullRequestStatus::Open;
+        root.pull_requests = Some(vec![open_info]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        // Seed the last-observed baseline via a list read: the open,
+        // mergeable root PR (`sample_pr()` is `clean`) reads `pr_ready`; a
+        // seed never emits.
+        let list = svc.list_workspaces(false).await.unwrap();
+        let row = list.iter().find(|w| w.id == ws.id).expect("row");
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+        assert!(display_status_events(&svc, &ws.id).await.is_empty());
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            merged_linked: true,
+            ..Default::default()
+        });
+        let outcome = svc.refresh_git_root_pr(root.clone(), &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+        assert_eq!(
+            display_status_events(&svc, &ws.id).await,
+            vec![json!("pr_merged")],
+            "one transition to pr_merged"
+        );
+
+        // Identical forge state: no persist, no event.
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let outcome = svc
+            .refresh_git_root_pr(roots[0].clone(), &sc)
+            .await
+            .unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Unchanged);
+        assert_eq!(display_status_events(&svc, &ws.id).await.len(), 1);
+    }
+
+    /// Registering a root that already carries a merged PR promotes the
+    /// rollup (`complete` → `pr_merged`) and unregistering the PR-bearing
+    /// root lapses it back (`pr_merged` → `complete`); each transition emits
+    /// exactly once.
+    #[tokio::test]
+    async fn git_root_register_unregister_recompute_display_status() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let wsroot = super::WorkspacesRoot::new();
+        let svc = svc.with_workspaces_root(wsroot.path().to_path_buf());
+        svc.store()
+            .insert_note(&sweep_task_note(&ws.id, intent_core::TaskStatus::Complete))
+            .await
+            .unwrap();
+
+        // Seed the baseline at `complete` via a list read (never emits).
+        let list = svc.list_workspaces(false).await.unwrap();
+        let row = list.iter().find(|w| w.id == ws.id).expect("row");
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::Complete)
+        );
+        assert!(display_status_events(&svc, &ws.id).await.is_empty());
+
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        let mut merged_pr = sample_pr();
+        merged_pr.state = PrState::Merged;
+        root.pull_requests = Some(vec![crate::pr_ops::build_pr_info(&merged_pr)]);
+        let stored = svc.register_git_root(&root).await.unwrap();
+        assert_eq!(
+            display_status_events(&svc, &ws.id).await,
+            vec![json!("pr_merged")]
+        );
+
+        svc.unregister_git_root(&stored.id).await.unwrap();
+        assert_eq!(
+            display_status_events(&svc, &ws.id).await,
+            vec![json!("pr_merged"), json!("complete")]
+        );
+    }
+
     /// Build a persisted `pull_requests` entry shaped exactly like
     /// `build_pr_info(StubForge::get_pr(number))` (so an identical re-fetch
     /// is a no-op), with the status/updatedAt under test.
