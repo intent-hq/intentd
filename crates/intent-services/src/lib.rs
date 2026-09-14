@@ -383,18 +383,22 @@ pub struct Services {
     /// parked in the queue — where the STAB-52 gate refuses to redrive it
     /// and the exiting worker never drains. A send parked behind a
     /// still-`Active` turn is never recorded: it is an ordinary mid-turn
-    /// queue entry and stays behind the gate if that turn fails. The
-    /// releasing worker consumes this marker at exit and redrives THAT
-    /// entry; the send side re-probes after its enqueue for the opposite
-    /// interleaving. Cleared by [`agent_ops::Services::pop_draining`] the
-    /// moment any drain delivers the entry — whether or not a redrive has
-    /// consumed it meanwhile (a consumed record stays in the map flagged
-    /// `consumed` until delivery retires it or the redrive hands it back) —
-    /// so a marker never outlives its send: a context-size requeue restores
-    /// entries under their ORIGINAL ids, and without the clear a marker left
-    /// by an already-delivered send would re-validate and lift the gate with
-    /// no fresh send. Never persisted.
-    parked_recovery_sends: Arc<Mutex<HashMap<AgentId, agent_ops::ParkedRecoverySend>>>,
+    /// queue entry and stays behind the gate if that turn fails. Recorded
+    /// atomically with the enqueue ([`agent_ops::Services::enqueue_recovery_send`]);
+    /// the releasing worker's exit and the send side's post-enqueue probe
+    /// both redrive THAT entry through
+    /// [`agent_ops::Services::claim_parked_recovery_send`], which pops the
+    /// entry and retires the marker INSIDE the in-flight slot claim — the
+    /// marker is the only authorization, never a copy held across awaits.
+    /// Retired by every committed delivery of the entry
+    /// ([`agent_ops::Services::commit_recovery_send_delivery`]) so a marker
+    /// never outlives its send: a context-size requeue restores entries
+    /// under their ORIGINAL ids, and without the clear a marker left by an
+    /// already-delivered send would lift the gate with no fresh send. Lock
+    /// order: `draining_queue_entries` → `agent_queues` → this mutex, all
+    /// nested inside the `AgentManager` `busy` lock when taken from the slot
+    /// claim. Never persisted.
+    parked_recovery_sends: Arc<Mutex<HashMap<AgentId, String>>>,
     /// Serializes [`agent_ops`] queue write-through persists. Each persist
     /// snapshots the live queue *inside* this async lock, so the last write to
     /// the `agent_queue` table always reflects the newest in-memory state — an
