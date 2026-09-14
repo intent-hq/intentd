@@ -787,6 +787,28 @@ pub(crate) fn upgrade_pr_lifecycle(present: &mut PullRequestInfo, candidate: &Pu
     }
 }
 
+/// Canonicalization key of a same-URL copy inside [`fold_git_root_prs`]:
+/// the lifecycle rank first, then the latest `updated_at` among equal
+/// ranks, so two merged (or two open) copies of one PR agree on the
+/// timestamp step 6 compares, whichever copy the fold visits first.
+fn pr_lifecycle_key(info: &PullRequestInfo) -> (u8, &str) {
+    (pr_status_rank(info.status), info.updated_at.as_str())
+}
+
+/// [`upgrade_pr_lifecycle`] for the fold: identity fields still keep
+/// `present`, a higher-ranked `canonical` still moves the lifecycle fields,
+/// and an equal-ranked `canonical` with a newer `updated_at` advances the
+/// timestamp too (its `isDraft` moves with it, so a draft that became ready
+/// reads `open`). A lower rank never moves anything — `closed` cannot
+/// downgrade `merged`.
+fn canonicalize_pr_lifecycle(present: &mut PullRequestInfo, canonical: &PullRequestInfo) {
+    if pr_lifecycle_key(canonical) > pr_lifecycle_key(present) {
+        present.status = canonical.status;
+        present.updated_at.clone_from(&canonical.updated_at);
+        present.is_draft = canonical.is_draft;
+    }
+}
+
 /// The workspace PR linkage after [`fold_git_root_prs`].
 struct FoldedPrLinkage {
     /// The linked `activePullRequest`, canonicalized in place to the
@@ -811,13 +833,15 @@ struct FoldedPrLinkage {
 /// identity, and the lifecycle only moves up the [`pr_status_rank`] ladder.
 /// For every URL a git-root PR carries, the effective lifecycle is the
 /// highest rank across ALL copies — linked `activePullRequest`, pooled
-/// `pullRequests` entry, and every git-root record — and each copy is
+/// `pullRequests` entry, and every git-root record — with the latest
+/// `updated_at` among the copies of that rank, and each copy is
 /// canonicalized to it, in both directions: a merged pool copy lifts a
 /// stale `open` linked copy just as a merged root lifts either, and a
 /// `closed` copy never downgrades `merged`. Same-URL copies therefore
-/// agree, so a merged PR cannot resurface as `open` through whichever copy
-/// step 4 happens to scan first, and the result is independent of git-root
-/// order. A git-root URL absent from the workspace linkage is appended
+/// agree on status AND timestamp, so a merged PR cannot resurface as
+/// `open` through whichever copy step 4 happens to scan first, the step-6
+/// latest-updated pick sees one timestamp per PR, and the result is
+/// independent of git-root order. A git-root URL absent from the workspace linkage is appended
 /// once (root-only) and later same-URL roots upgrade that appended entry
 /// without counting as a workspace-owned upgrade. Copies of a URL no
 /// git-root PR carries keep the pre-existing linkage semantics (the linked
@@ -844,16 +868,16 @@ fn fold_git_root_prs(
         let Some(canonical) = [Some(info), pooled.map(|i| &pool[i]), linked]
             .into_iter()
             .flatten()
-            .max_by_key(|p| pr_status_rank(p.status))
+            .max_by_key(|p| pr_lifecycle_key(p))
             .cloned()
         else {
             continue;
         };
         if let Some(active) = active.as_mut().filter(|active| active.url == info.url) {
-            upgrade_pr_lifecycle(active, &canonical);
+            canonicalize_pr_lifecycle(active, &canonical);
         }
         if let Some(i) = pooled {
-            upgrade_pr_lifecycle(&mut pool[i], &canonical);
+            canonicalize_pr_lifecycle(&mut pool[i], &canonical);
         }
         if owned
             && owned_lifecycle
@@ -2259,6 +2283,114 @@ mod display_status {
             assert_eq!(folded.owned_lifecycle, Some(PullRequestStatus::Merged));
             assert!(folded.pool.is_empty(), "{:?}", folded.pool);
         }
+    }
+
+    /// Equal-rank same-URL copies canonicalize to the LATEST `updated_at`
+    /// (rank first, then timestamp), so the step-6 latest-updated pick
+    /// between a merged PR and a distinct newer-looking closed PR does not
+    /// depend on which merged copy the fold visited first: root-only
+    /// `[merged(A, Jan 1), merged(A, Jan 3), closed(B, Jan 2)]` reads
+    /// `pr_merged` with the two A copies in either order, because A's
+    /// effective timestamp is Jan 3.
+    #[test]
+    fn root_only_equal_rank_copies_take_latest_updated_at_in_either_order() {
+        let merged_old = pr(PullRequestStatus::Merged, "2026-01-01T00:00:00Z");
+        let merged_new = pr(PullRequestStatus::Merged, "2026-01-03T00:00:00Z");
+        let closed_between = root_pr(PullRequestStatus::Closed, "2026-01-02T00:00:00Z");
+        let old_first = [
+            merged_old.clone(),
+            merged_new.clone(),
+            closed_between.clone(),
+        ];
+        let new_first = [merged_new.clone(), merged_old, closed_between];
+        for roots in [&old_first, &new_first] {
+            assert_eq!(
+                with_git_root_prs(None, &[], roots, Some(&stats(2, 2, 0))),
+                WorkspaceDisplayStatus::PrMerged,
+                "roots {:?}",
+                roots.iter().map(|p| &p.updated_at).collect::<Vec<_>>()
+            );
+            let folded = super::fold_git_root_prs(None, &[], roots);
+            assert_eq!(folded.owned_lifecycle, None);
+            assert_eq!(
+                folded
+                    .pool
+                    .iter()
+                    .map(|p| (p.status, p.updated_at.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (PullRequestStatus::Merged, "2026-01-03T00:00:00Z"),
+                    (PullRequestStatus::Closed, "2026-01-02T00:00:00Z"),
+                ]
+            );
+        }
+    }
+
+    /// The same timestamp rule for a workspace-owned URL: a pooled
+    /// `open(A, Jan 1)` upgraded by `[merged(A, Jan 2), merged(A, Jan 4),
+    /// closed(B, Jan 3)]` keeps the workspace object but carries A's latest
+    /// merged timestamp (Jan 4), so step 6 reads `pr_merged` in either root
+    /// order and the lower-rank closed B never displaces it.
+    #[test]
+    fn owned_equal_rank_copies_take_latest_updated_at_in_either_order() {
+        let stale_open_pool = [pr(PullRequestStatus::Open, "2026-01-01T00:00:00Z")];
+        let merged_old = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        let merged_new = pr(PullRequestStatus::Merged, "2026-01-04T00:00:00Z");
+        let closed_between = root_pr(PullRequestStatus::Closed, "2026-01-03T00:00:00Z");
+        let old_first = [
+            merged_old.clone(),
+            merged_new.clone(),
+            closed_between.clone(),
+        ];
+        let new_first = [merged_new.clone(), merged_old, closed_between];
+        for roots in [&old_first, &new_first] {
+            assert_eq!(
+                with_git_root_prs(None, &stale_open_pool, roots, Some(&stats(2, 2, 0))),
+                WorkspaceDisplayStatus::PrMerged,
+                "roots {:?}",
+                roots.iter().map(|p| &p.updated_at).collect::<Vec<_>>()
+            );
+            let folded = super::fold_git_root_prs(None, &stale_open_pool, roots);
+            assert_eq!(folded.owned_lifecycle, Some(PullRequestStatus::Merged));
+            assert_eq!(
+                folded
+                    .pool
+                    .iter()
+                    .map(|p| (p.id.as_str(), p.status, p.updated_at.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (
+                        stale_open_pool[0].id.as_str(),
+                        PullRequestStatus::Merged,
+                        "2026-01-04T00:00:00Z"
+                    ),
+                    (
+                        "root-pr-2026-01-03T00:00:00Z",
+                        PullRequestStatus::Closed,
+                        "2026-01-03T00:00:00Z"
+                    ),
+                ]
+            );
+        }
+    }
+
+    /// Equal-rank timestamp advancement is still one-directional on rank: a
+    /// lower-rank `closed` copy newer than every merged copy neither
+    /// downgrades the status nor moves the merged timestamp.
+    #[test]
+    fn newer_closed_same_url_copy_never_advances_merged_timestamp() {
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        let roots = [
+            pr(PullRequestStatus::Closed, "2026-01-05T00:00:00Z"),
+            pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z"),
+        ];
+        let folded = super::fold_git_root_prs(Some(&merged), &[], &roots);
+        let active = folded.active.expect("linked PR kept");
+        assert_eq!(
+            (active.status, active.updated_at.as_str()),
+            (PullRequestStatus::Merged, "2026-01-02T00:00:00Z")
+        );
+        assert!(folded.pool.is_empty(), "{:?}", folded.pool);
     }
 
     /// Cost-contract guard: the list paths issue ONE bulk git-root read —
