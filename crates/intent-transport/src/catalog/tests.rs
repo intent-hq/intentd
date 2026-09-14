@@ -1623,6 +1623,23 @@ mod unbound_owner_only_methods {
         let script = json!({ "workspaceId": ws, "scriptId": "s1" });
         let term = json!({ "terminalId": "t1" });
         vec![
+            (
+                "accept-changes.addRemote",
+                json!({ "workspaceId": ws, "remoteUrl": "u" }),
+            ),
+            (
+                "accept-changes.execute",
+                json!({ "workspaceId": ws, "action": "a" }),
+            ),
+            ("accept-changes.getStatus", json!({ "workspaceId": ws })),
+            (
+                "accept-changes.mergePR",
+                json!({ "workspaceId": ws, "prNumber": 1 }),
+            ),
+            (
+                "accept-changes.prepare",
+                json!({ "workspaceId": ws, "action": "a" }),
+            ),
             ("agent.cancelDelete", json!({ "agentId": "a1" })),
             (
                 "agent.completeOnce",
@@ -1648,6 +1665,18 @@ mod unbound_owner_only_methods {
             ),
             ("client.list", json!({})),
             ("debug.sampleStacks", json!({ "durationMs": 1 })),
+            ("file-tracking.getAgentLocks", json!({ "workspaceId": ws })),
+            ("file-tracking.getChanges", json!({ "workspaceId": ws })),
+            ("file-tracking.getLineStats", json!({ "workspaceId": ws })),
+            ("file-tracking.loadCommits", json!({ "workspaceId": ws })),
+            (
+                "file-tracking.stage",
+                json!({ "workspaceId": ws, "paths": [] }),
+            ),
+            (
+                "file-tracking.unstage",
+                json!({ "workspaceId": ws, "paths": [] }),
+            ),
             (
                 "git.agentCommit",
                 json!({ "workspaceId": ws, "message": "m" }),
@@ -1676,6 +1705,7 @@ mod unbound_owner_only_methods {
             ("github.pulls.merge", gh_n.clone()),
             ("github.pulls.search", gh.clone()),
             ("github.pulls.updateBranch", gh_n.clone()),
+            ("github.relatedRepos.list", gh.clone()),
             (
                 "github.replyReviewComment",
                 json!({ "owner": "o", "repo": "r", "number": 1, "commentId": 1, "body": "b" }),
