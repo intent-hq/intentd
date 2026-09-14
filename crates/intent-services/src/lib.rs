@@ -17349,9 +17349,10 @@ impl WorkspaceApi for Services {
                     // a workspace row. The inputs are shaped to their final
                     // form first so the plan sees exactly what is persisted;
                     // the trimmed prompt and effective image blocks ride along
-                    // for id / branch naming and the first turn. The plan's
-                    // `workspace_id` is a passthrough the planner never reads,
-                    // so it is stamped once the id is derived below.
+                    // for id / branch naming and the first turn. The plan
+                    // carries no workspace identity — the planner never reads
+                    // it — so the id derived below goes straight to the
+                    // persist half as an argument.
                     let planned_initial_agent = match input.initial_agent.take() {
                         Some(agent) => {
                             let prompt = agent
