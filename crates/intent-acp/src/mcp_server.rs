@@ -306,13 +306,24 @@ impl WorkspaceMcpServer {
 
     /// Handle one MCP JSON-RPC message. Returns `Some(response)` for requests and
     /// `None` for notifications (port of `MCPServer.handleMessage`).
+    ///
+    /// The whole message runs as the bridge's caller agent — not just the
+    /// `workspace_api` eval — so the service calls around it (output settings
+    /// read, retired-caller guard, feature lookups) reach the fail-closed
+    /// capability gates bound. The bridge listener dispatches every message
+    /// on a fresh task, which would otherwise arrive unbound. A bridge with no
+    /// caller agent leaves whatever caller the enclosing scope bound.
     pub async fn handle_message(&self, message: &Value) -> Option<Value> {
         let method = message.get("method").and_then(Value::as_str)?;
-        let id = message.get("id").cloned();
-        match id {
-            Some(id) => Some(self.handle_request(&id, method, message).await),
-            None => None,
-        }
+        let id = message.get("id").cloned()?;
+        let handled = self.handle_request(&id, method, message);
+        let response = match self.caller_agent_id.clone() {
+            Some(agent_id) => {
+                intent_core::with_caller(intent_core::Caller::Agent { agent_id }, handled).await
+            }
+            None => handled.await,
+        };
+        Some(response)
     }
 
     async fn handle_request(&self, id: &Value, method: &str, message: &Value) -> Value {
