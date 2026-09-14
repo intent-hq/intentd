@@ -25593,7 +25593,7 @@ mod search {
         assert_eq!(r["truncated"], false);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn cancel_unknown_is_noop_success() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.unwrap();
