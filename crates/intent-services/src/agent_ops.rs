@@ -458,19 +458,34 @@ pub(crate) struct CreateModelAndEffort {
 /// ([`Services::persist_agent_create`]) needs that was derived from a
 /// *failing* check — the delegation-depth guard, specialist canonicalization,
 /// display-name derivation, attachment-block validation, and the provider /
-/// model / reasoning-effort chain. Once a plan exists, no `-32602` remains
-/// to be raised: persisting it can only fail on infrastructure
-/// ([`AgentPersistError`]).
+/// model / reasoning-effort chain. Once a plan exists, the agent create has
+/// no input / derived-config rejection (`-32602`) left to raise: persisting
+/// it can only fail on infrastructure ([`AgentPersistError`]). The guarantee
+/// covers the create seam only — a caller's own calls between plan and
+/// persist keep their own errors (e.g. `workspace.create`'s `ensure_spec_note`
+/// can still hit `NotFound` on a concurrent delete).
 ///
-/// `skip_auto_commit` is the one post-plan input: for `workspace.create`'s
-/// `initialAgent` it depends on the new workspace's effective auto-commit,
-/// known only once the workspace row exists, so callers may set it on the
-/// plan before persisting (it is not a validation).
+/// Two fields are post-plan inputs that `workspace.create`'s `initialAgent`
+/// stamps on the plan between planning and persisting; neither is a
+/// validation. `skip_auto_commit` depends on the new workspace's effective
+/// auto-commit, known only once the workspace row exists. `workspace_id` is
+/// a pure passthrough: the planner forwards it untouched, no check consults
+/// it, and `workspace.create` plans with an empty placeholder and stamps
+/// the derived id before persist (see the field doc).
 #[derive(Debug, Clone)]
 pub(crate) struct AgentCreatePlan {
     /// Error-label method (`agent.create` / `workspace.create`) for the
     /// persist half's infrastructure failures.
     pub(crate) method: &'static str,
+    /// Workspace the session row belongs to. Passthrough/stamping invariant:
+    /// [`Services::plan_agent_create`] only forwards this field — none of its
+    /// checks read it — so `workspace.create` passes an empty placeholder
+    /// (the id is derived only after the plan, from the initial prompt) and
+    /// stamps the derived id here before [`Services::persist_agent_create`].
+    /// Store-backed seams (`agent.create` & co.) pass the real id up front.
+    /// A future API could drop workspace identity from the plan and take the
+    /// `WorkspaceId` as a persist argument instead, removing the placeholder
+    /// without changing `agent_create_op`'s signature (note only; not done).
     pub(crate) workspace_id: WorkspaceId,
     pub(crate) parent_agent_id: Option<AgentId>,
     pub(crate) task_note_id: Option<NoteId>,
@@ -4174,10 +4189,11 @@ impl Services {
     /// session row and emits `agent:created`. Everything here is either
     /// non-failing (the specialist prompt / orchestrator snapshot, usage
     /// stats) or infrastructure ([`AgentPersistError`]) — by construction it
-    /// cannot raise a `-32602`, so a caller such as `workspace.create` can
-    /// run it AFTER its workspace row is inserted without an input or
-    /// derived-config rejection stranding that row (store / internal / join
-    /// failures remain possible and map to `-32603`).
+    /// cannot raise an input / derived-config rejection (`-32602`), so a
+    /// caller such as `workspace.create` can run it AFTER its workspace row
+    /// is inserted without such a rejection stranding that row (store /
+    /// internal / join failures remain possible and map to `-32603`; what the
+    /// caller itself does between insert and persist is outside this claim).
     ///
     /// `snapshot_wp` is the project-tier root for the *non-failing* specialist
     /// snapshot (`resolve_prompt_injection` / `resolve_is_orchestrator`): the
