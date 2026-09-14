@@ -115,7 +115,7 @@ async fn rpc(
 }
 
 /// Mixed batch (server.* + non-server key): when hook fails, ALL keys revert.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mixed_batch_full_rollback_on_hook_failure() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
@@ -138,7 +138,7 @@ async fn mixed_batch_full_rollback_on_hook_failure() {
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         serve_uds(api, bus, &socket_path_clone, None, async {
             shutdown_rx.await.ok();
         })
@@ -251,7 +251,7 @@ async fn mixed_batch_full_rollback_on_hook_failure() {
 }
 
 /// Successful mixed batch persists all keys (no rollback).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn successful_mixed_batch_persists_all() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
@@ -272,7 +272,7 @@ async fn successful_mixed_batch_persists_all() {
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         serve_uds(api, bus, &socket_path_clone, None, async {
             shutdown_rx.await.ok();
         })
@@ -322,7 +322,7 @@ async fn successful_mixed_batch_persists_all() {
 }
 
 /// Single-key failure behavior unchanged (still reverts that one key).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn single_key_failure_reverts() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
@@ -343,7 +343,7 @@ async fn single_key_failure_reverts() {
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         serve_uds(api, bus, &socket_path_clone, None, async {
             shutdown_rx.await.ok();
         })
@@ -383,7 +383,7 @@ async fn single_key_failure_reverts() {
 }
 
 /// Mixed batch with sensitive setting: hook failure reverts both sensitive and non-sensitive keys.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mixed_batch_with_sensitive_setting_full_rollback() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
@@ -404,7 +404,7 @@ async fn mixed_batch_with_sensitive_setting_full_rollback() {
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         serve_uds(api, bus, &socket_path_clone, None, async {
             shutdown_rx.await.ok();
         })
@@ -511,7 +511,7 @@ async fn mixed_batch_with_sensitive_setting_full_rollback() {
 /// applying anything (Phase 3 wave 2, lib.rs:4484-4497). Proves that when
 /// `Store::get_setting` returns Err during snapshot capture, the whole batch fails
 /// with an error naming the key, and NO settings in the batch are applied.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn db_read_error_during_capture_fails_batch() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
@@ -533,7 +533,7 @@ async fn db_read_error_during_capture_fails_batch() {
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         serve_uds(api, bus_clone, &socket_path_clone, None, async {
             shutdown_rx.await.ok();
         })

@@ -91,7 +91,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
     (Arc::new(services), ws, tmp)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_add_appends_content_at_end() {
     let (services, ws, _tmp) = setup().await;
 
@@ -139,7 +139,7 @@ async fn note_add_appends_content_at_end() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_edit_replaces_first_exact_match() {
     let (services, ws, _tmp) = setup().await;
 
@@ -186,7 +186,7 @@ async fn note_edit_replaces_first_exact_match() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_edit_lines_replaces_line_range() {
     let (services, ws, _tmp) = setup().await;
 
@@ -237,7 +237,7 @@ async fn note_edit_lines_replaces_line_range() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_anchors_to_text() {
     let (services, ws, _tmp) = setup().await;
 
@@ -294,7 +294,7 @@ async fn comment_add_anchors_to_text() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_list_returns_threads() {
     let (services, ws, _tmp) = setup().await;
 
@@ -344,7 +344,7 @@ async fn comment_list_returns_threads() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_respond_adds_reply_to_thread() {
     let (services, ws, _tmp) = setup().await;
 

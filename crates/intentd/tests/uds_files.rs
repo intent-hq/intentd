@@ -89,7 +89,7 @@ async fn send(socket: &Path, frame: &str) -> Value {
     serde_json::from_str(line.trim()).expect("valid json")
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_file_tree_returns_root_entries() {
     let base = common::test_tempdir_in("/tmp", "intentd-files-");
     let data_dir = base.path().join("data");
@@ -124,7 +124,7 @@ async fn uds_file_tree_returns_root_entries() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -210,7 +210,7 @@ async fn boot(
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -226,7 +226,7 @@ async fn boot(
     (base, repo, server, tx, config, ws_root)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_file_exists_reports_type_and_absent() {
     let (_base, repo, server, tx, config, _ws_root) = boot("exists").await;
     std::fs::write(repo.join("hello.txt"), "hi\n").unwrap();
@@ -274,7 +274,7 @@ async fn uds_file_exists_reports_type_and_absent() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_file_stat_returns_legacy_shape() {
     let (_base, repo, server, tx, config, _ws_root) = boot("stat").await;
     std::fs::write(repo.join("hello.txt"), "hello").unwrap();

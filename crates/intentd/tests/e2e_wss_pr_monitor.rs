@@ -708,7 +708,7 @@ async fn owner_messages(fx: &Fixture) -> String {
 /// Registration (via the service surface the `ws.pr.monitor` binding calls)
 /// emits `prMonitor:registered`, and `prMonitor.list` over the wire carries
 /// the identity + hover payload PROTOCOL §6.9 documents.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
     let fx = boot().await;
     let mut sub = connect(fx.port, fx.cfg.clone()).await;
@@ -842,7 +842,7 @@ async fn pr_monitor_list_omits_unreadable_threads_unresolved_over_wss() {
 /// omitted from `prMonitor.list`'s `lastSnapshot` while the forge reports the
 /// PR not queued (or unknown), present as `true` after the PR enters the
 /// merge queue, and the transition surfaces as a `prMonitor:changed` line.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_list_carries_is_in_merge_queue_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -913,7 +913,7 @@ async fn pr_monitor_list_carries_is_in_merge_queue_over_wss() {
 /// value) once the host reports one, the transition surfaces as a
 /// `prMonitor:changed` line keyed on the event identity, and the flushed
 /// monitor wake carries the same humanized ejection line.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_carries_merge_queue_ejection_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -1002,7 +1002,7 @@ async fn pr_monitor_carries_merge_queue_ejection_over_wss() {
 
 /// `prMonitor.flush` over the wire delivers the pending debounced wake right
 /// away (emitting `prMonitor:emitted`) and is an explicit no-op afterwards.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_flush_delivers_pending_changes_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -1074,7 +1074,7 @@ async fn pr_monitor_flush_delivers_pending_changes_over_wss() {
 /// delivered immediately (emitting `prMonitor:emitted`), while a checked
 /// flush with nothing changed returns `flushed: false`. A non-boolean
 /// `check` is `-32602`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_flush_with_check_repolls_on_demand_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -1161,7 +1161,7 @@ async fn pr_monitor_flush_with_check_repolls_on_demand_over_wss() {
 /// `prMonitor.cancel` over the wire (the FE path) cancels the monitor, removes
 /// it from `prMonitor.list`, emits `prMonitor:cancelled`, and notifies the
 /// owning agent — unlike an agent's own `ws.pr.unmonitor`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_cancel_removes_the_row_and_notifies_the_owner_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -1232,7 +1232,7 @@ async fn pr_monitor_cancel_removes_the_row_and_notifies_the_owner_over_wss() {
 /// `prMonitor.list` over the wire stays single. After the owner's own
 /// `ws.pr.unmonitor`, the second agent registers normally and the list
 /// carries its row instead.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn a_duplicate_monitor_is_refused_and_the_workspace_list_stays_single_over_wss() {
     let fx = boot().await;
     let second_id = AgentId::from("agent-prmon-second");
@@ -1367,7 +1367,7 @@ async fn a_duplicate_monitor_is_refused_and_the_workspace_list_stays_single_over
 /// cleared, `prMonitor:registered` over the wire marks the adoption, and
 /// `prMonitor.list` stays single. The next change then wakes the adopter,
 /// not the dead owner, and a `prMonitor.flush` over the wire delivers to it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn a_monitor_owned_by_a_dead_agent_is_adopted_over_wss() {
     let fx = boot().await;
     let second_id = AgentId::from("agent-prmon-second");
@@ -1804,7 +1804,7 @@ async fn a_parent_is_refused_while_its_child_is_still_working_over_wss() {
 /// (`type`/`monitorId`/`repo`/`prNumber`/`reason` + the baseline-sourced
 /// `url`), asserted through `agent.getConversation` over the wire — the
 /// client-visible read path.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn merged_pr_completes_the_monitor_but_keeps_it_listed_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -1958,7 +1958,7 @@ async fn pr_monitor_list_carries_paused_until_over_wss() {
 /// part of the terminal completion (intent-hq/monorepo#2094): `pr:updated`
 /// fires over the wire and `workspace.get` serves `prStatus: "Merged"` +
 /// the refreshed `activePullRequest` — with no explicit `pr.refresh` call.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn merged_pr_terminal_wake_refreshes_workspace_linkage_over_wss() {
     let fx = boot().await;
     // Link the fixture workspace to the monitored PR up front (the fixture
@@ -2018,7 +2018,7 @@ async fn merged_pr_terminal_wake_refreshes_workspace_linkage_over_wss() {
 /// monitor is ACTIVE — and cancelling it over the wire (`prMonitor.cancel`)
 /// lapses the signal back to `idle` and drops the field (omitted, never
 /// `false`). Both transitions emit `workspace:displayStatus-changed`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn active_monitor_serves_waiting_and_pr_ready_over_wss() {
     let fx = boot().await;
     // Clear every checklist blocker: the required check passes and the
@@ -2152,7 +2152,7 @@ async fn active_monitor_serves_waiting_and_pr_ready_over_wss() {
 /// `waiting: true` off a stale monitor signal. The sweep runs on a detached
 /// tail after the archive RPC returns, so assertions ride the subscribed
 /// events.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archive_over_wss_cancels_active_monitors_and_drops_waiting() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
@@ -2258,7 +2258,7 @@ async fn archive_over_wss_cancels_active_monitors_and_drops_waiting() {
 /// `workspace.get`, and the PR merging flips the derivation to `pr_merged`
 /// off the COMPLETED monitor's final snapshot — with no further transition
 /// after the terminal one.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_repo_monitor_drives_pr_ready_then_pr_merged_over_wss() {
     let fx = boot().await;
     // Clear every checklist blocker so the open PR reads truly mergeable.
@@ -2349,7 +2349,7 @@ async fn cross_repo_monitor_drives_pr_ready_then_pr_merged_over_wss() {
 /// `agent:idle` event itself lives in `intent-services` unit tests, which
 /// can reach the private `annotate_waiting_on_pr_monitors` helper directly;
 /// this fixture has no ACP provider to drive a real agent turn.)
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_get_surfaces_waiting_on_pr_monitors_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -2404,7 +2404,7 @@ async fn agent_get_surfaces_waiting_on_pr_monitors_over_wss() {
 /// on the same PR, both siblings' pending changes surface via
 /// `prMonitor.list`, and `prMonitor.flush` delivers each owner's wake and
 /// emits `prMonitor:emitted` — the same behavior FEs observe from the loop.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
     let fx = boot().await;
     // The sibling lives in a SECOND workspace on the same `o/r` repo: a
@@ -2547,7 +2547,7 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
 /// `pending → passed` transition accumulates NO pending change and emits NO
 /// `prMonitor:changed`; the suite completing produces exactly ONE aggregate
 /// line, and the consolidated wake carries it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn intermediate_check_successes_stay_quiet_until_the_completion_aggregate_over_wss() {
     let fx = boot().await;
     // Two pending checks so one can pass while the suite is still running.
@@ -2636,7 +2636,7 @@ async fn intermediate_check_successes_stay_quiet_until_the_completion_aggregate_
 /// anchors, and produces NO owner wake even though the debounce window had
 /// already elapsed (the pre-coalescing accumulated-log behavior would have
 /// delivered the whole journey here).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn full_revert_coalesces_to_empty_and_produces_no_owner_wake_over_wss() {
     let fx = boot().await;
     let monitor = fx

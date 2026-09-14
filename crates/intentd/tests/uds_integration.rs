@@ -123,7 +123,7 @@ async fn send_session(socket: &Path, frames: &[&str]) -> Vec<Value> {
     out
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_slice_end_to_end() {
     // Use a short base path: macOS caps UDS paths at ~104 bytes (SUN_LEN) and
     // `temp_dir()` resolves to a long `/var/folders/...` path.
@@ -158,7 +158,7 @@ async fn uds_slice_end_to_end() {
     );
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })

@@ -531,7 +531,7 @@ async fn assert_no_display_status_event(ws: &mut TlsWs) {
 /// `task.updateNoteStatus` emits `workspace:displayStatus-changed` with the
 /// self-sufficient `{ workspaceId, displayStatus: "complete" }` payload, and a
 /// repeat no-op status write emits nothing.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_completion_transition_over_wss() {
     let fx = boot(StubForge::default(), false, None).await;
 
@@ -620,7 +620,7 @@ async fn task_completion_transition_over_wss() {
 /// `feature` discovers the stub forge's open PR (#300, mergeable) via
 /// `pr.refresh` — the linkage flips the derived rollup to `pr_ready` and emits
 /// `workspace:displayStatus-changed` alongside `pr:linked`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_linkage_transition_over_wss() {
     let fx = boot(
         StubForge {
@@ -701,7 +701,7 @@ async fn pr_linkage_transition_over_wss() {
 /// `mergeable_state: "queued"` (GitHub's merge-queue state), so the linkage
 /// flips the rollup to `pr_queued` — not `pr_ready` — on the
 /// `workspace:displayStatus-changed` event and the `workspace.get` read path.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_in_merge_queue_is_pr_queued_over_wss() {
     let fx = boot(
         StubForge {
@@ -765,7 +765,7 @@ async fn pr_in_merge_queue_is_pr_queued_over_wss() {
 /// `prStatus` column is `Open` but which carries no rich PR objects
 /// (`activePullRequest` / `pullRequests` unset) reports
 /// `displayStatus: "pr_open"` on both `workspace.get` and `workspace.list`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn persisted_pr_status_only_is_pr_open_over_wss() {
     let fx = boot(StubForge::default(), false, Some(PullRequestStatus::Open)).await;
 
@@ -849,7 +849,7 @@ fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
 /// `displayStatus: "failed"` on `workspace.get`; `agent.retry` clears the
 /// park and emits the `failed → idle` demotion with the self-sufficient
 /// payload.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn failed_agent_and_retry_transition_over_wss() {
     let fx = boot(StubForge::default(), false, None).await;
     let mut session = top_level_session(&fx.ws_id, "agent-e2e-err");
@@ -904,7 +904,7 @@ async fn failed_agent_and_retry_transition_over_wss() {
 /// reads as `displayStatus: "blocked"` on `workspace.get` — outranking
 /// `needs_attention` from a sibling discussion request — and `agent.delete`
 /// of the blocker-holding agent emits the demotion.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn blocked_transition_over_wss() {
     let fx = boot(StubForge::default(), false, None).await;
     let blocker = top_level_session(&fx.ws_id, "agent-e2e-blk");
@@ -1070,7 +1070,7 @@ async fn muted_agent_transition_over_wss() {
 /// `workspace.dismissAttention` retires it; the ordered event stream (first
 /// event observed is the `review_required` promotion) proves the unread
 /// mutations stayed silent.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn attention_flag_transitions_over_wss() {
     let fx = boot(StubForge::default(), false, None).await;
 

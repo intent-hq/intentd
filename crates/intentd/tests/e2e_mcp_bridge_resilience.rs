@@ -112,7 +112,7 @@ fn gate() -> Option<String> {
 /// the ping was answered WHILE the long call was still in flight (release-file
 /// gate) AND the long call then completed successfully; any deadlock or error
 /// resolves `refusal` and fails the assertions below.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn slow_tool_call_does_not_block_concurrent_tools_list() {
     let Some(script) = gate() else { return };
 
@@ -277,7 +277,7 @@ async fn read_json_line<R: tokio::io::AsyncBufRead + Unpin>(
 /// (monorepo#1530); a request sent during the gap gets the retryable `-32001`
 /// error (never silence); and once the listener is back the bridge reconnects
 /// on its own and serves requests again over the SAME stdio session.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn bridge_subprocess_survives_tcp_blip_with_retryable_errors() {
     // Fake daemon listener the test controls end-to-end.
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
@@ -461,7 +461,7 @@ fn spawn_bridge_subprocess(
 /// yet is buffered through the initial connect window — never answered with
 /// `-32001` — and gets the real server response once the listener is rebound
 /// inside the window.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn bridge_subprocess_buffers_initialize_during_startup_race() {
     // Reserve an address, then DROP the listener so nothing is accepting.
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
@@ -546,7 +546,7 @@ async fn bridge_subprocess_buffers_initialize_during_startup_race() {
 /// Scenario 3 exhaustion (monorepo#908): against a never-rebound address the
 /// bridge exits NON-ZERO once the initial window is exhausted (~5.5s default)
 /// and writes no `-32001` response for the buffered `initialize`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn bridge_subprocess_initial_window_exhaustion_exits_nonzero_without_errors() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
     let addr = listener.local_addr().expect("local addr");

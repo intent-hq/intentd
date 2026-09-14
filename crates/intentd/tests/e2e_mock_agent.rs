@@ -79,7 +79,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
     }
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mock_agent_full_turn_with_real_mcp_tool_call() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(

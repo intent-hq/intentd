@@ -286,7 +286,7 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
 /// A warm cache: the response is `{ cached: true, branches, defaultBranch }`
 /// with sorted branch names, `HEAD` excluded, and the default branch resolved
 /// from `origin/HEAD` — all served locally, no network.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_cached_returns_branches_from_warm_cache() {
     if !gate() {
         return;
@@ -332,7 +332,7 @@ async fn list_cached_returns_branches_from_warm_cache() {
 /// A cold cache with a reachable remote falls back to one `git ls-remote`:
 /// `{ cached: false, source: "ls-remote", branches, defaultBranch }` with
 /// sorted names and the default branch from the remote's `HEAD` symref.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_cached_cold_cache_falls_back_to_ls_remote() {
     if !gate() {
         return;
@@ -366,7 +366,7 @@ async fn list_cached_cold_cache_falls_back_to_ls_remote() {
 /// A cold cache whose remote is also unreachable stays the graceful
 /// `{ cached: false, branches: [] }` with no `defaultBranch` key — never an
 /// error.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_cached_cold_cache_is_graceful() {
     if !gate() {
         return;
@@ -395,7 +395,7 @@ async fn list_cached_cold_cache_is_graceful() {
 
 /// Missing or traversal-shaped params fail with the JSON-RPC `-32602`
 /// invalid-params envelope.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_cached_invalid_params_fail_with_32602() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;

@@ -314,7 +314,7 @@ fn assert_disk_usage_shape(du: &Value) {
 /// entry reads `refreshing: false`. The direct-mode row answers
 /// `{ refreshing: false }` without the field, and an unknown id is the
 /// standard not-found error envelope.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn disk_usage_method_serves_on_demand_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
@@ -384,7 +384,7 @@ async fn disk_usage_method_serves_on_demand_over_wss() {
 /// The aggregate left the hot read path: `workspace.get` and `workspace.list`
 /// rows never carry `diskUsage`, even after an on-demand call populated the
 /// cache for the same workspace.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn disk_usage_never_appears_on_list_or_get_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;

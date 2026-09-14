@@ -487,7 +487,7 @@ fn wire_next_token(cursor: &str) -> String {
 /// the engine as `PrQuery.search`, the involvement filter still parses, the
 /// `nextToken` decodes onto the engine cursor, and the response carries the
 /// PR page plus an encoded `nextToken` for the engine's `next_cursor`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pulls_search_forwards_query_and_cursor() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -519,7 +519,7 @@ async fn pulls_search_forwards_query_and_cursor() {
 /// `github.issues.search` with a free-text `query`: the trimmed text reaches
 /// the engine as `IssueQuery.search` with the state filter intact, and the
 /// cursor round-trips both ways.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn issues_search_forwards_query_and_cursor() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -552,7 +552,7 @@ async fn issues_search_forwards_query_and_cursor() {
 
 /// Without a `query` (or with a blank one) the engine sees `search: None` —
 /// the pre-existing listing behavior is unchanged.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn search_without_query_leaves_listing_unchanged() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -787,7 +787,7 @@ async fn search_repos_rejects_malformed_and_over_cap() {
 /// the `GithubIssue` DTO with `user.login` / `createdAt` / `updatedAt`
 /// populated from the engine model, while a missing `number` is rejected in
 /// the router with `-32602` before the engine is touched.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn issues_get_returns_issue_with_author_and_timestamps() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -846,7 +846,7 @@ async fn issues_get_returns_issue_with_author_and_timestamps() {
 /// filter set from PROTOCOL §5 (`all, assigned, created, involves`) and never
 /// reaches the engine, while `github.pulls.search` continues to accept
 /// `review-requested` (monorepo#551).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn issues_search_rejects_pr_only_review_requested_filter() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -902,7 +902,7 @@ async fn issues_search_rejects_pr_only_review_requested_filter() {
 /// reaches the engine and narrows the branch names, the `nextToken` cursor
 /// round-trips onto the engine cursor, and the no-prefix (or blank-prefix)
 /// call keeps the pre-existing unfiltered listing (`prefix: None`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn branches_list_forwards_optional_prefix() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;

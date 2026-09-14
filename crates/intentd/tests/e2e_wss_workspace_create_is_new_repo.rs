@@ -116,7 +116,7 @@ fn run_git(args: &[&str], dir: &Path) -> String {
 /// carries `checkoutMode: "direct"`, `worktreePath` = the repository folder
 /// (intent-hq/monorepo#2611), and `baseCommitSha` matches the seeded initial
 /// commit (PROTOCOL §5.1).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_is_new_repo_initializes_and_provisions() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -178,7 +178,7 @@ async fn workspace_create_is_new_repo_initializes_and_provisions() {
 /// regular file, so `mkdir -p` cannot succeed) fails the whole create with a
 /// typed `-32603` whose `data` carries the initialization detail (PROTOCOL
 /// §9) — and persists no row: `workspace.list` stays empty.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_is_new_repo_init_failure_is_typed_with_no_row() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -218,7 +218,7 @@ async fn workspace_create_is_new_repo_init_failure_is_typed_with_no_row() {
 /// Regression guard for the documented legacy behavior: a non-git
 /// `repositoryPath` **without** `isNewRepo` still succeeds row-only — no
 /// init, no worktree — and the directory stays non-git.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_without_is_new_repo_keeps_row_only_skip() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;

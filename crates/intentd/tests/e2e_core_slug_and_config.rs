@@ -15,7 +15,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Create a workspace with an initial-agent prompt and verify that the workspace
 /// ID is derived from the prompt via `extract_local_slug` ("fix auth" → "auth-fix").
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_id_derived_from_initial_agent_prompt() {
     let tmp = common::test_tempdir("intentd-e2e-core-");
     let db = tmp.path().join("intentd.db");
@@ -57,7 +57,7 @@ async fn workspace_id_derived_from_initial_agent_prompt() {
 /// Regression (intent-hq/intent#4801): a prompt with an `@` followed by a
 /// multi-byte char used to panic inside the slug heuristic's mention stripping,
 /// taking `workspace.create` down with an internal error.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_survives_multibyte_char_after_at_in_prompt() {
     let tmp = common::test_tempdir("intentd-e2e-core-");
     let db = tmp.path().join("intentd.db");
@@ -96,7 +96,7 @@ async fn workspace_create_survives_multibyte_char_after_at_in_prompt() {
 
 /// Create a workspace with no prompt and verify the ID is a random slug
 /// (adjective-animal from `generate_workspace_slug`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_id_random_slug_when_no_prompt() {
     let tmp = common::test_tempdir("intentd-e2e-core-");
     let db = tmp.path().join("intentd.db");
@@ -132,7 +132,7 @@ async fn workspace_id_random_slug_when_no_prompt() {
 }
 
 /// Verify `Config::resolve` parses env vars and fills defaults.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn config_resolve_fills_defaults() {
     let tmp = common::test_tempdir("intentd-cfg-");
     let tmp_dir = tmp.path().to_path_buf();
@@ -157,7 +157,7 @@ async fn config_resolve_fills_defaults() {
 }
 
 /// Verify `Config::resolve` reads `idle_reap_minutes` from config.toml.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn config_resolve_reads_idle_reap_from_file() {
     let tmp = common::test_tempdir("intentd-cfg-");
     let tmp_dir = tmp.path().to_path_buf();

@@ -131,7 +131,7 @@ fn boot(
             .with_event_bus(bus.clone()),
     );
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -148,7 +148,7 @@ fn find<'a>(arr: &'a [Value], id: &str) -> Option<&'a Value> {
     arr.iter().find(|e| e["id"] == id)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_channel_snapshot_then_removed_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -205,7 +205,7 @@ async fn agent_channel_snapshot_then_removed_delta() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -288,7 +288,7 @@ async fn task_channel_snapshot_then_updated_delta() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -356,7 +356,7 @@ async fn comment_channel_snapshot_then_updated_delta() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");

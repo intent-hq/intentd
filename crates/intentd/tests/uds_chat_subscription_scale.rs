@@ -117,7 +117,7 @@ async fn boot() -> (
     );
     let api: Arc<dyn intent_core::WorkspaceApi> = services.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let socket = socket.clone();
         async move {
             let _ = serve_uds(api, bus, &socket, None, async {
@@ -465,7 +465,7 @@ async fn run_scenario(
 /// The hypothesis predicts multi-second seq-0 latencies at large scale; the
 /// hard assertion is a lenient sanity bound so the diagnostic numbers, not a
 /// flaky threshold, are the deliverable.
-#[tokio::test(flavor = "multi_thread")]
+#[intent_test_macros::daemon_test(flavor = "multi_thread")]
 async fn concurrent_cold_start_subscribe_latency_at_scale() {
     let (s1, s2) = run_scenario("small: 2 ws, 2 agents", 0, 0, 0).await;
     let (b1, b2) = run_scenario("large: ~100 ws, ~300 tasks, 20 agents", 100, 20, 40).await;

@@ -81,6 +81,8 @@ intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.84" }
 # `e2e_pty_job_control.rs` boots the daemon inside a real PTY session as a
 # member of a background process group (intent-hq/intent#4231 hazard class).
 portable-pty = { workspace = true }
+# In-process `Services` tests run as `Caller::Daemon` (fail-closed gates).
+intent-test-macros = { path = "../intent-test-macros" }
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }
