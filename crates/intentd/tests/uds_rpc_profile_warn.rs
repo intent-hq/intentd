@@ -561,12 +561,17 @@ async fn transfer_plan_stays_within_statement_budget() {
 /// fetch through to the attention probe, and decides written markers inline.
 /// With 10 answered-question sessions the pre-fix `workspace.get` shape
 /// executed 15+ statements; the fixed shape stays at ~6. A statement
-/// threshold of 10 pins that.
+/// threshold of 10 pinned that; the first (cache-seeding) read now executes
+/// 12 statements — #1884 folds the secondary git-root PRs into
+/// `displayStatus` (10, intermittently 11 on main), and the caller's
+/// membership / role enrichment on the workspace payload adds one — so the
+/// threshold is the observed maximum, 12. Folding the membership lookup into
+/// the `workspace.get` query is a recorded follow-up.
 #[tokio::test]
 async fn workspace_get_enrichment_stays_within_statement_budget() {
     let (_daemon, socket, log_path) = spawn_daemon(
         "itdp-wsget",
-        &[("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "10")],
+        &[("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "12")],
     );
     assert!(await_socket(&socket).await, "daemon did not start");
 
