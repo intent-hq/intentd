@@ -62,7 +62,7 @@ impl SkillsWatcher {
         let mut user_watchers = Vec::new();
         let user_roots = get_user_skill_roots();
         for root in user_roots {
-            user_watchers.push(watch_directory(root, None, raw_tx.clone()));
+            user_watchers.push(watch_directory(hub, root, None, raw_tx.clone()));
         }
 
         // Start project-tier watchers (per-workspace)
@@ -228,11 +228,12 @@ async fn skills_fingerprint(workspace_path: &Path) -> u64 {
 /// nearest existing ancestor is promoted to a recursive watch on the root
 /// once it appears.
 fn watch_directory(
+    hub: &Arc<SharedWatchHub>,
     root: PathBuf,
     workspace_id: Option<WorkspaceId>,
     tx: mpsc::UnboundedSender<SkillsMsg>,
 ) -> RootWatch {
-    watch_root(root, is_skill_md, move || {
+    watch_root(hub, root, is_skill_md, move || {
         let _ = tx.send(SkillsMsg::Change(workspace_id.clone()));
     })
 }

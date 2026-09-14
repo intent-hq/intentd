@@ -77,7 +77,7 @@ impl SpecialistsWatcher {
         // Start the user-tier watcher (affects all workspaces)
         let mut user_watchers = Vec::new();
         if let Some(root) = &user_dir {
-            user_watchers.push(watch_directory(root.clone(), None, raw_tx.clone()));
+            user_watchers.push(watch_directory(hub, root.clone(), None, raw_tx.clone()));
         }
 
         // Start project-tier watchers (per-workspace)
@@ -222,11 +222,12 @@ enum SpecialistsMsg {
 /// nearest existing ancestor is promoted to a recursive watch on the root
 /// once it appears.
 fn watch_directory(
+    hub: &Arc<SharedWatchHub>,
     root: PathBuf,
     workspace_id: Option<WorkspaceId>,
     tx: mpsc::UnboundedSender<SpecialistsMsg>,
 ) -> RootWatch {
-    watch_root(root, is_md, move || {
+    watch_root(hub, root, is_md, move || {
         let _ = tx.send(SpecialistsMsg::Change(workspace_id.clone()));
     })
 }

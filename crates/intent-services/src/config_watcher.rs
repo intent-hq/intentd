@@ -1,11 +1,14 @@
-//! Live-reload of `config.toml` (§9.8): a `notify` watch on the config file's
-//! **parent directory** feeds a debounced strict re-parse through
+//! Live-reload of `config.toml` (§9.8): a non-recursive watch on the config
+//! file's **parent directory** feeds a debounced strict re-parse through
 //! [`SettingsRegistry::reload`].
 //!
 //! Watching the directory (not the file) survives editor rename/atomic-save
 //! patterns (vim, VS Code write-then-rename): a watch attached to the file's
 //! inode dies when the editor renames a temp file over it, while
-//! directory-level events keep reporting the config file's name. Events are
+//! directory-level events keep reporting the config file's name. The watch
+//! rides the daemon's [`SharedWatchHub`] rather than owning a `notify`
+//! watcher of its own (intent-hq/intent#4953: on Linux each watcher is one
+//! inotify instance against `fs.inotify.max_user_instances`). Events are
 //! filtered to the config file, coalesced within [`DEBOUNCE`], and then the
 //! file is read once ([`process_config_change`], the testable core):
 //!
@@ -40,10 +43,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::{Error, Result};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::RecursiveMode;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::events::shared_watch::{SharedWatchHub, SubHandle};
 use crate::settings_registry::{SettingsChanged, SettingsRegistry};
 
 /// Debounce window: the file is read once, this long after the *last* raw
@@ -110,12 +114,13 @@ pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcom
     }
 }
 
-/// A live watch over `config.toml`'s parent directory. Holds the `notify`
-/// watcher (the OS subscription ends when it drops) and the debounce task
-/// (aborted on drop), so dropping the [`ConfigWatcher`] tears the whole
-/// pipeline down — the clean-shutdown contract for `serve`.
+/// A live watch over `config.toml`'s parent directory. Holds the hub
+/// subscription (the directory is unwatched when it drops, unless another
+/// subscriber still needs it) and the debounce task (aborted on drop), so
+/// dropping the [`ConfigWatcher`] tears the whole pipeline down — the
+/// clean-shutdown contract for `serve`.
 pub struct ConfigWatcher {
-    _watcher: RecommendedWatcher,
+    _sub: SubHandle,
     task: JoinHandle<()>,
 }
 
@@ -126,16 +131,21 @@ impl Drop for ConfigWatcher {
 }
 
 impl ConfigWatcher {
-    /// Start watching the parent directory of `registry.config_path()`.
-    /// `on_change` runs after each debounced **valid external** edit that
-    /// changed effective values (the registry has already been reloaded and
-    /// its subscribers notified); the composition root uses it to apply
+    /// Start watching the parent directory of `registry.config_path()` over
+    /// `hub`. `on_change` runs after each debounced **valid external** edit
+    /// that changed effective values (the registry has already been reloaded
+    /// and its subscribers notified); the composition root uses it to apply
     /// server runtime hooks and emit `settings:changed`.
+    ///
+    /// The OS registration itself is deferred to the hub's registrar thread,
+    /// so this returns without blocking; a registration failure is logged by
+    /// the debounce task rather than returned.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Internal` if the config path has no parent directory or file name, or if the file watcher cannot be created or registered.
+    /// Returns `Error::Internal` if the config path has no parent directory or file name.
     pub fn start<F, Fut>(
+        hub: &Arc<SharedWatchHub>,
         registry: Arc<SettingsRegistry>,
         revision_gate: Arc<tokio::sync::RwLock<()>>,
         on_change: F,
@@ -157,61 +167,70 @@ impl ConfigWatcher {
                 Error::Internal(format!("config path has no file name: {}", path.display()))
             })?
             .to_os_string();
-        // The notify callback is synchronous and runs off the tokio runtime,
-        // so it forwards ticks over an unbounded channel to the debounce loop.
-        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<()>();
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let event = match res {
-                Ok(event) => event,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "config.toml watcher callback error; settings changes may be missed"
-                    );
-                    return;
-                }
-            };
-            // Access events carry no mutation; everything else (create,
-            // modify, rename, remove) can affect the file's content.
-            if matches!(event.kind, notify::EventKind::Access(_)) {
-                return;
-            }
-            if event
-                .paths
-                .iter()
-                .any(|p| p.file_name() == Some(file_name.as_os_str()))
-            {
-                let _ = raw_tx.send(());
-            }
-        })
-        .map_err(|e| Error::Internal(format!("config.toml watcher: {e}")))?;
-        watcher
-            .watch(&dir, RecursiveMode::NonRecursive)
-            .map_err(|e| Error::Internal(format!("config.toml watch on {}: {e}", dir.display())))?;
-        let task = tokio::spawn(watch_loop(registry, revision_gate, raw_rx, on_change));
-        Ok(Self {
-            _watcher: watcher,
-            task,
-        })
+        let (sub, raw_rx, _) = hub.subscribe_with(&dir, RecursiveMode::NonRecursive);
+        let established = sub.established();
+        let task = tokio::spawn(watch_loop(
+            registry,
+            revision_gate,
+            established,
+            dir,
+            file_name,
+            raw_rx,
+            on_change,
+        ));
+        Ok(Self { _sub: sub, task })
+    }
+
+    /// Detach a probe for the hub subscription this watcher rides, so a test
+    /// can await the directory watch going live before mutating it.
+    #[cfg(test)]
+    #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
+    fn probe(&self) -> crate::events::shared_watch::RegistrationProbe {
+        self._sub.probe()
     }
 }
 
 /// Coalesce raw file events within [`DEBOUNCE`], then run the reload core
-/// once per burst. Returns when the watcher (and its channel sender) drops.
+/// once per burst. Returns when the subscription (and its channel sender)
+/// drops.
 async fn watch_loop<F, Fut>(
     registry: Arc<SettingsRegistry>,
     revision_gate: Arc<tokio::sync::RwLock<()>>,
-    mut raw_rx: mpsc::UnboundedReceiver<()>,
+    established: impl Future<Output = bool>,
+    dir: std::path::PathBuf,
+    file_name: std::ffi::OsString,
+    mut raw_rx: mpsc::UnboundedReceiver<notify::Event>,
     on_change: F,
 ) where
     F: Fn(SettingsChanged) -> Fut,
     Fut: Future<Output = ()>,
 {
+    if !established.await {
+        tracing::warn!(
+            dir = %dir.display(),
+            "config.toml live-reload watch failed to register; \
+             external edits will require a daemon restart"
+        );
+    }
     let mut deadline: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             maybe = raw_rx.recv() => match maybe {
-                Some(()) => deadline = Some(tokio::time::Instant::now() + DEBOUNCE),
+                Some(event) => {
+                    // Access events carry no mutation; everything else
+                    // (create, modify, rename, remove) can affect the file's
+                    // content.
+                    if matches!(event.kind, notify::EventKind::Access(_)) {
+                        continue;
+                    }
+                    if event
+                        .paths
+                        .iter()
+                        .any(|p| p.file_name() == Some(file_name.as_os_str()))
+                    {
+                        deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
+                    }
+                }
                 None => return,
             },
             () = sleep_until(deadline), if deadline.is_some() => {
@@ -383,7 +402,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (dir, reg) = temp_registry(Some("[git]\nautoCommit = true\n"));
         let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
-        let _watcher = ConfigWatcher::start(
+        let watcher = ConfigWatcher::start(
+            &SharedWatchHub::new(),
             reg.clone(),
             Arc::new(tokio::sync::RwLock::new(())),
             move |notice| {
@@ -394,8 +414,10 @@ mod tests {
             },
         )
         .expect("start watcher");
-        // Give the OS watch a moment to establish before mutating the dir.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Registration is deferred to the hub's registrar thread, so wait for
+        // the watch to be LIVE before mutating the dir: a write that lands
+        // first produces no event and the wait below hangs.
+        watcher.probe().wait_live(crate::events::LIVENESS).await;
         // Editor-style atomic save: write a temp file, rename over config.toml.
         let tmp = dir.path().join(".config.toml.editor-save");
         std::fs::write(&tmp, "[git]\nautoCommit = false\n").expect("write tmp");

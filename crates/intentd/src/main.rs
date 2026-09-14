@@ -2080,9 +2080,14 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     };
     // Watch-health handle created BEFORE the backgrounded registry start so
     // DaemonControl can hold it now; it snapshots `None` (fileWatch absent
-    // from system.status) until the registry attaches the shared hub.
+    // from system.status) until the registry attaches the shared hub. The hub
+    // itself is created here too so the config.toml live-reload watcher below
+    // shares its OS stream instead of costing a second inotify instance
+    // (intent-hq/intent#4953).
     let watch_health = intent_services::WatchHealth::default();
+    let watch_hub = intent_services::SharedWatchHub::new();
     let watcher_init_task = spawn_watcher_registry_init(
+        Arc::clone(&watch_hub),
         bus.clone(),
         api.clone(),
         Arc::clone(&git_status_refresher),
@@ -2348,12 +2353,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // (survives editor rename/atomic-save), debounce, and strictly re-parse.
     // Valid external edits update the registry, run the same server runtime
     // hooks as `settings.update`, and emit `settings:changed`; invalid edits
-    // keep last-good values. Registration is a synchronous FSEvents call, so
-    // it too runs in the background (monorepo#1581) with the guard held by the
-    // task for the lifetime of `serve`; aborting the handle at shutdown drops
-    // the guard and tears the watch down with the daemon.
+    // keep last-good values. The watch rides the shared hub (whose registrar
+    // performs the OS call off-thread, monorepo#1581) with the guard held by a
+    // background task for the lifetime of `serve`; aborting the handle at
+    // shutdown drops the guard and tears the watch down with the daemon.
     let config_watcher_task =
-        spawn_config_watcher_init(settings_registry.clone(), services.clone());
+        spawn_config_watcher_init(watch_hub, settings_registry.clone(), services.clone());
 
     // Boot-time secure WSS listener auto-start when the effective
     // server.wsApi.enabled is true (config.toml or persisted runtime toggle).
@@ -4928,6 +4933,7 @@ fn test_watcher_init_delay(raw: Option<&str>) -> Option<Duration> {
 /// startup so it owns the registry; aborting the returned handle drops it,
 /// tearing down every watcher.
 fn spawn_watcher_registry_init(
+    hub: Arc<intent_services::SharedWatchHub>,
     bus: EventBus,
     api: Arc<dyn WorkspaceApi>,
     refresher: Arc<GitStatusRefresher>,
@@ -4956,7 +4962,7 @@ fn spawn_watcher_registry_init(
                     // exercise worker starvation at all.
                     std::thread::sleep(delay);
                 }
-                WatcherRegistry::start_with_health(bus, api, refresher, &watch_health).await
+                WatcherRegistry::start_with_health(&hub, bus, api, refresher, &watch_health).await
             })
         });
         tracing::info!("watcher registry ready");
@@ -4967,37 +4973,29 @@ fn spawn_watcher_registry_init(
     })
 }
 
-/// Start the `config.toml` live-reload watcher (§9.8) in the background and
-/// hold it for the task's lifetime.
+/// Start the `config.toml` live-reload watcher (§9.8) over the shared `hub`
+/// and hold it for the task's lifetime.
 ///
-/// Spawned rather than started inline for the same reason as
-/// [`spawn_watcher_registry_init`]: `notify`'s `FSEvents` registration is a
-/// synchronous IPC to `fseventsd` that can take seconds on a loaded machine,
-/// which would otherwise delay the UDS bind past the FE sidecar's probe window
-/// (monorepo#1581), and it runs under `block_in_place` for the same reason. The
-/// task parks after startup so it owns the watcher guard; aborting the returned
-/// handle drops it, ending the OS subscription.
+/// The OS registration runs on the hub's registrar thread, so `start` itself
+/// never blocks on `fseventsd` IPC (monorepo#1581). The task parks after
+/// startup so it owns the watcher guard; aborting the returned handle drops
+/// it, ending the subscription.
 fn spawn_config_watcher_init(
+    hub: Arc<intent_services::SharedWatchHub>,
     registry: Arc<intent_services::SettingsRegistry>,
     services: Services,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let watcher_services = services.clone();
-        // `ConfigWatcher::start` is synchronous and its `notify` registration
-        // blocks the calling thread on `fseventsd` IPC, so it runs under
-        // `block_in_place` for the same reason as the watcher registry above.
-        // It stays inside the runtime context, so the watcher's own
-        // `tokio::spawn` of its debounce loop keeps working.
-        let started = tokio::task::block_in_place(|| {
-            intent_services::ConfigWatcher::start(
-                registry,
-                watcher_services.settings_revision_gate(),
-                move |notice| {
-                    let services = watcher_services.clone();
-                    async move { services.apply_external_settings_change(&notice).await }
-                },
-            )
-        });
+        let started = intent_services::ConfigWatcher::start(
+            &hub,
+            registry,
+            watcher_services.settings_revision_gate(),
+            move |notice| {
+                let services = watcher_services.clone();
+                async move { services.apply_external_settings_change(&notice).await }
+            },
+        );
         let watcher = match started {
             Ok(watcher) => watcher,
             Err(e) => {

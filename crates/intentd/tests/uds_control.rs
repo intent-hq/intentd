@@ -323,3 +323,69 @@ async fn system_status_surfaces_file_watch_coverage_and_degradation() {
     );
     drop(degraded);
 }
+
+/// Per-daemon inotify baseline (intent-hq/intent#4953): every `notify`
+/// watcher is one inotify instance, capped host-wide by
+/// `fs.inotify.max_user_instances` (default 128), and parallel e2e runs boot
+/// dozens of daemons at once. A freshly booted daemon with no workspaces used
+/// to hold six — the config.toml watcher, the specialists user tier and the
+/// four skills user tiers each owned a watcher — which is what exhausted the
+/// cap under package load. All of those now ride the one shared hub stream,
+/// so a booted daemon holds exactly [`INOTIFY_INSTANCE_CEILING`].
+#[cfg(target_os = "linux")]
+const INOTIFY_INSTANCE_CEILING: usize = 1;
+
+/// Count the `anon_inode:inotify` descriptors `pid` holds via `/proc`.
+#[cfg(target_os = "linux")]
+fn inotify_instances(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("read /proc/<pid>/fd")
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| target.to_string_lossy() == "anon_inode:inotify")
+        .count()
+}
+
+/// Poll daemon.log until every watcher family has reported ready, so the
+/// census counts the steady state rather than a half-started daemon.
+#[cfg(target_os = "linux")]
+async fn await_watchers_ready(data_dir: &std::path::Path) {
+    let log_path = data_dir.join("daemon.log");
+    let deadline = tokio::time::Instant::now() + common::daemon_startup_timeout();
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains("watcher registry ready")
+            && log.contains("config.toml live-reload watcher ready")
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "watchers never reported ready\n--- daemon log ---\n{log}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn booted_daemon_holds_at_most_the_inotify_instance_ceiling() {
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdi-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+    let daemon = Daemon {
+        // The readiness markers are INFO on the `intentd` target; pin the
+        // filter so a stricter ambient RUST_LOG cannot hide them.
+        child: spawn_daemon_with_env(&data_dir, &[("RUST_LOG", "info")]),
+    };
+    assert!(await_socket(&socket).await, "daemon did not start");
+    await_watchers_ready(&data_dir).await;
+
+    let instances = inotify_instances(daemon.child.id());
+    assert!(
+        instances <= INOTIFY_INSTANCE_CEILING,
+        "a booted daemon holds {instances} inotify instances, ceiling is \
+         {INOTIFY_INSTANCE_CEILING}\n--- daemon log ---\n{}",
+        std::fs::read_to_string(data_dir.join("daemon.log")).unwrap_or_default()
+    );
+    drop(daemon);
+}

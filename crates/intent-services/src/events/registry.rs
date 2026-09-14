@@ -100,26 +100,45 @@ impl WatcherRegistry {
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
     ) -> Self {
-        Self::start_with_health(bus, services, refresher, &WatchHealth::default()).await
+        Self::start_with_health(
+            &SharedWatchHub::new(),
+            bus,
+            services,
+            refresher,
+            &WatchHealth::default(),
+        )
+        .await
     }
 
-    /// [`Self::start`] that additionally attaches `health` to the shared hub,
-    /// so `system.status` can render live watch coverage
-    /// (intent-hq/intent#3708). The composition root creates the handle before
-    /// this backgrounded start runs; until attachment the handle snapshots
-    /// `None` (rendered as an absent field).
+    /// [`Self::start`] over a caller-provided `hub` that additionally attaches
+    /// `health` to it, so `system.status` can render live watch coverage
+    /// (intent-hq/intent#3708). The composition root creates both before this
+    /// backgrounded start runs — the hub so the `config.toml` watcher can share
+    /// its stream (intent-hq/intent#4953), the health handle so `DaemonControl`
+    /// can hold it; until attachment the handle snapshots `None` (rendered as
+    /// an absent field).
     pub async fn start_with_health(
+        hub: &Arc<SharedWatchHub>,
         bus: EventBus,
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
         health: &WatchHealth,
     ) -> Self {
-        Self::start_with_backstop(bus, services, refresher, health, SETUP_COMPLETION_BACKSTOP).await
+        Self::start_with_backstop(
+            hub,
+            bus,
+            services,
+            refresher,
+            health,
+            SETUP_COMPLETION_BACKSTOP,
+        )
+        .await
     }
 
     /// [`Self::start`] with an explicit setup-completion backstop, so tests
     /// can exercise the backstop without waiting out the production window.
     async fn start_with_backstop(
+        hub: &Arc<SharedWatchHub>,
         bus: EventBus,
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
@@ -162,7 +181,7 @@ impl WatcherRegistry {
         // FSEvents stream count follows the number of distinct parent
         // directories the workspace roots live under, not the workspace count
         // times the number of watch roots each one used to register.
-        let hub = SharedWatchHub::new();
+        let hub = Arc::clone(hub);
         health.attach(&hub);
         tracing::info!(
             os_watch_limits = %super::shared_watch::os_watch_limits(),
@@ -834,6 +853,7 @@ mod tests {
             Arc::new(crate::git_status_cache::GitStatusCache::new()),
         ));
         WatcherRegistry::start_with_backstop(
+            &SharedWatchHub::new(),
             bus.clone(),
             api,
             refresher,

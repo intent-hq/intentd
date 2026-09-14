@@ -15858,8 +15858,14 @@ async fn system_status_surfaces_file_watch_coverage_over_wss() {
         api.clone(),
         status_cache,
     ));
-    let _watcher_registry =
-        WatcherRegistry::start_with_health(bus.clone(), api.clone(), refresher, &health).await;
+    let _watcher_registry = WatcherRegistry::start_with_health(
+        &intent_services::SharedWatchHub::new(),
+        bus.clone(),
+        api.clone(),
+        refresher,
+        &health,
+    )
+    .await;
 
     let resp = wss_call(port, cfg, frame).await;
     let fw = &resp["result"]["fileWatch"];

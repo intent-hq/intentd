@@ -63,8 +63,23 @@
 //! every caller's thread, and steady-state event delivery is unaffected —
 //! only initial coverage of a newly-registered root can lag behind a slow
 //! neighbour.
+//!
+//! Roots are watched recursively by default; [`SharedWatchHub::subscribe_with`]
+//! also takes [`RecursiveMode::NonRecursive`] for the per-daemon singletons
+//! that used to own a watcher each — the `config.toml` directory watch and the
+//! ancestor watches [`super::root_watch`] parks on the nearest existing parent
+//! of a missing user-tier skills/specialists root (intent-hq/intent#4953). A
+//! non-recursive sink is narrowed to the root itself and its direct children,
+//! exactly what a dedicated non-recursive watch would have delivered, so
+//! sharing the stream changes what the OS watches but not what a subscriber
+//! sees. When the same root is wanted both ways, the OS watch is recursive —
+//! the non-recursive sinks still see only their slice — and stays recursive
+//! until the root's last subscriber drops; downgrading would mean an unwatch
+//! (which on inotify strips nested roots' descriptors) for a case that does
+//! not occur in practice.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -84,19 +99,32 @@ type EventCallback = Box<dyn FnMut(notify::Result<notify::Event>) + Send>;
 type WatcherFactory =
     dyn Fn(EventCallback) -> notify::Result<Box<dyn Watcher + Send>> + Send + Sync;
 
-/// One demux destination: raw events whose paths fall under `root` are cloned
-/// into `tx`.
+/// One demux destination: raw events whose paths fall under `root` — or, for
+/// a non-recursive sink, are the root or one of its direct children (see
+/// [`covers`]) — are cloned into `tx`.
 struct Sink {
     id: u64,
     root: PathBuf,
+    recursive: bool,
     tx: mpsc::UnboundedSender<notify::Event>,
+}
+
+/// The per-mode containment check: recursive means any descendant, non-
+/// recursive means the root itself or a direct child (what a dedicated
+/// non-recursive OS watch reports).
+fn covers(root: &Path, recursive: bool, path: &Path) -> bool {
+    if recursive {
+        path.starts_with(root)
+    } else {
+        path == root || path.parent() == Some(root)
+    }
 }
 
 /// Command to a group's registrar thread. Dropping the sender ends the thread,
 /// which drops the watcher and tears the stream down. `Watch` carries the
 /// [`Registration`] the registrar settles once the root is actually registered.
 enum Cmd {
-    Watch(PathBuf, Arc<Registration>),
+    Watch(PathBuf, RecursiveMode, Arc<Registration>),
     Unwatch(PathBuf),
 }
 
@@ -131,7 +159,6 @@ impl Registration {
         self.state.load(Ordering::Acquire) == REG_FAILED
     }
 
-    #[cfg(test)]
     fn live(&self) -> bool {
         self.state.load(Ordering::Acquire) == REG_LIVE
     }
@@ -156,10 +183,24 @@ impl Registration {
 }
 
 /// A watched root: how many subscribers reference it (two workspaces can
-/// resolve to the same root) and the state of its deferred registration.
+/// resolve to the same root), the mode the OS watch was requested in, and the
+/// state of its deferred registration.
 struct Root {
     subscribers: usize,
+    /// Recursive as soon as any subscriber wants it recursive; never
+    /// downgraded while subscribers remain (see the module header).
+    recursive: bool,
     registration: Arc<Registration>,
+}
+
+impl Root {
+    fn mode(&self) -> RecursiveMode {
+        if self.recursive {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        }
+    }
 }
 
 /// One shared stream: the registrar handle, the roots on it, and its demux
@@ -180,10 +221,11 @@ struct HubState {
     next_id: u64,
 }
 
-/// Owns the shared streams and the demux table. Held by the
-/// [`super::registry::WatcherRegistry`] for the daemon's lifetime; dropping it
+/// Owns the shared streams and the demux table. Created by the composition
+/// root and shared between the [`super::registry::WatcherRegistry`] and the
+/// `config.toml` watcher for the daemon's lifetime; dropping the last handle
 /// drops every group, which ends the registrar threads and the streams.
-pub(super) struct SharedWatchHub {
+pub struct SharedWatchHub {
     state: Mutex<HubState>,
     /// Builds each group's watcher; injectable so tests can fail creation.
     factory: Arc<WatcherFactory>,
@@ -272,7 +314,7 @@ impl WatchHealth {
 
 /// A live subscription. Dropping it removes the sink and, when the root has no
 /// subscribers left, unwatches it (and retires the group once it is empty).
-pub(super) struct SubHandle {
+pub(crate) struct SubHandle {
     hub: Arc<SharedWatchHub>,
     group: PathBuf,
     root: PathBuf,
@@ -293,11 +335,30 @@ impl SubHandle {
         wait_settled(&self.registration, timeout).await;
     }
 
+    /// Await the registration and report whether the OS watch is live. `false`
+    /// covers both a settled failure and a registrar that has not answered
+    /// within [`ESTABLISH_TIMEOUT`] — either way the subscriber cannot count on
+    /// events arriving.
+    pub(crate) async fn wait_live(&self) -> bool {
+        self.established().await
+    }
+
+    /// [`Self::wait_live`] as an owned future, for a subscriber whose event
+    /// loop runs on a spawned task while the handle itself stays with the
+    /// owner that tears the subscription down.
+    pub(crate) fn established(&self) -> impl Future<Output = bool> + Send + 'static {
+        let registration = Arc::clone(&self.registration);
+        async move {
+            wait_settled(&registration, ESTABLISH_TIMEOUT).await;
+            registration.live()
+        }
+    }
+
     /// Detach a [`RegistrationProbe`] for this subscription, so a test can
     /// await the watch going live without holding whatever lock guards the
     /// handle itself.
     #[cfg(test)]
-    pub(super) fn probe(&self) -> RegistrationProbe {
+    pub(crate) fn probe(&self) -> RegistrationProbe {
         let watcher_live = {
             let state = match self.hub.state.lock() {
                 Ok(state) => state,
@@ -330,7 +391,7 @@ impl SubHandle {
 /// event never arrives and the test hangs into nextest's kill.
 /// [`Self::wait_live`] waits for the watch to actually be live instead.
 #[cfg(test)]
-pub(super) struct RegistrationProbe {
+pub(crate) struct RegistrationProbe {
     root: PathBuf,
     registration: Arc<Registration>,
     watcher_live: Arc<std::sync::atomic::AtomicBool>,
@@ -346,7 +407,7 @@ impl RegistrationProbe {
     /// `watch()` failed (nothing will retry that), or when `timeout` elapses,
     /// so a dead watch is diagnosed here rather than as a downstream
     /// "no event" hang.
-    pub(super) async fn wait_live(&self, timeout: std::time::Duration) {
+    pub(crate) async fn wait_live(&self, timeout: std::time::Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if self.registration.live() {
@@ -437,9 +498,11 @@ impl Drop for SubHandle {
             for (nested, root) in &group.roots {
                 if nested.starts_with(&self.root) {
                     root.registration.reset();
-                    let _ = group
-                        .cmd
-                        .send(Cmd::Watch(nested.clone(), Arc::clone(&root.registration)));
+                    let _ = group.cmd.send(Cmd::Watch(
+                        nested.clone(),
+                        root.mode(),
+                        Arc::clone(&root.registration),
+                    ));
                 }
             }
         }
@@ -480,7 +543,8 @@ fn group_key(root: &Path) -> PathBuf {
 pub(super) const TEST_FAIL_WATCHER_CREATION_ENV: &str = "INTENTD_TEST_FAIL_WATCHER_CREATION";
 
 impl SharedWatchHub {
-    pub(super) fn new() -> Arc<Self> {
+    #[must_use]
+    pub fn new() -> Arc<Self> {
         Self::with_factory(Arc::new(|callback: EventCallback| {
             if std::env::var(TEST_FAIL_WATCHER_CREATION_ENV).is_ok_and(|v| v != "0") {
                 return Err(notify::Error::generic(
@@ -500,14 +564,27 @@ impl SharedWatchHub {
         })
     }
 
-    /// Subscribe to raw events under `root`, joining (or starting) the shared
-    /// stream for its group. Returns the canonical root the demux matches
-    /// against, so callers can build their own path filters on the same form
-    /// the OS reports.
+    /// Subscribe to raw events under `root` (recursively), joining (or
+    /// starting) the shared stream for its group. Returns the canonical root
+    /// the demux matches against, so callers can build their own path filters
+    /// on the same form the OS reports.
     pub(super) fn subscribe(
         self: &Arc<Self>,
         root: &Path,
     ) -> (SubHandle, mpsc::UnboundedReceiver<notify::Event>, PathBuf) {
+        self.subscribe_with(root, RecursiveMode::Recursive)
+    }
+
+    /// [`Self::subscribe`] with an explicit mode. A non-recursive subscription
+    /// receives only events on `root` itself and its direct children; the OS
+    /// watch it rides is recursive whenever any co-subscriber of the same root
+    /// asked for that (see the module header).
+    pub(crate) fn subscribe_with(
+        self: &Arc<Self>,
+        root: &Path,
+        mode: RecursiveMode,
+    ) -> (SubHandle, mpsc::UnboundedReceiver<notify::Event>, PathBuf) {
+        let recursive = matches!(mode, RecursiveMode::Recursive);
         let root = match std::fs::canonicalize(root) {
             Ok(canonical) => canonical,
             Err(e) => {
@@ -553,11 +630,13 @@ impl SharedWatchHub {
             sinks.push(Sink {
                 id,
                 root: root.clone(),
+                recursive,
                 tx,
             });
         }
         let entry = group.roots.entry(root.clone()).or_insert_with(|| Root {
             subscribers: 0,
+            recursive,
             registration: Arc::new(Registration::default()),
         });
         entry.subscribers += 1;
@@ -567,14 +646,27 @@ impl SharedWatchHub {
         // instead: a transient cause (the directory briefly missing) resolves,
         // and a persistent one just fails again and is logged again.
         let retry_failed = entry.subscribers > 1 && entry.registration.failed();
-        if retry_failed {
+        // A recursive subscriber joining a root watched non-recursively widens
+        // the OS watch. Replace rather than re-add: `notify` merges a repeated
+        // `watch()` per backend in ways that differ (inotify merges masks and
+        // walks the tree, `FSEvents` appends the path a second time), and an
+        // explicit unwatch first makes the outcome the same everywhere. The
+        // registrar serves the pair in order.
+        let widen = entry.subscribers > 1 && recursive && !entry.recursive;
+        if retry_failed || widen {
             entry.registration.reset();
         }
+        if widen {
+            entry.recursive = true;
+            let _ = group.cmd.send(Cmd::Unwatch(root.clone()));
+        }
         let registration = Arc::clone(&entry.registration);
-        if entry.subscribers == 1 || retry_failed {
-            let _ = group
-                .cmd
-                .send(Cmd::Watch(root.clone(), Arc::clone(&registration)));
+        if entry.subscribers == 1 || retry_failed || widen {
+            let _ = group.cmd.send(Cmd::Watch(
+                root.clone(),
+                entry.mode(),
+                Arc::clone(&registration),
+            ));
         }
         drop(state);
 
@@ -719,8 +811,8 @@ fn spawn_registrar(
         watcher_live.store(true, Ordering::Release);
         while let Ok(cmd) = rx.recv() {
             match cmd {
-                Cmd::Watch(root, registration) => {
-                    register(watcher.as_mut(), &root, &registration);
+                Cmd::Watch(root, mode, registration) => {
+                    register(watcher.as_mut(), &root, mode, &registration);
                 }
                 Cmd::Unwatch(root) => {
                     if let Err(e) = watcher.unwatch(&root) {
@@ -750,7 +842,7 @@ fn build_watcher_serving(
 ) -> Option<Box<dyn Watcher + Send>> {
     let mut backoff = CREATE_RETRY_INITIAL;
     let mut failures = 0u64;
-    let mut pending: Vec<(PathBuf, Arc<Registration>)> = Vec::new();
+    let mut pending: Vec<(PathBuf, RecursiveMode, Arc<Registration>)> = Vec::new();
     loop {
         match make() {
             Ok(mut watcher) => {
@@ -761,8 +853,8 @@ fn build_watcher_serving(
                         "shared watcher created after earlier failures; re-registering its roots"
                     );
                 }
-                for (root, registration) in pending {
-                    register(watcher.as_mut(), &root, &registration);
+                for (root, mode, registration) in pending {
+                    register(watcher.as_mut(), &root, mode, &registration);
                 }
                 return Some(watcher);
             }
@@ -784,12 +876,12 @@ fn build_watcher_serving(
                 break;
             }
             match rx.recv_timeout(remaining) {
-                Ok(Cmd::Watch(root, registration)) => {
+                Ok(Cmd::Watch(root, mode, registration)) => {
                     registration.settle(false);
-                    pending.retain(|(r, _)| r != &root);
-                    pending.push((root, registration));
+                    pending.retain(|(r, _, _)| r != &root);
+                    pending.push((root, mode, registration));
                 }
-                Ok(Cmd::Unwatch(root)) => pending.retain(|(r, _)| r != &root),
+                Ok(Cmd::Unwatch(root)) => pending.retain(|(r, _, _)| r != &root),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
             }
@@ -801,8 +893,13 @@ fn build_watcher_serving(
 /// One deferred `watcher.watch()`. Settled either way, so waiters do not hang
 /// on a failure; the failed state is distinct so a later subscriber to the
 /// same root can retry it rather than inheriting a dead channel.
-fn register(watcher: &mut dyn Watcher, root: &Path, registration: &Registration) {
-    match watcher.watch(root, RecursiveMode::Recursive) {
+fn register(
+    watcher: &mut dyn Watcher,
+    root: &Path,
+    mode: RecursiveMode,
+    registration: &Registration,
+) {
+    match watcher.watch(root, mode) {
         Ok(()) => registration.settle(true),
         Err(e) => {
             tracing::warn!(
@@ -855,10 +952,14 @@ pub(super) fn os_watch_limits() -> String {
 /// The cheap `starts_with` pass runs first and is the only one needed in
 /// practice: the roots are canonicalized at subscribe time and `FSEvents` reports
 /// canonical paths. Resolution (a symlinked root, or a deleted path that cannot
-/// be canonicalized directly) is attempted only for the paths that no sink
-/// matched raw, so a busy stream costs no filesystem syscalls per event. Doing
-/// it per path rather than per event matters for multi-path events: one path
-/// matching raw must not suppress the fallback for a sibling path that needs it.
+/// be canonicalized directly) is attempted only for the paths that no sink's
+/// root contains raw, so a busy stream costs no filesystem syscalls per event.
+/// Doing it per path rather than per event matters for multi-path events: one
+/// path matching raw must not suppress the fallback for a sibling path that
+/// needs it. A non-recursive sink additionally drops paths deeper than its
+/// direct children ([`covers`]); such a path still counts as contained
+/// for the fallback's purposes, since resolving it cannot move it under a
+/// different root.
 ///
 /// The routing table is snapshotted and the lock released before any of that
 /// work happens. Resolution stats the filesystem, and holding the sinks lock
@@ -867,17 +968,17 @@ pub(super) fn os_watch_limits() -> String {
 /// contradicting the per-group isolation this module claims. A sink that goes
 /// away mid-send just makes the send a no-op.
 fn demux(sinks: &Arc<Mutex<Vec<Sink>>>, event: &notify::Event) {
-    let routes: Vec<(PathBuf, mpsc::UnboundedSender<notify::Event>)> = match sinks.lock() {
+    let routes: Vec<(PathBuf, bool, mpsc::UnboundedSender<notify::Event>)> = match sinks.lock() {
         Ok(sinks) => sinks
             .iter()
-            .map(|s| (s.root.clone(), s.tx.clone()))
+            .map(|s| (s.root.clone(), s.recursive, s.tx.clone()))
             .collect(),
         Err(_) => return,
     };
 
     let mut unmatched: Vec<usize> = (0..event.paths.len()).collect();
-    for (root, tx) in &routes {
-        let mine = narrow(event, &event.paths, root);
+    for (root, recursive, tx) in &routes {
+        let mine = narrow(event, &event.paths, root, *recursive);
         unmatched.retain(|i| !event.paths[*i].starts_with(root));
         send_narrowed(tx, event, mine);
     }
@@ -892,22 +993,28 @@ fn demux(sinks: &Arc<Mutex<Vec<Sink>>>, event: &notify::Event) {
         let raw = &event.paths[*i];
         resolved[*i] = canonical_root(raw, &find_existing_ancestor(raw));
     }
-    for (root, tx) in &routes {
+    for (root, recursive, tx) in &routes {
         let mine: Vec<PathBuf> = unmatched
             .iter()
-            .filter(|i| resolved[**i].starts_with(root))
+            .filter(|i| covers(root, *recursive, &resolved[**i]))
             .map(|i| event.paths[*i].clone())
             .collect();
         send_narrowed(tx, event, mine);
     }
 }
 
-/// The raw paths of `event` whose `candidates` counterpart falls under `root`.
-fn narrow(event: &notify::Event, candidates: &[PathBuf], root: &Path) -> Vec<PathBuf> {
+/// The raw paths of `event` whose `candidates` counterpart falls within the
+/// sink's slice of `root` (see [`covers`]).
+fn narrow(
+    event: &notify::Event,
+    candidates: &[PathBuf],
+    root: &Path,
+    recursive: bool,
+) -> Vec<PathBuf> {
     candidates
         .iter()
         .zip(event.paths.iter())
-        .filter(|(candidate, _)| candidate.starts_with(root))
+        .filter(|(candidate, _)| covers(root, recursive, candidate))
         .map(|(_, raw)| raw.clone())
         .collect()
 }
@@ -1283,11 +1390,13 @@ mod tests {
             Sink {
                 id: 0,
                 root: a.clone(),
+                recursive: true,
                 tx: tx_a,
             },
             Sink {
                 id: 1,
                 root: b.clone(),
+                recursive: true,
                 tx: tx_b,
             },
         ]));
@@ -1319,6 +1428,7 @@ mod tests {
         let sinks = Arc::new(Mutex::new(vec![Sink {
             id: 0,
             root: a,
+            recursive: true,
             tx: tx_a,
         }]));
 
@@ -1327,6 +1437,66 @@ mod tests {
         demux(&sinks, &event);
 
         assert!(rx_a.try_recv().is_err(), "unrelated path must not deliver");
+    }
+
+    /// A non-recursive sink sees the root itself and its direct children —
+    /// what a dedicated non-recursive OS watch reports — and nothing deeper,
+    /// even though the shared stream it rides is recursive. A recursive
+    /// co-subscriber of the same root keeps the full view.
+    #[test]
+    fn a_non_recursive_sink_is_narrowed_to_direct_children() {
+        use notify::event::{CreateKind, EventKind};
+
+        let root = PathBuf::from("/home/u/.intent");
+        let (tx_shallow, mut rx_shallow) = mpsc::unbounded_channel();
+        let (tx_deep, mut rx_deep) = mpsc::unbounded_channel();
+        let sinks = Arc::new(Mutex::new(vec![
+            Sink {
+                id: 0,
+                root: root.clone(),
+                recursive: false,
+                tx: tx_shallow,
+            },
+            Sink {
+                id: 1,
+                root: root.clone(),
+                recursive: true,
+                tx: tx_deep,
+            },
+        ]));
+
+        let direct = notify::Event::new(EventKind::Create(CreateKind::File))
+            .add_path(root.join("config.toml"));
+        demux(&sinks, &direct);
+        assert_eq!(
+            rx_shallow.try_recv().expect("direct child delivers").paths,
+            vec![root.join("config.toml")]
+        );
+        assert!(rx_deep.try_recv().is_ok(), "recursive sink sees it too");
+
+        let itself =
+            notify::Event::new(EventKind::Create(CreateKind::Folder)).add_path(root.clone());
+        demux(&sinks, &itself);
+        assert!(
+            rx_shallow.try_recv().is_ok(),
+            "the root itself is a non-recursive event"
+        );
+        rx_deep.try_recv().expect("recursive sink sees it too");
+
+        let nested = notify::Event::new(EventKind::Create(CreateKind::File))
+            .add_path(root.join("specialists").join("x.md"));
+        demux(&sinks, &nested);
+        assert!(
+            rx_shallow.try_recv().is_err(),
+            "a grandchild must not reach a non-recursive sink"
+        );
+        assert_eq!(
+            rx_deep
+                .try_recv()
+                .expect("recursive sink sees the grandchild")
+                .paths,
+            vec![root.join("specialists").join("x.md")]
+        );
     }
 
     /// The resolution fallback is per path, not per event: one path of a
@@ -1356,11 +1526,13 @@ mod tests {
             Sink {
                 id: 0,
                 root: canonical_plain.clone(),
+                recursive: true,
                 tx: tx_plain,
             },
             Sink {
                 id: 1,
                 root: canonical_real,
+                recursive: true,
                 tx: tx_linked,
             },
         ]));

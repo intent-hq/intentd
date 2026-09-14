@@ -9,7 +9,7 @@ pub(crate) mod git_metadata_watcher;
 pub mod git_status_refresher;
 pub mod registry;
 mod root_watch;
-mod shared_watch;
+pub(crate) mod shared_watch;
 pub(crate) mod skills_watcher;
 pub(crate) mod specialists_watcher;
 pub mod watcher;
@@ -22,7 +22,7 @@ pub(crate) use filter::{
 };
 pub use git_status_refresher::GitStatusRefresher;
 pub use registry::WatcherRegistry;
-pub use shared_watch::{WatchHealth, WatchHealthSnapshot};
+pub use shared_watch::{SharedWatchHub, WatchHealth, WatchHealthSnapshot};
 
 /// Serializes every test that starts a real filesystem watcher (the
 /// `notify`-backed `RootWatch` / `FileWatcher` / `ConfigWatcher` probes across

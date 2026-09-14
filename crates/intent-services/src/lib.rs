@@ -195,12 +195,13 @@ pub use agent_manager::{
 pub use agent_session::SuspendOverlapQuery;
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
-// The individual watcher families are constructed only by `WatcherRegistry`
-// (they now take the crate-private shared-stream hub), so only the registry and
-// the bus/refresher surface leave the crate.
+// The individual watcher families are constructed only by `WatcherRegistry`,
+// so only the registry, the shared-stream hub it and `ConfigWatcher` ride
+// (created by the composition root; intent-hq/intent#4953), and the
+// bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatchHealth,
-    WatchHealthSnapshot, WatcherRegistry,
+    Delivery, EventBus, GitStatusRefresher, SharedWatchHub, Subscription, SubscriptionFilter,
+    WatchHealth, WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
