@@ -6403,6 +6403,9 @@ mod workspace_api_tool_tests {
         /// `(called, caller)`: whether `get_workspace` ran and the task-local
         /// [`intent_core::Caller`] it observed (multiplayer w1 caller binding).
         seen_caller: Mutex<(bool, Option<intent_core::Caller>)>,
+        /// `(called, caller)` for `settings_get` — the post-eval
+        /// output-settings read that runs outside the eval scope.
+        settings_caller: Mutex<(bool, Option<intent_core::Caller>)>,
     }
 
     impl WorkspaceInfoMockApi {
@@ -6458,6 +6461,7 @@ mod workspace_api_tool_tests {
             Arc::new(Self {
                 ws: Mutex::new(ws),
                 seen_caller: Mutex::new((false, None)),
+                settings_caller: Mutex::new((false, None)),
             })
         }
     }
@@ -6474,6 +6478,7 @@ mod workspace_api_tool_tests {
         // bodies; the TOON/limit paths are covered by
         // `workspace_api_output_limit_tests`.
         fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            *self.settings_caller.lock().unwrap() = (true, intent_core::current_caller());
             Box::pin(async move {
                 let value = match path.as_str() {
                     "workspaceApi.toonOutput" => json!(false),
@@ -6800,6 +6805,46 @@ mod workspace_api_tool_tests {
         let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         assert_eq!(api.seen_caller.lock().unwrap().clone(), (true, None));
+    }
+
+    #[tokio::test]
+    async fn bridge_dispatch_binds_the_caller_agent_around_the_whole_message() {
+        // The bridge listener dispatches every message on a fresh task
+        // (`tokio::spawn(server.dispatch(message))`), so nothing from the
+        // enclosing scope is bound. The post-eval `settings.get` for the
+        // output knobs runs outside the eval scope and must still see the
+        // caller agent — an unbound read is refused by the fail-closed
+        // service layer (found by the e2e `INTENTD_ASSERT_BOUND_CALLER` seam).
+        use crate::mcp_bridge::BridgeDispatch;
+        let api = WorkspaceInfoMockApi::new("amber-forest", None);
+        let srv = Arc::new(
+            WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+                .with_caller_agent_id(Some(intent_core::AgentId::from_string("agent-77"))),
+        );
+        let message = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "workspace_api",
+                "arguments": { "code": "return await ws.workspace.info();", "summary": "unit test" }
+            }
+        });
+        let resp = tokio::spawn(srv.dispatch(message))
+            .await
+            .unwrap()
+            .expect("tools/call must produce a response");
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let expected = Some(intent_core::Caller::Agent {
+            agent_id: intent_core::AgentId::from_string("agent-77"),
+        });
+        assert_eq!(
+            api.seen_caller.lock().unwrap().clone(),
+            (true, expected.clone())
+        );
+        assert_eq!(
+            api.settings_caller.lock().unwrap().clone(),
+            (true, expected),
+            "the post-eval settings read must run as the caller agent"
+        );
     }
 
     #[tokio::test]
