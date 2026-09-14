@@ -1066,8 +1066,15 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// `git.agentCommit` (agent-only), agent deletion / proposals / one-shot
 /// completions, `agent.replaceMessages` (persists client-supplied user rows
 /// verbatim, so a non-owner could forge `fromPrincipalId`), hook run/cancel,
-/// PR-monitor cancel/flush, daemon-wide metrics.
+/// PR-monitor cancel/flush, daemon-wide metrics, and the `accept-changes.*` /
+/// `file-tracking.*` publishing flow (stages, commits, pushes and merges as
+/// the primary user; refused as a family pending a per-method decision).
 const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
+    "accept-changes.addRemote",
+    "accept-changes.execute",
+    "accept-changes.getStatus",
+    "accept-changes.mergePR",
+    "accept-changes.prepare",
     "agent.cancelDelete",
     "agent.completeOnce",
     "agent.delete",
@@ -1085,6 +1092,12 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "browser.upsertTab",
     "client.list",
     "debug.sampleStacks",
+    "file-tracking.getAgentLocks",
+    "file-tracking.getChanges",
+    "file-tracking.getLineStats",
+    "file-tracking.loadCommits",
+    "file-tracking.stage",
+    "file-tracking.unstage",
     "forward.close",
     "forward.create",
     "forward.list",
@@ -1107,6 +1120,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "github.pulls.merge",
     "github.pulls.search",
     "github.pulls.updateBranch",
+    "github.relatedRepos.list",
     "github.replyReviewComment",
     "github.repoConfig.get",
     "github.repos.get",
