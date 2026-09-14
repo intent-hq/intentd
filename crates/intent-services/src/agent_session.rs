@@ -3889,10 +3889,13 @@ impl Services {
                 // row until the NEXT host wake — even though the normal
                 // failure/retry surface was suppressed. Fire a gated, debounced
                 // resume directly for this agent so it recovers on its own; the
-                // wake sweep stays the catch-all. The debounce lets the worker's
-                // post-enrollment `kill_child_only` + `end_turn` settle first,
-                // and the row's atomic claim dedupes against a racing wake sweep
-                // / `resolveInterrupted`.
+                // wake sweep stays the catch-all. The debounce usually lets the
+                // worker's post-enrollment `kill_child_only` settle first, but
+                // it is only a timer: a continuation that lands while the
+                // worker still holds the slot is parked in the queue and
+                // delivered by the worker's own end-of-turn drain
+                // (intent-hq/intent#4972). The row's atomic claim dedupes
+                // against a racing wake sweep / `resolveInterrupted`.
                 let services = self.clone();
                 let debounce = wake_resume_self_heal_debounce();
                 tokio::spawn(async move {

@@ -10030,14 +10030,15 @@ async fn run_message_worker(
                             // `interrupted_agent` row) and emitted the
                             // interrupted terminal `agent:stream:end` — NOT
                             // `agent:failed`. Suppress the terminal-failure path
-                            // (no Error status, no manual-retry surface): settle
-                            // the session to idle and stop the worker, leaving
-                            // the enrolled turn for the wake orchestrator (Task
-                            // D) to resume. Placed before the pre-output redrive
-                            // arm so a suspend-overlapping pre-output failure is
-                            // resumed via `session/load` (preserving the partial
-                            // turn) rather than silently redriven on a fresh
-                            // child.
+                            // (no Error status, no manual-retry surface) and
+                            // fall through to the end-of-turn drain below,
+                            // leaving the enrolled turn for the wake
+                            // orchestrator (Task D) to resume. Placed before
+                            // the pre-output redrive arm so a
+                            // suspend-overlapping pre-output failure is
+                            // resumed via `session/load` (preserving the
+                            // partial turn) rather than silently redriven on a
+                            // fresh child.
                             tracing::info!(
                                 agent = %agent_id,
                                 error = %e,
@@ -10056,8 +10057,26 @@ async fn run_message_worker(
                             // child and reload the persisted session via
                             // `session/load` (or the recreate fallback).
                             mgr.kill_child_only(&agent_id).await;
-                            mgr.end_turn(&agent_id).await;
-                            break 'outer;
+                            // Do NOT `end_turn` + `break 'outer` here
+                            // (intent-hq/intent#4972): the enrollment's
+                            // self-heal (and the wake sweep) deliver the
+                            // resume continuation through `send_message`,
+                            // and when that send lands while this worker
+                            // still holds the in-flight slot — the debounce
+                            // is a timer, and under load the enrollment
+                            // persist + `kill_child_only` above outlast it —
+                            // it loses `try_begin` and is parked in the queue.
+                            // A `break` exits without a drain pass and the
+                            // session is `RuntimeIdle`, not `Error`, so the
+                            // parked-recovery-send redrive at the worker exit
+                            // does not cover it either: the continuation
+                            // strands until an unrelated message arrives.
+                            // Falling through to the shared end-of-turn drain
+                            // (the benign-error arm's contract) delivers a
+                            // parked continuation on this worker — spawning a
+                            // fresh child that reloads the session — and, when
+                            // nothing is queued, releases the slot with the
+                            // same `end_turn` and exits.
                         } else if !silent_redrive_used && pre_output_transport_failure(&e) {
                             // Silent redrive (monorepo#764): the transport closed
                             // before the turn streamed anything — the prompt

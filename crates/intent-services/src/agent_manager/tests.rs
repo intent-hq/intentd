@@ -3767,11 +3767,14 @@ fn track_mock_agent_inner(
 /// `session/prompt` with a JSON-RPC ERROR carrying `error_message` (a
 /// transient-shaped `-32603`), while answering the lifecycle methods normally.
 /// Drives the suspend-enrollment turn worker path: a suspend-overlapping
-/// transient disconnect that `run_prompt_turn` enrolls for wake-resume.
+/// transient disconnect that `run_prompt_turn` enrolls for wake-resume. With a
+/// `gate`, the prompt failure is held until the test notifies it, so the worker
+/// provably holds its in-flight slot while the test acts.
 fn spawn_mock_agent_erroring_on_prompt<R, W>(
     read: R,
     write: W,
     error_message: String,
+    gate: Option<Arc<tokio::sync::Notify>>,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -3791,6 +3794,9 @@ where
                 continue;
             };
             if method == "session/prompt" {
+                if let Some(gate) = &gate {
+                    gate.notified().await;
+                }
                 // A pre-failure warning chunk, then the transient error.
                 let note = json!({
                     "jsonrpc": "2.0",
@@ -3841,10 +3847,36 @@ fn track_mock_agent_prompt_rpc_error(
     id: &AgentId,
     error_message: &str,
 ) -> JoinHandle<()> {
+    track_mock_agent_prompt_rpc_error_inner(mgr, id, error_message, "auggie", None)
+}
+
+/// Like [`track_mock_agent_prompt_rpc_error`], but the prompt failure waits on
+/// the returned gate (`notify_one`), holding the worker mid-turn until then.
+/// The handle is stamped as spawned by the `mock` provider (`node`) so a
+/// session pinned to `mock` reuses it instead of taking the provider-changed
+/// respawn branch.
+fn track_mock_agent_prompt_rpc_error_gated(
+    mgr: &AgentManager,
+    id: &AgentId,
+    error_message: &str,
+) -> (JoinHandle<()>, Arc<tokio::sync::Notify>) {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let agent =
+        track_mock_agent_prompt_rpc_error_inner(mgr, id, error_message, "node", Some(gate.clone()));
+    (agent, gate)
+}
+
+fn track_mock_agent_prompt_rpc_error_inner(
+    mgr: &AgentManager,
+    id: &AgentId,
+    error_message: &str,
+    spawned_provider: &str,
+    gate: Option<Arc<tokio::sync::Notify>>,
+) -> JoinHandle<()> {
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
     let agent =
-        spawn_mock_agent_erroring_on_prompt(c2a_agent, a2c_agent, error_message.to_string());
+        spawn_mock_agent_erroring_on_prompt(c2a_agent, a2c_agent, error_message.to_string(), gate);
     let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
     let connection = Arc::new(Connection::new(
         c2a_client,
@@ -3870,7 +3902,7 @@ fn track_mock_agent_prompt_rpc_error(
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
-            spawned_provider: "auggie".to_string(),
+            spawned_provider: spawned_provider.to_string(),
             thought_level: None,
             wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_listener: None,
@@ -4076,6 +4108,164 @@ async fn suspend_enrollment_flushes_deferred_attention() {
     assert!(
         mgr.services.take_deferred_attention(&id).is_empty(),
         "the flush consumed the parked queue"
+    );
+}
+
+/// Regression (intent-hq/intent#4972): the wake-resume continuation is
+/// delivered through `send_message`, and under load it can land while the
+/// suspend-interrupted worker still holds its in-flight slot (the self-heal
+/// debounce is only a timer; the enrollment persist + `kill_child_only` can
+/// outlast it). The send then loses `try_begin` and is parked in the queue.
+/// The suspend arm used to `end_turn` + `break` without a drain pass, and the
+/// session settles `RuntimeIdle` (not `Error`), so the parked-recovery-send
+/// redrive never fired either: the continuation stranded until an unrelated
+/// message arrived, and the e2e waited out its 180 s slow-timeout. The worker
+/// must drain the parked continuation itself, on a fresh child.
+///
+/// Deterministic: the mock's prompt failure is gated, so the second send
+/// provably lands behind the held slot before the failure is released.
+#[tokio::test]
+async fn suspend_enrollment_drains_continuation_parked_behind_held_slot() {
+    let script = mock_agent_script();
+    // Keep the enrollment self-heal from firing: the test IS the continuation
+    // send, timed against the held slot. The mock script serves the fresh
+    // child the drained turn spawns after `kill_child_only`.
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_WAKE_RESUME_SELF_HEAL_MS", "600000"),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+    ]);
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store)
+        .with_event_bus(bus.clone())
+        .with_suspend_tracker(Arc::new(AlwaysSuspended(Duration::from_secs(120))));
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services, sink, 8));
+
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-suspend-parked"));
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "existing-id")
+        .await
+        .unwrap();
+
+    // A live child whose prompt fails transiently (suspend-overlapping) — but
+    // only once the gate opens, so the worker holds the slot until then.
+    let (_agent, gate) =
+        track_mock_agent_prompt_rpc_error_gated(&mgr, &id, "Connection reset by peer");
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "work through the sleep".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message starts the turn worker");
+    assert!(
+        mgr.is_busy(&id),
+        "the worker holds the in-flight slot mid-turn"
+    );
+
+    // The resume continuation lands behind the held slot: parked in the queue
+    // (the shape `resume_interrupted_agent` sends — automatic origin, tagged).
+    let parked = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "You can now continue your work and pick up where you left off.".to_string(),
+            None,
+            super::TurnOptions {
+                message_metadata: Some(json!({
+                    "type": "resume_continuation",
+                    "source": "system",
+                })),
+                origin: MessageOrigin::Automatic,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("continuation send is accepted");
+    assert_eq!(
+        parked["queued"],
+        json!(true),
+        "the continuation lost try_begin to the held slot: {parked}"
+    );
+    assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+
+    // Release the prompt failure: the worker enrolls the turn (system_suspend)
+    // and must drain the parked continuation instead of exiting past it.
+    gate.notify_one();
+
+    // Wait for the worker to exit with the slot released (pre-fix it exits
+    // straight after the enrollment; post-fix after the drained turn).
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the suspend-interrupted worker exits");
+    // The continuation did not strand behind the exited worker: the drain
+    // delivered it on a fresh child.
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "the suspend-interrupted worker drains the continuation parked behind its slot: {:?}",
+        mgr.services.queue_snapshot(&id)
+    );
+
+    // The turn was enrolled (not surfaced terminally) …
+    let row = mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .expect("interrupted_agent row enrolled");
+    assert_eq!(row.reason.as_deref(), Some("system_suspend"));
+    // … with its partial persisted, and the continuation reached the
+    // transcript and produced a completed assistant turn (the mock's default
+    // response) — no stranded message.
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.to_string().contains("partial ")),
+        "suspend-interrupted partial persisted: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == "user"
+                && m.content.to_string().contains("pick up where you left off")),
+        "continuation user row persisted by the drain: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(
+            |m| m.role == "assistant" && m.content.to_string().contains("Mock agent completed")
+        ),
+        "drained continuation completed on the fresh child: {messages:?}"
+    );
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap(),
+        AgentStatus::RuntimeIdle,
+        "no Error status: the suspend path stays non-terminal"
     );
 }
 
