@@ -181,7 +181,7 @@ impl ConfigWatcher {
             .to_os_string();
         let (sub, raw_rx, _) = hub.subscribe_with(&dir, RecursiveMode::NonRecursive);
         let sub = Arc::new(Mutex::new(Some(sub)));
-        let task = tokio::spawn(watch_loop(
+        let task = intent_core::spawn_daemon(watch_loop(
             Arc::clone(hub),
             registry,
             revision_gate,

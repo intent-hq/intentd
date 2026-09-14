@@ -632,7 +632,9 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
                 let seen = seen.clone();
                 let dir = dir.clone();
                 let manifest = manifest.clone();
-                tokio::spawn(async move { import_one(&store, &dir, &manifest, &opts, &seen).await })
+                intent_core::spawn_daemon(async move {
+                    import_one(&store, &dir, &manifest, &opts, &seen).await
+                })
             };
             match task.await {
                 Ok((claimed, entry)) => {

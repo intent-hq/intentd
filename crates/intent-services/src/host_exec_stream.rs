@@ -337,7 +337,7 @@ pub async fn start_stream(
     // Stdin forwarder: drain `stdin_rx` into the child. Exits on `Close` or
     // channel close; a write error also ends the task (child likely gone).
     if let Some(mut stdin_pipe) = child_stdin {
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             while let Some(msg) = stdin_rx.recv().await {
                 match msg {
                     StdinMsg::Data(bytes) => {
@@ -379,7 +379,7 @@ pub async fn start_stream(
     let ws_wait = workspace_id.clone();
     let req_wait = request_id.clone();
     let timeout_ms = common.timeout_ms;
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         run_wait_loop(
             bus_wait,
             ws_wait,
@@ -414,7 +414,7 @@ fn spawn_reader<R>(
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let mut buf = vec![0u8; READ_BUF_SIZE];
         loop {
             match reader.read(&mut buf).await {

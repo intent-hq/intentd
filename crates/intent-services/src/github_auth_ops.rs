@@ -227,7 +227,7 @@ pub(crate) async fn run_poll_loop(
     if outcome.is_none() && sync_gh {
         // Best-effort gh CLI sync: loads the token back from the secret store
         // (it never leaves the engine) and pipes it to `gh` via stdin only.
-        tokio::spawn(intent_sourcecontrol::gh_sync::sync_token_to_gh(
+        intent_core::spawn_daemon(intent_sourcecontrol::gh_sync::sync_token_to_gh(
             intent_core::FileSecretStore::new(),
         ));
     }

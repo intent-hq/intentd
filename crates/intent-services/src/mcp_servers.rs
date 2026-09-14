@@ -610,7 +610,7 @@ impl McpHub {
     /// sweep runs after one interval; missed ticks are skipped.
     pub fn spawn_health_monitor(&self) -> tokio::task::JoinHandle<()> {
         let hub = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let mut ticker = tokio::time::interval(HEALTH_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;

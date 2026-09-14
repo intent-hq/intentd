@@ -556,7 +556,7 @@ impl FileWatcher {
         // relative-path strip works against the paths the OS reports (macOS
         // FSEvents resolves `/var/...` → `/private/var/...`).
         let (sub, raw_rx, root) = hub.subscribe(root);
-        let task = tokio::spawn(debounce_loop(bus, workspace_id, root, raw_rx));
+        let task = intent_core::spawn_daemon(debounce_loop(bus, workspace_id, root, raw_rx));
         Self { _sub: sub, task }
     }
 
