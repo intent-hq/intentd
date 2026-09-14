@@ -647,6 +647,16 @@ async function handlePrompt(id, params) {
   if (ruleDelayMs > 0) {
     await new Promise((r) => setTimeout(r, ruleDelayMs));
   }
+  // Optional per-rule barrier: hold the turn open until `releaseFile` exists.
+  // Unlike `delayMs` this is not a timer — the test decides exactly when the
+  // turn may end (e.g. only after follow-up sends have provably queued behind
+  // it), so the interleaving it pins cannot drift under CPU load.
+  if (typeof active.releaseFile === 'string' && active.releaseFile.length > 0) {
+    log(`releaseFile: holding turn until ${active.releaseFile} exists`);
+    while (!fs.existsSync(active.releaseFile)) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
   const toolCalls = Array.isArray(active.toolCalls)
     ? active.toolCalls
     : active.toolCall

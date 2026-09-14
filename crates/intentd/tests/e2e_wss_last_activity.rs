@@ -333,7 +333,14 @@ where
 /// each row), and the terminal `agent:stream:end` names the same `turnId`.
 /// Both ride the same event bus, so the row echo always precedes its turn's
 /// stream:end on the wire.
-async fn await_user_turns_ended<S>(ws: &mut WebSocketStream<S>, agent_id: &str, user_rows: usize)
+///
+/// Returns the distinct turn ids the `user_rows` rows were carried by, so a
+/// caller that forced a particular folding can assert it actually happened.
+async fn await_user_turns_ended<S>(
+    ws: &mut WebSocketStream<S>,
+    agent_id: &str,
+    user_rows: usize,
+) -> HashSet<String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -372,6 +379,7 @@ where
             _ => {}
         }
     }
+    open_turns
 }
 
 async fn boot(mock_script: &str, behavior: &str) -> (Daemon, u16, Arc<ClientConfig>) {
@@ -763,31 +771,39 @@ async fn last_activity_debounce_coalesces_burst() {
     let Some(script) = gate("WSS lastActivity debounce") else {
         return;
     };
-    burst_debounce_case(&script, json!({ "response": "burst" })).await;
+    burst_debounce_case(&script, json!({ "response": "burst" }), None).await;
 }
 
-/// Same debounce case, with the first burst turn held open long enough that
-/// the remaining messages queue behind it and drain as ONE combined flush
-/// turn. Pins the turn-identity wait in [`await_user_turns_ended`]: this is
-/// the interleaving a loaded host produces nondeterministically
-/// (intent-hq/intent#4947), and a fixed count of three `agent:stream:end`
-/// events times out here.
+/// Same debounce case, with the first burst turn held open by a file barrier
+/// until the remaining two messages have provably queued behind it, so they
+/// drain as ONE combined flush turn. Pins the turn-identity wait in
+/// [`await_user_turns_ended`]: this is the interleaving a loaded host produces
+/// nondeterministically (intent-hq/intent#4947), and a fixed count of three
+/// `agent:stream:end` events times out here. A barrier rather than a timer:
+/// the msg 0 turn cannot end before the test releases it, so the queued sends
+/// and the two-turn folding are asserted, not hoped for.
 #[tokio::test]
 async fn last_activity_debounce_coalesces_burst_with_queued_flush() {
     let Some(script) = gate("WSS lastActivity debounce (queued flush)") else {
         return;
     };
+    let release_dir = scratch_dir("release");
+    let release_file = release_dir.path().join("release-msg-0");
     burst_debounce_case(
         &script,
         json!({
             "response": "burst",
-            "rules": [{ "ifPromptContains": "msg 0", "delayMs": 400 }],
+            "rules": [{ "ifPromptContains": "msg 0", "releaseFile": release_file }],
         }),
+        Some(&release_file),
     )
     .await;
 }
 
-async fn burst_debounce_case(script: &str, behavior: Value) {
+/// `release_file`: when set, the mock holds the msg 0 turn open until this
+/// file exists; the burst then asserts msgs 1 and 2 queued behind it and folded
+/// into exactly one combined turn.
+async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option<&Path>) {
     let behavior = behavior.to_string();
     let (daemon, port, cfg) = boot(script, &behavior).await;
 
@@ -869,21 +885,44 @@ async fn burst_debounce_case(script: &str, behavior: Value) {
     }
 
     // Drive a rapid burst: 3 messages within the 500ms debounce window
+    let mut sends = Vec::new();
     for i in 0..3 {
-        wss_rpc(
+        let sent = wss_rpc(
             &mut rpc,
             10 + i,
             "agent.sendMessage",
             json!({ "workspaceId": ws_id, "agentId": agent_id, "content": format!("msg {i}") }),
         )
         .await;
+        assert_eq!(sent["success"], json!(true), "msg {i} send: {sent}");
+        sends.push(sent);
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Barrier variant: msg 0 is still held open, so msgs 1 and 2 must have
+    // queued behind it. Only now let the msg 0 turn end.
+    if let Some(release) = release_file {
+        for (i, sent) in sends.iter().enumerate().skip(1) {
+            assert_eq!(
+                sent["queued"],
+                json!(true),
+                "msg {i} must queue behind the held msg 0 turn: {sent}"
+            );
+        }
+        std::fs::write(release, b"go").expect("write release file");
     }
 
     // Wait (bounded) until every turn carrying a burst message has completed.
     // Not "three stream:ends": messages that queue behind an in-flight turn
     // drain as one combined turn, so the burst may end in fewer turns.
-    await_user_turns_ended(&mut agent_sub, agent_id, 3).await;
+    let burst_turns = await_user_turns_ended(&mut agent_sub, agent_id, 3).await;
+    if release_file.is_some() {
+        assert_eq!(
+            burst_turns.len(),
+            2,
+            "held msg 0 turn + one combined flush turn for msgs 1 and 2: {burst_turns:?}"
+        );
+    }
 
     // Collect workspace:updated events until the subscription has been quiet
     // for well over one debounce window (covers the trailing debounce fire).
