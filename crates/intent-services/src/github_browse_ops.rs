@@ -78,7 +78,7 @@ pub(crate) fn related_repos_from_gitmodules(content: &str, parent: &RepoRef) -> 
         }
         if line.starts_with('[') {
             flush(&mut section, &mut out);
-            section = line.starts_with("[submodule").then_some((None, None));
+            section = is_submodule_section_header(line).then_some((None, None));
             continue;
         }
         let Some((path, url)) = section.as_mut() else {
@@ -90,15 +90,29 @@ pub(crate) fn related_repos_from_gitmodules(content: &str, parent: &RepoRef) -> 
         let Some(value) = git_config_value(value) else {
             continue;
         };
-        match key.trim() {
-            "path" => *path = Some(value),
-            "url" => *url = Some(value),
-            _ => {}
+        let key = key.trim();
+        if key.eq_ignore_ascii_case("path") {
+            *path = Some(value);
+        } else if key.eq_ignore_ascii_case("url") {
+            *url = Some(value);
         }
     }
     flush(&mut section, &mut out);
     out.truncate(RELATED_REPOS_CAP);
     out
+}
+
+/// `[submodule "name"]` (git-config section names are case-insensitive), with
+/// the section keyword delimited by whitespace or `]` so `[submodulex]` does
+/// not match.
+fn is_submodule_section_header(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('[') else {
+        return false;
+    };
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ']')
+        .unwrap_or(rest.len());
+    rest[..end].eq_ignore_ascii_case("submodule")
 }
 
 /// Decode the right-hand side of a git-config `key = value` line: surrounding
@@ -421,6 +435,12 @@ mod tests {
              [submodule \"hash-in-quotes\"]\n\
              \tpath = \"packages/#hash\"\n\
              \turl = \"https://github.com/acme/hash\"\n\
+             [Submodule \"mixed-case\"]\n\
+             \tPath = packages/mixed\n\
+             \tURL = https://github.com/acme/mixed.git\n\
+             [submodulex \"not-a-submodule\"]\n\
+             \tpath = packages/nope\n\
+             \turl = https://github.com/acme/nope.git\n\
              [submodule \"broken\"]\n\
              \tpath = \"packages/broken\n\
              \turl = \"https://github.com/acme/broken\n";
@@ -443,6 +463,10 @@ mod tests {
                 RelatedRepo {
                     repo: RepoRef::new("acme", "hash"),
                     path: "packages/#hash".into(),
+                },
+                RelatedRepo {
+                    repo: RepoRef::new("acme", "mixed"),
+                    path: "packages/mixed".into(),
                 },
             ]
         );
