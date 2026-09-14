@@ -82,11 +82,13 @@ impl RootWatch {
     /// once the watch loop has ended without storing a watch (a registration
     /// thread that never reported), since nothing will establish it later.
     /// A registration that merely *failed* is retried by the loop
-    /// (intent-hq/intent#4852), so that case waits, up to `timeout`.
+    /// (intent-hq/intent#4852), so that case waits, up to `timeout` — as
+    /// does a live watch the loop lost and is re-registering, during which
+    /// `watched()` reads `None` again.
     ///
-    /// The loop ends *normally* right after a successful store, so a finished
-    /// task is only a failure if `watched()` is still `None` when observed
-    /// after `is_finished()` — the store happens-before the task ends.
+    /// The loop only ends when the watch is dropped, so a finished task is
+    /// only a failure if `watched()` is still `None` when observed after
+    /// `is_finished()` — the store happens-before the task ends.
     #[cfg(test)]
     pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -166,6 +168,14 @@ pub(super) fn watch_root(
 /// filesystem after each — and the ancestor receiver lives only for the wait
 /// it drives, so traffic while a recursive registration keeps failing is
 /// dropped at the hub rather than queued for the watch's lifetime.
+///
+/// A live subscription can still be lost afterwards: the hub re-registers a
+/// root when a recursive co-tenant above it retires (its unwatch strips the
+/// nested descriptors) and closes the root's channels if that re-registration
+/// fails. The loop treats a closed receiver — recursive or ancestor — as such
+/// a loss: it forgets the dead subscription and starts over with the same
+/// backoff, rather than parking on the closed channel with a watch that
+/// looks established and delivers nothing.
 async fn watch_loop(
     hub: Arc<SharedWatchHub>,
     root: PathBuf,
@@ -179,6 +189,7 @@ async fn watch_loop(
             let (sub, mut rx, canonical) = hub.subscribe(&root);
             if sub.wait_live().await {
                 store(&inner, sub, root.clone(), true);
+                backoff = CREATE_RETRY_INITIAL;
                 // Registration is deferred, so changes can land between
                 // `watch_root` returning and the watch existing — and callers
                 // prime their fingerprint before that. Flush once so such a
@@ -191,7 +202,16 @@ async fn watch_loop(
                         on_change();
                     }
                 }
-                return;
+                forget(&inner);
+                tracing::warn!(
+                    root = %root.display(),
+                    retry_in = ?backoff,
+                    os_watch_limits = %os_watch_limits(),
+                    "recursive watch lost; re-registering"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(CREATE_RETRY_CAP);
+                continue;
             }
             // Includes the root being deleted between the `exists` check and
             // the registrar's `watch()`: the retry sees it missing and falls
@@ -224,13 +244,29 @@ async fn watch_loop(
             continue;
         }
         store(&inner, sub, ancestor.clone(), false);
+        backoff = CREATE_RETRY_INITIAL;
 
         // Wait until the root or a nearer ancestor appears. Re-check after
         // the watch is established to close the create-before-watch race.
-        while !root.exists() && find_existing_ancestor(&root) == ancestor {
-            if rx.recv().await.is_none() {
-                return;
+        let lost = loop {
+            if root.exists() || find_existing_ancestor(&root) != ancestor {
+                break false;
             }
+            if rx.recv().await.is_none() {
+                break true;
+            }
+        };
+        if lost {
+            forget(&inner);
+            tracing::warn!(
+                root = %root.display(),
+                ancestor = %ancestor.display(),
+                retry_in = ?backoff,
+                os_watch_limits = %os_watch_limits(),
+                "ancestor watch lost; re-registering"
+            );
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(CREATE_RETRY_CAP);
         }
     }
 }
@@ -240,6 +276,16 @@ fn store(inner: &Arc<Mutex<Inner>>, sub: SubHandle, path: PathBuf, recursive: bo
         guard.sub = Some(sub);
         guard.watched_path = Some(path);
         guard.recursive = recursive;
+    }
+}
+
+/// Release a lost subscription so the next attempt registers afresh, and stop
+/// reporting it as the watched path meanwhile.
+fn forget(inner: &Arc<Mutex<Inner>>) {
+    if let Ok(mut guard) = inner.lock() {
+        guard.sub = None;
+        guard.watched_path = None;
+        guard.recursive = false;
     }
 }
 
@@ -530,6 +576,83 @@ mod tests {
             "file changes under the recovered root must be detected"
         );
         drop(watch);
+    }
+
+    /// Regression for the widened-ancestor promotion hole (PR #1876 review,
+    /// the intent-hq/intent#4852 shape): while the loop parks on the missing
+    /// root's parent, a recursive co-subscriber of that parent (a workspace
+    /// root watch) joins and leaves, which leaves the parent's OS watch
+    /// recursive. Promotion then subscribes the root and, on storing it,
+    /// releases the parent watch — whose recursive unwatch strips the root's
+    /// descriptors, so the hub re-registers the root behind the loop's
+    /// completed `wait_live`. With that second registration failing, the loop
+    /// must not stay parked on a dead watch: it re-registers (third call) and
+    /// the recovered watch reports later changes. Linux only, like the hub
+    /// behaviour it exercises.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn promotion_off_a_widened_ancestor_survives_a_failed_re_registration() {
+        use crate::events::shared_watch::WatchFault;
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = TempDir::new("widened");
+        let root = dir.path.join("specialists");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        let fault = WatchFault::nth("specialists", 2);
+        let hub = SharedWatchHub::with_watch_fault(&fault);
+        let watch = watch_root(&hub, root.clone(), md_only, move || {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(
+            wait_for(
+                || watch.watched() == Some((dir.path.clone(), false)),
+                LIVENESS
+            )
+            .await,
+            "ancestor watch must establish"
+        );
+
+        // A recursive co-subscriber widens the ancestor's OS watch and leaves;
+        // the hub keeps the root recursive for the ancestor watch's lifetime.
+        let (sub_wide, _rx_wide, _) = hub.subscribe(&dir.path);
+        sub_wide.wait_established(LIVENESS).await;
+        drop(sub_wide);
+
+        std::fs::create_dir_all(&root).expect("create root");
+        // Promotion registers the root (1st call, live), stores it — releasing
+        // the ancestor watch, whose retirement re-registers the root (2nd
+        // call, injected failure) — and the loop recovers (3rd call).
+        assert!(
+            wait_for(|| fault.attempts() >= 3, LIVENESS).await,
+            "the lost promoted watch must be re-registered, saw {} watch() calls",
+            fault.attempts()
+        );
+        assert!(
+            wait_for(|| watch.watched() == Some((root.clone(), true)), LIVENESS).await,
+            "watch must settle on a recursive watch of the root, got {:?}",
+            watch.watched()
+        );
+        assert!(
+            wait_for(|| hits.load(Ordering::SeqCst) >= 1, LIVENESS).await,
+            "the recovered promotion must fire a catch-up notification"
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = hits.load(Ordering::SeqCst);
+        std::fs::write(root.join("new.md"), "x").expect("write md");
+        assert!(
+            wait_for(|| hits.load(Ordering::SeqCst) > before, LIVENESS).await,
+            "file changes under the recovered root must be detected"
+        );
+        assert_eq!(
+            fault.attempts(),
+            3,
+            "exactly one recovery registration must follow the injected failure"
+        );
     }
 
     #[tokio::test]
