@@ -451,11 +451,6 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
             })
             .await
             .expect("Antigravity turn must finish");
-            if should_fail {
-                // Let the terminal failure's queue/status publication finish
-                // before redriving the same model on the next user message.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
         }
         let calls: Vec<Value> = std::fs::read_to_string(&log)
             .unwrap()

@@ -2291,6 +2291,18 @@ pub struct AgentManager {
     /// stale flag cleared by [`AgentManager::release_slot_sync`] when the
     /// slot is released. In-memory only, same gap as `recreated`.
     auto_unarchived: Arc<Mutex<HashSet<AgentId>>>,
+    /// Recovery sends parked by the busy race (intent-hq/intent#4962): the
+    /// queue-entry id of the most recent `send_message` that lost `try_begin`
+    /// to a worker still holding the slot. The documented recovery for an
+    /// `Error` session is a fresh `agent.sendMessage`, but a send landing in
+    /// the window between the terminal-failure handler's `Error` persist and
+    /// its slot release is parked in the queue — where the STAB-52 gate in
+    /// `try_drain_queue` refuses to redrive it and the exiting worker never
+    /// drains (`break 'outer`). The releasing worker consumes this marker at
+    /// exit and redrives the entry if it is still queued; the send side
+    /// re-probes after its enqueue for the opposite interleaving. In-memory
+    /// only: a stale marker is validated against the queue before use.
+    parked_recovery_sends: Arc<Mutex<HashMap<AgentId, String>>>,
 }
 
 impl AgentManager {
@@ -2364,6 +2376,7 @@ impl AgentManager {
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
             auto_unarchived: Arc::new(Mutex::new(HashSet::new())),
+            parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -5633,6 +5646,10 @@ impl AgentManager {
     /// # Errors
     ///
     /// Returns `Error::InvalidParams` when the request options are invalid; `Error::NotFound` if the agent session does not exist. Turn failures propagate from the underlying run.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn send_message(
         self: &Arc<Self>,
         agent_id: AgentId,
@@ -5849,6 +5866,15 @@ impl AgentManager {
                 options.interrupt_priority,
                 options.origin,
             );
+            // Record the parked send BEFORE publishing (intent-hq/intent#4962):
+            // the slot holder may be a terminal-failure worker that already
+            // persisted `Error` and is about to release without draining —
+            // its exit consumes this marker and redrives the entry so the
+            // documented "fresh sendMessage" recovery still starts a turn.
+            self.parked_recovery_sends
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone(), queued.id.clone());
             let result = json!({
                 "success": true,
                 "queued": true,
@@ -5856,6 +5882,11 @@ impl AgentManager {
                 "turnId": queued.turn_id,
             });
             self.services.publish_queue_updated(&agent_id).await;
+            // Opposite interleaving: the worker released (and ran its exit
+            // re-check) between the failed claim and the insert above, so
+            // nobody else will consume the marker — probe now.
+            self.redrive_parked_recovery_send(&agent_id, &workspace_id)
+                .await;
             return Ok(result);
         }
         // Delivery-time unblocked hints (monorepo#2044), direct-send arm: an
@@ -6026,6 +6057,53 @@ impl AgentManager {
     /// When the slot is already held by another worker this is a no-op — that
     /// worker's drain loop will pick the message up at turn-end.
     pub async fn try_drain_queue(self: Arc<Self>, agent_id: AgentId, workspace_id: WorkspaceId) {
+        self.try_drain_queue_inner(agent_id, workspace_id, false)
+            .await;
+    }
+
+    /// Worker-exit / send-side half of the parked recovery-send window
+    /// (intent-hq/intent#4962): consume this agent's marker and, if the
+    /// recorded entry is still queued, run the drain with the STAB-52
+    /// `Error` gate lifted — the entry IS the fresh `agent.sendMessage`
+    /// that documented recovery path promises will start a turn. Leaves
+    /// the marker in place while the slot is held so the releasing worker
+    /// consumes it at exit; a marker whose entry has already drained (normal
+    /// turn end) or been re-minted (terminal-failure requeue) is dropped
+    /// without effect.
+    async fn redrive_parked_recovery_send(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) {
+        if self.is_busy(agent_id) {
+            return;
+        }
+        let Some(message_id) = self.parked_recovery_sends.lock().unwrap().remove(agent_id) else {
+            return;
+        };
+        if !self.services.is_message_queued(agent_id, &message_id) {
+            return;
+        }
+        tracing::debug!(
+            agent = %agent_id,
+            message_id = %message_id,
+            "redriving recovery send parked by the busy race (intent-hq/intent#4962)"
+        );
+        self.clone()
+            .try_drain_queue_inner(agent_id.clone(), workspace_id.clone(), true)
+            .await;
+    }
+
+    /// [`AgentManager::try_drain_queue`] body. `redrive_error_park` lifts
+    /// the STAB-52 `Error` gate for a validated parked recovery send (see
+    /// [`AgentManager::redrive_parked_recovery_send`]); every other gate —
+    /// busy, ready-to-send, archived, quarantine, retired — still applies.
+    async fn try_drain_queue_inner(
+        self: Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        redrive_error_park: bool,
+    ) {
         if self.is_busy(&agent_id) {
             return;
         }
@@ -6107,11 +6185,36 @@ impl AgentManager {
             .await
         {
             Ok(AgentStatus::Error) => {
-                tracing::debug!(
-                    agent = %agent_id,
-                    "skipping queue drain: session parked in error state (awaiting agent.retry)"
-                );
-                return;
+                // A validated parked recovery send (intent-hq/intent#4962)
+                // is the fresh `agent.sendMessage` this gate defers to, so
+                // it passes — but only for a non-poisoned session, mirroring
+                // `send_message`'s quarantine gate (monorepo#840): a poisoned
+                // session stays parked for `agent.retry` either way.
+                if !redrive_error_park {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        "skipping queue drain: session parked in error state (awaiting agent.retry)"
+                    );
+                    return;
+                }
+                match self.services.store.get_agent_session(&agent_id).await {
+                    Ok(session) if !self.services.session_poisoned(&session) => {}
+                    Ok(_) => {
+                        tracing::debug!(
+                            agent = %agent_id,
+                            "skipping recovery-send redrive: session is quarantined (poisoned)"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            error = %e,
+                            "skipping recovery-send redrive: agent session lookup failed"
+                        );
+                        return;
+                    }
+                }
             }
             Ok(_) => {}
             // Vanished session (intent-hq/monorepo#2762): the row is GONE
@@ -6155,6 +6258,14 @@ impl AgentManager {
         }
         if !self.try_begin(&agent_id, &workspace_id).await {
             return;
+        }
+        if redrive_error_park {
+            // Same `failed → in_progress` displayStatus recompute the direct
+            // Error-redrive arm of `send_message` performs: `try_begin`'s own
+            // recompute still read `status = Error` and was a no-op.
+            self.services
+                .maybe_emit_display_status_changed(&workspace_id)
+                .await;
         }
         // Batch flush (`agents.flushQueuedMessages`, default `all`): with a
         // batching mode and MORE THAN ONE eligible entry waiting, drain them
@@ -10239,6 +10350,16 @@ async fn run_message_worker(
         break 'outer;
     }
     mgr.clear_worker(&agent_id);
+    // Parked recovery send (intent-hq/intent#4962): a `send_message` that
+    // lost `try_begin` to THIS worker while it was parking the session in
+    // `Error` (terminal spawn/turn failure, persist failure) sits in the
+    // queue behind the STAB-52 gate with no drainer — the `break 'outer`
+    // arms above never drain. Redrive it now that the slot is released;
+    // runs AFTER `clear_worker` so the worker it spawns is not deregistered
+    // by this exit. A no-op on every other exit (marker absent, entry
+    // already drained, slot re-claimed by a concurrent send).
+    mgr.redrive_parked_recovery_send(&agent_id, &workspace_id)
+        .await;
     // The agent finished its work (queue drained, slot released): raise the
     // server-owned `attention` blue dot so every client surfaces it (§9.9) —
     // but only for TOP-LEVEL FOREGROUND agents (monorepo#1781): a delegated
@@ -15604,6 +15725,215 @@ mod agent_retry_tests {
                 "raced message stranded on idle session (yields={yields})"
             );
         }
+    }
+
+    /// Simulate a worker holding the in-flight slot WITHOUT `try_begin`
+    /// (which would persist `Active` and hide the `Error` park under test).
+    fn hold_slot(mgr: &AgentManager, agent_id: &AgentId, ws: &WorkspaceId) {
+        mgr.busy.lock().unwrap().insert(agent_id.clone());
+        mgr.agent_ws
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), ws.clone());
+    }
+
+    fn user_send() -> TurnOptions {
+        TurnOptions {
+            origin: intent_core::MessageOrigin::User,
+            ..TurnOptions::default()
+        }
+    }
+
+    /// Regression for intent-hq/intent#4962: a recovery `send_message` that
+    /// lands while the terminal-failure worker still holds the slot (status
+    /// already `Error`, slot not yet released) is parked in the queue. The
+    /// STAB-52 gate refuses to auto-redrive an `Error` session and the
+    /// exiting worker never drains, so without the marker hand-off the
+    /// documented "fresh sendMessage" recovery never starts a turn. The
+    /// worker-exit re-check must claim the slot and redrive the entry.
+    #[tokio::test]
+    async fn recovery_send_parked_by_busy_race_is_redriven_at_worker_exit() {
+        let agent_id = AgentId::from("agent-4962-worker");
+        let ws = WorkspaceId::from("ws-4962");
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        hold_slot(&mgr, &agent_id, &ws);
+
+        let result = mgr
+            .send_message(
+                agent_id.clone(),
+                ws.clone(),
+                "recover".to_string(),
+                None,
+                user_send(),
+            )
+            .await
+            .expect("send");
+        assert_eq!(result["queued"], true, "busy race parks the send");
+        let parked_id = mgr
+            .parked_recovery_sends
+            .lock()
+            .unwrap()
+            .get(&agent_id)
+            .cloned()
+            .expect("busy-race park records the recovery-send marker");
+        assert_eq!(parked_id, result["queuedMessage"]["id"].as_str().unwrap());
+        // The send-side probe saw the slot still held: the entry stays
+        // parked and the marker stays armed for the worker's exit.
+        assert!(mgr.services.has_ready_to_send(&agent_id));
+
+        // The worker's terminal-failure exit: release the slot, then the
+        // post-`clear_worker` re-check.
+        mgr.release_in_flight_slot(&agent_id);
+        mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
+
+        assert!(
+            mgr.is_busy(&agent_id),
+            "recovery send redriven: the drain re-claimed the slot"
+        );
+        assert!(
+            !mgr.services.is_message_queued(&agent_id, &parked_id),
+            "recovery send dequeued for the redriven turn"
+        );
+        assert!(
+            mgr.parked_recovery_sends
+                .lock()
+                .unwrap()
+                .get(&agent_id)
+                .is_none(),
+            "marker consumed"
+        );
+    }
+
+    /// Drive a recovery `send_message` against a held slot and release the
+    /// slot the moment the send has parked its entry (the worker's release
+    /// racing the send's post-enqueue probe). With `worker_redrives` the
+    /// releasing side also runs the worker-exit re-check, so both halves
+    /// contend for the marker; without it only the send-side probe can
+    /// redrive. Returns the send result.
+    async fn race_recovery_send_with_release(
+        mgr: &Arc<AgentManager>,
+        agent_id: &AgentId,
+        ws: &WorkspaceId,
+        worker_redrives: bool,
+    ) -> Value {
+        hold_slot(mgr, agent_id, ws);
+        let send_fut = mgr.send_message(
+            agent_id.clone(),
+            ws.clone(),
+            "recover".to_string(),
+            None,
+            user_send(),
+        );
+        let release_fut = async {
+            while !mgr.services.has_ready_to_send(agent_id) {
+                tokio::task::yield_now().await;
+            }
+            mgr.release_in_flight_slot(agent_id);
+            if worker_redrives {
+                mgr.redrive_parked_recovery_send(agent_id, ws).await;
+            }
+        };
+        let (result, ()) = tokio::join!(send_fut, release_fut);
+        let result = result.expect("send");
+        assert_eq!(result["queued"], true, "busy race parks the send");
+        result
+    }
+
+    /// Send-side half of #4962: the worker released between the send's
+    /// lost claim and its post-enqueue probe without consuming the marker
+    /// (its exit re-check ran before the marker existed), so the probe is
+    /// the only redrive left.
+    #[tokio::test]
+    async fn recovery_send_parked_by_busy_race_is_redriven_by_send_side_probe() {
+        let agent_id = AgentId::from("agent-4962-send");
+        let ws = WorkspaceId::from("ws-4962");
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+
+        let result = race_recovery_send_with_release(&mgr, &agent_id, &ws, false).await;
+
+        let id = result["queuedMessage"]["id"].as_str().unwrap();
+        assert!(
+            !mgr.services.is_message_queued(&agent_id, id),
+            "parked recovery send stranded in the queue"
+        );
+        assert!(mgr.is_busy(&agent_id), "the recovery turn claimed the slot");
+        assert!(mgr
+            .parked_recovery_sends
+            .lock()
+            .unwrap()
+            .get(&agent_id)
+            .is_none());
+    }
+
+    /// Both halves of #4962 contend: the worker-exit re-check and the
+    /// send-side probe race for the same marker. Exactly one redrives; the
+    /// entry is never stranded and never double-claimed.
+    #[tokio::test]
+    async fn recovery_send_redrive_is_claimed_once_when_both_halves_race() {
+        let agent_id = AgentId::from("agent-4962-both");
+        let ws = WorkspaceId::from("ws-4962");
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+
+        let result = race_recovery_send_with_release(&mgr, &agent_id, &ws, true).await;
+
+        let id = result["queuedMessage"]["id"].as_str().unwrap();
+        assert!(
+            !mgr.services.is_message_queued(&agent_id, id),
+            "parked recovery send stranded in the queue"
+        );
+        assert!(mgr.is_busy(&agent_id), "the recovery turn claimed the slot");
+        assert!(mgr
+            .parked_recovery_sends
+            .lock()
+            .unwrap()
+            .get(&agent_id)
+            .is_none());
+    }
+
+    /// The STAB-52 gate itself is untouched: a plain `agent.queueMessage`
+    /// kick (no recovery-send marker) on an `Error` session still parks,
+    /// and a stale marker whose entry is gone (re-minted by a terminal-
+    /// failure requeue) is dropped without lifting the gate.
+    #[tokio::test]
+    async fn stale_recovery_marker_does_not_lift_error_gate() {
+        let agent_id = AgentId::from("agent-4962-stale");
+        let ws = WorkspaceId::from("ws-4962");
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        mgr.services.enqueue_message(
+            &agent_id,
+            "requeued".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::Automatic,
+        );
+
+        mgr.clone()
+            .try_drain_queue(agent_id.clone(), ws.clone())
+            .await;
+        assert!(
+            !mgr.is_busy(&agent_id),
+            "STAB-52: Error session not redriven"
+        );
+
+        mgr.parked_recovery_sends
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), "user-msg-gone".to_string());
+        mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
+        assert!(
+            !mgr.is_busy(&agent_id),
+            "stale marker must not lift the gate"
+        );
+        assert!(mgr.services.has_ready_to_send(&agent_id));
+        assert!(mgr
+            .parked_recovery_sends
+            .lock()
+            .unwrap()
+            .get(&agent_id)
+            .is_none());
     }
 
     #[tokio::test]

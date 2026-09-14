@@ -13643,6 +13643,19 @@ impl Services {
             .is_some_and(|q| q.iter().any(QueuedMessage::ready_to_send))
     }
 
+    /// `true` iff the agent's queue still holds a ready-to-send entry with
+    /// this exact `id`. Validates a parked recovery-send marker
+    /// (intent-hq/intent#4962) before redriving: a drained entry is gone,
+    /// and a terminal-failure requeue mints a NEW entry id, so a stale
+    /// marker never matches.
+    pub(crate) fn is_message_queued(&self, agent_id: &AgentId, message_id: &str) -> bool {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .is_some_and(|q| q.iter().any(|m| m.id == message_id && m.ready_to_send()))
+    }
+
     /// `true` iff at least one ready-to-send queued entry is user-origin:
     /// the archived-drain exemption's legacy-row fallback (no `archivedAt`)
     /// uses this to decide whether a drain may proceed for the user entry.
