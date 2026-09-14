@@ -17866,6 +17866,19 @@ mod pr {
             .insert_note(&sweep_task_note(&ws.id, intent_core::TaskStatus::Complete))
             .await
             .unwrap();
+
+        // Seed the last-observed baseline at `complete` via a list read (a
+        // seed never emits).
+        let list = svc.list_workspaces(false).await.unwrap();
+        let row = list.iter().find(|w| w.id == ws.id).expect("row");
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::Complete)
+        );
+        assert!(display_status_events(&svc, &ws.id).await.is_empty());
+
+        // The root's open linked PR lands via the store (not the service),
+        // so nothing recomputes until the sweep persists the merge.
         let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
         root.pr_number = Some(42);
         root.pr_url = Some("https://github.com/o/r/pull/42".into());
@@ -17874,16 +17887,6 @@ mod pr {
         open_info.status = intent_core::PullRequestStatus::Open;
         root.pull_requests = Some(vec![open_info]);
         svc.store().upsert_workspace_git_root(&root).await.unwrap();
-
-        // Seed the last-observed baseline via a list read: the open,
-        // mergeable root PR (`sample_pr()` is `clean`) reads `pr_ready`; a
-        // seed never emits.
-        let list = svc.list_workspaces(false).await.unwrap();
-        let row = list.iter().find(|w| w.id == ws.id).expect("row");
-        assert_eq!(
-            row.display_status,
-            Some(intent_core::WorkspaceDisplayStatus::PrReady)
-        );
         assert!(display_status_events(&svc, &ws.id).await.is_empty());
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
