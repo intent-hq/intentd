@@ -439,12 +439,27 @@
 //! (exactly one of `attachmentId` | the key pair). Bindings are per
 //! workspace, retained 7 days. No method-catalog change.
 //!
-//! Version 9.14 adds the `github.relatedRepos.list` router method (additive;
+//! Version 10.0 drops the inline `data` arm of `fileBlocks` (breaking; §5.5).
+//! The 6.12 "exactly one of `data` / `attachmentId`" rule is replaced by
+//! "every entry carries a non-empty `attachmentId`": an entry carrying `data`
+//! (with or without a reference) or missing `attachmentId` is `-32602` naming
+//! the index, on every seam that accepts `fileBlocks` — `agent.sendMessage`,
+//! `agent.queueMessage`, `agent.editAndRegenerate`, `agent.create`,
+//! `agent.update`, and `workspace.create`'s `initialAgent`. Prompt assembly
+//! no longer emits ACP `resource` blobs from file blocks. Persisted legacy
+//! inline file blocks are not rewritten; on the way out, every read surface
+//! (`agent.getConversation` in both projections, the `chat.subscribe` seq-0
+//! snapshot and delta re-reads, `agent.getMessageBlock`) serves such a block
+//! as `{ type: "text", text: "Attached file: <fileName>" }` (`"Attached
+//! file"` when the name is missing) with the bytes dropped. `imageBlocks`
+//! keep their inline arm unchanged. No method-catalog change.
+//!
+//! Version 10.1 adds the `github.relatedRepos.list` router method (additive;
 //! §5.27): the GitHub repositories a remote repository's `.gitmodules`
 //! references, fetched via the contents API without a clone →
 //! `{ repos: [{ owner, repo, path }] }` (file order, deduplicated, the parent
 //! excluded, capped at 5; a missing or unparsable file is `{ repos: [] }`,
-//! never an error). Also within 9.14 (additive optional param, no catalog
+//! never an error). Also within 10.1 (additive optional param, no catalog
 //! change): `github.pulls.search` / `github.issues.search` accept
 //! `repos?: [{ owner, repo }]` extras — ONE search request spanning at most
 //! 6 repositories (addressed + extras, deduplicated; over-cap or a malformed
@@ -456,7 +471,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.14";
+pub const PROTOCOL_VERSION: &str = "10.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

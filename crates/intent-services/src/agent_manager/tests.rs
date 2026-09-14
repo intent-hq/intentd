@@ -4854,9 +4854,10 @@ async fn build_turn_prompt_appends_image_blocks_after_text() {
     assert_eq!(arr[2]["mimeType"], json!("image/jpeg"));
 }
 
-/// FE-supplied `fileBlocks` become ACP `resource` content blocks with a
-/// `BlobResourceContents` carrying the file name lifted into the resource
-/// `uri` (`file:///<fileName>`), appended after any image blocks.
+/// FE-supplied `fileBlocks` (attachment references, PROTOCOL §5.5 v10.0)
+/// become `text` attachment notices naming the file and its `attachmentId`,
+/// appended after any image blocks, in caller order. No `resource` blob is
+/// ever emitted.
 #[tokio::test]
 async fn build_turn_prompt_appends_file_blocks_after_text_and_images() {
     let (_tmp, mgr) = manager().await;
@@ -4866,26 +4867,32 @@ async fn build_turn_prompt_appends_file_blocks_after_text_and_images() {
     let options = super::TurnOptions {
         image_blocks: Some(json!([{"data": "IMG", "mimeType": "image/png"}])),
         file_blocks: Some(json!([
-            {"data": "Zm9v", "mimeType": "text/plain", "fileName": "notes.txt"},
-            {"data": "YmFy", "mimeType": "application/pdf", "fileName": "spec.pdf"},
+            {"attachmentId": "att-notes", "mimeType": "text/plain", "fileName": "notes.txt"},
+            {"attachmentId": "att-spec", "mimeType": "application/pdf", "fileName": "spec.pdf"},
         ])),
         ..super::TurnOptions::default()
     };
     let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
-    assert_eq!(arr.len(), 4, "text + 1 image + 2 file blocks");
+    assert_eq!(arr.len(), 4, "text + 1 image + 2 file notices");
     assert_eq!(arr[0]["type"], json!("text"));
     assert_eq!(arr[1]["type"], json!("image"));
     // Images come before files, files come in caller order.
-    assert_eq!(arr[2]["type"], json!("resource"));
-    assert_eq!(arr[2]["resource"]["blob"], json!("Zm9v"));
-    assert_eq!(arr[2]["resource"]["mimeType"], json!("text/plain"));
-    assert_eq!(arr[2]["resource"]["uri"], json!("file:///notes.txt"));
-    assert_eq!(arr[3]["type"], json!("resource"));
-    assert_eq!(arr[3]["resource"]["blob"], json!("YmFy"));
-    assert_eq!(arr[3]["resource"]["mimeType"], json!("application/pdf"));
-    assert_eq!(arr[3]["resource"]["uri"], json!("file:///spec.pdf"));
+    assert_eq!(arr[2]["type"], json!("text"));
+    let notes = arr[2]["text"].as_str().unwrap();
+    assert!(notes.contains("notes.txt"), "{notes}");
+    assert!(notes.contains("text/plain"), "{notes}");
+    assert!(notes.contains("att-notes"), "{notes}");
+    assert_eq!(arr[3]["type"], json!("text"));
+    let spec = arr[3]["text"].as_str().unwrap();
+    assert!(spec.contains("spec.pdf"), "{spec}");
+    assert!(spec.contains("application/pdf"), "{spec}");
+    assert!(spec.contains("att-spec"), "{spec}");
+    assert!(
+        arr.iter().all(|b| b["type"] != json!("resource")),
+        "no resource blob is emitted from file blocks: {wire}"
+    );
 }
 
 /// Malformed attachment entries (missing required fields, wrong types) are
@@ -4904,20 +4911,26 @@ async fn build_turn_prompt_skips_malformed_attachments() {
             {"data": "GOOD", "mimeType": "image/png"},
         ])),
         file_blocks: Some(json!([
-            {"mimeType": "text/plain", "fileName": "x.txt"},   // missing data
-            {"data": "d", "fileName": "x.txt"},                 // missing mimeType
-            {"data": "d", "mimeType": "text/plain"},            // missing fileName
-            {"data": "d", "mimeType": "text/plain", "fileName": "keep.txt"},
+            {"mimeType": "text/plain", "fileName": "x.txt"},   // no attachmentId
+            {"attachmentId": "att-1"},                          // missing fileName
+            {"attachmentId": "  ", "fileName": "blank.txt"},    // blank attachmentId
+            // Legacy inline data (v10.0): dropped, never a resource blob.
+            {"data": "d", "mimeType": "text/plain", "fileName": "inline.txt"},
+            {"attachmentId": "att-keep", "mimeType": "text/plain", "fileName": "keep.txt"},
         ])),
         ..super::TurnOptions::default()
     };
     let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
-    // text + 1 well-formed image + 1 well-formed file.
-    assert_eq!(arr.len(), 3);
+    // text + 1 well-formed image + 1 well-formed file reference.
+    assert_eq!(arr.len(), 3, "{wire}");
     assert_eq!(arr[1]["data"], json!("GOOD"));
-    assert_eq!(arr[2]["resource"]["uri"], json!("file:///keep.txt"));
+    assert_eq!(arr[2]["type"], json!("text"));
+    let notice = arr[2]["text"].as_str().unwrap();
+    assert!(notice.contains("keep.txt"), "{notice}");
+    assert!(notice.contains("att-keep"), "{notice}");
+    assert!(!wire.to_string().contains("inline.txt"));
 }
 
 /// Combined interrupt delivery (STAB-114 / monorepo#1014): `prepend_content`
@@ -4934,11 +4947,11 @@ async fn build_turn_prompt_prepends_preempted_content_and_attachments_first() {
         prepend_content: Some("original ask".to_string()),
         prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
         prepend_file_blocks: Some(json!([
-            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+            {"attachmentId": "att-orig", "mimeType": "text/plain", "fileName": "orig.txt"},
         ])),
         image_blocks: Some(json!([{"data": "NEW_IMG", "mimeType": "image/jpeg"}])),
         file_blocks: Some(json!([
-            {"data": "bmV3", "mimeType": "text/plain", "fileName": "new.txt"},
+            {"attachmentId": "att-new", "mimeType": "text/plain", "fileName": "new.txt"},
         ])),
         ..super::TurnOptions::default()
     };
@@ -4964,12 +4977,12 @@ async fn build_turn_prompt_prepends_preempted_content_and_attachments_first() {
     // Preempted attachments precede this turn's own.
     assert_eq!(arr[1]["type"], json!("image"));
     assert_eq!(arr[1]["data"], json!("ORIG_IMG"));
-    assert_eq!(arr[2]["type"], json!("resource"));
-    assert_eq!(arr[2]["resource"]["uri"], json!("file:///orig.txt"));
+    assert_eq!(arr[2]["type"], json!("text"));
+    assert!(arr[2]["text"].as_str().unwrap().contains("orig.txt"));
     assert_eq!(arr[3]["type"], json!("image"));
     assert_eq!(arr[3]["data"], json!("NEW_IMG"));
-    assert_eq!(arr[4]["type"], json!("resource"));
-    assert_eq!(arr[4]["resource"]["uri"], json!("file:///new.txt"));
+    assert_eq!(arr[4]["type"], json!("text"));
+    assert!(arr[4]["text"].as_str().unwrap().contains("new.txt"));
 }
 
 /// Recreated-session interaction (monorepo#1014): when the ACP session was
@@ -14339,31 +14352,53 @@ fn user_message_blocks_blank_attachment_id_persists_inline_data() {
     assert!(arr[1].get("attachmentId").is_none());
 }
 
-/// `validate_file_blocks` (PROTOCOL §5.5): exactly one of `data` /
-/// `attachmentId` per entry — both or neither is `-32602`; valid arrays,
-/// non-arrays, and non-object entries pass.
+/// `validate_file_blocks` (PROTOCOL §5.5, v10.0): every entry must carry a
+/// non-empty `attachmentId`; inline `data` (alone or beside a reference) and
+/// a missing / blank reference are `-32602` naming the index; valid
+/// reference arrays, non-arrays, and non-object entries pass.
 #[test]
-fn validate_file_blocks_rejects_both_or_neither() {
+fn validate_file_blocks_rejects_inline_data_and_missing_reference() {
     use crate::agent_ops::validate_file_blocks;
-    // Valid: inline-data entry and attachment-reference entry.
+    let invalid_params =
+        |err: &intent_core::Error| matches!(err, intent_core::Error::InvalidParams(_));
+    // Valid: attachment-reference entries only.
     let ok = json!([
-        { "type": "file", "data": "d", "mimeType": "t/p", "fileName": "a.txt" },
         { "type": "file", "attachmentId": "att-1", "fileName": "b.pdf" },
+        { "type": "file", "attachmentId": "att-2", "fileName": "c.txt", "mimeType": "t/p", "size": 3 },
     ]);
     assert!(validate_file_blocks("m", Some(&ok)).is_ok());
-    // Neither.
-    let neither = json!([{ "type": "file", "fileName": "x.txt" }]);
-    let err = validate_file_blocks("agent.sendMessage", Some(&neither)).unwrap_err();
+    // Inline data alone: rejected, naming the index and the removed arm.
+    let inline = json!([
+        { "type": "file", "attachmentId": "att-1", "fileName": "b.pdf" },
+        { "type": "file", "data": "QQ==", "mimeType": "t/p", "fileName": "a.txt" },
+    ]);
+    let err = validate_file_blocks("agent.sendMessage", Some(&inline)).unwrap_err();
+    assert!(invalid_params(&err), "{err:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("agent.sendMessage"), "{msg}");
+    assert!(msg.contains("fileBlocks[1]"), "{msg}");
     assert!(
-        matches!(err, intent_core::Error::InvalidParams(_)),
-        "{err:?}"
+        msg.contains("inline file data is no longer accepted"),
+        "{msg}"
     );
-    // Both.
+    // Inline data beside a reference: still rejected.
     let both = json!([{ "type": "file", "data": "d", "attachmentId": "att-1", "fileName": "x" }]);
-    assert!(validate_file_blocks("m", Some(&both)).is_err());
-    // Blank attachmentId counts as absent → data-only entry still valid.
-    let blank = json!([{ "type": "file", "data": "d", "attachmentId": " ", "fileName": "x" }]);
-    assert!(validate_file_blocks("m", Some(&blank)).is_ok());
+    let err = validate_file_blocks("m", Some(&both)).unwrap_err();
+    assert!(invalid_params(&err), "{err:?}");
+    assert!(err.to_string().contains("fileBlocks[0]"), "{err}");
+    // A non-string `data` value is also inline data.
+    let bad_type = json!([{ "type": "file", "data": 7, "attachmentId": "att-1", "fileName": "x" }]);
+    assert!(validate_file_blocks("m", Some(&bad_type)).is_err());
+    // No reference.
+    let neither = json!([{ "type": "file", "fileName": "x.txt" }]);
+    let err = validate_file_blocks("agent.queueMessage", Some(&neither)).unwrap_err();
+    assert!(invalid_params(&err), "{err:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("agent.queueMessage: fileBlocks[0]"), "{msg}");
+    assert!(msg.contains("attachmentId"), "{msg}");
+    // Blank attachmentId counts as absent.
+    let blank = json!([{ "type": "file", "attachmentId": " ", "fileName": "x" }]);
+    assert!(validate_file_blocks("m", Some(&blank)).is_err());
     // Non-array / absent / non-object entries are tolerated.
     assert!(validate_file_blocks("m", None).is_ok());
     assert!(validate_file_blocks("m", Some(&json!("nope"))).is_ok());
@@ -14671,8 +14706,8 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
 
 /// Prompt rendering (PROTOCOL §5.5): an attachment-reference file block
 /// becomes a `text` attachment notice naming the metadata and directing the
-/// model to `ws.file.getAttachment(attachmentId)`; inline-data file blocks
-/// keep the `resource` blob shape.
+/// model to `ws.file.getAttachment(attachmentId)`; a legacy inline-data file
+/// block (v10.0) is dropped from the prompt — never a `resource` blob.
 #[test]
 fn append_attachment_blocks_renders_attachment_reference_notice() {
     let options = super::TurnOptions {
@@ -14685,7 +14720,7 @@ fn append_attachment_blocks_renders_attachment_reference_notice() {
     };
     let mut blocks = Vec::new();
     super::append_attachment_blocks(&mut blocks, &options);
-    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks.len(), 1, "inline entry dropped: {blocks:?}");
     let notice = serde_json::to_value(&blocks[0]).unwrap();
     assert_eq!(notice["type"], json!("text"));
     let text = notice["text"].as_str().unwrap();
@@ -14693,9 +14728,7 @@ fn append_attachment_blocks_renders_attachment_reference_notice() {
     assert!(text.contains("application/json"), "{text}");
     assert!(text.contains("4096 bytes"), "{text}");
     assert!(text.contains("ws.file.getAttachment(\"att-9\")"), "{text}");
-    let inline = serde_json::to_value(&blocks[1]).unwrap();
-    assert_eq!(inline["type"], json!("resource"));
-    assert_eq!(inline["resource"]["blob"], json!("aGk="));
+    assert!(!text.contains("aGk="), "{text}");
 }
 
 /// STAB-133: the queue-drain `persist_user` path appends the FE-supplied

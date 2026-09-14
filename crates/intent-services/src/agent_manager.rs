@@ -444,11 +444,11 @@ pub struct TurnOptions {
     /// `Image` content block appended after the text prompt (reference-parity
     /// `acp-provider.ts`).
     pub image_blocks: Option<serde_json::Value>,
-    /// FE-supplied file attachments: each `{ data, mimeType, fileName }`
-    /// becomes an ACP `Resource` content block (`EmbeddedResource` with
-    /// `BlobResourceContents`) appended after the text prompt and any image
-    /// blocks; the `fileName` becomes the resource `uri` as `file:///<name>`
-    /// so downstream consumers can reference it.
+    /// FE-supplied file attachments (PROTOCOL §5.5): each attachment-reference
+    /// `{ attachmentId, fileName, mimeType?, size? }` becomes a `text`
+    /// attachment notice appended after the text prompt and any image blocks;
+    /// the bytes never ride the prompt (inline `data` is rejected at every
+    /// input seam since v10.0).
     pub file_blocks: Option<serde_json::Value>,
     /// Opaque per-message payload from `agent.sendMessage`'s
     /// `messageMetadata` (PROTOCOL §5.5). Persisted verbatim on the user
@@ -8601,11 +8601,11 @@ fn build_stdin_context_from_context_references(refs: Option<&Value>) -> Option<S
 
 /// Append one ACP content block per FE-supplied attachment to `blocks`
 /// (reference-parity `acp-provider.ts`): image entries `{ data, mimeType }`
-/// become `image` content blocks; file entries `{ data, mimeType, fileName }`
-/// become `resource` blocks carrying a `BlobResourceContents` with the file
-/// name lifted into the resource URI (`file:///<fileName>`). Malformed entries
-/// (missing required fields, wrong types) are silently skipped so a partial
-/// attachment array can never break the turn.
+/// become `image` content blocks; attachment-reference file entries
+/// `{ attachmentId, fileName }` become `text` attachment notices (see
+/// [`push_file_blocks`]). Malformed entries (missing required fields, wrong
+/// types, inline file `data` without a reference) are silently skipped so a
+/// partial attachment array can never break the turn.
 ///
 /// Combined interrupt delivery (STAB-114 / monorepo#1014): the preempted
 /// message's attachments (`prepend_image_blocks` / `prepend_file_blocks`) are
@@ -8777,16 +8777,16 @@ fn requeue_payload_after_context_failure(
     (content, persisted, prepend_content)
 }
 
-/// Push one content block per well-formed file entry: inline
-/// `{ data, mimeType, fileName }` entries become `resource` blocks carrying
-/// the blob; attachment-reference `{ attachmentId, fileName }` entries
-/// (PROTOCOL §5.5) become a `text` attachment notice naming the metadata and
-/// directing the model to `ws.file.getAttachment(attachmentId)` — the file
-/// bytes never ride the prompt for reference blocks.
+/// Push one `text` attachment notice per well-formed attachment-reference
+/// `{ attachmentId, fileName }` file entry (PROTOCOL §5.5), naming the
+/// metadata and directing the model to `ws.file.getAttachment(attachmentId)`
+/// — the file bytes never ride the prompt. Since v10.0 inline file `data` is
+/// rejected at every input seam, so entries without an `attachmentId`
+/// (legacy inline payloads still held in a persisted queue or prepend) are
+/// skipped rather than rendered as a `resource` blob.
 fn push_file_blocks(blocks: &mut Vec<ContentBlock>, file_blocks: Option<&Value>) {
     if let Some(files) = file_blocks.and_then(Value::as_array) {
         for file in files {
-            let data = file.get("data").and_then(Value::as_str);
             let mime = file.get("mimeType").and_then(Value::as_str);
             let name = file.get("fileName").and_then(Value::as_str);
             let attachment_id = file
@@ -8799,17 +8799,6 @@ fn push_file_blocks(blocks: &mut Vec<ContentBlock>, file_blocks: Option<&Value>)
                 if let Ok(block) =
                     serde_json::from_value::<ContentBlock>(json!({ "type": "text", "text": text }))
                 {
-                    blocks.push(block);
-                }
-            } else if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(json!({
-                    "type": "resource",
-                    "resource": {
-                        "blob": data,
-                        "mimeType": mime,
-                        "uri": format!("file:///{name}"),
-                    },
-                })) {
                     blocks.push(block);
                 }
             }

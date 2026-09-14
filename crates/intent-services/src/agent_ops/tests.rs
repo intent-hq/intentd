@@ -12893,7 +12893,7 @@ async fn send_message_op_preserves_attachments_on_auto_queue() {
         { "type": "image", "data": "base64data", "mimeType": "image/png" }
     ]);
     let file_blocks = json!([
-        { "type": "file", "data": "filedata", "mimeType": "text/plain", "fileName": "test.txt" }
+        { "type": "file", "attachmentId": "att-test", "mimeType": "text/plain", "fileName": "test.txt" }
     ]);
     let r = svc
         .agent_send_message_op(
@@ -12984,7 +12984,7 @@ async fn send_message_op_persists_attachment_blocks_in_transcript() {
         { "type": "image", "data": "imgdata", "mimeType": "image/png" }
     ]);
     let file_blocks = json!([
-        { "type": "file", "data": "filedata", "mimeType": "text/plain", "fileName": "notes.txt" }
+        { "type": "file", "attachmentId": "att-notes", "mimeType": "text/plain", "fileName": "notes.txt" }
     ]);
     let r = svc
         .agent_send_message_op(
@@ -13011,9 +13011,267 @@ async fn send_message_op_persists_attachment_blocks_in_transcript() {
     assert_eq!(blocks[1]["data"], "imgdata");
     assert_eq!(blocks[1]["mimeType"], "image/png");
     assert_eq!(blocks[2]["type"], "file");
-    assert_eq!(blocks[2]["data"], "filedata");
+    assert_eq!(blocks[2]["attachmentId"], "att-notes");
     assert_eq!(blocks[2]["fileName"], "notes.txt");
     assert_eq!(blocks[2]["mimeType"], "text/plain");
+    assert!(blocks[2].get("data").is_none());
+}
+
+/// v10.0: every `fileBlocks` input seam rejects an inline `data` entry with
+/// `InvalidParams` (→ `-32602`) naming the seam and the index, before any
+/// state change; a reference-only payload on the same seams behaves as
+/// before.
+#[tokio::test]
+async fn file_blocks_inline_data_rejected_on_every_seam() {
+    let (_t, svc, ws, _bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "InlineReject").await;
+    let inline = json!([
+        { "type": "file", "attachmentId": "att-ok", "fileName": "ok.txt" },
+        { "type": "file", "data": "QQ==", "mimeType": "text/plain", "fileName": "a.txt" }
+    ]);
+    let expect_rejected = |method: &str, err: intent_core::Error| {
+        assert!(
+            matches!(err, intent_core::Error::InvalidParams(_)),
+            "{method}: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("{method}: fileBlocks[1]")), "{msg}");
+        assert!(
+            msg.contains("inline file data is no longer accepted"),
+            "{msg}"
+        );
+    };
+
+    let err = svc
+        .agent_send_message_op(
+            id.clone(),
+            "hi".into(),
+            None,
+            None,
+            Some(inline.clone()),
+            None,
+        )
+        .await
+        .expect_err("sendMessage rejects inline data");
+    expect_rejected("agent.sendMessage", err);
+
+    let err = svc
+        .agent_queue_message_op(id.clone(), "hi".into(), None, Some(inline.clone()), None)
+        .await
+        .expect_err("queueMessage rejects inline data");
+    expect_rejected("agent.queueMessage", err);
+
+    let err = svc
+        .agent_update_op(id.clone(), json!({ "fileBlocks": inline.clone() }))
+        .await
+        .expect_err("update rejects inline data");
+    expect_rejected("agent.update", err);
+
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("InlineCreate".to_string()),
+            Some("sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                provider: Some("auggie".into()),
+                file_blocks: Some(inline.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("create rejects inline data");
+    expect_rejected("agent.create", err);
+
+    let err = WorkspaceApi::agent_edit_and_regenerate(
+        &svc,
+        ws.clone(),
+        id.clone(),
+        "msg-1".into(),
+        "edited".into(),
+        None,
+        Some(inline.clone()),
+        None,
+    )
+    .await
+    .expect_err("editAndRegenerate rejects inline data");
+    expect_rejected("agent.editAndRegenerate", err);
+
+    // workspace.create rejects BEFORE any side effect: no workspace row, no
+    // spec note and no `workspace:created` event is left behind (both the
+    // top-level `initialAgent.fileBlocks` and its `metadata.fileBlocks`
+    // mirror).
+    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let notes_before = svc.store().list_all_notes().await.expect("notes").len();
+    let created_events = || async {
+        svc.store()
+            .query_events(&intent_store::EventQuery {
+                event_types: vec![intent_core::events::WORKSPACE_CREATED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query workspace:created")
+            .len()
+    };
+    let events_before = created_events().await;
+    for initial_agent in [
+        intent_core::WorkspaceCreateInitialAgent {
+            prompt: Some("go".into()),
+            file_blocks: Some(inline.clone()),
+            ..Default::default()
+        },
+        intent_core::WorkspaceCreateInitialAgent {
+            prompt: Some("go".into()),
+            metadata: Some(json!({ "fileBlocks": inline.clone() })),
+            ..Default::default()
+        },
+    ] {
+        let err = WorkspaceApi::create_workspace(
+            &svc,
+            intent_core::WorkspaceCreate {
+                title: Some("W".into()),
+                skip_isolation: Some(true),
+                initial_agent: Some(initial_agent),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("workspace.create rejects inline data");
+        expect_rejected("workspace.create", err);
+    }
+    assert_eq!(
+        svc.list_workspaces(true).await.expect("list").len(),
+        workspaces_before,
+        "workspace.create rejection must precede the workspace row"
+    );
+    assert_eq!(
+        svc.store().list_all_notes().await.expect("notes").len(),
+        notes_before,
+        "workspace.create rejection must precede the spec note"
+    );
+    assert_eq!(
+        created_events().await,
+        events_before,
+        "workspace.create rejection must precede workspace:created"
+    );
+
+    // Nothing was queued or persisted on the way to the rejection.
+    let queue = svc
+        .agent_get_queue_op(id.clone(), None)
+        .await
+        .expect("queue");
+    assert_eq!(queue["queue"].as_array().map(Vec::len), Some(0), "{queue}");
+    let conv = svc
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
+        .await
+        .expect("conv");
+    assert_eq!(conv["totalMessages"], 0, "{conv}");
+}
+
+/// v10.0: a legacy inline file block already persisted on a user row (no
+/// `attachmentId`) is served as a `text` block naming the file — with no
+/// `data` key — on `agent.getConversation` in both projections and on
+/// `agent.getMessageBlock`; a missing `fileName` falls back to
+/// `"Attached file"`; attachment-reference file blocks are untouched. The
+/// stored row is never rewritten.
+#[tokio::test]
+async fn legacy_inline_file_blocks_served_as_text() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "LegacyInline").await;
+    let stored = json!([
+        { "type": "text", "text": "see attached" },
+        { "type": "file", "data": "ZmlsZWRhdGE=", "mimeType": "text/plain", "fileName": "notes.txt" },
+        { "type": "file", "data": "eA==", "mimeType": "application/octet-stream" },
+        { "type": "file", "attachmentId": "att-1", "fileName": "ref.pdf", "mimeType": "application/pdf" },
+    ]);
+    let message_id = svc
+        .store
+        .append_agent_message(&id, "user", &stored, &now_iso())
+        .await
+        .expect("append")
+        .id;
+
+    let expected = |blocks: &[serde_json::Value], surface: &str| {
+        assert_eq!(blocks.len(), 4, "{surface}: {blocks:?}");
+        assert_eq!(blocks[0]["type"], "text", "{surface}");
+        assert_eq!(blocks[0]["text"], "see attached", "{surface}");
+        assert_eq!(blocks[1]["type"], "text", "{surface}: {:?}", blocks[1]);
+        assert_eq!(blocks[1]["text"], "Attached file: notes.txt", "{surface}");
+        assert_eq!(blocks[1]["id"], format!("{message_id}:1"), "{surface}");
+        assert_eq!(blocks[2]["type"], "text", "{surface}: {:?}", blocks[2]);
+        assert_eq!(blocks[2]["text"], "Attached file", "{surface}");
+        assert_eq!(blocks[3]["type"], "file", "{surface}");
+        assert_eq!(blocks[3]["attachmentId"], "att-1", "{surface}");
+        assert_eq!(blocks[3]["fileName"], "ref.pdf", "{surface}");
+        for b in blocks {
+            assert!(b.get("data").is_none(), "{surface}: bytes served: {b}");
+            assert!(
+                b.get("mimeType").is_none() || b["type"] == "file",
+                "{surface}: {b}"
+            );
+        }
+        assert!(
+            !serde_json::to_string(blocks)
+                .unwrap()
+                .contains("ZmlsZWRhdGE="),
+            "{surface}: inline bytes leaked"
+        );
+    };
+
+    let full = svc
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
+        .await
+        .expect("full conv");
+    expected(
+        full["messages"][0]["contentBlocks"].as_array().unwrap(),
+        "getConversation (full)",
+    );
+    let slim = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(intent_core::ConversationProjection::Slim),
+            false,
+        )
+        .await
+        .expect("slim conv");
+    expected(
+        slim["messages"][0]["contentBlocks"].as_array().unwrap(),
+        "getConversation (slim)",
+    );
+
+    let block = svc
+        .agent_get_message_block_op(
+            id.clone(),
+            message_id.clone(),
+            format!("{message_id}:1"),
+            None,
+        )
+        .await
+        .expect("getMessageBlock");
+    assert_eq!(block["block"]["type"], "text", "{block}");
+    assert_eq!(
+        block["block"]["text"], "Attached file: notes.txt",
+        "{block}"
+    );
+    assert!(block["block"].get("data").is_none(), "{block}");
+
+    // Stored row untouched: no migration, serve-time only.
+    let raw = svc
+        .store
+        .get_agent_message_by_id(&id, &message_id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(raw.content, stored);
 }
 
 /// STAB-133 parity: `agent_send_queued_message_now_op` must persist the

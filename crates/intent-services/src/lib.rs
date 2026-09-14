@@ -17171,13 +17171,27 @@ impl WorkspaceApi for Services {
                     let mut input = input;
                     // Attachment-reference validation (PROTOCOL §5.5,
                     // monorepo#3338), hoisted BEFORE any state change so a
-                    // bad `initialAgent.imageBlocks` reference rejects
-                    // `-32602` without leaving a partially created workspace
-                    // (row/metadata/event/spec note) behind. Same harvest as
-                    // `agent_create_op` (top-level param wins over the
-                    // `metadata.imageBlocks` copy); the create op re-runs
-                    // the same checks harmlessly.
+                    // bad `initialAgent.fileBlocks` / `imageBlocks` entry
+                    // rejects `-32602` without leaving a partially created
+                    // workspace (row/metadata/event/spec note) behind. Same
+                    // harvest as `agent_create_op` (top-level param wins over
+                    // the `metadata.*Blocks` copy); the create op re-runs the
+                    // same checks harmlessly.
                     if let Some(agent) = input.initial_agent.as_ref() {
+                        let effective_file_blocks = agent
+                            .file_blocks
+                            .clone()
+                            .or_else(|| {
+                                agent
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("fileBlocks").cloned())
+                            })
+                            .filter(|v| !v.is_null());
+                        crate::agent_ops::validate_file_blocks(
+                            "workspace.create",
+                            effective_file_blocks.as_ref(),
+                        )?;
                         let effective_image_blocks = agent
                             .image_blocks
                             .clone()
