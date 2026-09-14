@@ -6646,6 +6646,15 @@ impl AgentManager {
             self.services.requeue_front(&agent_id, entry);
             drop(draining);
             self.services.publish_queue_updated(&agent_id).await;
+            // Post-hand-back probe (intent-hq/intent#4962): the holder's
+            // terminal exit can release the slot and run its own redrive
+            // between the lost claim above and the `requeue_front` — while
+            // the entry is popped, so that probe has nothing to claim and
+            // nothing follows it. Re-probe now that the entry is back; a
+            // no-op while the holder still owns the slot (its exit probe
+            // then sees the requeued entry) or when no marker is parked.
+            self.redrive_parked_recovery_send(&agent_id, &workspace_id)
+                .await;
             return Ok(json!({
                 "success": true,
                 "queued": true,
@@ -16440,6 +16449,84 @@ mod agent_retry_tests {
         assert!(
             mgr.is_busy(&agent_id),
             "the recovery send's own turn started"
+        );
+        assert!(!mgr.services.is_message_queued(&agent_id, &id));
+        assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
+    }
+
+    /// Poll a future once with the current task's waker; `None` while it is
+    /// pending. Lets a test advance `sendQueuedMessageNow` one async gate at
+    /// a time and act between gates.
+    async fn poll_step<T, F: std::future::Future<Output = T>>(
+        fut: &mut std::pin::Pin<Box<F>>,
+    ) -> Option<T> {
+        std::future::poll_fn(|cx| match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(value) => std::task::Poll::Ready(Some(value)),
+            std::task::Poll::Pending => std::task::Poll::Ready(None),
+        })
+        .await
+    }
+
+    /// The slot holder's terminal exit can run its redrive while the "send
+    /// now" entry is popped provisionally (it finds nothing to claim and
+    /// keeps the marker) and release the slot before the lost-claim
+    /// hand-back lands. The hand-back must re-probe: otherwise the requeued
+    /// entry sits behind the STAB-52 gate with a free slot and a live marker
+    /// and nothing left to redrive it.
+    #[tokio::test]
+    async fn send_now_handback_reprobes_after_holder_released() {
+        let agent_id = AgentId::from("agent-4962-send-now-reprobe");
+        let ws = WorkspaceId::from("ws-4962");
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        hold_slot(&mgr, &agent_id, &ws);
+        let sent = mgr
+            .send_message(
+                agent_id.clone(),
+                ws.clone(),
+                "recover".to_string(),
+                None,
+                user_send(),
+            )
+            .await
+            .expect("send");
+        let id = sent["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+        // Drive "send now" gate by gate: it pops the entry (provisional),
+        // loses the claim to the held slot and hands the entry back, then
+        // parks at the hand-back's queue-updated publish.
+        let mut send_now =
+            Box::pin(mgr.send_queued_message_now(agent_id.clone(), ws.clone(), id.clone()));
+        let mut popped = false;
+        loop {
+            assert!(
+                poll_step(&mut send_now).await.is_none(),
+                "send now must park after the hand-back, before its re-probe"
+            );
+            let queued = mgr.services.is_message_queued(&agent_id, &id);
+            if popped && queued {
+                break;
+            }
+            popped |= !queued;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            mgr.services.parked_recovery_send(&agent_id).as_deref(),
+            Some(id.as_str()),
+            "the hand-back keeps the marker"
+        );
+
+        // The holder failed terminally while the entry was popped: its own
+        // exit probe deferred (nothing to claim), and it releases the slot
+        // before the hand-back is visible.
+        mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
+            .await;
+        mgr.release_in_flight_slot(&agent_id);
+
+        let now = send_now.await.expect("send now");
+        assert_eq!(now["queued"], true, "the lost claim is reported honestly");
+        assert!(
+            mgr.is_busy(&agent_id),
+            "the hand-back's re-probe started the recovery send's turn"
         );
         assert!(!mgr.services.is_message_queued(&agent_id, &id));
         assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
