@@ -29,14 +29,17 @@
 //!   a per-(principal, note) [`CursorThrottle`]: at most one `updated` per
 //!   [`CURSOR_MIN_INTERVAL`], always ending on the latest position.
 //!
-//! Membership: a `presence.update` focus target and a `note.presence`
-//! subscribe are Member+ (`require_member`, `NotFound` for a non-member);
+//! Membership: a `presence.update` focus target, a `note.presence` subscribe
+//! and every caret update are Member+ (`require_member`, `NotFound` for a
+//! non-member) — a lease outlives a membership removal, so the update gate
+//! runs on every call and a deferred caret is re-gated when its flush fires;
 //! the events are workspace-scoped so the collaborator fan-out gate narrows
 //! them like any other row. Profiles (login / avatar) are read once per
 //! principal from the store and cached while the principal is present.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use intent_core::events::{NOTE_PRESENCE, PRESENCE_CHANGED};
@@ -47,7 +50,6 @@ use intent_core::{
 use intent_store::NewEvent;
 use serde_json::{json, Value};
 
-use crate::events::EventBus;
 use crate::{publish_event_transient, Services};
 
 /// Floor between two `note:presence { kind: "updated" }` deliveries for one
@@ -204,12 +206,28 @@ impl Conn {
 }
 
 /// One principal's viewer entry on a note.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Viewer {
+    /// Fences the coalescer's trailing-flush tasks: a task armed for one
+    /// viewer never flushes its replacement (the principal left and rejoined
+    /// before the old deadline), whose own timer runs on its own schedule.
+    generation: u64,
     cursor: Option<Value>,
     throttle: CursorThrottle,
     /// `(connection id, lease id)` pairs keeping the principal on the note.
     leases: HashSet<(String, String)>,
+}
+
+impl Default for Viewer {
+    fn default() -> Self {
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+        Self {
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            cursor: None,
+            throttle: CursorThrottle::default(),
+            leases: HashSet::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -712,7 +730,7 @@ impl Services {
     }
 
     /// See [`intent_core::WorkspaceApi::note_presence_update`].
-    pub(crate) fn note_presence_update_op(
+    pub(crate) async fn note_presence_update_op(
         &self,
         connection_id: &str,
         workspace_id: WorkspaceId,
@@ -720,6 +738,7 @@ impl Services {
         cursor: &Value,
     ) -> Result<Value> {
         let principal = wire_principal("note.presence.update")?;
+        self.require_member(&workspace_id).await?;
         let cursor = parse_cursor(cursor)?;
         let key = (workspace_id, note_id);
         let publish = {
@@ -756,10 +775,11 @@ impl Services {
                 )),
                 Offer::Defer(delay) => {
                     spawn_trailing_flush(
-                        Arc::clone(&self.presence),
-                        self.event_bus.clone(),
+                        self.clone(),
+                        current_caller(),
                         key,
                         principal,
+                        viewer.generation,
                         delay,
                     );
                     None
@@ -775,30 +795,42 @@ impl Services {
 }
 
 /// The coalescer's trailing edge: after `delay`, publish the latest caret
-/// absorbed for `(principal, note)` — if the viewer is still there.
+/// absorbed for `(principal, note)` — if the viewer of `generation` is still
+/// there and `caller` (the request that armed the flush) is still a member:
+/// a removal that lands inside the window drops the pending caret instead of
+/// letting it out after the gate closed.
 fn spawn_trailing_flush(
-    registry: Arc<PresenceRegistry>,
-    bus: Option<EventBus>,
+    services: Services,
+    caller: Option<Caller>,
     key: (WorkspaceId, NoteId),
     principal: PrincipalId,
+    generation: u64,
     delay: Duration,
 ) {
     intent_core::spawn_daemon(async move {
         tokio::time::sleep(delay).await;
+        let member = match caller {
+            Some(caller) => intent_core::with_caller(caller, services.require_member(&key.0))
+                .await
+                .is_ok(),
+            None => false,
+        };
         let event = {
-            let mut state = registry.lock();
+            let mut state = services.presence.lock();
             let profile = state.profile(&principal);
             state
                 .viewers
                 .get_mut(&key)
                 .and_then(|v| v.get_mut(&principal))
+                .filter(|viewer| viewer.generation == generation)
                 .and_then(|viewer| viewer.throttle.flush(Instant::now()))
+                .filter(|_| member)
                 .map(|cursor| {
                     note_presence_event(&key, &principal, &profile, "updated", Some(&cursor))
                 })
         };
         if let Some(event) = &event {
-            publish_event_transient(bus.as_ref(), event);
+            publish_event_transient(services.event_bus.as_ref(), event);
         }
     });
 }
