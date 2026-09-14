@@ -9,10 +9,12 @@
 //!   `lastActivity` that matches a subsequent `workspace.get`.
 //! - Negative: no `workspace:updated { lastActivity }` for a workspace with no
 //!   activity.
-//! - Debounce: rapid burst coalesces into one emission with the latest value.
+//! - Debounce: a rapid burst coalesces into at most one emission per debounce
+//!   window it spans, the last one carrying the latest value.
 //!
 //! Uses the mock ACP agent fixture for deterministic behavior. The test
-//! overrides `LAST_ACTIVITY_DEBOUNCE_TEST_MS` to 500ms for fast execution.
+//! overrides `LAST_ACTIVITY_DEBOUNCE_TEST_MS` to [`DEBOUNCE_MS`] for fast
+//! execution.
 
 #![cfg(unix)]
 
@@ -397,15 +399,19 @@ where
     open_turns
 }
 
+/// Debounce window the booted daemon runs with (`LAST_ACTIVITY_DEBOUNCE_TEST_MS`
+/// override): short for fast execution, large enough that CI scheduler stalls
+/// between activity touches don't routinely split a burst across windows.
+const DEBOUNCE_MS: u64 = 500;
+
 async fn boot(mock_script: &str, behavior: &str) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir_guard = scratch_dir("data");
     let data_dir = data_dir_guard.path().to_path_buf();
-    // Override debounce to 500ms for fast test execution (large enough that
-    // CI scheduler stalls between activity touches don't split the window).
+    let debounce_ms = DEBOUNCE_MS.to_string();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
-        ("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "500"),
+        ("LAST_ACTIVITY_DEBOUNCE_TEST_MS", debounce_ms.as_str()),
         ("MOCK_AGENT_SCRIPT_PATH", mock_script),
         ("MOCK_AGENT_BEHAVIOR", behavior),
     ];
@@ -780,7 +786,15 @@ async fn no_last_activity_event_for_idle_workspace() {
 }
 
 /// Debounce case: a burst of rapid activity coalesces into at most one
-/// `workspace:updated { lastActivity }` with the latest derived value.
+/// `workspace:updated { lastActivity }` per debounce window the burst spans —
+/// exactly one when the whole burst lands inside a single window — with the
+/// last emission carrying the latest derived value.
+///
+/// The burst is three back-to-back agent turns whose wall-clock span the test
+/// does not control: under host load (intent-hq/intent#4999) the turns can
+/// straddle a window boundary, which legitimately yields two emissions. So
+/// the assertion bounds the emission count by the windows the burst provably
+/// spanned instead of assuming a single window; see [`burst_debounce_case`].
 #[tokio::test]
 async fn last_activity_debounce_coalesces_burst() {
     let Some(script) = gate("WSS lastActivity debounce") else {
@@ -801,8 +815,8 @@ async fn last_activity_debounce_coalesces_burst() {
 /// The barrier deliberately spreads the burst over wall-clock time the test
 /// does not bound (three RPC round trips plus the release), so this variant
 /// asserts `lastActivity` convergence — the announced value advanced past the
-/// pre-burst value and matches `workspace.get` — not the one-window
-/// coalescing count, which only the genuinely rapid plain burst above pins.
+/// pre-burst value and matches `workspace.get` — not the coalescing bound,
+/// which only the plain burst above pins.
 #[tokio::test]
 async fn last_activity_debounce_coalesces_burst_with_queued_flush() {
     let Some(script) = gate("WSS lastActivity debounce (queued flush)") else {
@@ -824,7 +838,7 @@ async fn last_activity_debounce_coalesces_burst_with_queued_flush() {
 /// `release_file`: when set, the mock holds the msg 0 turn open until this
 /// file exists; the burst then asserts msgs 1 and 2 queued behind it and folded
 /// into exactly one combined turn, and asserts `lastActivity` convergence
-/// instead of the single-window coalescing count.
+/// instead of the coalescing bound.
 async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option<&Path>) {
     let behavior = behavior.to_string();
     let (daemon, port, cfg) = boot(script, &behavior).await;
@@ -919,7 +933,11 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
         .expect("pre-burst lastActivity")
         .to_string();
 
-    // Drive a rapid burst: 3 messages within the 500ms debounce window
+    // Drive a rapid burst: 3 messages sent 50ms apart, normally well inside one
+    // debounce window. Every debounce schedule the burst triggers postdates
+    // this instant, which anchors the windows-spanned bound below. Wall clock
+    // on purpose: it is compared against the daemon's own event timestamps.
+    let burst_started = chrono::Utc::now();
     let mut sends = Vec::new();
     for i in 0..3 {
         let sent = wss_rpc(
@@ -987,13 +1005,48 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
     );
 
     if release_file.is_none() {
-        // Plain rapid burst: the three sends land well inside one 500ms
-        // debounce window, so the debounce must coalesce them into ONE
-        // emission.
+        // Plain rapid burst: bound the emission count by the debounce windows
+        // the burst provably spanned. The debounce is trailing-edge: an
+        // emission fires only after one full window of quiet following the
+        // schedule that armed it, and a schedule that arms a further emission
+        // must postdate the previous timer's expiry (an earlier one would have
+        // cancelled that timer instead). So `n` emissions need at least
+        // `n * DEBOUNCE_MS` between the first burst schedule — which postdates
+        // `burst_started` — and the daemon timestamp of the last emission:
+        // `n <= floor((last_emit - burst_started) / DEBOUNCE_MS)`. A burst that
+        // lands inside one window therefore still gets exactly one emission,
+        // while a burst that straddled a boundary under load (#4999) is
+        // allowed its second — and a debounce that fires per touch, or on the
+        // leading edge, still fails.
+        let last_emit = last_activity_events
+            .last()
+            .and_then(|evt| evt["timestamp"].as_str())
+            .map(|ts| DateTime::parse_from_rfc3339(ts).expect("parse emission timestamp"))
+            .expect("last emission carries a timestamp");
+        let spanned_ms =
+            u64::try_from((last_emit.to_utc() - burst_started).num_milliseconds()).unwrap_or(0);
+        let windows_spanned = spanned_ms / DEBOUNCE_MS;
         assert!(
-            last_activity_events.len() <= 1,
-            "expected at most 1 workspace:updated, got {}",
+            u64::try_from(last_activity_events.len()).expect("emission count fits in u64")
+                <= windows_spanned,
+            "expected at most {windows_spanned} workspace:updated (last emission {spanned_ms}ms \
+             after the burst started, {DEBOUNCE_MS}ms debounce), got {}",
             last_activity_events.len()
+        );
+        // Each emission carries the latest derived value at its fire time, so
+        // successive emissions never walk lastActivity back.
+        let announced: Vec<_> = last_activity_events
+            .iter()
+            .map(|evt| {
+                let ts = evt["data"]["changes"]["lastActivity"]
+                    .as_str()
+                    .expect("lastActivity string");
+                DateTime::parse_from_rfc3339(ts).expect("parse announced lastActivity")
+            })
+            .collect();
+        assert!(
+            announced.windows(2).all(|pair| pair[0] <= pair[1]),
+            "announced lastActivity must be non-decreasing across emissions: {announced:?}"
         );
     }
 
