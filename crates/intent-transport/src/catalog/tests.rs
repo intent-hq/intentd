@@ -1473,8 +1473,12 @@ fn reverse_methods_are_never_on_the_collaborator_allowlist() {
 /// successful early return ahead of a gate (the `agent.respondPermission`
 /// no-manager path was one, fixed and pinned by
 /// `unbound_respond_permission_is_forbidden_without_a_manager`) — unless the
-/// method has no service-layer gate at all, in which case it is pinned by
-/// name in [`UNGATED_AT_SERVICE_LAYER`].
+/// method is pinned by name in one of two goldens: its gate is conditional
+/// on something the minimal call omits — an optional scope argument or a
+/// live export session ([`CONDITIONALLY_GATED_AT_SERVICE_LAYER`], whose
+/// armed modes `armed_conditional_gates_are_forbidden_unbound` asserts
+/// separately) — or it has no service-layer gate at all
+/// ([`UNGATED_AT_SERVICE_LAYER`]).
 ///
 /// The table below is params-only: it supplies the minimal *valid* arguments
 /// so each arm gets past `-32602` parsing and reaches the service method
@@ -1488,51 +1492,76 @@ fn reverse_methods_are_never_on_the_collaborator_allowlist() {
 /// `browser.*`, `forward.*`, `system.*`, `pairing.*`, `server.*`,
 /// `providers.setup.*`, `invite.redeem`) and the subscription channels — have
 /// no `WorkspaceApi` method to gate; they are protected only by the
-/// transport allowlist (`-32001`) and stay out of this table by
-/// construction. That partition is asserted, not assumed.
+/// transport allowlist in `conn::process_frame` (`-32003`) and stay out of
+/// this table by construction. That partition is asserted, not assumed.
 mod unbound_owner_only_methods {
     use super::{COLLABORATOR_METHODS, ROUTER_METHODS};
     use crate::router::handle_message;
-    use intent_core::{chief_workspace, WorkspaceId};
+    use intent_core::{chief_workspace, AgentId, Error, WorkspaceApi as _, WorkspaceId};
     use intent_services::Services;
     use intent_store::Store;
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
 
-    /// Golden: owner-only router methods whose service method answers an
-    /// unbound caller with something other than `-32003` today, with the
-    /// observed outcome (`ok` or the error code). Each entry is a method with
-    /// **no unconditional service-layer gate**: it is owner-only by the
-    /// transport allowlist alone, and its unbound behaviour is whatever the
-    /// body does. The ones whose gate is conditional on an optional scope
-    /// param (`agent.completeOnce` / `agent.enhancePrompt` / `rules.list` on
-    /// `workspaceId`; `agent.diagnostics` / `git.agentCommit` on `agentId`)
-    /// are listed because the table dispatches the unscoped call. Shrinking
-    /// this list is the goal; growing it needs a reason on the row. The
-    /// failure message prints the recomputed list.
+    /// How a [`CONDITIONALLY_GATED_AT_SERVICE_LAYER`] row's gate is armed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Arming {
+        /// `require_member` runs only when the optional `workspaceId` is
+        /// given.
+        WorkspaceId,
+        /// `require_agent_member` runs only when the optional `agentId` is
+        /// given.
+        AgentId,
+        /// The gated calls (`update_workspace` for `finalStatusMessage`,
+        /// `archive_workspace` for `archiveSource`) run only once the
+        /// `exportId` resolves to a Ready session; an unknown id returns at
+        /// the lookup.
+        ReadyExport,
+    }
+
+    /// Golden: owner-only router methods whose service-layer gate is
+    /// **conditional** — on an optional scope argument, or on the export
+    /// session the id names — so the sweep's minimal call never reaches it.
+    /// Each row is `(method, unarmed outcome, what arms the gate)`. The
+    /// unarmed outcome is pinned here so the sweep sees it as classified,
+    /// not as ungated; the unarmed mode is owner-only by the transport
+    /// allowlist in `conn::process_frame` alone. Every armed mode is
+    /// asserted by [`armed_conditional_gates_are_forbidden_unbound`], which
+    /// arms the gate and requires `-32003`. A row leaves this list when its
+    /// gate stops being conditional (then it is simply `-32003` in the
+    /// sweep); making a gate unconditional is a capability-rule change and
+    /// not something this table decides.
+    const CONDITIONALLY_GATED_AT_SERVICE_LAYER: &[(&str, &str, Arming)] = &[
+        ("agent.completeOnce", "ok", Arming::WorkspaceId),
+        ("agent.diagnostics", "ok", Arming::AgentId),
+        ("agent.enhancePrompt", "ok", Arming::WorkspaceId),
+        // Unscoped, the call proceeds to the worktree lookup (Internal here).
+        ("git.agentCommit", "-32603", Arming::AgentId),
+        ("rules.list", "ok", Arming::WorkspaceId),
+        // Unknown `exportId`: NotFound at the registry lookup (`-32602`,
+        // `not-found`), ahead of both gated mutations.
+        ("workspace.export.finalize", "-32602", Arming::ReadyExport),
+    ];
+
+    /// Golden: owner-only router methods whose service method has **no
+    /// service-layer gate at all**, with the outcome an unbound caller
+    /// observes today (`ok` or the error code). Each is owner-only by the
+    /// transport allowlist in `conn::process_frame` alone, and its unbound
+    /// behaviour is whatever the body does. Shrinking this list is the goal;
+    /// growing it needs a reason on the row. The failure message prints the
+    /// recomputed list.
     const UNGATED_AT_SERVICE_LAYER: &[(&str, &str)] = &[
-        // Conditional gate: `require_member(ws)` only when `workspaceId` is given.
-        ("agent.completeOnce", "ok"),
-        // Conditional gate: `require_agent_member` only when `agentId` is given.
-        ("agent.diagnostics", "ok"),
-        // Conditional gate: `require_member(ws)` only when `workspaceId` is given.
-        ("agent.enhancePrompt", "ok"),
         // No gate: daemon-wide reverse-client listing.
         ("client.list", "ok"),
         // No gate: process-wide stack sampler.
         ("debug.sampleStacks", "ok"),
-        // Conditional gate: `require_agent_member` only when `agentId` is given;
-        // the unscoped call proceeds to the worktree lookup (Internal here).
-        ("git.agentCommit", "-32603"),
         // No gate: daemon-wide metrics read.
         ("metrics.getAllWorkspaceStats", "ok"),
         // No gate: known-repo registry read.
         ("repo.list", "ok"),
         // No gate: `_workspace_id` is unused; reads the global rule row.
         ("rules.get", "ok"),
-        // Conditional gate: `require_member(ws)` only when `workspaceId` is given.
-        ("rules.list", "ok"),
         // No gate: no-manager early return `{ running: false }`.
         ("unsloth.status", "ok"),
         // No gate: no-manager early return `{ stopped: false }`.
@@ -1540,9 +1569,10 @@ mod unbound_owner_only_methods {
         // No gate: proceeds to provider selection (Internal without an engine).
         ("voice.transcribe", "-32603"),
         // No gate: export sessions are keyed by the `exportId` handed out by
-        // the gated `workspace.export.start`; an unknown id is a no-op / -32602.
+        // the gated `workspace.export.start`, and neither method mutates the
+        // workspace; an unknown id is a no-op / -32602. (`finalize` does
+        // mutate and is classified above.)
         ("workspace.export.abort", "ok"),
-        ("workspace.export.finalize", "-32602"),
         ("workspace.export.read", "-32602"),
         // No gate: host filesystem scan under `directory`.
         ("workspace.findRepositories", "ok"),
@@ -1575,7 +1605,9 @@ mod unbound_owner_only_methods {
             })
             .await
             .expect("insert workspace");
-        let services = Services::new(store).with_workspaces_root(dir.path().join("workspaces"));
+        let services = Services::new(store)
+            .with_workspaces_root(dir.path().join("workspaces"))
+            .with_assets_root(dir.path().join("assets"));
         Fixture { services, ws, dir }
     }
 
@@ -1907,25 +1939,179 @@ mod unbound_owner_only_methods {
                 ungated.push(((*method).to_string(), outcome));
             }
         }
-        let golden: Vec<(String, String)> = UNGATED_AT_SERVICE_LAYER
-            .iter()
-            .map(|(m, o)| ((*m).to_string(), (*o).to_string()))
-            .collect();
+        // The two goldens are disjoint and, merged by method, are exactly
+        // what the sweep may observe: a conditionally gated row's *unarmed*
+        // outcome and a genuinely ungated method's outcome.
+        let mut golden: BTreeMap<String, String> = BTreeMap::new();
+        for (m, o, _) in CONDITIONALLY_GATED_AT_SERVICE_LAYER {
+            assert!(
+                golden.insert((*m).to_string(), (*o).to_string()).is_none(),
+                "{m}: duplicated in CONDITIONALLY_GATED_AT_SERVICE_LAYER"
+            );
+        }
+        for (m, o) in UNGATED_AT_SERVICE_LAYER {
+            assert!(
+                golden.insert((*m).to_string(), (*o).to_string()).is_none(),
+                "{m}: named in both CONDITIONALLY_GATED_AT_SERVICE_LAYER and \
+                 UNGATED_AT_SERVICE_LAYER"
+            );
+        }
+        let golden: Vec<(String, String)> = golden.into_iter().collect();
         if ungated != golden {
             let mut msg = String::from(
                 "Unbound owner-only router methods not answering -32003 Forbidden drifted \
-                 from UNGATED_AT_SERVICE_LAYER.\n\
+                 from CONDITIONALLY_GATED_AT_SERVICE_LAYER ∪ UNGATED_AT_SERVICE_LAYER.\n\
                  A `-32602` here usually means the table row is not valid enough to reach \
                  the service method; an `ok` or other code means the service method \
                  returns before its capability gate — move the gate first (see \
-                 `agent_respond_permission`) or name it in the golden with a reason.\n\
-                 Recomputed golden:\n",
+                 `agent_respond_permission`), or name it in \
+                 CONDITIONALLY_GATED_AT_SERVICE_LAYER (gate conditional on an optional \
+                 argument or a live session; add its armed cell) or in \
+                 UNGATED_AT_SERVICE_LAYER (no gate) with a reason.\n\
+                 Recomputed (merged) golden:\n",
             );
             for (m, o) in &ungated {
                 let _ = writeln!(msg, "    (\"{m}\", \"{o}\"),");
             }
             panic!("{msg}");
         }
+    }
+
+    /// One dispatch through the real router with the daemon caller bound;
+    /// the decoded response envelope.
+    async fn dispatch_as_daemon(services: &Services, method: &str, params: &Value) -> Value {
+        intent_core::with_caller(intent_core::Caller::Daemon, async {
+            let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+            let raw = handle_message(services, &frame.to_string())
+                .await
+                .expect("request gets a response");
+            serde_json::from_str::<Value>(&raw).expect("response is JSON")
+        })
+        .await
+    }
+
+    /// Drive the gated `workspace.export.start` as the daemon on the fixture
+    /// workspace (repo-less, so the build is a manifest and no bundle) and
+    /// wait for the session to seal: `workspace.export.read` answers
+    /// `-32602` while building and `ok` once Ready. Returns the `exportId`.
+    async fn ready_export(f: &Fixture) -> String {
+        let start = dispatch_as_daemon(
+            &f.services,
+            "workspace.export.start",
+            &json!({ "workspaceId": f.ws.as_str() }),
+        )
+        .await;
+        let export_id = start["result"]["exportId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("daemon-bound workspace.export.start: {start}"))
+            .to_string();
+        let read = json!({ "exportId": export_id, "seq": 0 });
+        for _ in 0..400 {
+            let response = dispatch_as_daemon(&f.services, "workspace.export.read", &read).await;
+            match response.get("error") {
+                None => return export_id,
+                Some(e) if e["data"]["code"] == json!("not-found") => {
+                    panic!("export {export_id} failed to build: {response}")
+                }
+                Some(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+            }
+        }
+        panic!("export {export_id} did not become Ready");
+    }
+
+    /// Every armed mode of every [`CONDITIONALLY_GATED_AT_SERVICE_LAYER`]
+    /// row, through the real router into the same unbound `Services`, must
+    /// be `-32003`:
+    ///
+    /// - Scope arguments: the sweep's minimal params plus `workspaceId` /
+    ///   `agentId`. The gate runs before any lookup, so an unknown `agentId`
+    ///   is still `Forbidden` unbound, never `NotFound`.
+    /// - `workspace.export.finalize`: a Ready session (built by the daemon)
+    ///   with `finalStatusMessage` reaches the gated `update_workspace`, and
+    ///   with `archiveSource: true` the gated `archive_workspace`. Both
+    ///   mutations run before the session is retired, so the one session
+    ///   serves both cells and stays Ready after each refusal.
+    ///
+    /// `git.agentCommit` is the one row whose router arm cannot arm the gate:
+    /// it passes `agent_id = None` unconditionally (the wire shape has no
+    /// `agentId`; the MCP bridge is the only caller that supplies one). Both
+    /// halves are asserted — the wire call with an `agentId` keeps the
+    /// unscoped outcome, and the service method called directly with one is
+    /// `Forbidden` — so a router arm that starts forwarding `agentId` fails
+    /// here and moves the cell onto the router path.
+    #[tokio::test]
+    async fn armed_conditional_gates_are_forbidden_unbound() {
+        let f = fixture().await;
+        let table: BTreeMap<&str, Value> = minimal_params(&f).into_iter().collect();
+        for (method, unarmed, arming) in CONDITIONALLY_GATED_AT_SERVICE_LAYER {
+            let mut params = table[method].clone();
+            let (scope, scope_value) = match arming {
+                Arming::WorkspaceId => ("workspaceId", f.ws.as_str().to_string()),
+                Arming::AgentId => ("agentId", "a1".to_string()),
+                Arming::ReadyExport => {
+                    let export_id = ready_export(&f).await;
+                    for armed in [
+                        json!({ "exportId": export_id, "finalStatusMessage": "done" }),
+                        json!({ "exportId": export_id, "archiveSource": true }),
+                    ] {
+                        let outcome = dispatch_unbound(&f.services, method, &armed).await;
+                        assert_eq!(
+                            outcome, "-32003",
+                            "{method} on a Ready export with {armed} must reach its \
+                             capability gate unbound"
+                        );
+                    }
+                    let still_ready = dispatch_as_daemon(
+                        &f.services,
+                        "workspace.export.read",
+                        &json!({ "exportId": export_id, "seq": 0 }),
+                    )
+                    .await;
+                    assert!(
+                        still_ready.get("error").is_none(),
+                        "a refused finalize must leave the export intact: {still_ready}"
+                    );
+                    continue;
+                }
+            };
+            assert!(
+                params.get(scope).is_none(),
+                "{method}: minimal params already carry `{scope}`, so the sweep is not \
+                 exercising the unscoped call"
+            );
+            params[scope] = json!(scope_value);
+            let outcome = dispatch_unbound(&f.services, method, &params).await;
+            if *method == "git.agentCommit" {
+                assert_eq!(
+                    outcome, *unarmed,
+                    "git.agentCommit: the router arm now forwards `agentId` — assert \
+                     -32003 through the router here and drop the direct call"
+                );
+                continue;
+            }
+            assert_eq!(
+                outcome, "-32003",
+                "{method} with `{scope}` supplied must reach its capability gate unbound"
+            );
+        }
+
+        assert_eq!(intent_core::current_caller(), None, "caller leaked");
+        let direct = f
+            .services
+            .git_agent_commit(
+                f.ws.clone(),
+                "m".to_string(),
+                Some(AgentId::from("a1")),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(direct, Err(Error::Forbidden(_))),
+            "git_agent_commit with an agentId, unbound: {direct:?}"
+        );
     }
 
     /// Positive control for the table: the same real router + `Services`
