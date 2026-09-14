@@ -13172,6 +13172,266 @@ async fn file_blocks_inline_data_rejected_on_every_seam() {
     assert_eq!(conv["totalMessages"], 0, "{conv}");
 }
 
+/// Restores a seeded auth verdict to cached-unknown (permissive) on drop so a
+/// panicking arm cannot leave a hard-false verdict in the process-wide cache
+/// (60s TTL) for other tests to trip over.
+struct AuthVerdictReset(&'static str);
+impl Drop for AuthVerdictReset {
+    fn drop(&mut self) {
+        crate::provider_auth::seed_auth_verdict_for_tests(self.0, None);
+    }
+}
+
+/// Every `-32602` producer reachable from `workspace.create` rejects BEFORE
+/// any side effect: for each named arm the request fails `InvalidParams`
+/// naming that arm's own validator, and the workspace row count, note count,
+/// and `workspace:created` event count are unchanged against the baseline
+/// captured before the loop. Guards the ordering of
+/// `Services::preflight_workspace_create` arm by arm — moving any single
+/// check below `insert_workspace_with_auto_commit` fails this test naming
+/// the arm.
+#[tokio::test]
+async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
+    // (arm, `model.defaultProvider` in force for the arm, request, expected
+    // message fragment naming the arm's own validator).
+    struct Arm {
+        name: &'static str,
+        default_provider: &'static str,
+        create: intent_core::WorkspaceCreate,
+        expect: &'static str,
+    }
+    let (tmp, svc, _ws, _bus) = setup_with_bus().await;
+    // A hermetic workspaces root, so a check that regresses below the row
+    // insert fails on THIS test's side-effect assertions (naming the arm)
+    // rather than on the hermetic-tests `default_workspaces_root()` guard.
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
+    // Fixture for the provider/model arms (all keyed on providers no other
+    // arm uses, so each arm trips exactly its own gate): opencode disabled
+    // in settings, claude-code with a cached hard-false auth verdict, and
+    // cached catalogs proving `sonnet4.5` belongs to auggie and not grok.
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.enabled".into(), json!({ "opencode": false }))])
+        .expect("disable opencode");
+    let _auth_reset = AuthVerdictReset("claude-code");
+    crate::provider_auth::seed_auth_verdict_for_tests("claude-code", Some(false));
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "grok",
+        "",
+        vec![json!({ "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" })],
+        now,
+    );
+
+    let inline_file = json!([
+        { "type": "file", "data": "QQ==", "mimeType": "text/plain", "fileName": "a.txt" }
+    ]);
+    let link = |url: &str, number: u64| intent_core::ContextLink {
+        kind: intent_core::ContextLinkKind::Issue,
+        url: url.into(),
+        owner: "intent-hq".into(),
+        repo: "intent".into(),
+        number,
+    };
+    let agent = |a: intent_core::WorkspaceCreateInitialAgent| intent_core::WorkspaceCreate {
+        title: Some("W".into()),
+        skip_isolation: Some(true),
+        initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+            prompt: Some("go".into()),
+            ..a
+        }),
+        ..Default::default()
+    };
+    let links = |links: Vec<intent_core::ContextLink>| intent_core::WorkspaceCreate {
+        title: Some("W".into()),
+        skip_isolation: Some(true),
+        context_links: Some(links),
+        ..Default::default()
+    };
+
+    let arm =
+        |name: &'static str, create: intent_core::WorkspaceCreate, expect: &'static str| Arm {
+            name,
+            default_provider: "auggie",
+            create,
+            expect,
+        };
+    let arms = vec![
+        arm(
+            "compound model",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                model: Some("auggie:sonnet4.5".into()),
+                ..Default::default()
+            }),
+            "initialAgent.model",
+        ),
+        arm(
+            "inline fileBlocks (top-level)",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                file_blocks: Some(inline_file.clone()),
+                ..Default::default()
+            }),
+            "workspace.create: fileBlocks[0]",
+        ),
+        arm(
+            "inline fileBlocks (metadata mirror)",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                metadata: Some(json!({ "fileBlocks": inline_file.clone() })),
+                ..Default::default()
+            }),
+            "workspace.create: fileBlocks[0]",
+        ),
+        arm(
+            "imageBlocks with both data and attachmentId",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                image_blocks: Some(json!([
+                    { "type": "image", "data": "aW1n", "mimeType": "image/png", "attachmentId": "att-1" }
+                ])),
+                ..Default::default()
+            }),
+            "workspace.create: imageBlocks[0] must carry exactly one",
+        ),
+        arm(
+            "imageBlocks with neither data nor attachmentId",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                image_blocks: Some(json!([{ "type": "image", "mimeType": "image/png" }])),
+                ..Default::default()
+            }),
+            "workspace.create: imageBlocks[0] must carry exactly one",
+        ),
+        arm(
+            "image attachmentId that does not exist",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                image_blocks: Some(json!([{ "type": "image", "attachmentId": "att-missing" }])),
+                ..Default::default()
+            }),
+            "workspace.create: unknown attachment id: att-missing",
+        ),
+        arm(
+            "unknown provider",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                provider: Some("no-such-provider".into()),
+                ..Default::default()
+            }),
+            "workspace.create: unknown provider: no-such-provider",
+        ),
+        Arm {
+            name: "no default provider",
+            // Unregistered `model.defaultProvider` reads as unset.
+            default_provider: "typo",
+            create: agent(intent_core::WorkspaceCreateInitialAgent::default()),
+            expect: "workspace.create: no default provider/model is configured",
+        },
+        arm(
+            "provider disabled via settings",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                provider: Some("opencode".into()),
+                ..Default::default()
+            }),
+            "workspace.create: provider \"opencode\"",
+        ),
+        arm(
+            "provider with cached auth verdict false",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                provider: Some("claude-code".into()),
+                ..Default::default()
+            }),
+            "workspace.create: provider \"claude-code\"",
+        ),
+        arm(
+            "client-supplied bare model owned by another provider",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                provider: Some("grok".into()),
+                model: Some("sonnet4.5".into()),
+                ..Default::default()
+            }),
+            "workspace.create: model sonnet4.5 does not belong to provider grok",
+        ),
+        arm(
+            "contextLinks > 20",
+            links(
+                (1..=21)
+                    .map(|n| link("https://github.com/intent-hq/intent/issues/1", n))
+                    .collect(),
+            ),
+            "contextLinks: at most 20 entries",
+        ),
+        arm(
+            "contextLinks empty url",
+            links(vec![link("", 1)]),
+            "contextLinks[0].url must be a non-empty string",
+        ),
+        arm(
+            "contextLinks zero number",
+            links(vec![link(
+                "https://github.com/intent-hq/intent/issues/1",
+                0,
+            )]),
+            "contextLinks[0].number must be a positive integer",
+        ),
+    ];
+
+    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let notes_before = svc.store().list_all_notes().await.expect("notes").len();
+    let created_events = || async {
+        svc.store()
+            .query_events(&intent_store::EventQuery {
+                event_types: vec![intent_core::events::WORKSPACE_CREATED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query workspace:created")
+            .len()
+    };
+    let events_before = created_events().await;
+
+    for Arm {
+        name,
+        default_provider,
+        create,
+        expect,
+    } in arms
+    {
+        svc.settings_registry()
+            .expect("registry")
+            .apply(&[("model.defaultProvider".into(), json!(default_provider))])
+            .expect("set default provider");
+        let err = WorkspaceApi::create_workspace(&svc, create, None)
+            .await
+            .expect_err(&format!("{name}: workspace.create must reject"));
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "{name}: expected InvalidParams, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expect),
+            "{name}: rejection must come from this arm's validator; got: {msg}"
+        );
+        assert_eq!(
+            svc.list_workspaces(true).await.expect("list").len(),
+            workspaces_before,
+            "{name}: workspace.create rejection must precede the workspace row"
+        );
+        assert_eq!(
+            svc.store().list_all_notes().await.expect("notes").len(),
+            notes_before,
+            "{name}: workspace.create rejection must precede the spec note"
+        );
+        assert_eq!(
+            created_events().await,
+            events_before,
+            "{name}: workspace.create rejection must precede workspace:created"
+        );
+    }
+}
+
 /// v10.0: a legacy inline file block already persisted on a user row (no
 /// `attachmentId`) is served as a `text` block naming the file — with no
 /// `data` key — on `agent.getConversation` in both projections and on

@@ -11014,6 +11014,110 @@ fn validate_context_links(links: Option<&[intent_core::ContextLink]>) -> Result<
     Ok(())
 }
 
+impl Services {
+    /// Every `-32602` (`InvalidParams`) producer for `workspace.create`, in one
+    /// place. `create_workspace` calls this once at the top of its idempotency
+    /// closure — BEFORE the first store write, worktree provisioning, or event
+    /// publish — so a rejected request never leaves a workspace row, spec
+    /// note, or `workspace:created` event behind. Owns every `initialAgent`
+    /// and `contextLinks` check:
+    /// - compound `initialAgent.model` (`reject_compound_model`, PROTOCOL §5.5);
+    /// - `fileBlocks` / `imageBlocks` shape and attachment references
+    ///   (PROTOCOL §5.5, monorepo#3338) — same harvest as `agent_create_op`
+    ///   (top-level param wins over the `metadata.*Blocks` copy);
+    /// - provider / model resolution in `agent_create_op`'s exact precedence:
+    ///   known provider → default present → enabled → authenticated →
+    ///   client-supplied bare model owned by the effective provider;
+    /// - `contextLinks` (PROTOCOL §5.1).
+    ///
+    /// `agent_create_op` re-runs its own checks unchanged when the initial
+    /// agent is created — harmless, since this preflight already accepted the
+    /// same input. The `workspace_create_rejects_every_invalid_input_before_side_effects`
+    /// test guards the ordering arm by arm.
+    pub(crate) async fn preflight_workspace_create(&self, input: &WorkspaceCreate) -> Result<()> {
+        if let Some(agent) = input.initial_agent.as_ref() {
+            if let Some(model) = agent.model.as_deref() {
+                reject_compound_model("initialAgent.model", model)?;
+            }
+            let effective_file_blocks = agent
+                .file_blocks
+                .clone()
+                .or_else(|| {
+                    agent
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("fileBlocks").cloned())
+                })
+                .filter(|v| !v.is_null());
+            crate::agent_ops::validate_file_blocks(
+                "workspace.create",
+                effective_file_blocks.as_ref(),
+            )?;
+            let effective_image_blocks = agent
+                .image_blocks
+                .clone()
+                .or_else(|| {
+                    agent
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("imageBlocks").cloned())
+                })
+                .filter(|v| !v.is_null());
+            crate::agent_ops::validate_image_blocks(
+                "workspace.create",
+                effective_image_blocks.as_ref(),
+            )?;
+            self.validate_image_block_refs("workspace.create", effective_image_blocks.as_ref())
+                .await?;
+
+            // Provider / model gates, mirroring `agent_create_op` (which
+            // receives the same `nonempty_owned` values).
+            let provider = nonempty_owned(agent.provider.clone());
+            let model = nonempty_owned(agent.model.clone());
+            if let Some(p) = provider.as_deref() {
+                crate::agent_ops::ensure_known_provider("workspace.create", p)?;
+            }
+            let settings = self.effective_settings();
+            let derived_default = crate::agent_session::derived_default_provider(&settings);
+            if provider.is_none() && derived_default.is_none() {
+                return Err(crate::agent_session::no_default_provider_error(
+                    "workspace.create",
+                ));
+            }
+            if let Some(p) = crate::agent_session::resolve_provider_id(
+                provider.as_deref(),
+                derived_default.as_deref(),
+            ) {
+                crate::agent_ops::ensure_provider_enabled(
+                    "workspace.create",
+                    &p,
+                    settings.providers.enabled.as_ref(),
+                )?;
+                crate::agent_ops::ensure_provider_authenticated(
+                    "workspace.create",
+                    &p,
+                    crate::provider_auth::cached_auth_verdict(&p),
+                )?;
+            }
+            // Client-supplied bare model only: a derived default's mismatch
+            // is soft in `agent_create_op` (falls back to the CLI default).
+            if let Some(m) = model.as_deref() {
+                let effective = provider
+                    .as_deref()
+                    .or(derived_default.as_deref())
+                    .expect("guarded above: provider or derived default present");
+                crate::agent_ops::ensure_bare_model_matches_provider(
+                    "workspace.create",
+                    &self.cached_models(),
+                    effective,
+                    m,
+                )?;
+            }
+        }
+        validate_context_links(input.context_links.as_deref())
+    }
+}
+
 /// Locked phase of the blocking `workspace.delete` cleanup (ports the TS
 /// `removeGitWorktree` body). Runs under the per-repo worktree lock, so it
 /// does git-metadata work only: capture the checked-out branch, detach the
@@ -17102,15 +17206,6 @@ impl WorkspaceApi for Services {
         input: WorkspaceCreate,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
-        if let Some(model) = input
-            .initial_agent
-            .as_ref()
-            .and_then(|a| a.model.as_deref())
-        {
-            if let Err(e) = reject_compound_model("initialAgent.model", model) {
-                return Box::pin(async move { Err(e) });
-            }
-        }
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
         let workspaces_root = self.workspaces_root.clone();
@@ -17169,56 +17264,12 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
-                    // Attachment-reference validation (PROTOCOL §5.5,
-                    // monorepo#3338), hoisted BEFORE any state change so a
-                    // bad `initialAgent.fileBlocks` / `imageBlocks` entry
-                    // rejects `-32602` without leaving a partially created
-                    // workspace (row/metadata/event/spec note) behind. Same
-                    // harvest as `agent_create_op` (top-level param wins over
-                    // the `metadata.*Blocks` copy); the create op re-runs the
-                    // same checks harmlessly.
-                    if let Some(agent) = input.initial_agent.as_ref() {
-                        let effective_file_blocks = agent
-                            .file_blocks
-                            .clone()
-                            .or_else(|| {
-                                agent
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("fileBlocks").cloned())
-                            })
-                            .filter(|v| !v.is_null());
-                        crate::agent_ops::validate_file_blocks(
-                            "workspace.create",
-                            effective_file_blocks.as_ref(),
-                        )?;
-                        let effective_image_blocks = agent
-                            .image_blocks
-                            .clone()
-                            .or_else(|| {
-                                agent
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("imageBlocks").cloned())
-                            })
-                            .filter(|v| !v.is_null());
-                        crate::agent_ops::validate_image_blocks(
-                            "workspace.create",
-                            effective_image_blocks.as_ref(),
-                        )?;
-                        services
-                            .validate_image_block_refs(
-                                "workspace.create",
-                                effective_image_blocks.as_ref(),
-                            )
-                            .await?;
-                    }
-                    // Context-links validation (PROTOCOL §5.1), also hoisted
-                    // BEFORE any state change: a malformed `contextLinks`
-                    // rejects `-32602` without leaving a partially created
-                    // workspace behind. Bounded list, non-empty string
-                    // fields, positive PR/issue number.
-                    validate_context_links(input.context_links.as_deref())?;
+                    // Every request-validation `-32602` runs here, BEFORE
+                    // any state change (row / metadata file / event / spec
+                    // note / initial agent): `initialAgent` model, blocks,
+                    // attachment references and provider gates, plus
+                    // `contextLinks`. See `preflight_workspace_create`.
+                    services.preflight_workspace_create(&input).await?;
                     // Caller-supplied paths may carry a leading `~` (the FE
                     // onboarding default is `~/Developer`); expand to `$HOME`
                     // before the existing-repo check, clone targeting, and

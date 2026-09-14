@@ -584,7 +584,7 @@ fn default_model_belongs_to_provider(
 /// (`InvalidParams`). Persisting an unknown provider would make the spawn path
 /// silently fall back to the default binary; hard-fail at the front door
 /// instead (PROTOCOL §5.5). `method` names the rejecting RPC in the message.
-fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
+pub(crate) fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
     if intent_providers::find_provider(provider_id).is_none() {
         return Err(Error::InvalidParams(format!(
             "{method}: unknown provider: {provider_id} (known providers: {})",
@@ -838,7 +838,7 @@ pub(crate) fn resolve_delegate_provider_preview(
 /// a disabled provider must fail fast at every create/delegate front door
 /// regardless of whether its binary (or npx) would resolve. An absent map or
 /// absent entry means enabled (the settings default).
-fn ensure_provider_enabled(
+pub(crate) fn ensure_provider_enabled(
     method: &str,
     provider_id: &str,
     enabled: Option<&std::collections::BTreeMap<String, bool>>,
@@ -910,7 +910,7 @@ fn ensure_provider_available(
 /// verdict, so a retry within the cache TTL (60s) can still reject until
 /// the entry expires or a forced `host.providerAuthStatus` refresh (the
 /// FE's recheck) overwrites it — bounded and deemed acceptable.
-fn ensure_provider_authenticated(
+pub(crate) fn ensure_provider_authenticated(
     method: &str,
     provider_id: &str,
     auth_verdict: Option<bool>,
