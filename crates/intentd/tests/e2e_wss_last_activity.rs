@@ -296,6 +296,17 @@ where
     }
 }
 
+/// `try_next_event` yields `None` both when the deadline elapses and when the
+/// subscription socket closes or errors; name which one it was so a failure
+/// under load is triaged from the panic message alone.
+fn wait_failure_kind(deadline: tokio::time::Instant) -> &'static str {
+    if tokio::time::Instant::now() >= deadline {
+        "timed out"
+    } else {
+        "subscription socket closed before the deadline"
+    }
+}
+
 /// Wait until `count` terminal `agent:stream:end` events for `agent_id` have
 /// arrived on an `agent:*` subscription. One overall deadline bounds the whole
 /// wait so a missing event fails fast instead of polling a fixed iteration
@@ -311,7 +322,10 @@ where
         let evt = try_next_event(ws, &["agent:stream:end"], remaining)
             .await
             .unwrap_or_else(|| {
-                panic!("timed out waiting for {count} agent:stream:end events (saw {seen})")
+                panic!(
+                    "{} waiting for {count} agent:stream:end events (saw {seen})",
+                    wait_failure_kind(deadline)
+                )
             });
         if evt["data"]["agentId"] == agent_id {
             seen += 1;
@@ -358,8 +372,9 @@ where
                     .filter(|t| !ended_turns.contains(*t))
                     .count();
                 panic!(
-                    "timed out waiting for {user_rows} user rows and their turns to end \
-                     (saw {rows_seen} user rows, {still_open} turns still open)"
+                    "{} waiting for {user_rows} user rows and their turns to end \
+                     (saw {rows_seen} user rows, {still_open} turns still open)",
+                    wait_failure_kind(deadline)
                 )
             });
         if evt["data"]["agentId"] != agent_id {
