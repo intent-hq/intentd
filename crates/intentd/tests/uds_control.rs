@@ -345,22 +345,29 @@ fn inotify_instances(pid: u32) -> usize {
         .count()
 }
 
-/// Poll daemon.log until every watcher family has reported ready, so the
-/// census counts the steady state rather than a half-started daemon.
+/// Poll daemon.log until every watcher family has reported ready, then until
+/// `pid` holds at least one inotify instance, so the census counts the steady
+/// state rather than a half-started daemon. The registry marker fires once its
+/// subscriptions are enqueued; the config marker fires only after the hub's
+/// registrar has actually installed that watch — and no watcher may exist
+/// before the first `watch()` lands — so the instance floor is what proves
+/// the OS-side work has happened at all before the count is trusted.
 #[cfg(target_os = "linux")]
-async fn await_watchers_ready(data_dir: &std::path::Path) {
+async fn await_watchers_ready(data_dir: &std::path::Path, pid: u32) {
     let log_path = data_dir.join("daemon.log");
     let deadline = tokio::time::Instant::now() + common::daemon_startup_timeout();
     loop {
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
         if log.contains("watcher registry ready")
             && log.contains("config.toml live-reload watcher ready")
+            && inotify_instances(pid) >= 1
         {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "watchers never reported ready\n--- daemon log ---\n{log}"
+            "watchers never reported ready with a live inotify instance\n\
+             --- daemon log ---\n{log}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -378,14 +385,24 @@ async fn booted_daemon_holds_at_most_the_inotify_instance_ceiling() {
         child: spawn_daemon_with_env(&data_dir, &[("RUST_LOG", "info")]),
     };
     assert!(await_socket(&socket).await, "daemon did not start");
-    await_watchers_ready(&data_dir).await;
+    await_watchers_ready(&data_dir, daemon.child.id()).await;
 
-    let instances = inotify_instances(daemon.child.id());
-    assert!(
-        instances <= INOTIFY_INSTANCE_CEILING,
-        "a booted daemon holds {instances} inotify instances, ceiling is \
-         {INOTIFY_INSTANCE_CEILING}\n--- daemon log ---\n{}",
-        std::fs::read_to_string(data_dir.join("daemon.log")).unwrap_or_default()
-    );
+    // Sample across a settle window rather than once: a late-created extra
+    // watcher (a family that deferred its own creation past the markers)
+    // must not slip in behind a single early read.
+    let settle_until = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let instances = inotify_instances(daemon.child.id());
+        assert!(
+            instances <= INOTIFY_INSTANCE_CEILING,
+            "a booted daemon holds {instances} inotify instances, ceiling is \
+             {INOTIFY_INSTANCE_CEILING}\n--- daemon log ---\n{}",
+            std::fs::read_to_string(data_dir.join("daemon.log")).unwrap_or_default()
+        );
+        if tokio::time::Instant::now() >= settle_until {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     drop(daemon);
 }

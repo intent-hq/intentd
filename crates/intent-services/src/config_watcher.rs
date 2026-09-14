@@ -120,7 +120,7 @@ pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcom
 /// dropping the [`ConfigWatcher`] tears the whole pipeline down — the
 /// clean-shutdown contract for `serve`.
 pub struct ConfigWatcher {
-    _sub: SubHandle,
+    sub: SubHandle,
     task: JoinHandle<()>,
 }
 
@@ -138,8 +138,10 @@ impl ConfigWatcher {
     /// server runtime hooks and emit `settings:changed`.
     ///
     /// The OS registration itself is deferred to the hub's registrar thread,
-    /// so this returns without blocking; a registration failure is logged by
-    /// the debounce task rather than returned.
+    /// so this returns without blocking and the watch is NOT yet live; a
+    /// caller that reports readiness awaits [`Self::ready`] first. A
+    /// registration failure is logged by the debounce task rather than
+    /// returned.
     ///
     /// # Errors
     ///
@@ -178,15 +180,22 @@ impl ConfigWatcher {
             raw_rx,
             on_change,
         ));
-        Ok(Self { _sub: sub, task })
+        Ok(Self { sub, task })
+    }
+
+    /// Resolve once the deferred directory registration has settled: `true`
+    /// when the OS watch is live, `false` when it failed or the registrar has
+    /// not answered within the hub's establish timeout. Owned, so the caller
+    /// can await it while the watcher itself stays parked elsewhere.
+    pub fn ready(&self) -> impl Future<Output = bool> + Send + 'static {
+        self.sub.established()
     }
 
     /// Detach a probe for the hub subscription this watcher rides, so a test
     /// can await the directory watch going live before mutating it.
     #[cfg(test)]
-    #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     fn probe(&self) -> crate::events::shared_watch::RegistrationProbe {
-        self._sub.probe()
+        self.sub.probe()
     }
 }
 

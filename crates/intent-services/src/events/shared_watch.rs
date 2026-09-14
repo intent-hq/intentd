@@ -76,7 +76,15 @@
 //! the non-recursive sinks still see only their slice — and stays recursive
 //! until the root's last subscriber drops; downgrading would mean an unwatch
 //! (which on inotify strips nested roots' descriptors) for a case that does
-//! not occur in practice.
+//! not occur in practice. The same rule applies across roots: inotify keys its
+//! descriptors per directory, not per `watch()` call, so a non-recursive root
+//! nested under a recursive root (a missing project-tier skills root parked
+//! on `<workspace>/.agents` under the recursive workspace root) shares the
+//! ancestor's descriptors. It is registered recursively on the ancestor's
+//! behalf and is not unwatched while the ancestor survives — otherwise the
+//! shallow registration would stop the ancestor auto-watching directories
+//! created under it, and the unwatch would strip the subtree from the ancestor
+//! outright ([`covered_recursively`]).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -193,13 +201,29 @@ struct Root {
     registration: Arc<Registration>,
 }
 
-impl Root {
-    fn mode(&self) -> RecursiveMode {
-        if self.recursive {
-            RecursiveMode::Recursive
-        } else {
-            RecursiveMode::NonRecursive
-        }
+/// Whether a recursive root in `roots` other than `path` itself is an ancestor
+/// of `path`. inotify keys its descriptor table per directory, not per
+/// `watch()` call, so a root nested under a recursive root shares the
+/// ancestor's descriptors: registering it non-recursively would flip those
+/// descriptors' recursion flag (newly created subdirectories under it stop
+/// being auto-watched for the ancestor), and unwatching it would strip them
+/// from the ancestor's coverage outright. Such a root is therefore always
+/// registered in the ancestor's mode and never unwatched while the ancestor
+/// survives. On macOS nested roots have distinct parents and so live in
+/// distinct groups; this never fires there.
+fn covered_recursively(roots: &HashMap<PathBuf, Root>, path: &Path) -> bool {
+    roots
+        .iter()
+        .any(|(root, state)| state.recursive && root.as_path() != path && path.starts_with(root))
+}
+
+/// The mode `path` must be registered in: recursive when its own subscribers
+/// asked for that OR when [`covered_recursively`] by a co-tenant of the group.
+fn os_mode(roots: &HashMap<PathBuf, Root>, path: &Path, recursive: bool) -> RecursiveMode {
+    if recursive || covered_recursively(roots, path) {
+        RecursiveMode::Recursive
+    } else {
+        RecursiveMode::NonRecursive
     }
 }
 
@@ -485,24 +509,38 @@ impl Drop for SubHandle {
             None => false,
         };
         if drop_root {
-            group.roots.remove(&self.root);
-            let _ = group.cmd.send(Cmd::Unwatch(self.root.clone()));
-            // `notify`'s recursive inotify unwatch removes the target AND every
-            // descendant descriptor without per-root ref-counting, so retiring
-            // this root silently strips coverage from any still-subscribed
-            // root nested under it (a Linux global-group concern; on macOS
-            // nested roots under distinct parents live in distinct groups).
-            // Re-register the survivors: reset each one's registration and
-            // re-send `Cmd::Watch`, which the registrar serves after the
-            // `Unwatch` above (the channel is ordered).
-            for (nested, root) in &group.roots {
-                if nested.starts_with(&self.root) {
-                    root.registration.reset();
-                    let _ = group.cmd.send(Cmd::Watch(
-                        nested.clone(),
-                        root.mode(),
-                        Arc::clone(&root.registration),
-                    ));
+            let retired = group.roots.remove(&self.root);
+            // Under a surviving recursive ancestor this root's descriptors ARE
+            // the ancestor's (see `covered_recursively`): unwatching would
+            // strip them from its coverage, and the ancestor's own unwatch
+            // retires them later. Leave them in place.
+            if !covered_recursively(&group.roots, &self.root) {
+                let _ = group.cmd.send(Cmd::Unwatch(self.root.clone()));
+                // `notify`'s recursive inotify unwatch removes the target AND
+                // every descendant descriptor without per-root ref-counting,
+                // so retiring a RECURSIVE root silently strips coverage from
+                // any still-subscribed root nested under it (a Linux
+                // global-group concern; on macOS nested roots under distinct
+                // parents live in distinct groups). Re-register the survivors:
+                // reset each one's registration and re-send `Cmd::Watch`,
+                // which the registrar serves after the `Unwatch` above (the
+                // channel is ordered). A non-recursive root owns exactly one
+                // descriptor, so its unwatch touches no nested root and the
+                // survivors — notably a root just promoted off the ancestor
+                // watch `root_watch` parks on its parent — keep their live
+                // registrations rather than being reset behind their owner's
+                // successful `wait_live`.
+                if retired.is_some_and(|root| root.recursive) {
+                    for (nested, root) in &group.roots {
+                        if nested.starts_with(&self.root) {
+                            root.registration.reset();
+                            let _ = group.cmd.send(Cmd::Watch(
+                                nested.clone(),
+                                os_mode(&group.roots, nested, root.recursive),
+                                Arc::clone(&root.registration),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -634,6 +672,7 @@ impl SharedWatchHub {
                 tx,
             });
         }
+        let covered = covered_recursively(&group.roots, &root);
         let entry = group.roots.entry(root.clone()).or_insert_with(|| Root {
             subscribers: 0,
             recursive,
@@ -651,22 +690,25 @@ impl SharedWatchHub {
         // `watch()` per backend in ways that differ (inotify merges masks and
         // walks the tree, `FSEvents` appends the path a second time), and an
         // explicit unwatch first makes the outcome the same everywhere. The
-        // registrar serves the pair in order.
-        let widen = entry.subscribers > 1 && recursive && !entry.recursive;
+        // registrar serves the pair in order. A root already registered
+        // recursively on a recursive ancestor's behalf has nothing to widen
+        // (and its unwatch would strip the ancestor's descriptors).
+        let widen = entry.subscribers > 1 && recursive && !entry.recursive && !covered;
         if retry_failed || widen {
             entry.registration.reset();
         }
+        entry.recursive |= recursive;
         if widen {
-            entry.recursive = true;
             let _ = group.cmd.send(Cmd::Unwatch(root.clone()));
         }
         let registration = Arc::clone(&entry.registration);
-        if entry.subscribers == 1 || retry_failed || widen {
-            let _ = group.cmd.send(Cmd::Watch(
-                root.clone(),
-                entry.mode(),
-                Arc::clone(&registration),
-            ));
+        let register = entry.subscribers == 1 || retry_failed || widen;
+        let root_recursive = entry.recursive;
+        if register {
+            let mode = os_mode(&group.roots, &root, root_recursive);
+            let _ = group
+                .cmd
+                .send(Cmd::Watch(root.clone(), mode, Arc::clone(&registration)));
         }
         drop(state);
 
@@ -1346,6 +1388,126 @@ mod tests {
                 .is_some(),
             "the nested root must keep delivering after its outer co-tenant retires"
         );
+    }
+
+    /// Write `rel` under `root` and keep touching it until `rx` delivers an
+    /// event for it. A directory created under a recursive watch is added to
+    /// inotify only after the create event that announced it is dispatched, so
+    /// a single write racing that add can land before the descriptor exists;
+    /// every later touch is a fresh chance to be seen.
+    async fn touch_until_seen(
+        rx: &mut mpsc::UnboundedReceiver<notify::Event>,
+        root: &Path,
+        rel: &str,
+    ) -> bool {
+        let path = root.join(rel);
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        while tokio::time::Instant::now() < deadline {
+            std::fs::write(&path, b"x").expect("write probe file");
+            if next_for(rx, root, rel, Duration::from_millis(250))
+                .await
+                .is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Drive a recursive `outer` root with a NON-recursive co-tenant nested
+    /// under it — the shape a missing project-tier skills root parked on
+    /// `<workspace>/.agents` takes under the recursive workspace root — and
+    /// assert the outer root still auto-watches directories created under
+    /// the nested one, then keeps them after the nested subscriber retires.
+    /// Without the ancestor rule in `subscribe_with` / `SubHandle::drop`, the
+    /// shallow registration flips the shared inotify descriptor's recursion
+    /// flag off (new subdirectories are never added) and the shallow unwatch
+    /// strips the descriptor from the outer root entirely.
+    async fn recursive_outer_survives_shallow_nested(outer_first: bool, tag: &str) {
+        let base = TempDir::new(tag);
+        let outer = base.path.join("outer");
+        let nested = outer.join("nested");
+        std::fs::create_dir_all(&nested).expect("mk nested");
+
+        let hub = SharedWatchHub::new();
+        let (sub_outer, mut rx_outer, root_outer, sub_nested, mut rx_nested, root_nested) =
+            if outer_first {
+                let (so, ro, po) = hub.subscribe(&outer);
+                let (sn, rn, pn) = hub.subscribe_with(&nested, RecursiveMode::NonRecursive);
+                (so, ro, po, sn, rn, pn)
+            } else {
+                let (sn, rn, pn) = hub.subscribe_with(&nested, RecursiveMode::NonRecursive);
+                let (so, ro, po) = hub.subscribe(&outer);
+                (so, ro, po, sn, rn, pn)
+            };
+        hub.wait_all_established(2, LIVENESS).await;
+
+        // A directory created under the shallow root must still be picked up
+        // by the recursive outer root, and its contents delivered there.
+        std::fs::create_dir(root_nested.join("created-later")).expect("mk created-later");
+        assert!(
+            touch_until_seen(
+                &mut rx_outer,
+                &root_outer,
+                "nested/created-later/expected.txt"
+            )
+            .await,
+            "outer_first={outer_first}: the recursive outer root lost coverage of a \
+             directory created under its shallow co-tenant"
+        );
+        // The shallow sink stays shallow: it sees its direct child, not the
+        // grandchild the outer root just saw.
+        std::fs::write(root_nested.join("direct.txt"), b"x").expect("write direct");
+        assert!(
+            next_for(&mut rx_nested, &root_nested, "direct.txt", LIVENESS)
+                .await
+                .is_some(),
+            "outer_first={outer_first}: the shallow sink must see its direct child"
+        );
+        while let Ok(event) = rx_nested.try_recv() {
+            assert!(
+                !event
+                    .paths
+                    .iter()
+                    .any(|p| p.starts_with(root_nested.join("created-later"))),
+                "outer_first={outer_first}: shallow sink leaked a grandchild event: {event:?}"
+            );
+        }
+
+        // Retiring the shallow root must leave the outer root's descriptors
+        // for that subtree in place.
+        drop(sub_nested);
+        sub_outer.wait_established(LIVENESS).await;
+        std::fs::create_dir(root_nested.join("after-retire")).expect("mk after-retire");
+        assert!(
+            touch_until_seen(
+                &mut rx_outer,
+                &root_outer,
+                "nested/after-retire/expected.txt"
+            )
+            .await,
+            "outer_first={outer_first}: retiring the shallow co-tenant stripped the \
+             outer root's coverage of the nested subtree"
+        );
+        drop(sub_outer);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_shallow_root_under_a_recursive_root_keeps_the_ancestor_recursive() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recursive_outer_survives_shallow_nested(true, "shallow-after-outer").await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_recursive_root_over_an_existing_shallow_root_watches_its_subtree() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recursive_outer_survives_shallow_nested(false, "outer-after-shallow").await;
     }
 
     /// macOS keeps parent-directory grouping: the `FSEvents` stream rebuild on

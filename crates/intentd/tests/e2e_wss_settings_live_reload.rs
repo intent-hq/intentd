@@ -310,6 +310,50 @@ async fn await_config_watcher_ready(data_dir: &Path) {
     }
 }
 
+/// The readiness marker `await_config_watcher_ready` gates on must mean the
+/// directory watch is actually live, not merely requested: the registration
+/// runs on the hub's registrar thread after `ConfigWatcher::start` returns
+/// (intent-hq/intent#4953), so a marker logged straight after `start` would
+/// let a test hand-edit config.toml before the watch exists. Under the
+/// watcher-creation-failure seam every registration settles as failed, so
+/// the daemon must report `failed to start` and never `ready`.
+#[tokio::test]
+async fn config_watcher_readiness_marker_waits_for_a_live_watch() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
+        child: spawn_serve(
+            &data_dir,
+            "uds",
+            &[("INTENTD_TEST_FAIL_WATCHER_CREATION", "1")],
+        ),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let log_path = data_dir.join("daemon.log");
+    let deadline = tokio::time::Instant::now() + LIVENESS;
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            !log.contains("config.toml live-reload watcher ready"),
+            "readiness must not be reported while the config directory watch is not live\n\
+             --- daemon log ---\n{log}"
+        );
+        if log.contains("config.toml live-reload watcher failed to start") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the daemon never reported the config watcher failing to start within {LIVENESS:?}\n\
+             --- daemon log ---\n{log}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    drop(daemon);
+}
+
 /// Boot with the WSS listener enabled, discover the WSS port + fingerprint via
 /// `system.status` over UDS, and return (daemon, rpc conn, subscriber conn)
 /// with the subscriber already subscribed to `settings:changed`.

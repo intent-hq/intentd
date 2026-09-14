@@ -5007,7 +5007,21 @@ fn spawn_config_watcher_init(
                 return;
             }
         };
-        tracing::info!("config.toml live-reload watcher ready");
+        // `start` only enqueues the directory registration on the hub's
+        // registrar thread; the readiness marker below is what
+        // `e2e_wss_settings_live_reload` gates its external edits on, so it
+        // must not be logged until that watch is actually live.
+        if watcher.ready().await {
+            tracing::info!("config.toml live-reload watcher ready");
+        } else {
+            // Still park below rather than drop: the hub re-registers roots
+            // that failed while its watcher was being created, once creation
+            // succeeds.
+            tracing::warn!(
+                "config.toml live-reload watcher failed to start: the config directory \
+                 watch did not go live; external edits will require a daemon restart"
+            );
+        }
         // Park forever so the watch stays alive until the handle is aborted.
         std::future::pending::<()>().await;
         drop(watcher);
