@@ -13023,7 +13023,7 @@ async fn send_message_op_persists_attachment_blocks_in_transcript() {
 /// before.
 #[tokio::test]
 async fn file_blocks_inline_data_rejected_on_every_seam() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "InlineReject").await;
     let inline = json!([
         { "type": "file", "attachmentId": "att-ok", "fileName": "ok.txt" },
@@ -13085,6 +13085,79 @@ async fn file_blocks_inline_data_rejected_on_every_seam() {
         .await
         .expect_err("create rejects inline data");
     expect_rejected("agent.create", err);
+
+    let err = WorkspaceApi::agent_edit_and_regenerate(
+        &svc,
+        ws.clone(),
+        id.clone(),
+        "msg-1".into(),
+        "edited".into(),
+        None,
+        Some(inline.clone()),
+        None,
+    )
+    .await
+    .expect_err("editAndRegenerate rejects inline data");
+    expect_rejected("agent.editAndRegenerate", err);
+
+    // workspace.create rejects BEFORE any side effect: no workspace row, no
+    // spec note and no `workspace:created` event is left behind (both the
+    // top-level `initialAgent.fileBlocks` and its `metadata.fileBlocks`
+    // mirror).
+    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let notes_before = svc.store().list_all_notes().await.expect("notes").len();
+    let created_events = || async {
+        svc.store()
+            .query_events(&intent_store::EventQuery {
+                event_types: vec![intent_core::events::WORKSPACE_CREATED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query workspace:created")
+            .len()
+    };
+    let events_before = created_events().await;
+    for initial_agent in [
+        intent_core::WorkspaceCreateInitialAgent {
+            prompt: Some("go".into()),
+            file_blocks: Some(inline.clone()),
+            ..Default::default()
+        },
+        intent_core::WorkspaceCreateInitialAgent {
+            prompt: Some("go".into()),
+            metadata: Some(json!({ "fileBlocks": inline.clone() })),
+            ..Default::default()
+        },
+    ] {
+        let err = WorkspaceApi::create_workspace(
+            &svc,
+            intent_core::WorkspaceCreate {
+                title: Some("W".into()),
+                skip_isolation: Some(true),
+                initial_agent: Some(initial_agent),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("workspace.create rejects inline data");
+        expect_rejected("workspace.create", err);
+    }
+    assert_eq!(
+        svc.list_workspaces(true).await.expect("list").len(),
+        workspaces_before,
+        "workspace.create rejection must precede the workspace row"
+    );
+    assert_eq!(
+        svc.store().list_all_notes().await.expect("notes").len(),
+        notes_before,
+        "workspace.create rejection must precede the spec note"
+    );
+    assert_eq!(
+        created_events().await,
+        events_before,
+        "workspace.create rejection must precede workspace:created"
+    );
 
     // Nothing was queued or persisted on the way to the rejection.
     let queue = svc
