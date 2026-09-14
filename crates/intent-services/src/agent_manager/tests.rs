@@ -11102,7 +11102,7 @@ async fn pending_permissions_snapshots_and_respond_unblocks() {
     assert!(!mgr.respond_permission("nope", PermissionOutcome::Cancelled));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn services_pending_and_respond_rpcs_drive_the_registry() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11163,7 +11163,7 @@ async fn services_pending_and_respond_rpcs_drive_the_registry() {
     assert!(matches!(err, Error::InvalidParams(_)));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn services_permission_rpcs_are_inert_without_a_manager() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11253,7 +11253,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
 /// `AgentManager::stop`: the tracked handles, workers, in-flight busy set, and
 /// `agent_ws` map all drain, and the workspace insert itself is idempotent —
 /// a same-slug recreate observes zero pre-existing agents.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
     // Build the manager inline so we can pin a hermetic `workspaces_root` on
     // Services — the delete path walks it to unlink the daemon-owned
@@ -11369,7 +11369,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
 /// is deleted. The tracked handle (provider child), registry entry, and
 /// session row all survive so unarchive can resume the same session, and no
 /// `agent:deleted` fires; `workspace:updated` still carries the archive delta.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11460,7 +11460,7 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
 /// its worker orphans the tool call and leaks the busy slot (the workspace
 /// stays `agent_running` forever). Every OTHER in-flight turn is still
 /// interrupted keep-alive.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archive_workspace_skips_the_calling_agents_turn() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11540,7 +11540,7 @@ async fn archive_workspace_skips_the_calling_agents_turn() {
 /// drained into a new turn while the workspace is archived (the archived gate
 /// in `try_drain_queue`); `workspace.unarchive` itself kicks the drain and
 /// delivers the parked queue — no organic follow-up kick required.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archive_workspace_parks_queue_until_unarchive() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11606,7 +11606,7 @@ async fn archive_workspace_parks_queue_until_unarchive() {
 /// the workspace is archived: the archived gate parks them in the queue
 /// instead of claiming the slot, and unarchive's own drain kick delivers
 /// the parked wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archive_workspace_parks_wake_deliveries() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11661,7 +11661,7 @@ async fn archive_workspace_parks_wake_deliveries() {
 /// strands until the next organic drain trigger. The re-check must self-heal
 /// by kicking the drain once it observes the workspace no longer archived
 /// (mirroring `AgentManager::send_message`'s archived-gate re-check).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archived_wake_park_self_heals_when_unarchived_during_enqueue() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11795,7 +11795,7 @@ async fn retired_session_parks_wake_deliveries_until_restore() {
 /// `try_begin` would auto-unarchive the workspace). The workspace stays
 /// Archived with no `autoUnarchive` delta, and unarchive's own drain kick
 /// delivers the parked message.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archived_workspace_parks_automatic_send_until_unarchive() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11873,7 +11873,7 @@ async fn archived_workspace_parks_automatic_send_until_unarchive() {
 /// event-subscription wake path) into an archived workspace parks in the
 /// parent's queue instead of starting a turn that flips the workspace
 /// straight back to Active.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archived_workspace_parks_internal_parent_wake() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11917,7 +11917,7 @@ async fn archived_workspace_parks_internal_parent_wake() {
 /// delivery (`interrupt_send_message`) into an archived workspace parks
 /// front-of-queue instead of preempting/driving a turn; the workspace stays
 /// Archived.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archived_workspace_parks_automatic_interrupt_send_front_of_queue() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11982,7 +11982,7 @@ async fn archived_workspace_parks_automatic_interrupt_send_front_of_queue() {
 /// Guard the revive path (intent-hq/monorepo#2732 non-goal): a USER-origin
 /// `send_message` into an archived workspace still claims the slot and
 /// auto-unarchives — only automatic deliveries park.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archived_workspace_user_send_still_auto_unarchives() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -12037,7 +12037,7 @@ async fn archived_workspace_user_send_still_auto_unarchives() {
 /// target's home workspace), so a parent whose home workspace is Active
 /// receives its wake immediately even when the watched child's workspace is
 /// archived.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_workspace_parent_wake_unaffected_by_archived_child_workspace() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -12214,7 +12214,7 @@ async fn idle_since_is_none_while_a_claim_is_mid_write() {
     assert!(mgr.idle_since().is_some());
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_active_projects_busy_agent_with_workspace_and_epoch_timestamp() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -12256,7 +12256,7 @@ async fn list_active_projects_busy_agent_with_workspace_and_epoch_timestamp() {
 /// A busy agent whose session row is missing (e.g. deleted mid-turn by a
 /// concurrent `agent.delete`) is skipped instead of failing the whole
 /// `agent.listActive` response (PR #881 review).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_active_skips_busy_agent_with_missing_session_row() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -19230,7 +19230,7 @@ mod unblocked_hints_tests {
     /// appended to the LAST trigger-carrying entry; the delta reflects task
     /// state at annotation time (both deps complete → the gated task rows
     /// once, not per-wake).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn batch_coalesces_triggers_into_one_section_on_last_entry() {
         // The section is gated behind `agentFeatures.taskGraph`
         // (intent-hq/monorepo#2445), so wire a registry with it explicitly on.
@@ -19305,7 +19305,7 @@ mod unblocked_hints_tests {
     /// Idempotency + persisted guards: an entry whose content already carries
     /// the section (terminal-failure requeue) and a `persisted: true` entry
     /// are never (re)annotated.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn requeued_and_persisted_entries_are_not_reannotated() {
         let (_tmp, mgr) = manager().await;
         let ws = WorkspaceId::from("ws-unblocked-idem");
@@ -22760,7 +22760,7 @@ mod enqueue_origin_table {
             .user_origin
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn every_front_door_records_its_origin() {
         for (index, row) in ROWS.iter().enumerate() {
             let (_tmp, mgr) = manager().await;

@@ -4614,7 +4614,7 @@ async fn app_agents_wait_validation_failures() {
     assert!(svc.delegation_group_for_parent(&caller).is_none());
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn app_agents_send_persists_chief_attribution_and_source_link() {
     let (_t, svc, target_ws) = setup().await;
     let chief_ws = WorkspaceId::chief();
@@ -4679,7 +4679,7 @@ async fn app_agents_send_persists_chief_attribution_and_source_link() {
 /// Pending questions on the target no longer park a Chief send: the
 /// automatic send persists directly with its attribution, and the target's
 /// pending-questions marker survives.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn app_agents_send_delivers_despite_target_pending_questions() {
     let (_t, svc, target_ws) = setup().await;
     let chief_ws = WorkspaceId::chief();
@@ -4810,7 +4810,7 @@ async fn app_agents_send_fails_closed_for_invalid_callers_and_targets() {
     assert!(matches!(deleted, Err(Error::InvalidParams(_))));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn app_agents_send_remains_an_ordinary_send_without_a_completion_watch() {
     let (_t, svc, target_ws) = setup().await;
     let chief_ws = WorkspaceId::chief();
@@ -4836,7 +4836,7 @@ async fn app_agents_send_remains_an_ordinary_send_without_a_completion_watch() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn app_agents_ask_ignores_same_target_progress_and_wakes_once_on_completion() {
     let (_t, svc, target_ws) = setup().await;
     let chief_ws = WorkspaceId::chief();
@@ -4975,7 +4975,7 @@ async fn app_agents_ask_ignores_same_target_progress_and_wakes_once_on_completio
 /// directly), and queued work on the target keeps the ask's completion watch
 /// armed through an interim idle until the queue drains and the target
 /// genuinely completes.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn app_agents_ask_keeps_watch_armed_while_target_has_queued_work() {
     let (_t, svc, target_ws) = setup().await;
     let chief_ws = WorkspaceId::chief();
@@ -5058,7 +5058,7 @@ async fn app_agents_ask_keeps_watch_armed_while_target_has_queued_work() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn app_agents_ask_adopts_generic_watch_without_weakening_or_duplication() {
     let (_t, svc, target_ws) = setup().await;
     let chief_ws = WorkspaceId::chief();
@@ -5093,7 +5093,7 @@ async fn app_agents_ask_adopts_generic_watch_without_weakening_or_duplication() 
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn app_agents_ask_ignores_attention_and_stays_armed_for_completion() {
     let (_t, svc, target_ws) = setup().await;
     let chief_ws = WorkspaceId::chief();
@@ -5175,7 +5175,7 @@ async fn app_agents_ask_ignores_attention_and_stays_armed_for_completion() {
     assert!(svc.list_watches_for_parent(&chief).is_empty());
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn app_agents_ask_does_not_adopt_an_unrelated_after_all_group() {
     let (_t, svc, target_ws) = setup().await;
     let chief_ws = WorkspaceId::chief();
@@ -5267,7 +5267,7 @@ async fn app_agents_ask_does_not_adopt_an_unrelated_after_all_group() {
     assert!(group.completed_agent_ids.contains(&target));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
     let tmp = TempDb::new();
     let target_ws = WorkspaceId::new();
@@ -5369,7 +5369,7 @@ async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
     wait_for_persisted_watches(&restarted, 0).await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn app_agents_ask_fails_closed_when_completion_watch_persistence_fails() {
     let (_t, svc, target_ws) = setup().await;
     let chief_ws = WorkspaceId::chief();
@@ -10195,7 +10195,7 @@ async fn report_to_parent_persists_completion_report() {
     assert_eq!(v["metadata"]["completionReportTimestamp"], r["savedAt"]);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn legacy_checkbox_delegate_can_report_and_request_attention() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -10330,7 +10330,7 @@ async fn delegate_task_then_edit_note(
     (note.id, child)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegated_task_note_edits_do_not_suppress_report_to_parent() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -10365,7 +10365,7 @@ async fn delegated_task_note_edits_do_not_suppress_report_to_parent() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegated_task_note_edits_do_not_suppress_attention_requests() {
     for (kind, expected_status) in [
         ("discussion", intent_core::TaskStatus::DiscussionNeeded),
@@ -10403,7 +10403,7 @@ async fn delegated_task_note_edits_do_not_suppress_attention_requests() {
     }
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegated_task_note_edits_do_not_suppress_valid_status_updates() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -10428,7 +10428,7 @@ async fn delegated_task_note_edits_do_not_suppress_valid_status_updates() {
 /// TASK-B: on `agent.reportToParent`, the caller's linked task note
 /// transitions from a non-terminal status (`in_progress`) to
 /// `review_required`, mirroring the reference reportToParent writer.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_transitions_linked_task_to_review_required() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -10493,7 +10493,7 @@ async fn report_to_parent_transitions_linked_task_to_review_required() {
 /// TASK-B: terminal task statuses (`complete`, `cancelled`) MUST NOT be
 /// overwritten by a late `reportToParent` — the reference writer is a strict
 /// upgrade, never a downgrade of a done/cancelled task.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_does_not_overwrite_terminal_task_status() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -10563,7 +10563,7 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
 /// short-circuiting on the current status is what keeps repeated
 /// child-reports from churning the note (unresolved copilot review
 /// thread `PRRT_kwDOS9Wxuc6QIRcj` on PR #104).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -10699,7 +10699,7 @@ async fn report_to_parent_without_linked_task_is_status_noop() {
 /// workspace must NOT leak the foreign note's title/content into the TASK-C
 /// preamble injected as the child's first message; the preamble is skipped and
 /// the message falls back to the caller-supplied `agentInstructions`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
     let (_t, svc, ws_a) = setup().await;
     let ws_b = WorkspaceId::new();
@@ -10761,7 +10761,7 @@ async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
 /// returns `NotFound` and the transition is a silent no-op: the foreign note's
 /// task metadata is left untouched (no cross-workspace read, no cross-workspace
 /// write).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
     let (_t, svc, ws_a) = setup().await;
     let ws_b = WorkspaceId::new();
@@ -11954,7 +11954,7 @@ async fn durable_completion_queue_retry_adopts_existing_message_id() {
     assert_eq!(svc.queue_snapshot(&parent).len(), 1);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn failed_terminal_wake_retries_without_another_event() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -12554,7 +12554,7 @@ async fn report_to_parent_then_failed_or_deleted_still_wakes_parent() {
 /// SUB-2: repeated `agent.wakeOrCreate` for the same caller/target reuses the
 /// live ungrouped watch instead of stacking duplicates. A single terminal
 /// `agent:idle` then produces exactly one parent wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_reuses_existing_watch_no_duplicate() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
@@ -12597,7 +12597,7 @@ async fn wake_or_create_reuses_existing_watch_no_duplicate() {
 /// `agent.wakeOrCreate` refreshes the stored `parent_agent_name` so a rename
 /// applied to the caller (via `agent.rename`) between wake calls surfaces
 /// through `agent.getSubscriptions` / `describe_subscription`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_reuse_refreshes_parent_agent_name() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "OldName").await;
@@ -12647,7 +12647,7 @@ async fn wake_or_create_reuse_refreshes_parent_agent_name() {
 /// watch — not return the dead subscription id. Dropping the seeded watch
 /// directly stands in for the concurrent removal that would race the
 /// pre-fix non-atomic find/refresh pair.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_reuse_after_removal_registers_fresh_watch() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
@@ -12839,7 +12839,7 @@ async fn create_rejects_when_parent_at_max_depth() {
 /// reports "cow". This test uses a workspace without `repository_path`, so `CoW` cannot
 /// provision and effectiveIsolation is absent (graceful fallback to shared mode).
 /// The setting is read and respected; actual provisioning is workspace-dependent.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_reads_cow_isolation_setting() {
     let (_t, svc, ws) = setup().await;
     // Enable workspace.cowIsolation setting
@@ -12896,7 +12896,7 @@ async fn delegate_defaults_to_shared_when_setting_disabled() {
 }
 
 /// Explicit isolation parameter overrides workspace.cowIsolation setting.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_explicit_isolation_overrides_setting() {
     let (_t, svc, ws) = setup().await;
     // Enable workspace.cowIsolation setting
@@ -13599,7 +13599,7 @@ async fn send_message_op_persists_message_metadata() {
 /// Sender attribution: `agent_send_to_task_op` on the store-only fallback
 /// path (no runtime manager) must plumb `message_metadata` through to the
 /// persisted row rather than dropping it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn send_to_task_store_only_fallback_persists_message_metadata() {
     let (_t, svc, ws) = setup().await;
     let agent_id = create_agent(&svc, &ws, "TaskMetaRecv").await;
@@ -13643,7 +13643,7 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
 /// and overwrites the client-supplied `fromPrincipalId`; Agent / Daemon
 /// callers strip it instead. Driven through the `WorkspaceApi` trait (where
 /// the stamp lives), read back from the persisted row or the queue entry.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_point() {
     use intent_core::{with_caller, AgentWakeOrCreateInput, Caller, Principal, PrincipalId};
 
@@ -14126,7 +14126,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
 /// stamp, so every user-origin entry point rejects it as `InvalidParams`
 /// instead of persisting an unattributed human message (which would be
 /// served as the workspace's legacy author / owner, not its sender).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn non_object_message_metadata_is_rejected_on_every_user_origin_entry_point() {
     use intent_core::{with_caller, AgentWakeOrCreateInput, Caller, Principal, PrincipalId};
 
@@ -16827,7 +16827,7 @@ async fn models_list_legacy_and_provider_id_paths_share_one_cache() {
     assert_eq!(res["source"], "auggie");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn subscribe_then_unsubscribe_roundtrips() {
     let (_t, svc, ws) = setup().await;
     let sub = svc
@@ -16847,7 +16847,7 @@ async fn subscribe_then_unsubscribe_roundtrips() {
 /// monorepo#937 (review): fail closed on invalid subscribers — an unknown
 /// agent id, a deleted agent, and an empty eventTypes array must all be
 /// rejected before anything registers or persists.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn event_subscription_rejects_invalid_subscriber_and_empty_types() {
     let (_t, svc, ws, _bus) = setup_with_bus().await;
     let subscriber = create_agent(&svc, &ws, "Watcher").await;
@@ -16901,7 +16901,7 @@ async fn event_subscription_rejects_invalid_subscriber_and_empty_types() {
 
 /// monorepo#937: an agent-owned `event.subscribe` delivers a batched wake to
 /// the subscriber when a matching event is published by another actor.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn event_subscription_delivers_batched_wake_to_subscriber() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let subscriber = create_agent(&svc, &ws, "Watcher").await;
@@ -16974,7 +16974,7 @@ async fn event_subscription_delivers_batched_wake_to_subscriber() {
 
 /// monorepo#937: `excludeSelf` (default true) drops the subscriber's own
 /// events, and `event.unsubscribe` stops delivery entirely.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn event_subscription_excludes_self_and_unsubscribe_stops_delivery() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let subscriber = create_agent(&svc, &ws, "Watcher").await;
@@ -17053,7 +17053,7 @@ async fn event_subscription_excludes_self_and_unsubscribe_stops_delivery() {
 
 /// monorepo#937: agent-owned subscriptions persist and rehydrate on startup;
 /// rows whose subscriber agent is gone are pruned.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn event_subscriptions_survive_restart_and_prune_orphans() {
     let tmp = TempDb::new();
     let ws = WorkspaceId::new();
@@ -17170,7 +17170,7 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
 /// subscriber retired while the daemon was down (crash window after the
 /// retire mark but before the teardown's row delete) is pruned at startup
 /// instead of rehydrated.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn event_subscriptions_reject_and_prune_retired_subscribers() {
     let tmp = TempDb::new();
     let ws = WorkspaceId::new();
@@ -17264,7 +17264,7 @@ async fn event_subscriptions_reject_and_prune_retired_subscribers() {
 /// monorepo#947: `agent.getSubscriptions` lists the caller's live event
 /// subscriptions (additive `eventSubscriptions` field alongside the
 /// unchanged completion-watch payload), and unsubscribing removes the entry.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn get_subscriptions_includes_event_subscriptions() {
     let (_t, svc, ws, _bus) = setup_with_bus().await;
     let subscriber = create_agent(&svc, &ws, "Watcher").await;
@@ -17326,7 +17326,7 @@ async fn get_subscriptions_includes_event_subscriptions() {
 /// monorepo#947: `agent.diagnostics` reports event subscriptions — the
 /// snapshot array, the summary count, the per-agent `eventSubscriptionCount`,
 /// and the text rendering line.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn diagnostics_reports_event_subscriptions() {
     let (_t, svc, ws, _bus) = setup_with_bus().await;
     let subscriber = create_agent(&svc, &ws, "Watcher").await;
@@ -18027,7 +18027,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
 /// monorepo#947: deleting a workspace drops its event subscriptions — the
 /// live registry entries (delivery tasks aborted) and the persisted rows —
 /// while subscriptions scoped to other workspaces survive.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_delete_cleans_up_event_subscriptions() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -18100,7 +18100,7 @@ async fn workspace_delete_cleans_up_event_subscriptions() {
 /// owned by a LIVE chief agent (chief agents may subscribe cross-workspace),
 /// so the prune decision is driven purely by workspace existence — not the
 /// pre-existing subscriber-liveness prune.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn heal_prunes_orphan_workspace_rows_but_keeps_chief() {
     let tmp = TempDb::new();
     let gone_ws = WorkspaceId::new();
@@ -18248,7 +18248,7 @@ async fn report_to_parent_rejects_non_delegated_caller() {
 
 /// The RPC front door (no caller context, `caller_agent_id = None`) keeps
 /// returning `-32603` exactly as before.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_rejects_rpc_front_door() {
     let (_t, svc, ws) = setup().await;
     let err = svc
@@ -18263,7 +18263,7 @@ async fn report_to_parent_rejects_rpc_front_door() {
     }
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn get_subscriptions_has_stable_shape() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Sub").await;
@@ -18278,7 +18278,7 @@ async fn get_subscriptions_has_stable_shape() {
 
 /// After an immediate (default) delegate, `getSubscriptions(parent)` lists the
 /// ungrouped watch with `actorIds = [child]` and no delegation group.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn get_subscriptions_lists_immediate_delegate_watch() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -18311,7 +18311,7 @@ async fn get_subscriptions_lists_immediate_delegate_watch() {
 /// After an `after_all` delegate, the watch is a grouped watch and one
 /// `delegationGroups` entry lists the child in `expectedAgentIds` with the wire
 /// `awaitMode` mapped from `after_all` to `"all"`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn get_subscriptions_lists_after_all_group() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -18341,7 +18341,7 @@ async fn get_subscriptions_lists_after_all_group() {
 /// persisted `delegation_group` rows, so cancelled groups can't rehydrate on
 /// restart — and a second cancel with nothing left still returns
 /// `{ success: true }`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -18413,7 +18413,7 @@ async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
 /// the delegation group and its grouped watch stay intact — deletes the
 /// persisted `completion_watch` row, and publishes
 /// `agent:subscriptions-changed` with the parent's refreshed waiting flags.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn scoped_cancel_by_subscription_id_leaves_group_intact() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -18468,7 +18468,7 @@ async fn scoped_cancel_by_subscription_id_leaves_group_intact() {
 /// Scoped cancel by `groupId` removes the delegation group and its grouped
 /// watch (in-memory + persisted rows) while an ungrouped watch
 /// survives untouched.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn scoped_cancel_by_group_id_leaves_ungrouped_intact() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -18527,7 +18527,7 @@ async fn scoped_cancel_by_group_id_leaves_ungrouped_intact() {
 /// Unknown scoped ids — including another parent's valid watch id — are
 /// rejected with `-32602` BEFORE anything is removed; a combined call where
 /// only one id is valid is all-or-nothing, leaving the registry untouched.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn scoped_cancel_unknown_ids_error_and_remove_nothing() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -18598,7 +18598,7 @@ async fn scoped_cancel_unknown_ids_error_and_remove_nothing() {
 /// group still fires its single aggregated wake once the surviving sibling
 /// settles (group settlement is driven exclusively by the grouped watches,
 /// so leaving the child expected would hang the group forever).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn scoped_cancel_of_grouped_watch_lets_group_still_fire() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -18654,7 +18654,7 @@ async fn scoped_cancel_of_grouped_watch_lets_group_still_fire() {
 /// Scoped-cancelling the LAST grouped watch by `subscriptionId` empties the
 /// group's expected set; a group that can never fire is removed outright
 /// (in-memory + persisted row) rather than left behind.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn scoped_cancel_of_last_grouped_watch_removes_empty_group() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -18677,7 +18677,7 @@ async fn scoped_cancel_of_last_grouped_watch_removes_empty_group() {
 /// call, leaving the registry (and the persisted group row) empty. Scoped
 /// cancel leaves the caller's EVENT subscriptions untouched (the documented
 /// contract — those are `agent.unsubscribe`'s job).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn scoped_cancel_combined_success_and_event_subscriptions_untouched() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -18746,7 +18746,7 @@ async fn scoped_cancel_combined_success_and_event_subscriptions_untouched() {
 /// A delegate through the MCP front door (caller set) stamps the child's
 /// `parentAgentId`; the same op through the RPC front door (caller `None`)
 /// leaves it null.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
     let (_t, svc, ws) = setup().await;
     // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
@@ -18817,7 +18817,7 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
 /// service-level integration coverage chosen over a node-gated UDS E2E so the
 /// full loop is exercised deterministically without an external `node`
 /// dependency.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
     let (_t, svc, ws) = setup().await;
     // Pin `workspaceApi.toonOutput` off so the workspace_api tool bodies stay
@@ -19625,7 +19625,7 @@ async fn sender_watch_skips_independent_top_level_foreground_target() {
 /// `agent.wakeOrCreate` woke-existing with a caller: the caller gets a completion
 /// watch on the woken assignee; the response carries `subscriptionId` and the
 /// reference tool's notification text.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_woke_existing_subscribes_caller() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
@@ -19663,7 +19663,7 @@ async fn wake_or_create_woke_existing_subscribes_caller() {
 /// The caller gets a completion watch on the freshly created agent, the response
 /// carries `subscriptionId` + the notification line, and the child's terminal
 /// `agent:idle` delivers exactly one wake to the caller.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_created_new_subscribes_caller() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
@@ -19707,7 +19707,7 @@ async fn wake_or_create_created_new_subscribes_caller() {
 
 /// The caller-less (FE/RPC) wake registers nothing and the response stays in
 /// the pre-SUB-1 shape (no `subscriptionId` / `message` keys).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_without_caller_registers_no_watch() {
     let (_t, svc, ws) = setup().await;
     let target = create_agent(&svc, &ws, "Assignee").await;
@@ -19735,7 +19735,7 @@ async fn wake_or_create_without_caller_registers_no_watch() {
 /// free. The gate runs before any side-effectful work, so a non-chief caller
 /// waking a task outside its home workspace gets `-32602` with no agent
 /// created, no task assignment written, and no watch registered.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_scope_gate_rejection_create_branch_is_side_effect_free() {
     let (_t, svc, ws_a) = setup().await;
     let ws_b = WorkspaceId::new();
@@ -19782,7 +19782,7 @@ async fn wake_or_create_scope_gate_rejection_create_branch_is_side_effect_free()
 /// monorepo#932: the same pre-gate covers the wake branch — a rejected
 /// out-of-scope caller must not deliver the context message to the assignee,
 /// must not touch the task's assignments, and must register no watch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_scope_gate_rejection_wake_branch_is_side_effect_free() {
     let (_t, svc, ws_a) = setup().await;
     let ws_b = WorkspaceId::new();
@@ -19830,7 +19830,7 @@ async fn wake_or_create_scope_gate_rejection_wake_branch_is_side_effect_free() {
 /// monorepo#932 (chief parity): a chief-workspace caller passes the pre-gate
 /// and the cross-workspace wake still succeeds end-to-end with the SUB-1
 /// subscription attached.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_scope_gate_allows_chief_caller_cross_workspace() {
     let (_t, svc, ws) = setup().await;
     let chief_ws = WorkspaceId::chief();
@@ -19854,7 +19854,7 @@ async fn wake_or_create_scope_gate_allows_chief_caller_cross_workspace() {
 /// not be rejected by the pre-gate — the op proceeds and the SUB-1 watch is
 /// registered with the fallback anchor (the call's workspace), preserving the
 /// pre-fix behavior for callers whose session lookup fails.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_unknown_caller_still_proceeds() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Unknown caller").await;
@@ -19898,7 +19898,7 @@ async fn flag_agent_deleted(svc: &Services, agent: &AgentId) {
 /// a Deleted caller (asymmetry with `agent_delegate_op`'s deleted-parent
 /// guard). The wake itself proceeds, but the response keeps the caller-less
 /// shape (no `subscriptionId` / `message`) and no watch is registered.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_skips_watch_when_caller_deleted_wake_branch() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Deleted coordinator").await;
@@ -19929,7 +19929,7 @@ async fn wake_or_create_skips_watch_when_caller_deleted_wake_branch() {
 
 /// monorepo#994: the `created_new` branch must NOT register a SUB-1 watch for a
 /// Deleted caller either — parity with the wake branch guard above.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_skips_watch_when_caller_deleted_create_branch() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Deleted coordinator").await;
@@ -19957,7 +19957,7 @@ async fn wake_or_create_skips_watch_when_caller_deleted_create_branch() {
 /// created session's `parent_agent_id`, making a wakeOrCreate-created agent a
 /// delegated child — so `agent.reportToParent` succeeds for it and delivers
 /// the report wake to the caller, like a delegate child.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_created_new_sets_parent_to_live_caller() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
@@ -20002,7 +20002,7 @@ async fn wake_or_create_created_new_sets_parent_to_live_caller() {
 
 /// monorepo#3442: the caller-less create path keeps `parent_agent_id` unset —
 /// `reportToParent` stays unavailable for such agents.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_created_new_without_caller_leaves_parent_unset() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "No caller parent").await;
@@ -20029,7 +20029,7 @@ async fn wake_or_create_created_new_without_caller_leaves_parent_unset() {
 /// monorepo#3442: a Deleted caller must not become a parent (it can never
 /// receive the report wake) — mirrors `agent_delegate_op`'s deleted-parent
 /// guard, sharing the monorepo#994 `caller_deleted` pre-gate.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_created_new_deleted_caller_leaves_parent_unset() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Deleted coordinator").await;
@@ -20062,7 +20062,7 @@ async fn wake_or_create_created_new_deleted_caller_leaves_parent_unset() {
 /// `reportToParent` against a nonexistent recipient and emit an unresolvable
 /// `parentAgentId`. Parentage derives from the resolved `caller_session`, not
 /// the raw client-supplied ID.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_created_new_unknown_caller_leaves_parent_unset() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Unknown caller parent").await;
@@ -20094,7 +20094,7 @@ async fn wake_or_create_created_new_unknown_caller_leaves_parent_unset() {
 /// passes, but `agent_create_op`'s LC-1 guard reads the column and rejects —
 /// pre-fix this path never fired on the create branch (parent was `None`) and
 /// produced a parentless agent; post-fix the call errors.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_created_new_rejects_caller_column_at_depth_cap() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Capped coordinator").await;
@@ -20127,7 +20127,7 @@ async fn wake_or_create_created_new_rejects_caller_column_at_depth_cap() {
 
 /// monorepo#994: the queued-to-active branch shares the wake-branch SUB-1
 /// block, so a Deleted caller gets no caller→assignee watch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
     let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
     let caller = create_agent(&svc, &ws, "Deleted coordinator").await;
@@ -20164,7 +20164,7 @@ async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
 /// monorepo#994: the #932 pre-gate is ALSO skipped for a Deleted caller —
 /// mirroring `agent_delegate_op`, where a deleted out-of-scope parent gates
 /// nothing. The cross-workspace wake proceeds and still registers no watch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_deleted_out_of_scope_caller_skips_pre_gate() {
     let (_t, svc, ws_a) = setup().await;
     let ws_b = WorkspaceId::new();
@@ -20192,7 +20192,7 @@ async fn wake_or_create_deleted_out_of_scope_caller_skips_pre_gate() {
 /// Queued-to-active wake: the context message queues behind the assignee's
 /// in-flight turn; the caller gets an ungrouped watch on the target and the
 /// response carries the queued text.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_queued_registers_watch() {
     let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
@@ -20240,7 +20240,7 @@ async fn wake_or_create_queued_registers_watch() {
 /// [`Services::register_completion_watch`] to sidestep runtime turn-starting
 /// side effects) drives the queued wake through the reuse path in
 /// [`Services::agent_wake_or_create_op`].
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_queued_adopts_existing_watch() {
     let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
@@ -20389,7 +20389,7 @@ async fn find_and_refresh_ungrouped_watch_corrects_fallback_parent_anchor() {
 
 /// End-to-end through the MCP front door: delegating with a caller registers
 /// exactly one completion watch for the child returned by the tool.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mcp_delegate_immediate_registers_ungrouped_watch() {
     let (_t, svc, ws) = setup().await;
     // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
@@ -20542,7 +20542,7 @@ async fn delegate_prefers_agent_instructions_over_task_text() {
 
 /// With neither `agentInstructions` nor `taskText`, the child's first message
 /// falls back to the linked task note's content.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
     let (_t, svc, ws) = setup().await;
     let note = svc
@@ -20584,7 +20584,7 @@ async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
 /// `DelegateTaskTool` preamble ("Your Task Note" + scope contract) after the
 /// child's first message with a `---` separator. The task title and note id
 /// appear verbatim so the child can self-mark the note complete when done.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_appends_task_note_preamble_to_first_message() {
     let (_t, svc, ws) = setup().await;
     let note = svc
@@ -20661,7 +20661,7 @@ This note is your workspace for this task. Update it with your progress, finding
 /// message ends at the scope directive, byte-for-byte. The opt-out only gates
 /// the idle subscriber; the prompt-side policy is the neutral
 /// `## Commit Policy` clause in `rules.rs`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_omits_commit_instruction_when_skip_auto_commit_true() {
     let (_t, svc, ws) = setup().await;
     let note = svc
@@ -20714,7 +20714,7 @@ This note is your workspace for this task. Update it with your progress, finding
 
 /// `skipAutoCommit=false` (explicit) matches the default: no commit
 /// instruction tail — regression guard alongside the `=true` case above.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_omits_skip_auto_commit_instruction_when_false() {
     let (_t, svc, ws) = setup().await;
     let note = svc
@@ -20761,7 +20761,7 @@ async fn delegate_omits_skip_auto_commit_instruction_when_false() {
 /// session persists the opt-out even without an explicit `skipAutoCommit`
 /// from the caller, while the child's first message stays status-neutral
 /// (no OFF-state commit instruction).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_derives_skip_auto_commit_from_workspace_auto_commit_off() {
     let (_t, svc, ws) = setup().await;
     svc.store()
@@ -20814,7 +20814,7 @@ async fn delegate_derives_skip_auto_commit_from_workspace_auto_commit_off() {
 /// Harness-owned commits: the `agent.create` front door derives the same
 /// opt-out — a session created while the workspace's effective auto-commit is
 /// OFF persists `skip_auto_commit = true`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_create_derives_skip_auto_commit_from_workspace_auto_commit_off() {
     let (_t, svc, ws) = setup().await;
     svc.store()
@@ -20844,7 +20844,7 @@ async fn agent_create_derives_skip_auto_commit_from_workspace_auto_commit_off() 
 /// TASK-C: delegating with a linked task note but no explicit
 /// `agentInstructions` / `taskText` still injects the preamble (the note's
 /// body/title fallback slots in above it).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_task_note_only_injects_preamble_below_note_body() {
     let (_t, svc, ws) = setup().await;
     let note = svc
@@ -20940,7 +20940,7 @@ async fn delegate_without_message_source_delivers_nothing() {
 /// `ws.workspace.setAgentName` (`skipIfExplicitlySet: true`) can still rename
 /// it. Without this the child inherits the generic `Agent xxxxxx` fallback
 /// that leaks into the waiting panel and `agent:idle` wake reports.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_names_child_from_task_note_title() {
     let (_t, svc, ws) = setup().await;
     let note = svc
@@ -20979,7 +20979,7 @@ async fn delegate_names_child_from_task_note_title() {
 /// NAME-1: the taskText delegate path names the child from the task text,
 /// matching the reference `DelegateTaskTool` taskText branch. `taskText` wins
 /// over the linked note's title when both are present.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_names_child_from_task_text() {
     let (_t, svc, ws) = setup().await;
     let note = svc
@@ -23582,7 +23582,7 @@ async fn concurrent_completion_passes_deliver_one_terminal_wake() {
 /// shared across overlapping passes: both wakes carry the flipped task. The
 /// flip-take park forces exactly that interleaving: pass 1 is held between
 /// its take and the publish while pass 2 is released into the take.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -26904,7 +26904,7 @@ async fn request_attention_persists_fields_and_notice_for_non_delegated_agent() 
 /// `kind: "blocker"` writes the `blocker-report` meta.kind and moves the
 /// linked task to the new `blocked` status; `kind: "discussion"` moves it to
 /// `discussion_needed`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn request_attention_transitions_linked_task_per_kind() {
     for (kind, meta_kind, expected_status) in [
         (
@@ -26980,7 +26980,7 @@ async fn request_attention_transitions_linked_task_per_kind() {
 /// skips the task writer entirely (the `task.status == target` guard in
 /// `transition_linked_task_status`): the note's `rev` is unchanged by the
 /// second call, so repeated attention requests do not churn the note.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn request_attention_repeat_at_target_status_does_not_churn_note() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -27043,7 +27043,7 @@ async fn request_attention_repeat_at_target_status_does_not_churn_note() {
 
 /// Terminal task statuses (`complete` / `cancelled`) are never overwritten by
 /// an attention request — parity with `reportToParent`'s terminal guard.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn request_attention_does_not_overwrite_terminal_task_status() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Done task").await;
@@ -27912,7 +27912,7 @@ async fn wait_for_group_cleanup(svc: &Services, parent: &AgentId) {
 ///       settles and after an explicit cancel).
 /// Chosen over a node-gated UDS E2E so the whole loop runs deterministically
 /// with no external provider dependency, mirroring the AS-3/AS-4 worker tests.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn as6_end_to_end_auto_subscription_over_bus() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let worker = svc.spawn_completion_delivery_loop();
@@ -28164,7 +28164,7 @@ async fn diagnostics_agent_filter_narrows_scope() {
 /// associated with the task — the union of sessions persisting
 /// `task_note_id` (`agent.delegate`) and the note-side `assigned_agents`
 /// (`task.assignAgent`) — instead of matching nothing.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn diagnostics_task_filter_matches_task_agents() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "diagnostics filter task").await;
@@ -28197,7 +28197,7 @@ async fn diagnostics_task_filter_matches_task_agents() {
 
 /// monorepo#1150: an agent assigned note-side only (`task.assignAgent`; its
 /// session's `task_note_id` is unset) is still in the `taskNoteId` scope.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn diagnostics_task_filter_includes_note_side_assignees() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "note-side assignment task").await;
@@ -28221,7 +28221,7 @@ async fn diagnostics_task_filter_includes_note_side_assignees() {
 /// `assigned_agents` — the session-side branch of the union stands on its
 /// own. (`agent.delegate` sets both sides, so the note-side assignment is
 /// stripped store-side to isolate the branch.)
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn diagnostics_task_filter_matches_session_side_only() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "session-side only task").await;
@@ -29120,7 +29120,7 @@ async fn agent_edit_truncate_bad_target_mutates_nothing() {
 /// The `WorkspaceApi::agent_edit_and_regenerate` no-manager fallback applies
 /// the `model` param (parity with the manager path), truncates, and persists
 /// the edited message; a bad target is rejected BEFORE the model switch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_edit_and_regenerate_fallback_applies_model_and_truncates() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "EditFallback").await;
@@ -29221,7 +29221,7 @@ fn wake_input(model: Option<&str>) -> AgentWakeOrCreateInput {
 /// The pre-widening 3-required-params shape (`model` only) still creates and
 /// assigns when the task has no prior agent; response carries the widened
 /// `action`/`agentName`/`taskTitle` fields and `created: true`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_backcompat_create_branch_widened_response() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Ship it").await;
@@ -29239,7 +29239,7 @@ async fn wake_or_create_backcompat_create_branch_widened_response() {
 
 /// B1: newest-first. When the task has an older assignment plus a newer live
 /// one, the newer one is woken (not the oldest) and `created: false`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_wakes_newest_of_multiple_assignments() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Multi").await;
@@ -29292,7 +29292,7 @@ async fn wake_or_create_wakes_newest_of_multiple_assignments() {
 /// B2: stale earlier assignment (session gone) is skipped, cleaned up from
 /// the task's `assigned_agent_ids`, and reported in `cleanedUpAgentIds`; the
 /// older-but-live agent is woken.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_skips_stale_and_reports_cleanup() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Stale").await;
@@ -29359,7 +29359,7 @@ async fn wake_or_create_skips_stale_and_reports_cleanup() {
 
 /// B3: delegation-depth guard rejects when the explicit `delegationDepth`
 /// meets or exceeds `MAX_DELEGATION_DEPTH` with an `InvalidParams` error.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_depth_guard_rejects_at_cap() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Deep").await;
@@ -29379,7 +29379,7 @@ async fn wake_or_create_depth_guard_rejects_at_cap() {
 
 /// B3 (compute path): when `delegationDepth` is omitted but `callerAgentId`
 /// is provided, the guard reads the caller session's `metadata.delegationDepth`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_depth_guard_reads_caller_metadata() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Caller").await;
@@ -29416,7 +29416,7 @@ async fn wake_or_create_depth_guard_reads_caller_metadata() {
 /// B4 + B5 + B6: specialist inherits from the newest previous session; the
 /// rich create payload (name / contextReferences / metadata / skipAutoCommit)
 /// lands on the persisted session row so a child wake can read it back.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Inherit").await;
@@ -29497,7 +29497,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
 /// strict validation, or whose file was since deleted) is dropped with a warn
 /// instead of failing the wake — the strict `-32602` applies only to
 /// client-supplied ids, never to legacy stored state.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_drops_stale_inherited_specialist() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Stale").await;
@@ -29561,7 +29561,7 @@ async fn wake_or_create_drops_stale_inherited_specialist() {
 /// stale AND the client supplied a valid `create.specialist`, the drop falls
 /// through to the client value (already strict-validated) instead of no
 /// specialist.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Fallback").await;
@@ -29626,7 +29626,7 @@ async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
 /// validation), and the rejection is side-effect free — the stale-assignment
 /// purge must not have run, so the previous (deleted) agent's task assignment
 /// survives and no new session is persisted.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_rejects_unknown_create_specialist_side_effect_free() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Strict").await;
@@ -29706,7 +29706,7 @@ async fn wake_or_create_rejects_unknown_create_specialist_side_effect_free() {
 
 /// B7: `messageMetadata` is folded onto the delivered content block on the
 /// create branch (and by construction the wake branch shares the same helper).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_delivers_message_metadata_on_block() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Tag").await;
@@ -29736,7 +29736,7 @@ async fn wake_or_create_delivers_message_metadata_on_block() {
 /// persist `messageMetadata` as ROW-LEVEL metadata (not just folded onto the
 /// content block), matching the direct-send and queue-drain persists — the FE
 /// attribution chip reads the row's `metadata` column.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_store_only_persists_row_level_metadata() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Row tag").await;
@@ -29861,7 +29861,7 @@ async fn expect_status(
 /// the coordinator's follow-up looked "sent" but no work happened. Proof:
 /// the runtime's `try_begin` slot claim emits `agent:status-changed`
 /// with `status: "active"`; that event MUST appear on the create branch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn deliv1_wake_or_create_drives_turn_via_runtime() {
     let (_t, svc, manager, bus, ws) = setup_with_manager().await;
     let note_id = seed_task(&svc, &ws, "DELIV-1 wake").await;
@@ -29890,7 +29890,7 @@ async fn deliv1_wake_or_create_drives_turn_via_runtime() {
 /// actually processes the follow-up context message instead of silently
 /// storing it. Same evidence: `agent:status-changed[active]` fires on
 /// each wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn deliv1_wake_existing_drives_turn_via_runtime() {
     let (_t, svc, manager, bus, ws) = setup_with_manager().await;
     let note_id = seed_task(&svc, &ws, "DELIV-1 wake-existing").await;
@@ -29939,7 +29939,7 @@ async fn deliv1_wake_existing_drives_turn_via_runtime() {
 /// called the store-only `agent_send_message_op` unconditionally, so
 /// coordinator follow-ups over a task note silently no-op'd. Interrupt
 /// priority already routed correctly; this test locks in the default.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn deliv1_send_to_task_non_interrupt_drives_turn_via_runtime() {
     let (_t, svc, manager, bus, ws) = setup_with_manager().await;
     let agent_id = create_agent(&svc, &ws, "Follow-up target").await;
@@ -29969,7 +29969,7 @@ async fn deliv1_send_to_task_non_interrupt_drives_turn_via_runtime() {
 /// ALSO driving a turn via the runtime. Guards against a regression that
 /// might trade block-embedded metadata for row-level metadata when
 /// routing through `agent_manager.send_message`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn deliv1_wake_or_create_persists_block_metadata_alongside_runtime_drive() {
     let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
     let note_id = seed_task(&svc, &ws, "Tag").await;
@@ -29998,7 +29998,7 @@ async fn deliv1_wake_or_create_persists_block_metadata_alongside_runtime_drive()
 /// (manager attached, slot claimed, pre-persisted spawn) must also store
 /// `messageMetadata` as row-level metadata — parity with `persist_user`'s
 /// queue-drain persist and the direct `agent.sendMessage` path.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn deliv1_wake_runtime_idle_branch_persists_row_level_metadata() {
     let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
     let note_id = seed_task(&svc, &ws, "Row tag runtime").await;
@@ -30040,7 +30040,7 @@ async fn deliv1_wake_runtime_idle_branch_persists_row_level_metadata() {
 /// Before fix: parent received individual wake for child A, aggregated "All 2 settled"
 /// wake, AND duplicate individual wake for child B.
 /// After fix: parent receives exactly ONE aggregated wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn sub1_sendtotask_after_all_no_duplicate_wake() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let _worker = svc.spawn_completion_delivery_loop();
@@ -30365,7 +30365,7 @@ async fn agent_store_mutations_reject_cross_workspace_writes() {
 /// under the workspace's `WorkspaceWatches` entry). One `agent:deleted` fires
 /// per session ahead of the terminal `workspace:deleted`, so a same-slug
 /// recreate observes zero ghost agents and no residual event traffic.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state() {
     let (tmp, svc, ws, bus) = setup_with_bus().await;
     // The delete path walks `workspaces_root` to unlink the daemon-owned
@@ -30466,7 +30466,7 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
 /// directly. Exactly one wake reaches the chief parent, the watch is gone from
 /// the registry (memory + persisted row), and a later bus-loop reprocessing of
 /// the same event delivers nothing (no duplicate wake).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delete_workspace_consumes_chief_ungrouped_watch_without_bus() {
     let (tmp, svc, ws) = setup().await;
     let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
@@ -30539,7 +30539,7 @@ async fn delete_workspace_consumes_chief_ungrouped_watch_without_bus() {
 /// in the deleted workspace records that child in `deleted_agent_ids` at
 /// delete time (no bus wired, no restart needed), and the grouped watch no
 /// longer references the deleted workspace as its child side.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delete_workspace_records_deleted_child_in_chief_after_all_group() {
     let (tmp, svc, ws) = setup().await;
     let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
@@ -30580,7 +30580,7 @@ async fn delete_workspace_records_deleted_child_in_chief_after_all_group() {
 /// clients converge on the shrunken watch set without polling — the swept
 /// grouped watch would otherwise leave stale waiting flags until the group
 /// settles.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delete_workspace_backstop_sweep_emits_subscriptions_changed() {
     let (tmp, svc, ws, bus) = setup_with_bus().await;
     let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
@@ -30626,7 +30626,7 @@ async fn delete_workspace_backstop_sweep_emits_subscriptions_changed() {
 /// The workspace-delete sweep stays scoped: watches parented in the deleted
 /// workspace and groups anchored there are still dropped, while watches and
 /// groups that live entirely in another workspace are untouched.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delete_workspace_leaves_unrelated_watches_and_groups_untouched() {
     let (tmp, svc, ws_a) = setup().await;
     let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
@@ -32339,7 +32339,7 @@ async fn migrate_queue_rearms_hold_timers_for_target() {
 /// must not be redriven via `resume_interrupted_agent` — the retired probe
 /// after the atomic claim rejects with the agent.restore hint, and the row
 /// resets to pending so the interruption stays resolvable after restore.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn resume_interrupted_rejects_retired_session_and_resets_to_pending() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "RetiredInterrupted").await;
@@ -32374,7 +32374,7 @@ async fn resume_interrupted_rejects_retired_session_and_resets_to_pending() {
 /// the append is idempotent on retry: when a prior resume attempt already left
 /// the marker as the transcript tail (continuation delivery failed, row reset
 /// to pending), a second resume must not append a duplicate marker.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn resume_interrupted_marker_is_idempotent_on_retry() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Interrupted").await;
@@ -32442,7 +32442,7 @@ async fn resume_interrupted_marker_is_idempotent_on_retry() {
 /// Wake-resume Task D: the sweep resumes ONLY rows tagged `system_suspend`
 /// (what Task C enrolls) and leaves rows a user left pending for other reasons
 /// (daemon restart, agent stop, …) untouched.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_resume_targets_only_system_suspend_rows() {
     let (_t, svc, ws) = setup().await;
 
@@ -32530,7 +32530,7 @@ async fn wake_resume_skips_agents_without_resumable_session() {
 /// claim in `resume_interrupted_agent` guarantees it effectively runs exactly
 /// once — exactly one racer transitions the pending row to resumed, and the row
 /// is never double-resumed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_resume_runs_resume_exactly_once_under_concurrent_resolve() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Raced").await;
@@ -32602,7 +32602,7 @@ fn subscribe_subscriptions_changed(bus: &EventBus) -> crate::Subscription {
 /// home workspace (like every other watch-lifecycle site). The re-armed
 /// watch reads as the orthogonal `waiting` flag — never a `displayStatus`
 /// transition.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn resume_watch_reregistration_publishes_subscriptions_changed() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -32655,7 +32655,7 @@ async fn resume_watch_reregistration_publishes_subscriptions_changed() {
 /// monorepo#1449 (grouped branch): a resumed child still expected by an
 /// `after_all` delegation group re-arms the GROUPED watch — that path must
 /// publish `agent:subscriptions-changed` too.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn resume_grouped_watch_reregistration_publishes_subscriptions_changed() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -32697,7 +32697,7 @@ async fn resume_grouped_watch_reregistration_publishes_subscriptions_changed() {
 /// exists, resume reuses it via `find_and_refresh_ungrouped_watch` — the
 /// snapshot event is still published, but the displayStatus recompute is a
 /// no-op (already promoted) and stays silent.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn resume_existing_watch_refresh_publishes_snapshot_without_display_status() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -32729,7 +32729,7 @@ async fn resume_existing_watch_refresh_publishes_snapshot_without_display_status
 /// re-registration (non-chief parent homed in a different workspace than the
 /// child), resume keeps its existing warn-only behavior and publishes NO
 /// `agent:subscriptions-changed`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn resume_watch_rejection_publishes_no_subscriptions_changed() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let ws_b = WorkspaceId::new();
@@ -33064,7 +33064,7 @@ async fn session_poisoned_requires_error_status_and_fatal_reason_or_streak() {
 /// monorepo#840: `wakeOrCreate` must NOT wake a poisoned session (Error +
 /// session-fatal provider block) — it is cleaned off the task and a fresh
 /// agent is created, inheriting specialist from the poisoned source.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_skips_poisoned_session_and_creates_fresh() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Poison").await;
@@ -33134,7 +33134,7 @@ async fn wake_or_create_skips_poisoned_session_and_creates_fresh() {
 /// monorepo#840: a streak of identical terminal failures (no recognized
 /// provider block in the `stop_reason`) also makes the session non-resumable
 /// for `wakeOrCreate`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_skips_streak_poisoned_session() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Streak").await;
@@ -33191,7 +33191,7 @@ async fn poison_session(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
 /// queue and no live sibling → `created_new`, the queue migrates in order
 /// onto the fresh agent with per-entry flags reset, and the poisoned session
 /// is GC'd (hard-deleted, persisted rows cascaded).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_migrates_poisoned_queue_to_created_agent() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Migrate Create").await;
@@ -33245,7 +33245,7 @@ async fn wake_or_create_migrates_poisoned_queue_to_created_agent() {
 /// monorepo#847 wiring (wake branch): a poisoned sibling's parked queue
 /// migrates onto the woken live agent (`woke_existing`), and the poisoned
 /// session is GC'd while `cleanedUpAgentIds` still lists it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_migrates_poisoned_sibling_queue_to_woken_agent() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Migrate Wake").await;
@@ -33354,7 +33354,7 @@ async fn wake_or_create_migrates_cross_workspace_poisoned_sibling_queue_to_woken
 /// monorepo#847: `NotFound` and soft-Deleted stale assignments keep the
 /// cleanup-only behavior — stripped and reported, but never run through
 /// migration/GC (the soft-Deleted row and its parked queue survive).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_cleanup_only_for_not_found_and_soft_deleted() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Cleanup Only").await;
@@ -33415,7 +33415,7 @@ async fn wake_or_create_cleanup_only_for_not_found_and_soft_deleted() {
 /// `cleanedUpAgentIds` (and its task assignment survives) so the next
 /// `agent.wakeOrCreate` actually retries — and succeeds once the store
 /// recovers.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_survives_failed_queue_migration() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Migrate Fail").await;
@@ -34472,7 +34472,7 @@ const STALL_MARKER: &str = "may have stalled rather than finished (monorepo#1016
 /// suspected-stall annotation appended to the wake text, and the wake's
 /// `event_notification` metadata carries `stallSuspected: true` + the task's
 /// wire status.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stall_suspected_wake_annotated_when_no_report_and_task_incomplete() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -34532,7 +34532,7 @@ async fn stall_suspected_wake_annotated_when_no_report_and_task_incomplete() {
 /// A completion WITH a persisted completion report is clean — no annotation,
 /// no `stallSuspected` metadata — even though the assigned task note is still
 /// incomplete (the child reported, so the parent has the real signal).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stall_annotation_skipped_when_completion_report_present() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -34585,7 +34585,7 @@ async fn stall_annotation_skipped_when_completion_report_present() {
 /// and a task note already `complete` → clean wake (the work IS finished,
 /// report or not). Also covers fail-open: a dangling `task_note_id` whose
 /// note row is gone must not annotate (store lookup fails → no annotation).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stall_annotation_skipped_for_no_task_completed_task_and_missing_note() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -34647,7 +34647,7 @@ async fn stall_annotation_skipped_for_no_task_completed_task_and_missing_note() 
 /// `agent:failed` never carries the stall annotation — failure is already an
 /// explicit signal, and the annotation is scoped to misleading "completed"
 /// wording on agent:idle.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stall_annotation_skipped_for_agent_failed() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -34685,7 +34685,7 @@ async fn stall_annotation_skipped_for_agent_failed() {
 /// Grouped `after_all` path: a suspected-stall child's per-child line in the
 /// aggregated wake carries the annotation, and the aggregated metadata lifts
 /// `stallSuspected: true` from the annotated raw event.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stall_annotation_applies_to_grouped_after_all_child_line() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Caller").await;
@@ -34762,7 +34762,7 @@ async fn stall_annotation_applies_to_grouped_after_all_child_line() {
 /// after a restart as Completed WITHOUT a completion report — while its
 /// assigned task note is still `in_progress` — carries the suspected-stall
 /// annotation in the synthesized per-child line of the aggregated wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
     let tmp = TempDb::new();
     let ws = WorkspaceId::new();
@@ -34834,7 +34834,7 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
 /// monorepo#1898: a task note in `review_required` means the child explicitly
 /// reported completion (reportToParent's TASK-B transition) — an idle with no
 /// persisted report must NOT get the "may have stalled" annotation.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stall_annotation_skipped_when_task_review_required() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -34879,7 +34879,7 @@ async fn stall_annotation_skipped_when_task_review_required() {
 /// neither the contradictory "No completion report … may have stalled" tail
 /// nor the machine-readable `stallSuspected` metadata, in both the
 /// standalone wake and the grouped `after_all` per-child line.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stall_tail_never_contradicts_rendered_report() {
     let (_t, svc, ws) = setup().await;
 
@@ -34986,7 +34986,7 @@ async fn stall_tail_never_contradicts_rendered_report() {
 /// persisted completion report is redrive-eligible; each of the exclusions —
 /// no parent, no task note, non-in-progress task, persisted report — makes
 /// it ineligible (today's WARN + advisory behavior).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn truncation_redrive_eligibility_gates() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -35177,7 +35177,7 @@ async fn empty_wake_recovery_raises_attention_for_root_agent() {
 /// empty-wake nudge enqueued (tagged `{"type": "empty_wake_redrive"}`)
 /// instead of an attention request — bounded by the shared consecutive
 /// counter, past which the attention arm takes over.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn empty_wake_recovery_enqueues_nudge_for_delegated_agent_until_cap() {
     use crate::agent_session::MAX_CONSECUTIVE_TRUNCATION_REDRIVES;
     let (_t, svc, ws) = setup().await;
@@ -38047,7 +38047,7 @@ async fn seed_pending_question(svc: &Services, id: &AgentId) {
 /// questions are pending — no queue park, no `heldForQuestions` — and the
 /// marker survives it. An UNTAGGED user send leaves the marker too: only a
 /// `question_answers` tag (or a dismissal) retires it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pending_questions_do_not_gate_store_only_automatic_send() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Asker").await;
@@ -38110,7 +38110,7 @@ async fn pending_questions_do_not_gate_store_only_automatic_send() {
 
 /// Store-only `agent_send_to_task_op` (automatic by definition) delivers
 /// while questions are pending.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pending_questions_do_not_gate_store_only_send_to_task() {
     let (_t, svc, ws) = setup().await;
     let agent_id = create_agent(&svc, &ws, "TaskRecv").await;
@@ -38255,7 +38255,7 @@ fn delegate_input(note_id: &NoteId, force: Option<bool>) -> AgentDelegateInput {
 }
 
 /// Unoccupied task → first delegate succeeds without `force`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_unoccupied_task_succeeds_without_force() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Fresh").await;
@@ -38268,7 +38268,7 @@ async fn delegate_unoccupied_task_succeeds_without_force() {
 
 /// Occupied task (live assigned agent) → second delegate is rejected with
 /// `-32602` naming the existing agent; `force: true` allows it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_occupied_task_rejected_unless_forced() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Busy").await;
@@ -38318,7 +38318,7 @@ async fn delegate_occupied_task_rejected_unless_forced() {
 
 /// Stale (`NotFound`), soft-Deleted, and poisoned assignees do NOT count as
 /// occupancy — a new delegate still succeeds without `force`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_with_only_dead_assignees_succeeds_without_force() {
     // NotFound-stale: a validly-formatted id with no session row.
     let (_t, svc, ws) = setup().await;
@@ -38358,7 +38358,7 @@ async fn delegate_with_only_dead_assignees_succeeds_without_force() {
 
 /// A task whose status is `complete` or `cancelled` is not workable — its
 /// assignments never count as occupancy, so delegation passes without `force`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_completed_or_cancelled_task_succeeds_without_force() {
     for status in ["complete", "cancelled"] {
         let (_t, svc, ws) = setup().await;
@@ -38386,7 +38386,7 @@ async fn delegate_completed_or_cancelled_task_succeeds_without_force() {
 /// `task.assignAgent`: a NEW agent on an occupied task is rejected without
 /// `force` and allowed with it; re-assigning the already-assigned id stays
 /// idempotent-ok either way.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn assign_agent_occupancy_guard_and_idempotent_reassign() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Guarded").await;
@@ -40992,7 +40992,7 @@ async fn seed_task_note(svc: &Services, ws: &WorkspaceId, title: &str, status: &
 /// (`blocked` / `waiting` included), `complete` / `cancelled` are dropped,
 /// keys are in `BTreeMap` order, and the field alone forces the injection
 /// line.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_snapshot_counts_open_task_statuses_and_forces_injection() {
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "Coordinator").await;
@@ -41038,7 +41038,7 @@ async fn agent_snapshot_counts_open_task_statuses_and_forces_injection() {
 
 /// A workspace whose task notes are all `complete` / `cancelled` omits
 /// `tasks` entirely and stays trivial — no injection line fires.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_snapshot_omits_tasks_when_only_terminal_statuses() {
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "Coordinator").await;
@@ -41091,7 +41091,7 @@ fn row_for<'a>(resp: &'a serde_json::Value, id: &NoteId) -> &'a serde_json::Valu
 
 /// Empty `tasks`, and mixing `tasks` with single-task addressing, are both
 /// rejected up front with no side effects.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_rejects_empty_and_mixed_addressing() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Solo").await;
@@ -41251,7 +41251,7 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
 /// N identical per-row `error` dispositions; no children are persisted. An
 /// unknown per-entry override stays a per-row `error` (other rows still
 /// start), consistent with the other per-entry options.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_rejects_unknown_specialist_default_fast() {
     let (_t, svc, ws) = setup().await;
     let t1 = seed_task(&svc, &ws, "One").await;
@@ -41319,7 +41319,7 @@ async fn batch_delegate_rejects_unknown_specialist_default_fast() {
 
 /// The full batch shape: ready task starts (agent created + assigned),
 /// dep-blocked task holds with the unmet ids, and the unlock plan names it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_starts_ready_holds_dep_blocked_and_projects_unlock() {
     let (_t, svc, ws) = setup().await;
     let t1 = seed_task(&svc, &ws, "First").await;
@@ -41408,7 +41408,7 @@ async fn batch_delegate_starts_ready_holds_dep_blocked_and_projects_unlock() {
 /// monorepo#3334 regression: a batch where EVERYTHING holds on dependencies
 /// returns `ok: true` but must carry a zeroed summary and the prominent
 /// warning, so the caller cannot misread the call as "work started".
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_zero_started_carries_summary_and_warning() {
     let (_t, svc, ws) = setup().await;
     let dep = seed_task(&svc, &ws, "Dep").await;
@@ -41455,7 +41455,7 @@ async fn batch_delegate_zero_started_carries_summary_and_warning() {
 
 /// monorepo#3334 regression: an all-started batch carries the summary but no
 /// warning.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_all_started_summary_without_warning() {
     let (_t, svc, ws) = setup().await;
     let t1 = seed_task(&svc, &ws, "First").await;
@@ -41478,7 +41478,7 @@ async fn batch_delegate_all_started_summary_without_warning() {
 /// monorepo#3334 fix 3: a zero-started `after_all` batch from an agent caller
 /// with NO open delegation group delivers an immediate advisory wake to the
 /// parent — otherwise no settlement wake would ever arrive (silent stall).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_zero_started_after_all_delivers_advisory_wake() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -41530,7 +41530,7 @@ async fn batch_delegate_zero_started_after_all_delivers_advisory_wake() {
 /// delegation still owes the parent a settlement wake, a zero-started batch
 /// stays silent — the coming settlement wake is the resume signal, and a
 /// redundant advisory would double-wake the parent.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_zero_started_after_all_skips_advisory_when_group_open() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -41566,7 +41566,7 @@ async fn batch_delegate_zero_started_after_all_skips_advisory_when_group_open() 
 /// task still starts exactly as before, but its row carries
 /// `relationsUnknown: true`, the relation-bearing rows carry no flag, and the
 /// unlock message counts the started uncovered tasks.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_annotates_relation_less_tasks_and_counts_them() {
     let (_t, svc, ws) = setup().await;
     let t1 = seed_task(&svc, &ws, "First").await;
@@ -41604,7 +41604,7 @@ async fn batch_delegate_annotates_relation_less_tasks_and_counts_them() {
 /// All-relation-less request: every row flags and the summary counts them
 /// all. A task referenced by another requested task's `dependsOn` while
 /// declaring none itself is covered by the graph — no flag, no count.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_flags_all_uncovered_and_spares_referenced_tasks() {
     let (_t, svc, ws) = setup().await;
     let a = seed_task(&svc, &ws, "A").await;
@@ -41657,7 +41657,7 @@ async fn batch_delegate_flags_all_uncovered_and_spares_referenced_tasks() {
 /// The flag is stamped regardless of disposition: an uncovered task that
 /// skips (already complete) still carries `relationsUnknown: true`, and the
 /// count sentence stays absent when flagged tasks exist but none started.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_flags_non_started_rows_and_counts_started_only() {
     let (_t, svc, ws) = setup().await;
     let done = seed_task(&svc, &ws, "Done").await;
@@ -41684,7 +41684,7 @@ async fn batch_delegate_flags_non_started_rows_and_counts_started_only() {
 
 /// Conflicts: the later task of a conflicting pair holds, naming the pair,
 /// and the reason points at individual delegation (no more greedy override).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_conflicts_hold_and_point_at_individual_delegation() {
     let (_t, svc, ws) = setup().await;
     let a = seed_task(&svc, &ws, "A").await;
@@ -41722,7 +41722,7 @@ async fn batch_delegate_conflicts_hold_and_point_at_individual_delegation() {
 /// Per-task option entries: an object entry's `specialist`/`model`/
 /// `reasoningEffort` override the top-level defaults for that task only,
 /// while bare-string entries inherit the defaults; row shape is unchanged.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_per_task_options_override_top_level_defaults() {
     let (_t, svc, ws) = setup().await;
     let plain = seed_task(&svc, &ws, "Plain").await;
@@ -41794,7 +41794,7 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
 
 /// Terminal statuses skip; a cancelled dependency surfaces as
 /// decision-needed rather than a plain hold.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_skips_terminal_and_flags_cancelled_deps() {
     let (_t, svc, ws) = setup().await;
     let done = seed_task(&svc, &ws, "Done").await;
@@ -41843,7 +41843,7 @@ use crate::agent_ops::ready_delta::{UNBLOCKED_SECTION_PREFIX, UNBLOCKED_TRIGGER_
 /// and the store-only delivery path (no `AgentManager` attached — delivery IS
 /// the persist) resolves the section fresh: the dependent task's row names it
 /// with an `intent://local/task/` link and the deps-satisfied reason.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_graph_on_then_off_completion_wake_keeps_unblocked_section() {
     let (_t, svc, ws, registry, _config) = setup_with_task_graph(true).await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -41905,7 +41905,7 @@ async fn task_graph_on_then_off_completion_wake_keeps_unblocked_section() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_graph_off_then_on_completion_wake_omits_unblocked_section() {
     let (_t, svc, ws, registry, _config) = setup_with_task_graph(false).await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -41958,7 +41958,7 @@ async fn task_graph_off_then_on_completion_wake_omits_unblocked_section() {
 /// A child with no linked task note produces a wake with no trigger stamp and
 /// no section — byte-for-byte the pre-2044 wake. Same for a completion whose
 /// task unlocks nothing.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn taskless_and_no_delta_wakes_are_unannotated() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -42021,7 +42021,7 @@ async fn taskless_and_no_delta_wakes_are_unannotated() {
 /// section is rendered appears in the delivered section (delivery-time state
 /// wins). Rendered here via `unblocked_section_for_delivery`, the exact
 /// function the drain paths call at flush time.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn unblocked_section_reflects_state_at_render_time_not_enqueue() {
     let (_t, svc, ws, _registry, _config) = setup_with_task_graph(true).await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -42090,7 +42090,7 @@ async fn unblocked_section_reflects_state_at_render_time_not_enqueue() {
 /// `after_all` aggregated wake: every idle-settled task-linked member
 /// contributes its trigger id to the group wake's metadata (the enumeration
 /// still resolves at delivery).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn group_wake_stamps_all_settled_member_trigger_tasks() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Caller").await;
@@ -42157,7 +42157,7 @@ async fn group_wake_stamps_all_settled_member_trigger_tasks() {
 /// settlement: the trigger is captured on the RECORDED event when the child
 /// settles, so deleting the child session before the last member settles
 /// does not lose its task from the aggregated wake's trigger stamp.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn group_wake_keeps_trigger_of_child_deleted_before_settlement() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Caller").await;
@@ -42227,7 +42227,7 @@ async fn group_wake_keeps_trigger_of_child_deleted_before_settlement() {
 /// into its completion wake's trigger stamp alongside its own linked task —
 /// and the flip set is CONSUMED on stamp: a second completion cycle stamps
 /// only the own task, never re-attributing the old flips.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn completion_wake_joins_flipped_triggers_and_consumes_them() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -42320,7 +42320,7 @@ async fn completion_wake_joins_flipped_triggers_and_consumes_them() {
 /// A child with NO linked task note that flipped another task still stamps
 /// that flip as its completion wake's trigger (previously such wakes were
 /// unannotated).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn unlinked_child_completion_wake_stamps_flips_only() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -42376,7 +42376,7 @@ async fn unlinked_child_completion_wake_stamps_flips_only() {
 
 /// A progress report leaves flipped-completion trigger facts untouched. The
 /// later terminal wake stamps and consumes them when it retires the watch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_progress_preserves_flips_for_terminal_wake() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -42464,7 +42464,7 @@ async fn report_to_parent_progress_preserves_flips_for_terminal_wake() {
 /// `after_all` aggregated wake: a settled member's flipped completions are
 /// captured (and consumed) at group RECORD time and survive into the
 /// aggregated wake's trigger stamp alongside every member's own task.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn group_wake_includes_flipped_completion_triggers() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Caller").await;
@@ -42548,7 +42548,7 @@ async fn group_wake_includes_flipped_completion_triggers() {
 /// explicit send with no `AgentManager` attached) resolves the unblocked
 /// section at persist time — parity with the manager path and the store-only
 /// `deliver_parent_wake` branch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn no_manager_send_now_resolves_unblocked_section() {
     let (_t, svc, ws, _registry, _config) = setup_with_task_graph(true).await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -42609,7 +42609,7 @@ async fn no_manager_send_now_resolves_unblocked_section() {
 /// (intent-hq/monorepo#2445): with the toggle opted out, the same trigger
 /// stamp that would render a section yields `None` — the wake delivers
 /// unannotated. The opted-out value is captured when the session is created.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_graph_off_suppresses_unblocked_section() {
     let (_t, svc, ws, _registry, _config) = setup_with_task_graph(false).await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -43262,7 +43262,7 @@ fn assert_compound_model_rejection(err: Error, param: &str) {
     }
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wire_agent_create_rejects_compound_model() {
     let (_t, svc, ws) = setup().await;
     for bad in ["mock:default", ":default"] {
@@ -43296,7 +43296,7 @@ async fn wire_agent_create_rejects_compound_model() {
     .expect("bare model accepted");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wire_agent_delegate_rejects_compound_model() {
     let (_t, svc, ws) = setup().await;
     for bad in ["mock:default", ":default"] {
@@ -43330,7 +43330,7 @@ async fn wire_agent_delegate_rejects_compound_model() {
     .expect("bare model accepted");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wire_agent_delegate_rejects_compound_model_in_batch_tasks() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Batch").await;
@@ -43355,7 +43355,7 @@ async fn wire_agent_delegate_rejects_compound_model_in_batch_tasks() {
     assert_compound_model_rejection(err, "tasks[0].model");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wire_agent_set_model_rejects_compound_model_id() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Setter").await;
@@ -43370,7 +43370,7 @@ async fn wire_agent_set_model_rejects_compound_model_id() {
         .expect("bare modelId accepted");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wire_agent_wake_or_create_rejects_compound_model() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Wake").await;
@@ -43414,7 +43414,7 @@ async fn wire_agent_wake_or_create_rejects_compound_model() {
     assert_eq!(resp["created"], true);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wire_create_workspace_rejects_compound_initial_agent_model() {
     let (_t, svc, _ws) = setup().await;
     let before = svc.list_workspaces(true).await.expect("list").len();
@@ -43457,7 +43457,7 @@ async fn wire_agent_enhance_prompt_rejects_compound_model() {
     }
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wire_agent_edit_and_regenerate_rejects_compound_model() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Editor").await;

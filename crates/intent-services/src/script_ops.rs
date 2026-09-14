@@ -2337,7 +2337,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_status_returns_not_found_for_missing_id() {
         let h = harness().await;
         let err = h
@@ -2348,7 +2348,7 @@ mod tests {
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_remove_returns_not_found_for_missing_id() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -2379,7 +2379,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_start_returns_not_found_for_missing_id() {
         let h = harness().await;
         let err = h
@@ -2390,7 +2390,7 @@ mod tests {
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_stop_returns_not_found_for_missing_id() {
         let h = harness().await;
         let err = h
@@ -2401,7 +2401,7 @@ mod tests {
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_output_returns_not_found_for_missing_id() {
         let h = harness().await;
         let err = h
@@ -2412,7 +2412,7 @@ mod tests {
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_run_returns_not_found_for_missing_id() {
         let h = harness().await;
         let err = h
@@ -2423,7 +2423,7 @@ mod tests {
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_create_preserves_explicit_script_id() {
         let h = harness().await;
         let id = create(
@@ -2451,7 +2451,7 @@ mod tests {
         assert_eq!(entry["runtime"]["status"], "idle");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_definition_mutations_emit_changed_events() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -2504,7 +2504,7 @@ mod tests {
         assert_eq!(actions, vec!["created", "removed", "updated"]);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_create_empty_script_id_falls_back_to_uuid() {
         let h = harness().await;
         let id = create(
@@ -2522,7 +2522,7 @@ mod tests {
         assert_eq!(id.split('-').count(), 5, "id should be a uuid: {id}");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_list_is_workspace_scoped() {
         let h = harness().await;
         let _a = create_simple(&h, "a", "echo a", ScriptMode::Command).await;
@@ -2553,7 +2553,7 @@ mod tests {
         assert_eq!(names, vec!["a", "b"], "workspace-scoped");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn scripts_persist_across_service_restart() {
         let h = harness().await;
         let mut env = std::collections::BTreeMap::new();
@@ -2608,7 +2608,7 @@ mod tests {
     /// `previouslyRunning: true` (the stored-on-write `was_running` marker),
     /// and the marker persists across repeated restarts until the script is
     /// stopped.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn service_running_at_daemon_death_hydrates_previously_running() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -2733,7 +2733,7 @@ mod tests {
     /// is the FE dismiss affordance: it returns ok, drops `previouslyRunning`
     /// from the runtime state, publishes the cleared state as `script:state`,
     /// and durably clears the persisted marker.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_stop_dismisses_previously_running_marker() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -2800,7 +2800,7 @@ mod tests {
     /// Command-mode scripts set the was-running marker while running (so a
     /// daemon death mid-run is detectable on the next boot) and clear it on
     /// exit, exactly like services.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn command_mode_marker_set_while_running_cleared_on_exit() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -2838,7 +2838,7 @@ mod tests {
     /// `previouslyRunning` restore affordance stays service-only; the reading
     /// is stable across repeated restarts and cleared by the next
     /// start/stop.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn command_running_at_daemon_death_hydrates_exited_lost() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -2986,7 +2986,7 @@ mod tests {
     /// must not keep the stale `was_running` marker: the failure supersedes
     /// the lost reading and the next boot hydrates a plain `idle`, not
     /// another daemon-loss report for a run that already settled.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn failed_relaunch_of_lost_command_clears_marker() {
         let h = harness_with_worktree(true).await;
         let id = create(
@@ -3059,7 +3059,7 @@ mod tests {
     /// A service whose relaunch fails keeps its hydrated `previouslyRunning`
     /// marker exactly as before: the restore affordance is only consumed by
     /// a successful `mark_running` or a dismiss, never by a launch failure.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn failed_relaunch_of_marked_service_keeps_marker() {
         let h = harness_with_worktree(true).await;
         let id = create(
@@ -3132,7 +3132,7 @@ mod tests {
     /// its status, both surfaces report `-1` — never the host's placeholder
     /// code — and they always agree.
     #[cfg(unix)]
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_run_result_exit_code_matches_runtime_state_when_unobserved() {
         use nix::sys::signal::{kill, Signal};
         use nix::sys::wait::waitpid;
@@ -3144,7 +3144,10 @@ mod tests {
         let services = h.services.clone();
         let ws = h.ws.clone();
         let sid = id.clone();
-        let run = tokio::spawn(async move { services.script_run(ws, sid, None, None).await });
+        let run =
+            intent_core::spawn_daemon(
+                async move { services.script_run(ws, sid, None, None).await },
+            );
         let ev = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
         let pid = Pid::from_raw(
             i32::try_from(
@@ -3188,7 +3191,7 @@ mod tests {
     /// `mark_exited` without an observable status (the host never yielded a
     /// `PtyExit`) still writes a terminal reading: `exited`, `exitCode: -1`,
     /// and an `error` naming the cause — never `exited` with no code.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn mark_exited_without_exit_writes_unobservable_sentinel() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -3228,7 +3231,7 @@ mod tests {
     /// polls; whichever wins, the run terminates and the reading matches what
     /// was observable.
     #[cfg(unix)]
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn child_reaped_out_of_band_settles_exited_with_sentinel() {
         use nix::sys::signal::{kill, Signal};
         use nix::sys::wait::waitpid;
@@ -3279,7 +3282,7 @@ mod tests {
 
     /// A service's natural exit durably clears the marker (the process is
     /// gone; a daemon death from here on must not resurrect the tab).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn service_natural_exit_clears_was_running_marker() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -3309,7 +3312,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_remove_unpersists_definition() {
         let h = harness().await;
         let id = create_simple(&h, "gone", "echo bye", ScriptMode::Command).await;
@@ -3330,7 +3333,7 @@ mod tests {
     /// must stop the old supervisor/PTY (no orphaned process), preserve the
     /// original `createdAt`/`source`, stamp `updatedAt`, and reset the
     /// runtime state to idle.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_create_upsert_stops_running_predecessor() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -3403,7 +3406,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_start_is_noop_when_already_running() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -3452,7 +3455,7 @@ mod tests {
     /// supervisor task has not run yet on the current-thread runtime — must
     /// never report the pre-launch `idle` (pre-fix, the status only left
     /// `idle` at the supervisor's `mark_running`).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_start_replies_only_after_status_leaves_idle() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -3484,7 +3487,7 @@ mod tests {
     /// so the window is open deterministically; `starting` precedes `running`
     /// on the bus, and a second `start` inside the window is a no-op (no
     /// second `starting`, no second supervisor).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_start_launch_window_reports_starting() {
         let h = harness().await;
         let park = Arc::new(SupervisePark::default());
@@ -3529,7 +3532,7 @@ mod tests {
     /// rejected by `resolve_cwd` before any spawn) surfaces through the
     /// status as `exited` + `error` — never as a stale `idle`
     /// (intent-hq/intent#4858).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_start_spawn_failure_surfaces_exited_not_idle() {
         let h = harness_with_worktree(true).await;
         let mut sub = subscribe(&h);
@@ -3583,7 +3586,7 @@ mod tests {
     /// recorded PTY yet: the supervisor's `mark_running` refuses on the stop
     /// flag and reaps its PTY, and the status settles back to `idle` with a
     /// `script:state` so subscribers never retain `starting`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_stop_during_launch_window_settles_idle() {
         let h = harness().await;
         let park = Arc::new(SupervisePark::default());
@@ -3603,7 +3606,7 @@ mod tests {
         let svc = services.clone();
         let ws = h.ws.clone();
         let sid = id.clone();
-        let stop_task = tokio::spawn(async move { svc.script_stop(ws, sid).await });
+        let stop_task = intent_core::spawn_daemon(async move { svc.script_stop(ws, sid).await });
         tokio::task::yield_now().await;
         park.release.notify_one();
         tokio::time::timeout(LIVENESS, stop_task)
@@ -3625,7 +3628,7 @@ mod tests {
     /// already-running guard (intent-hq/intent#4858): the reserved `starting`
     /// status is as exclusive as `running`, so a run can never spawn a second
     /// PTY that the supervisor's `mark_running` would then overwrite.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_run_during_launch_window_hits_running_guard() {
         let h = harness().await;
         let park = Arc::new(SupervisePark::default());
@@ -3659,7 +3662,7 @@ mod tests {
     /// atomic step (intent-hq/intent#4858 review): the `script.start` future
     /// completes on its first poll, so a caller dropping it can never strand
     /// the registry at `starting` with no supervisor to move it on.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_start_completes_on_first_poll_so_cancellation_cannot_strand_starting() {
         let h = harness().await;
         let park = Arc::new(SupervisePark::default());
@@ -3697,7 +3700,7 @@ mod tests {
     /// first one's pid. Pre-fix the reservation and the registration were
     /// separated by an await, and this sequence spawned two supervisors under
     /// the same generation.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_stop_racing_a_pending_start_never_admits_a_second_launch() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -3705,7 +3708,7 @@ mod tests {
         let svc = h.services.clone();
         let ws = h.ws.clone();
         let sid = id.clone();
-        let first = tokio::spawn(async move { svc.script_start(ws, sid).await });
+        let first = intent_core::spawn_daemon(async move { svc.script_start(ws, sid).await });
         tokio::task::yield_now().await;
         h.services
             .script_stop(h.ws.clone(), id.clone())
@@ -3753,7 +3756,7 @@ mod tests {
     /// the previous run's terminal fields already cleared (intent-hq/intent#4858
     /// review): the launch-window snapshot never pairs `status: "starting"`
     /// with a stale `exitCode` / `stoppedAt` / `error` / `startedAt`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_start_clears_stale_terminal_fields_with_starting() {
         let h = harness().await;
         let park = Arc::new(SupervisePark::default());
@@ -3812,7 +3815,7 @@ mod tests {
         await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn running_script_is_hidden_from_terminal_list_but_output_remains_available() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -3848,7 +3851,7 @@ mod tests {
             .expect("stop");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_stop_on_idle_keeps_idle_state() {
         let h = harness().await;
         let id = create_simple(&h, "idle", "echo nope", ScriptMode::Command).await;
@@ -3866,7 +3869,7 @@ mod tests {
         assert_eq!(st["status"], "idle");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_restart_returns_ok_and_emits_running() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -3901,7 +3904,7 @@ mod tests {
     /// `mark_running`, so a snapshot taken mid-restart never reads `exited`/`idle`.
     /// The supervise park holds the respawn pre-`mark_running` so the window is
     /// open deterministically.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_restart_gap_reports_restarting() {
         let h = harness().await;
         let park = Arc::new(SupervisePark::default());
@@ -3950,7 +3953,7 @@ mod tests {
     /// and the supervise park holds the respawn pre-`mark_running` so the
     /// window is open deterministically. The flag file makes the second run
     /// long-lived so teardown is a clean `script.stop`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn auto_restart_backoff_window_reports_restarting() {
         let mut h = harness().await;
         h.services = h.services.clone().with_script_too_fast_ms(0);
@@ -4000,7 +4003,7 @@ mod tests {
         services.script_stop(h.ws.clone(), id).await.expect("stop");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_run_service_mode_returns_warning_envelope() {
         let h = harness().await;
         let id = create_simple(&h, "svc", "sleep 5", ScriptMode::Service).await;
@@ -4019,7 +4022,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_run_with_timeout_marks_timed_out() {
         let h = harness().await;
         // Command lifetime must outlast any load-induced timer lag so the 1s
@@ -4038,7 +4041,7 @@ mod tests {
     /// already running must not spawn a second PTY or overwrite `pty_id`
     /// (which would orphan the first run's process on stop/remove); it
     /// warn-and-returns with the service-mode warning shape.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_run_while_running_warns_without_second_pty() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -4046,7 +4049,10 @@ mod tests {
         let services = h.services.clone();
         let ws = h.ws.clone();
         let sid = id.clone();
-        let first = tokio::spawn(async move { services.script_run(ws, sid, None, None).await });
+        let first =
+            intent_core::spawn_daemon(
+                async move { services.script_run(ws, sid, None, None).await },
+            );
         let running = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
         let pid = running["data"]["pid"].as_i64().expect("pid");
 
@@ -4090,7 +4096,7 @@ mod tests {
     /// cleanup — the detached completion task still enforces the script-level
     /// timeout, kills the PTY (child reaped, no orphan), and emits the
     /// `exited` `script:state` transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_run_dropped_future_still_reaps_and_marks_exited() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -4231,7 +4237,7 @@ mod tests {
     /// traps both SIGTERM and SIGHUP — the old escalation keyed SIGKILL on the
     /// direct child still running, so a shell that exited within the grace
     /// window left the trapped descendant alive forever.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_stop_reaps_term_and_hup_trapping_descendant() {
         let h = harness().await;
         let (flag, pidfile) = straggler_paths("stop");
@@ -4266,7 +4272,7 @@ mod tests {
     /// must reach `exited` with a code within a bounded time (the poll plus
     /// the straggler reap's TERM grace) and the noisy descendant must be gone.
     #[cfg(unix)]
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn noisy_descendant_cannot_starve_exit_poll_after_leader_is_killed() {
         use nix::sys::signal::{kill, Signal};
         use nix::unistd::Pid;
@@ -4350,7 +4356,7 @@ mod tests {
     /// `was_running` marker survives the graceful shutdown so the next boot
     /// still offers the relaunch affordance (monorepo#932 parity with daemon
     /// death).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn shutdown_pty_sessions_stops_scripts_and_kills_all_ptys() {
         let h = harness().await;
         let (flag, pidfile) = straggler_paths("shutdown");
@@ -4412,14 +4418,17 @@ mod tests {
     /// gets. The sweep must count the running `script.run`, `script.run` must
     /// still settle with a result, and the marker must survive so a fresh
     /// `Services` over the same store hydrates the lost terminal state.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn shutdown_pty_sessions_keeps_lost_marker_for_running_script_run() {
         let h = harness().await;
         let mut sub = subscribe(&h);
         let id = create_simple(&h, "cmd", SERVICE_CMD, ScriptMode::Command).await;
         let services = h.services.clone();
         let (ws, sid) = (h.ws.clone(), id.clone());
-        let run = tokio::spawn(async move { services.script_run(ws, sid, None, None).await });
+        let run =
+            intent_core::spawn_daemon(
+                async move { services.script_run(ws, sid, None, None).await },
+            );
         await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
 
         let (scripts, ptys) = h.services.shutdown_pty_sessions().await;
@@ -4474,7 +4483,7 @@ mod tests {
     /// lets the replacement group survive. Pre-fix, `mark_running` ignored
     /// the flag: the fresh PTY was adopted after `stop_all`'s snapshot and
     /// its group outlived the daemon.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn stop_all_during_respawn_window_refuses_registration_and_reaps() {
         let mut h = harness().await;
         h.services = h.services.clone().with_script_too_fast_ms(0);
@@ -4549,7 +4558,7 @@ mod tests {
     /// group before recording the exit — the script cannot present as a
     /// healthy `running` (or `exited`-with-survivors) while trapped
     /// stragglers hold the group.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_exit_with_trapped_straggler_reaps_group_before_exited() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -4582,7 +4591,7 @@ mod tests {
     /// config still exits 0. The two vars are unset for the test's lifetime so
     /// an inheriting harness cannot mask a missing overlay.
     #[cfg(unix)]
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_git_log_with_blocking_config_pager_exits_cleanly() {
         let _env =
             crate::agent_manager::tests::EnvGuard::apply(&[("GIT_PAGER", None), ("PAGER", None)]);
@@ -4632,7 +4641,7 @@ mod tests {
     /// gone shortly after the drop, and the supervisor's respawn is refused,
     /// so a test that panics mid-wait cannot leak `sleep 3600` past nextest.
     #[cfg(unix)]
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn harness_drop_kills_tracked_script_process_groups() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -4661,7 +4670,7 @@ mod tests {
     /// reservation must reset the status via `fail()` — the script ends up
     /// `exited` with the error recorded, and a follow-up run hits the same
     /// error instead of the already-running guard.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_run_cwd_failure_resets_reservation_via_fail() {
         let h = harness_with_worktree(true).await;
         let id = create(
@@ -4717,7 +4726,7 @@ mod tests {
     /// await) hits the already-running guard instead of spawning a second
     /// PTY — and a caller-side cancellation inside that window releases the
     /// reservation instead of leaving the script stuck `running`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_run_reservation_blocks_concurrent_entry_and_cancel_releases_it() {
         let h = harness().await;
         let id = create_simple(&h, "long", "sleep 3600", ScriptMode::Command).await;
@@ -4775,7 +4784,7 @@ mod tests {
         assert!(out.get("warning").is_none(), "no warning: {out:?}");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_run_max_lines_truncates_captured_output() {
         let h = harness().await;
         let id = create_simple(
@@ -4803,7 +4812,7 @@ mod tests {
         assert!(!text.contains("line-1"), "output: {text:?}");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_output_paginated_returns_items_envelope() {
         let h = harness().await;
         let id = create_simple(&h, "echo", "echo hello-pag", ScriptMode::Command).await;
@@ -4825,7 +4834,7 @@ mod tests {
         assert!(out.get("items").is_some(), "envelope shape: {out:?}");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_output_truncated_header_shows_last_n_of_m() {
         let h = harness().await;
         let id = create_simple(
@@ -4857,7 +4866,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_remove_kills_running_pty_and_drops_definition() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -5008,14 +5017,14 @@ mod tests {
     /// pre-registration window (PTY spawned, id not yet recorded) must still
     /// reap the fresh PTY. Pre-fix, `remove()` aborted the supervisor at that
     /// await point and the process leaked forever.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_remove_in_pre_registration_window_reaps_fresh_pty() {
         let h = harness().await;
         let p = start_parked_service(&h).await;
         let services = p.services.clone();
         let ws = h.ws.clone();
         let sid = p.id.clone();
-        let rm = tokio::spawn(async move { services.script_remove(ws, sid).await });
+        let rm = intent_core::spawn_daemon(async move { services.script_remove(ws, sid).await });
         await_entry_taken(&h, &p, &rm).await;
         p.park.release.notify_one();
         let res = tokio::time::timeout(LIVENESS, rm)
@@ -5034,14 +5043,14 @@ mod tests {
     /// Regression (monorepo#1180): a `script.create` upsert racing the same
     /// window must also reap the old supervisor's fresh PTY before installing
     /// the new definition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_create_upsert_in_pre_registration_window_reaps_fresh_pty() {
         let h = harness().await;
         let p = start_parked_service(&h).await;
         let services = p.services.clone();
         let ws = h.ws.clone();
         let sid = p.id.clone();
-        let up = tokio::spawn(async move {
+        let up = intent_core::spawn_daemon(async move {
             services
                 .script_create(
                     ws,
@@ -5077,7 +5086,7 @@ mod tests {
     /// so both survive, `script.list` is workspace-partitioned, and
     /// `script.status` / `script.remove` from workspace A never touches workspace
     /// B's script (no cross-workspace takeover).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn same_script_id_across_workspaces_does_not_collide() {
         let h = harness().await;
         let ws_b = WorkspaceId::new();
@@ -5146,7 +5155,7 @@ mod tests {
         assert!(matches!(err, Error::NotFound(_)));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn supervise_records_cwd_escape_error_via_fail_path() {
         let h = harness_with_worktree(true).await;
         let mut sub = subscribe(&h);
