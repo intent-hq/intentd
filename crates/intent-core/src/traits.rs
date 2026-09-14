@@ -4421,9 +4421,12 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `presence.update({ focus: [{ workspaceId, agentId?, noteId? }],
     /// typing?: { agentId } })`: replace the connection's focus set (sent
-    /// whole) and typing target → `{ ok: true }`. Requires a hello'd
-    /// connection; every focused workspace and the typing agent's workspace
-    /// must be a member workspace (`NotFound` otherwise). Publishes
+    /// whole) and typing target → `{ ok: true, typingSource }`, where
+    /// `typingSource` is the connection's own opaque, daemon-minted typing
+    /// source handle (the `source` its typing entry carries in
+    /// `presence:changed`, so the client can suppress only itself). Requires
+    /// a hello'd connection; every focused workspace and the typing agent's
+    /// workspace must be a member workspace (`NotFound` otherwise). Publishes
     /// `presence:changed` to each workspace whose aggregate changed.
     fn presence_update(
         &self,
@@ -4434,6 +4437,24 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::presence_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `presence.snapshot({ workspaceId })`: the current `presence:changed`
+    /// roster of a member workspace on demand — `{ workspaceId, members }`
+    /// with the same member rows the event carries — for a client that
+    /// attached its event subscription after its hello (or a second
+    /// connection of an already-online principal, whose hello publishes
+    /// nothing). Member+; a non-member sees `NotFound`.
+    fn presence_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::presence_snapshot not implemented".to_string(),
             ))
         })
     }
