@@ -30050,6 +30050,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
+            Self::require_administrator("github.relatedReposList")?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
             // Missing `.gitmodules` → { repos: [] }. A mis-shaped contents
