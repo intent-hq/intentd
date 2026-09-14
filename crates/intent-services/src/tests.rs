@@ -1648,20 +1648,28 @@ async fn display_status_folds_git_root_prs_on_every_read_surface() {
         assert_eq!(got.display_status, Some(expected), "workspace.get: {ws}");
     }
 
-    // The control row is untouched by the fold: no `pullRequests` appears,
-    // and the full-list row is byte-identical to the enriched `get` row
-    // once the list-only slimming (`tokenUsage`) is accounted for.
+    // The control row is untouched by the fold on every surface: no
+    // `pullRequests` appears on the full list, the lite list, or `get`.
+    // Cross-surface consistency guard (not a golden): the full-list row
+    // serializes byte-identically to the enriched `get` row once the
+    // list-only slimming (`tokenUsage`) is accounted for. Both operands run
+    // through the same enrichment, so this pins list/get agreement for a
+    // root-less workspace, not equality with a pre-fold payload — the
+    // empty-root rollup path is the unchanged `rollup_over_pr_pool` call in
+    // `compute_base_display_status`.
     let control_get = svc
         .get_workspace(control.clone())
         .await
         .expect("control get");
     assert!(control_get.pull_requests.is_none());
+    assert!(row(&full, &control).pull_requests.is_none());
+    assert!(row(&lite, &control).pull_requests.is_none());
     let mut control_get_as_list_row = control_get;
     control_get_as_list_row.token_usage = None;
     assert_eq!(
         serde_json::to_vec(&row(&full, &control)).unwrap(),
         serde_json::to_vec(&control_get_as_list_row).unwrap(),
-        "a workspace with no roots serializes exactly as before"
+        "a workspace with no roots serializes identically on workspace.list and workspace.get"
     );
 
     // Emit-path only: the fold persists nothing on the workspace row.

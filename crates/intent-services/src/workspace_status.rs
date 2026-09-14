@@ -798,14 +798,22 @@ fn pr_lifecycle_key(info: &PullRequestInfo) -> (u8, &str) {
 /// [`upgrade_pr_lifecycle`] for the fold: identity fields still keep
 /// `present`, a higher-ranked `canonical` still moves the lifecycle fields,
 /// and an equal-ranked `canonical` with a newer `updated_at` advances the
-/// timestamp too (its `isDraft` moves with it, so a draft that became ready
-/// reads `open`). A lower rank never moves anything — `closed` cannot
+/// timestamp too. The readiness fields (`isDraft`, `mergeable`,
+/// `mergeableState`) travel with the selected snapshot, so `present` reads
+/// as one coherent copy — the one chosen by (rank, `updated_at`) — rather
+/// than a newer status over whichever copy's mergeability the fold visited
+/// first (step 4's `pr_ready` / `pr_queued` would otherwise depend on
+/// git-root order). A lower rank never moves anything — `closed` cannot
 /// downgrade `merged`.
 fn canonicalize_pr_lifecycle(present: &mut PullRequestInfo, canonical: &PullRequestInfo) {
     if pr_lifecycle_key(canonical) > pr_lifecycle_key(present) {
         present.status = canonical.status;
         present.updated_at.clone_from(&canonical.updated_at);
         present.is_draft = canonical.is_draft;
+        present.mergeable = canonical.mergeable;
+        present
+            .mergeable_state
+            .clone_from(&canonical.mergeable_state);
     }
 }
 
@@ -838,10 +846,12 @@ struct FoldedPrLinkage {
 /// canonicalized to it, in both directions: a merged pool copy lifts a
 /// stale `open` linked copy just as a merged root lifts either, and a
 /// `closed` copy never downgrades `merged`. Same-URL copies therefore
-/// agree on status AND timestamp, so a merged PR cannot resurface as
-/// `open` through whichever copy step 4 happens to scan first, the step-6
-/// latest-updated pick sees one timestamp per PR, and the result is
-/// independent of git-root order. A git-root URL absent from the workspace linkage is appended
+/// agree on status, timestamp AND readiness (`isDraft` / `mergeable` /
+/// `mergeableState` ride along with the selected copy), so a merged PR
+/// cannot resurface as `open` through whichever copy step 4 happens to
+/// scan first, step 4 reads the mergeability of the copy it reads the
+/// status from, the step-6 latest-updated pick sees one timestamp per PR,
+/// and the result is independent of git-root order. A git-root URL absent from the workspace linkage is appended
 /// once (root-only) and later same-URL roots upgrade that appended entry
 /// without counting as a workspace-owned upgrade. Copies of a URL no
 /// git-root PR carries keep the pre-existing linkage semantics (the linked
@@ -2393,12 +2403,171 @@ mod display_status {
         assert!(folded.pool.is_empty(), "{:?}", folded.pool);
     }
 
-    /// Cost-contract guard: the list paths issue ONE bulk git-root read —
-    /// the aggregate snapshot's — which both the derivation and the wire
-    /// `pullRequests` merge consume. A second call site in the services
-    /// crate is a second statement per `workspace.list` / seq-0 snapshot.
+    /// An OPEN same-URL copy with the given mergeability.
+    fn open_pr(mergeable_state: &str, updated_at: &str) -> PullRequestInfo {
+        let mut info = pr(PullRequestStatus::Open, updated_at);
+        info.mergeable = Some(true);
+        info.mergeable_state = Some(mergeable_state.to_string());
+        info
+    }
+
+    /// Step-4 readiness of root-only same-URL duplicates follows the copy
+    /// selected by (rank, `updated_at`), not the first root visited: the
+    /// `mergeable` / `mergeableState` fields travel with the canonical
+    /// snapshot, so `pr_ready` / `pr_queued` / `pr_open` are independent of
+    /// git-root order (store reads order roots by registration, not PR
+    /// recency). Covers older blocked → newer clean (`pr_ready`), older
+    /// blocked → newer queued (`pr_queued`), and older clean → newer blocked
+    /// (`pr_open` — the stale `clean` must not survive).
     #[test]
-    fn list_paths_bulk_read_git_root_prs_exactly_once() {
+    fn root_only_same_url_readiness_follows_latest_copy_in_either_order() {
+        let cases = [
+            ("blocked", "clean", WorkspaceDisplayStatus::PrReady),
+            ("blocked", "queued", WorkspaceDisplayStatus::PrQueued),
+            ("clean", "blocked", WorkspaceDisplayStatus::PrOpen),
+        ];
+        for (older_state, newer_state, expected) in cases {
+            let older = open_pr(older_state, "2026-01-01T00:00:00Z");
+            let newer = open_pr(newer_state, "2026-01-02T00:00:00Z");
+            let older_first = [older.clone(), newer.clone()];
+            let newer_first = [newer, older];
+            for roots in [&older_first, &newer_first] {
+                let order: Vec<_> = roots
+                    .iter()
+                    .map(|p| (p.updated_at.as_str(), p.mergeable_state.as_deref()))
+                    .collect();
+                assert_eq!(
+                    with_git_root_prs(None, &[], roots, Some(&stats(2, 2, 0))),
+                    expected,
+                    "roots {order:?}"
+                );
+                assert_eq!(
+                    with_git_root_prs(None, &[], roots, None),
+                    expected,
+                    "roots {order:?}"
+                );
+                let folded = super::fold_git_root_prs(None, &[], roots);
+                assert_eq!(folded.owned_lifecycle, None);
+                assert_eq!(
+                    folded
+                        .pool
+                        .iter()
+                        .map(|p| {
+                            (
+                                p.status,
+                                p.updated_at.as_str(),
+                                p.mergeable,
+                                p.mergeable_state.as_deref(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    vec![(
+                        PullRequestStatus::Open,
+                        "2026-01-02T00:00:00Z",
+                        Some(true),
+                        Some(newer_state)
+                    )],
+                    "roots {order:?}"
+                );
+            }
+        }
+    }
+
+    /// The same readiness rule for a workspace-owned URL: a stale pooled
+    /// `open(blocked, Jan 1)` upgraded by a newer clean root copy keeps the
+    /// workspace object's identity but reads the newer copy's mergeability,
+    /// so step 4 lands on `pr_ready` in either root order; the reverse
+    /// (fresh blocked root over an older clean pool copy) reads `pr_open`.
+    /// The accepted rules still hold: the root-only `prStatus` scalar is
+    /// untouched (an equal-rank open upgrade never changes it) and a
+    /// `closed` copy never downgrades `merged`.
+    #[test]
+    fn owned_same_url_readiness_follows_latest_copy_in_either_order() {
+        for (pool_state, root_state, expected) in [
+            ("blocked", "clean", WorkspaceDisplayStatus::PrReady),
+            ("clean", "blocked", WorkspaceDisplayStatus::PrOpen),
+        ] {
+            let pool = [open_pr(pool_state, "2026-01-01T00:00:00Z")];
+            let newer_root = open_pr(root_state, "2026-01-02T00:00:00Z");
+            let older_root = open_pr(pool_state, "2026-01-01T00:00:00Z");
+            let older_first = [older_root.clone(), newer_root.clone()];
+            let newer_first = [newer_root, older_root];
+            for roots in [&older_first, &newer_first] {
+                assert_eq!(
+                    with_git_root_prs(None, &pool, roots, Some(&stats(2, 2, 0))),
+                    expected,
+                    "{pool_state} pool, roots {:?}",
+                    roots
+                        .iter()
+                        .map(|p| p.mergeable_state.as_deref())
+                        .collect::<Vec<_>>()
+                );
+                let folded = super::fold_git_root_prs(None, &pool, roots);
+                assert_eq!(folded.owned_lifecycle, Some(PullRequestStatus::Open));
+                assert_eq!(
+                    folded
+                        .pool
+                        .iter()
+                        .map(|p| {
+                            (
+                                p.id.as_str(),
+                                p.updated_at.as_str(),
+                                p.mergeable_state.as_deref(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    vec![(
+                        pool[0].id.as_str(),
+                        "2026-01-02T00:00:00Z",
+                        Some(root_state)
+                    )]
+                );
+            }
+        }
+    }
+
+    /// Readiness fields never travel against the rank ladder: a newer
+    /// `closed` root copy carrying `mergeable_state: "clean"` neither
+    /// downgrades a merged linked copy nor rewrites its mergeability, and a
+    /// merged copy lifting a stale open one carries its own (absent)
+    /// mergeability rather than leaving the open copy's `clean` behind.
+    #[test]
+    fn readiness_fields_follow_the_rank_ladder_only() {
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        let mut closed_clean = pr(PullRequestStatus::Closed, "2026-01-05T00:00:00Z");
+        closed_clean.mergeable = Some(true);
+        closed_clean.mergeable_state = Some("clean".into());
+        let folded =
+            super::fold_git_root_prs(Some(&merged), &[], std::slice::from_ref(&closed_clean));
+        let active = folded.active.expect("linked PR kept");
+        assert_eq!(active.status, PullRequestStatus::Merged);
+        assert_eq!((active.mergeable, active.mergeable_state), (None, None));
+
+        let stale_open_clean = open_pr("clean", "2026-01-01T00:00:00Z");
+        let merged_root = pr(PullRequestStatus::Merged, "2026-01-03T00:00:00Z");
+        let folded = super::fold_git_root_prs(
+            Some(&stale_open_clean),
+            &[],
+            std::slice::from_ref(&merged_root),
+        );
+        let active = folded.active.expect("linked PR kept");
+        assert_eq!(
+            (active.status, active.updated_at.as_str()),
+            (PullRequestStatus::Merged, "2026-01-03T00:00:00Z")
+        );
+        assert_eq!((active.mergeable, active.mergeable_state), (None, None));
+    }
+
+    /// Cost-contract guard (single-bulk-call-site heuristic): the list paths
+    /// issue ONE bulk git-root read — the aggregate snapshot's — which both
+    /// the derivation and the wire `pullRequests` merge consume, and a second
+    /// call site in the services crate is a second statement per
+    /// `workspace.list` / seq-0 snapshot. This pins the call-site shape, not
+    /// the runtime statement count: it would still pass if the snapshot
+    /// branch of `enrich_display_status_with_snapshot` were disabled and
+    /// every row fell through to the scoped `workspace_git_root_prs` reader.
+    #[test]
+    fn list_paths_have_one_bulk_git_root_read_call_site() {
         const CALL: &str = concat!(".list_workspace_git_roots", "_with_prs(");
         let lib = include_str!("lib.rs");
         let call_sites: Vec<usize> = lib
