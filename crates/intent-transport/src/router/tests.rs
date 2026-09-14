@@ -5730,6 +5730,114 @@ async fn github_missing_required_params_are_minus_32602() {
     }
 }
 
+/// `repos[]` slugs (§5.27 multi-repo search) are interpolated into
+/// `repo:{owner}/{repo}` search qualifiers, so a value carrying whitespace,
+/// `:` or `/` could smuggle in a second qualifier and bypass the repo cap.
+/// Each malformed entry is `-32602` naming its index; well-formed slugs pass
+/// through to the trait (→ -32603 on the default impl).
+#[tokio::test]
+async fn github_search_repos_entries_must_be_valid_slugs() {
+    for (method, repos, needle) in [
+        // qualifier injection via whitespace
+        (
+            "github.issues.search",
+            r#"[{"owner":"o","repo":"r repo:other/private"}]"#,
+            "repos[0].repo",
+        ),
+        (
+            "github.pulls.search",
+            r#"[{"owner":"o","repo":"r repo:other/private"}]"#,
+            "repos[0].repo",
+        ),
+        // colon / slash
+        (
+            "github.issues.search",
+            r#"[{"owner":"o:x","repo":"r"}]"#,
+            "repos[0].owner",
+        ),
+        (
+            "github.pulls.search",
+            r#"[{"owner":"o","repo":"r"},{"owner":"o","repo":"a/b"}]"#,
+            "repos[1].repo",
+        ),
+        // empty / whitespace-only
+        (
+            "github.issues.search",
+            r#"[{"owner":"","repo":"r"}]"#,
+            "repos[0].owner",
+        ),
+        (
+            "github.pulls.search",
+            r#"[{"owner":"o","repo":"  "}]"#,
+            "repos[0].repo",
+        ),
+        // owner may not carry `_` / `.`; repo may not be `.` / `..`
+        (
+            "github.issues.search",
+            r#"[{"owner":"o_x","repo":"r"}]"#,
+            "repos[0].owner",
+        ),
+        (
+            "github.issues.search",
+            r#"[{"owner":"o","repo":".."}]"#,
+            "repos[0].repo",
+        ),
+    ] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"owner":"o","repo":"r","repos":{repos}}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "msg={msg}");
+        let text = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(text.contains(needle), "msg={msg} error={text}");
+    }
+
+    // Well-formed slugs (letters, digits, `-`, and `.`/`_` in repo names) route.
+    for method in ["github.issues.search", "github.pulls.search"] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"owner":"o","repo":"r","repos":[{{"owner":"intent-hq","repo":"cloudlands-fe"}},{{"owner":"acme","repo":"my_lib.rs"}}]}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "msg={msg}");
+    }
+}
+
+/// The addressed `owner` / `repo` of the search methods and
+/// `github.relatedRepos.list` get the same slug validation as `repos[]`.
+#[tokio::test]
+async fn github_search_addressed_owner_repo_must_be_valid_slugs() {
+    for method in [
+        "github.issues.search",
+        "github.pulls.search",
+        "github.relatedRepos.list",
+    ] {
+        for (owner, repo, needle) in [
+            ("o", "r repo:other/private", "repo"),
+            ("o x", "r", "owner"),
+            ("o", "r:x", "repo"),
+            ("o/x", "r", "owner"),
+            ("", "r", "owner"),
+            ("o", "", "repo"),
+        ] {
+            let msg = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"owner":"{owner}","repo":"{repo}"}}}}"#
+            );
+            let v = call(&msg).await.unwrap();
+            assert_eq!(err_code(&v), -32602, "msg={msg}");
+            let text = v["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                text.contains(&format!("{needle} is not a valid GitHub")),
+                "msg={msg} error={text}"
+            );
+        }
+        let ok = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"owner":"Intent-HQ","repo":"intent.d_2"}}}}"#
+        );
+        let v = call(&ok).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "msg={ok}");
+    }
+}
+
 /// FIX 1 parity: `agent.sendMessage` must forward the FE-side per-turn
 /// prompt-assembly hints (`noteIds`, `stdinContext`, `contextReferences`)
 /// verbatim to the [`WorkspaceApi`] call — the daemon previously dropped

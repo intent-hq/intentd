@@ -73,6 +73,9 @@ pub(crate) fn related_repos_from_gitmodules(content: &str, parent: &RepoRef) -> 
 
     for line in content.lines() {
         let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
         if line.starts_with('[') {
             flush(&mut section, &mut out);
             section = line.starts_with("[submodule").then_some((None, None));
@@ -84,19 +87,48 @@ pub(crate) fn related_repos_from_gitmodules(content: &str, parent: &RepoRef) -> 
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        let value = value.trim();
-        if value.is_empty() {
+        let Some(value) = git_config_value(value) else {
             continue;
-        }
+        };
         match key.trim() {
-            "path" => *path = Some(value.to_string()),
-            "url" => *url = Some(value.to_string()),
+            "path" => *path = Some(value),
+            "url" => *url = Some(value),
             _ => {}
         }
     }
     flush(&mut section, &mut out);
     out.truncate(RELATED_REPOS_CAP);
     out
+}
+
+/// Decode the right-hand side of a git-config `key = value` line: surrounding
+/// double quotes are removed (with `\"` / `\\` escapes and the `\n` / `\t` /
+/// `\b` letters git accepts), quoted and unquoted segments concatenate as git
+/// does, and an unquoted `#` / `;` starts a trailing comment. `None` for an
+/// empty result or an unterminated quote (git itself rejects the file).
+fn git_config_value(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.trim().chars();
+    let mut in_quotes = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('b') => out.push('\u{8}'),
+                Some(esc) => out.push(esc),
+                None => return None,
+            },
+            '"' => in_quotes = !in_quotes,
+            '#' | ';' if !in_quotes => break,
+            _ => out.push(c),
+        }
+    }
+    if in_quotes {
+        return None;
+    }
+    let value = out.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// Project [`RelatedRepo`] entries to the wire `{ owner, repo, path }` list.
@@ -337,6 +369,82 @@ mod tests {
         assert_eq!(
             paths,
             vec!["libs/s0", "libs/s1", "libs/s2", "libs/s3", "libs/s4"]
+        );
+    }
+
+    #[test]
+    fn git_config_value_unquotes_and_strips_comments() {
+        for (raw, expected) in [
+            (
+                "https://github.com/acme/widget.git",
+                Some("https://github.com/acme/widget.git"),
+            ),
+            (
+                "\"https://github.com/acme/widget.git\"",
+                Some("https://github.com/acme/widget.git"),
+            ),
+            ("  \"libs/widget\"  ", Some("libs/widget")),
+            ("libs/widget # the widget", Some("libs/widget")),
+            ("libs/widget ; the widget", Some("libs/widget")),
+            ("\"libs/widget\" # the widget", Some("libs/widget")),
+            ("\"libs/widget\"; the widget", Some("libs/widget")),
+            // `#` / `;` inside quotes are literal; `\"` and `\\` unescape.
+            ("\"libs/#1;a\"", Some("libs/#1;a")),
+            ("\"say \\\"hi\\\"\"", Some("say \"hi\"")),
+            ("\"a\\\\b\"", Some("a\\b")),
+            // quoted and unquoted segments concatenate like git.
+            ("\"libs/\"widget", Some("libs/widget")),
+            ("", None),
+            ("   ", None),
+            ("# only a comment", None),
+            ("\"\"", None),
+            ("\"unterminated", None),
+        ] {
+            assert_eq!(git_config_value(raw).as_deref(), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn related_repos_accept_quoted_and_commented_values() {
+        let parent = RepoRef::new("intent-hq", "intent");
+        let content = "# superproject submodules\n\
+             [submodule \"quoted\"]\n\
+             \tpath = \"packages/quoted\"\n\
+             \turl = \"https://github.com/acme/quoted.git\"\n\
+             [submodule \"commented\"]\n\
+             \tpath = packages/commented # pinned\n\
+             \turl = git@github.com:acme/commented.git ; ssh form\n\
+             [submodule \"both\"]\n\
+             \t; a full-line comment inside the section\n\
+             \tpath = \"packages/both\" # quoted then commented\n\
+             \turl = \"ssh://git@github.com/acme/both\"; quoted then commented\n\
+             [submodule \"hash-in-quotes\"]\n\
+             \tpath = \"packages/#hash\"\n\
+             \turl = \"https://github.com/acme/hash\"\n\
+             [submodule \"broken\"]\n\
+             \tpath = \"packages/broken\n\
+             \turl = \"https://github.com/acme/broken\n";
+        let repos = related_repos_from_gitmodules(content, &parent);
+        assert_eq!(
+            repos,
+            vec![
+                RelatedRepo {
+                    repo: RepoRef::new("acme", "quoted"),
+                    path: "packages/quoted".into(),
+                },
+                RelatedRepo {
+                    repo: RepoRef::new("acme", "commented"),
+                    path: "packages/commented".into(),
+                },
+                RelatedRepo {
+                    repo: RepoRef::new("acme", "both"),
+                    path: "packages/both".into(),
+                },
+                RelatedRepo {
+                    repo: RepoRef::new("acme", "hash"),
+                    path: "packages/#hash".into(),
+                },
+            ]
         );
     }
 

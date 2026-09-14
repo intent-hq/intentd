@@ -719,6 +719,37 @@ async fn search_repos_rejects_malformed_and_over_cap() {
     .await;
     assert_eq!(env["error"]["code"], json!(-32602), "{env}");
 
+    // A slug carrying whitespace / `:` / `/` would smuggle a second `repo:`
+    // qualifier into the search `q` and bypass the cap → `-32602` naming it.
+    for (id, repos, needle) in [
+        (
+            5,
+            json!([{ "owner": "a", "repo": "b repo:other/private" }]),
+            "repos[0].repo",
+        ),
+        (
+            6,
+            json!([{ "owner": "a:x", "repo": "b" }]),
+            "repos[0].owner",
+        ),
+        (
+            7,
+            json!([{ "owner": "a", "repo": "b" }, { "owner": "c/d", "repo": "e" }]),
+            "repos[1].owner",
+        ),
+    ] {
+        let env = wss_rpc_envelope(
+            &mut ws,
+            id,
+            "github.issues.search",
+            json!({ "owner": "o", "repo": "r", "repos": repos }),
+        )
+        .await;
+        assert_eq!(env["error"]["code"], json!(-32602), "{env}");
+        let msg = env["error"]["message"].as_str().unwrap();
+        assert!(msg.contains(needle), "{msg}");
+    }
+
     let seven: Vec<Value> = (1..=6)
         .map(|i| json!({ "owner": "o", "repo": format!("r{i}") }))
         .collect();
