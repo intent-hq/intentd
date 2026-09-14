@@ -1230,7 +1230,7 @@ mod tests {
     /// up"), `getAttachmentInfo` resolves the key, and a keyed
     /// `file.placeAttachment` of the same bytes replays the committed
     /// result (the base64 and chunked arms share one fingerprint).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn keyed_begin_replays_live_session_and_commit_binds_key() {
         let ws = WorkspaceId("ws-up-keyed".to_string());
         let other_ws = WorkspaceId("ws-up-keyed-other".to_string());
@@ -1390,7 +1390,7 @@ mod tests {
     /// nothing placed, the session retired, `replayed: true` on the result.
     /// A session whose key the single-shot bound with a DIFFERENT payload
     /// commits into the conflict error and stays alive for abort.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn keyed_commit_replays_single_shot_bound_first_and_conflicts_otherwise() {
         let ws = WorkspaceId("ws-up-keyed-xsurface".to_string());
         let ws_root = TempDir::new("attach-up-root");
@@ -1496,7 +1496,7 @@ mod tests {
     /// the bound fingerprint must carry the copied length and a re-place of
     /// the same (now stable) file must match it.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn keyed_source_path_binds_placed_size_not_stat_size() {
         let ws = WorkspaceId("ws-up-keyed-drift".to_string());
         let ws_root = TempDir::new("attach-up-root");
@@ -1547,7 +1547,7 @@ mod tests {
     /// post-lookup path directly with the binding back-dated past the
     /// cutoff and no sweep: the file is placed, the key is rebound to the
     /// new row, and the original row and file are untouched.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn keyed_placement_replaces_expired_binding_the_sweep_missed() {
         let ws = WorkspaceId("ws-up-keyed-expired".to_string());
         let ws_root = TempDir::new("attach-up-root");

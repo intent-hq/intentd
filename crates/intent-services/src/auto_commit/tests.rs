@@ -317,7 +317,7 @@ fn fake_auggie(tag: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, bin)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_linked_idle_commits_with_both_trailers() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -343,7 +343,7 @@ async fn task_linked_idle_commits_with_both_trailers() {
 /// (monorepo#3778) must still auto-commit on idle: the path resolution falls
 /// back to `repositoryPath` instead of silently skipping on the missing
 /// `worktreePath`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn repository_only_workspace_auto_commits_via_repository_path() {
     let repo = init_git_repo();
     let tmp = TempDb::new();
@@ -416,7 +416,7 @@ async fn workspace_override_disabled_is_silent_skip() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_override_enabled_beats_global_disabled() {
     // Global git.autoCommit=false, workspace override=true → commit proceeds.
     let repo = init_git_repo();
@@ -476,7 +476,7 @@ async fn clean_tree_is_silent_skip() {
     assert_eq!(commits.len(), 1);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn non_task_agent_commits_with_agent_id_only() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -517,7 +517,7 @@ async fn missing_agent_id_event_is_a_no_op() {
     assert_eq!(commits.len(), 1);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn fallback_subject_uses_default_for_auto_named_non_task_agent() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -531,7 +531,7 @@ async fn fallback_subject_uses_default_for_auto_named_non_task_agent() {
     assert!(message.starts_with("Agent changes"), "subject: {message}");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn idle_auto_commit_does_not_sweep_unattributed_changes() {
     // monorepo#939 regression: the idle auto-commit path must only commit the
     // paths attributed to the idle agent — another actor's dirty file stays
@@ -701,7 +701,7 @@ fn parse_commit_message_rejects_empty_output() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn generated_message_replaces_fallback_subject() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -724,7 +724,7 @@ async fn generated_message_replaces_fallback_subject() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn generation_uses_commit_quick_action_override() {
     // monorepo#1734: the auto-commit path calls agent.completeOnce with
     // `type: "commit"`, so the user's commit quick-action override reaches
@@ -759,7 +759,7 @@ printf '{"subject": "feat: %s"}' "$args""#,
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn generation_timeout_falls_back_to_subject() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -791,7 +791,7 @@ async fn generation_timeout_falls_back_to_subject() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn malformed_output_falls_back_to_subject() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -829,7 +829,7 @@ async fn no_changes_skips_generation_and_commit() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn generated_message_preserves_trailers() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
