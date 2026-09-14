@@ -6,10 +6,11 @@
 //! `sqlx::query` statement events sqlx emits — one per executed statement,
 //! propagated into the span's scope by sqlx-sqlite's worker-thread span
 //! forwarding. The one exclusion is the pool's connection-setup PRAGMA
-//! batch ([`CONNECT_PRAGMA_SUMMARY_PREFIX`]): a lazy connect runs inside the
-//! acquiring dispatch's span, so under load it would otherwise be charged to
-//! whichever handler happened to trigger it. When the span closes, the layer
-//! emits:
+//! batch ([`CONNECT_PRAGMA_SUMMARY_PREFIX`] + [`CONNECT_PRAGMA_BATCH_MARKER`]):
+//! a lazy connect runs inside the acquiring dispatch's span, so under load it
+//! would otherwise be charged to whichever handler happened to trigger it.
+//! PRAGMAs a handler issues itself still count. When the span closes, the
+//! layer emits:
 //!
 //! - one WARN when the statement count exceeds the statement threshold
 //!   (default [`DEFAULT_STATEMENT_WARN_THRESHOLD`]; N+1 / hydrate-then-discard
@@ -194,7 +195,19 @@ const SQLX_QUERY_TARGET: &str = "sqlx::query";
 /// so a dispatch that finds every idle connection held by concurrent work
 /// pays that batch inside its own span; it is pool setup, not handler work,
 /// and is excluded from the statement count (intent-hq/intent#5000).
-const CONNECT_PRAGMA_SUMMARY_PREFIX: &str = "PRAGMA";
+///
+/// The prefix alone is not enough — handlers run single PRAGMAs of their
+/// own (`PRAGMA defer_foreign_keys = ON`, `PRAGMA wal_checkpoint(PASSIVE)`,
+/// …) that are real work — so the exclusion also requires the event's
+/// `db.statement` (the full SQL, which sqlx only attaches when it is longer
+/// than the four-word summary) to contain [`CONNECT_PRAGMA_BATCH_MARKER`]:
+/// every intent-store pool sets `journal_mode` at connect time
+/// (`intent_store::connect_write` / `connect_read`), and no handler sets it
+/// at runtime.
+const CONNECT_PRAGMA_SUMMARY_PREFIX: &str = "PRAGMA ";
+/// Marker that identifies a PRAGMA batch as the pool's connect batch (see
+/// [`CONNECT_PRAGMA_SUMMARY_PREFIX`]).
+const CONNECT_PRAGMA_BATCH_MARKER: &str = "PRAGMA journal_mode = ";
 /// Target the layer's own WARN events are emitted under.
 const WARN_TARGET: &str = "intentd::rpc_profile";
 
@@ -339,13 +352,30 @@ impl Visit for ResponseFieldsVisitor<'_> {
 }
 
 /// Detects the pool connection-setup PRAGMA batch on a `sqlx::query` event
-/// (see [`CONNECT_PRAGMA_SUMMARY_PREFIX`]).
-struct ConnectPragmaVisitor(bool);
+/// (see [`CONNECT_PRAGMA_SUMMARY_PREFIX`]): both the summary prefix and the
+/// batch marker in `db.statement` must match.
+#[derive(Default)]
+struct ConnectPragmaVisitor {
+    pragma_summary: bool,
+    batch_marker: bool,
+}
+
+impl ConnectPragmaVisitor {
+    fn is_connect_batch(&self) -> bool {
+        self.pragma_summary && self.batch_marker
+    }
+}
 
 impl Visit for ConnectPragmaVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "summary" && value.starts_with(CONNECT_PRAGMA_SUMMARY_PREFIX) {
-            self.0 = true;
+        match field.name() {
+            "summary" if value.starts_with(CONNECT_PRAGMA_SUMMARY_PREFIX) => {
+                self.pragma_summary = true;
+            }
+            "db.statement" if value.contains(CONNECT_PRAGMA_BATCH_MARKER) => {
+                self.batch_marker = true;
+            }
+            _ => {}
         }
     }
 
@@ -391,9 +421,9 @@ where
         }
         // A lazy pool connect's PRAGMA batch is pool setup charged to
         // whichever dispatch happened to trigger it, not handler work.
-        let mut connect_pragma = ConnectPragmaVisitor(false);
+        let mut connect_pragma = ConnectPragmaVisitor::default();
         event.record(&mut connect_pragma);
-        if connect_pragma.0 {
+        if connect_pragma.is_connect_batch() {
             return;
         }
         // Attribute the statement to the nearest enclosing dispatch span, if
@@ -564,6 +594,29 @@ mod tests {
         );
     }
 
+    /// The write pool's connect batch (`intent_store::connect_write` also
+    /// sets `auto_vacuum`, which sqlx orders first, so the summary differs).
+    fn sqlx_write_pool_connect_pragma_event() {
+        tracing::event!(
+            target: "sqlx::query",
+            tracing::Level::DEBUG,
+            summary = "PRAGMA auto_vacuum = INCREMENTAL; …",
+            db.statement = "\n\nPRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; \n",
+        );
+    }
+
+    /// A handler-issued single PRAGMA (`note_repo::adopt_stray_spec_note`
+    /// runs `PRAGMA defer_foreign_keys = ON`): the summary is the whole
+    /// statement, so sqlx attaches an empty `db.statement`.
+    fn sqlx_handler_pragma_event() {
+        tracing::event!(
+            target: "sqlx::query",
+            tracing::Level::DEBUG,
+            summary = "PRAGMA defer_foreign_keys = ON",
+            db.statement = "",
+        );
+    }
+
     #[test]
     fn over_threshold_emits_exactly_one_statement_warn() {
         let layer =
@@ -609,6 +662,37 @@ mod tests {
             sqlx_event();
             sqlx_event();
             sqlx_event();
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("statements=4"), "{warns:?}");
+    }
+
+    /// The write pool's connect batch is excluded too (its summary starts
+    /// with `auto_vacuum`, but the batch still carries the marker).
+    #[test]
+    fn write_pool_connect_pragma_batch_is_not_charged_to_the_dispatch() {
+        let layer =
+            RpcProfileLayer::new(3, 3, Duration::from_secs(3600), Duration::from_secs(3600));
+        let warns = run_dispatch(layer, "note.create", || {
+            sqlx_write_pool_connect_pragma_event();
+            sqlx_event();
+            sqlx_event();
+            sqlx_event();
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    /// Only the connect batch is excluded: a PRAGMA a handler issues itself
+    /// is real work and still counts.
+    #[test]
+    fn handler_pragma_is_still_charged_to_the_dispatch() {
+        let layer =
+            RpcProfileLayer::new(3, 3, Duration::from_secs(3600), Duration::from_secs(3600));
+        let warns = run_dispatch(layer, "note.create", || {
+            sqlx_event();
+            sqlx_event();
+            sqlx_event();
+            sqlx_handler_pragma_event();
         });
         assert_eq!(warns.len(), 1, "warns: {warns:?}");
         assert!(warns[0].contains("statements=4"), "{warns:?}");
