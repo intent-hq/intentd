@@ -2143,6 +2143,31 @@ enum SlotClaimLoss<E> {
     Refused(E),
 }
 
+/// Test seam for the lost-claim hand-back in
+/// [`AgentManager::send_queued_message_now`] (intent-hq/intent#4962): once
+/// armed, the hand-back sets `reached` after its queue-updated publish and
+/// parks until [`HandbackGate::resume`], so a test can act between the
+/// hand-back and the re-probe without depending on task scheduling.
+#[cfg(test)]
+#[derive(Default)]
+struct HandbackGate {
+    reached: std::sync::atomic::AtomicBool,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl HandbackGate {
+    /// Whether the hand-back has landed (entry requeued, publish done).
+    fn reached(&self) -> bool {
+        self.reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Let the parked hand-back continue into its re-probe.
+    fn resume(&self) {
+        self.resume.notify_one();
+    }
+}
+
 /// Central multiplexer over the ACP client + process registry (§6.8). Owns a
 /// [`HashMap<AgentId, AgentHandle>`], the [`ProcessRegistry`], and the shared
 /// [`EventSink`]/permission state the per-agent client handlers use.
@@ -2301,6 +2326,10 @@ pub struct AgentManager {
     /// stale flag cleared by [`AgentManager::release_slot_sync`] when the
     /// slot is released. In-memory only, same gap as `recreated`.
     auto_unarchived: Arc<Mutex<HashSet<AgentId>>>,
+    /// Armed by [`AgentManager::arm_send_now_handback_gate`]; see
+    /// [`HandbackGate`].
+    #[cfg(test)]
+    send_now_handback_gate: Mutex<Option<Arc<HandbackGate>>>,
 }
 
 impl AgentManager {
@@ -2374,6 +2403,8 @@ impl AgentManager {
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
             auto_unarchived: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            send_now_handback_gate: Mutex::new(None),
         }
     }
 
@@ -2382,6 +2413,27 @@ impl AgentManager {
     pub fn with_policy(mut self, policy: PermissionPolicy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Arm the lost-claim hand-back seam of
+    /// [`AgentManager::send_queued_message_now`]; see [`HandbackGate`].
+    #[cfg(test)]
+    fn arm_send_now_handback_gate(&self) -> Arc<HandbackGate> {
+        let gate = Arc::new(HandbackGate::default());
+        *self.send_now_handback_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// Park at the hand-back seam while a [`HandbackGate`] is armed; a no-op
+    /// otherwise.
+    #[cfg(test)]
+    async fn park_at_send_now_handback(&self) {
+        let gate = self.send_now_handback_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.reached
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            gate.resume.notified().await;
+        }
     }
 
     /// The active permission policy (headless `AutoByRisk` unless overridden).
@@ -6650,6 +6702,8 @@ impl AgentManager {
             self.services.requeue_front(&agent_id, entry);
             drop(draining);
             self.services.publish_queue_updated(&agent_id).await;
+            #[cfg(test)]
+            self.park_at_send_now_handback().await;
             // Post-hand-back probe (intent-hq/intent#4962): the holder's
             // terminal exit can release the slot and run its own redrive
             // between the lost claim above and the `requeue_front` — while
@@ -16459,8 +16513,8 @@ mod agent_retry_tests {
     }
 
     /// Poll a future once with the current task's waker; `None` while it is
-    /// pending. Lets a test advance `sendQueuedMessageNow` one async gate at
-    /// a time and act between gates.
+    /// pending. Lets a test drive `sendQueuedMessageNow` up to an armed
+    /// [`HandbackGate`] and act while it is parked there.
     async fn poll_step<T, F: std::future::Future<Output = T>>(
         fut: &mut std::pin::Pin<Box<F>>,
     ) -> Option<T> {
@@ -16495,24 +16549,25 @@ mod agent_retry_tests {
             .expect("send");
         let id = sent["queuedMessage"]["id"].as_str().unwrap().to_string();
 
-        // Drive "send now" gate by gate: it pops the entry (provisional),
-        // loses the claim to the held slot and hands the entry back, then
-        // parks at the hand-back's queue-updated publish.
+        // Drive "send now" to the hand-back seam: it pops the entry
+        // (provisional), loses the claim to the held slot, hands the entry
+        // back, and parks at the armed gate — after the queue-updated
+        // publish, before its re-probe. It cannot finish before the gate:
+        // only the test resumes it.
+        let gate = mgr.arm_send_now_handback_gate();
         let mut send_now =
             Box::pin(mgr.send_queued_message_now(agent_id.clone(), ws.clone(), id.clone()));
-        let mut popped = false;
-        loop {
+        while !gate.reached() {
             assert!(
                 poll_step(&mut send_now).await.is_none(),
-                "send now must park after the hand-back, before its re-probe"
+                "send now must lose the claim and reach the hand-back seam"
             );
-            let queued = mgr.services.is_message_queued(&agent_id, &id);
-            if popped && queued {
-                break;
-            }
-            popped |= !queued;
             tokio::task::yield_now().await;
         }
+        assert!(
+            mgr.services.is_message_queued(&agent_id, &id),
+            "the hand-back requeued the entry"
+        );
         assert_eq!(
             mgr.services.parked_recovery_send(&agent_id).as_deref(),
             Some(id.as_str()),
@@ -16526,6 +16581,7 @@ mod agent_retry_tests {
             .await;
         mgr.release_in_flight_slot(&agent_id);
 
+        gate.resume();
         let now = send_now.await.expect("send now");
         assert_eq!(now["queued"], true, "the lost claim is reported honestly");
         assert!(
