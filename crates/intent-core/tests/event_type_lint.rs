@@ -60,8 +60,9 @@ enum Marker {
     Malformed,
 }
 
-/// A string literal found by the lexer, with its content between the quotes
-/// (escape sequences left as written) and the 1-based line it opens on.
+/// A string literal found by the lexer, with its cooked content (escape
+/// sequences evaluated; raw strings taken as written) and the 1-based line it
+/// opens on.
 struct Literal {
     /// Char offset of the opening quote in the source.
     offset: usize,
@@ -140,6 +141,77 @@ fn markers_by_line(src: &str, line_comments: &[LineComment]) -> Vec<Marker> {
 
 fn push_blank(out: &mut String, c: char) {
     out.push(if c == '\n' { '\n' } else { ' ' });
+}
+
+/// Evaluates the escape sequences of a non-raw string literal's body so the
+/// lint classifies the value the program sees (`"task\u{3a}bogus"` is
+/// `task:bogus` at runtime). Unknown or malformed escapes are kept as written;
+/// rustc rejects those files anyway.
+fn cook(body: &str) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(&e) = chars.get(i) else {
+            out.push(c);
+            break;
+        };
+        i += 1;
+        match e {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            '0' => out.push('\0'),
+            '\\' | '"' | '\'' => out.push(e),
+            '\n' => {
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+            }
+            'x' => {
+                let hex: String = chars[i..chars.len().min(i + 2)].iter().collect();
+                let byte = u8::from_str_radix(&hex, 16).ok().filter(|_| hex.len() == 2);
+                if let Some(b) = byte {
+                    out.push(b as char);
+                    i += 2;
+                } else {
+                    out.push('\\');
+                    out.push('x');
+                }
+            }
+            'u' if chars.get(i) == Some(&'{') => {
+                let close = chars[i..].iter().position(|&c| c == '}');
+                let cooked = close.and_then(|len| {
+                    let hex: String = chars[i + 1..i + len]
+                        .iter()
+                        .filter(|&&c| c != '_')
+                        .collect();
+                    u32::from_str_radix(&hex, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .map(|ch| (ch, len))
+                });
+                if let Some((ch, len)) = cooked {
+                    out.push(ch);
+                    i += len + 1;
+                } else {
+                    out.push('\\');
+                    out.push('u');
+                }
+            }
+            _ => {
+                out.push('\\');
+                out.push(e);
+            }
+        }
+    }
+    out
 }
 
 /// `Some(hashes)` when a raw string literal (`r"`, `r#"`, `br"`, `cr#"`, …)
@@ -285,7 +357,7 @@ fn lex(src: &str) -> Lexed {
             literals.push(Literal {
                 offset,
                 line: open_line,
-                text: chars[body_start..body_end].iter().collect(),
+                text: cook(&chars[body_start..body_end].iter().collect::<String>()),
             });
         } else if c == '\'' {
             // `'\…'` and `'x'` are char literals; anything else is a lifetime
@@ -775,6 +847,25 @@ fn raw_byte_and_c_strings_are_lexed() {
     assert_eq!(hit_lines(quote_char), vec![1]);
     let raw_with_quote = "fn f() {\n    let _ = r#\"ends \"\"#;\n    let _ = \"task:bogus\";\n}\n";
     assert_eq!(hit_lines(raw_with_quote), vec![3]);
+}
+
+#[test]
+fn escaped_literals_are_classified_on_their_cooked_value() {
+    let unicode = "fn f() -> &'static str { \"task\\u{3a}bogus\" }\n";
+    let scanned = scan_source(unicode);
+    assert_eq!(
+        scanned.hits.iter().map(|h| h.line).collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(scanned.hits[0].literal, "task:bogus");
+    let hex = "fn f() -> &'static str { \"\\x74ask:\\x62ogus\" }\n";
+    assert_eq!(hit_lines(hex), vec![1]);
+    let continuation = "fn f() -> &'static str { \"task:\\\n        bogus\" }\n";
+    assert_eq!(hit_lines(continuation), vec![1]);
+    let cooked_to_non_event = "fn f() -> &'static str { \"task:bo\\ngus\" }\n";
+    assert_eq!(hit_lines(cooked_to_non_event), Vec::<usize>::new());
+    let raw_is_not_cooked = "fn f() -> &'static str { r\"task\\u{3a}bogus\" }\n";
+    assert_eq!(hit_lines(raw_is_not_cooked), Vec::<usize>::new());
 }
 
 #[test]
