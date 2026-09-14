@@ -14024,7 +14024,7 @@ async fn send_message_op_persists_attachment_blocks_in_transcript() {
 /// `InvalidParams` (→ `-32602`) naming the seam and the index, before any
 /// state change; a reference-only payload on the same seams behaves as
 /// before.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn file_blocks_inline_data_rejected_on_every_seam() {
     let (_t, svc, ws, _bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "InlineReject").await;
@@ -14193,7 +14193,7 @@ impl Drop for AuthVerdictReset {
 /// `Services::preflight_workspace_create` arm by arm — moving any single
 /// check below `insert_workspace_with_auto_commit` fails this test naming
 /// the arm.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
     // (arm, `model.defaultProvider` in force for the arm, request, expected
     // message fragment naming the arm's own validator).
@@ -14596,7 +14596,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
 /// the worktree `workspace.create` provisions at `baseRef` does not carry it:
 /// the persist half's non-failing prompt snapshot reads that worktree, finds
 /// nothing, and the create still succeeds — the snapshot root has no say.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
     let (tmp, svc, _ws, _bus) = setup_with_bus().await;
     let workspaces_root = tmp.path.with_extension("workspaces");
@@ -32651,7 +32651,7 @@ async fn wake_or_create_migrates_poisoned_sibling_queue_to_woken_agent() {
 /// helper's target-workspace guard rejects it every time, the poisoned
 /// sibling stays assigned with its queue stranded, and `cleanedUpAgentIds`
 /// never lists it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_migrates_cross_workspace_poisoned_sibling_queue_to_woken_agent() {
     let (_t, svc, ws) = setup().await;
     let home_ws = WorkspaceId::new();
