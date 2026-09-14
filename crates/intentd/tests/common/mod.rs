@@ -26,9 +26,9 @@ use std::time::Duration;
 /// The same ctor arms the bound-caller guard: every daemon the suite spawns
 /// inherits `INTENTD_ASSERT_BOUND_CALLER`, so a capability gate evaluated
 /// without a bound `Caller` (a `tokio::spawn` that dropped the binding)
-/// panics in the daemon instead of quietly refusing — the fail-closed
-/// service layer must never be reached unbound from a production entry point
-/// (see `intent_services::capability`).
+/// aborts the daemon instead of quietly refusing — even on a detached task
+/// no test awaits — so the fail-closed service layer is never reached unbound
+/// from a production entry point (see `intent_services::capability`).
 #[ctor::ctor(unsafe)]
 fn force_hermetic_root_guard() {
     std::env::set_var("INTENTD_ASSERT_HERMETIC_ROOT", "1");
