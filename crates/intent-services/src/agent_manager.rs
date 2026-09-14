@@ -6070,29 +6070,37 @@ impl AgentManager {
     /// A consumed marker whose drain then loses the slot claim (a competing
     /// fresh send or `agent.retry` took the freed slot across the drain's
     /// gate awaits) is restored by `try_drain_queue_inner`, so the
-    /// authorization survives until the entry is actually delivered.
+    /// authorization survives until the entry is actually delivered. The
+    /// restore is not synchronized with the slot winner's exit — the winner
+    /// may release and run its own exit re-check (finding no marker) before
+    /// the loser puts it back — so after a lost claim this loops back to the
+    /// probe: the restore happens-before the `is_busy` re-check and the
+    /// winner's release happens-before its take, so whichever order the two
+    /// sides land in, one of them sees the marker and redrives.
     async fn redrive_parked_recovery_send(
         self: &Arc<Self>,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) {
-        if self.is_busy(agent_id) {
-            return;
+        loop {
+            if self.is_busy(agent_id) {
+                return;
+            }
+            let Some(message_id) = self.services.take_parked_recovery_send(agent_id) else {
+                return;
+            };
+            if !self.services.is_message_queued(agent_id, &message_id) {
+                return;
+            }
+            tracing::debug!(
+                agent = %agent_id,
+                message_id = %message_id,
+                "redriving recovery send parked by the busy race (intent-hq/intent#4962)"
+            );
+            self.clone()
+                .try_drain_queue_inner(agent_id.clone(), workspace_id.clone(), Some(message_id))
+                .await;
         }
-        let Some(message_id) = self.services.take_parked_recovery_send(agent_id) else {
-            return;
-        };
-        if !self.services.is_message_queued(agent_id, &message_id) {
-            return;
-        }
-        tracing::debug!(
-            agent = %agent_id,
-            message_id = %message_id,
-            "redriving recovery send parked by the busy race (intent-hq/intent#4962)"
-        );
-        self.clone()
-            .try_drain_queue_inner(agent_id.clone(), workspace_id.clone(), Some(message_id))
-            .await;
     }
 
     /// [`AgentManager::try_drain_queue`] body. `redrive_error_park` names a
@@ -6114,7 +6122,9 @@ impl AgentManager {
             // re-check — otherwise a competing fresh send/retry that claims
             // the freed slot and then fails terminally strands this entry
             // behind the Error gate with nothing left to lift it. The
-            // winner's own drain still clears it at delivery.
+            // restore is skipped when the winner's drain already delivered
+            // the entry, and the caller re-probes afterwards in case the
+            // winner released and ran its exit re-check before this restore.
             if let Some(id) = redrive_error_park {
                 self.services.restore_parked_recovery_send(&agent_id, id);
             }
@@ -16048,6 +16058,69 @@ mod agent_retry_tests {
             "the recovery send's own turn started"
         );
         assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
+    }
+
+    /// A competitor that wins the slot while the redrive is parked at its
+    /// gate can also DELIVER the recovery entry through its own drain while
+    /// the marker is consumed (`pop_draining` then finds nothing to clear).
+    /// The losing redrive must not restore the marker for an entry that is
+    /// already in flight: a context-size requeue brings it back under its
+    /// ORIGINAL id, and a restored marker would re-validate and lift the
+    /// STAB-52 gate for an already-delivered send.
+    #[tokio::test]
+    async fn lost_claim_restore_skips_entry_already_delivered() {
+        let agent_id = AgentId::from("agent-4962-claim-delivered");
+        let ws = WorkspaceId::from("ws-4962");
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        hold_slot(&mgr, &agent_id, &ws);
+        let sent = mgr
+            .send_message(
+                agent_id.clone(),
+                ws.clone(),
+                "recover".to_string(),
+                None,
+                user_send(),
+            )
+            .await
+            .expect("send");
+        let id = sent["queuedMessage"]["id"].as_str().unwrap().to_string();
+        mgr.release_in_flight_slot(&agent_id);
+
+        let mut redrive = Box::pin(mgr.redrive_parked_recovery_send(&agent_id, &ws));
+        poll_once_pending(&mut redrive).await;
+        assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
+        // Competitor wins the slot and its drain delivers the entry.
+        hold_slot(&mgr, &agent_id, &ws);
+        let (delivered, draining) = mgr
+            .services
+            .dequeue_message_draining(&agent_id)
+            .expect("competitor drains the parked send");
+        assert_eq!(delivered.id, id);
+        drop(draining);
+        redrive.await;
+        assert!(
+            mgr.services.parked_recovery_send(&agent_id).is_none(),
+            "a delivered entry is not re-authorized by the lost-claim restore"
+        );
+
+        // Competitor fails on context size: the SAME id is requeued, then
+        // Error persisted, slot released, exit re-check.
+        mgr.services.requeue_front(
+            &agent_id,
+            crate::agent_ops::QueuedMessage {
+                requeued_after_failure: true,
+                ..delivered
+            },
+        );
+        mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
+            .await;
+        mgr.release_in_flight_slot(&agent_id);
+        mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
+        assert!(
+            !mgr.is_busy(&agent_id),
+            "no fresh send: the STAB-52 gate holds on the original-id requeue"
+        );
+        assert!(mgr.services.is_message_queued(&agent_id, &id));
     }
 
     /// Restoring a lost-claim marker never overwrites a newer one: a second

@@ -13681,7 +13681,22 @@ impl Services {
     /// must outlive the lost claim so the slot winner's exit can honour it.
     /// Never overwrites a newer marker recorded meanwhile — the newer send is
     /// the one redriven, and this entry rides its turn or the next drain.
+    /// Restores only while the entry is still live in the queue, decided
+    /// under the draining overlay lock that [`Self::pop_draining`] holds
+    /// across its pop and marker clear: a competing drain that already
+    /// delivered the entry while the marker was consumed must not have it
+    /// re-authorized behind its back (a context-size requeue restores the
+    /// ORIGINAL id, and the marker would then lift the STAB-52 gate for an
+    /// already-delivered send). Lock order draining → `agent_queues` →
+    /// `parked_recovery_sends`, the same as `pop_draining`.
     pub(crate) fn restore_parked_recovery_send(&self, agent_id: &AgentId, message_id: String) {
+        let _draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        if !self.is_message_queued(agent_id, &message_id) {
+            return;
+        }
         self.parked_recovery_sends
             .lock()
             .expect("parked recovery send registry poisoned")
