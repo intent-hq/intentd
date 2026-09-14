@@ -875,6 +875,9 @@ pub(crate) async fn handle_fast_path(
                 // subscription on `workspace:updated` feeds unshares to the
                 // gate so a removal tears delivery down at once — and, for
                 // a subscription scoped to one `workspaceId`, ends it.
+                // Channel-only types (`note:presence`, multiplayer w5) never
+                // travel on this firehose for anyone: they reach only the
+                // note's `note.presence.subscribe` lease holders.
                 let gate = events::MembershipGate::for_current_caller(api);
                 let scoped_workspace = gate.as_ref().and(workspace_id.clone());
                 let membership_events = gate.as_ref().map(|_| {
@@ -891,6 +894,7 @@ pub(crate) async fn handle_fast_path(
                     workspace_id,
                     batch_window: None,
                     collaborator_only: gate.is_some(),
+                    exclude_channel_only: true,
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
