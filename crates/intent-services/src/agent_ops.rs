@@ -3880,7 +3880,8 @@ impl Services {
     /// [`AgentPersistError`] return type, cannot raise an input rejection.
     /// This op is the thin `plan → persist` wrapper for the store-backed
     /// seams (`agent.create`, `agent.delegate`, `agent.wakeOrCreate`);
-    /// `workspace.create` drives the two phases around its workspace insert.
+    /// `workspace.create` is expected to call the two phases directly, plan
+    /// before its workspace insert and persist after it.
     ///
     /// Agent ids are server-assigned: the op always mints a fresh
     /// `agent-{uuid}` id (client-supplied ids are rejected `-32602` at the
@@ -3954,8 +3955,8 @@ impl Services {
     /// provider / model / reasoning-effort chain
     /// ([`Self::resolve_create_model_and_effort`]). Pure with respect to the
     /// store: nothing is written, so a rejection here is side-effect free on
-    /// every seam, including `workspace.create`, which runs it BEFORE the
-    /// workspace row is inserted.
+    /// every seam — which is what lets a caller such as `workspace.create`
+    /// run it BEFORE its workspace row is inserted.
     ///
     /// `method` labels the errors (`agent.create` / `workspace.create`).
     /// `spec_wp` is the single project-tier root for the plan's *failing*
@@ -4078,8 +4079,8 @@ impl Services {
         // P2-12a deferral) so `agent.wakeOrCreate` chains can read back the
         // parent's `delegationDepth`/`createdByAgentId`/`taskNoteId`/
         // `isBackground`/`source`/`skipAutoCommit` without a follow-up round-trip.
-        // `workspace_path` is now used for project-tier specialist resolution;
-        // `agent_type` and `workspace_context` remain deferred.
+        // Project-tier specialist resolution reads the trusted `spec_wp`, not
+        // `workspace_path`; `agent_type` and `workspace_context` remain deferred.
         let AgentCreateExtra {
             provider,
             reasoning_effort,
@@ -4170,8 +4171,10 @@ impl Services {
     /// session row and emits `agent:created`. Everything here is either
     /// non-failing (the specialist prompt / orchestrator snapshot, usage
     /// stats) or infrastructure ([`AgentPersistError`]) — by construction it
-    /// cannot raise a `-32602`, which is what lets `workspace.create` run it
-    /// AFTER the workspace row is inserted without risking a stranded row.
+    /// cannot raise a `-32602`, so a caller such as `workspace.create` can
+    /// run it AFTER its workspace row is inserted without an input or
+    /// derived-config rejection stranding that row (store / internal / join
+    /// failures remain possible and map to `-32603`).
     ///
     /// `snapshot_wp` is the project-tier root for the *non-failing* specialist
     /// snapshot (`resolve_prompt_injection` / `resolve_is_orchestrator`): the
