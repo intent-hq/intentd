@@ -485,16 +485,24 @@ impl Services {
 
     /// The pre-persist hook `github.connect` installs on its device flow
     /// (multiplayer w4): the granted token's account is resolved through
-    /// the token-bound client and applied via [`Self::apply_primary_identity`]
-    /// *before* the engine writes the token, so a reconnect as a different
-    /// account is refused (the stored credential and cached identity stay)
-    /// while the identity is locked. When the daemon is still single-user
-    /// the switch is applied and the token persisted as before. A failed
-    /// `GET /user` refuses the grant only while locked: unverifiable is
-    /// unsafe exactly when there is something to protect. Every other
-    /// failure — the lock state or the principal row unreadable, the apply
-    /// failing — refuses too: the token is only persisted once the identity
-    /// has been positively applied.
+    /// the token-bound client and applied via
+    /// [`Self::apply_primary_identity_locked`] *before* the engine writes
+    /// the token, so a reconnect as a different account is refused (the
+    /// stored credential and cached identity stay) while the identity is
+    /// locked. When the daemon is still single-user the switch is applied
+    /// and the token persisted as before. A failed `GET /user` refuses the
+    /// grant only while locked: unverifiable is unsafe exactly when there is
+    /// something to protect. Every other failure — the lock state or the
+    /// principal row unreadable, the apply failing — refuses too: the token
+    /// is only persisted once the identity has been positively applied.
+    ///
+    /// The whole decision runs under the [`IdentityTransitionLock`], and an
+    /// admission hands that lock back to the flow as its
+    /// [`IdentityLease`](intent_sourcecontrol::device_flow::IdentityLease),
+    /// held until the token write completes: the lock state consulted here
+    /// (including by the failed-`GET /user` fallback) cannot change, and no
+    /// other switch can interleave, between the verdict and the credential
+    /// landing on disk.
     pub(crate) fn connect_identity_guard(
         &self,
     ) -> intent_sourcecontrol::device_flow::IdentityGuard {
@@ -503,26 +511,33 @@ impl Services {
             move |client: Arc<dyn intent_sourcecontrol::SourceControl>| {
                 let this = this.clone();
                 Box::pin(async move {
+                    let transition = this.identity_transition.clone().lock_owned().await;
                     let primary = this
                         .store
                         .get_primary_principal()
                         .await
                         .map_err(|e| format!("primary principal unavailable: {e}"))?;
+                    let lease: intent_sourcecontrol::device_flow::IdentityLease =
+                        Box::new(transition);
                     match client.get_user().await {
-                        Ok(user) => match this.apply_primary_identity(primary, &user).await {
-                            Ok(_) => Ok(()),
-                            Err(Error::Invite(InviteErrorKind::IdentityLocked)) => Err(format!(
+                        Ok(user) => {
+                            match this.apply_primary_identity_locked(primary, &user).await {
+                                Ok(_) => Ok(lease),
+                                Err(Error::Invite(InviteErrorKind::IdentityLocked)) => {
+                                    Err(format!(
                                 "authorized as GitHub account {} while collaborators or open \
                              invites depend on the current identity; disconnect them first",
                                 user.login
-                            )),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "github.connect: identity apply failed");
-                                Err(format!(
-                                    "could not apply the authorized GitHub identity: {e}"
-                                ))
+                            ))
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "github.connect: identity apply failed");
+                                    Err(format!(
+                                        "could not apply the authorized GitHub identity: {e}"
+                                    ))
+                                }
                             }
-                        },
+                        }
                         Err(e) => {
                             if this.primary_identity_locked().await.unwrap_or(true) {
                                 Err(format!(
@@ -530,7 +545,7 @@ impl Services {
                                  the primary identity is locked"
                                 ))
                             } else {
-                                Ok(())
+                                Ok(lease)
                             }
                         }
                     }
@@ -557,6 +572,18 @@ impl Services {
         user: &intent_sourcecontrol::UserIdentity,
     ) -> Result<Principal> {
         let _transition = self.identity_transition.lock().await;
+        self.apply_primary_identity_locked(principal, user).await
+    }
+
+    /// [`Self::apply_primary_identity`] for a caller that already holds the
+    /// [`IdentityTransitionLock`] (the connect guard, which keeps it across
+    /// the token write). Re-reads the current row under that lock exactly
+    /// as the locking variant does.
+    pub(crate) async fn apply_primary_identity_locked(
+        &self,
+        principal: Principal,
+        user: &intent_sourcecontrol::UserIdentity,
+    ) -> Result<Principal> {
         let principal = self.store.get_principal(&principal.id).await?;
         let fetched_id = user.id.and_then(|id| i64::try_from(id).ok());
         let same_account =
