@@ -2469,6 +2469,7 @@ dependencies = [
  "intent-services",
  "intent-sourcecontrol",
  "intent-store",
+ "intent-test-macros",
  "intent-transport",
  "intent-voice",
  "libc",

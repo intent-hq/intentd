@@ -96,12 +96,12 @@ async fn spawn_401_server() -> u16 {
         .await
         .expect("bind 401 server");
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
                 break;
             };
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 let mut buf = [0u8; 4096];
                 let _ = sock.read(&mut buf).await;
                 let _ = sock
@@ -121,7 +121,7 @@ async fn spawn_401_server() -> u16 {
 
 /// A `clonePath` whose target has no file name is rejected pre-clone with a
 /// typed `path-invalid` error (-32602) instead of a generic failure.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_invalid_clone_path_returns_path_invalid() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -163,7 +163,7 @@ async fn workspace_create_invalid_clone_path_returns_path_invalid() {
 /// disabled) surfaces as a typed `auth-required` error (-32603) whose message
 /// and `data.detail` carry the sanitized git stderr tail — never a bare
 /// "Internal error".
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_auth_required_clone_returns_typed_error() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -205,7 +205,7 @@ async fn workspace_create_auth_required_clone_returns_typed_error() {
 
 /// A clone target that already exists (and is non-empty) is rejected
 /// pre-clone with a typed `destination-exists-non-empty` error (-32602).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_existing_clone_target_returns_destination_exists() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;

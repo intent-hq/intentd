@@ -101,7 +101,7 @@ fn gate() -> Option<String> {
 /// `repositoryPath` reports it as `path` through the full mock-agent loop
 /// (agent → MCP bridge → binding → Services), not just at the binding unit.
 /// Adopted from PR intent-hq/intentd#1564.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_info_uses_repository_path() {
     let Some(script) = gate() else { return };
 
@@ -238,7 +238,7 @@ async fn workspace_info_uses_repository_path() {
 // Task bindings coverage
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_bindings_update_status_and_get() {
     let Some(script) = gate() else { return };
 
@@ -378,7 +378,7 @@ async fn task_bindings_update_status_and_get() {
 // Comment bindings coverage
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_bindings_add_and_list() {
     let Some(script) = gate() else { return };
 

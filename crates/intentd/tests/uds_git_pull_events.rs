@@ -200,7 +200,7 @@ fn boot(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let bus_clone = bus.clone();
     let socket_clone = socket.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         let _ = serve_uds(services, bus_clone, &socket_clone, None, async {
             let _ = shutdown_rx.await;
         })
@@ -215,7 +215,7 @@ fn boot(
 /// method resolves its owning workspace by canonicalized `worktree_path`
 /// match; a persisted row is required for events to fire (workspace-create
 /// auto-pull runs before the row exists and stays silent by design).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn git_pull_emits_git_pull_and_changes_git_status_over_uds() {
     if !gate() {
         eprintln!("skipping git.pull UDS e2e: git not on PATH");

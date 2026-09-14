@@ -524,7 +524,7 @@ fn assert_merged_rows(rows: &[Value], ws_merge: &WorkspaceId, ws_plain: &Workspa
 /// `workspace.list` rows over WSS carry the emit-path merged `pullRequests`
 /// (git-root + monitor sources, URL-deduped, cancelled excluded), while the
 /// nothing-to-merge row omits the field entirely.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_list_merges_external_prs_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
@@ -537,7 +537,7 @@ async fn workspace_list_merges_external_prs_over_wss() {
 /// The `workspace.subscribe` seq-0 snapshot rides the same lite list path
 /// and must carry the identical merged `pullRequests` a `workspace.list`
 /// would (docs/protocol/06-events.md).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_subscribe_snapshot_merges_external_prs_over_wss() {
     let fx = boot().await;
     let mut sub = connect(fx.port, fx.cfg.clone()).await;

@@ -130,7 +130,7 @@ async fn conversation_text(rpc: &mut PlainWs, id: i64, ws_id: &str, agent_id: &s
 /// matching event delivers nothing. Agent subscribers use non-agent
 /// categories here because `agent:*` is rejected for them (monorepo#1229),
 /// which is asserted separately below.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_subscribe_delivers_batched_wake_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -264,7 +264,7 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
 /// subscription silently narrows to the non-agent categories (no `agent:*`,
 /// no `chat:stream:delta`), while a front-door subscription (no `agentId`)
 /// keeps the full category expansion including `agent:*`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn bare_star_expansion_narrows_for_agent_subscribers_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -354,7 +354,7 @@ async fn event_subscriptions_view(
 /// `agent.diagnostics` reports it; `agent.unsubscribe` removes it from the
 /// view; a second subscription then disappears when its workspace is deleted
 /// (`workspace.delete` sweep).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn event_subscriptions_introspection_and_workspace_delete_cleanup_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
