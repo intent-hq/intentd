@@ -268,10 +268,11 @@ impl WatcherRegistry {
         self.hub.root_registration_state(root)
     }
 
-    /// Live shared `FSEvents` stream count — the consolidation metric.
+    /// Which shared stream a root rides — the consolidation metric. See
+    /// [`SharedWatchHub::stream_for_root`].
     #[cfg(test)]
-    fn stream_count(&self) -> usize {
-        self.hub.stream_count()
+    fn stream_for_root(&self, root: &std::path::Path) -> Option<std::path::PathBuf> {
+        self.hub.stream_for_root(root)
     }
 
     /// Live shared common-dir watch count — the linked-worktree refcount
@@ -1351,6 +1352,12 @@ mod tests {
     /// workspaces meant ~40+. Now roots join shared streams (per parent
     /// directory on macOS, one global group on Linux — see
     /// `shared_watch::group_key`), so sibling workspaces ride ONE stream.
+    ///
+    /// Asserted per group rather than as a global total: the hub also
+    /// supervises roots this test did not create (the user-tier skill roots,
+    /// via their nearest existing ancestor), and how many groups THOSE occupy
+    /// is a grouping-policy detail — one on Linux, several on macOS
+    /// (intent-hq/intent#4986).
     #[tokio::test]
     #[expect(clippy::await_holding_lock)]
     async fn many_workspaces_share_a_single_stream_per_parent_directory() {
@@ -1359,22 +1366,36 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, _sub) = bus_and_sub().await;
         let parent = TempDir::new("count");
-        let workspaces: Vec<_> = (0..8)
+        let roots: Vec<_> = (0..8)
             .map(|i| {
                 let root = parent.path.join(format!("ws-{i}"));
                 std::fs::create_dir_all(&root).expect("mk ws");
-                test_workspace(&format!("ws-count-{i}"), &root)
+                root
             })
+            .collect();
+        let workspaces: Vec<_> = roots
+            .iter()
+            .enumerate()
+            .map(|(i, root)| test_workspace(&format!("ws-count-{i}"), root))
             .collect();
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(workspaces.clone()));
 
         let registry = start_registry(&bus, api).await;
         registry.wait_established(workspaces.len(), LIVENESS).await;
 
+        let streams: Vec<_> = roots
+            .iter()
+            .map(|root| {
+                registry
+                    .stream_for_root(root)
+                    .unwrap_or_else(|| panic!("{} must ride a shared stream", root.display()))
+            })
+            .collect();
+        let distinct: std::collections::HashSet<_> = streams.iter().collect();
         assert_eq!(
-            registry.stream_count(),
+            distinct.len(),
             1,
-            "8 sibling workspaces must consolidate onto a single shared stream"
+            "8 sibling workspaces must consolidate onto a single shared stream, got {streams:?}"
         );
     }
 

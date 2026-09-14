@@ -845,6 +845,26 @@ impl SharedWatchHub {
         }
     }
 
+    /// Which shared stream `root` rides, as that stream's group key, or `None`
+    /// when nothing watches it. The per-group consolidation invariant under
+    /// test: sibling roots resolve to the same key regardless of how many other
+    /// groups the hub supervises (the count differs per OS — see
+    /// [`group_key`]). Path is canonicalized to match the form
+    /// [`Self::subscribe`] keys roots by.
+    #[cfg(test)]
+    pub(super) fn stream_for_root(&self, root: &Path) -> Option<PathBuf> {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(e) => e.into_inner(),
+        };
+        state
+            .groups
+            .iter()
+            .find(|(_, g)| g.roots.contains_key(&root))
+            .map(|(key, _)| key.clone())
+    }
+
     /// Registration state of one root: `None` when nothing watches it,
     /// `Some(false)` while the watch request is still pending, `Some(true)` once
     /// the registrar has answered (either way — a failed registration will never
