@@ -2374,7 +2374,7 @@ impl Services {
     #[must_use]
     pub fn spawn_pr_monitor_loop(&self) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             loop {
                 tokio::time::sleep(services.pr_monitor_poll_interval()).await;
                 services.poll_due_pr_monitors().await;

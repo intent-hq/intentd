@@ -161,7 +161,7 @@ impl TunnelSupervisor {
         .await?;
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let task = tokio::spawn(supervise(
+        let task = intent_core::spawn_daemon(supervise(
             self.bin.clone(),
             self.key_path.clone(),
             ws_port,
@@ -305,7 +305,7 @@ async fn spawn_and_read_address(
     // key parse failure, network errors) are diagnosable, and the child never
     // blocks on a full pipe.
     if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let line = line.trim();
@@ -333,7 +333,9 @@ async fn spawn_and_read_address(
         Ok(Some(addr)) => {
             // Keep draining stdout in the background so the child never
             // blocks on a full pipe.
-            tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+            intent_core::spawn_daemon(
+                async move { while let Ok(Some(_)) = lines.next_line().await {} },
+            );
             Ok((child, addr))
         }
         Ok(None) => {
