@@ -338,6 +338,11 @@ struct WorkspaceAggregateSnapshot {
     active_hooks: HashSet<WorkspaceId>,
     active_pr_monitors: HashSet<WorkspaceId>,
     monitor_pr_signals: HashMap<WorkspaceId, workspace_status::MonitorPrSignals>,
+    /// PRs persisted on each workspace's secondary git roots
+    /// (`workspace_git_root.pull_requests`), from the same one bulk read
+    /// [`Services::merge_external_pull_requests`] issues; fed to the
+    /// displayStatus PR rungs. Empty lists are never inserted.
+    git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>>,
     legacy_question_holds: HashSet<AgentId>,
     cow_supported: Option<bool>,
 }
@@ -2527,9 +2532,12 @@ impl Services {
 
     /// Load every store-backed list aggregate in a constant number of
     /// statements, then pre-fold the PR and legacy-question projections.
+    /// `include_archived` mirrors the list call's flag so the git-root PR
+    /// bulk read never pays for archived workspaces the list won't return.
     async fn workspace_aggregate_snapshot(
         &self,
         workspace_ids: &[WorkspaceId],
+        include_archived: bool,
     ) -> WorkspaceAggregateSnapshot {
         let (max_note_updated_at, task_stats, sessions, unread, cow_supported) = tokio::join!(
             self.store.max_note_updated_at_by_workspace(workspace_ids),
@@ -2540,12 +2548,14 @@ impl Services {
                 .workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids),
             self.compute_cow_supported(),
         );
-        let (active_hooks, monitors, legacy_question_tails) = tokio::join!(
+        let (active_hooks, monitors, legacy_question_tails, git_roots) = tokio::join!(
             self.store.workspaces_with_active_hooks(workspace_ids),
             self.store
                 .list_display_status_pr_monitors_by_workspaces(workspace_ids),
             self.store
                 .list_legacy_question_tail_candidates_by_workspace(workspace_ids),
+            self.store
+                .list_workspace_git_roots_with_prs(include_archived),
         );
 
         let task_stats = match task_stats {
@@ -2616,6 +2626,25 @@ impl Services {
             .into_iter()
             .map(|(id, monitors)| (id, pr_monitor::fold_monitor_pr_signals(&monitors)))
             .collect();
+        // A read failure degrades to no git-root PRs (the pre-fold
+        // derivation) rather than failing the list.
+        let mut git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>> = HashMap::new();
+        match git_roots {
+            Ok(roots) => {
+                for root in roots {
+                    if let Some(prs) = root.pull_requests.filter(|prs| !prs.is_empty()) {
+                        git_root_prs
+                            .entry(root.workspace_id)
+                            .or_default()
+                            .extend(prs);
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "batch git-root PR read failed; displayStatus derives without git-root PRs"
+            ),
+        }
 
         let sessions_by_agent: HashMap<&AgentId, &AgentSession> = sessions
             .iter()
@@ -2666,6 +2695,7 @@ impl Services {
             active_hooks: active_hooks.unwrap_or_default(),
             active_pr_monitors,
             monitor_pr_signals,
+            git_root_prs,
             legacy_question_holds,
             cow_supported,
         }
@@ -2737,6 +2767,11 @@ impl Services {
                     .monitor_pr_signals
                     .get(&ws.id)
                     .copied()
+                    .unwrap_or_default(),
+                git_root_prs: snapshot
+                    .git_root_prs
+                    .get(&ws.id)
+                    .map(Vec::as_slice)
                     .unwrap_or_default(),
                 legacy_question_holds: &snapshot.legacy_question_holds,
             }),
@@ -2840,14 +2875,6 @@ impl Services {
                 .or_default()
                 .push(pr_monitor::pr_monitor_pr_info(monitor));
         }
-        // Lifecycle-ladder rank: status only ever moves up (open/draft <
-        // closed < merged) — merged is irreversible, closed must never
-        // overwrite it (see the doc comment).
-        let status_rank = |s: intent_core::PullRequestStatus| match s {
-            intent_core::PullRequestStatus::Merged => 2,
-            intent_core::PullRequestStatus::Closed => 1,
-            intent_core::PullRequestStatus::Open | intent_core::PullRequestStatus::Draft => 0,
-        };
         for ws in list.iter_mut() {
             let Some(candidates) = extras.remove(ws.id.as_str()) else {
                 continue;
@@ -2856,18 +2883,14 @@ impl Services {
             for info in candidates {
                 match merged.iter_mut().find(|p| p.url == info.url) {
                     None => merged.push(info),
-                    // Status-ladder upgrade: identity/fields keep the
-                    // higher-priority entry, but a lower-priority source
-                    // whose status ranks higher wins the lifecycle fields —
-                    // `isDraft` moves with `status` so an upgraded entry
-                    // never reads merged/closed while still claiming draft.
-                    Some(present) => {
-                        if status_rank(info.status) > status_rank(present.status) {
-                            present.status = info.status;
-                            present.updated_at = info.updated_at;
-                            present.is_draft = info.is_draft;
-                        }
-                    }
+                    // Status-ladder upgrade (`workspace_status::pr_status_rank`
+                    // — the same ladder the displayStatus derivation folds
+                    // git-root PRs with, so the wire `pullRequests` and the
+                    // derived status can never disagree on a duplicate):
+                    // identity/fields keep the higher-priority entry, but a
+                    // lower-priority source whose status ranks higher wins
+                    // the lifecycle fields.
+                    Some(present) => workspace_status::upgrade_pr_lifecycle(present, &info),
                 }
             }
         }
@@ -16915,7 +16938,9 @@ impl WorkspaceApi for Services {
             let started = std::time::Instant::now();
             let count = list.len();
             let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
-            let snapshot = this.workspace_aggregate_snapshot(&workspace_ids).await;
+            let snapshot = this
+                .workspace_aggregate_snapshot(&workspace_ids, include_archived)
+                .await;
             for ws in &mut list {
                 this.enrich_workspace_from_snapshot(ws, &snapshot, true)
                     .await;
@@ -16947,8 +16972,11 @@ impl WorkspaceApi for Services {
                 "workspace.list: aggregate enrichment"
             );
             // Emit-path PR merge: fold git-root + monitor PRs into each
-            // row's `pullRequests` (after enrichment so displayStatus
-            // derivation still sees only the persisted workspace PRs).
+            // row's `pullRequests`. Runs after enrichment: the displayStatus
+            // derivation already folded the git-root PRs (from the aggregate
+            // snapshot's bulk read) and the monitor signals with the same
+            // per-URL priority, so it must not see them a second time via
+            // the merged `pullRequests`.
             this.merge_external_pull_requests(&mut list, include_archived)
                 .await;
             Ok(list)
@@ -16973,7 +17001,9 @@ impl WorkspaceApi for Services {
             // `cowSupported` (lifetime-cached probe, effectively free).
             let mut list = store.list_workspaces(include_archived).await?;
             let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
-            let snapshot = this.workspace_aggregate_snapshot(&workspace_ids).await;
+            let snapshot = this
+                .workspace_aggregate_snapshot(&workspace_ids, include_archived)
+                .await;
             for ws in &mut list {
                 this.enrich_workspace_from_snapshot(ws, &snapshot, false)
                     .await;
@@ -16983,7 +17013,8 @@ impl WorkspaceApi for Services {
             }
             // Emit-path PR merge, same as the full list path: the seq-0
             // snapshot must carry the same `pullRequests` a later
-            // `workspace.list` would.
+            // `workspace.list` would (and, like there, the displayStatus
+            // above already folded the git-root PRs from the snapshot).
             this.merge_external_pull_requests(&mut list, include_archived)
                 .await;
             Ok(list)

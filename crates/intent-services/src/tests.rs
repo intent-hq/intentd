@@ -1530,6 +1530,146 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     assert!(stored.pull_requests.is_none(), "merge must not persist");
 }
 
+/// Every surface that derives `displayStatus` folds the PRs persisted on
+/// the workspace's secondary git roots into the PR rungs: a workspace with
+/// no PR linkage of its own whose only PR is a MERGED git-root record reads
+/// `pr_merged` on `workspace.list`, the lite list (subscribe seq-0), and
+/// `workspace.get` alike — list paths from the one bulk read, `get` from the
+/// scoped per-workspace read — while a workspace with no roots keeps the
+/// exact row it produced before (same bytes across all three surfaces, no
+/// `pullRequests` materialized).
+#[tokio::test]
+async fn display_status_folds_git_root_prs_on_every_read_surface() {
+    use intent_core::{
+        PullRequestInfo, PullRequestStatus, WorkspaceDisplayStatus, WorkspaceGitRoot,
+        WorkspaceGitRootId, WorkspaceGitRootSource,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+
+    let git_root = |ws: &WorkspaceId, path: &str, status: PullRequestStatus| {
+        let ts = now_iso();
+        WorkspaceGitRoot {
+            id: WorkspaceGitRootId::new(),
+            workspace_id: ws.clone(),
+            path: path.to_string(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: Some("o".into()),
+            repo_name: Some("r".into()),
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: Some(vec![PullRequestInfo {
+                id: "1".into(),
+                number: 1,
+                url: "https://github.com/o/r/pull/1".into(),
+                title: "Root PR".into(),
+                status,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-02T00:00:00Z".into(),
+                base_ref: None,
+                head_ref: None,
+                head_sha: None,
+                author: None,
+                mergeable: None,
+                mergeable_state: None,
+                is_draft: None,
+            }]),
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    };
+
+    // merged_ws: no workspace PR linkage; one merged git-root PR.
+    let merged_ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&merged_ws))
+        .await
+        .expect("merged ws");
+    store
+        .upsert_workspace_git_root(&git_root(
+            &merged_ws,
+            "/tmp/root-merged",
+            PullRequestStatus::Merged,
+        ))
+        .await
+        .expect("merged root");
+    // open_ws: same shape with an OPEN git-root PR — the PR-open rung.
+    let open_ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&open_ws))
+        .await
+        .expect("open ws");
+    store
+        .upsert_workspace_git_root(&git_root(
+            &open_ws,
+            "/tmp/root-open",
+            PullRequestStatus::Open,
+        ))
+        .await
+        .expect("open root");
+    // control: no roots at all.
+    let control = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&control))
+        .await
+        .expect("control ws");
+
+    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+
+    let full = svc.list_workspaces(false).await.expect("full list");
+    let lite = svc.list_workspaces_lite(false).await.expect("lite list");
+    let row = |list: &[Workspace], id: &WorkspaceId| {
+        list.iter()
+            .find(|w| &w.id == id)
+            .cloned()
+            .expect("row in list")
+    };
+    for (ws, expected) in [
+        (&merged_ws, WorkspaceDisplayStatus::PrMerged),
+        (&open_ws, WorkspaceDisplayStatus::PrOpen),
+        (&control, WorkspaceDisplayStatus::Idle),
+    ] {
+        assert_eq!(
+            row(&full, ws).display_status,
+            Some(expected),
+            "workspace.list: {ws}"
+        );
+        assert_eq!(
+            row(&lite, ws).display_status,
+            Some(expected),
+            "lite list: {ws}"
+        );
+        let got = svc.get_workspace(ws.clone()).await.expect("workspace.get");
+        assert_eq!(got.display_status, Some(expected), "workspace.get: {ws}");
+    }
+
+    // The control row is untouched by the fold: no `pullRequests` appears,
+    // and the full-list row is byte-identical to the enriched `get` row
+    // once the list-only slimming (`tokenUsage`) is accounted for.
+    let control_get = svc
+        .get_workspace(control.clone())
+        .await
+        .expect("control get");
+    assert!(control_get.pull_requests.is_none());
+    let mut control_get_as_list_row = control_get;
+    control_get_as_list_row.token_usage = None;
+    assert_eq!(
+        serde_json::to_vec(&row(&full, &control)).unwrap(),
+        serde_json::to_vec(&control_get_as_list_row).unwrap(),
+        "a workspace with no roots serializes exactly as before"
+    );
+
+    // Emit-path only: the fold persists nothing on the workspace row.
+    let stored = store.get_workspace(&merged_ws).await.expect("stored");
+    assert!(stored.pull_requests.is_none());
+    assert!(stored.active_pull_request.is_none());
+}
+
 /// The emit-path PR merge moves a stale entry's status up the lifecycle
 /// ladder (open/draft < closed < merged) when a lower-priority duplicate
 /// ranks higher: a git-root entry still reading `open`/`draft`/`closed`
