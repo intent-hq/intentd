@@ -64,6 +64,15 @@ pub(crate) fn is_agent_restricted_event_type(event_type: &str) -> bool {
         || event_type == NOTE_PRESENCE
 }
 
+/// Whether an event type travels ONLY on its scoped subscription channel and
+/// never on the `events.subscribe` firehose (multiplayer w5): `note:presence`
+/// is delivered exclusively to `note.presence.subscribe` lease holders of the
+/// note — a `note:*`, exact-type or unfiltered raw subscriber of the same
+/// workspace must receive zero caret frames.
+pub(crate) fn is_channel_only_event_type(event_type: &str) -> bool {
+    event_type == NOTE_PRESENCE
+}
+
 /// Default coalescing window applied when a subscriber requests batching
 /// without a value (TS `options.batchWindow || 500`).
 pub(crate) const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(500);
@@ -98,6 +107,11 @@ pub struct SubscriptionFilter {
     /// before the pattern check, so a `terminal:*` or `client:*` pattern is
     /// accepted at subscribe time but stays silent.
     pub collaborator_only: bool,
+    /// When set, types on [`is_channel_only_event_type`] never match — the
+    /// match-time guard for the raw `events.subscribe` firehose (owner and
+    /// collaborator alike), which keeps `note:presence` on the lease-gated
+    /// note channel. The channel forwarders leave this `false`.
+    pub exclude_channel_only: bool,
 }
 
 impl SubscriptionFilter {
@@ -189,6 +203,9 @@ pub(crate) fn event_matches(filter: &SubscriptionFilter, event: &Event) -> bool 
         return false;
     }
     if filter.collaborator_only && !is_collaborator_event_type(&event.event_type) {
+        return false;
+    }
+    if filter.exclude_channel_only && is_channel_only_event_type(&event.event_type) {
         return false;
     }
     if !filter.event_types.is_empty()
@@ -422,6 +439,57 @@ mod tests {
         assert!(event_matches(
             &owner,
             &event("terminal:data", None, ActorType::System)
+        ));
+    }
+
+    /// Multiplayer w5: with `exclude_channel_only` set (the raw firehose),
+    /// `note:presence` never matches — not through `note:*`, the exact type
+    /// or an unfiltered pattern list, owner or collaborator — while the
+    /// other `note:*` types and `presence:changed` still do. A channel
+    /// forwarder (flag unset) keeps matching it.
+    #[test]
+    fn exclude_channel_only_keeps_note_presence_off_the_firehose() {
+        for (patterns, collaborator_only) in [
+            (vec!["note:*".to_string()], false),
+            (vec![NOTE_PRESENCE.to_string()], false),
+            (vec![], false),
+            (vec!["note:*".to_string()], true),
+            (vec![NOTE_PRESENCE.to_string()], true),
+        ] {
+            let f = SubscriptionFilter {
+                event_types: patterns.clone(),
+                collaborator_only,
+                exclude_channel_only: true,
+                ..Default::default()
+            };
+            assert!(
+                !event_matches(&f, &event(NOTE_PRESENCE, None, ActorType::System)),
+                "{patterns:?} (collaborator_only={collaborator_only}) must not deliver note:presence"
+            );
+            if patterns.iter().all(|p| p != NOTE_PRESENCE) {
+                assert!(
+                    event_matches(&f, &event("note:updated", Some("a"), ActorType::User)),
+                    "{patterns:?}: note:updated still flows"
+                );
+            }
+        }
+        let workspace = SubscriptionFilter {
+            event_types: vec![PRESENCE_CHANGED.to_string()],
+            exclude_channel_only: true,
+            ..Default::default()
+        };
+        assert!(event_matches(
+            &workspace,
+            &event(PRESENCE_CHANGED, None, ActorType::System)
+        ));
+        let channel = SubscriptionFilter {
+            event_types: vec![NOTE_PRESENCE.to_string()],
+            collaborator_only: true,
+            ..Default::default()
+        };
+        assert!(event_matches(
+            &channel,
+            &event(NOTE_PRESENCE, None, ActorType::System)
         ));
     }
 
