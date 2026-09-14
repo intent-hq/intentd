@@ -210,6 +210,10 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
     // spawned `handle_message` path; `events.subscribe` the inline fast path.
     // The guard removes the var on drop, including during unwinding.
     let _env = PanicMethodEnv::set("note.list,events.subscribe");
+    // The injected panics are caught on this (current-thread runtime) test
+    // thread, so opt out of failure-time tempdir retention or a passing run
+    // leaves a `failed-itd-panic-*` dir behind.
+    common::suppress_failure_retention();
     let (_srv, port, cfg, _dir) = start_server().await;
     let mut ws = connect_ws(port, cfg).await;
 
