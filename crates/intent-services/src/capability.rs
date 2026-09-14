@@ -984,9 +984,10 @@ mod tests {
                 ),
             )
             .await;
-        assert!(
-            matches!(refused, Err(Error::InvalidParams(_))),
-            "note.presence.update without a lease: {refused:?}"
+        assert_eq!(
+            cell(&refused),
+            "not-found",
+            "note.presence.update: {refused:?}"
         );
 
         // The collaborator passes every one of them.
