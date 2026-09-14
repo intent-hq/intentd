@@ -1670,7 +1670,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
 /// scoped per-workspace read — while a workspace with no roots keeps the
 /// exact row it produced before (same bytes across all three surfaces, no
 /// `pullRequests` materialized).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn display_status_folds_git_root_prs_on_every_read_surface() {
     use intent_core::{
         PullRequestInfo, PullRequestStatus, WorkspaceDisplayStatus, WorkspaceGitRoot,
@@ -1827,7 +1827,7 @@ async fn display_status_folds_git_root_prs_on_every_read_surface() {
 /// (repro C) and a linked `open(blocked)` + pooled `open(clean)` at one
 /// instant beside an older root copy (repro D) both serve the clean
 /// snapshot next to `pr_ready` in either root order.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
     use intent_core::{
         PullRequestInfo, PullRequestStatus, WorkspaceDisplayStatus, WorkspaceGitRoot,
@@ -16393,7 +16393,7 @@ pub(crate) mod pr {
         assert_eq!(v["exists"], true);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_related_repos_list_normalizes_dedupes_and_excludes_parent() {
         // Every accepted URL form, a duplicate (different casing + form), the
         // parent itself, a non-GitHub host, and a relative URL — only the
@@ -16430,7 +16430,7 @@ pub(crate) mod pr {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_related_repos_list_caps_at_five() {
         let content = (0..7).fold(String::new(), |mut acc, i| {
             use std::fmt::Write as _;
@@ -16454,7 +16454,7 @@ pub(crate) mod pr {
         assert_eq!(repos[4]["path"], "libs/s4");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_related_repos_list_missing_file_yields_empty() {
         let (_t, svc) = github_svc().await;
         let v = svc
@@ -16464,7 +16464,7 @@ pub(crate) mod pr {
         assert_eq!(v, serde_json::json!({ "repos": [] }));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_related_repos_list_unparsable_or_decode_error_yields_empty() {
         let forge = StubForge {
             file_content: Some("not a gitmodules file\n= =\n".to_string()),
@@ -17875,7 +17875,7 @@ pub(crate) mod pr {
     /// `owner` / `repo` of ITS OWN hit (caller casing echoed for scoped
     /// repos), the blended page keeps the engine's updated-desc order, and
     /// the continuation cursor round-trips as `nextToken`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_pulls_search_multi_repo_attributes_each_hit() {
         let forge = Arc::new(StubForge::default());
         let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
@@ -17947,7 +17947,7 @@ pub(crate) mod pr {
     /// ONE engine call carrying `IssueQuery.extra_repos`, each issue's
     /// `owner` / `repo` derived from its own hit (not echoed from the request
     /// params), updated-desc order preserved, cursor round-tripped.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_issues_search_multi_repo_attributes_each_hit() {
         let forge = Arc::new(StubForge::default());
         let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
@@ -17998,7 +17998,7 @@ pub(crate) mod pr {
     /// `repos` absent/empty leaves both searches on the pre-existing path:
     /// the engine sees an empty `extra_repos`, the single-repo item shapes
     /// echo the request params.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_search_without_repos_is_unchanged() {
         let forge = Arc::new(StubForge::default());
         let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
@@ -18037,7 +18037,7 @@ pub(crate) mod pr {
     /// The `repos` extras are capped so the whole search spans at most 6
     /// repositories: a seventh distinct repo is `-32602`, and the engine is
     /// never called.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_search_rejects_more_than_six_repos() {
         let forge = Arc::new(StubForge::default());
         let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
@@ -18762,7 +18762,7 @@ pub(crate) mod pr {
     /// status delta and emits exactly one
     /// `workspace:displayStatus-changed { displayStatus: "pr_merged" }`; an
     /// identical re-sweep persists nothing and emits nothing.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn root_refresh_merged_pr_emits_display_status_changed() {
         let primary = SweepRepo::init("main", None);
         let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
@@ -18822,7 +18822,7 @@ pub(crate) mod pr {
     /// rollup (`complete` → `pr_merged`) and unregistering the PR-bearing
     /// root lapses it back (`pr_merged` → `complete`); each transition emits
     /// exactly once.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_root_register_unregister_recompute_display_status() {
         let primary = SweepRepo::init("main", None);
         let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
@@ -42778,7 +42778,7 @@ mod derived_workspace_unread {
     /// bumping that session's `updated_at`, so the derived workspace
     /// `lastActivity` (max over session `updated_at`) stays put and the
     /// workspace is not re-sorted to the top merely for being opened.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_mark_seen_does_not_bump_session_updated_at() {
         let h = harness().await;
         let last = seed_pinned_unseen_session(&h, "agent-a").await;
