@@ -4,8 +4,11 @@
 //! semantics' event emission: `browser:tab-opened` / `browser:tab-updated
 //! { changes }` / `browser:tab-closed`, workspace-scoped with the
 //! self-sufficient `{ tab, changes? }` payload, attributed to the reporting
-//! host (`actor.id` = its `clientId`). The connection→host binding (which
-//! `clientId` is reporting) is a transport concern.
+//! host (`actor.id` = its `clientId`) unless the report arrives on a bound
+//! wire principal's connection, in which case the event bus re-stamps the
+//! actor with that principal (multiplayer w4) and the host stays
+//! identifiable through `tab.hostClientId`. The connection→host binding
+//! (which `clientId` is reporting) is a transport concern.
 //!
 //! Every mutation holds `Services::browser_tab_gate` from before its store
 //! transaction until its last event is published, so the event stream is a
