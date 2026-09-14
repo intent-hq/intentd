@@ -269,10 +269,64 @@ async fn connect_guard_refuses_when_the_lock_state_is_unreadable() {
 
     let guard = services.connect_identity_guard();
     let result = guard(Arc::new(StubForge::default())).await;
-    assert!(result.is_err(), "{result:?}");
+    assert!(
+        result.is_err(),
+        "unreadable lock state must refuse the grant"
+    );
     let stored = store.get_primary_principal().await.expect("primary");
     assert_eq!(stored.github_user_id, primary.github_user_id);
     assert_eq!(stored.login, primary.login);
+}
+
+/// An admitted grant hands the transition lock back to the flow as its
+/// lease: while the flow holds it (across the token write) no invite can
+/// be minted and no other switch can run, and both proceed once the lease
+/// is dropped. The verdict and the credential landing are one critical
+/// section.
+#[tokio::test]
+async fn connect_guard_lease_pins_the_transition_until_dropped() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services = Services::new(store.clone()).with_source_control(Arc::new(StubForge::default()));
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    let guard = services.connect_identity_guard();
+    let lease = guard(Arc::new(StubForge::default()))
+        .await
+        .unwrap_or_else(|reason| panic!("single-user grant admitted: {reason}"));
+    let applied = store.get_primary_principal().await.expect("primary");
+    assert_eq!(applied.github_user_id, Some(583_231));
+    assert_eq!(applied.login.as_deref(), Some("octocat"));
+
+    let mint = tokio::spawn({
+        let services = services.clone();
+        let ws = ws.clone();
+        async move {
+            with_caller(
+                Caller::Daemon,
+                services.workspace_invite_create_op(&ws, None, None),
+            )
+            .await
+        }
+    });
+    assert!(!settles(&mint).await, "mint waits for the lease");
+    let switch = tokio::spawn({
+        let services = services.clone();
+        async move {
+            services
+                .apply_primary_identity(applied, &identity("other", 20))
+                .await
+        }
+    });
+    assert!(!settles(&switch).await, "switch waits for the lease");
+
+    drop(lease);
+    mint.await
+        .expect("mint task")
+        .expect("mint after the lease");
+    let err = switch.await.expect("switch task");
+    assert_eq!(invite_kind(&err), InviteErrorKind::IdentityLocked);
 }
 
 /// An open invite alone (still a single principal row) locks the identity
