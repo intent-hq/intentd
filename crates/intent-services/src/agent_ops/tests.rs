@@ -28309,7 +28309,12 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
         "late completion wake expected, got: {msgs}"
     );
 
-    // The watch is consumed by the delivery.
+    // The watch is consumed by the delivery. The registry removal lands only
+    // after the durable wake AND the store-side watch retirement commit
+    // (the persisted watch is the crash-retry recovery record), so the
+    // transcript write synchronized on above can be visible before the
+    // registry entry is gone — poll the registry (intent-hq/intent#4957).
+    wait_for_child_watch_cleanup(&svc, &child_b).await;
     let watches_after = svc.list_watches_for_parent(&parent);
     assert!(
         !watches_after.iter().any(|w| w.child_agent_id == child_b),
