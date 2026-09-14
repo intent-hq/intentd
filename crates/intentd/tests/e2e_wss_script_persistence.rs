@@ -190,12 +190,16 @@ where
     }
 }
 
+/// Await the next `script:changed` on `ws` and assert its envelope. The
+/// event is stamped with the bound principal behind the mutating wire
+/// connection — `{ type: user, id: actor_id, .. }` (multiplayer w4).
 async fn next_script_change<S>(
     ws: &mut WebSocketStream<S>,
     subscription_id: &str,
     workspace_id: &str,
     script_id: &str,
     action: &str,
+    actor_id: &str,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -222,7 +226,8 @@ async fn next_script_change<S>(
                 assert_eq!(event["data"]["action"], action, "action: {frame}");
                 assert!(event["id"].is_string(), "event id: {frame}");
                 assert!(event["timestamp"].is_string(), "timestamp: {frame}");
-                assert_eq!(event["actor"]["type"], "system", "actor: {frame}");
+                assert_eq!(event["actor"]["type"], "user", "actor: {frame}");
+                assert_eq!(event["actor"]["id"], actor_id, "actor: {frame}");
                 return;
             }
             Some(Ok(Message::Ping(payload))) => {
@@ -348,6 +353,8 @@ async fn script_definition_changes_emit_over_authenticated_wss() {
         .as_str()
         .expect("subscription B id")
         .to_string();
+    let me = wss_rpc(&mut rpc, 9, "principal.me", json!({})).await;
+    let actor_id = me["id"].as_str().expect("principal id").to_string();
 
     let created = wss_rpc(
         &mut rpc,
@@ -369,6 +376,7 @@ async fn script_definition_changes_emit_over_authenticated_wss() {
         workspace_a,
         "script-a",
         "created",
+        &actor_id,
     )
     .await;
 
@@ -392,6 +400,7 @@ async fn script_definition_changes_emit_over_authenticated_wss() {
         workspace_a,
         "script-a",
         "updated",
+        &actor_id,
     )
     .await;
 
@@ -409,6 +418,7 @@ async fn script_definition_changes_emit_over_authenticated_wss() {
         workspace_a,
         "script-a",
         "removed",
+        &actor_id,
     )
     .await;
 
@@ -447,6 +457,7 @@ async fn script_definition_changes_emit_over_authenticated_wss() {
         workspace_a,
         "barrier-a",
         "created",
+        &actor_id,
     )
     .await;
 
@@ -471,6 +482,7 @@ async fn script_definition_changes_emit_over_authenticated_wss() {
         workspace_b,
         "barrier-b",
         "created",
+        &actor_id,
     )
     .await;
 

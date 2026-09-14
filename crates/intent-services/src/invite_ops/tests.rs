@@ -173,6 +173,50 @@ async fn primary_identity_locked_once_another_principal_exists() {
     assert_eq!(refreshed.login.as_deref(), Some("first-renamed"));
 }
 
+/// The caller's snapshot never decides the guard: a `GET /user` that
+/// completes with a snapshot taken before a switch to account 20 landed
+/// (and before the daemon became locked) is judged against the current
+/// row — refused for the old account, and the snapshot's stale fields are
+/// never written back over the current identity.
+#[tokio::test]
+async fn stale_snapshot_cannot_bypass_the_reconnect_guard() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services = Services::new(store.clone());
+    let mut primary = store.get_primary_principal().await.expect("primary");
+    primary.github_user_id = Some(10);
+    primary.login = Some("first".into());
+    store
+        .upsert_principal(&primary)
+        .await
+        .expect("seed identity");
+    let stale = primary.clone();
+
+    services
+        .apply_primary_identity(primary, &identity("second", 20))
+        .await
+        .expect("single-user switch");
+    store
+        .upsert_principal(&principal("guest", Some(77)))
+        .await
+        .expect("second principal");
+
+    let err = services
+        .apply_primary_identity(stale.clone(), &identity("first", 10))
+        .await;
+    assert_eq!(invite_kind(&err), InviteErrorKind::IdentityLocked);
+    let stored = store.get_primary_principal().await.expect("primary");
+    assert_eq!(stored.github_user_id, Some(20));
+    assert_eq!(stored.login.as_deref(), Some("second"));
+
+    let refreshed = services
+        .apply_primary_identity(stale, &identity("second-renamed", 20))
+        .await
+        .expect("current account refreshes from a stale snapshot");
+    assert_eq!(refreshed.github_user_id, Some(20));
+    assert_eq!(refreshed.login.as_deref(), Some("second-renamed"));
+}
+
 /// While locked, a profile without a stable account id is unverifiable and
 /// refused: the cached identity stays.
 #[tokio::test]
@@ -1061,14 +1105,21 @@ async fn event_actor_restamp_overrides_a_preset_non_system_actor() {
     assert_eq!(agent.actor.id.as_deref(), Some("agent-1"));
 }
 
-/// The administrator's events keep the actor the operation supplied.
+/// The administrator — the owner over UDS or its own wire credential — is a
+/// bound principal like any other: its events carry `{ type: user, id:
+/// primaryPrincipalId, name }`, with the display name when no GitHub
+/// identity is attached.
 #[tokio::test]
-async fn event_actor_is_untouched_for_the_administrator() {
+async fn event_actor_is_the_primary_for_the_administrator() {
     let tmp = TempDb::new();
     let mut f = fixture(&tmp).await;
     f.services = f
         .services
         .with_event_bus(crate::events::EventBus::new(f.store.clone()));
+    let mut primary = f.store.get_primary_principal().await.expect("primary");
+    primary.login = None;
+    primary.display_name = Some("Local owner".into());
+    f.store.upsert_principal(&primary).await.expect("seed");
     with_caller(
         Caller::Wire {
             principal_id: f.primary.clone(),
@@ -1096,7 +1147,80 @@ async fn event_actor_is_untouched_for_the_administrator() {
         .await
         .expect("events");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].actor.actor_type, intent_core::ActorType::System);
+    assert_eq!(rows[0].actor.actor_type, intent_core::ActorType::User);
+    assert_eq!(rows[0].actor.id.as_deref(), Some(f.primary.0.as_str()));
+    assert_eq!(rows[0].actor.name.as_deref(), Some("Local owner"));
+}
+
+/// The administrator's comments are stamped with the primary's GitHub
+/// login once one is attached; a single-user daemon that never connected
+/// GitHub keeps the author its client supplied.
+#[tokio::test]
+async fn administrator_comment_author_follows_the_attached_identity() {
+    let (_tmp, f, note_id) = attribution_fixture().await;
+    let admin = || Caller::Wire {
+        principal_id: f.primary.clone(),
+        is_administrator: true,
+    };
+    let mut primary = f.store.get_primary_principal().await.expect("primary");
+    primary.login = None;
+    primary.github_user_id = None;
+    f.store.upsert_principal(&primary).await.expect("seed");
+    with_caller(
+        admin(),
+        f.services.comment_add(
+            f.ws.clone(),
+            note_id.clone(),
+            "Probe anchor text".into(),
+            "anchor".into(),
+            "Legacy comment".into(),
+            None,
+            Some("Legacy Author".into()),
+            Some("user".into()),
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("legacy comment");
+
+    primary.login = Some("primary-gh".into());
+    primary.github_user_id = Some(10);
+    f.store.upsert_principal(&primary).await.expect("attach");
+    with_caller(
+        admin(),
+        f.services.comment_add(
+            f.ws.clone(),
+            note_id.clone(),
+            "Probe anchor text".into(),
+            "anchor".into(),
+            "Attached comment".into(),
+            None,
+            Some("Someone Else".into()),
+            Some("agent".into()),
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("attached comment");
+
+    let rows = f
+        .store
+        .list_comments_in_workspace(&f.ws, &note_id)
+        .await
+        .expect("comments");
+    let by_text = |text: &str| {
+        rows.iter()
+            .find(|row| row.content == text)
+            .unwrap_or_else(|| panic!("comment {text:?}"))
+    };
+    let legacy = by_text("Legacy comment");
+    assert_eq!(legacy.author, "Legacy Author");
+    assert_eq!(legacy.author_type, intent_core::AuthorType::User);
+    let attached = by_text("Attached comment");
+    assert_eq!(attached.author, "primary-gh");
+    assert_eq!(attached.author_type, intent_core::AuthorType::User);
 }
 
 /// Invite rows survive a reopen of the migrated store.

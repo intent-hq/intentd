@@ -73,19 +73,13 @@ fn stamping_principal_id() -> Option<PrincipalId> {
     }
 }
 
-/// The bound collaborator — a non-administrator wire principal — whose
-/// requests the daemon attributes authoritatively (multiplayer w4): comment
-/// authorship and every non-agent-actored event. The administrator keeps the
-/// attribution its client supplies (it owns the daemon and predates
-/// principals); agents, the daemon and an absent caller are not people.
-pub(crate) fn collaborator_caller_id() -> Option<PrincipalId> {
-    match current_caller() {
-        Some(Caller::Wire {
-            principal_id,
-            is_administrator: false,
-        }) => Some(principal_id),
-        Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) | None => None,
-    }
+/// The bound wire principal — the owner over UDS or its own wire
+/// credential as much as a collaborator — whose requests the daemon
+/// attributes authoritatively (multiplayer w4): comment authorship and
+/// every non-agent-actored event. Agents, the daemon and an absent caller
+/// are not people and attribute nothing.
+pub(crate) fn attributed_caller_id() -> Option<PrincipalId> {
+    stamping_principal_id()
 }
 
 /// The name a principal is attributed by: GitHub login, else display name,
@@ -96,20 +90,6 @@ pub(crate) fn principal_attribution_name(principal: &Principal) -> String {
         .clone()
         .or_else(|| principal.display_name.clone())
         .unwrap_or_else(|| principal.id.0.clone())
-}
-
-/// Authoritative event actor for a collaborator's request: `{ type: user,
-/// id: principalId, name }`. `None` for every other caller, or when the
-/// principal row cannot be read (the operation's own actor then stands).
-pub(crate) async fn collaborator_event_actor(store: &Store) -> Option<intent_core::EventActor> {
-    let principal_id = collaborator_caller_id()?;
-    let principal = store.get_principal(&principal_id).await.ok()?;
-    Some(intent_core::EventActor {
-        actor_type: intent_core::ActorType::User,
-        id: Some(principal_id.0),
-        name: Some(principal_attribution_name(&principal)),
-        ..Default::default()
-    })
 }
 
 /// Daemon-authoritative principal stamp on a user-origin message payload
@@ -409,19 +389,25 @@ pub(crate) fn principal_to_wire(p: &Principal, is_administrator: bool) -> Value 
 }
 
 impl Services {
-    /// Authoritative `(author, authorType)` for a comment written by the
-    /// bound collaborator: its attribution name and `"user"`, replacing
-    /// whatever the client supplied so a guest cannot sign as someone else
-    /// or as an agent. Every other caller's supplied values pass through.
+    /// Authoritative `(author, authorType)` for a comment written by a
+    /// bound wire principal: its attribution name and `"user"`, replacing
+    /// whatever the client supplied so nobody signs as someone else or as
+    /// an agent. The one pass-through is the primary principal with no
+    /// GitHub identity attached — a single-user daemon that never connected
+    /// GitHub keeps rendering the author its client always supplied.
+    /// Agents and the daemon are not people; their supplied values pass.
     pub(crate) async fn attribute_comment_author(
         &self,
         author: Option<String>,
         author_type: Option<String>,
     ) -> Result<(Option<String>, Option<String>)> {
-        let Some(principal_id) = collaborator_caller_id() else {
+        let Some(principal_id) = attributed_caller_id() else {
             return Ok((author, author_type));
         };
         let principal = self.store.get_principal(&principal_id).await?;
+        if principal.is_primary && principal.login.is_none() {
+            return Ok((author, author_type));
+        }
         Ok((
             Some(principal_attribution_name(&principal)),
             Some("user".to_string()),
@@ -560,13 +546,18 @@ impl Services {
     /// and a missing one (an unverifiable account) are both refused, and a
     /// lock state that cannot be read propagates as an error rather than
     /// admitting the change. The lock check and the write run under the
-    /// [`IdentityTransitionLock`], so no invite is minted in between.
+    /// [`IdentityTransitionLock`], so no invite is minted in between, and
+    /// the cached identity is re-read under that lock: `principal` is the
+    /// caller's snapshot, which a switch that landed while `GET /user` was
+    /// in flight may have outdated, and a stale snapshot must not decide
+    /// the same-account check or be written back over the current row.
     pub(crate) async fn apply_primary_identity(
         &self,
         principal: Principal,
         user: &intent_sourcecontrol::UserIdentity,
     ) -> Result<Principal> {
         let _transition = self.identity_transition.lock().await;
+        let principal = self.store.get_principal(&principal.id).await?;
         let fetched_id = user.id.and_then(|id| i64::try_from(id).ok());
         let same_account =
             principal.github_user_id.is_some() && principal.github_user_id == fetched_id;

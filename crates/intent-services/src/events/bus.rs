@@ -16,10 +16,11 @@
 //! changes attributed to the system/user are broadcast-only, since they are
 //! high-volume noise that no read path queries back out of the log.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use intent_core::{ActorType, Error, Event, Result};
+use intent_core::{ActorType, Error, Event, EventActor, PrincipalId, Result};
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -53,6 +54,14 @@ const WRITER_CHANNEL_CAPACITY: usize = 512;
 
 /// Max events drained per batch by the writer task (to bound transaction size).
 const WRITER_BATCH_SIZE: usize = 64;
+
+/// How long a principal's attribution name is reused by
+/// [`EventBus::publish`] before it is re-read from the store. Sized for one
+/// request's burst (a cascade such as `workspace.delete` publishes tens of
+/// events in milliseconds) so re-stamping costs one principal read per
+/// request rather than one per event, while a login change surfaces within
+/// this window.
+const ATTRIBUTION_NAME_TTL: Duration = Duration::from_secs(2);
 
 /// Wall-clock retry budget for a batch insert that fails transiently
 /// (write-pool acquire timeout / `SQLITE_BUSY` under contention — the write
@@ -110,6 +119,9 @@ pub struct EventBus {
     store: Store,
     tx: broadcast::Sender<Arc<Event>>,
     writer_tx: mpsc::Sender<WriterRequest>,
+    /// Attribution names by principal, each with its load time; entries
+    /// older than [`ATTRIBUTION_NAME_TTL`] are reloaded on next use.
+    attribution_names: Arc<Mutex<HashMap<PrincipalId, (Instant, String)>>>,
 }
 
 impl EventBus {
@@ -124,6 +136,7 @@ impl EventBus {
             store,
             tx,
             writer_tx,
+            attribution_names: Arc::default(),
         }
     }
 
@@ -157,20 +170,20 @@ impl EventBus {
     /// ([`is_transient_file_event`]) so watcher noise never reaches `SQLite`;
     /// callers see the same `Ok(Event)` shape either way.
     ///
-    /// An event published inside a collaborator's request is re-stamped
-    /// with that collaborator — `{ type: user, id: principalId, name }`
-    /// (multiplayer w4) — whatever actor the emitting path set, so subscribers
-    /// see who acted and no code path can attribute a collaborator's action
-    /// to someone else. Only an agent-actored event keeps its actor: the
-    /// agent is the event's subject (`getAgentActivity` groups by it), not
-    /// the person who prodded it. Every other caller's actor is kept as
-    /// supplied.
+    /// An event published inside a bound wire principal's request — the
+    /// owner over UDS as much as a collaborator — is re-stamped with that
+    /// principal, `{ type: user, id: principalId, name }` (multiplayer w4),
+    /// whatever actor the emitting path set, so subscribers see who acted
+    /// and no code path can attribute a person's action to someone else.
+    /// Only an agent-actored event keeps its actor: the agent is the event's
+    /// subject (`getAgentActivity` groups by it), not the person who prodded
+    /// it. Agent and daemon callers' actors are kept as supplied.
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the event writer task has shut down or dropped the response.
     pub async fn publish(&self, ev: &NewEvent) -> Result<Event> {
-        let attributed = self.attribute_to_collaborator(ev).await;
+        let attributed = self.attribute_to_caller(ev).await;
         let ev = attributed.as_ref().unwrap_or(ev);
         if is_transient_file_event(ev) {
             let event = self.publish_transient(ev);
@@ -194,16 +207,44 @@ impl EventBus {
             .map_err(|_| Error::Internal("event writer task dropped response".to_string()))?
     }
 
-    /// The collaborator-stamped copy of a non-agent-actored `ev` when the
-    /// current request is a collaborator's; `None` leaves `ev` as supplied.
-    async fn attribute_to_collaborator(&self, ev: &NewEvent) -> Option<NewEvent> {
+    /// The principal-stamped copy of a non-agent-actored `ev` when the
+    /// current request is a bound wire principal's — `{ type: user, id:
+    /// principalId, name }`; `None` leaves `ev` as supplied, including when
+    /// the principal row cannot be read.
+    async fn attribute_to_caller(&self, ev: &NewEvent) -> Option<NewEvent> {
         if ev.actor.actor_type == ActorType::Agent {
             return None;
         }
-        let actor = crate::principal_ops::collaborator_event_actor(&self.store).await?;
+        let principal_id = crate::principal_ops::attributed_caller_id()?;
+        let name = self.attribution_name(&principal_id).await?;
         let mut stamped = ev.clone();
-        stamped.actor = actor;
+        stamped.actor = EventActor {
+            actor_type: ActorType::User,
+            id: Some(principal_id.0),
+            name: Some(name),
+            ..Default::default()
+        };
         Some(stamped)
+    }
+
+    /// The attribution name of `principal_id`, reused for
+    /// [`ATTRIBUTION_NAME_TTL`] after each load from the store.
+    async fn attribution_name(&self, principal_id: &PrincipalId) -> Option<String> {
+        {
+            let cache = self.attribution_names.lock().ok()?;
+            if let Some((loaded_at, name)) = cache.get(principal_id) {
+                if loaded_at.elapsed() < ATTRIBUTION_NAME_TTL {
+                    return Some(name.clone());
+                }
+            }
+        }
+        let principal = self.store.get_principal(principal_id).await.ok()?;
+        let name = crate::principal_ops::principal_attribution_name(&principal);
+        if let Ok(mut cache) = self.attribution_names.lock() {
+            cache.retain(|_, (loaded_at, _)| loaded_at.elapsed() < ATTRIBUTION_NAME_TTL);
+            cache.insert(principal_id.clone(), (Instant::now(), name.clone()));
+        }
+        Some(name)
     }
 
     /// Mint an event id (`UUIDv7`) + timestamp and broadcast to live subscribers
