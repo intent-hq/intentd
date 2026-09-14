@@ -257,9 +257,6 @@ impl Services {
                 .seed(&ws.id, waiting, waiting_generation);
             waiting
         };
-        if ws.task_stats.is_none() {
-            return;
-        }
         // Pre-read generation snapshot: a `workspace.delete` eviction racing
         // the awaits below must not have this seed resurrect the baseline.
         let generation = self.last_display_statuses.generation();
@@ -274,6 +271,22 @@ impl Services {
             fetched_git_root_prs = self.workspace_git_root_prs(&ws.id).await;
             &fetched_git_root_prs
         };
+        // The served PR fields follow the same rule as the derivation: every
+        // workspace-owned copy (linked `activePullRequest`, pooled
+        // `pullRequests` entry) of a URL a git-root PR carries is
+        // canonicalized in place to the snapshot [`fold_git_root_prs`]
+        // selects for it, so no response pairs a stale `open` linked copy
+        // with `displayStatus: pr_merged` or a `draft` pooled copy with
+        // `pr_ready`. Root-only URLs are not appended here (the list emit
+        // merge owns that); a workspace without git-root PRs is untouched.
+        canonicalize_workspace_pr_copies(
+            ws.active_pull_request.as_mut(),
+            ws.pull_requests.as_deref_mut().unwrap_or_default(),
+            git_root_prs,
+        );
+        if ws.task_stats.is_none() {
+            return;
+        }
         // Derive from the row's own `activity` (set by every caller just
         // before enrichment) so a single response can never pair
         // `activity: "agent_running"` with `displayStatus: "idle"`. Wait
@@ -778,11 +791,17 @@ pub(crate) fn pr_status_rank(status: PullRequestStatus) -> u8 {
     }
 }
 
-/// Status-ladder upgrade of a same-URL duplicate: identity fields keep the
-/// higher-priority `present` entry, but when `candidate` ranks higher on
-/// [`pr_status_rank`] its lifecycle fields win — `isDraft` moves with
-/// `status` so an upgraded entry never reads merged/closed while still
-/// claiming draft.
+/// Status-ladder upgrade of a same-URL **monitor-derived** duplicate on
+/// the emit-path merge (`Services::merge_external_pull_requests`): identity
+/// fields keep the higher-priority `present` entry, but when `candidate`
+/// ranks strictly higher on [`pr_status_rank`] its `status`, `updatedAt`
+/// and `isDraft` win — `isDraft` moves with `status` so an upgraded entry
+/// never reads merged/closed while still claiming draft. Deliberately
+/// narrower than [`canonicalize_pr_lifecycle`]: a monitor entry's
+/// `updatedAt` is the monitor row's timestamp, not the PR's, and it carries
+/// no `mergeableState`, so an equal-rank tie-break on it would overwrite
+/// real readiness data with the monitor's blanks. Git-root duplicates take
+/// the full same-URL rule via [`canonicalize_pr_url_copies`].
 pub(crate) fn upgrade_pr_lifecycle(present: &mut PullRequestInfo, candidate: &PullRequestInfo) {
     if pr_status_rank(candidate.status) > pr_status_rank(present.status) {
         present.status = candidate.status;
@@ -799,9 +818,9 @@ fn pr_lifecycle_key(info: &PullRequestInfo) -> (u8, &str) {
     (pr_status_rank(info.status), info.updated_at.as_str())
 }
 
-/// [`upgrade_pr_lifecycle`] for the fold: identity fields still keep
-/// `present`, a higher-ranked `canonical` still moves the lifecycle fields,
-/// and an equal-ranked `canonical` with a newer `updated_at` advances the
+/// The same-URL rule of the fold: identity fields keep `present`, a
+/// higher-ranked `canonical` moves the lifecycle fields, and an
+/// equal-ranked `canonical` with a newer `updated_at` advances the
 /// timestamp too. The readiness fields (`isDraft`, `mergeable`,
 /// `mergeableState`) travel with the selected snapshot, so `present` reads
 /// as one coherent copy — the one chosen by (rank, `updated_at`) — rather
@@ -809,7 +828,10 @@ fn pr_lifecycle_key(info: &PullRequestInfo) -> (u8, &str) {
 /// first (step 4's `pr_ready` / `pr_queued` would otherwise depend on
 /// git-root order). A lower rank never moves anything — `closed` cannot
 /// downgrade `merged`.
-fn canonicalize_pr_lifecycle(present: &mut PullRequestInfo, canonical: &PullRequestInfo) {
+pub(crate) fn canonicalize_pr_lifecycle(
+    present: &mut PullRequestInfo,
+    canonical: &PullRequestInfo,
+) {
     if pr_lifecycle_key(canonical) > pr_lifecycle_key(present) {
         present.status = canonical.status;
         present.updated_at.clone_from(&canonical.updated_at);
@@ -818,6 +840,73 @@ fn canonicalize_pr_lifecycle(present: &mut PullRequestInfo, canonical: &PullRequ
         present
             .mergeable_state
             .clone_from(&canonical.mergeable_state);
+    }
+}
+
+/// Outcome of one same-URL step ([`canonicalize_pr_url_copies`]).
+pub(crate) struct PrUrlCopies {
+    /// The snapshot every copy of the URL was canonicalized to: the copy
+    /// with the highest (rank, `updated_at`) among the git-root record and
+    /// the workspace's own copies.
+    pub(crate) canonical: PullRequestInfo,
+    /// The linked `activePullRequest` carries the URL.
+    pub(crate) linked: bool,
+    /// A `pullRequests` entry carries the URL.
+    pub(crate) pooled: bool,
+}
+
+/// The one same-URL step shared by the derivation's fold
+/// ([`fold_git_root_prs`]) and the emit path
+/// ([`canonicalize_workspace_pr_copies`],
+/// `Services::merge_external_pull_requests`), so the served
+/// `activePullRequest` / `pullRequests` and the derived `displayStatus` can
+/// never disagree on a PR's lifecycle: for the git-root record `info`,
+/// select the copy with the highest (rank, `updated_at`) among `info`, the
+/// linked `active` (when it carries the URL) and the pooled entry (when one
+/// does), and canonicalize both workspace-owned copies to it with
+/// [`canonicalize_pr_lifecycle`] — identity fields stay, the lifecycle
+/// fields move together, `merged` is irreversible. A URL the workspace does
+/// not own is left to the caller (`linked` / `pooled` both `false`).
+pub(crate) fn canonicalize_pr_url_copies(
+    active: Option<&mut PullRequestInfo>,
+    pool: &mut [PullRequestInfo],
+    info: &PullRequestInfo,
+) -> PrUrlCopies {
+    let linked = active.filter(|active| active.url == info.url);
+    let pooled = pool.iter_mut().find(|p| p.url == info.url);
+    let canonical = [Some(info), pooled.as_deref(), linked.as_deref()]
+        .into_iter()
+        .flatten()
+        .max_by_key(|p| pr_lifecycle_key(p))
+        .cloned()
+        .unwrap_or_else(|| info.clone());
+    let copies = PrUrlCopies {
+        canonical,
+        linked: linked.is_some(),
+        pooled: pooled.is_some(),
+    };
+    if let Some(linked) = linked {
+        canonicalize_pr_lifecycle(linked, &copies.canonical);
+    }
+    if let Some(pooled) = pooled {
+        canonicalize_pr_lifecycle(pooled, &copies.canonical);
+    }
+    copies
+}
+
+/// Emit-path counterpart of [`fold_git_root_prs`] applied in place to the
+/// workspace row about to be served: canonicalize the workspace-owned
+/// copies of every URL a git-root PR carries ([`canonicalize_pr_url_copies`]
+/// per record) without appending root-only URLs. Idempotent, and a no-op
+/// for a workspace without git-root PRs, so a root-less row serializes
+/// exactly as before.
+fn canonicalize_workspace_pr_copies(
+    mut active: Option<&mut PullRequestInfo>,
+    pool: &mut [PullRequestInfo],
+    git_root_prs: &[PullRequestInfo],
+) {
+    for info in git_root_prs {
+        canonicalize_pr_url_copies(active.as_deref_mut(), pool, info);
     }
 }
 
@@ -839,8 +928,9 @@ struct FoldedPrLinkage {
 }
 
 /// Fold the workspace's git-root PRs into its own PR linkage for the PR
-/// rungs, with exactly the priority `merge_external_pull_requests` gives
-/// the wire `pullRequests`: dedup by `url`, the workspace entry keeps its
+/// rungs, with exactly the rule the emit path applies to the wire
+/// `activePullRequest` / `pullRequests` ([`canonicalize_pr_url_copies`] is
+/// the shared step): dedup by `url`, the workspace entry keeps its
 /// identity, and the lifecycle only moves up the [`pr_status_rank`] ladder.
 /// For every URL a git-root PR carries, the effective lifecycle is the
 /// highest rank across ALL copies — linked `activePullRequest`, pooled
@@ -875,29 +965,16 @@ fn fold_git_root_prs(
     let mut pool = pull_requests.to_vec();
     let mut scalar_lifecycle: Option<PullRequestStatus> = None;
     for info in git_root_prs {
-        let linked = active.as_ref().filter(|active| active.url == info.url);
-        let pooled = pool.iter().position(|p| p.url == info.url);
-        let canonical = [Some(info), pooled.map(|i| &pool[i]), linked]
-            .into_iter()
-            .flatten()
-            .max_by_key(|p| pr_lifecycle_key(p))
-            .cloned()
-            .unwrap_or_else(|| info.clone());
-        if linked.is_none() && pooled.is_none() {
+        let copies = canonicalize_pr_url_copies(active.as_mut(), &mut pool, info);
+        if !copies.linked && !copies.pooled {
             pool.push(info.clone());
-        } else {
-            if let Some(active) = active.as_mut().filter(|active| active.url == info.url) {
-                canonicalize_pr_lifecycle(active, &canonical);
-            }
-            if let Some(i) = pooled {
-                canonicalize_pr_lifecycle(&mut pool[i], &canonical);
-            }
         }
         if pr_url == Some(info.url.as_str())
-            && scalar_lifecycle
-                .is_none_or(|current| pr_status_rank(canonical.status) > pr_status_rank(current))
+            && scalar_lifecycle.is_none_or(|current| {
+                pr_status_rank(copies.canonical.status) > pr_status_rank(current)
+            })
         {
-            scalar_lifecycle = Some(canonical.status);
+            scalar_lifecycle = Some(copies.canonical.status);
         }
     }
     FoldedPrLinkage {
@@ -2753,6 +2830,99 @@ mod display_status {
             (PullRequestStatus::Merged, "2026-01-03T00:00:00Z")
         );
         assert_eq!((active.mergeable, active.mergeable_state), (None, None));
+    }
+
+    /// The emit-path helper applies the fold's same-URL rule to the row's
+    /// own copies in place: the two intentd#1884 review repros, in both
+    /// root orders. A stale `open` linked copy beside a merged root copy
+    /// (and a newer-but-still-open one) reads `merged` with the merged
+    /// copy's timestamp; an older `draft` pooled copy beside a newer clean
+    /// `open` root copy reads open/clean/not-draft — the same snapshot the
+    /// derivation lands `pr_merged` / `pr_ready` on. Identity fields stay,
+    /// root-only URLs are not appended, and a root-less row is untouched.
+    #[test]
+    fn workspace_copies_canonicalize_in_place_like_the_fold() {
+        let stale_linked = pr(PullRequestStatus::Open, "2026-01-01T00:00:00Z");
+        let root_open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        let root_merged = pr(PullRequestStatus::Merged, "2026-01-03T00:00:00Z");
+        for roots in [
+            [root_merged.clone(), root_open.clone()],
+            [root_open.clone(), root_merged.clone()],
+        ] {
+            let mut active = stale_linked.clone();
+            let mut pool = vec![stale_linked.clone()];
+            super::canonicalize_workspace_pr_copies(Some(&mut active), &mut pool, &roots);
+            for copy in [&active, &pool[0]] {
+                assert_eq!(copy.id, stale_linked.id, "identity kept");
+                assert_eq!(
+                    (copy.status, copy.updated_at.as_str()),
+                    (PullRequestStatus::Merged, "2026-01-03T00:00:00Z")
+                );
+            }
+            assert_eq!(pool.len(), 1, "root copies are not appended");
+            assert_eq!(
+                with_git_root_prs(Some(&active), &pool, &roots, None),
+                WorkspaceDisplayStatus::PrMerged,
+                "the canonicalized row derives the same status"
+            );
+        }
+
+        let mut stale_draft = open_pr("blocked", "2026-01-01T00:00:00Z");
+        stale_draft.status = PullRequestStatus::Draft;
+        stale_draft.is_draft = Some(true);
+        let mut root_blocked = open_pr("blocked", "2026-01-02T00:00:00Z");
+        root_blocked.is_draft = Some(false);
+        let mut root_clean = open_pr("clean", "2026-01-03T00:00:00Z");
+        root_clean.is_draft = Some(false);
+        for roots in [
+            [root_clean.clone(), root_blocked.clone()],
+            [root_blocked.clone(), root_clean.clone()],
+        ] {
+            let mut pool = vec![stale_draft.clone()];
+            super::canonicalize_workspace_pr_copies(None, &mut pool, &roots);
+            assert_eq!(pool.len(), 1);
+            assert_eq!(pool[0].id, stale_draft.id, "identity kept");
+            assert_eq!(
+                (
+                    pool[0].status,
+                    pool[0].updated_at.as_str(),
+                    pool[0].is_draft,
+                    pool[0].mergeable,
+                    pool[0].mergeable_state.as_deref(),
+                ),
+                (
+                    PullRequestStatus::Open,
+                    "2026-01-03T00:00:00Z",
+                    Some(false),
+                    Some(true),
+                    Some("clean"),
+                )
+            );
+            assert_eq!(
+                with_git_root_prs(None, &pool, &roots, None),
+                WorkspaceDisplayStatus::PrReady
+            );
+        }
+
+        let mut active = stale_linked.clone();
+        let mut pool = vec![stale_linked.clone()];
+        let root_only = root_pr(PullRequestStatus::Merged, "2026-01-03T00:00:00Z");
+        super::canonicalize_workspace_pr_copies(
+            Some(&mut active),
+            &mut pool,
+            std::slice::from_ref(&root_only),
+        );
+        assert_eq!(
+            (active.clone(), pool.clone()),
+            (stale_linked.clone(), vec![stale_linked.clone()]),
+            "another URL moves nothing"
+        );
+        super::canonicalize_workspace_pr_copies(Some(&mut active), &mut pool, &[]);
+        assert_eq!(
+            (active, pool),
+            (stale_linked.clone(), vec![stale_linked]),
+            "no roots: untouched"
+        );
     }
 
     /// Cost-contract guard (single-bulk-call-site heuristic): the list paths

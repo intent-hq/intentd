@@ -2810,17 +2810,34 @@ impl Services {
     /// never hydrate on this path, intent-hq/monorepo#3878). Dedup is by PR
     /// `url` — the one field every source carries that stays unambiguous
     /// across repos — first-wins in source-priority order: workspace's own
-    /// PRs, then git-root PRs, then monitor-derived entries. One exception
-    /// to first-wins: a lower-priority duplicate whose status sits higher
-    /// on the lifecycle ladder (open/draft < closed < merged) upgrades the
-    /// present entry's `status` + `updatedAt` + `isDraft` in place, so a
-    /// stale git-root/workspace entry can never shadow a monitor that
-    /// already saw the PR merge (intent-hq/monorepo#3127). Status only ever
-    /// moves up the ladder: `merged` is irreversible so it wins over
-    /// everything (including a stale `closed`), while `closed` — the
-    /// snapshotless completed-monitor fallback among others — never
-    /// downgrades a `merged` verdict, and reopened-after-close is left to
-    /// the sweep re-fetch. A row with nothing to merge is left untouched (a `None`
+    /// PRs, then git-root PRs, then monitor-derived entries. Identity
+    /// fields always keep the higher-priority entry; the lifecycle fields
+    /// of a duplicate follow the source:
+    /// - a git-root duplicate takes the SAME same-URL rule the
+    ///   `displayStatus` derivation folds git-root PRs with
+    ///   ([`workspace_status::canonicalize_pr_url_copies`]): the copy with
+    ///   the highest (lifecycle rank, `updatedAt`) wins `status` +
+    ///   `updatedAt` + `isDraft` + `mergeable` + `mergeableState` as one
+    ///   coherent snapshot, for the pooled entry AND the linked
+    ///   `activePullRequest`, so the served PR fields can never disagree
+    ///   with `displayStatus` (a merged root copy lifts a stale open linked
+    ///   copy beside `pr_merged`; a newer clean root copy lifts an older
+    ///   draft pooled copy beside `pr_ready`; the result is independent of
+    ///   git-root order). The read-path enrichment already applied this to
+    ///   the workspace-owned copies; re-applying here is idempotent and
+    ///   also covers root-only URLs carried by several roots.
+    /// - a monitor-derived duplicate upgrades only on a strictly higher
+    ///   lifecycle rank (open/draft < closed < merged) — `status` +
+    ///   `updatedAt` + `isDraft` ([`workspace_status::upgrade_pr_lifecycle`]),
+    ///   so a stale git-root/workspace entry can never shadow a monitor that
+    ///   already saw the PR merge (intent-hq/monorepo#3127). Status only
+    ///   ever moves up the ladder: `merged` is irreversible so it wins over
+    ///   everything (including a stale `closed`), while `closed` — the
+    ///   snapshotless completed-monitor fallback among others — never
+    ///   downgrades a `merged` verdict, and reopened-after-close is left to
+    ///   the sweep re-fetch.
+    ///
+    /// A row with nothing to merge is left untouched (a `None`
     /// stays omitted on the wire, and an empty git-root list contributes
     /// nothing rather than materializing `[]`); a store read failure
     /// degrades to serving the base rows. `include_archived` mirrors the
@@ -2846,33 +2863,44 @@ impl Services {
         if git_root_prs.is_empty() && monitors.is_empty() {
             return;
         }
-        // Group externally sourced PRs per workspace, git-root entries before
-        // monitor-derived ones so the first-wins dedup below encodes the
-        // source priority. The snapshot never carries an empty git-root
-        // list, so no entry here can flip an omitted workspace
-        // `pullRequests` into `[]`.
-        let mut extras = git_root_prs;
+        // Group monitor-derived PRs per workspace; they merge after the
+        // git-root entries so the first-wins dedup below encodes the source
+        // priority. The snapshot never carries an empty git-root list, so no
+        // entry here can flip an omitted workspace `pullRequests` into `[]`.
+        let mut git_root_prs = git_root_prs;
+        let mut monitor_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>> = HashMap::new();
         for monitor in &monitors {
-            extras
+            monitor_prs
                 .entry(monitor.workspace_id.clone())
                 .or_default()
                 .push(pr_monitor::pr_monitor_pr_info(monitor));
         }
         for ws in list.iter_mut() {
-            let Some(candidates) = extras.remove(&ws.id) else {
+            let roots = git_root_prs.remove(&ws.id).unwrap_or_default();
+            let monitored = monitor_prs.remove(&ws.id).unwrap_or_default();
+            if roots.is_empty() && monitored.is_empty() {
                 continue;
-            };
+            }
             let merged = ws.pull_requests.get_or_insert_with(Vec::new);
-            for info in candidates {
+            for mut info in roots {
+                // The derivation's same-URL step: the linked and pooled
+                // copies of this URL move to the canonical snapshot; a URL
+                // the pool does not carry is appended, itself canonicalized
+                // (it may duplicate the linked `activePullRequest`, and a
+                // URL's copies always agree).
+                let copies = workspace_status::canonicalize_pr_url_copies(
+                    ws.active_pull_request.as_mut(),
+                    merged,
+                    &info,
+                );
+                if !copies.pooled {
+                    workspace_status::canonicalize_pr_lifecycle(&mut info, &copies.canonical);
+                    merged.push(info);
+                }
+            }
+            for info in monitored {
                 match merged.iter_mut().find(|p| p.url == info.url) {
                     None => merged.push(info),
-                    // Status-ladder upgrade (`workspace_status::pr_status_rank`
-                    // — the same ladder the displayStatus derivation folds
-                    // git-root PRs with, so the wire `pullRequests` and the
-                    // derived status can never disagree on a duplicate):
-                    // identity/fields keep the higher-priority entry, but a
-                    // lower-priority source whose status ranks higher wins
-                    // the lifecycle fields.
                     Some(present) => workspace_status::upgrade_pr_lifecycle(present, &info),
                 }
             }
@@ -16987,10 +17015,12 @@ impl WorkspaceApi for Services {
             // Emit-path PR merge: fold git-root + monitor PRs into each
             // row's `pullRequests`. Runs after enrichment: the displayStatus
             // derivation already folded the git-root PRs and the monitor
-            // signals with the same per-URL priority, so it must not see
-            // them a second time via the merged `pullRequests`. The git-root
-            // PRs move out of the snapshot — the list's one bulk git-root
-            // read serves both the derivation and the wire merge.
+            // signals with the same per-URL priority (and canonicalized the
+            // row's own `activePullRequest` / `pullRequests` copies to the
+            // same lifecycle), so it must not see them a second time via the
+            // merged `pullRequests`. The git-root PRs move out of the
+            // snapshot — the list's one bulk git-root read serves both the
+            // derivation and the wire merge.
             this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
                 .await;
             Ok(list)
