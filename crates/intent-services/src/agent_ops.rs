@@ -6607,7 +6607,7 @@ impl Services {
                 intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
                 "",
                 expected_guard,
-                &now_iso(),
+                Some(&now_iso()),
             )
             .await
         {
@@ -6964,7 +6964,7 @@ impl Services {
                 intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY,
                 &message_id,
                 None,
-                &now_iso(),
+                Some(&now_iso()),
             )
             .await
         {
@@ -7138,9 +7138,14 @@ impl Services {
             // Guarded atomic single-key write: `json_set` on exactly
             // `lastSeenMessageId` (sibling keys — e.g. a concurrent
             // `dismissedQuestionsMessageId` — are preserved; only
-            // `metadata`+`updated_at` are touched so the stored
-            // `system_prompt` survives), conditioned on the marker still
-            // holding the value the gate above was computed against.
+            // `metadata` is touched so the stored `system_prompt`
+            // survives), conditioned on the marker still holding the value
+            // the gate above was computed against. `updated_at` is
+            // deliberately NOT refreshed: reading a conversation is not
+            // activity, and a bump here would move the session's served
+            // `lastActivity` and the derived workspace `lastActivity`,
+            // re-sorting the workspace merely for being opened
+            // (intent-hq/intent#1466).
             let wrote = self
                 .store
                 .set_agent_session_metadata_key(
@@ -7149,7 +7154,7 @@ impl Services {
                     intent_core::LAST_SEEN_MESSAGE_ID_KEY,
                     &message_id,
                     Some(current.as_deref()),
-                    &now_iso(),
+                    None,
                 )
                 .await?;
             if !wrote {

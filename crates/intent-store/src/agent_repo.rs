@@ -2085,7 +2085,10 @@ impl Store {
     /// when the guard failed (the session exists but the key's value moved —
     /// callers re-read and retry); `NotFound` when the session is absent or
     /// the workspace does not match. `updated_at` is refreshed on a successful
-    /// write only.
+    /// write only, and only when `Some`: `None` leaves the column untouched
+    /// (same UPDATE, same guard) for writes that are bookkeeping rather than
+    /// activity — the `agent.markSeen` seen marker, whose bump would move the
+    /// derived workspace `lastActivity` (intent-hq/intent#1466).
     ///
     /// # Errors
     ///
@@ -2097,7 +2100,7 @@ impl Store {
         key: &str,
         value: &str,
         expected: Option<Option<&str>>,
-        updated_at: &str,
+        updated_at: Option<&str>,
     ) -> Result<bool> {
         let guarded = expected.is_some();
         let expected_value = expected.flatten();
@@ -2110,7 +2113,7 @@ impl Store {
                      ELSE json_object('priorNonObjectMetadata', json(metadata)) \
                  END, \
                  '$.' || ?, ?), \
-             updated_at = ? \
+             updated_at = COALESCE(?, updated_at) \
              WHERE id = ? AND workspace_id = ? \
                AND (? = 0 OR json_extract(metadata, '$.' || ?) IS ?)",
         )
@@ -10781,7 +10784,7 @@ mod tests {
                 "lastSeenMessageId",
                 "msg-1",
                 Some(None),
-                &now_iso(),
+                Some(&now_iso()),
             )
             .await
             .expect("first write");
@@ -10795,7 +10798,7 @@ mod tests {
                 "dismissedQuestionsMessageId",
                 "msg-q",
                 None,
-                &now_iso(),
+                Some(&now_iso()),
             )
             .await
             .expect("sibling write");
@@ -10821,7 +10824,7 @@ mod tests {
                 "lastSeenMessageId",
                 "msg-stale",
                 Some(Some("msg-0")),
-                &now_iso(),
+                Some(&now_iso()),
             )
             .await
             .expect("guard miss is not an error");
@@ -10841,7 +10844,7 @@ mod tests {
                 "lastSeenMessageId",
                 "msg-2",
                 Some(Some("msg-1")),
-                &now_iso(),
+                Some(&now_iso()),
             )
             .await
             .expect("guard hit");
@@ -10870,7 +10873,7 @@ mod tests {
                 "lastSeenMessageId",
                 "msg-1",
                 None,
-                &now_iso(),
+                Some(&now_iso()),
             )
             .await
             .expect("legacy write");
@@ -10894,7 +10897,7 @@ mod tests {
                     "lastSeenMessageId",
                     "msg-3",
                     expected,
-                    &now_iso(),
+                    Some(&now_iso()),
                 )
                 .await
             {
@@ -10910,7 +10913,111 @@ mod tests {
                 "lastSeenMessageId",
                 "msg-3",
                 Some(None),
-                &now_iso(),
+                Some(&now_iso()),
+            )
+            .await
+        {
+            Err(Error::NotFound(_)) => {}
+            other => panic!("expected NotFound on unknown id, got {other:?}"),
+        }
+    }
+
+    /// Regression (intent-hq/intent#1466): `set_agent_session_metadata_key`
+    /// refreshes `updated_at` only when asked. `Some(ts)` stamps the row
+    /// (the activity-flavored callers), `None` writes the key and leaves
+    /// `updated_at` exactly where it was (the seen-marker path), with the
+    /// CAS guard and `NotFound` semantics unchanged either way.
+    #[tokio::test]
+    async fn set_agent_session_metadata_key_updated_at_is_optional() {
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let pinned = "2020-01-03T00:00:00Z";
+        let ws_id = WorkspaceId("ws-meta-key-ts".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, pinned))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, pinned, None))
+            .await
+            .expect("insert session");
+
+        // No-touch variant: key written, `updated_at` untouched (guarded).
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &agent_id,
+                "lastSeenMessageId",
+                "msg-1",
+                Some(None),
+                None,
+            )
+            .await
+            .expect("no-touch write");
+        assert!(wrote);
+        let after = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(
+            after.metadata.as_ref().expect("metadata")["lastSeenMessageId"],
+            serde_json::json!("msg-1")
+        );
+        assert_eq!(
+            after.updated_at, pinned,
+            "updated_at: None must leave the column untouched"
+        );
+
+        // No-touch guard miss: still Ok(false), still no bump.
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &agent_id,
+                "lastSeenMessageId",
+                "msg-stale",
+                Some(Some("msg-0")),
+                None,
+            )
+            .await
+            .expect("guard miss is not an error");
+        assert!(!wrote);
+        let after = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(after.updated_at, pinned);
+
+        // Default variant: `Some(ts)` still refreshes the column.
+        let later = "2021-06-01T00:00:00Z";
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &agent_id,
+                "dismissedQuestionsMessageId",
+                "msg-q",
+                None,
+                Some(later),
+            )
+            .await
+            .expect("stamping write");
+        assert!(wrote);
+        let after = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(
+            after.updated_at, later,
+            "updated_at: Some(ts) must refresh the column"
+        );
+        assert_eq!(
+            after.metadata.as_ref().expect("metadata")["lastSeenMessageId"],
+            serde_json::json!("msg-1"),
+            "sibling key must survive"
+        );
+
+        // No-touch on a missing session is still NotFound.
+        let missing = AgentId("agent-meta-key-ts-missing".to_string());
+        match store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &missing,
+                "lastSeenMessageId",
+                "msg-3",
+                None,
+                None,
             )
             .await
         {

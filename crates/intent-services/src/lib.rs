@@ -21043,8 +21043,10 @@ impl WorkspaceApi for Services {
             // case; after the mark-all above it is normally a no-op — the
             // settle already cleared and emitted). Review-required attention
             // persists. Merely looking at a workspace is not "activity", so
-            // `updated_at` (which feeds the derived `lastActivity`) stays
-            // untouched (intent-hq/monorepo#1466). Atomic settle-clear
+            // neither the workspace `updated_at` nor any session `updated_at`
+            // (both feed the derived `lastActivity`) moves: the per-agent
+            // marker writes above pass `updated_at: None` to the store
+            // (intent-hq/monorepo#1466). Atomic settle-clear
             // (monorepo#1481 pattern, hardened): one UPDATE guarded on
             // `attention = unread` AND the derivation re-checked inside the
             // write — touching only the attention column, so a concurrent

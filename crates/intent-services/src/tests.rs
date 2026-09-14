@@ -41549,6 +41549,94 @@ mod derived_workspace_unread {
         assert_silent(&mut sub).await;
     }
 
+    /// Pin the workspace row and one seeded top-level session to fixed past
+    /// instants so any `updated_at` bump from a seen-marker write shows.
+    /// Returns the session's last message id.
+    async fn seed_pinned_unseen_session(h: &Harness, agent: &str) -> String {
+        let last = seed_session(h, agent, &["user", "assistant"]).await;
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.created_at = "2020-01-01T00:00:00Z".to_string();
+        ws.updated_at = "2020-01-02T00:00:00Z".to_string();
+        ws.last_activity = None;
+        h.store.update_workspace(&ws).await.expect("pin workspace");
+        h.store
+            .update_agent_session_metadata(
+                &h.ws,
+                &AgentId::from(agent),
+                None,
+                "2020-01-03T00:00:00Z",
+            )
+            .await
+            .expect("pin session");
+        last
+    }
+
+    /// Regression (intent-hq/intent#1466, reopened): `workspace.markSeen`
+    /// advances the seen marker of an unseen top-level session WITHOUT
+    /// bumping that session's `updated_at`, so the derived workspace
+    /// `lastActivity` (max over session `updated_at`) stays put and the
+    /// workspace is not re-sorted to the top merely for being opened.
+    #[tokio::test]
+    async fn workspace_mark_seen_does_not_bump_session_updated_at() {
+        let h = harness().await;
+        let last = seed_pinned_unseen_session(&h, "agent-a").await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        let seen = h.services.mark_seen(h.ws.clone()).await.expect("seen");
+        assert_eq!(seen.attention, WorkspaceAttention::None);
+
+        let session = h
+            .store
+            .get_agent_session_summary(&AgentId::from("agent-a"))
+            .await
+            .expect("summary");
+        assert_eq!(session.last_seen_message_id(), Some(last.as_str()));
+        assert_eq!(
+            session.updated_at, "2020-01-03T00:00:00Z",
+            "workspace.markSeen must not bump the session's updated_at"
+        );
+        let mut reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.updated_at, "2020-01-02T00:00:00Z");
+        h.services.derive_last_activity(&mut reloaded).await;
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some("2020-01-03T00:00:00Z"),
+            "derived lastActivity must not move on workspace.markSeen"
+        );
+    }
+
+    /// Regression (intent-hq/intent#1466, reopened): the direct
+    /// `agent.markSeen` op persists the marker without touching the
+    /// session's `updated_at` (served as the per-agent `lastActivity`).
+    #[tokio::test]
+    async fn agent_mark_seen_does_not_bump_session_updated_at() {
+        let h = harness().await;
+        let last = seed_pinned_unseen_session(&h, "agent-a").await;
+
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last.clone())
+            .await
+            .expect("mark seen");
+
+        let session = h
+            .store
+            .get_agent_session_summary(&AgentId::from("agent-a"))
+            .await
+            .expect("summary");
+        assert_eq!(session.last_seen_message_id(), Some(last.as_str()));
+        assert_eq!(
+            session.updated_at, "2020-01-03T00:00:00Z",
+            "agent.markSeen must not bump the session's updated_at"
+        );
+        let mut reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        h.services.derive_last_activity(&mut reloaded).await;
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some("2020-01-03T00:00:00Z"),
+            "derived lastActivity must not move on agent.markSeen"
+        );
+    }
+
     /// The turn-end raise still only emits on the none→unread transition
     /// (guarded write), and the derivation agrees with the raise.
     #[tokio::test]

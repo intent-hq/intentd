@@ -32467,7 +32467,7 @@ async fn record_pending_proposals_error_paths_leave_metadata_intact() {
             intent_core::PENDING_PROPOSALS_KEY,
             "corrupt",
             None,
-            &now_iso(),
+            Some(&now_iso()),
         )
         .await
         .expect("corrupt marker");
@@ -33808,7 +33808,7 @@ async fn dismiss_questions_event_reflects_concurrent_marker_clear() {
             intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
             "",
             None,
-            &now_iso(),
+            Some(&now_iso()),
         )
         .await
         .expect("clear marker"));
