@@ -4037,6 +4037,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.relatedRepos.list`: the GitHub repositories a remote
+    /// repository's `.gitmodules` references, fetched via the contents API
+    /// (no clone) → `{ repos: [{ owner, repo, path }] }` in file order,
+    /// deduplicated, the parent excluded, capped at 5. A missing or
+    /// unparsable `.gitmodules` yields `{ repos: [] }` (never an error).
+    fn github_related_repos_list(
+        &self,
+        owner: String,
+        repo: String,
+        git_ref: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, git_ref);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_related_repos_list not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `github.pulls.updateBranch`:
     /// `PUT /repos/{owner}/{repo}/pulls/{number}/update-branch` → `{ message, url? }`.
     fn github_pulls_update_branch(

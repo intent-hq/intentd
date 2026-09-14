@@ -438,12 +438,25 @@
 //! `{ workspaceId, idempotencyKey }` selector arm on `file.getAttachmentInfo`
 //! (exactly one of `attachmentId` | the key pair). Bindings are per
 //! workspace, retained 7 days. No method-catalog change.
+//!
+//! Version 9.14 adds the `github.relatedRepos.list` router method (additive;
+//! §5.27): the GitHub repositories a remote repository's `.gitmodules`
+//! references, fetched via the contents API without a clone →
+//! `{ repos: [{ owner, repo, path }] }` (file order, deduplicated, the parent
+//! excluded, capped at 5; a missing or unparsable file is `{ repos: [] }`,
+//! never an error). Also within 9.14 (additive optional param, no catalog
+//! change): `github.pulls.search` / `github.issues.search` accept
+//! `repos?: [{ owner, repo }]` extras — ONE search request spanning at most
+//! 6 repositories (addressed + extras, deduplicated; over-cap or a malformed
+//! entry → `-32602`), `sort=updated`, every item's `owner` / `repo` naming
+//! its own hit's repository. The catalog contains 304 router methods, 49
+//! fast-path methods, and two aliases: 355 client-callable names.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.13";
+pub const PROTOCOL_VERSION: &str = "9.14";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

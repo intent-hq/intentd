@@ -6,10 +6,11 @@
 //! preserved, and that the tolerant semantics hold on the wire: a missing
 //! file yields `{ config: null, exists: false }`, invalid JSON folds to
 //! `{ config: {}, exists: true }` (never an error), and missing
-//! `owner`/`repo` fail with `-32602`. Drives a real [`WsApiServer`] over TLS
-//! with bearer-token auth and a pinned self-signed fingerprint (the
-//! production transport path) with a recording stub forge injected via
-//! `with_source_control`.
+//! `owner`/`repo` fail with `-32602`. Also covers the sibling contents-API
+//! read `github.relatedRepos.list` (`.gitmodules` → GitHub repos). Drives a
+//! real [`WsApiServer`] over TLS with bearer-token auth and a pinned
+//! self-signed fingerprint (the production transport path) with a recording
+//! stub forge injected via `with_source_control`.
 
 #![cfg(unix)]
 
@@ -479,4 +480,109 @@ async fn repo_config_get_requires_owner_and_repo() {
     assert_eq!(env2["error"]["code"], json!(-32602));
 
     assert!(fx.forge.content_calls.lock().unwrap().is_empty());
+}
+
+/// `github.relatedRepos.list` (§5.27) on the wire: the params land on the
+/// engine as a `.gitmodules` content fetch at the requested ref, and the
+/// response is `{ repos: [{ owner, repo, path }] }` in file order with the
+/// parent excluded, duplicates collapsed, and non-GitHub / relative URLs
+/// skipped.
+#[tokio::test]
+async fn related_repos_list_returns_gitmodules_github_repos() {
+    let fx = boot().await;
+    *fx.forge.file_content.lock().unwrap() = Some(
+        "[submodule \"packages/intentd\"]\n\
+         \tpath = packages/intentd\n\
+         \turl = https://github.com/intent-hq/intentd.git\n\
+         [submodule \"packages/fe\"]\n\
+         \tpath = packages/fe\n\
+         \turl = git@github.com:intent-hq/cloudlands-fe.git\n\
+         [submodule \"self\"]\n\
+         \tpath = vendor/self\n\
+         \turl = https://github.com/Intent-HQ/Intent.git\n\
+         [submodule \"dup\"]\n\
+         \tpath = vendor/dup\n\
+         \turl = ssh://git@github.com/Intent-HQ/IntentD\n\
+         [submodule \"foreign\"]\n\
+         \tpath = vendor/foreign\n\
+         \turl = https://gitlab.com/acme/widget.git\n\
+         [submodule \"rel\"]\n\
+         \tpath = vendor/rel\n\
+         \turl = ../sibling.git\n"
+            .into(),
+    );
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    let r = wss_rpc(
+        &mut ws,
+        1,
+        "github.relatedRepos.list",
+        json!({ "owner": "intent-hq", "repo": "intent", "ref": "main" }),
+    )
+    .await;
+    assert_eq!(
+        r,
+        json!({
+            "repos": [
+                { "owner": "intent-hq", "repo": "intentd", "path": "packages/intentd" },
+                { "owner": "intent-hq", "repo": "cloudlands-fe", "path": "packages/fe" },
+            ]
+        })
+    );
+
+    let calls = fx.forge.content_calls.lock().unwrap();
+    assert_eq!(
+        calls.as_slice(),
+        &[(
+            "intent-hq/intent".to_string(),
+            ".gitmodules".to_string(),
+            Some("main".to_string()),
+        )]
+    );
+}
+
+/// Graceful semantics on the wire: a missing `.gitmodules` yields
+/// `{ repos: [] }` (never an error) with an omitted `ref` reaching the engine
+/// as `None`, and missing required params fail with `-32602` before any
+/// engine call.
+#[tokio::test]
+async fn related_repos_list_missing_file_is_empty_and_requires_owner_and_repo() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    let r = wss_rpc(
+        &mut ws,
+        1,
+        "github.relatedRepos.list",
+        json!({ "owner": "octocat", "repo": "hello" }),
+    )
+    .await;
+    assert_eq!(r, json!({ "repos": [] }));
+    {
+        let calls = fx.forge.content_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, ".gitmodules");
+        assert_eq!(calls[0].2, None, "omitted ref reaches the engine as None");
+    }
+
+    let env = wss_rpc_envelope(
+        &mut ws,
+        2,
+        "github.relatedRepos.list",
+        json!({ "owner": "octocat" }),
+    )
+    .await;
+    assert!(env.get("result").is_none(), "expected error: {env}");
+    assert_eq!(env["error"]["code"], json!(-32602));
+
+    let env2 = wss_rpc_envelope(
+        &mut ws,
+        3,
+        "github.relatedRepos.list",
+        json!({ "repo": "r" }),
+    )
+    .await;
+    assert_eq!(env2["error"]["code"], json!(-32602));
+
+    assert_eq!(fx.forge.content_calls.lock().unwrap().len(), 1);
 }

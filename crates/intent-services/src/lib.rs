@@ -28502,6 +28502,47 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn github_related_repos_list(
+        &self,
+        owner: String,
+        repo: String,
+        git_ref: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
+            // Missing `.gitmodules` → { repos: [] }. A mis-shaped contents
+            // payload (directory, non-base64/non-UTF-8 content) folds the
+            // same way — never an error, like `github.repoConfig.get`.
+            // Transport/auth failures still surface like the other
+            // `github.*` methods.
+            let content = match sc
+                .get_file_content(&repo_ref, ".gitmodules", git_ref.as_deref())
+                .await
+            {
+                Ok(c) => c,
+                Err(intent_sourcecontrol::Error::Decode(msg)) => {
+                    tracing::warn!(
+                        "Mis-shaped remote .gitmodules at {}/{}@{}: {}",
+                        owner,
+                        repo,
+                        git_ref.as_deref().unwrap_or("default"),
+                        msg
+                    );
+                    None
+                }
+                Err(e) => return Err(pr_ops::map_sc_err(e)),
+            };
+            let repos = content
+                .map(|text| github_browse_ops::related_repos_from_gitmodules(&text, &repo_ref))
+                .unwrap_or_default();
+            Ok(serde_json::json!({
+                "repos": github_browse_ops::related_repos_to_wire(&repos),
+            }))
+        })
+    }
+
     fn github_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         let state = self.github_auth_flow.clone();

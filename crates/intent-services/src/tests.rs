@@ -15694,6 +15694,104 @@ mod pr {
     }
 
     #[tokio::test]
+    async fn github_related_repos_list_normalizes_dedupes_and_excludes_parent() {
+        // Every accepted URL form, a duplicate (different casing + form), the
+        // parent itself, a non-GitHub host, and a relative URL — only the
+        // distinct GitHub siblings survive, in `.gitmodules` order.
+        let forge = StubForge {
+            file_content: Some(
+                "[submodule \"a\"]\n\tpath = libs/a\n\turl = https://github.com/octocat/a.git\n\
+                 [submodule \"b\"]\n\tpath = libs/b\n\turl = git@github.com:octocat/b\n\
+                 [submodule \"c\"]\n\tpath = libs/c\n\turl = ssh://git@github.com/octocat/c.git\n\
+                 [submodule \"d\"]\n\tpath = libs/d\n\turl = github.com/octocat/d\n\
+                 [submodule \"a-dup\"]\n\tpath = libs/a-dup\n\turl = git@github.com:OctoCat/A.git\n\
+                 [submodule \"self\"]\n\tpath = libs/self\n\turl = https://github.com/OCTOCAT/Hello.git\n\
+                 [submodule \"foreign\"]\n\tpath = libs/foreign\n\turl = https://gitlab.com/octocat/e.git\n\
+                 [submodule \"rel\"]\n\tpath = libs/rel\n\turl = ../f.git\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let (_t, svc, _ws) = setup_with(forge, false).await;
+        let v = svc
+            .github_related_repos_list("octocat".into(), "hello".into(), Some("main".into()))
+            .await
+            .expect("related repos");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "repos": [
+                    { "owner": "octocat", "repo": "a", "path": "libs/a" },
+                    { "owner": "octocat", "repo": "b", "path": "libs/b" },
+                    { "owner": "octocat", "repo": "c", "path": "libs/c" },
+                    { "owner": "octocat", "repo": "d", "path": "libs/d" },
+                ]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn github_related_repos_list_caps_at_five() {
+        let content = (0..7).fold(String::new(), |mut acc, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                acc,
+                "[submodule \"s{i}\"]\n\tpath = libs/s{i}\n\turl = https://github.com/octocat/s{i}"
+            );
+            acc
+        });
+        let forge = StubForge {
+            file_content: Some(content),
+            ..Default::default()
+        };
+        let (_t, svc, _ws) = setup_with(forge, false).await;
+        let v = svc
+            .github_related_repos_list("octocat".into(), "hello".into(), None)
+            .await
+            .expect("related repos");
+        let repos = v["repos"].as_array().expect("repos array");
+        assert_eq!(repos.len(), 5);
+        assert_eq!(repos[4]["path"], "libs/s4");
+    }
+
+    #[tokio::test]
+    async fn github_related_repos_list_missing_file_yields_empty() {
+        let (_t, svc) = github_svc().await;
+        let v = svc
+            .github_related_repos_list("octocat".into(), "hello".into(), None)
+            .await
+            .expect("related repos");
+        assert_eq!(v, serde_json::json!({ "repos": [] }));
+    }
+
+    #[tokio::test]
+    async fn github_related_repos_list_unparsable_or_decode_error_yields_empty() {
+        let forge = StubForge {
+            file_content: Some("not a gitmodules file\n= =\n".to_string()),
+            ..Default::default()
+        };
+        let (_t, svc, _ws) = setup_with(forge, false).await;
+        let v = svc
+            .github_related_repos_list("octocat".into(), "hello".into(), None)
+            .await
+            .expect("related repos");
+        assert_eq!(v, serde_json::json!({ "repos": [] }));
+
+        // A mis-shaped contents payload (directory / non-base64 / non-UTF-8)
+        // folds the same way — never an RPC error.
+        let forge = StubForge {
+            file_content_decode_error: true,
+            ..Default::default()
+        };
+        let (_t, svc, _ws) = setup_with(forge, false).await;
+        let v = svc
+            .github_related_repos_list("octocat".into(), "hello".into(), None)
+            .await
+            .expect("related repos");
+        assert_eq!(v, serde_json::json!({ "repos": [] }));
+    }
+
+    #[tokio::test]
     async fn github_get_user_drops_id_name_and_never_leaks_token() {
         let (_t, svc) = github_svc().await;
         let v = svc.github_get_user().await.expect("user");
