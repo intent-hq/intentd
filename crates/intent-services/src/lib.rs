@@ -112,6 +112,7 @@ pub mod pagination;
 pub mod pi_cli;
 mod pr_monitor;
 mod pr_ops;
+pub mod presence;
 mod primitive_ops;
 mod principal_ops;
 pub mod provider_auth;
@@ -972,6 +973,9 @@ pub struct Services {
     /// (`principal.revokeSelf`), consumed by the transport to close their
     /// connections (multiplayer w4).
     principal_revocations: invite_ops::PrincipalRevocations,
+    /// Ephemeral workspace / note presence table (multiplayer w5), shared
+    /// with the caret coalescer's trailing-flush tasks.
+    presence: Arc<presence::PresenceRegistry>,
     /// Test-only override for the GitHub API base the identity-only flow's
     /// `GET /user` talks to (`None` → `$INTENTD_GITHUB_API_BASE_URI` →
     /// api.github.com).
@@ -1345,6 +1349,7 @@ impl Services {
                 invite_ops::REVOCATION_CHANNEL_CAPACITY,
             )
             .0,
+            presence: Arc::new(presence::PresenceRegistry::default()),
             github_api_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
             disk_usage: Arc::new(disk_usage::DiskUsageCache::new()),
@@ -30379,6 +30384,53 @@ impl WorkspaceApi for Services {
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>> {
         Some(self.principal_revocations.subscribe())
+    }
+
+    // Presence (multiplayer w5) — see `presence`.
+
+    fn presence_connect(&self, connection_id: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move { self.presence_connect_op(connection_id).await })
+    }
+
+    fn presence_update(
+        &self,
+        connection_id: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.presence_update_op(connection_id, params).await })
+    }
+
+    fn presence_disconnect(&self, connection_id: String) -> BoxFuture<'_, ()> {
+        Box::pin(async move { self.presence_disconnect_op(connection_id).await })
+    }
+
+    fn note_presence_join(
+        &self,
+        connection_id: String,
+        lease_id: String,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.note_presence_join_op(connection_id, lease_id, workspace_id, note_id)
+                .await
+        })
+    }
+
+    fn note_presence_leave(&self, connection_id: String, lease_id: String) -> BoxFuture<'_, ()> {
+        Box::pin(async move { self.note_presence_leave_op(&connection_id, &lease_id) })
+    }
+
+    fn note_presence_update(
+        &self,
+        connection_id: String,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        cursor: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.note_presence_update_op(&connection_id, workspace_id, note_id, &cursor)
+        })
     }
 
     fn workspace_invite_create(
