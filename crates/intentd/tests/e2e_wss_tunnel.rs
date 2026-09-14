@@ -1137,3 +1137,129 @@ async fn tunnel_global_cap_applies_across_ports() {
     ws.close(None).await.unwrap();
     srv.ws.stop().await;
 }
+
+/// Exercise the production shared byte budget over WSS. No individual stream
+/// receives enough frames to hit its 32-frame queue limit.
+#[tokio::test]
+async fn tunnel_shared_byte_budget_exhaustion_and_release() {
+    let srv = start().await;
+    let socket = TcpSocket::new_v4().expect("socket");
+    socket.set_recv_buffer_size(1024).expect("receive window");
+    socket.bind((Ipv4Addr::LOCALHOST, 0).into()).expect("bind");
+    let listener = socket.listen(8).expect("listen");
+    let port = listener.local_addr().expect("addr").port();
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    let mut held = Vec::new();
+    for id in 1..=4 {
+        send_frame(
+            &mut ws,
+            Frame::Open {
+                stream_id: id,
+                port,
+            },
+        )
+        .await;
+        assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id: id });
+        held.push(listener.accept().await.expect("accept").0);
+    }
+    let outcome = tokio::time::timeout(common::test_timeout(Duration::from_secs(30)), async {
+        let (mut writer, mut reader) = ws.split();
+        let upload = async {
+            for _ in 0..24 {
+                for id in 1..=4 {
+                    writer
+                        .send(Message::Binary(
+                            Frame::Data {
+                                stream_id: id,
+                                payload: vec![0; 1024 * 1024],
+                            }
+                            .encode()
+                            .into(),
+                        ))
+                        .await
+                        .expect("upload");
+                }
+            }
+            writer
+                .send(Message::Ping(b"budget-barrier".to_vec().into()))
+                .await
+                .expect("ping");
+        };
+        let observe = async {
+            let mut closed = std::collections::HashSet::new();
+            loop {
+                match reader
+                    .next()
+                    .await
+                    .expect("open connection")
+                    .expect("message")
+                {
+                    Message::Pong(p) if p.as_ref() == b"budget-barrier" => break,
+                    Message::Binary(b) => match Frame::decode(&b).expect("frame") {
+                        Frame::Close { stream_id } => {
+                            closed.insert(stream_id);
+                        }
+                        other => panic!("unexpected frame: {other:?}"),
+                    },
+                    other => panic!("unexpected message: {other:?}"),
+                }
+            }
+            assert!(
+                !closed.is_empty(),
+                "aggregate budget must reject excess bytes"
+            );
+        };
+        tokio::join!(upload, observe);
+        let mut ws = writer.reunite(reader).expect("same connection");
+        for id in 1..=4 {
+            send_frame(&mut ws, Frame::Close { stream_id: id }).await;
+        }
+        held.clear();
+        // New streams get a full 64 MiB of admitted payload without a CLOSE.
+        // Leaking permits from aborted writes/queues would reject this batch.
+        for id in 5..=8 {
+            send_frame(
+                &mut ws,
+                Frame::Open {
+                    stream_id: id,
+                    port,
+                },
+            )
+            .await;
+            loop {
+                match recv_frame(&mut ws).await {
+                    Frame::Close { stream_id: 1..=4 } => {}
+                    frame => {
+                        assert_eq!(frame, Frame::OpenOk { stream_id: id });
+                        break;
+                    }
+                }
+            }
+            held.push(listener.accept().await.expect("accept").0);
+        }
+        for _ in 0..16 {
+            for id in 5..=8 {
+                send_frame(
+                    &mut ws,
+                    Frame::Data {
+                        stream_id: id,
+                        payload: vec![0; 1024 * 1024],
+                    },
+                )
+                .await;
+            }
+        }
+        ws.send(Message::Ping(b"released".to_vec().into()))
+            .await
+            .expect("ping");
+        assert_eq!(
+            ws.next().await.expect("connected").expect("pong"),
+            Message::Pong(b"released".to_vec().into())
+        );
+        ws
+    })
+    .await;
+    drop(held);
+    drop(outcome.expect("budget test completes without blocking mux"));
+    srv.ws.stop().await;
+}
