@@ -13676,6 +13676,19 @@ impl Services {
             .remove(agent_id)
     }
 
+    /// Put a consumed marker back when its redrive lost the in-flight slot
+    /// before dequeuing the entry (intent-hq/intent#4962): the authorization
+    /// must outlive the lost claim so the slot winner's exit can honour it.
+    /// Never overwrites a newer marker recorded meanwhile — the newer send is
+    /// the one redriven, and this entry rides its turn or the next drain.
+    pub(crate) fn restore_parked_recovery_send(&self, agent_id: &AgentId, message_id: String) {
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .entry(agent_id.clone())
+            .or_insert(message_id);
+    }
+
     #[cfg(test)]
     pub(crate) fn parked_recovery_send(&self, agent_id: &AgentId) -> Option<String> {
         self.parked_recovery_sends

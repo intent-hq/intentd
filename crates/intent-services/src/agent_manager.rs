@@ -6067,6 +6067,10 @@ impl AgentManager {
     /// consumes it at exit; a marker whose entry has already drained
     /// (cleared at delivery by `Services::pop_draining`), been removed, or
     /// been re-minted (terminal-failure requeue) is dropped without effect.
+    /// A consumed marker whose drain then loses the slot claim (a competing
+    /// fresh send or `agent.retry` took the freed slot across the drain's
+    /// gate awaits) is restored by `try_drain_queue_inner`, so the
+    /// authorization survives until the entry is actually delivered.
     async fn redrive_parked_recovery_send(
         self: &Arc<Self>,
         agent_id: &AgentId,
@@ -6104,6 +6108,16 @@ impl AgentManager {
         redrive_error_park: Option<String>,
     ) {
         if self.is_busy(&agent_id) {
+            // A redrive that lost the slot before dequeuing keeps its
+            // authorization (intent-hq/intent#4962): the marker was consumed
+            // at the probe, so put it back for the slot winner's exit
+            // re-check — otherwise a competing fresh send/retry that claims
+            // the freed slot and then fails terminally strands this entry
+            // behind the Error gate with nothing left to lift it. The
+            // winner's own drain still clears it at delivery.
+            if let Some(id) = redrive_error_park {
+                self.services.restore_parked_recovery_send(&agent_id, id);
+            }
             return;
         }
         // Only claim the in-flight slot when at least one ready-to-send (not
@@ -6256,6 +6270,11 @@ impl AgentManager {
             return;
         }
         if !self.try_begin(&agent_id, &workspace_id).await {
+            // Lost the claim across the gate awaits above — same restore as
+            // the entry `is_busy` check.
+            if let Some(id) = redrive_error_park {
+                self.services.restore_parked_recovery_send(&agent_id, id);
+            }
             return;
         }
         if redrive_error_park.is_some() {
@@ -15956,6 +15975,140 @@ mod agent_retry_tests {
             "STAB-52: the pre-failure entry stays parked for agent.retry"
         );
         assert!(mgr.services.is_message_queued(&agent_id, id));
+    }
+
+    /// Poll a redrive future exactly once so it parks at its first async
+    /// pre-claim gate (the archived-workspace store read) with the marker
+    /// already consumed — the window a competing slot claim can land in.
+    async fn poll_once_pending<F: std::future::Future<Output = ()>>(
+        fut: &mut std::pin::Pin<Box<F>>,
+    ) {
+        std::future::poll_fn(|cx| {
+            assert!(
+                fut.as_mut().poll(cx).is_pending(),
+                "redrive must park at an async pre-claim gate"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    /// A redrive consumes the marker, then awaits its gates before
+    /// `try_begin`; a competing fresh send / `agent.retry` can claim the
+    /// freed slot in between. The redrive must put the marker back when it
+    /// loses the claim, so the competitor's terminal exit still redrives the
+    /// authorized recovery send instead of stranding it behind the gate.
+    #[tokio::test]
+    async fn recovery_marker_survives_competing_slot_claim() {
+        let agent_id = AgentId::from("agent-4962-claim-lost");
+        let ws = WorkspaceId::from("ws-4962");
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        hold_slot(&mgr, &agent_id, &ws);
+        let sent = mgr
+            .send_message(
+                agent_id.clone(),
+                ws.clone(),
+                "recover".to_string(),
+                None,
+                user_send(),
+            )
+            .await
+            .expect("send");
+        let id = sent["queuedMessage"]["id"].as_str().unwrap().to_string();
+        mgr.release_in_flight_slot(&agent_id);
+
+        let mut redrive = Box::pin(mgr.redrive_parked_recovery_send(&agent_id, &ws));
+        poll_once_pending(&mut redrive).await;
+        assert!(
+            mgr.services.parked_recovery_send(&agent_id).is_none(),
+            "marker is consumed at the probe"
+        );
+        // Competitor wins the slot while the redrive is parked at a gate.
+        hold_slot(&mgr, &agent_id, &ws);
+        redrive.await;
+        assert!(mgr.services.is_message_queued(&agent_id, &id));
+        assert_eq!(
+            mgr.services.parked_recovery_send(&agent_id).as_deref(),
+            Some(id.as_str()),
+            "the lost claim restores the authorization"
+        );
+
+        // Competitor fails terminally: Error persisted, slot released, exit
+        // re-check — which must now honour the restored marker.
+        mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
+            .await;
+        mgr.release_in_flight_slot(&agent_id);
+        mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
+        assert!(
+            !mgr.services.is_message_queued(&agent_id, &id),
+            "authorized recovery send stranded after redrive lost its slot claim"
+        );
+        assert!(
+            mgr.is_busy(&agent_id),
+            "the recovery send's own turn started"
+        );
+        assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
+    }
+
+    /// Restoring a lost-claim marker never overwrites a newer one: a second
+    /// recovery send parked meanwhile is the authorization that stands, and
+    /// exactly that entry is redriven at the slot winner's exit.
+    #[tokio::test]
+    async fn lost_claim_restore_keeps_newer_recovery_marker() {
+        let agent_id = AgentId::from("agent-4962-claim-newer");
+        let ws = WorkspaceId::from("ws-4962");
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        hold_slot(&mgr, &agent_id, &ws);
+        let first = mgr
+            .send_message(
+                agent_id.clone(),
+                ws.clone(),
+                "recover-1".to_string(),
+                None,
+                user_send(),
+            )
+            .await
+            .expect("send");
+        let first_id = first["queuedMessage"]["id"].as_str().unwrap().to_string();
+        mgr.release_in_flight_slot(&agent_id);
+
+        let mut redrive = Box::pin(mgr.redrive_parked_recovery_send(&agent_id, &ws));
+        poll_once_pending(&mut redrive).await;
+        hold_slot(&mgr, &agent_id, &ws);
+        // A second recovery send parks behind the competitor and records the
+        // newer marker while the first redrive is still parked at its gate.
+        let second = mgr
+            .send_message(
+                agent_id.clone(),
+                ws.clone(),
+                "recover-2".to_string(),
+                None,
+                user_send(),
+            )
+            .await
+            .expect("send");
+        let second_id = second["queuedMessage"]["id"].as_str().unwrap().to_string();
+        redrive.await;
+        assert_eq!(
+            mgr.services.parked_recovery_send(&agent_id).as_deref(),
+            Some(second_id.as_str()),
+            "the newer marker is not overwritten by the restore"
+        );
+
+        mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
+            .await;
+        mgr.release_in_flight_slot(&agent_id);
+        mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
+        assert!(mgr.is_busy(&agent_id));
+        assert!(
+            !mgr.services.is_message_queued(&agent_id, &second_id),
+            "exactly the newer recovery send is redriven"
+        );
+        assert!(
+            mgr.services.is_message_queued(&agent_id, &first_id),
+            "the older entry rides the redriven turn's drain"
+        );
+        assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
     }
 
     /// Drive a recovery `send_message` against a held slot and release the
