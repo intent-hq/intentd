@@ -4400,6 +4400,102 @@ pub trait WorkspaceApi: Send + Sync {
         None
     }
 
+    // Presence (multiplayer w5). The daemon keeps an ephemeral, in-memory
+    // presence table keyed by (principal, connection); `connection_id` is the
+    // transport's per-connection token (never a wire parameter). Every call
+    // resolves the principal from the bound `Caller::Wire`; agent / daemon
+    // callers and unbound requests are refused (`Forbidden`). Nothing here is
+    // persisted: the events are transient only.
+
+    /// A hello'd connection came online for its principal. Publishes
+    /// `presence:changed` to every workspace the principal is a member of
+    /// when this is its first live connection.
+    fn presence_connect(&self, connection_id: String) -> BoxFuture<'_, Result<()>> {
+        let _ = connection_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::presence_connect not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `presence.update({ focus: [{ workspaceId, agentId?, noteId? }],
+    /// typing?: { agentId } })`: replace the connection's focus set (sent
+    /// whole) and typing target → `{ ok: true }`. Requires a hello'd
+    /// connection; every focused workspace and the typing agent's workspace
+    /// must be a member workspace (`NotFound` otherwise). Publishes
+    /// `presence:changed` to each workspace whose aggregate changed.
+    fn presence_update(
+        &self,
+        connection_id: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (connection_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::presence_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// A connection closed (clean close or heartbeat reap alike): drop its
+    /// presence row and every note-presence lease it held, publishing the
+    /// resulting `presence:changed` / `note:presence` deltas. Never fails.
+    fn presence_disconnect(&self, connection_id: String) -> BoxFuture<'_, ()> {
+        let _ = connection_id;
+        Box::pin(async {})
+    }
+
+    /// `note.presence.subscribe` join half: register lease `lease_id` of the
+    /// connection as a viewer of `note_id` → the seq-0 snapshot
+    /// `{ viewers: [{ principalId, login?, displayName?, avatarUrl?,
+    /// cursor? }] }` (the caller included). Member-only (`NotFound` for a
+    /// non-member); publishes `note:presence { kind: "joined" }` when the
+    /// principal was not yet viewing the note.
+    fn note_presence_join(
+        &self,
+        connection_id: String,
+        lease_id: String,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (connection_id, lease_id, workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::note_presence_join not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Release one note-presence lease (unsubscribe or connection close);
+    /// publishes `note:presence { kind: "left" }` when it was the principal's
+    /// last lease on the note. Never fails.
+    fn note_presence_leave(&self, connection_id: String, lease_id: String) -> BoxFuture<'_, ()> {
+        let _ = (connection_id, lease_id);
+        Box::pin(async {})
+    }
+
+    /// `note.presence.update({ workspaceId, noteId, rev, anchor, head })`:
+    /// the connection's caret on a note it is subscribed to → `{ ok: true }`.
+    /// `InvalidParams` when the connection holds no lease on the note. The
+    /// daemon stamps the principal and coalesces the resulting
+    /// `note:presence { kind: "updated" }` deltas to ≤10/s per (principal,
+    /// note), last writer wins.
+    fn note_presence_update(
+        &self,
+        connection_id: String,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        cursor: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (connection_id, workspace_id, note_id, cursor);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::note_presence_update not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `workspace.invite.create` (multiplayer w4), service half: mint a
     /// single-use invite for `workspace_id` → `{ invite, secret }` where
     /// `secret` is returned exactly once (only its hash is stored). Owner-only.

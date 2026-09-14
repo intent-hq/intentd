@@ -20,7 +20,7 @@ use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE,
     AGENT_RENAMED, AGENT_RESTORED, AGENT_RETIRED, AGENT_STARTED, AGENT_STATUS_CHANGED,
     AGENT_STREAM_END, AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA, COMMENT_ADDED,
-    NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED,
+    NOTE_CREATED, NOTE_DELETED, NOTE_PRESENCE, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED,
     TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
     WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED,
     WORKSPACE_WAITING_CHANGED,
@@ -51,6 +51,12 @@ pub(crate) enum Channel {
     /// `agent:stream:*` family for one agent (snapshot = newest conversation
     /// page; live deltas land in CS-3).
     Chat,
+    /// Per-note presence (multiplayer w5). Scoped by `workspaceId` +
+    /// `noteId`; the seq-0 snapshot is the note's current viewers and the
+    /// deltas are the transient `note:presence` joined / updated / left
+    /// frames. Subscribing is itself the "I am viewing" signal (the
+    /// subscription holds a viewer lease released on unsubscribe / close).
+    NotePresence,
 }
 
 /// A classified subscription fast-path request awaiting handling by the
@@ -185,6 +191,11 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
             channel: Channel::Chat,
             params,
         }),
+        "note.presence.subscribe" => Some(SubFastPath::Subscribe {
+            id,
+            channel: Channel::NotePresence,
+            params,
+        }),
         // The collection `agent` channel shares the `agent.subscribe` method
         // name with the pre-existing deprecated service-style alias (router,
         // §5.5). Disambiguate by params: the alias always carries `eventTypes`,
@@ -201,7 +212,8 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
         | "task.unsubscribe"
         | "workspace.unsubscribe"
         | "comment.unsubscribe"
-        | "chat.unsubscribe" => Some(SubFastPath::Unsubscribe { id, params }),
+        | "chat.unsubscribe"
+        | "note.presence.unsubscribe" => Some(SubFastPath::Unsubscribe { id, params }),
         "agent.unsubscribe" if !params.contains_key("workspaceId") => {
             Some(SubFastPath::Unsubscribe { id, params })
         }
@@ -435,6 +447,7 @@ pub(crate) fn channel_name(channel: Channel) -> &'static str {
         Channel::Workspace => "workspace",
         Channel::Comment => "comment",
         Channel::Chat => "chat",
+        Channel::NotePresence => "note.presence",
     }
 }
 
@@ -689,6 +702,9 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_STREAM_END,
             AGENT_MESSAGE,
         ],
+        // Transient only: the forwarder narrows the workspace-wide stream to
+        // one note by `data.noteId` ([`note_presence_delta`]).
+        Channel::NotePresence => &[NOTE_PRESENCE],
     };
     types.iter().map(std::string::ToString::to_string).collect()
 }
@@ -746,8 +762,10 @@ pub(crate) async fn channel_snapshot(
         },
         // The chat channel uses the dedicated `chat_snapshot` /
         // `forward_chat_subscription` path (a per-agent `messages[]` object
-        // snapshot, CS-0 D3), so this generic arm is unreachable.
-        Channel::Chat => empty(),
+        // snapshot, CS-0 D3), so this generic arm is unreachable. The
+        // note-presence channel's snapshot is the join's return value
+        // (`note_presence_join`, served by `forward_note_presence_subscription`).
+        Channel::Chat | Channel::NotePresence => empty(),
     }
 }
 
@@ -1811,12 +1829,32 @@ pub(crate) async fn channel_delta(
         // spec-body edit can refresh flipped `specLinked` flags
         // (monorepo#2407) — so this generic stateless arm is unreachable for
         // `Task`.
-        Channel::Task | Channel::Chat => None,
+        Channel::Task | Channel::Chat | Channel::NotePresence => None,
         // The chat channel uses the dedicated, stateful [`ChatDeltaState`] mapper
         // on the `forward_chat_subscription` path (CS-3) — its deltas are
         // event-payload-driven, not re-read — so this generic re-read arm is
-        // unreachable for `Chat`.
+        // unreachable for `Chat`. Likewise the note-presence channel maps its
+        // transient events payload-only through [`note_presence_delta`].
     }
+}
+
+/// Map one `note:presence` bus event to a note-presence channel delta
+/// `{ kind: "joined" | "updated" | "left", viewer: { principalId, login?,
+/// displayName?, avatarUrl?, cursor? } }`. Payload-only (nothing to re-read:
+/// presence is never persisted); events for a different note are ignored.
+pub(crate) fn note_presence_delta(note_id: &NoteId, event: &Event) -> Option<Value> {
+    if event.event_type != NOTE_PRESENCE {
+        return None;
+    }
+    if event.data.get("noteId").and_then(Value::as_str)? != note_id.as_str() {
+        return None;
+    }
+    let kind = event.data.get("kind").and_then(Value::as_str)?;
+    let mut viewer = event.data.as_object()?.clone();
+    viewer.remove("workspaceId");
+    viewer.remove("noteId");
+    viewer.remove("kind");
+    Some(json!({ "kind": kind, "viewer": Value::Object(viewer) }))
 }
 
 /// Materialize the task channel's seq-0 snapshot AND the spec's

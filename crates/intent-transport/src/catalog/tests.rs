@@ -80,6 +80,8 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("provider_setup.rs", "providers.setup."),
         ("invite.rs", "invite."),
         ("invite.rs", "workspace.invite."),
+        ("presence.rs", "presence."),
+        ("presence.rs", "note.presence."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
             .unwrap_or_else(|_| panic!("Failed to read {filename} at test time"));
@@ -137,7 +139,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// 355 → 366: `extract_router_methods` rejected `-` in method names, so the 11
 /// already-shipped `accept-changes.*` / `file-tracking.*` router arms were never
 /// frozen here. No protocol bump — the wire surface did not change.
-const EXPECTED_TOTAL_METHODS: usize = 375;
+const EXPECTED_TOTAL_METHODS: usize = 377;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
@@ -145,7 +147,7 @@ const EXPECTED_TOTAL_METHODS: usize = 375;
 const EXPECTED_ROUTER_METHODS: usize = 322;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 51;
+const EXPECTED_FASTPATH_METHODS: usize = 53;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;
@@ -670,6 +672,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.list",
     "note.listTasks",
     "note.listVersions",
+    "note.presence.update",
     "note.readAsset",
     "note.restoreVersion",
     "note.saveAsset",
@@ -682,6 +685,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "prMonitor.cancel",
     "prMonitor.flush",
     "prMonitor.list",
+    "presence.update",
     "primitive.addAgentAction",
     "primitive.addCli",
     "primitive.addPatch",
