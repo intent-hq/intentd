@@ -4412,6 +4412,530 @@ async fn wss_collaborator_event_fan_out_and_query_are_allowlisted() {
     srv.ws.stop().await;
 }
 
+/// A WSS test client for the presence e2es: the sink half plus a reader task
+/// that keeps the stream polled (so tungstenite answers every server ping and
+/// the connection is never reaped while the test talks to another client)
+/// and forwards each text frame. Aborting the reader makes the connection
+/// go silent — the heartbeat-drop scenario.
+struct PresenceClient {
+    tx: futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        Message,
+    >,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl PresenceClient {
+    async fn open(port: u16, cfg: Arc<ClientConfig>, token: &str) -> Self {
+        let url = format!("wss://localhost:{port}/ws?token={token}");
+        let ws = common::wss_connect_with_retry(port, cfg, &url).await;
+        let (tx, mut stream) = ws.split();
+        let (frames, rx) = tokio::sync::mpsc::unbounded_channel();
+        let reader = tokio::spawn(async move {
+            while let Some(Ok(msg)) = stream.next().await {
+                if let Message::Text(text) = msg {
+                    let v: Value = serde_json::from_str(&text).expect("json frame");
+                    if frames.send(v).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Self { tx, rx, reader }
+    }
+
+    /// The next frame, or `None` after `wait`.
+    async fn next_within(&mut self, wait: Duration) -> Option<Value> {
+        tokio::time::timeout(wait, self.rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Round-trip one request; pushes and events arriving first are skipped.
+    async fn call(&mut self, id: u64, method: &str, params: Value) -> Value {
+        let frame =
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        self.tx
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .expect("send");
+        loop {
+            let v = self
+                .next_within(Duration::from_secs(10))
+                .await
+                .unwrap_or_else(|| panic!("no reply to {method} #{id} within 10s"));
+            if v["id"] == id {
+                return v;
+            }
+        }
+    }
+
+    /// The params of the next `subscription.push` on `sub` (other frames are
+    /// skipped).
+    async fn push(&mut self, sub: &str) -> Value {
+        loop {
+            let v = self
+                .next_within(Duration::from_secs(10))
+                .await
+                .unwrap_or_else(|| panic!("no push on {sub} within 10s"));
+            if v["method"] == "subscription.push" && v["params"]["subscriptionId"] == sub {
+                return v["params"].clone();
+            }
+        }
+    }
+
+    /// The next `events.event` of `event_type` (other frames are skipped).
+    async fn event(&mut self, event_type: &str) -> Value {
+        loop {
+            let v = self
+                .next_within(Duration::from_secs(10))
+                .await
+                .unwrap_or_else(|| panic!("no {event_type} event within 10s"));
+            if v["method"] == "events.event" && v["params"]["event"]["type"] == event_type {
+                return v["params"]["event"].clone();
+            }
+        }
+    }
+
+    /// Every frame already delivered plus whatever arrives in a short grace
+    /// window (a negative check's "nothing else came").
+    async fn drain(&mut self) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Some(v) = self.next_within(Duration::from_millis(300)).await {
+            out.push(v);
+        }
+        out
+    }
+
+    /// Clean close: a `Close` frame, then the reader ends with the stream.
+    async fn close(mut self) {
+        let _ = self.tx.send(Message::Close(None)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.reader).await;
+    }
+
+    /// Silent drop: stop polling (no more pongs) without closing the socket,
+    /// so only the daemon's heartbeat reaper can end the connection.
+    fn go_silent(&mut self) {
+        self.reader.abort();
+    }
+}
+
+/// Seed a collaborator-capable principal with its own credential; `token`
+/// must be 64 hex chars (the per-principal credential is matched by SHA-256).
+async fn seed_principal(store: &Store, login: &str, token: &str) -> intent_core::Principal {
+    use intent_core::{Principal, PrincipalId};
+    let p = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some(login.to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store.upsert_principal(&p).await.expect("principal");
+    store
+        .insert_principal_credential(&p.id, &sha256_hex(token.as_bytes()))
+        .await
+        .expect("credential");
+    p
+}
+
+/// Multiplayer w5, over the real WSS wire: workspace presence and the
+/// per-note presence channel. A hello'd collaborator is reported online in
+/// `presence:changed` with its `presence.update` focus; `note.presence.subscribe`
+/// answers the seq-0 `{ viewers }` snapshot (the subscriber included) and
+/// then the `joined` / `updated` / `left` deltas of the other viewers of THAT
+/// note — a member subscribed to a different note receives none of them; a
+/// `note.presence.update` without a lease is `-32602 invalid-params`; a
+/// non-member's subscribe (and `presence.update` focus) is the same
+/// `-32602 { code: "not-found" }` as a nonexistent workspace; unsubscribe and
+/// a clean close both publish `left`, the close also taking the member
+/// offline; nothing is persisted — `event.query` has no presence rows.
+#[intent_test_macros::daemon_test]
+async fn wss_presence_channel_join_delta_leave_and_gating() {
+    use intent_core::events::{NOTE_PRESENCE, PRESENCE_CHANGED};
+    use intent_core::WorkspaceRole;
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let ws_id = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws_id))
+        .await
+        .expect("insert workspace");
+    let alice_token = "a1".repeat(32);
+    let bob_token = "b2".repeat(32);
+    let mallory_token = "c3".repeat(32);
+    let alice = seed_principal(&srv.store, "alice", &alice_token).await;
+    let bob = seed_principal(&srv.store, "bob", &bob_token).await;
+    let _mallory = seed_principal(&srv.store, "mallory", &mallory_token).await;
+    for member in [&alice.id, &bob.id] {
+        srv.store
+            .add_workspace_member(&ws_id, member, WorkspaceRole::Collaborator)
+            .await
+            .expect("add collaborator");
+    }
+    let ws = ws_id.0.clone();
+    let spec = json!({ "workspaceId": ws, "noteId": "spec" });
+
+    // The owner watches workspace presence and (later) a different note.
+    let mut owner = PresenceClient::open(srv.port, srv.cfg.clone(), TOKEN).await;
+    let v = owner
+        .call(
+            1,
+            "events.subscribe",
+            json!({ "eventTypes": [PRESENCE_CHANGED], "workspaceId": ws }),
+        )
+        .await;
+    assert!(v["result"]["subscriptionId"].is_string(), "{v}");
+
+    // Alice comes online: hello → `presence:changed` lists her, no focus yet.
+    let mut alice_c = PresenceClient::open(srv.port, srv.cfg.clone(), &alice_token).await;
+    let v = alice_c
+        .call(
+            1,
+            "client.hello",
+            json!({ "clientId": "cli-alice", "name": "Alice" }),
+        )
+        .await;
+    assert!(v.get("error").is_none(), "alice hello: {v}");
+    let ev = owner.event(PRESENCE_CHANGED).await;
+    assert_eq!(ev["workspaceId"], ws, "{ev}");
+    assert_eq!(
+        ev["data"]["members"],
+        json!([{ "principalId": alice.id.0, "login": "alice", "displayName": null,
+                 "avatarUrl": null, "focus": [], "typing": [] }]),
+        "{ev}"
+    );
+
+    // Her focus set is sent whole and echoed in the next aggregate.
+    let v = alice_c
+        .call(
+            2,
+            "presence.update",
+            json!({ "focus": [{ "workspaceId": ws, "noteId": "spec" }] }),
+        )
+        .await;
+    assert_eq!(v["result"], json!({ "ok": true }), "{v}");
+    let ev = owner.event(PRESENCE_CHANGED).await;
+    assert_eq!(ev["data"]["members"][0]["principalId"], alice.id.0, "{ev}");
+    assert_eq!(
+        ev["data"]["members"][0]["focus"],
+        json!([{ "workspaceId": ws, "noteId": "spec" }]),
+        "{ev}"
+    );
+
+    // Alice joins the spec's presence channel: snapshot with herself, then
+    // her own `joined` (the bus subscription precedes the join, §1.3).
+    let v = alice_c
+        .call(3, "note.presence.subscribe", spec.clone())
+        .await;
+    let sub_a = v["result"]["subscriptionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("alice subscribe: {v}"))
+        .to_string();
+    let p = alice_c.push(&sub_a).await;
+    assert_eq!(p["kind"], "snapshot", "{p}");
+    assert_eq!(p["seq"], 0, "{p}");
+    assert_eq!(
+        p["snapshot"],
+        json!({ "viewers": [{ "principalId": alice.id.0, "login": "alice", "displayName": null,
+                              "avatarUrl": null, "cursor": null }] }),
+        "{p}"
+    );
+    let p = alice_c.push(&sub_a).await;
+    assert_eq!(p["kind"], "delta", "{p}");
+    assert_eq!(p["seq"], 1, "{p}");
+    assert_eq!(p["delta"]["kind"], "joined", "{p}");
+    assert_eq!(p["delta"]["viewer"]["principalId"], alice.id.0, "{p}");
+
+    // Bob comes online and joins the same note: his snapshot has both
+    // viewers (sorted by principal id); Alice receives his `joined`.
+    let mut bob_c = PresenceClient::open(srv.port, srv.cfg.clone(), &bob_token).await;
+    let v = bob_c
+        .call(
+            1,
+            "client.hello",
+            json!({ "clientId": "cli-bob", "name": "Bob" }),
+        )
+        .await;
+    assert!(v.get("error").is_none(), "bob hello: {v}");
+    let ev = owner.event(PRESENCE_CHANGED).await;
+    let mut online: Vec<String> = ev["data"]["members"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .map(|m| m["principalId"].as_str().expect("principalId").to_string())
+        .collect();
+    online.sort();
+    let mut both = vec![alice.id.0.clone(), bob.id.0.clone()];
+    both.sort();
+    assert_eq!(online, both, "{ev}");
+
+    let v = bob_c.call(2, "note.presence.subscribe", spec.clone()).await;
+    let sub_b = v["result"]["subscriptionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("bob subscribe: {v}"))
+        .to_string();
+    let p = bob_c.push(&sub_b).await;
+    assert_eq!(p["kind"], "snapshot", "{p}");
+    let viewers: Vec<String> = p["snapshot"]["viewers"]
+        .as_array()
+        .expect("viewers")
+        .iter()
+        .map(|r| r["principalId"].as_str().expect("principalId").to_string())
+        .collect();
+    assert_eq!(viewers, both, "bob's snapshot lists both viewers: {p}");
+    let p = bob_c.push(&sub_b).await;
+    assert_eq!(p["delta"]["kind"], "joined", "{p}");
+    let p = alice_c.push(&sub_a).await;
+    assert_eq!(p["seq"], 2, "{p}");
+    assert_eq!(p["delta"]["kind"], "joined", "{p}");
+    assert_eq!(p["delta"]["viewer"]["principalId"], bob.id.0, "{p}");
+    assert_eq!(p["delta"]["viewer"]["login"], "bob", "{p}");
+
+    // The owner subscribes to ANOTHER note: its own snapshot + `joined` only.
+    let v = owner
+        .call(
+            2,
+            "note.presence.subscribe",
+            json!({ "workspaceId": ws, "noteId": "other" }),
+        )
+        .await;
+    let sub_o = v["result"]["subscriptionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("owner subscribe: {v}"))
+        .to_string();
+    let p = owner.push(&sub_o).await;
+    assert_eq!(p["kind"], "snapshot", "{p}");
+    assert_eq!(
+        p["snapshot"]["viewers"].as_array().map(Vec::len),
+        Some(1),
+        "{p}"
+    );
+    let p = owner.push(&sub_o).await;
+    assert_eq!(p["delta"]["kind"], "joined", "{p}");
+
+    // Bob's caret: stamped with his principal, delivered to Alice.
+    let v = bob_c
+        .call(
+            3,
+            "note.presence.update",
+            json!({ "workspaceId": ws, "noteId": "spec", "rev": 3, "anchor": 10, "head": 12 }),
+        )
+        .await;
+    assert_eq!(v["result"], json!({ "ok": true }), "{v}");
+    let p = alice_c.push(&sub_a).await;
+    assert_eq!(p["seq"], 3, "{p}");
+    assert_eq!(
+        p["delta"],
+        json!({ "kind": "updated", "viewer": { "principalId": bob.id.0, "login": "bob",
+                "displayName": null, "avatarUrl": null,
+                "cursor": { "rev": 3, "anchor": 10, "head": 12 } } }),
+        "{p}"
+    );
+
+    // No lease on the spec → the owner's caret is refused.
+    let v = owner
+        .call(
+            3,
+            "note.presence.update",
+            json!({ "workspaceId": ws, "noteId": "spec", "rev": 1, "anchor": 0, "head": 0 }),
+        )
+        .await;
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert_eq!(v["error"]["data"]["code"], "invalid-params", "{v}");
+
+    // A non-member sees no workspace: subscribe and focus are `not-found`.
+    let mut mallory_c = PresenceClient::open(srv.port, srv.cfg.clone(), &mallory_token).await;
+    let v = mallory_c
+        .call(1, "note.presence.subscribe", spec.clone())
+        .await;
+    assert_eq!(v["error"]["code"], -32602, "non-member subscribe: {v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("not found: workspace")),
+        "{v}"
+    );
+    assert_eq!(v["error"]["data"]["code"], "not-found", "{v}");
+    let v = mallory_c
+        .call(2, "client.hello", json!({ "clientId": "cli-mallory" }))
+        .await;
+    assert!(v.get("error").is_none(), "mallory hello: {v}");
+    let v = mallory_c
+        .call(
+            3,
+            "presence.update",
+            json!({ "focus": [{ "workspaceId": ws }] }),
+        )
+        .await;
+    assert_eq!(v["error"]["code"], -32602, "non-member focus: {v}");
+    assert_eq!(v["error"]["data"]["code"], "not-found", "{v}");
+
+    // Unsubscribe → `left`; resubscribe → `joined`; clean close → `left`
+    // again and Bob goes offline.
+    let v = bob_c
+        .call(
+            4,
+            "note.presence.unsubscribe",
+            json!({ "subscriptionId": sub_b }),
+        )
+        .await;
+    assert_eq!(v["result"], json!({ "success": true }), "{v}");
+    let p = alice_c.push(&sub_a).await;
+    assert_eq!(p["seq"], 4, "{p}");
+    assert_eq!(p["delta"]["kind"], "left", "{p}");
+    assert_eq!(p["delta"]["viewer"]["principalId"], bob.id.0, "{p}");
+
+    let v = bob_c.call(5, "note.presence.subscribe", spec.clone()).await;
+    assert!(v["result"]["subscriptionId"].is_string(), "{v}");
+    let p = alice_c.push(&sub_a).await;
+    assert_eq!(p["seq"], 5, "{p}");
+    assert_eq!(p["delta"]["kind"], "joined", "{p}");
+    bob_c.close().await;
+    let p = alice_c.push(&sub_a).await;
+    assert_eq!(p["seq"], 6, "{p}");
+    assert_eq!(p["delta"]["kind"], "left", "{p}");
+    assert_eq!(p["delta"]["viewer"]["principalId"], bob.id.0, "{p}");
+    let ev = owner.event(PRESENCE_CHANGED).await;
+    assert_eq!(
+        ev["data"]["members"].as_array().map(Vec::len),
+        Some(1),
+        "bob offline after the clean close: {ev}"
+    );
+    assert_eq!(ev["data"]["members"][0]["principalId"], alice.id.0, "{ev}");
+
+    // The owner never received a spec presence frame on its `other` channel.
+    let stray: Vec<Value> = owner
+        .drain()
+        .await
+        .into_iter()
+        .filter(|v| v["method"] == "subscription.push")
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "a member subscribed to another note receives no note:presence frames: {stray:?}"
+    );
+
+    // Transient only: no presence rows in the durable log.
+    let v = owner
+        .call(4, "event.query", json!({ "workspaceId": ws }))
+        .await;
+    let rows = v["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("event.query rows: {v}"));
+    assert!(
+        rows.iter()
+            .all(|e| e["type"] != NOTE_PRESENCE && e["type"] != PRESENCE_CHANGED),
+        "event.query must have no presence rows: {v}"
+    );
+
+    alice_c.close().await;
+    mallory_c.close().await;
+    owner.close().await;
+    srv.ws.stop().await;
+}
+
+/// Multiplayer w5: a connection that goes silent (no pongs) is reaped by the
+/// heartbeat and treated exactly like a clean close — its viewer `left` is
+/// published on the note channel and the member drops out of
+/// `presence:changed`.
+#[intent_test_macros::daemon_test]
+async fn wss_presence_heartbeat_drop_removes_viewer_and_marks_offline() {
+    use intent_core::events::PRESENCE_CHANGED;
+    use intent_core::WorkspaceRole;
+    use serde_json::json;
+
+    let srv = start(WsOptions {
+        heartbeat_interval: Duration::from_millis(100),
+        heartbeat_timeout: Duration::from_millis(300),
+        ..WsOptions::default()
+    })
+    .await;
+    let ws_id = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws_id))
+        .await
+        .expect("insert workspace");
+    let alice_token = "d4".repeat(32);
+    let bob_token = "e5".repeat(32);
+    let alice = seed_principal(&srv.store, "alice", &alice_token).await;
+    let bob = seed_principal(&srv.store, "bob", &bob_token).await;
+    for member in [&alice.id, &bob.id] {
+        srv.store
+            .add_workspace_member(&ws_id, member, WorkspaceRole::Collaborator)
+            .await
+            .expect("add collaborator");
+    }
+    let ws = ws_id.0.clone();
+    let spec = json!({ "workspaceId": ws, "noteId": "spec" });
+
+    let mut alice_c = PresenceClient::open(srv.port, srv.cfg.clone(), &alice_token).await;
+    let v = alice_c
+        .call(
+            1,
+            "events.subscribe",
+            json!({ "eventTypes": [PRESENCE_CHANGED], "workspaceId": ws }),
+        )
+        .await;
+    assert!(v["result"]["subscriptionId"].is_string(), "{v}");
+    let v = alice_c
+        .call(2, "note.presence.subscribe", spec.clone())
+        .await;
+    let sub_a = v["result"]["subscriptionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("alice subscribe: {v}"))
+        .to_string();
+    let p = alice_c.push(&sub_a).await;
+    assert_eq!(p["kind"], "snapshot", "{p}");
+    let p = alice_c.push(&sub_a).await;
+    assert_eq!(p["delta"]["kind"], "joined", "{p}");
+
+    let mut bob_c = PresenceClient::open(srv.port, srv.cfg.clone(), &bob_token).await;
+    let v = bob_c
+        .call(1, "client.hello", json!({ "clientId": "cli-bob" }))
+        .await;
+    assert!(v.get("error").is_none(), "bob hello: {v}");
+    let ev = alice_c.event(PRESENCE_CHANGED).await;
+    assert!(
+        ev["data"]["members"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .any(|m| m["principalId"] == bob.id.0),
+        "bob online: {ev}"
+    );
+    let v = bob_c.call(2, "note.presence.subscribe", spec).await;
+    assert!(v["result"]["subscriptionId"].is_string(), "{v}");
+    let p = alice_c.push(&sub_a).await;
+    assert_eq!(p["delta"]["kind"], "joined", "{p}");
+    assert_eq!(p["delta"]["viewer"]["principalId"], bob.id.0, "{p}");
+
+    // Bob stops answering pings; the reaper ends his connection.
+    bob_c.go_silent();
+    let p = alice_c.push(&sub_a).await;
+    assert_eq!(p["delta"]["kind"], "left", "heartbeat drop: {p}");
+    assert_eq!(p["delta"]["viewer"]["principalId"], bob.id.0, "{p}");
+    let ev = alice_c.event(PRESENCE_CHANGED).await;
+    assert!(
+        ev["data"]["members"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .all(|m| m["principalId"] != bob.id.0),
+        "bob offline after the heartbeat drop: {ev}"
+    );
+
+    drop(bob_c);
+    alice_c.close().await;
+    srv.ws.stop().await;
+}
+
 /// Multiplayer w2: every human-authored chat entry is stamped with the wire
 /// caller's principal — `agent.sendMessage` (direct persist),
 /// `agent.appendMessage` (`user` role) and `agent.queueMessage` (queue entry
