@@ -4528,10 +4528,12 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `note.presence.update({ workspaceId, noteId, rev, anchor, head })`:
     /// the connection's caret on a note it is subscribed to → `{ ok: true }`.
-    /// `InvalidParams` when the connection holds no lease on the note. The
-    /// daemon stamps the principal and coalesces the resulting
-    /// `note:presence { kind: "updated" }` deltas to ≤10/s per (principal,
-    /// note), last writer wins.
+    /// Member+ on every call (`NotFound` for a non-member — a lease outlives
+    /// a membership removal, and a caret still deferred when the membership
+    /// ended is dropped rather than flushed); `InvalidParams` when the
+    /// connection holds no lease on the note. The daemon stamps the
+    /// principal and coalesces the resulting `note:presence { kind:
+    /// "updated" }` deltas to ≤10/s per (principal, note), last writer wins.
     fn note_presence_update(
         &self,
         connection_id: String,
