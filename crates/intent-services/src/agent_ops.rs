@@ -1845,13 +1845,14 @@ pub(crate) fn annotate_sender_attribution(content: &mut String, message_metadata
     *content = format!("{annotated_head}{content}");
 }
 
-/// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5): every entry
-/// must carry EXACTLY one of inline `data` (base64 payload) or an
-/// attachment-registry `attachmentId` reference, both non-empty strings when
-/// present. Both-or-neither is `Error::InvalidParams` (→ `-32602`) naming the
-/// offending index. A non-array payload and non-object entries are tolerated
-/// (skipped downstream like every other malformed attachment entry) so
-/// legacy callers keep their fail-soft behavior.
+/// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5, v10.0): every
+/// entry must carry a non-empty attachment-registry `attachmentId`
+/// reference. Inline file `data` is no longer accepted: an entry carrying
+/// `data` (with or without `attachmentId`) or missing `attachmentId` is
+/// `Error::InvalidParams` (→ `-32602`) naming the offending index. A
+/// non-array payload and non-object entries are tolerated (skipped
+/// downstream like every other malformed attachment entry) so legacy
+/// callers keep their fail-soft behavior.
 pub(crate) fn validate_file_blocks(method: &str, file_blocks: Option<&Value>) -> Result<()> {
     let Some(files) = file_blocks.and_then(Value::as_array) else {
         return Ok(());
@@ -1860,14 +1861,18 @@ pub(crate) fn validate_file_blocks(method: &str, file_blocks: Option<&Value>) ->
         let Some(obj) = file.as_object() else {
             continue;
         };
-        let has_data = obj.get("data").and_then(Value::as_str).is_some();
+        if obj.contains_key("data") {
+            return Err(Error::InvalidParams(format!(
+                "{method}: fileBlocks[{i}] carries inline `data`; inline file data is no longer accepted — upload the file and reference it by `attachmentId`"
+            )));
+        }
         let has_ref = obj
             .get("attachmentId")
             .and_then(Value::as_str)
             .is_some_and(|s| !s.trim().is_empty());
-        if has_data == has_ref {
+        if !has_ref {
             return Err(Error::InvalidParams(format!(
-                "{method}: fileBlocks[{i}] must carry exactly one of `data` or `attachmentId`"
+                "{method}: fileBlocks[{i}] must carry a non-empty `attachmentId`; inline file data is no longer accepted"
             )));
         }
     }
@@ -2340,6 +2345,33 @@ fn strip_anonymous_tool_blocks(mut message: AgentMessage) -> AgentMessage {
         .collect();
     message.content = Value::Array(kept);
     message
+}
+
+/// v10.0: degrade legacy inline file blocks (`{ type: "file", data, … }`
+/// without an `attachmentId`) to a text block naming the file, dropping the
+/// bytes. The block transform lives in
+/// [`crate::tool_block::degrade_inline_file_blocks`]; this wrapper adapts it
+/// to the [`AgentMessage`] pipeline. Runs AFTER
+/// [`strip_anonymous_tool_blocks`] and BEFORE [`stamp_synthetic_block_ids`]
+/// so the degraded block receives the same synthetic id as the served
+/// array position.
+fn degrade_legacy_file_blocks(mut message: AgentMessage) -> AgentMessage {
+    if let Some(blocks) = message.content.as_array_mut() {
+        crate::tool_block::degrade_inline_file_blocks(blocks);
+    }
+    message
+}
+
+/// The serve-time projection every persisted or in-flight message passes
+/// through before reaching any read surface (`agent.getConversation` in both
+/// projections, the `chat.subscribe` seq-0 snapshot and delta re-reads, and
+/// `agent.getMessageBlock`): [`strip_anonymous_tool_blocks`] →
+/// [`degrade_legacy_file_blocks`] → [`stamp_synthetic_block_ids`], in that
+/// order so block indices and ids agree byte-for-byte across all of them.
+fn project_served_message(message: AgentMessage) -> AgentMessage {
+    stamp_synthetic_block_ids(degrade_legacy_file_blocks(strip_anonymous_tool_blocks(
+        message,
+    )))
 }
 
 /// monorepo#1114: stamp the stable synthetic `{messageId}:{index}` id onto any
@@ -3133,11 +3165,8 @@ impl Services {
                 .get_agent_messages_page(&agent_id, page_offset, page_limit)
                 .await?
         };
-        let mut page: Vec<AgentMessage> = raw_page
-            .into_iter()
-            .map(strip_anonymous_tool_blocks)
-            .map(stamp_synthetic_block_ids)
-            .collect();
+        let mut page: Vec<AgentMessage> =
+            raw_page.into_iter().map(project_served_message).collect();
         if projection == Some(ConversationProjection::Slim) {
             // One bounded thumbnails read sized by the page (RPC cost
             // contract: O(rows returned); the common all-text page selects
@@ -3216,7 +3245,7 @@ impl Services {
                         app_message_id: None,
                         created_at: live.last_activity_at.clone(),
                     };
-                    let mut row = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(row));
+                    let mut row = project_served_message(row);
                     if projection == Some(ConversationProjection::Slim) {
                         row = apply_slim_projection(row, None);
                     }
@@ -3287,8 +3316,9 @@ impl Services {
     /// `agent.getMessageBlock` (PROTOCOL §5.5): one FULL content block of one
     /// persisted message, by block id — the on-demand counterpart of the slim
     /// conversation projection. The row is served through the same
-    /// [`strip_anonymous_tool_blocks`] + [`stamp_synthetic_block_ids`] passes
-    /// as `agent.getConversation` (NEVER the slim bounding), so block identity
+    /// [`project_served_message`] passes (anonymous-tool strip, legacy
+    /// inline-file degrade, synthetic-id stamp) as `agent.getConversation`
+    /// (NEVER the slim bounding), so block identity
     /// matches the served conversation byte-for-byte — persisted assistant ids
     /// and serve-time synthetic `{messageId}:{index}` ids both resolve — and
     /// the returned block is the full, unprojected body whenever that body is
@@ -3380,7 +3410,7 @@ impl Services {
                 }
             },
         };
-        let message = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(message));
+        let message = project_served_message(message);
         let block = message
             .content
             .as_array()

@@ -438,12 +438,27 @@
 //! `{ workspaceId, idempotencyKey }` selector arm on `file.getAttachmentInfo`
 //! (exactly one of `attachmentId` | the key pair). Bindings are per
 //! workspace, retained 7 days. No method-catalog change.
+//!
+//! Version 10.0 drops the inline `data` arm of `fileBlocks` (breaking; §5.5).
+//! The 6.12 "exactly one of `data` / `attachmentId`" rule is replaced by
+//! "every entry carries a non-empty `attachmentId`": an entry carrying `data`
+//! (with or without a reference) or missing `attachmentId` is `-32602` naming
+//! the index, on every seam that accepts `fileBlocks` — `agent.sendMessage`,
+//! `agent.queueMessage`, `agent.editAndRegenerate`, `agent.create`,
+//! `agent.update`, and `workspace.create`'s `initialAgent`. Prompt assembly
+//! no longer emits ACP `resource` blobs from file blocks. Persisted legacy
+//! inline file blocks are not rewritten; on the way out, every read surface
+//! (`agent.getConversation` in both projections, the `chat.subscribe` seq-0
+//! snapshot and delta re-reads, `agent.getMessageBlock`) serves such a block
+//! as `{ type: "text", text: "Attached file: <fileName>" }` (`"Attached
+//! file"` when the name is missing) with the bytes dropped. `imageBlocks`
+//! keep their inline arm unchanged. No method-catalog change.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.13";
+pub const PROTOCOL_VERSION: &str = "10.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

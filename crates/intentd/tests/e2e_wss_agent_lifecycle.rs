@@ -11683,9 +11683,33 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
 
     let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
-    let sent = wss_rpc(
+    // Protocol 10.0: the inline `data` arm of `fileBlocks` is rejected on the
+    // wire with `-32602` naming the index, before any state change.
+    let rejected = wss_rpc_envelope(
         &mut rpc,
         11,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": "look at these",
+            "fileBlocks": [
+                { "type": "file", "data": "QQ==", "mimeType": "text/plain", "fileName": "a.txt" }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+    let err_msg = rejected["error"]["message"].as_str().unwrap_or_default();
+    assert!(err_msg.contains("fileBlocks[0]"), "{rejected}");
+    assert!(
+        err_msg.contains("inline file data is no longer accepted"),
+        "{rejected}"
+    );
+
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
         "agent.sendMessage",
         json!({
             "workspaceId": &ws_id,
@@ -11695,7 +11719,7 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
                 { "type": "image", "data": image_data, "mimeType": "image/png" }
             ],
             "fileBlocks": [
-                { "type": "file", "data": "ZmlsZWRhdGE=", "mimeType": "text/plain", "fileName": "notes.txt" }
+                { "type": "file", "attachmentId": "att-notes", "mimeType": "text/plain", "fileName": "notes.txt" }
             ],
         }),
     )
@@ -11719,12 +11743,17 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
     // file blocks after the text block.
     let conv = wss_rpc(
         &mut rpc,
-        12,
+        13,
         "agent.getConversation",
         json!({ "workspaceId": &ws_id, "agentId": &agent_id }),
     )
     .await;
     let messages = conv["messages"].as_array().expect("messages array");
+    assert_eq!(
+        messages.iter().filter(|m| m["role"] == "user").count(),
+        1,
+        "the rejected send persisted nothing: {conv}"
+    );
     let user_row = messages
         .iter()
         .find(|m| m["role"] == "user")
@@ -11748,9 +11777,10 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
         .iter()
         .find(|b| b["type"] == "file")
         .expect("file block persisted on the user row");
-    assert_eq!(file["data"], "ZmlsZWRhdGE=");
+    assert_eq!(file["attachmentId"], "att-notes");
     assert_eq!(file["fileName"], "notes.txt");
     assert_eq!(file["mimeType"], "text/plain");
+    assert!(file.get("data").is_none(), "{file}");
 }
 
 /// Sender attribution for agent-to-agent sends (PROTOCOL §5.5): when agent A

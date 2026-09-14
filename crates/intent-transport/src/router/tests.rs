@@ -5945,7 +5945,7 @@ mod send_message_payload_forwarding {
                 "agentId":"agent-1",
                 "content":"hi",
                 "imageBlocks":[{"data":"aGVsbG8=","mimeType":"image/png"}],
-                "fileBlocks":[{"data":"Zm9v","mimeType":"text/plain","fileName":"notes.txt"}]
+                "fileBlocks":[{"attachmentId":"att-1","mimeType":"text/plain","fileName":"notes.txt"}]
             }
         }"#;
         handle_message(&api, msg).await.expect("response");
@@ -5957,7 +5957,9 @@ mod send_message_payload_forwarding {
         );
         assert_eq!(
             cap.file_blocks,
-            Some(json!([{"data": "Zm9v", "mimeType": "text/plain", "fileName": "notes.txt"}])),
+            Some(
+                json!([{"attachmentId": "att-1", "mimeType": "text/plain", "fileName": "notes.txt"}])
+            ),
             "fileBlocks must be forwarded verbatim"
         );
     }
@@ -6449,7 +6451,7 @@ mod edit_and_regenerate {
                 "messageId":"msg-7",
                 "content":"edited text",
                 "imageBlocks":[{"data":"aGk=","mimeType":"image/png"}],
-                "fileBlocks":[{"data":"aGk=","mimeType":"text/plain","fileName":"a.txt"}],
+                "fileBlocks":[{"attachmentId":"att-a","mimeType":"text/plain","fileName":"a.txt"}],
                 "model":"auggie:sonnet4.5"
             }
         }"#;
@@ -6477,7 +6479,7 @@ mod edit_and_regenerate {
         );
         assert_eq!(
             cap.file_blocks,
-            Some(json!([{"data":"aGk=","mimeType":"text/plain","fileName":"a.txt"}]))
+            Some(json!([{"attachmentId":"att-a","mimeType":"text/plain","fileName":"a.txt"}]))
         );
         assert_eq!(cap.model.as_deref(), Some("auggie:sonnet4.5"));
     }
