@@ -1862,6 +1862,19 @@ impl Services {
         self
     }
 
+    /// Test seam (monorepo#4952): park `mark_running` after its eligibility
+    /// check, before the `was_running` marker write and the in-memory flip to
+    /// `running`, so persist-before-observable ordering is testable.
+    /// Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_script_mark_running_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.mark_running_persist = Some(park);
+        self
+    }
+
     /// Test seam (issue intent-hq/monorepo#1468 follow-up): park
     /// `deliver_completion_to_watches` in its classify→mark window (after the
     /// `agent_waiting` probe, before `mark_interim_skipped_idle`) so a

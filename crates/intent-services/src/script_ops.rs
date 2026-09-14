@@ -150,6 +150,10 @@ pub(crate) struct ScriptParks {
     /// Parks `supervise()` in its pre-registration window — after
     /// `pty.spawn`, before `mark_running` records the id (monorepo#1180).
     pub(crate) supervise: Option<Arc<SupervisePark>>,
+    /// Parks `mark_running` after its eligibility check, before the
+    /// `was_running` marker write and the in-memory flip to `running`
+    /// (monorepo#4952).
+    pub(crate) mark_running_persist: Option<Arc<SupervisePark>>,
 }
 
 /// Cancellation guard for the `script.run` reservation window (reserve →
@@ -1159,6 +1163,18 @@ impl ScriptManager {
     /// marker (and drops any hydrated `previouslyRunning`), so a daemon that
     /// dies while the service runs hydrates it as previously running.
     /// Command-mode scripts never set the marker.
+    ///
+    /// The marker is persisted *before* the in-memory flip to `running`
+    /// (monorepo#4952): `script.status` / `script.list` read the registry
+    /// directly, so a `running` they report must already be durable — a
+    /// daemon killed right after a client observed `running` must hydrate
+    /// the script as previously running. The eligibility check therefore
+    /// runs twice: once to decide whether to write, once under the flip. A
+    /// same-generation entry that a `stop`/`stop_all` flagged during the
+    /// write is refused with the marker cleared again (the fresh PTY is
+    /// reaped by the caller, so nothing is running); a removed or recreated
+    /// entry is left alone — `script.remove` deleted the row and the
+    /// create-upsert's `INSERT OR REPLACE` reset it.
     async fn mark_running(
         &self,
         ws: &WorkspaceId,
@@ -1167,32 +1183,57 @@ impl ScriptManager {
         pty_id: PtyId,
         refuse_if_stopped: bool,
     ) -> bool {
-        let pid = self.pty.pid(pty_id);
-        let (state, is_service) = {
-            let mut guard = self.scripts.lock().unwrap();
-            let Some(m) = guard
-                .get_mut(&(ws.clone(), script_id.to_string()))
-                .filter(|m| m.generation == generation)
-                .filter(|m| !(refuse_if_stopped && m.stopped_by_user))
-            else {
-                return false;
-            };
-            m.pty_id = Some(pty_id);
-            m.state.status = ScriptStatus::Running;
-            m.state.pid = pid;
-            m.state.started_at = Some(now_iso());
-            m.state.exit_code = None;
-            m.state.stopped_at = None;
-            m.state.error = None;
-            m.state.detected_url = None;
-            m.state.previously_running = None;
-            (m.state.clone(), m.def.mode == ScriptMode::Service)
+        let key = (ws.clone(), script_id.to_string());
+        let eligible = |m: &ManagedScript| {
+            m.generation == generation && !(refuse_if_stopped && m.stopped_by_user)
         };
+        let is_service = {
+            let guard = self.scripts.lock().unwrap();
+            match guard.get(&key).filter(|m| eligible(m)) {
+                Some(m) => m.def.mode == ScriptMode::Service,
+                None => return false,
+            }
+        };
+        // Test seam (monorepo#4952): park here so a test can observe the
+        // status while the marker write is still outstanding.
+        if let Some(park) = &self.parks.mark_running_persist {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         if is_service {
             self.persist_was_running(ws, script_id, true).await;
         }
-        self.emit_state(ws, script_id, &state).await;
-        true
+        let pid = self.pty.pid(pty_id);
+        let flipped = {
+            let mut guard = self.scripts.lock().unwrap();
+            match guard.get_mut(&key).filter(|m| eligible(m)) {
+                Some(m) => {
+                    m.pty_id = Some(pty_id);
+                    m.state.status = ScriptStatus::Running;
+                    m.state.pid = pid;
+                    m.state.started_at = Some(now_iso());
+                    m.state.exit_code = None;
+                    m.state.stopped_at = None;
+                    m.state.error = None;
+                    m.state.detected_url = None;
+                    m.state.previously_running = None;
+                    Ok(m.state.clone())
+                }
+                None => Err(guard.get(&key).is_some_and(|m| m.generation == generation)),
+            }
+        };
+        match flipped {
+            Ok(state) => {
+                self.emit_state(ws, script_id, &state).await;
+                true
+            }
+            Err(same_incarnation) => {
+                if is_service && same_incarnation {
+                    self.persist_was_running(ws, script_id, false).await;
+                }
+                false
+            }
+        }
     }
 
     /// Flip a script to `exited`, record the exit code, and emit `script:state`.
@@ -2473,6 +2514,73 @@ mod tests {
             st.get("previouslyRunning").is_none(),
             "post-stop hydration carries no marker: {st}"
         );
+    }
+
+    /// Regression (monorepo#4952): the `was_running` marker must be durable
+    /// before `script.status` can report `running`. Park `mark_running` in
+    /// front of the marker write: while parked the status is not `running`
+    /// and the marker is unset; once released both flip, and a fresh
+    /// `Services` over the same store (a simulated daemon death right after a
+    /// client observed `running`) hydrates `previouslyRunning: true`.
+    #[tokio::test]
+    async fn was_running_marker_is_durable_before_status_reports_running() {
+        let h = harness().await;
+        let park = Arc::new(SupervisePark::default());
+        let services = h
+            .services
+            .clone()
+            .with_script_mark_running_park(park.clone());
+        let store = services.store().clone();
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("mark_running entered the persist window");
+
+        let st = services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_ne!(
+            st["status"], "running",
+            "status flips only after the marker is durable: {st}"
+        );
+        assert!(
+            store
+                .list_was_running_script_ids()
+                .await
+                .expect("list")
+                .is_empty(),
+            "marker not written yet"
+        );
+
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let st = services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "running");
+        assert_eq!(
+            store.list_was_running_script_ids().await.expect("list"),
+            vec![(h.ws.as_str().to_string(), id.clone())],
+            "marker durable once running is observable"
+        );
+
+        let svc2 = Services::new(store.clone());
+        assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
+        let st = svc2
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "idle");
+        assert_eq!(st["previouslyRunning"], true, "marker surfaced: {st}");
+
+        services.script_stop(h.ws.clone(), id).await.expect("stop");
     }
 
     /// `script.stop` on a hydrated non-running script that carries the marker
