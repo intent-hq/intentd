@@ -39,7 +39,7 @@
 //! trade-offs for a human-timescale file; the next external edit wins again.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_core::{Error, Result};
@@ -47,7 +47,9 @@ use notify::RecursiveMode;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::events::shared_watch::{SharedWatchHub, SubHandle};
+use crate::events::shared_watch::{
+    os_watch_limits, SharedWatchHub, SubHandle, CREATE_RETRY_CAP, CREATE_RETRY_INITIAL,
+};
 use crate::settings_registry::{SettingsChanged, SettingsRegistry};
 
 /// Debounce window: the file is read once, this long after the *last* raw
@@ -118,16 +120,24 @@ pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcom
 /// subscription (the directory is unwatched when it drops, unless another
 /// subscriber still needs it) and the debounce task (aborted on drop), so
 /// dropping the [`ConfigWatcher`] tears the whole pipeline down — the
-/// clean-shutdown contract for `serve`.
+/// clean-shutdown contract for `serve`. The subscription sits behind a mutex
+/// because the debounce task replaces it when the watch is lost (see
+/// [`watch_loop`]).
 pub struct ConfigWatcher {
-    sub: SubHandle,
+    sub: Arc<Mutex<Option<SubHandle>>>,
     task: JoinHandle<()>,
 }
 
 impl Drop for ConfigWatcher {
     fn drop(&mut self) {
         self.task.abort();
+        *lock(&self.sub) = None;
     }
+}
+
+fn lock(sub: &Mutex<Option<SubHandle>>) -> std::sync::MutexGuard<'_, Option<SubHandle>> {
+    sub.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl ConfigWatcher {
@@ -170,13 +180,14 @@ impl ConfigWatcher {
             })?
             .to_os_string();
         let (sub, raw_rx, _) = hub.subscribe_with(&dir, RecursiveMode::NonRecursive);
-        let established = sub.established();
+        let sub = Arc::new(Mutex::new(Some(sub)));
         let task = tokio::spawn(watch_loop(
+            Arc::clone(hub),
             registry,
             revision_gate,
-            established,
             dir,
             file_name,
+            Arc::clone(&sub),
             raw_rx,
             on_change,
         ));
@@ -188,39 +199,96 @@ impl ConfigWatcher {
     /// not answered within the hub's establish timeout. Owned, so the caller
     /// can await it while the watcher itself stays parked elsewhere.
     pub fn ready(&self) -> impl Future<Output = bool> + Send + 'static {
-        self.sub.established()
+        let established = lock(&self.sub).as_ref().map(SubHandle::established);
+        async move {
+            match established {
+                Some(established) => established.await,
+                None => false,
+            }
+        }
     }
 
-    /// Detach a probe for the hub subscription this watcher rides, so a test
-    /// can await the directory watch going live before mutating it.
+    /// Detach a probe for the hub subscription this watcher currently rides,
+    /// so a test can await the directory watch going live before mutating it.
+    /// `None` while the loop is between a lost watch and its re-subscription.
     #[cfg(test)]
-    fn probe(&self) -> crate::events::shared_watch::RegistrationProbe {
-        self.sub.probe()
+    fn probe(&self) -> Option<crate::events::shared_watch::RegistrationProbe> {
+        lock(&self.sub).as_ref().map(SubHandle::probe)
     }
 }
 
 /// Coalesce raw file events within [`DEBOUNCE`], then run the reload core
-/// once per burst. Returns when the subscription (and its channel sender)
-/// drops.
+/// once per burst.
+///
+/// The directory watch can fail to register, or be lost later: the hub
+/// re-registers the directory when a recursive co-tenant above it retires and
+/// closes this loop's channel if that re-registration fails. Either way the
+/// loop drops the dead subscription and re-subscribes with the hub's capped
+/// backoff, as [`super::events::root_watch`] does — parking on the closed
+/// channel would end config live-reload for the process lifetime after a
+/// transient failure. Runs until the [`ConfigWatcher`] aborts it.
+#[expect(clippy::too_many_arguments)]
 async fn watch_loop<F, Fut>(
+    hub: Arc<SharedWatchHub>,
     registry: Arc<SettingsRegistry>,
     revision_gate: Arc<tokio::sync::RwLock<()>>,
-    established: impl Future<Output = bool>,
     dir: std::path::PathBuf,
     file_name: std::ffi::OsString,
+    sub: Arc<Mutex<Option<SubHandle>>>,
     mut raw_rx: mpsc::UnboundedReceiver<notify::Event>,
-    on_change: F,
+    mut on_change: F,
 ) where
     F: Fn(SettingsChanged) -> Fut,
     Fut: Future<Output = ()>,
 {
-    if !established.await {
+    let mut backoff = CREATE_RETRY_INITIAL;
+    loop {
+        let established = lock(&sub).as_ref().map(SubHandle::established);
+        let live = match established {
+            Some(established) => established.await,
+            None => false,
+        };
+        let reason = if live {
+            backoff = CREATE_RETRY_INITIAL;
+            debounce(
+                &registry,
+                &revision_gate,
+                &file_name,
+                &mut raw_rx,
+                &mut on_change,
+            )
+            .await;
+            "config directory watch lost; re-registering"
+        } else {
+            "config directory watch failed to register; retrying"
+        };
+        *lock(&sub) = None;
         tracing::warn!(
             dir = %dir.display(),
-            "config.toml live-reload watch failed to register; \
-             external edits will require a daemon restart"
+            retry_in = ?backoff,
+            os_watch_limits = %os_watch_limits(),
+            "{reason}"
         );
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(CREATE_RETRY_CAP);
+        let (fresh, rx, _) = hub.subscribe_with(&dir, RecursiveMode::NonRecursive);
+        raw_rx = rx;
+        *lock(&sub) = Some(fresh);
     }
+}
+
+/// The debounce loop over one live subscription; returns when its channel
+/// closes.
+async fn debounce<F, Fut>(
+    registry: &SettingsRegistry,
+    revision_gate: &tokio::sync::RwLock<()>,
+    file_name: &std::ffi::OsStr,
+    raw_rx: &mut mpsc::UnboundedReceiver<notify::Event>,
+    on_change: &mut F,
+) where
+    F: Fn(SettingsChanged) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let mut deadline: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
@@ -235,7 +303,7 @@ async fn watch_loop<F, Fut>(
                     if event
                         .paths
                         .iter()
-                        .any(|p| p.file_name() == Some(file_name.as_os_str()))
+                        .any(|p| p.file_name() == Some(file_name))
                     {
                         deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
                     }
@@ -245,7 +313,7 @@ async fn watch_loop<F, Fut>(
             () = sleep_until(deadline), if deadline.is_some() => {
                 deadline = None;
                 let _revision_guard = revision_gate.write().await;
-                if let ReloadOutcome::Applied(notice) = process_config_change(&registry) {
+                if let ReloadOutcome::Applied(notice) = process_config_change(registry) {
                     on_change(notice).await;
                 }
             }
@@ -426,7 +494,11 @@ mod tests {
         // Registration is deferred to the hub's registrar thread, so wait for
         // the watch to be LIVE before mutating the dir: a write that lands
         // first produces no event and the wait below hangs.
-        watcher.probe().wait_live(crate::events::LIVENESS).await;
+        watcher
+            .probe()
+            .expect("subscribed")
+            .wait_live(crate::events::LIVENESS)
+            .await;
         // Editor-style atomic save: write a temp file, rename over config.toml.
         let tmp = dir.path().join(".config.toml.editor-save");
         std::fs::write(&tmp, "[git]\nautoCommit = false\n").expect("write tmp");
@@ -434,6 +506,90 @@ mod tests {
         let notice = tokio::time::timeout(crate::events::LIVENESS, rx.recv())
             .await
             .expect("watcher should observe the atomic save within the liveness bound")
+            .expect("watcher task alive");
+        assert!(notice.changed.contains("git.autoCommit"), "{notice:?}");
+        assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));
+    }
+
+    /// The config directory's registration is reset when a recursive
+    /// co-tenant above it retires (Linux global inotify group); should that
+    /// re-registration fail, the hub closes the watcher's channel. The
+    /// watcher must re-subscribe and keep live-reloading rather than park on
+    /// the closed channel with a dead handle.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn watcher_re_subscribes_after_a_failed_re_registration() {
+        use crate::events::shared_watch::WatchFault;
+        use crate::events::LIVENESS;
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = tempfile::tempdir().expect("tempdir");
+        let ancestor = base.path().join("parent");
+        let cfg_dir = ancestor.join("cfg");
+        std::fs::create_dir_all(&cfg_dir).expect("mk cfg");
+        let path = cfg_dir.join("config.toml");
+        std::fs::write(&path, "[git]\nautoCommit = true\n").expect("seed config");
+        let reg = Arc::new(SettingsRegistry::load(&path).expect("load"));
+
+        // `cfg` is registered once on start; the second `watch()` is the
+        // survivor re-registration the ancestor's retirement sends; the
+        // third is the watcher's own re-subscription.
+        let fault = WatchFault::nth("cfg", 2);
+        let hub = SharedWatchHub::with_watch_fault(&fault);
+        let (sub_ancestor, _rx_ancestor, _) =
+            hub.subscribe_with(&ancestor, RecursiveMode::NonRecursive);
+        sub_ancestor.wait_established(LIVENESS).await;
+        let (sub_wide, _rx_wide, _) = hub.subscribe_with(&ancestor, RecursiveMode::Recursive);
+        sub_wide.wait_established(LIVENESS).await;
+        drop(sub_wide);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
+        let watcher = ConfigWatcher::start(
+            &hub,
+            reg.clone(),
+            Arc::new(tokio::sync::RwLock::new(())),
+            move |notice| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(notice);
+                }
+            },
+        )
+        .expect("start watcher");
+        watcher
+            .probe()
+            .expect("subscribed")
+            .wait_live(LIVENESS)
+            .await;
+        assert_eq!(fault.attempts(), 1);
+
+        drop(sub_ancestor);
+
+        // The re-subscription lands as the third `watch()` on `cfg`; the
+        // fresh handle is stored right after it is enqueued.
+        let probe = tokio::time::timeout(LIVENESS, async {
+            loop {
+                if fault.attempts() >= 3 {
+                    if let Some(probe) = watcher.probe() {
+                        break probe;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("watcher must re-subscribe after its channel is closed");
+        probe.wait_live(LIVENESS).await;
+
+        let tmp = cfg_dir.join(".config.toml.editor-save");
+        std::fs::write(&tmp, "[git]\nautoCommit = false\n").expect("write tmp");
+        std::fs::rename(&tmp, reg.config_path()).expect("rename over config");
+        let notice = tokio::time::timeout(LIVENESS, rx.recv())
+            .await
+            .expect("the re-subscribed watcher should observe the atomic save")
             .expect("watcher task alive");
         assert!(notice.changed.contains("git.autoCommit"), "{notice:?}");
         assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));

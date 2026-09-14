@@ -115,7 +115,7 @@ type WatcherFactory =
 /// tests that use it: survivor re-registration exists only in the global
 /// inotify group.
 #[cfg(all(test, target_os = "linux"))]
-pub(super) struct WatchFault {
+pub(crate) struct WatchFault {
     name: std::ffi::OsString,
     fail_attempt: usize,
     attempts: std::sync::atomic::AtomicUsize,
@@ -123,7 +123,7 @@ pub(super) struct WatchFault {
 
 #[cfg(all(test, target_os = "linux"))]
 impl WatchFault {
-    pub(super) fn nth(name: &str, fail_attempt: usize) -> Arc<Self> {
+    pub(crate) fn nth(name: &str, fail_attempt: usize) -> Arc<Self> {
         Arc::new(Self {
             name: name.into(),
             fail_attempt,
@@ -132,7 +132,7 @@ impl WatchFault {
     }
 
     /// `watch()` calls seen so far on roots named `name`.
-    pub(super) fn attempts(&self) -> usize {
+    pub(crate) fn attempts(&self) -> usize {
         self.attempts.load(Ordering::SeqCst)
     }
 
@@ -446,7 +446,7 @@ impl SubHandle {
     /// [`watch_tiers`], which reads the registration directly; the handle-level
     /// wrapper exists for the watcher tests.)
     #[cfg(test)]
-    pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
+    pub(crate) async fn wait_established(&self, timeout: std::time::Duration) {
         wait_settled(&self.registration, timeout).await;
     }
 
@@ -701,7 +701,7 @@ impl SharedWatchHub {
     /// can fail one specific (re-)registration deterministically while every
     /// other call reaches the real backend.
     #[cfg(all(test, target_os = "linux"))]
-    pub(super) fn with_watch_fault(fault: &Arc<WatchFault>) -> Arc<Self> {
+    pub(crate) fn with_watch_fault(fault: &Arc<WatchFault>) -> Arc<Self> {
         let fault = Arc::clone(fault);
         Self::with_factory(Arc::new(move |callback: EventCallback| {
             let inner = notify::recommended_watcher(callback)?;
@@ -920,11 +920,11 @@ impl SharedWatchHub {
 /// First delay before retrying a failed watcher creation; doubles per failure.
 /// Shared with [`super::root_watch`]'s registration retry so both watch
 /// families recover from the same transient failure on the same schedule.
-pub(super) const CREATE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const CREATE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Ceiling for the creation-retry backoff, so a persistent failure (fd
 /// exhaustion, intent-hq/intent#3708) keeps probing about once a minute.
-pub(super) const CREATE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const CREATE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Start a group's registrar: a DETACHED OS thread that builds the shared
 /// watcher and then serves `watch`/`unwatch` commands. Detached rather than
@@ -1089,7 +1089,7 @@ fn register(
 /// inotify sysctls (`max_user_instances` / `max_user_watches`); elsewhere
 /// there is no equivalent user-tunable cap to read, and unreadable procfs
 /// values degrade to `?`.
-pub(super) fn os_watch_limits() -> String {
+pub(crate) fn os_watch_limits() -> String {
     #[cfg(target_os = "linux")]
     {
         let read = |name: &str| {

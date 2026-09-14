@@ -5014,12 +5014,11 @@ fn spawn_config_watcher_init(
         if watcher.ready().await {
             tracing::info!("config.toml live-reload watcher ready");
         } else {
-            // Still park below rather than drop: the hub re-registers roots
-            // that failed while its watcher was being created, once creation
-            // succeeds.
+            // Still park below rather than drop: the watcher re-subscribes
+            // with capped backoff until the directory watch goes live.
             tracing::warn!(
                 "config.toml live-reload watcher failed to start: the config directory \
-                 watch did not go live; external edits will require a daemon restart"
+                 watch did not go live; retrying in the background"
             );
         }
         // Park forever so the watch stays alive until the handle is aborted.
