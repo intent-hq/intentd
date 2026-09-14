@@ -215,6 +215,24 @@ async fn rpc(
     resp["result"].clone()
 }
 
+/// The actor the daemon stamps on the UDS caller's own actions: UDS binds the
+/// primary principal, and every bound wire principal's event carries
+/// `{ type: user, id: principalId, name }` (multiplayer w4) — the name is
+/// the GitHub login, else the display name, else the id.
+async fn primary_actor(bus: &EventBus) -> Value {
+    let p = bus
+        .store()
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+    let name = p
+        .login
+        .clone()
+        .or(p.display_name.clone())
+        .unwrap_or_else(|| p.id.0.clone());
+    json!({ "type": "user", "id": p.id, "name": name })
+}
+
 /// End-to-end change-event proof (M2.6): one connection subscribes; another runs
 /// CRUD across workspace/note/task/comment over JSON-RPC; the subscriber receives
 /// the matching `events.event` notifications with the camelCase envelope + payload
@@ -305,10 +323,7 @@ async fn crud_mutations_emit_change_events_over_uds() {
     assert_eq!(e["workspaceId"], ws_id.as_str());
     assert!(e["id"].is_string());
     assert!(e["timestamp"].is_string());
-    assert_eq!(
-        e["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(e["actor"], primary_actor(&bus).await);
     assert_eq!(
         e["data"],
         json!({ "noteId": note_id, "title": "Note", "action": "create" })
@@ -350,10 +365,7 @@ async fn crud_mutations_emit_change_events_over_uds() {
     let ev = read_json(&mut sub_reader).await;
     let e = &ev["params"]["event"];
     assert_eq!(e["type"], "task:created");
-    assert_eq!(
-        e["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(e["actor"], primary_actor(&bus).await);
     assert_eq!(e["data"]["noteId"], note_id.as_str());
     assert_eq!(e["data"]["noteTitle"], "Note");
     assert_eq!(e["data"]["status"], "not_started");
@@ -529,10 +541,7 @@ async fn workspace_create_emits_workspace_created() {
     assert_eq!(e["workspaceId"], ws_id.as_str());
     assert!(e["id"].is_string());
     assert!(e["timestamp"].is_string());
-    assert_eq!(
-        e["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(e["actor"], primary_actor(&bus).await);
     // Self-sufficient payload: the event carries the same Workspace the RPC
     // result returned, so clients render it without a follow-up read.
     assert_eq!(e["data"]["workspaceId"], ws_id.as_str());
@@ -621,10 +630,7 @@ async fn workspace_update_emits_workspace_updated_with_delta() {
     assert_eq!(e["workspaceId"], ws_id.as_str());
     assert!(e["id"].is_string());
     assert!(e["timestamp"].is_string());
-    assert_eq!(
-        e["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(e["actor"], primary_actor(&bus).await);
     // `changes` is the applied WorkspaceUpdate delta only (Option::is_none
     // fields are skipped in serialization), so absent fields do not leak.
     assert_eq!(

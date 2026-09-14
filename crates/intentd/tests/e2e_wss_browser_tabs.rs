@@ -402,11 +402,21 @@ async fn browser_tab_registry_round_trip_over_wss() {
     assert_eq!(ev["workspaceId"], ws_id);
     assert_eq!(ev["data"]["tab"], *opened);
     assert!(ev["data"].get("changes").is_none());
+    // The actor is the bound principal behind the reporting connection (the
+    // owner's own wire credential here), not the host's clientId: the bus
+    // stamps every wire caller's event authoritatively (multiplayer w4). The
+    // reporting host stays identifiable through `tab.hostClientId`.
+    let me = wss_rpc(&mut host, 2, "principal.me", json!({})).await;
+    let principal_id = me["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("principal id: {me}"))
+        .to_string();
+    assert_eq!(ev["actor"]["type"], "user", "{ev}");
     assert_eq!(
-        ev["actor"],
-        json!({ "type": "user", "id": "desktop-a" }),
-        "attributed to the reporting host's clientId: {ev}"
+        ev["actor"]["id"], principal_id,
+        "attributed to the reporting connection's principal: {ev}"
     );
+    assert_eq!(opened["hostClientId"], "desktop-a");
 
     // 2. Any client lists the tab with live host presence.
     let res = wss_rpc(
