@@ -436,7 +436,7 @@ async fn tunnel_duplicate_stream_id_rejected() {
     srv.ws.stop().await;
 }
 
-/// The 33rd concurrent stream (default cap 32) is refused with `OPEN_ERR`,
+/// The 33rd concurrent stream on one port (default per-port cap 32) is refused with `OPEN_ERR`,
 /// and closing one stream frees a slot for a new `OPEN`.
 #[tokio::test]
 async fn tunnel_concurrent_stream_cap_enforced() {
@@ -444,8 +444,7 @@ async fn tunnel_concurrent_stream_cap_enforced() {
     let echo_port = spawn_echo_listener().await;
     let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
 
-    let cap =
-        u32::try_from(intent_transport::tunnel::MAX_STREAMS_PER_CONNECTION).expect("small cap");
+    let cap = u32::try_from(intent_transport::tunnel::MAX_STREAMS_PER_PORT).expect("small cap");
     for id in 0..cap {
         send_frame(
             &mut ws,
@@ -1047,5 +1046,94 @@ async fn heartbeat_keeps_responsive_tunnel_client_alive() {
         "responsive tunnel client must survive heartbeat cycles"
     );
     poller.abort();
+    srv.ws.stop().await;
+}
+
+/// Real TLS mux: seven independent preview ports retain their HMR/keep-alive
+/// traffic while fresh entry traffic opens, echoes and retires on every port.
+#[tokio::test]
+async fn tunnel_seven_ports_progress_with_held_streams() {
+    let srv = start().await;
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    let mut ports = Vec::new();
+    for index in 0..7 {
+        let port = spawn_echo_listener().await;
+        ports.push(port);
+        for held in 0..5 {
+            let stream_id = index * 5 + held;
+            send_frame(&mut ws, Frame::Open { stream_id, port }).await;
+            assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id });
+        }
+    }
+    for (index, port) in ports.into_iter().enumerate() {
+        let stream_id = 100 + u32::try_from(index).unwrap();
+        send_frame(&mut ws, Frame::Open { stream_id, port }).await;
+        assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id });
+        send_frame(
+            &mut ws,
+            Frame::Data {
+                stream_id,
+                payload: b"entry".to_vec(),
+            },
+        )
+        .await;
+        assert_eq!(
+            recv_frame(&mut ws).await,
+            Frame::Data {
+                stream_id,
+                payload: b"entry".to_vec()
+            }
+        );
+        send_frame(&mut ws, Frame::Close { stream_id }).await;
+        assert_eq!(recv_frame(&mut ws).await, Frame::Close { stream_id });
+    }
+    // The long-lived sibling remains usable, not reclaimed to fake progress.
+    send_frame(
+        &mut ws,
+        Frame::Data {
+            stream_id: 0,
+            payload: b"hmr".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_frame(&mut ws).await,
+        Frame::Data {
+            stream_id: 0,
+            payload: b"hmr".to_vec()
+        }
+    );
+    ws.close(None).await.unwrap();
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn tunnel_global_cap_applies_across_ports() {
+    let srv = start_with(TunnelLimits {
+        max_streams: 2,
+        max_streams_per_port: 2,
+        ..TunnelLimits::default()
+    })
+    .await;
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    for stream_id in 0..2 {
+        let port = spawn_echo_listener().await;
+        send_frame(&mut ws, Frame::Open { stream_id, port }).await;
+        assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id });
+    }
+    let port = spawn_echo_listener().await;
+    send_frame(&mut ws, Frame::Open { stream_id: 2, port }).await;
+    assert_eq!(
+        recv_frame(&mut ws).await,
+        Frame::OpenErr {
+            stream_id: 2,
+            message: "too many concurrent streams (max 2)".into()
+        }
+    );
+    send_frame(&mut ws, Frame::Close { stream_id: 0 }).await;
+    assert_eq!(recv_frame(&mut ws).await, Frame::Close { stream_id: 0 });
+    send_frame(&mut ws, Frame::Open { stream_id: 2, port }).await;
+    assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id: 2 });
+    ws.close(None).await.unwrap();
     srv.ws.stop().await;
 }

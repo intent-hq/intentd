@@ -45,7 +45,7 @@ use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
@@ -73,7 +73,11 @@ pub(crate) const HEADER_LEN: usize = 5;
 
 /// Maximum concurrent streams per `/tunnel` connection; further `OPEN`s are
 /// answered with `OPEN_ERR` until a stream closes.
-pub const MAX_STREAMS_PER_CONNECTION: usize = 32;
+pub const MAX_STREAMS_PER_CONNECTION: usize = 256;
+/// A single forward cannot consume another preview port's admission budget.
+pub const MAX_STREAMS_PER_PORT: usize = 32;
+/// Shared budget for inbound payloads, including data in blocked TCP writes.
+const INBOUND_BYTES_PER_CONNECTION: usize = 64 * 1024 * 1024;
 
 /// Largest `DATA` payload accepted from a client. The shared 40 MiB
 /// transport limit is sized for JSON-RPC envelopes; tunnel frames get a much
@@ -100,6 +104,8 @@ const READ_CHUNK_BYTES: usize = 16 * 1024;
 pub struct TunnelLimits {
     /// Concurrent-stream cap per connection.
     pub max_streams: usize,
+    /// Concurrent stream cap for a single remote port.
+    pub max_streams_per_port: usize,
     /// Daemon-side TCP connect deadline before `OPEN_ERR`.
     pub connect_timeout: Duration,
     /// Idle-stream (no data either way) teardown deadline; also bounds a
@@ -111,6 +117,7 @@ impl Default for TunnelLimits {
     fn default() -> Self {
         Self {
             max_streams: MAX_STREAMS_PER_CONNECTION,
+            max_streams_per_port: MAX_STREAMS_PER_PORT,
             connect_timeout: CONNECT_TIMEOUT,
             idle_timeout: IDLE_STREAM_TIMEOUT,
         }
@@ -253,13 +260,14 @@ impl Frame {
 /// full queue can never delay a teardown.
 enum StreamMsg {
     /// Bytes to write to the daemon-side TCP socket.
-    Data(Vec<u8>),
+    Data(Vec<u8>, OwnedSemaphorePermit),
     /// Client half-close: shut down the TCP write side.
     Eof,
 }
 
 /// Connection-loop handle to one live stream's relay task.
 struct StreamHandle {
+    port: u16,
     generation: Arc<()>,
     msg_tx: mpsc::Sender<StreamMsg>,
     abort: tokio::task::AbortHandle,
@@ -288,6 +296,7 @@ pub(crate) async fn run_tunnel_connection<S>(
     let (mut sink, mut stream) = ws.split();
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_FRAMES);
     let mut streams: HashMap<u32, StreamHandle> = HashMap::new();
+    let inbound_budget = Arc::new(Semaphore::new(INBOUND_BYTES_PER_CONNECTION));
     loop {
         tokio::select! {
             incoming = stream.next() => match incoming {
@@ -319,6 +328,7 @@ pub(crate) async fn run_tunnel_connection<S>(
                         &mut streams,
                         &out_tx,
                         limits,
+                        &inbound_budget,
                     )
                     .await
                     {
@@ -376,6 +386,7 @@ async fn handle_frame<S>(
     streams: &mut HashMap<u32, StreamHandle>,
     out_tx: &mpsc::Sender<OutboundFrame>,
     limits: TunnelLimits,
+    inbound_budget: &Arc<Semaphore>,
 ) -> bool
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -389,10 +400,22 @@ where
                     "too many concurrent streams (max {})",
                     limits.max_streams
                 ))
+            } else if streams
+                .values()
+                .filter(|stream| stream.port == port)
+                .count()
+                >= limits.max_streams_per_port
+            {
+                Some(format!(
+                    "too many concurrent streams for port {port} (max {})",
+                    limits.max_streams_per_port
+                ))
             } else {
                 None
             };
             if let Some(message) = reject {
+                tracing::info!(stream_id, port, active_streams = streams.len(), max_streams = limits.max_streams,
+                    max_streams_per_port = limits.max_streams_per_port, reason = %message, "tunnel OPEN rejected");
                 let frame = Frame::OpenErr { stream_id, message };
                 return sink
                     .send(Message::Binary(frame.encode().into()))
@@ -414,6 +437,7 @@ where
             streams.insert(
                 stream_id,
                 StreamHandle {
+                    port,
                     generation,
                     msg_tx,
                     abort: task.abort_handle(),
@@ -430,7 +454,25 @@ where
                 .await;
                 return false;
             }
-            forward_to_stream(sink, streams, stream_id, StreamMsg::Data(payload)).await
+            if !streams.contains_key(&stream_id) {
+                return true;
+            }
+            let Ok(permit) = inbound_budget.clone().try_acquire_many_owned(
+                u32::try_from(payload.len()).expect("payload bounded to one MiB"),
+            ) else {
+                if let Some(handle) = streams.remove(&stream_id) {
+                    handle.abort.abort();
+                }
+                tracing::warn!(
+                    stream_id,
+                    "closing tunnel stream: shared inbound byte budget exhausted"
+                );
+                return sink
+                    .send(Message::Binary(Frame::Close { stream_id }.encode().into()))
+                    .await
+                    .is_ok();
+            };
+            forward_to_stream(sink, streams, stream_id, StreamMsg::Data(payload, permit)).await
         }
         Frame::Eof { stream_id } => {
             forward_to_stream(sink, streams, stream_id, StreamMsg::Eof).await
@@ -629,7 +671,7 @@ async fn run_stream(
                 }
             },
             msg = msg_rx.recv() => match msg {
-                Some(StreamMsg::Data(bytes)) => {
+                Some(StreamMsg::Data(bytes, _permit)) => {
                     // Data after the client's own EOF is a client error; drop it.
                     if write_done {
                         continue;
