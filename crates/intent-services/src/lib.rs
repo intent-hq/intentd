@@ -28510,17 +28510,20 @@ impl WorkspaceApi for Services {
                         .to_string(),
                 )
             })?;
+            // Multiplayer w3: the prompt is answered on behalf of the owner
+            // (the agent runs with the owner's capabilities), so a collaborator
+            // must own the prompting agent's workspace. The caller gate runs
+            // before the manager lookup so an unbound context is `Forbidden`
+            // on the no-manager path too, never a successful early return.
+            let constrained = capability::collaborator_caller()?.is_some();
             // Without a runtime manager there is no registry to answer against, so
             // every request id is unresolved.
             let Some(manager) = self.agent_manager() else {
                 return Ok(serde_json::json!({ "resolved": false }));
             };
-            // Multiplayer w3: the prompt is answered on behalf of the owner
-            // (the agent runs with the owner's capabilities), so a collaborator
-            // must own the prompting agent's workspace. The request id is
-            // resolved back to its agent through the pending snapshot; an
-            // unknown id stays `resolved: false` for everyone.
-            if capability::collaborator_caller()?.is_some() {
+            // The request id is resolved back to its agent through the pending
+            // snapshot; an unknown id stays `resolved: false` for everyone.
+            if constrained {
                 let Some(session_id) = manager
                     .pending_permissions()
                     .into_iter()
