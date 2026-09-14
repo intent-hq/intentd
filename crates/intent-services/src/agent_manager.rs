@@ -6122,10 +6122,12 @@ impl AgentManager {
             // re-check — otherwise a competing fresh send/retry that claims
             // the freed slot and then fails terminally strands this entry
             // behind the Error gate with nothing left to lift it. The
-            // restore is skipped when the winner's drain already delivered
-            // the entry, and the caller re-probes afterwards in case the
-            // winner released and ran its exit re-check before this restore.
-            if let Some(id) = redrive_error_park {
+            // restore hands back only the record the probe consumed — a
+            // delivery by the winner's drain anywhere since then has retired
+            // it, so nothing is restored — and the caller re-probes afterwards
+            // in case the winner released and ran its exit re-check before
+            // this restore.
+            if let Some(id) = &redrive_error_park {
                 self.services.restore_parked_recovery_send(&agent_id, id);
             }
             return;
@@ -6282,7 +6284,7 @@ impl AgentManager {
         if !self.try_begin(&agent_id, &workspace_id).await {
             // Lost the claim across the gate awaits above — same restore as
             // the entry `is_busy` check.
-            if let Some(id) = redrive_error_park {
+            if let Some(id) = &redrive_error_park {
                 self.services.restore_parked_recovery_send(&agent_id, id);
             }
             return;
@@ -16062,11 +16064,12 @@ mod agent_retry_tests {
 
     /// A competitor that wins the slot while the redrive is parked at its
     /// gate can also DELIVER the recovery entry through its own drain while
-    /// the marker is consumed (`pop_draining` then finds nothing to clear).
-    /// The losing redrive must not restore the marker for an entry that is
-    /// already in flight: a context-size requeue brings it back under its
-    /// ORIGINAL id, and a restored marker would re-validate and lift the
-    /// STAB-52 gate for an already-delivered send.
+    /// the marker is consumed, and fail on context size so the SAME id is
+    /// requeued — live and `ready_to_send` again — all before the losing
+    /// redrive restores. Live membership cannot tell that entry from one
+    /// never popped; only the delivery itself (`pop_draining` retiring the
+    /// consumed record) may decide, or the restored marker would
+    /// re-validate and lift the STAB-52 gate for an already-delivered send.
     #[tokio::test]
     async fn lost_claim_restore_skips_entry_already_delivered() {
         let agent_id = AgentId::from("agent-4962-claim-delivered");
@@ -16097,14 +16100,9 @@ mod agent_retry_tests {
             .expect("competitor drains the parked send");
         assert_eq!(delivered.id, id);
         drop(draining);
-        redrive.await;
-        assert!(
-            mgr.services.parked_recovery_send(&agent_id).is_none(),
-            "a delivered entry is not re-authorized by the lost-claim restore"
-        );
-
-        // Competitor fails on context size: the SAME id is requeued, then
-        // Error persisted, slot released, exit re-check.
+        // Competitor fails on context size BEFORE the loser restores: the
+        // SAME id is already back at the queue front, live and ready, when
+        // the lost-claim restore runs.
         mgr.services.requeue_front(
             &agent_id,
             crate::agent_ops::QueuedMessage {
@@ -16112,6 +16110,15 @@ mod agent_retry_tests {
                 ..delivered
             },
         );
+        assert!(mgr.services.is_message_queued(&agent_id, &id));
+        redrive.await;
+        assert!(
+            mgr.services.parked_recovery_send(&agent_id).is_none(),
+            "a delivered entry is not re-authorized by the lost-claim restore, \
+             even once its original-id requeue is live again"
+        );
+
+        // Error persisted, slot released, exit re-check.
         mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
             .await;
         mgr.release_in_flight_slot(&agent_id);

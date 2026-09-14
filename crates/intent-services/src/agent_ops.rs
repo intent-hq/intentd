@@ -958,6 +958,19 @@ fn ensure_provider_runnable(
     Ok(())
 }
 
+/// Registry record behind `Services::parked_recovery_sends`
+/// (intent-hq/intent#4962): the queue-entry id of a recovery send parked
+/// behind a releasing worker, plus whether a redrive currently holds the
+/// authorization. A consumed record is kept (not removed) so a drain that
+/// delivers the entry while the redrive is mid-flight still finds and
+/// retires it — delivery must invalidate the marker across the whole
+/// consume→restore window, not only while it sits unconsumed.
+#[derive(Debug, Clone)]
+pub(crate) struct ParkedRecoverySend {
+    pub(crate) message_id: String,
+    pub(crate) consumed: bool,
+}
+
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
 ///
 /// `editing` marks the entry as "under edit" — excluded from the **ready-to-send**
@@ -13660,57 +13673,71 @@ impl Services {
 
     /// Record a user send parked by the busy race as the agent's pending
     /// recovery send (intent-hq/intent#4962); see `Services::parked_recovery_sends`.
+    /// Replaces any earlier marker, consumed or not: the newer send is the
+    /// authorization that stands.
     pub(crate) fn mark_parked_recovery_send(&self, agent_id: &AgentId, message_id: String) {
         self.parked_recovery_sends
             .lock()
             .expect("parked recovery send registry poisoned")
-            .insert(agent_id.clone(), message_id);
+            .insert(
+                agent_id.clone(),
+                ParkedRecoverySend {
+                    message_id,
+                    consumed: false,
+                },
+            );
     }
 
     /// Consume the agent's pending recovery-send marker, if any. The caller
-    /// must still validate it with [`Self::is_message_queued`].
+    /// must still validate it with [`Self::is_message_queued`]. The record
+    /// stays in the registry flagged `consumed` rather than being removed, so
+    /// a drain delivering the entry while the redrive holds the
+    /// authorization still finds and retires it ([`Self::pop_draining`]);
+    /// a second `take` sees the consumed record and gets `None`.
     pub(crate) fn take_parked_recovery_send(&self, agent_id: &AgentId) -> Option<String> {
         self.parked_recovery_sends
             .lock()
             .expect("parked recovery send registry poisoned")
-            .remove(agent_id)
+            .get_mut(agent_id)
+            .filter(|marker| !marker.consumed)
+            .map(|marker| {
+                marker.consumed = true;
+                marker.message_id.clone()
+            })
     }
 
-    /// Put a consumed marker back when its redrive lost the in-flight slot
+    /// Hand a consumed marker back when its redrive lost the in-flight slot
     /// before dequeuing the entry (intent-hq/intent#4962): the authorization
     /// must outlive the lost claim so the slot winner's exit can honour it.
-    /// Never overwrites a newer marker recorded meanwhile — the newer send is
-    /// the one redriven, and this entry rides its turn or the next drain.
-    /// Restores only while the entry is still live in the queue, decided
-    /// under the draining overlay lock that [`Self::pop_draining`] holds
-    /// across its pop and marker clear: a competing drain that already
-    /// delivered the entry while the marker was consumed must not have it
-    /// re-authorized behind its back (a context-size requeue restores the
-    /// ORIGINAL id, and the marker would then lift the STAB-52 gate for an
-    /// already-delivered send). Lock order draining → `agent_queues` →
-    /// `parked_recovery_sends`, the same as `pop_draining`.
-    pub(crate) fn restore_parked_recovery_send(&self, agent_id: &AgentId, message_id: String) {
-        let _draining = self
-            .draining_queue_entries
-            .lock()
-            .expect("draining queue registry poisoned");
-        if !self.is_message_queued(agent_id, &message_id) {
-            return;
-        }
-        self.parked_recovery_sends
+    /// Only un-consumes the record `take` handed out — it never recreates
+    /// one. A record retired meanwhile stays retired: `pop_draining` removes
+    /// it the moment ANY drain delivers the entry, consumed or not, so a
+    /// delivery anywhere in the consume→restore window (including one
+    /// already followed by a context-size requeue under the ORIGINAL id)
+    /// leaves nothing to restore and the STAB-52 gate holds. A newer marker
+    /// recorded meanwhile is likewise left alone — the newer send is the one
+    /// redriven, and this entry rides its turn or the next drain.
+    pub(crate) fn restore_parked_recovery_send(&self, agent_id: &AgentId, message_id: &str) {
+        if let Some(marker) = self
+            .parked_recovery_sends
             .lock()
             .expect("parked recovery send registry poisoned")
-            .entry(agent_id.clone())
-            .or_insert(message_id);
+            .get_mut(agent_id)
+            .filter(|marker| marker.consumed && marker.message_id == message_id)
+        {
+            marker.consumed = false;
+        }
     }
 
+    /// The marker a `take` would hand out right now: `None` while consumed.
     #[cfg(test)]
     pub(crate) fn parked_recovery_send(&self, agent_id: &AgentId) -> Option<String> {
         self.parked_recovery_sends
             .lock()
             .expect("parked recovery send registry poisoned")
             .get(agent_id)
-            .cloned()
+            .filter(|marker| !marker.consumed)
+            .map(|marker| marker.message_id.clone())
     }
 
     /// `true` iff at least one ready-to-send queued entry is user-origin:
@@ -13943,7 +13970,7 @@ impl Services {
                 .expect("parked recovery send registry poisoned");
             if parked
                 .get(agent_id)
-                .is_some_and(|id| entries.iter().any(|m| m.id == *id))
+                .is_some_and(|marker| entries.iter().any(|m| m.id == marker.message_id))
             {
                 parked.remove(agent_id);
             }

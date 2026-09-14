@@ -387,11 +387,14 @@ pub struct Services {
     /// releasing worker consumes this marker at exit and redrives THAT
     /// entry; the send side re-probes after its enqueue for the opposite
     /// interleaving. Cleared by [`agent_ops::Services::pop_draining`] the
-    /// moment any drain delivers the entry, so a marker never outlives its
-    /// send: a context-size requeue restores entries under their ORIGINAL
-    /// ids, and without the clear a marker left by an already-delivered send
-    /// would re-validate and lift the gate with no fresh send. Never persisted.
-    parked_recovery_sends: Arc<Mutex<HashMap<AgentId, String>>>,
+    /// moment any drain delivers the entry — whether or not a redrive has
+    /// consumed it meanwhile (a consumed record stays in the map flagged
+    /// `consumed` until delivery retires it or the redrive hands it back) —
+    /// so a marker never outlives its send: a context-size requeue restores
+    /// entries under their ORIGINAL ids, and without the clear a marker left
+    /// by an already-delivered send would re-validate and lift the gate with
+    /// no fresh send. Never persisted.
+    parked_recovery_sends: Arc<Mutex<HashMap<AgentId, agent_ops::ParkedRecoverySend>>>,
     /// Serializes [`agent_ops`] queue write-through persists. Each persist
     /// snapshots the live queue *inside* this async lock, so the last write to
     /// the `agent_queue` table always reflects the newest in-memory state — an
