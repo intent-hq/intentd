@@ -2668,7 +2668,7 @@ mod tests {
     /// and the marker is unset; once released both flip, and a fresh
     /// `Services` over the same store (a simulated daemon death right after a
     /// client observed `running`) hydrates `previouslyRunning: true`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn was_running_marker_is_durable_before_status_reports_running() {
         let h = harness().await;
         let park = Arc::new(SupervisePark::default());

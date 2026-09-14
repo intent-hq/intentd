@@ -14400,7 +14400,7 @@ async fn cross_workspace_send_queued_now_binds_woken_agent_to_its_session_worksp
 /// bridge scoped to the caller's workspace. Same binding contract as the
 /// three `ws.agent.send` routes above; this arm covers two ordinary
 /// workspaces.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_workspace_wake_or_create_binds_woken_agent_to_its_session_workspace() {
     assert_cross_workspace_send_binds_to_session_workspace(
         SendRoute::WakeOrCreate,
@@ -14417,7 +14417,7 @@ async fn cross_workspace_wake_or_create_binds_woken_agent_to_its_session_workspa
 /// on demand), so the ordinary-workspace arm above is not evidence for it:
 /// this arm asserts the echoed cwd is the chief cwd root, the live bridge
 /// answers the chief workspace id, and the rebind logged the mismatch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_workspace_wake_or_create_binds_chief_homed_target_to_chief_workspace() {
     assert_cross_workspace_send_binds_to_session_workspace(
         SendRoute::WakeOrCreate,

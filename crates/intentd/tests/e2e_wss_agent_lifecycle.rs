@@ -12147,7 +12147,7 @@ fn assert_no_file_data(v: &Value, surface: &str) {
 /// block on the same row is untouched. The row is seeded directly in the
 /// store before the daemon boots (the input seams reject the shape now, so
 /// no wire call can create it), and nothing is rewritten on disk.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn legacy_inline_file_blocks_served_as_text_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
