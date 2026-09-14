@@ -375,6 +375,23 @@ pub struct Services {
     /// never shows the entry gone before its row exists. Never persisted.
     /// Lock order: this mutex is taken BEFORE `agent_queues`, never after.
     draining_queue_entries: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Queue-entry id of an `agent.sendMessage` into an `Error` session that
+    /// lost the in-flight slot to a worker still holding it
+    /// (intent-hq/intent#4962). The documented recovery for an `Error`
+    /// session is a fresh send, but a send landing between the
+    /// terminal-failure handler's `Error` persist and its slot release is
+    /// parked in the queue — where the STAB-52 gate refuses to redrive it
+    /// and the exiting worker never drains. A send parked behind a
+    /// still-`Active` turn is never recorded: it is an ordinary mid-turn
+    /// queue entry and stays behind the gate if that turn fails. The
+    /// releasing worker consumes this marker at exit and redrives THAT
+    /// entry; the send side re-probes after its enqueue for the opposite
+    /// interleaving. Cleared by [`agent_ops::Services::pop_draining`] the
+    /// moment any drain delivers the entry, so a marker never outlives its
+    /// send: a context-size requeue restores entries under their ORIGINAL
+    /// ids, and without the clear a marker left by an already-delivered send
+    /// would re-validate and lift the gate with no fresh send. Never persisted.
+    parked_recovery_sends: Arc<Mutex<HashMap<AgentId, String>>>,
     /// Serializes [`agent_ops`] queue write-through persists. Each persist
     /// snapshots the live queue *inside* this async lock, so the last write to
     /// the `agent_queue` table always reflects the newest in-memory state — an
@@ -1155,6 +1172,7 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
+            parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),

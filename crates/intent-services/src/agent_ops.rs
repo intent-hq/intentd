@@ -13645,15 +13645,44 @@ impl Services {
 
     /// `true` iff the agent's queue still holds a ready-to-send entry with
     /// this exact `id`. Validates a parked recovery-send marker
-    /// (intent-hq/intent#4962) before redriving: a drained entry is gone,
+    /// (intent-hq/intent#4962) before redriving: a removed entry is gone,
     /// and a terminal-failure requeue mints a NEW entry id, so a stale
-    /// marker never matches.
+    /// marker never matches. A delivered entry restored under its ORIGINAL
+    /// id (context-size requeue) is covered by [`Self::pop_draining`], which
+    /// clears the marker at delivery.
     pub(crate) fn is_message_queued(&self, agent_id: &AgentId, message_id: &str) -> bool {
         self.agent_queues
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
             .is_some_and(|q| q.iter().any(|m| m.id == message_id && m.ready_to_send()))
+    }
+
+    /// Record a user send parked by the busy race as the agent's pending
+    /// recovery send (intent-hq/intent#4962); see `Services::parked_recovery_sends`.
+    pub(crate) fn mark_parked_recovery_send(&self, agent_id: &AgentId, message_id: String) {
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .insert(agent_id.clone(), message_id);
+    }
+
+    /// Consume the agent's pending recovery-send marker, if any. The caller
+    /// must still validate it with [`Self::is_message_queued`].
+    pub(crate) fn take_parked_recovery_send(&self, agent_id: &AgentId) -> Option<String> {
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .remove(agent_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parked_recovery_send(&self, agent_id: &AgentId) -> Option<String> {
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .get(agent_id)
+            .cloned()
     }
 
     /// `true` iff at least one ready-to-send queued entry is user-origin:
@@ -13874,7 +13903,24 @@ impl Services {
             .lock()
             .expect("draining queue registry poisoned");
         let popped = pop(self)?;
-        let guard = self.register_draining(&mut draining, agent_id, entries(&popped));
+        let entries = entries(&popped);
+        // Delivery invalidates the parked recovery-send marker
+        // (intent-hq/intent#4962): the send it authorized is now in flight,
+        // so a later requeue of the same entry — a context-size requeue keeps
+        // the ORIGINAL id — must not re-validate it and lift the STAB-52 gate.
+        {
+            let mut parked = self
+                .parked_recovery_sends
+                .lock()
+                .expect("parked recovery send registry poisoned");
+            if parked
+                .get(agent_id)
+                .is_some_and(|id| entries.iter().any(|m| m.id == *id))
+            {
+                parked.remove(agent_id);
+            }
+        }
+        let guard = self.register_draining(&mut draining, agent_id, entries);
         Some((popped, guard))
     }
 
