@@ -14001,6 +14001,13 @@ const PERSIST_FORBIDDEN: &[&str] = &[
 /// first assertion; moving the plan call below the insert fails the ordering
 /// one; adding an `agent_create_op(...)` call after the insert fails the
 /// post-insert scan.
+///
+/// This is exact-text matching on the blanked source, not call resolution:
+/// a comment or whitespace between a producer's name and its `(`, or a call
+/// through an alias / re-import, is outside its detection, and a helper
+/// whose name ENDS with a forbidden name (e.g. `my_canonical_id_or_err(`)
+/// matches. Accepted for a rung-2 backstop behind the [`AgentPersistError`]
+/// type guard — no parser dependency or semantic proof is intended.
 #[test]
 fn persist_agent_create_and_workspace_create_carry_no_input_validation_after_the_plan() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -14058,6 +14065,151 @@ fn persist_agent_create_and_workspace_create_carry_no_input_validation_after_the
                 line_of(&lib, start + insert + hit)
             );
         }
+    }
+}
+
+/// Lexical table for [`blank_rust_non_code`]: every case keeps the char count
+/// and every newline in place, replaces chars only with `' '` (never shifts
+/// them), and leaves exactly `kept` (the non-space chars) standing — so
+/// braces and forbidden names inside comments, escaped / raw strings and
+/// char literals are invisible to the guard's brace matching and token
+/// scans, while lifetimes and Unicode code survive.
+#[test]
+fn blank_rust_non_code_blanks_comments_and_literals_only() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("nested block comment", "a /* x /* y */ z */ b", "ab"),
+        (
+            "nested block comment hiding braces and a forbidden name",
+            "f(); /* { InvalidParams( /* } */ */ g();",
+            "f();g();",
+        ),
+        (
+            "line comment hiding a forbidden name, newline kept",
+            "x // agent_create_op( {\ny",
+            "x\ny",
+        ),
+        (
+            "escaped string with braces and a forbidden name",
+            r#"let s = "{ \" InvalidParams( } \\";"#,
+            "lets=;",
+        ),
+        (
+            "raw string with hashes, an inner quote-hash and a forbidden name",
+            r###"let s = r##"} "# agent_create_op( {"##;"###,
+            "lets=;",
+        ),
+        (
+            "char literals blanked, lifetimes kept",
+            r"let c = '{'; let q = '\''; let e = '\n'; fn f<'a>(s: &'a str) -> &'a str { s }",
+            "letc=;letq=;lete=;fnf<'a>(s:&'astr)->&'astr{s}",
+        ),
+        (
+            "unicode in a literal and a comment, unicode code kept",
+            "let grüße = \"héllo { ✓ }\"; // wörld }\nfn f() {}",
+            "letgrüße=;\nfnf(){}",
+        ),
+    ];
+    for (name, src, kept) in cases {
+        let blanked = blank_rust_non_code(src);
+        assert_eq!(
+            blanked.chars().count(),
+            src.chars().count(),
+            "{name}: char count changed"
+        );
+        for (i, (s, b)) in src.chars().zip(blanked.chars()).enumerate() {
+            assert!(
+                b == s || b == ' ',
+                "{name}: char {i} shifted or replaced with {b:?} (was {s:?})"
+            );
+            assert_eq!(
+                b == '\n',
+                s == '\n',
+                "{name}: newline at char {i} not preserved"
+            );
+        }
+        let visible: String = blanked.chars().filter(|c| *c != ' ').collect();
+        assert_eq!(visible, *kept, "{name}: blanked to {blanked:?}");
+    }
+}
+
+/// [`fn_body`] returns the text strictly between the fn's outer braces —
+/// nested blocks included, the closing brace of a blanked `"}"` literal
+/// ignored, the following fn excluded — with `body_start` pointing just past
+/// the opening brace; `line_of` on an offset inside the body reports the
+/// source line even when multi-byte Unicode precedes it.
+#[test]
+fn fn_body_isolates_the_target_body_and_line_numbers_survive_unicode() {
+    let src = "\
+/// Grüße — “smart quotes” ✓
+const GREETING: &str = \"héllo { world }\";
+fn target(x: u32) -> u32 {
+    let s = \"}\";
+    if x > 0 { { x } } else { 0 }
+    needle(
+}
+fn other() { needle( }
+";
+    let blanked = blank_rust_non_code(src);
+    let (start, body) = fn_body("x.rs", &blanked, "fn target(");
+    assert_eq!(
+        &blanked[start - 1..start],
+        "{",
+        "body_start is just past the opening brace"
+    );
+    assert_eq!(line_of(&blanked, start), 3);
+    assert!(!body.contains('"'), "literals are blanked: {body:?}");
+    assert!(
+        body.contains("if x > 0 { { x } } else { 0 }"),
+        "nested blocks kept: {body:?}"
+    );
+    assert!(!body.contains("fn other"), "next fn excluded: {body:?}");
+    assert_eq!(body.matches("needle(").count(), 1, "{body:?}");
+    let hit = body.find("needle(").unwrap();
+    assert_eq!(line_of(&blanked, start + hit), 6);
+    assert_eq!(
+        body.matches('{').count(),
+        body.matches('}').count(),
+        "body is brace-balanced: {body:?}"
+    );
+}
+
+/// Every [`fn_body`] failure panics naming `file:line`: a vanished
+/// signature anchors at `file:1`, a signature without a body and an
+/// unbalanced body at the signature's line.
+#[test]
+fn fn_body_panics_name_file_and_line() {
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "missing signature",
+            "fn a() {}\n",
+            "fn missing(",
+            "x.rs:1: signature not found: `fn missing(`",
+        ),
+        (
+            "signature without a body",
+            "\n\nfn decl();\n",
+            "fn decl(",
+            "x.rs:3: no body after `fn decl(`",
+        ),
+        (
+            "unbalanced body",
+            "\nfn open() {\n    {\n",
+            "fn open(",
+            "x.rs:2: unbalanced body for `fn open(`",
+        ),
+    ];
+    for (name, src, signature, expected) in cases {
+        let blanked = blank_rust_non_code(src);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fn_body("x.rs", &blanked, signature).0
+        }));
+        let payload = outcome.expect_err(name);
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(ToString::to_string))
+            .unwrap_or_else(|| panic!("{name}: non-string panic payload"));
+        assert_eq!(message, *expected, "{name}");
     }
 }
 
