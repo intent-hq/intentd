@@ -339,9 +339,10 @@ struct WorkspaceAggregateSnapshot {
     active_pr_monitors: HashSet<WorkspaceId>,
     monitor_pr_signals: HashMap<WorkspaceId, workspace_status::MonitorPrSignals>,
     /// PRs persisted on each workspace's secondary git roots
-    /// (`workspace_git_root.pull_requests`), from the same one bulk read
-    /// [`Services::merge_external_pull_requests`] issues; fed to the
-    /// displayStatus PR rungs. Empty lists are never inserted.
+    /// (`workspace_git_root.pull_requests`): the list's ONE bulk git-root
+    /// read, fed to the displayStatus PR rungs during enrichment and then
+    /// handed to [`Services::merge_external_pull_requests`] for the wire
+    /// `pullRequests` merge. Empty lists are never inserted.
     git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>>,
     legacy_question_holds: HashSet<AgentId>,
     cow_supported: Option<bool>,
@@ -2800,10 +2801,13 @@ impl Services {
     /// pool the FE builds after opening a workspace, PROTOCOL §6.9). Purely
     /// an emit-path merge: nothing is persisted, `workspace.pull_requests`
     /// stays daemon-owned, and no forge calls are made (rung 1 of the
-    /// derived-field ladder: two SQL-filtered bulk reads + in-memory merge,
-    /// O(PR-bearing rows) regardless of workspace count; the monitor read is
-    /// the narrow [`intent_store::PrMonitorListEntry`] projection — snapshot
-    /// blobs never hydrate on this path, intent-hq/monorepo#3878). Dedup is by PR
+    /// derived-field ladder: one SQL-filtered monitor bulk read + the
+    /// git-root PRs the caller's aggregate snapshot already bulk-read —
+    /// `git_root_prs`, keyed by workspace, the list's single git-root
+    /// statement — + in-memory merge, O(PR-bearing rows) regardless of
+    /// workspace count; the monitor read is the narrow
+    /// [`intent_store::PrMonitorListEntry`] projection — snapshot blobs
+    /// never hydrate on this path, intent-hq/monorepo#3878). Dedup is by PR
     /// `url` — the one field every source carries that stays unambiguous
     /// across repos — first-wins in source-priority order: workspace's own
     /// PRs, then git-root PRs, then monitor-derived entries. One exception
@@ -2820,25 +2824,14 @@ impl Services {
     /// stays omitted on the wire, and an empty git-root list contributes
     /// nothing rather than materializing `[]`); a store read failure
     /// degrades to serving the base rows. `include_archived` mirrors the
-    /// list call's flag so the bulk reads never pay for archived workspaces
-    /// the list won't return.
+    /// list call's flag so the monitor bulk read never pays for archived
+    /// workspaces the list won't return.
     pub(crate) async fn merge_external_pull_requests(
         &self,
         list: &mut [Workspace],
         include_archived: bool,
+        git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>>,
     ) {
-        use std::collections::HashMap;
-        let roots = match self
-            .store
-            .list_workspace_git_roots_with_prs(include_archived)
-            .await
-        {
-            Ok(roots) => roots,
-            Err(e) => {
-                tracing::warn!(error = %e, "workspace.list: git-root PR read failed; skipping");
-                Vec::new()
-            }
-        };
         let monitors = match self
             .store
             .load_non_cancelled_pr_monitor_list_entries(include_archived)
@@ -2850,33 +2843,23 @@ impl Services {
                 Vec::new()
             }
         };
-        if roots.is_empty() && monitors.is_empty() {
+        if git_root_prs.is_empty() && monitors.is_empty() {
             return;
         }
         // Group externally sourced PRs per workspace, git-root entries before
         // monitor-derived ones so the first-wins dedup below encodes the
-        // source priority. Empty lists are skipped so they can't flip an
-        // omitted workspace `pullRequests` into `[]`.
-        let mut extras: HashMap<String, Vec<PullRequestInfo>> = HashMap::new();
-        for root in &roots {
-            if let Some(prs) = &root.pull_requests {
-                if prs.is_empty() {
-                    continue;
-                }
-                extras
-                    .entry(root.workspace_id.0.clone())
-                    .or_default()
-                    .extend(prs.iter().cloned());
-            }
-        }
+        // source priority. The snapshot never carries an empty git-root
+        // list, so no entry here can flip an omitted workspace
+        // `pullRequests` into `[]`.
+        let mut extras = git_root_prs;
         for monitor in &monitors {
             extras
-                .entry(monitor.workspace_id.0.clone())
+                .entry(monitor.workspace_id.clone())
                 .or_default()
                 .push(pr_monitor::pr_monitor_pr_info(monitor));
         }
         for ws in list.iter_mut() {
-            let Some(candidates) = extras.remove(ws.id.as_str()) else {
+            let Some(candidates) = extras.remove(&ws.id) else {
                 continue;
             };
             let merged = ws.pull_requests.get_or_insert_with(Vec::new);
@@ -16973,11 +16956,12 @@ impl WorkspaceApi for Services {
             );
             // Emit-path PR merge: fold git-root + monitor PRs into each
             // row's `pullRequests`. Runs after enrichment: the displayStatus
-            // derivation already folded the git-root PRs (from the aggregate
-            // snapshot's bulk read) and the monitor signals with the same
-            // per-URL priority, so it must not see them a second time via
-            // the merged `pullRequests`.
-            this.merge_external_pull_requests(&mut list, include_archived)
+            // derivation already folded the git-root PRs and the monitor
+            // signals with the same per-URL priority, so it must not see
+            // them a second time via the merged `pullRequests`. The git-root
+            // PRs move out of the snapshot — the list's one bulk git-root
+            // read serves both the derivation and the wire merge.
+            this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
                 .await;
             Ok(list)
         })
@@ -17014,8 +16998,9 @@ impl WorkspaceApi for Services {
             // Emit-path PR merge, same as the full list path: the seq-0
             // snapshot must carry the same `pullRequests` a later
             // `workspace.list` would (and, like there, the displayStatus
-            // above already folded the git-root PRs from the snapshot).
-            this.merge_external_pull_requests(&mut list, include_archived)
+            // above already folded the git-root PRs, whose one bulk read
+            // now moves out of the snapshot into the merge).
+            this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
                 .await;
             Ok(list)
         })
