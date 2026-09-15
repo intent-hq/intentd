@@ -35,7 +35,7 @@ pub use server::{
     PairingSnapshot, ServerPairingInfo,
 };
 pub use tls::{ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
-pub use ws::{GuestConnectionLimits, WsApiServer, WsOptions};
+pub use ws::{GuestConnectionLimits, SharedGuestLimits, WsApiServer, WsOptions};
 
 /// Source commit embedded at build time, when the build environment can identify it.
 pub const BUILD_COMMIT: Option<&str> = option_env!("INTENTD_EMBEDDED_BUILD_COMMIT");
