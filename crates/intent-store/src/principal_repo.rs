@@ -507,19 +507,26 @@ impl Store {
     }
 }
 
-/// Re-derive `workspace.owner_principal_id` from the `owner` membership row
-/// (the earliest-added one when several exist; `NULL` when there is none) so
-/// the column stays a faithful mirror of the membership table after every
-/// membership write. Runs inside the caller's write transaction.
+/// Re-derive `workspace.owner_principal_id` from the `owner` membership rows
+/// so the column stays a faithful mirror of the membership table after every
+/// membership write: the current value is kept while it still names an
+/// owner; otherwise the earliest-added owner wins, and `NULL` when there is
+/// none. Keeping the current owner matters because `added_at` mixes the
+/// migration trigger's millisecond stamps with `now_iso()`'s nanosecond ones,
+/// so ordering two rows written in the same millisecond is not meaningful.
+/// Runs inside the caller's write transaction.
 async fn sync_workspace_owner(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workspace_id: &WorkspaceId,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE workspace SET owner_principal_id = (\
-            SELECT m.principal_id FROM workspace_member m \
-            WHERE m.workspace_id = workspace.id AND m.role = 'owner' \
-            ORDER BY m.added_at, m.principal_id LIMIT 1) \
+        "UPDATE workspace SET owner_principal_id = COALESCE(\
+            (SELECT m.principal_id FROM workspace_member m \
+             WHERE m.workspace_id = workspace.id AND m.role = 'owner' \
+               AND m.principal_id = workspace.owner_principal_id), \
+            (SELECT m.principal_id FROM workspace_member m \
+             WHERE m.workspace_id = workspace.id AND m.role = 'owner' \
+             ORDER BY m.added_at, m.principal_id LIMIT 1)) \
          WHERE id = ?",
     )
     .bind(&workspace_id.0)
