@@ -30339,6 +30339,30 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn github_users_search(
+        &self,
+        query: String,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            Self::require_administrator("github.users.search")?;
+            let query = query.trim();
+            if query.is_empty() {
+                return Ok(serde_json::json!({ "users": [] }));
+            }
+            let limit = github_browse_ops::clamp_user_search_limit(limit);
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let users = sc
+                .search_users(query, limit)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({
+                "users": github_browse_ops::user_hits_to_wire(&users)
+            }))
+        })
+    }
+
     // ========================================================================
     // principal.* (multiplayer w1) — see `principal_ops`.
     // ========================================================================

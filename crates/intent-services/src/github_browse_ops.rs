@@ -200,6 +200,41 @@ pub(crate) fn user_to_wire(user: &UserIdentity) -> Value {
     })
 }
 
+/// `github.users.search` page size: default and inclusive cap.
+pub(crate) const DEFAULT_USER_SEARCH_LIMIT: i64 = 8;
+pub(crate) const MAX_USER_SEARCH_LIMIT: i64 = 10;
+
+/// Clamp an optional `github.users.search` `limit` into `[1, 10]` (default 8)
+/// and cast to the engine's `u8` width.
+pub(crate) fn clamp_user_search_limit(limit: Option<i64>) -> u8 {
+    u8::try_from(
+        limit
+            .unwrap_or(DEFAULT_USER_SEARCH_LIMIT)
+            .clamp(1, MAX_USER_SEARCH_LIMIT),
+    )
+    .unwrap_or(1)
+}
+
+/// Project `github.users.search` hits to the wire user list: `{ id, login,
+/// avatarUrl, htmlUrl }` per hit. `id` is required on the wire (the FE keys
+/// the picker on it), so a hit the forge answered without one is dropped.
+pub(crate) fn user_hits_to_wire(users: &[UserIdentity]) -> Value {
+    Value::Array(
+        users
+            .iter()
+            .filter_map(|user| {
+                let id = user.id?;
+                Some(json!({
+                    "id": id,
+                    "login": user.login,
+                    "avatarUrl": user.avatar_url.clone().unwrap_or_default(),
+                    "htmlUrl": user.html_url.clone().unwrap_or_default(),
+                }))
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
@@ -260,6 +295,50 @@ mod tests {
         assert_eq!(v["htmlUrl"], "");
         assert!(v.get("id").is_none());
         assert!(v.get("name").is_none());
+    }
+
+    #[test]
+    fn user_search_limit_defaults_and_clamps() {
+        assert_eq!(clamp_user_search_limit(None), 8);
+        assert_eq!(clamp_user_search_limit(Some(0)), 1);
+        assert_eq!(clamp_user_search_limit(Some(-4)), 1);
+        assert_eq!(clamp_user_search_limit(Some(3)), 3);
+        assert_eq!(clamp_user_search_limit(Some(10)), 10);
+        assert_eq!(clamp_user_search_limit(Some(500)), 10);
+    }
+
+    #[test]
+    fn user_hits_carry_id_and_drop_hits_without_one() {
+        let users = vec![
+            UserIdentity {
+                login: "octocat".into(),
+                id: Some(583_231),
+                name: Some("The Octocat".into()),
+                avatar_url: Some("https://avatars/u/1".into()),
+                html_url: Some("https://github.com/octocat".into()),
+            },
+            UserIdentity {
+                login: "ghost".into(),
+                id: None,
+                name: None,
+                avatar_url: None,
+                html_url: None,
+            },
+        ];
+        let v = user_hits_to_wire(&users);
+        let hits = v.as_array().expect("array");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0],
+            json!({
+                "id": 583_231,
+                "login": "octocat",
+                "avatarUrl": "https://avatars/u/1",
+                "htmlUrl": "https://github.com/octocat",
+            })
+        );
+        assert!(hits[0].get("name").is_none());
+        assert_eq!(user_hits_to_wire(&[]), json!([]));
     }
 
     #[test]
