@@ -4586,8 +4586,8 @@ struct IdleUpdateState {
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct IdleUpdateTiming {
-    /// Start of the current continuous-idle stretch; `None` while a turn is
-    /// in flight.
+    /// Start of the current continuous-idle stretch as of the last tick
+    /// (`AgentManager::idle_since`); `None` while a turn is in flight.
     idle_since: Option<std::time::Instant>,
     /// When SIGUSR2 was last sent (or last failed to send).
     last_request_at: Option<std::time::Instant>,
@@ -4710,14 +4710,15 @@ fn next_eligible_at(
     interval_from.checked_add(policy.interval)
 }
 
-/// Spawn the idle update requester: every [`IDLE_UPDATE_TICK`] it tracks
-/// whether any turn is in flight (`AgentManager::list_busy` — hooks, PR
-/// monitors, subscriptions, queued messages and idle agents never count),
-/// and when [`should_request_idle_update`] holds and the daemon is
-/// sitter-supervised, sends the sitter SIGUSR2. A failed signal is logged and
-/// still counts for the interval; an unsupervised tick does not. Idleness is
-/// sampled per tick, so a turn that starts and ends between two ticks does
-/// not reset the grace. Each tick publishes its bookkeeping to
+/// Spawn the idle update requester: every [`IDLE_UPDATE_TICK`] it reads the
+/// start of the current continuous-idle stretch from
+/// `AgentManager::idle_since` (maintained on the in-flight-turn edges under
+/// the busy lock, so a turn that starts and ends between two ticks still
+/// resets the grace; hooks, PR monitors, subscriptions, queued messages and
+/// idle agents never count), and when [`should_request_idle_update`] holds
+/// and the daemon is sitter-supervised, sends the sitter SIGUSR2. A failed
+/// signal is logged and still counts for the interval; an unsupervised tick
+/// does not. Each tick publishes its bookkeeping to
 /// [`IdleUpdateState::timing`].
 #[cfg(unix)]
 fn spawn_idle_update_requester(
@@ -4738,12 +4739,7 @@ fn spawn_idle_update_requester(
             ticker.tick().await;
             let now = std::time::Instant::now();
             let mut timing = state.timing();
-            let busy = manager.list_busy().len();
-            if busy > 0 {
-                timing.idle_since = None;
-            } else if timing.idle_since.is_none() {
-                timing.idle_since = Some(now);
-            }
+            timing.idle_since = manager.idle_since();
             let policy = IdleUpdatePolicy::from_settings(
                 state.advertised,
                 &settings_registry.snapshot().effective.updates,
@@ -4767,7 +4763,6 @@ fn spawn_idle_update_requester(
             state.set_timing(timing);
             if !request {
                 tracing::debug!(
-                    busy,
                     idle_secs = timing
                         .idle_since
                         .map(|t| now.saturating_duration_since(t).as_secs()),
@@ -7437,6 +7432,12 @@ mod tests {
         assert!(decide(at(710), Some(at(650)), None, false, &policy));
         // A turn in flight never fires.
         assert!(!decide(at(700), None, None, false, &policy));
+        // The reviewer's scenario: ticks saw idle at 0/30/60/90, a turn ran
+        // entirely between ticks (100..110) and the manager re-armed
+        // `idle_since` at its end. The 120 s tick sees only 10 s of idle and
+        // must not fire even though the interval has elapsed since boot.
+        assert!(!decide(at(720), Some(at(710)), None, false, &policy));
+        assert!(decide(at(770), Some(at(710)), None, false, &policy));
         // Interval from the last request (later than boot).
         assert!(!decide(at(1199), Some(boot), Some(at(600)), false, &policy));
         assert!(decide(at(1200), Some(boot), Some(at(600)), false, &policy));

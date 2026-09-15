@@ -11257,6 +11257,41 @@ async fn list_busy_reports_only_claimed_agents_with_their_workspace() {
     );
 }
 
+/// `idle_since` is maintained on the busy edges, not sampled: a turn that
+/// begins and ends between two reads still advances it, and a second
+/// concurrent turn keeps it cleared until the last slot releases.
+#[tokio::test]
+async fn idle_since_advances_across_a_turn_between_two_reads() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-idle-since");
+    let (a, b) = (AgentId::from("agent-idle-a"), AgentId::from("agent-idle-b"));
+
+    let before = mgr.idle_since().expect("fresh manager is idle since boot");
+
+    assert!(mgr.try_begin(&a, &ws).await);
+    assert!(mgr.idle_since().is_none(), "a claim clears idle_since");
+    assert!(mgr.try_begin(&b, &ws).await);
+    mgr.end_turn(&a).await;
+    assert!(
+        mgr.idle_since().is_none(),
+        "still busy while another slot is held"
+    );
+    mgr.end_turn(&b).await;
+
+    let after = mgr
+        .idle_since()
+        .expect("idle again once the last slot releases");
+    assert!(
+        after > before,
+        "idle_since must move forward past the turn ({before:?} -> {after:?})"
+    );
+    assert_eq!(
+        mgr.idle_since(),
+        Some(after),
+        "idle_since is stable while nothing runs"
+    );
+}
+
 #[tokio::test]
 async fn list_active_projects_busy_agent_with_workspace_and_epoch_timestamp() {
     let tmp = TempDb::new();

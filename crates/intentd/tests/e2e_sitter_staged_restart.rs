@@ -3,7 +3,8 @@
 //! the handshake via `INTENTD_SITTER_IDLE_RESTART`) that receives SIGUSR2
 //! ("a newer version is staged") exits with the restart-for-update code —
 //! immediately when idle, and only once the in-flight turn ends when busy —
-//! while an unsupervised daemon ignores the signal.
+//! a SIGTERM while that restart is still pending exits 0, and an
+//! unsupervised daemon ignores the signal.
 
 #![cfg(unix)]
 
@@ -315,6 +316,73 @@ async fn busy_daemon_defers_restart_until_turn_ends() {
         "exit status {status}\n--- daemon log ---\n{}",
         daemon.log()
     );
+}
+
+/// A pending staged restart (SIGUSR2 accepted while busy) does not hijack an
+/// unrelated shutdown: SIGTERM while the turn is still in flight exits 0, not
+/// the restart code — the exit code is keyed on the exit-when-idle actually
+/// firing, not on the restart being pending.
+#[tokio::test]
+async fn sigterm_during_pending_restart_exits_cleanly() {
+    let Some(script) = mock_agent_script() else {
+        return;
+    };
+    let data_dir_guard = common::test_tempdir("itd-sr-");
+    let workspace_id = seed_workspace(data_dir_guard.path()).await;
+    let (mut daemon, socket) = launch_daemon(data_dir_guard.path(), &script, true).await;
+    let mut client = Client::connect(&socket).await;
+
+    let created = client
+        .rpc(
+            1,
+            "agent.create",
+            json!({ "workspaceId": workspace_id, "name": "Busy", "model": "default", "provider": "mock" }),
+        )
+        .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let sent = client
+        .rpc(
+            2,
+            "agent.sendMessage",
+            json!({ "workspaceId": workspace_id, "agentId": agent_id, "content": "park" }),
+        )
+        .await;
+    assert_eq!(sent["success"], true, "send response: {sent}");
+    let active = client.rpc(3, "agent.listActive", json!({})).await;
+    assert_eq!(
+        active["streams"].as_array().map(Vec::len),
+        Some(1),
+        "{active}"
+    );
+
+    daemon.signal(Signal::SIGUSR2);
+    assert!(
+        daemon.wait_exit(stay_alive_window()).await.is_none(),
+        "busy daemon must not exit while a turn is in flight\n--- daemon log ---\n{}",
+        daemon.log()
+    );
+    let log = daemon.log();
+    assert!(log.contains("staged update restart accepted"), "{log}");
+
+    // SIGTERM while the restart is pending and the turn still in flight.
+    daemon.signal(Signal::SIGTERM);
+    let status = daemon.wait_exit(exit_budget()).await.unwrap_or_else(|| {
+        panic!(
+            "daemon did not exit on SIGTERM\n--- daemon log ---\n{}",
+            daemon.log()
+        )
+    });
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "exit status {status}\n--- daemon log ---\n{}",
+        daemon.log()
+    );
+    let log = daemon.log();
+    assert!(!log.contains("exiting for staged update restart"), "{log}");
 }
 
 /// Without the sitter's handshake marker SIGUSR2 is logged and ignored (the
