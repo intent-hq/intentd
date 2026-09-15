@@ -31637,6 +31637,72 @@ async fn wake_or_create_migrates_poisoned_sibling_queue_to_woken_agent() {
     ));
 }
 
+/// intent-hq/intent#5046 regression, wake branch × monorepo#847: the live
+/// target and its poisoned sibling both live in the target's HOME workspace
+/// while the task (and the waking caller) sit in another one. The migration
+/// must key on the target's home — keyed on the caller's workspace, the
+/// helper's target-workspace guard rejects it every time, the poisoned
+/// sibling stays assigned with its queue stranded, and `cleanedUpAgentIds`
+/// never lists it.
+#[tokio::test]
+async fn wake_or_create_migrates_cross_workspace_poisoned_sibling_queue_to_woken_agent() {
+    let (_t, svc, ws) = setup().await;
+    let home_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&home_ws))
+        .await
+        .expect("home ws");
+    let note_id = seed_task(&svc, &ws, "Migrate Cross-WS Wake").await;
+    let live = create_agent(&svc, &home_ws, "Live").await;
+    let bad = create_agent(&svc, &home_ws, "Poisoned").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), live.0.clone(), None)
+        .await
+        .expect("assign live");
+    svc.assign_agent(ws.clone(), note_id.clone(), bad.0.clone(), Some(true))
+        .await
+        .expect("assign poisoned");
+    poison_session(&svc, &home_ws, &bad).await;
+    svc.agent_queues
+        .lock()
+        .unwrap()
+        .insert(bad.clone(), vec![parked_entry("m-0", "parked")]);
+    svc.persist_queue_snapshot(&bad).await;
+
+    let resp = svc
+        .agent_wake_or_create_op(
+            ws.clone(),
+            note_id.clone(),
+            "resume".into(),
+            wake_input(None),
+        )
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "woke_existing");
+    assert_eq!(resp["agentId"], live.0);
+    assert_eq!(
+        resp["cleanedUpAgentIds"],
+        json!([bad.clone()]),
+        "the cross-workspace poisoned sibling is migrated + GC'd, not left assigned: {resp}"
+    );
+
+    let moved = svc.dequeue_message(&live).expect("migrated entry");
+    assert_eq!(moved.id, "m-0");
+    assert!(svc.dequeue_message(&live).is_none());
+    assert!(matches!(
+        svc.store().get_agent_session(&bad).await,
+        Err(Error::NotFound(_))
+    ));
+    let task = svc
+        .get_my_task(ws.clone(), note_id)
+        .await
+        .expect("task read-back");
+    assert_eq!(
+        task.assigned_agents,
+        vec![live.clone()],
+        "the poisoned assignment is removed from the caller's task"
+    );
+}
+
 /// monorepo#847: `NotFound` and soft-Deleted stale assignments keep the
 /// cleanup-only behavior — stripped and reported, but never run through
 /// migration/GC (the soft-Deleted row and its parked queue survive).

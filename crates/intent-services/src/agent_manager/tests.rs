@@ -4381,11 +4381,15 @@ async fn seed_agent_with_task_graph(
         pending_delete_at: None,
         retired_at: None,
     };
-    mgr.services
-        .store
-        .insert_workspace(&workspace)
-        .await
-        .expect("insert ws");
+    // The chief row is seeded by migration 0033; every other workspace is
+    // created here.
+    if !ws.is_chief() {
+        mgr.services
+            .store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert ws");
+    }
     mgr.services
         .store
         .insert_agent_session_with_task_graph(&session, task_graph_enabled)
@@ -12996,6 +13000,16 @@ enum SendRoute {
     WakeOrCreate,
 }
 
+/// Where the woken TARGET lives for the intent-hq/intent#5017 / #5046
+/// regressions: an ordinary workspace with a checkout on disk, or the
+/// virtual chief workspace (`__chief__`), whose row carries no checkout and
+/// whose spawn cwd is the manager's configured isolated chief cwd root.
+#[derive(Clone, Copy, Debug)]
+enum TargetHome {
+    Ordinary,
+    Chief,
+}
+
 /// Captures the `agent_manager` tracing events (fields rendered as
 /// `name=value`) so a test can assert on the session-workspace rebind log.
 #[derive(Clone, Default)]
@@ -13090,15 +13104,20 @@ async fn probe_bridge_workspace_api(mgr: &AgentManager, id: &AgentId, code: &str
         .to_string()
 }
 
-/// Shared driver for the intent-hq/intent#5017 regressions: seeds a cold
-/// target in `ws-5017-home` (checkout `home_dir`) and a sender in
-/// `ws-5017-sender` (checkout `sender_dir`), delivers to the target keyed
-/// on the SENDER's workspace via `route`, and asserts (a) the woken child's
-/// actual cwd is the home checkout, (b) the `agent:message` user-row echo is
-/// scoped to the home workspace, (c) the woken child's live `workspace_api`
-/// bridge answers `ws.workspace.info()` with the home workspace + checkout,
-/// and (d) the rebind logged the caller-side scope mismatch.
-async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute) {
+/// Shared driver for the intent-hq/intent#5017 / #5046 regressions: seeds a
+/// cold target in its `home` — `ws-5017-home` (checkout `home_dir`) or the
+/// chief workspace (no checkout; spawn cwd is the configured chief cwd root)
+/// — and a sender in `ws-5017-sender` (checkout `sender_dir`), delivers to
+/// the target keyed on the SENDER's workspace via `route`, and asserts (a)
+/// the woken child's actual cwd is the home's spawn cwd, (b) the
+/// `agent:message` user-row echo is scoped to the home workspace, (c) the
+/// woken child's live `workspace_api` bridge answers `ws.workspace.info()`
+/// with the home workspace (+ checkout, or `null` for chief), and (d) the
+/// rebind logged the caller-side scope mismatch.
+async fn assert_cross_workspace_send_binds_to_session_workspace(
+    route: SendRoute,
+    home: TargetHome,
+) {
     let script = mock_agent_script();
     let behavior = json!({ "response": "done", "echoCwd": true }).to_string();
     let _env = EnvGuard::set_all(&[
@@ -13106,13 +13125,18 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute
         ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
     ]);
     let (_tmp, mgr, bus) = manager_with_bus().await;
-    let mgr = Arc::new(mgr);
+    // An isolated chief cwd root, as the composition root wires it; only
+    // the chief-homed arm ever resolves a spawn to it.
+    let chief_data = test_tempdir("intentd-5046-chief-data-");
+    let chief_root = intent_core::chief_cwd_root(chief_data.path());
+    let mgr = Arc::new(mgr.with_chief_cwd_root(chief_root.clone()));
     let home_dir = test_tempdir("intentd-5017-home-");
     let sender_dir = test_tempdir("intentd-5017-sender-");
-    let (home_ws, sender_ws) = (
-        WorkspaceId::from("ws-5017-home"),
-        WorkspaceId::from("ws-5017-sender"),
-    );
+    let home_ws = match home {
+        TargetHome::Ordinary => WorkspaceId::from("ws-5017-home"),
+        TargetHome::Chief => WorkspaceId::chief(),
+    };
+    let sender_ws = WorkspaceId::from("ws-5017-sender");
     // `agent-{uuid}` shaped so the wake route's `assign_agent` accepts the
     // target; the send routes do not care.
     let (target, sender) = (
@@ -13122,7 +13146,13 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute
     seed_agent(&mgr, &home_ws, &target).await;
     seed_agent(&mgr, &sender_ws, &sender).await;
     set_session_provider(&mgr, &home_ws, &target, "mock").await;
-    for (ws, dir) in [(&home_ws, &home_dir), (&sender_ws, &sender_dir)] {
+    // The chief row keeps no checkout: its spawn cwd comes from the chief
+    // cwd root, not a workspace path.
+    let checkouts = [
+        matches!(home, TargetHome::Ordinary).then_some((&home_ws, &home_dir)),
+        Some((&sender_ws, &sender_dir)),
+    ];
+    for (ws, dir) in checkouts.into_iter().flatten() {
         let mut row = mgr.services.store.get_workspace(ws).await.unwrap();
         row.path = Some(dir.path().display().to_string());
         mgr.services
@@ -13280,11 +13310,22 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute
     })
     .await
     .expect("the woken agent's turn completes with an echoed cwd");
-    let expected = std::fs::canonicalize(home_dir.path()).expect("home checkout");
+    // A chief-homed target resolves to the isolated chief cwd root, created
+    // on demand by the spawn — never the sender's checkout or `/tmp`.
+    let expected = match home {
+        TargetHome::Ordinary => std::fs::canonicalize(home_dir.path()).expect("home checkout"),
+        TargetHome::Chief => {
+            assert!(
+                chief_root.is_dir(),
+                "via {route:?}: the chief spawn created its cwd root on demand"
+            );
+            std::fs::canonicalize(&chief_root).expect("chief cwd root")
+        }
+    };
     let actual = std::fs::canonicalize(&echoed).unwrap_or_else(|_| PathBuf::from(&echoed));
     assert_eq!(
         actual, expected,
-        "via {route:?}: the woken agent spawns in ITS session workspace's checkout, not the sender's ({echoed})"
+        "via {route:?} ({home:?} home): the woken agent spawns in ITS session workspace's cwd, not the sender's ({echoed})"
     );
     assert_ne!(
         actual,
@@ -13319,10 +13360,14 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute
         "const i = await ws.workspace.info(); return i.id + '|' + i.path",
     )
     .await;
-    let home_path = home_dir.path().display().to_string();
+    // Chief is synthesized on read with no checkout, so its `path` is `null`.
+    let home_path = match home {
+        TargetHome::Ordinary => home_dir.path().display().to_string(),
+        TargetHome::Chief => "null".to_string(),
+    };
     assert!(
         info.contains(&format!("{}|{home_path}", home_ws.as_str())),
-        "via {route:?}: the woken agent's workspace_api bridge is scoped to ITS session workspace (got {info})"
+        "via {route:?} ({home:?} home): the woken agent's workspace_api bridge is scoped to ITS session workspace (got {info})"
     );
     assert!(
         !info.contains(sender_ws.as_str()),
@@ -13355,7 +13400,8 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute
 /// workspace.
 #[tokio::test]
 async fn cross_workspace_send_binds_woken_agent_to_its_session_workspace() {
-    assert_cross_workspace_send_binds_to_session_workspace(SendRoute::Queue).await;
+    assert_cross_workspace_send_binds_to_session_workspace(SendRoute::Queue, TargetHome::Ordinary)
+        .await;
 }
 
 /// Regression (intent-hq/intent#5017), interrupt route: the DEFAULT
@@ -13365,7 +13411,11 @@ async fn cross_workspace_send_binds_woken_agent_to_its_session_workspace() {
 /// the sender's bridge scope.
 #[tokio::test]
 async fn cross_workspace_interrupt_send_binds_woken_agent_to_its_session_workspace() {
-    assert_cross_workspace_send_binds_to_session_workspace(SendRoute::Interrupt).await;
+    assert_cross_workspace_send_binds_to_session_workspace(
+        SendRoute::Interrupt,
+        TargetHome::Ordinary,
+    )
+    .await;
 }
 
 /// Regression (intent-hq/intent#5017), send-now route: `agent.sendQueuedMessageNow`
@@ -13376,7 +13426,11 @@ async fn cross_workspace_interrupt_send_binds_woken_agent_to_its_session_workspa
 /// OWN session workspace, same as the two `ws.agent.send` routes.
 #[tokio::test]
 async fn cross_workspace_send_queued_now_binds_woken_agent_to_its_session_workspace() {
-    assert_cross_workspace_send_binds_to_session_workspace(SendRoute::QueuedNow).await;
+    assert_cross_workspace_send_binds_to_session_workspace(
+        SendRoute::QueuedNow,
+        TargetHome::Ordinary,
+    )
+    .await;
 }
 
 /// Regression (intent-hq/intent#5046), wake route: `agent.wakeOrCreate`
@@ -13387,10 +13441,32 @@ async fn cross_workspace_send_queued_now_binds_woken_agent_to_its_session_worksp
 /// `finish_prepersisted_turn_spawn` / `ensure_started` / `create_agent`, so
 /// the woken agent ran in the caller's checkout with a `workspace_api`
 /// bridge scoped to the caller's workspace. Same binding contract as the
-/// three `ws.agent.send` routes above.
+/// three `ws.agent.send` routes above; this arm covers two ordinary
+/// workspaces.
 #[tokio::test]
 async fn cross_workspace_wake_or_create_binds_woken_agent_to_its_session_workspace() {
-    assert_cross_workspace_send_binds_to_session_workspace(SendRoute::WakeOrCreate).await;
+    assert_cross_workspace_send_binds_to_session_workspace(
+        SendRoute::WakeOrCreate,
+        TargetHome::Ordinary,
+    )
+    .await;
+}
+
+/// Regression (intent-hq/intent#5046), wake route, chief-homed target: the
+/// issue's actual shape — the assignee is persisted in the CHIEF workspace
+/// (`__chief__`) and a sibling-scoped caller wakes it through
+/// `agent.wakeOrCreate`. Chief has its own archived-gate branch and cwd
+/// resolution (no checkout; the manager's isolated chief cwd root, created
+/// on demand), so the ordinary-workspace arm above is not evidence for it:
+/// this arm asserts the echoed cwd is the chief cwd root, the live bridge
+/// answers the chief workspace id, and the rebind logged the mismatch.
+#[tokio::test]
+async fn cross_workspace_wake_or_create_binds_chief_homed_target_to_chief_workspace() {
+    assert_cross_workspace_send_binds_to_session_workspace(
+        SendRoute::WakeOrCreate,
+        TargetHome::Chief,
+    )
+    .await;
 }
 
 /// Regression (intent-hq/intent#5017 × intent-hq/monorepo#2732): the

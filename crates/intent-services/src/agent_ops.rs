@@ -12236,17 +12236,23 @@ impl Services {
             // mid-migration, sidestepping the helper's theoretical
             // failure-path duplicate (the rollback restore racing a
             // concurrent dequeue of an already-migrated entry).
+            //
+            // Everything keyed on a workspace from here on uses the live
+            // target's HOME, not the task/caller workspace
+            // (intent-hq/intent#5046): the migration helper's
+            // target-workspace guard would otherwise reject every
+            // cross-workspace target and strand its poisoned siblings'
+            // queues on each wake; `deliver_wake_message` rebinds to the
+            // same home itself; and the explicit drain kick below keys on
+            // it so the drained turn spawns where the wake did, never under
+            // the caller's workspace.
+            let target_home_ws = session.workspace_id.clone();
             let failed = self
-                .migrate_poisoned_queues_to(&poisoned, &agent_id, &workspace_id)
+                .migrate_poisoned_queues_to(&poisoned, &agent_id, &target_home_ws)
                 .await;
             // Failed migrations stay assigned (and out of the response's
             // `cleanedUpAgentIds`) so the next wakeOrCreate retries them.
             cleaned_up.retain(|id| !failed.contains(id));
-            // `deliver_wake_message` rebinds to the target's session
-            // workspace itself (intent-hq/intent#5046); the explicit drain
-            // kick below keys on the same home so the drained turn spawns
-            // where the wake did, never under the caller's workspace.
-            let target_home_ws = session.workspace_id.clone();
             let result = self
                 .deliver_wake_message(
                     &workspace_id,
