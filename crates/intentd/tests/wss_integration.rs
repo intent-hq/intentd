@@ -328,6 +328,25 @@ fn status_code(response: &str) -> u16 {
         .unwrap_or(0)
 }
 
+/// Assert `response` is the guest-cap refusal: `503` carrying
+/// `Retry-After: GUEST_CAP_RETRY_AFTER_SECS` (header name case-insensitive).
+fn assert_guest_cap_refused(response: &str, ctx: &str) {
+    assert_eq!(status_code(response), 503, "{ctx}: {response}");
+    let want = intent_transport::GUEST_CAP_RETRY_AFTER_SECS.to_string();
+    let retry_after = response
+        .split("\r\n")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.trim().to_owned());
+    assert_eq!(
+        retry_after.as_deref(),
+        Some(want.as_str()),
+        "{ctx}: Retry-After header: {response}"
+    );
+}
+
 /// Build a WebSocket upgrade request head with optional Origin / bearer token.
 fn upgrade_req(target: &str, origin: Option<&str>, bearer: Option<&str>) -> String {
     let mut r = format!(
@@ -8971,9 +8990,10 @@ async fn health_reports_ok_and_client_count() {
 }
 
 /// Guest connection caps at the `/ws` upgrade: with
-/// `maxConnectionsPerGuest = 1` a guest's second connection is `503` while
-/// another guest still connects; with `maxGuestConnections = 2` the third
-/// guest is `503` while the owner (legacy token, never counted) still
+/// `maxConnectionsPerGuest = 1` a guest's second connection is `503` (with
+/// `Retry-After`) while another guest still connects; with
+/// `maxGuestConnections = 2` the third guest is `503` while the owner
+/// (legacy token, never counted) still
 /// connects; `/health` carries `guestConnections`; and a guest that
 /// disconnects gives its seat back so the refused guest is admitted.
 #[intent_test_macros::daemon_test]
@@ -9028,10 +9048,7 @@ async fn wss_guest_connection_caps_refuse_503_and_release_on_disconnect() {
     };
     let guest_upgrade = |token: &'static str| {
         let cfg = cfg.clone();
-        async move {
-            let resp = https_request(port, cfg, &upgrade_req("/ws", None, Some(token))).await;
-            status_code(&resp)
-        }
+        async move { https_request(port, cfg, &upgrade_req("/ws", None, Some(token))).await }
     };
     let guest_connect = |token: &'static str| {
         let cfg = cfg.clone();
@@ -9064,12 +9081,12 @@ async fn wss_guest_connection_caps_refuse_503_and_release_on_disconnect() {
     // per-guest cap while guest B is still admitted.
     let a = guest_connect(tokens[0]).await;
     await_guest_connections("\"guestConnections\":1").await;
-    assert_eq!(guest_upgrade(tokens[0]).await, 503, "guest A over its cap");
+    assert_guest_cap_refused(&guest_upgrade(tokens[0]).await, "guest A over its cap");
     let _b = guest_connect(tokens[1]).await;
     await_guest_connections("\"guestConnections\":2").await;
 
     // The listener-wide cap is spent: guest C is refused, the owner is not.
-    assert_eq!(guest_upgrade(tokens[2]).await, 503, "listener full");
+    assert_guest_cap_refused(&guest_upgrade(tokens[2]).await, "listener full");
     let _owner = connect_ws(srv.port, srv.cfg.clone()).await;
     let resp = health().await;
     assert!(resp.contains("\"clients\":3"), "health body: {resp}");
@@ -9083,7 +9100,7 @@ async fn wss_guest_connection_caps_refuse_503_and_release_on_disconnect() {
     await_guest_connections("\"guestConnections\":1").await;
     let _c = guest_connect(tokens[2]).await;
     await_guest_connections("\"guestConnections\":2").await;
-    assert_eq!(guest_upgrade(tokens[0]).await, 503, "listener full again");
+    assert_guest_cap_refused(&guest_upgrade(tokens[0]).await, "listener full again");
 
     srv.ws.stop().await;
 }
@@ -9148,10 +9165,7 @@ async fn wss_guest_connection_caps_apply_live_on_settings_update() {
     };
     let guest_upgrade = |token: &'static str| {
         let cfg = cfg.clone();
-        async move {
-            let resp = https_request(port, cfg, &upgrade_req("/ws", None, Some(token))).await;
-            status_code(&resp)
-        }
+        async move { https_request(port, cfg, &upgrade_req("/ws", None, Some(token))).await }
     };
     let guest_connect = |token: &'static str| {
         let cfg = cfg.clone();
@@ -9220,7 +9234,7 @@ async fn wss_guest_connection_caps_apply_live_on_settings_update() {
         resp.contains("\"guestConnections\":3"),
         "no eviction on lowering: {resp}"
     );
-    assert_eq!(guest_upgrade(tokens[1]).await, 503, "over the lowered cap");
+    assert_guest_cap_refused(&guest_upgrade(tokens[1]).await, "over the lowered cap");
 
     // Raise it: the next upgrade succeeds with the listener never restarted.
     update_caps(2, "sharing.maxGuestConnections", 0).await;
@@ -9230,7 +9244,7 @@ async fn wss_guest_connection_caps_apply_live_on_settings_update() {
     // Per-guest cap: guest A holds 2 seats; a cap of 1 refuses A only, and
     // A is admitted again once it drains below the new cap.
     update_caps(3, "sharing.maxConnectionsPerGuest", 1).await;
-    assert_eq!(guest_upgrade(tokens[0]).await, 503, "A over its new cap");
+    assert_guest_cap_refused(&guest_upgrade(tokens[0]).await, "A over its new cap");
     let resp = health().await;
     assert!(
         resp.contains("\"guestConnections\":4"),
@@ -9238,11 +9252,7 @@ async fn wss_guest_connection_caps_apply_live_on_settings_update() {
     );
     drop(a1);
     await_guest_connections("\"guestConnections\":3").await;
-    assert_eq!(
-        guest_upgrade(tokens[0]).await,
-        503,
-        "A still at its new cap"
-    );
+    assert_guest_cap_refused(&guest_upgrade(tokens[0]).await, "A still at its new cap");
     update_caps(4, "sharing.maxConnectionsPerGuest", 2).await;
     let _a3 = guest_connect(tokens[0]).await;
     await_guest_connections("\"guestConnections\":4").await;
@@ -9320,7 +9330,7 @@ async fn wss_guest_connection_caps_release_after_early_reject_and_heartbeat_abor
         wait_count(1).await;
         let response =
             https_request(port, cfg.clone(), &upgrade_req("/ws", None, Some(&token))).await;
-        assert_eq!(status_code(&response), 503, "cap is really occupied");
+        assert_guest_cap_refused(&response, "cap is really occupied");
         let owner = connect_ws(port, cfg.clone()).await;
         assert_eq!(health().await, 1, "administrator credential is exempt");
         reap_tx.send(true).expect("open heartbeat gate");
