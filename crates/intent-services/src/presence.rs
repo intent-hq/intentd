@@ -45,7 +45,9 @@
 //! profile persisted later (the lazy `principal.me` identity refresh or a
 //! `github.connect` on a fresh install) is pushed into the cache by
 //! [`Services::presence_profile_changed`], which re-projects every roster
-//! carrying it so the member is renamed without a reconnect.
+//! carrying it so the member is renamed without a reconnect; a first-sight
+//! read racing that write re-reads the row instead of installing the stale
+//! one.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -249,6 +251,10 @@ impl Default for Viewer {
 struct State {
     conns: HashMap<String, Conn>,
     profiles: HashMap<PrincipalId, Profile>,
+    /// Bumped by every [`Services::presence_profile_changed`], cached entry
+    /// or not: a first-sight read that started before the bump is stale
+    /// and must not be installed (see [`Services::ensure_profile`]).
+    profile_epoch: u64,
     viewers: HashMap<(WorkspaceId, NoteId), HashMap<PrincipalId, Viewer>>,
 }
 
@@ -354,6 +360,20 @@ impl State {
 #[derive(Debug, Default)]
 pub struct PresenceRegistry {
     state: Mutex<State>,
+    /// Test seam: parks the next first-sight profile read between its store
+    /// fetch and its cache install so a test can interleave an identity
+    /// change deterministically. Consumed by the first read that hits it.
+    #[cfg(test)]
+    pub(crate) profile_fetch_pause: Mutex<Option<std::sync::Arc<ProfileFetchPause>>>,
+}
+
+/// See [`PresenceRegistry::profile_fetch_pause`]: `fetched` fires once the
+/// stale row is in hand, `resume` lets the install proceed.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ProfileFetchPause {
+    pub(crate) fetched: tokio::sync::Notify,
+    pub(crate) resume: tokio::sync::Notify,
 }
 
 impl PresenceRegistry {
@@ -490,30 +510,55 @@ impl Services {
     }
 
     /// Cache `principal`'s profile on first sight (one store read per present
-    /// principal).
+    /// principal). The read is not atomic with the install, so an identity
+    /// persisted in between ([`Self::presence_profile_changed`] finding
+    /// nothing cached yet) would otherwise be overwritten by the stale row
+    /// and stick until the principal leaves: the miss records the profile
+    /// epoch and the install is retried from a fresh read whenever the
+    /// epoch moved while the row was in flight.
     async fn ensure_profile(&self, principal: &PrincipalId) -> Result<()> {
-        if self.presence.lock().profiles.contains_key(principal) {
-            return Ok(());
+        let mut epoch = {
+            let state = self.presence.lock();
+            if state.profiles.contains_key(principal) {
+                return Ok(());
+            }
+            state.profile_epoch
+        };
+        loop {
+            let profile = Profile::from(self.store.get_principal(principal).await?);
+            #[cfg(test)]
+            {
+                let pause = self.presence.profile_fetch_pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause.fetched.notify_one();
+                    pause.resume.notified().await;
+                }
+            }
+            let mut state = self.presence.lock();
+            if state.profiles.contains_key(principal) {
+                return Ok(());
+            }
+            if state.profile_epoch == epoch {
+                state.profiles.insert(principal.clone(), profile);
+                return Ok(());
+            }
+            epoch = state.profile_epoch;
         }
-        let profile = Profile::from(self.store.get_principal(principal).await?);
-        self.presence
-            .lock()
-            .profiles
-            .entry(principal.clone())
-            .or_insert(profile);
-        Ok(())
     }
 
     /// Refresh `principal`'s cached profile after its row was persisted with
-    /// new profile fields. A principal presence has never seen (nothing
-    /// cached) and an unchanged profile are no-ops; otherwise every roster
-    /// carrying the stale fields is re-projected: `note:presence
-    /// { kind: "updated" }` (the current caret) for each note the principal
-    /// views and `presence:changed` to each workspace it is online in.
+    /// new profile fields. Every call moves the profile epoch so a
+    /// first-sight read in flight re-reads the row ([`Self::ensure_profile`]).
+    /// A principal presence has never seen (nothing cached) and an unchanged
+    /// profile emit nothing; otherwise every roster carrying the stale
+    /// fields is re-projected: `note:presence { kind: "updated" }` (the
+    /// current caret) for each note the principal views and
+    /// `presence:changed` to each workspace it is online in.
     pub(crate) async fn presence_profile_changed(&self, principal: &Principal) {
         let profile = Profile::from(principal.clone());
         let (online, updated) = {
             let mut state = self.presence.lock();
+            state.profile_epoch += 1;
             match state.profiles.get_mut(&principal.id) {
                 None => return,
                 Some(cached) if *cached == profile => return,
