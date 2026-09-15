@@ -738,7 +738,7 @@ fn merge_requirements(
     }
 }
 
-fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
+pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
     crate::pr_monitor::PrMonitorSnapshot {
         title: "feat: add adapter".to_string(),
         url: "https://github.com/o/r/pull/42".to_string(),
