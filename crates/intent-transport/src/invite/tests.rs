@@ -143,6 +143,121 @@ async fn create_without_a_pairing_provider_is_unsupported_and_mints_nothing() {
     assert!(stub.calls.lock().unwrap().is_empty());
 }
 
+/// Minimal pairing provider for the resolver: a fixed port / tunnel address
+/// over a fresh data dir (the TLS certificate is generated on first use).
+struct StubPairingInfo {
+    port: Option<u16>,
+    tc_address: Option<String>,
+    data_dir: std::path::PathBuf,
+    token_store: crate::AsyncTokenStore,
+}
+
+struct NoToken;
+
+impl crate::auth::TokenStore for NoToken {
+    fn load_token(&self) -> Option<String> {
+        None
+    }
+    fn store_token(&self, _token: &str) -> intent_core::Result<()> {
+        Ok(())
+    }
+}
+
+impl crate::server::ServerPairingInfo for StubPairingInfo {
+    fn pairing_snapshot(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::server::PairingSnapshot> + Send + '_>,
+    > {
+        let port = self.port;
+        let tc_address = self.tc_address.clone();
+        Box::pin(async move {
+            crate::server::PairingSnapshot {
+                port,
+                bind_addresses: Some(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]),
+                tc_address,
+            }
+        })
+    }
+    fn host_environment(&self) -> crate::host_env::HostEnvironment {
+        crate::host_env::HostEnvironment {
+            hostname: "test".to_string(),
+            pretty_hostname: "test".to_string(),
+            device_kind: None,
+            hardware_model: None,
+        }
+    }
+    fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+    fn token_store(&self) -> &crate::AsyncTokenStore {
+        &self.token_store
+    }
+}
+
+fn stub_provider(
+    port: Option<u16>,
+    tc_address: Option<&str>,
+) -> (Arc<dyn crate::server::ServerPairingInfo>, tempfile::TempDir) {
+    let mut tmpdir = tempfile::Builder::new()
+        .prefix("intentd-test-invite-links-")
+        .tempdir()
+        .expect("create test temp dir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        tmpdir.disable_cleanup(true);
+    }
+    let provider = Arc::new(StubPairingInfo {
+        port,
+        tc_address: tc_address.map(str::to_string),
+        data_dir: tmpdir.path().to_path_buf(),
+        token_store: crate::AsyncTokenStore::new(Arc::new(NoToken)),
+    });
+    (provider, tmpdir)
+}
+
+/// The services-facing resolver rebuilds exactly the link `create` mints —
+/// same envelope, same formatter — and answers `None` rather than an error
+/// when the listener is down or nothing is dialable (loopback bind, no
+/// tunnel), so `workspace.invite.list` never fails for it.
+#[tokio::test]
+async fn link_resolver_rebuilds_the_minted_link_and_is_none_when_undialable() {
+    let (provider, _dir) = stub_provider(Some(7443), Some("tc-abc"));
+    let minted = link_envelope(Some(&provider)).await.expect("envelope");
+    let resolved = InviteLinkResolver::new(provider.clone())
+        .invite_link_envelope()
+        .await
+        .expect("resolves");
+    let url = resolved.invite_url("inv-1", "s3cret");
+    assert_eq!(url, minted.invite_url("inv-1", "s3cret"));
+    assert_eq!(
+        url,
+        format!(
+            "intent://invite?v=1&host=&port=7443&fp={}&inviteId=inv-1&secret=s3cret&tc=tc-abc",
+            encode_query_value(&minted.fingerprint)
+        )
+    );
+
+    let (down, _dir) = stub_provider(None, Some("tc-abc"));
+    assert!(matches!(
+        link_envelope(Some(&down)).await,
+        Err(Error::ListenerDown)
+    ));
+    assert!(InviteLinkResolver::new(down)
+        .invite_link_envelope()
+        .await
+        .is_none());
+
+    let (undialable, _dir) = stub_provider(Some(7443), None);
+    assert!(matches!(
+        link_envelope(Some(&undialable)).await,
+        Err(Error::Unsupported(_))
+    ));
+    assert!(InviteLinkResolver::new(undialable)
+        .invite_link_envelope()
+        .await
+        .is_none());
+}
+
 #[test]
 fn non_invite_method_on_invite_endpoint_is_unauthorized() {
     let frame =
