@@ -1614,7 +1614,8 @@ fn golden_supervisor_history_truncation_markers() {
 /// via a hermetic assembly with no workspace path (no rule files, no skills,
 /// no RTK — only the always-on layers). Assembled under a session pinned to
 /// `harnessVersion: "1.0"` so the bytes stay frozen as later versions reword
-/// surfaces (v2.3 rewords the next-steps layer; `v2_3_goldens` pins that).
+/// surfaces (v2.3/v2.4 reword the next-steps layer; `v2_3_goldens` /
+/// `v2_4_goldens` pin those).
 #[tokio::test]
 async fn golden_assembled_prompt_static_layers() {
     let (_t, svc, ws) = setup().await;
@@ -1852,8 +1853,8 @@ async fn golden_v1_session_assembles_v1_doctrine() {
     assert!(latest.contains("ws.workspace.proposeSibling"));
     // Only the doctrine layer differs between v1 and v2.2 (the last version
     // on v1 text surfaces): the static layers after the specialization
-    // rules are byte-identical. Latest (v2.3) additionally rewords the
-    // next-steps layer and nothing else.
+    // rules are byte-identical. Latest (v2.4, like v2.3) additionally
+    // rewords the next-steps layer and nothing else.
     session.harness_version = "2.2".to_string();
     let pinned_v2_2 = assemble(Some(session.clone())).await;
     let v2_2_rules = crate::instructions::get_instruction_with_common_for(

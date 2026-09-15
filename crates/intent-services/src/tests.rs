@@ -25802,7 +25802,7 @@ mod rules {
     /// `## Suggested Next Steps` directive at the very end of the assembled
     /// prompt so the model reliably emits a `<!-- suggested-prompts ... -->`
     /// block. The default (`auto_commit_enabled = false`) variant carries the
-    /// lever examples and appends no auto-commit clause (v2.3 wording; the
+    /// lever examples and appends no auto-commit clause (v2.4 wording; the
     /// v1 bytes stay pinned in `v1_goldens`).
     #[tokio::test]
     async fn assembly_appends_suggested_prompts_for_top_level_agent() {
@@ -25828,7 +25828,9 @@ mod rules {
             "SP-1 directive present for non-sub-agent"
         );
         assert!(
-            prompt.contains("Hold off on opening the PR until I have reviewed the diff."),
+            prompt.contains(
+                "Hold off on merging [#5034](https://github.com/owner/repo/pull/5034) until I have reviewed the diff."
+            ),
             "lever example line"
         );
         assert!(
@@ -25850,7 +25852,7 @@ mod rules {
         assert!(
             prompt
                 .trim_end()
-                .ends_with("or a decision only they can make."),
+                .ends_with("well under 200 characters — or the prompt is dropped."),
             "suggested-prompts block is the tail of the assembled prompt: {:?}",
             &prompt[tail_start..]
         );
