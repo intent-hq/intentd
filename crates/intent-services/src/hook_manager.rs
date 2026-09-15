@@ -1791,8 +1791,9 @@ impl Services {
                 // loop alive. `hook:dispatched` is non-terminal here and may
                 // fire once per cadence tick.
                 if hook.perpetual {
-                    self.hook_store_retry(id, "increment_hook_dispatch_count", move || {
-                        store.increment_hook_dispatch_count(id)
+                    let dispatched = hook.dispatch_count + 1;
+                    self.hook_store_retry(id, "record_hook_dispatch", move || {
+                        store.record_hook_dispatch(id, dispatched)
                     })
                     .await?;
                     hook.last_run_at = Some(last_run_at);
@@ -1859,8 +1860,9 @@ impl Services {
                         .await;
                     return Ok(Some(next_delay));
                 }
-                self.hook_store_retry(id, "increment_hook_dispatch_count", move || {
-                    store.increment_hook_dispatch_count(id)
+                let dispatched = hook.dispatch_count + 1;
+                self.hook_store_retry(id, "record_hook_dispatch", move || {
+                    store.record_hook_dispatch(id, dispatched)
                 })
                 .await?;
                 self.hook_store_retry(id, "update_hook_state(dispatched)", move || {
@@ -1941,7 +1943,11 @@ impl Services {
     /// sleeping `hook_store_retry_base` doubled per attempt and capped at
     /// [`HOOK_STORE_RETRY_MAX_BACKOFF`]. Only the store call is repeated —
     /// `op` must be idempotent and must not re-run the script or re-deliver
-    /// a wake. Any other error (`NotFound`, …) is returned at once; the last
+    /// a wake. The counter writes satisfy this per run: `update_hook_run`
+    /// keys its `run_count` bump on `last_run_at`, and `record_hook_dispatch`
+    /// raises `dispatch_count` to a floor rather than incrementing it, so a
+    /// retry after an error reported on an already-committed write never
+    /// double-counts. Any other error (`NotFound`, …) is returned at once; the last
     /// `Internal` error is returned when the budget is exhausted, and the
     /// scheduler loop then evicts the hook.
     async fn hook_store_retry<T, F, Fut>(

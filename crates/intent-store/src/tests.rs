@@ -7206,15 +7206,28 @@ async fn hook_perpetual_and_dispatch_count_round_trip() {
     assert_eq!(store.get_hook(&id).await.expect("get hook"), hook);
 
     store
-        .increment_hook_dispatch_count(&id)
+        .record_hook_dispatch(&id, 3)
         .await
         .expect("bump dispatch count");
     let bumped = store.get_hook(&id).await.expect("get bumped");
     assert!(bumped.perpetual);
     assert_eq!(bumped.dispatch_count, 3);
 
+    // Idempotent per fire: repeating the same record (a retry after a store
+    // error on an already-committed write) does not double-count, and a
+    // stale lower value never lowers the count.
+    store
+        .record_hook_dispatch(&id, 3)
+        .await
+        .expect("repeat dispatch record");
+    store
+        .record_hook_dispatch(&id, 1)
+        .await
+        .expect("stale dispatch record");
+    assert_eq!(store.get_hook(&id).await.unwrap().dispatch_count, 3);
+
     let err = store
-        .increment_hook_dispatch_count(&HookId("hook-missing".to_string()))
+        .record_hook_dispatch(&HookId("hook-missing".to_string()), 1)
         .await
         .expect_err("missing hook");
     assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
@@ -7337,6 +7350,25 @@ async fn hook_state_run_and_error_updates() {
     assert_eq!(got.run_count, 1);
     assert_eq!(got.last_run_at.as_deref(), Some(ran_at.as_str()));
     assert_eq!(got.next_run_at.as_deref(), Some(next_at.as_str()));
+
+    // Idempotent per run: repeating the same `last_run_at` (a retry after a
+    // store error on an already-committed write) keeps `run_count` at 1 and
+    // still applies the other columns; a new run timestamp bumps it.
+    store
+        .update_hook_run(&id, &ran_at, None)
+        .await
+        .expect("repeat run record");
+    let got = store.get_hook(&id).await.unwrap();
+    assert_eq!(got.run_count, 1);
+    assert_eq!(got.next_run_at, None);
+    let later_at = format!("{ran_at}-2");
+    store
+        .update_hook_run(&id, &later_at, Some(&next_at))
+        .await
+        .expect("second run record");
+    let got = store.get_hook(&id).await.unwrap();
+    assert_eq!(got.run_count, 2);
+    assert_eq!(got.last_run_at.as_deref(), Some(later_at.as_str()));
 
     // Atomic expiry: one call flips state AND clears next_run_at together.
     store.expire_hook(&id).await.expect("atomic expiry");
