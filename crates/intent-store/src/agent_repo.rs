@@ -116,32 +116,41 @@ pub(crate) fn session_message_projections_sql(retired_filter: &str) -> String {
 }
 
 /// SQL predicate selecting an **unread top-level session** row (§5.1): a
-/// non-deleted, non-background `agent_session` with no parent whose newest
-/// user/assistant message is an assistant message the per-agent seen marker
-/// (`metadata.lastSeenMessageId`, v4.5) has not caught up with. Shared by the
-/// single-workspace EXISTS probe, the batch list-path derivation, and the
-/// guarded workspace-attention clear so the three can never drift.
+/// non-deleted, non-background, non-retired `agent_session` with no parent
+/// whose newest user/assistant message is an assistant message the
+/// per-agent seen marker (`metadata.lastSeenMessageId`, v4.5) has not caught
+/// up with. Shared by the single-workspace EXISTS probe, the batch list-path
+/// derivation, and the guarded workspace-attention clear so the three can
+/// never drift. Soft-retired sessions (`retired_at` set) are excluded: they
+/// are hidden from `agent.list`, so an unread one could never be focused to
+/// clear the flag; clearing `retired_at` (restore) makes the session count
+/// again.
 ///
 /// The seen marker is read with `->>` (NOT `json_extract()`) and the three
 /// consumers force [`UNREAD_TOP_LEVEL_SESSION_INDEX`] via `INDEXED BY`, so
-/// each statement is answered entirely from the 0114 partial covering index
-/// instead of fetching every candidate row's metadata JSON from the main
-/// table B-tree — on a ~1GB dogfood DB that difference is ~5.6MB of
+/// each statement is answered entirely from the 0114/0122 partial covering
+/// index instead of fetching every candidate row's metadata JSON from the
+/// main table B-tree — on a ~1GB dogfood DB that difference is ~5.6MB of
 /// scattered page reads vs ~86KB, and cold-cache it pushed the
 /// `workspace.list` dispatch past its 1s budget (intent-hq/monorepo#4190).
 /// `json_extract()` would silently break the covering property: it carries
 /// the `SQLITE_RESULT_SUBTYPE` property, which makes `SQLite` refuse
 /// index-expression substitution (values here are plain strings/NULL, so
-/// `->>` is semantically identical). A plan-shape test guards this.
+/// `->>` is semantically identical). Every term other than the seen-marker
+/// comparison must be spelled exactly as in the index WHERE clause so
+/// `SQLite` marks it satisfied by the partial index rather than re-reading
+/// it from the main table. A plan-shape test guards this.
 pub(crate) const UNREAD_TOP_LEVEL_SESSION_PREDICATE: &str = "parent_agent_id IS NULL \
     AND is_background = 0 \
     AND status <> 'deleted' \
     AND last_message_id IS NOT NULL \
     AND last_message_role = 'assistant' \
+    AND retired_at IS NULL \
     AND (metadata ->> '$.lastSeenMessageId' IS NULL \
          OR metadata ->> '$.lastSeenMessageId' <> last_message_id)";
 
-/// The 0114 partial covering index answering
+/// The 0114 partial covering index (recreated by 0122 with `retired_at IS
+/// NULL` in its WHERE clause) answering
 /// [`UNREAD_TOP_LEVEL_SESSION_PREDICATE`] statements. Named explicitly (via
 /// `INDEXED BY`) by all three consumers because the planner's stat1
 /// estimates otherwise prefer `idx_agent_parent` (`parent_agent_id IS NULL`
@@ -1438,7 +1447,9 @@ impl Store {
     /// Legacy top-level sessions whose pending-question marker was never
     /// written, paired with their newest non-system message. List enrichment
     /// uses this one-statement projection to preserve the pre-upgrade question
-    /// hold fallback without issuing a tail query per session.
+    /// hold fallback without issuing a tail query per session. Soft-retired
+    /// sessions are excluded (a retired agent's stale question must not hold
+    /// the workspace at `needs_attention`).
     ///
     /// # Errors
     ///
@@ -1461,7 +1472,7 @@ impl Store {
              ) \
              WHERE s.workspace_id IN ({placeholders}) \
                AND s.parent_agent_id IS NULL AND s.is_background = 0 \
-               AND s.status != 'deleted' \
+               AND s.status != 'deleted' AND s.retired_at IS NULL \
                AND (json_type(s.metadata, '$.pendingQuestionsMessageId') IS NULL \
                     OR json_type(s.metadata, '$.pendingQuestionsMessageId') != 'text')"
         );
@@ -5283,18 +5294,42 @@ mod tests {
 
     /// The three unread-derivation statements (single-workspace EXISTS
     /// probe, workspace.list batch derivation, guarded settle-clear) must be
-    /// answered entirely from the 0114 partial covering index
+    /// answered entirely from the 0114/0122 partial covering index
     /// `idx_agent_session_unread_top_level` (intent-hq/monorepo#4190
     /// regression guard): the plan must name the index, and the bytecode
     /// must contain no `Function` opcode — a JSON function call in the
     /// program means `SQLite` declined index-expression substitution (e.g.
     /// someone reverted `->>` to `json_extract()`, whose `RESULT_SUBTYPE`
     /// property blocks substitution) and every candidate row's metadata is
-    /// being fetched from the main table B-tree again.
+    /// being fetched from the main table B-tree again — and no `Column`
+    /// read from the `agent_session` table cursor: every predicate term
+    /// outside the index columns (`parent_agent_id`, `is_background`,
+    /// `status`, `retired_at`) is satisfied by the partial index's WHERE
+    /// clause only while it is spelled identically there, so a term added to
+    /// the predicate but not the index (or vice versa) shows up as a
+    /// per-row main-table fetch.
     #[tokio::test]
     async fn unread_derivation_uses_partial_covering_index() {
         let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
+        let table_root: i64 =
+            sqlx::query("SELECT rootpage FROM sqlite_master WHERE name = 'agent_session'")
+                .fetch_one(store.read_pool())
+                .await
+                .expect("agent_session rootpage")
+                .get("rootpage");
+        // `Column` opcodes whose cursor (`p1`) was opened on the
+        // `agent_session` table B-tree itself (`OpenRead p2 = rootpage`).
+        let table_column_reads = |ops: &[(String, i64, i64)]| -> usize {
+            let table_cursors: Vec<i64> = ops
+                .iter()
+                .filter(|(op, _, p2)| op == "OpenRead" && *p2 == table_root)
+                .map(|(_, p1, _)| *p1)
+                .collect();
+            ops.iter()
+                .filter(|(op, p1, _)| op == "Column" && table_cursors.contains(p1))
+                .count()
+        };
         for (label, sql, bind) in [
             ("probe", unread_workspace_probe_sql(), true),
             ("batch", unread_workspaces_batch_sql(), false),
@@ -5325,47 +5360,247 @@ mod tests {
                     .any(|d| d.contains("INDEX idx_agent_session_unread_top_level")),
                 "{label} must use the partial unread index, plan: {details:?}"
             );
-            let opcodes: Vec<String> = bytecode
+            let ops: Vec<(String, i64, i64)> = bytecode
                 .fetch_all(store.read_pool())
                 .await
                 .expect("explain bytecode")
                 .iter()
-                .map(|row| row.get::<String, _>("opcode"))
+                .map(|row| {
+                    (
+                        row.get::<String, _>("opcode"),
+                        row.get::<i64, _>("p1"),
+                        row.get::<i64, _>("p2"),
+                    )
+                })
                 .collect();
+            let opcodes: Vec<&str> = ops.iter().map(|(op, _, _)| op.as_str()).collect();
             assert!(
-                !opcodes.iter().any(|o| o == "Function"),
+                !opcodes.contains(&"Function"),
                 "{label} must read the seen marker from the index expression, \
                  not recompute it per row (covering property lost), opcodes: {opcodes:?}"
             );
+            assert_eq!(
+                table_column_reads(&ops),
+                0,
+                "{label} must be answered from the partial unread index alone: a \
+                 `Column` read on the agent_session table cursor means a predicate \
+                 term is not satisfied by the index WHERE clause (0122 added \
+                 `retired_at IS NULL` to both — keep them spelled identically), \
+                 opcodes: {opcodes:?}"
+            );
         }
 
-        // Positive control: the no-`Function` assertion above is the
-        // load-bearing half of this guard (a `json_extract` revert still
-        // satisfies the partial index's WHERE, so EXPLAIN QUERY PLAN keeps
-        // naming the index), but EXPLAIN opcode names are not a stable
-        // interface. Prove the opcode check can still fail: the same batch
-        // statement with the seen marker spelled `json_extract()` MUST emit
-        // a `Function` opcode (RESULT_SUBTYPE blocks index-expression
-        // substitution). If a bundled-SQLite bump ever renames the opcode,
-        // this control fails loudly instead of the guard going vacuous.
+        // Positive control: the no-`Function` / no-table-`Column` assertions
+        // above are the load-bearing half of this guard (a `json_extract`
+        // revert still satisfies the partial index's WHERE, so EXPLAIN QUERY
+        // PLAN keeps naming the index), but EXPLAIN opcode names are not a
+        // stable interface. Prove both opcode checks can still fail: the same
+        // batch statement with the seen marker spelled `json_extract()` MUST
+        // emit a `Function` opcode (RESULT_SUBTYPE blocks index-expression
+        // substitution) and read `metadata` from the table cursor. If a
+        // bundled-SQLite bump ever renames the opcodes, this control fails
+        // loudly instead of the guard going vacuous.
         let control_sql = unread_workspaces_batch_sql()
             .replace("metadata ->> ", "json_extract(metadata, ")
             .replace("'$.lastSeenMessageId'", "'$.lastSeenMessageId')");
         assert_ne!(control_sql, unread_workspaces_batch_sql());
         let control_bytecode_sql = format!("EXPLAIN {control_sql}");
-        let opcodes: Vec<String> = sqlx::query(&control_bytecode_sql)
+        let ops: Vec<(String, i64, i64)> = sqlx::query(&control_bytecode_sql)
             .fetch_all(store.read_pool())
             .await
             .expect("explain control bytecode")
             .iter()
-            .map(|row| row.get::<String, _>("opcode"))
+            .map(|row| {
+                (
+                    row.get::<String, _>("opcode"),
+                    row.get::<i64, _>("p1"),
+                    row.get::<i64, _>("p2"),
+                )
+            })
             .collect();
+        let opcodes: Vec<&str> = ops.iter().map(|(op, _, _)| op.as_str()).collect();
         assert!(
-            opcodes.iter().any(|o| o == "Function"),
+            opcodes.contains(&"Function"),
             "positive control lost: a json_extract-spelled statement no longer \
              emits a `Function` opcode, so the no-Function guard above is \
              vacuous — re-verify the opcode name for this SQLite version, \
              opcodes: {opcodes:?}"
+        );
+        assert!(
+            table_column_reads(&ops) > 0,
+            "positive control lost: a json_extract-spelled statement no longer \
+             reads `metadata` from the agent_session table cursor, so the \
+             no-table-`Column` guard above is vacuous — re-verify the opcode \
+             names for this SQLite version, opcodes: {opcodes:?}"
+        );
+    }
+
+    /// Seed one top-level foreground session whose newest message is an
+    /// unseen assistant reply — the minimal unread-candidate row for the
+    /// §5.1 derivation tests below.
+    async fn seed_unread_top_level_session(
+        store: &Store,
+        ws_id: &WorkspaceId,
+        agent_id: &AgentId,
+        ts: &str,
+    ) {
+        let session = baseline_test_session(agent_id, ws_id, ts, None);
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        store
+            .append_agent_message(
+                agent_id,
+                "assistant",
+                &serde_json::json!([{"type": "text", "text": "done"}]),
+                ts,
+            )
+            .await
+            .expect("append assistant message");
+    }
+
+    /// A soft-retired session (`retired_at` set) never counts as unread: the
+    /// single-workspace probe, both batch derivations, and the guarded
+    /// settle-clear all ignore it (a retired agent is hidden from
+    /// `agent.list`, so nothing could ever focus it to clear the flag).
+    /// Restoring the session (`retired_at` cleared) makes the same row
+    /// unread again — the derivation is purely a read over the column.
+    #[tokio::test]
+    async fn unread_derivation_excludes_retired_sessions_until_restored() {
+        use intent_core::{now_iso, WorkspaceAttention};
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws = WorkspaceId("ws-unread-retired".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-unread-retired".to_string());
+        seed_unread_top_level_session(&store, &ws, &agent, &ts).await;
+
+        let assert_unread = |expected: bool, label: &'static str| {
+            let store = &store;
+            let ws = &ws;
+            async move {
+                assert_eq!(
+                    store
+                        .workspace_has_unread_top_level_session(ws)
+                        .await
+                        .expect("probe"),
+                    expected,
+                    "{label}: single-workspace probe"
+                );
+                assert_eq!(
+                    store
+                        .workspaces_with_unread_top_level_sessions()
+                        .await
+                        .expect("batch")
+                        .contains(&ws.0),
+                    expected,
+                    "{label}: batch derivation"
+                );
+                assert_eq!(
+                    store
+                        .workspaces_with_unread_top_level_sessions_by_workspace(
+                            std::slice::from_ref(ws)
+                        )
+                        .await
+                        .expect("scoped batch")
+                        .contains(ws),
+                    expected,
+                    "{label}: scoped batch derivation"
+                );
+            }
+        };
+
+        assert_unread(true, "active session").await;
+        assert!(store
+            .set_workspace_attention(&ws, WorkspaceAttention::Unread, None, None)
+            .await
+            .expect("raise unread"));
+        assert!(
+            !store
+                .clear_workspace_unread_if_all_seen(&ws)
+                .await
+                .expect("settle-clear while active"),
+            "settle-clear must decline while the active session is unread"
+        );
+
+        assert!(store
+            .set_agent_session_retired_at(&ws, &agent, Some(&ts), &ts)
+            .await
+            .expect("retire"));
+        assert_unread(false, "retired session").await;
+        assert!(
+            store
+                .clear_workspace_unread_if_all_seen(&ws)
+                .await
+                .expect("settle-clear after retire"),
+            "settle-clear must clear the flag when the only unread session is retired"
+        );
+        assert_eq!(
+            store.get_workspace(&ws).await.expect("workspace").attention,
+            WorkspaceAttention::None
+        );
+
+        assert!(store
+            .set_agent_session_retired_at(&ws, &agent, None, &ts)
+            .await
+            .expect("restore"));
+        assert_unread(true, "restored session").await;
+    }
+
+    /// The legacy question-tail fallback (list path) skips soft-retired
+    /// sessions — a retired agent's stale trailing question must not hold
+    /// its workspace at `needs_attention` — and picks them up again once
+    /// restored.
+    #[tokio::test]
+    async fn legacy_question_tail_candidates_exclude_retired_sessions_until_restored() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws = WorkspaceId("ws-legacy-retired".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-legacy-retired".to_string());
+        seed_unread_top_level_session(&store, &ws, &agent, &ts).await;
+
+        let candidates = |label: &'static str| {
+            let store = &store;
+            let ws = &ws;
+            async move {
+                store
+                    .list_legacy_question_tail_candidates_by_workspace(std::slice::from_ref(ws))
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: legacy candidates: {e}"))
+                    .into_iter()
+                    .map(|(id, _, role, _)| (id, role))
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert_eq!(
+            candidates("active session").await,
+            vec![(agent.clone(), "assistant".to_string())]
+        );
+
+        assert!(store
+            .set_agent_session_retired_at(&ws, &agent, Some(&ts), &ts)
+            .await
+            .expect("retire"));
+        assert!(
+            candidates("retired session").await.is_empty(),
+            "a retired session is not a legacy question-tail candidate"
+        );
+
+        assert!(store
+            .set_agent_session_retired_at(&ws, &agent, None, &ts)
+            .await
+            .expect("restore"));
+        assert_eq!(
+            candidates("restored session").await,
+            vec![(agent.clone(), "assistant".to_string())]
         );
     }
 
@@ -12335,6 +12570,12 @@ mod tests {
         .execute(store.write_pool())
         .await
         .expect("re-run 0114 migration");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0122_agent_session_unread_index_excludes_retired.sql"
+        ))
+        .execute(store.write_pool())
+        .await
+        .expect("re-run 0122 migration");
 
         assert_eq!(
             read_role_column(&store, &user_newest).await,
@@ -12658,6 +12899,12 @@ mod tests {
         .execute(store.write_pool())
         .await
         .expect("re-run 0114 migration");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0122_agent_session_unread_index_excludes_retired.sql"
+        ))
+        .execute(store.write_pool())
+        .await
+        .expect("re-run 0122 migration");
 
         assert_eq!(
             read_id_column(&store, &user_newest).await,
