@@ -566,6 +566,9 @@ impl Services {
     /// caller's snapshot, which a switch that landed while `GET /user` was
     /// in flight may have outdated, and a stale snapshot must not decide
     /// the same-account check or be written back over the current row.
+    /// A persisted change is pushed into the presence profile cache
+    /// ([`Self::presence_profile_changed`]) so a roster that already lists
+    /// the principal is renamed without a reconnect.
     pub(crate) async fn apply_primary_identity(
         &self,
         principal: Principal,
@@ -607,6 +610,7 @@ impl Services {
         }
         updated.updated_at = now_iso();
         self.store.upsert_principal(&updated).await?;
+        self.presence_profile_changed(&updated).await;
         Ok(updated)
     }
 

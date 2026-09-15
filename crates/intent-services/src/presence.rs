@@ -41,7 +41,11 @@
 //! runs on every call and a deferred caret is re-gated when its flush fires;
 //! the events are workspace-scoped so the collaborator fan-out gate narrows
 //! them like any other row. Profiles (login / avatar) are read once per
-//! principal from the store and cached while the principal is present.
+//! principal from the store and cached while the principal is present; a
+//! profile persisted later (the lazy `principal.me` identity refresh or a
+//! `github.connect` on a fresh install) is pushed into the cache by
+//! [`Services::presence_profile_changed`], which re-projects every roster
+//! carrying it so the member is renamed without a reconnect.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -120,7 +124,7 @@ impl CursorThrottle {
 
 /// The cached profile fields of a present principal (what
 /// `workspace.members.list` already exposes).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Profile {
     login: Option<String>,
     display_name: Option<String>,
@@ -498,6 +502,51 @@ impl Services {
             .entry(principal.clone())
             .or_insert(profile);
         Ok(())
+    }
+
+    /// Refresh `principal`'s cached profile after its row was persisted with
+    /// new profile fields. A principal presence has never seen (nothing
+    /// cached) and an unchanged profile are no-ops; otherwise every roster
+    /// carrying the stale fields is re-projected: `note:presence
+    /// { kind: "updated" }` (the current caret) for each note the principal
+    /// views and `presence:changed` to each workspace it is online in.
+    pub(crate) async fn presence_profile_changed(&self, principal: &Principal) {
+        let profile = Profile::from(principal.clone());
+        let (online, updated) = {
+            let mut state = self.presence.lock();
+            match state.profiles.get_mut(&principal.id) {
+                None => return,
+                Some(cached) if *cached == profile => return,
+                Some(cached) => *cached = profile.clone(),
+            }
+            let mut viewed: Vec<(&(WorkspaceId, NoteId), &Viewer)> = state
+                .viewers
+                .iter()
+                .filter_map(|(key, viewers)| viewers.get(&principal.id).map(|v| (key, v)))
+                .collect();
+            viewed.sort_by(|a, b| {
+                (a.0 .0.as_str(), a.0 .1.as_str()).cmp(&(b.0 .0.as_str(), b.0 .1.as_str()))
+            });
+            let updated: Vec<NewEvent> = viewed
+                .into_iter()
+                .map(|(key, viewer)| {
+                    note_presence_event(
+                        key,
+                        &principal.id,
+                        &profile,
+                        "updated",
+                        viewer.cursor.as_ref(),
+                    )
+                })
+                .collect();
+            (state.is_online(&principal.id), updated)
+        };
+        for event in &updated {
+            self.publish_presence(event);
+        }
+        if online {
+            self.emit_presence_for_memberships(&principal.id).await;
+        }
     }
 
     /// Publish `presence:changed` for `workspace_id` from the current table
