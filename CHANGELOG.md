@@ -2,6 +2,53 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.56] - 2026-09-15
+
+### 🚀 Features
+
+- *(harness)* V2.4 allows markdown links in suggested prompts ([#1900](https://github.com/intent-hq/intentd/pull/1900))
+- Drop inline file data from fileBlocks (protocol 10.0) ([#1878](https://github.com/intent-hq/intentd/pull/1878))
+- Submodule-aware multi-repo GitHub issue/PR search ([#1879](https://github.com/intent-hq/intentd/pull/1879))
+
+### 🐛 Bug Fixes
+
+- MarkSeen must not bump agent_session.updated_at ([#1873](https://github.com/intent-hq/intentd/pull/1873))
+- *(services)* Persist the was_running marker before status reports running ([#1875](https://github.com/intent-hq/intentd/pull/1875))
+- *(services)* Drain a resume continuation parked behind the suspend-interrupted worker ([#1892](https://github.com/intent-hq/intentd/pull/1892))
+- *(services)* Send notifications/cancelled when a stdio tools/call times out ([#1860](https://github.com/intent-hq/intentd/pull/1860))
+- *(events)* Ride all per-daemon watches on the shared hub so a booted daemon holds one inotify instance ([#1876](https://github.com/intent-hq/intentd/pull/1876))
+- *(services)* Fold secondary git-root PRs into the workspace displayStatus derivation ([#1884](https://github.com/intent-hq/intentd/pull/1884))
+- *(services)* Redrive a recovery send parked behind a releasing worker ([#1881](https://github.com/intent-hq/intentd/pull/1881))
+- Isolate preview tunnel capacity and bound queued bytes ([#1898](https://github.com/intent-hq/intentd/pull/1898))
+- *(intentd)* Stop charging pool connect PRAGMAs to the acquiring RPC dispatch ([#1894](https://github.com/intent-hq/intentd/pull/1894))
+- *(services)* Exclude retired agents from workspace attention and unread ([#1901](https://github.com/intent-hq/intentd/pull/1901))
+
+### 🔧 Refactor
+
+- *(services)* Split agent create into plan and persist phases ([#1886](https://github.com/intent-hq/intentd/pull/1886))
+- *(services)* Take WorkspaceId as a persist_agent_create argument ([#1890](https://github.com/intent-hq/intentd/pull/1890))
+
+### 🧪 Testing
+
+- *(transport)* Freeze hyphenated-namespace router methods in the catalog ([#1883](https://github.com/intent-hq/intentd/pull/1883))
+- *(services)* Assert unsloth responsiveness tests by ordering, not wall clock ([#1862](https://github.com/intent-hq/intentd/pull/1862))
+- *(services)* Pin conditional-write error precedence with a conformance table ([#1866](https://github.com/intent-hq/intentd/pull/1866))
+- *(services)* Assert workspace.create validates before any side effect ([#1882](https://github.com/intent-hq/intentd/pull/1882))
+- *(services)* Poll watch registry before late-completion assertion in group_settle_with_failed_child_reestablishes_parent_watch ([#1880](https://github.com/intent-hq/intentd/pull/1880))
+- *(events)* Assert per-group stream sharing in the registry consolidation test ([#1888](https://github.com/intent-hq/intentd/pull/1888))
+- *(services)* Wait on Scheduled in host_exec_failure_persists_last_error_and_recovery_clears_it ([#1895](https://github.com/intent-hq/intentd/pull/1895))
+- Wait for the enrolled child before crashing in group_rehydration_settles_retired_child ([#1897](https://github.com/intent-hq/intentd/pull/1897))
+- *(core)* Golden + lint for the emitted event-type catalog ([#1885](https://github.com/intent-hq/intentd/pull/1885))
+- *(intentd)* Assert the redrive e2e's single wake folds the report into the completion ([#3619](https://github.com/intent-hq/intentd/pull/3619)) ([#1861](https://github.com/intent-hq/intentd/pull/1861))
+- *(intentd)* Deflake WSS harness-wake e2e trigger write under load ([#1867](https://github.com/intent-hq/intentd/pull/1867))
+- *(intentd)* Wait for stand-in sitter identity and reap it on drop ([#1865](https://github.com/intent-hq/intentd/pull/1865))
+- *(intentd)* Deflake last_activity_debounce_coalesces_burst via turn identity ([#1874](https://github.com/intent-hq/intentd/pull/1874))
+- *(intentd)* Poll for the verifier completion wake in run_verifier_flip_flow ([#1891](https://github.com/intent-hq/intentd/pull/1891))
+- *(intentd)* Retain a failing e2e's tempdir and echo its daemon.log tail ([#1889](https://github.com/intent-hq/intentd/pull/1889))
+- *(intentd)* Reserve both loopback stacks in multi_bind_partial_failure_is_all_or_nothing ([#1893](https://github.com/intent-hq/intentd/pull/1893))
+- *(intentd)* Bound lastActivity burst emissions by windows spanned ([#1896](https://github.com/intent-hq/intentd/pull/1896))
+
+
 ## [0.9.55] - 2026-09-13
 
 ### 🐛 Bug Fixes

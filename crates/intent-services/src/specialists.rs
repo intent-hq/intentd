@@ -156,11 +156,54 @@ pub(crate) const EMBEDDED_BUNDLED_V2_1: &[(&str, &str)] = &[
     ),
 ];
 
+/// The v2.5 embedded specialist bundle: v2.4 with versioned PR-context
+/// handoffs for the Implementor, Spec Writer, and Verifier. Unchanged
+/// specialist bytes keep reusing their prior resources so sessions pinned to
+/// v2.4 and earlier retain their exact doctrine.
+pub(crate) const EMBEDDED_BUNDLED_V2_5: &[(&str, &str)] = &[
+    (
+        "chief-of-staff",
+        include_str!("../resources/specialists/v1.1/chief-of-staff.md"),
+    ),
+    (
+        "developer",
+        include_str!("../resources/specialists/v1.1/developer.md"),
+    ),
+    (
+        "implementor",
+        include_str!("../resources/specialists/v2.5/implementor.md"),
+    ),
+    (
+        "pr-reviewer",
+        include_str!("../resources/specialists/v1.1/pr-reviewer.md"),
+    ),
+    (
+        "ralph",
+        include_str!("../resources/specialists/v1.1/ralph.md"),
+    ),
+    (
+        "spec-writer",
+        include_str!("../resources/specialists/v2.5/spec-writer.md"),
+    ),
+    (
+        "ui-designer",
+        include_str!("../resources/specialists/v1.1/ui-designer.md"),
+    ),
+    (
+        "verifier",
+        include_str!("../resources/specialists/v2.5/verifier.md"),
+    ),
+    (
+        "vulnerability-scanner",
+        include_str!("../resources/specialists/v2.1/vulnerability-scanner.md"),
+    ),
+];
+
 /// The embedded bundled floor the specialist 3-tier resolution uses by
 /// default — the LATEST version's set (the file tiers above it are
 /// user-owned and unversioned). Session-scoped resolution swaps in the
 /// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
-const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V2_1;
+const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V2_5;
 
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
 /// base tier: no shipped specialist survives the replacement.

@@ -88,6 +88,23 @@ pub(crate) const MAX_HOOK_NAME_LEN: usize = 50;
 /// [`Services::with_hook_eval_timeout`].
 pub(crate) const HOOK_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Bounded retry budget for a hook run's persistence steps
+/// (intent-hq/intent#5035): a store/pool error (`Error::Internal`) on any
+/// single step is retried up to this many attempts in total, sleeping
+/// `HOOK_STORE_RETRY_BASE` doubled per attempt (capped at
+/// `HOOK_STORE_RETRY_MAX_BACKOFF`) between them, before the scheduler gives
+/// up and evicts the hook. Only the failing persistence step is retried — the
+/// script never re-runs and a dispatch is never re-delivered.
+pub(crate) const HOOK_STORE_RETRY_ATTEMPTS: u32 = 5;
+pub(crate) const HOOK_STORE_RETRY_BASE: Duration = Duration::from_secs(1);
+const HOOK_STORE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(16);
+
+/// Test-only fault injector for hook-run persistence steps: called with the
+/// step name before each attempt; `Some(err)` fails that attempt in place of
+/// the real store call (see [`Services::with_hook_store_fault`]).
+#[cfg(test)]
+pub(crate) type HookStoreFault = Arc<Mutex<Box<dyn FnMut(&str) -> Option<Error> + Send>>>;
+
 /// Per-run console-capture caps: the in-envelope `console.*` shim buffers at
 /// most this many lines / bytes, dropping from the head (with a marker line)
 /// so a hot loop cannot bloat the `last_logs` row.
@@ -1626,17 +1643,35 @@ impl Services {
     /// terminal outcome (dispatched, evicted, expired, or a one-shot
     /// `runAt` fire).
     async fn execute_hook_run(&self, hook: &mut Hook) -> Result<Option<Duration>> {
+        // Every store step below goes through `hook_store_retry` (a
+        // transient store/pool error must not evict a healthy hook —
+        // intent-hq/intent#5035). The closures capture plain references so
+        // the in-memory hook stays mutable between steps.
+        let store = &self.store;
+        let hook_id = hook.hook_id.clone();
+        let id = &hook_id;
         // A cancel can race the sleep expiry: re-read the persisted state and
         // stop silently if this hook is no longer active.
-        match self.store.get_hook(&hook.hook_id).await {
+        match self
+            .hook_store_retry(id, "get_hook", move || store.get_hook(id))
+            .await
+        {
             Ok(h) if matches!(h.state, HookState::Scheduled | HookState::Running) => {}
             Ok(_) | Err(Error::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         }
-        self.store
-            .update_hook_state(&hook.hook_id, HookState::Running)
-            .await?;
+        self.hook_store_retry(id, "update_hook_state(running)", move || {
+            store.update_hook_state(id, HookState::Running)
+        })
+        .await?;
         hook.state = HookState::Running;
+        // The pre-run steps above may have slept through retries: re-check
+        // the deadline the scheduler loop guarded before them, so a script
+        // never starts at/after `expiresAt`.
+        if is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms()) {
+            self.expire_hook(hook).await;
+            return Ok(None);
+        }
         self.emit_hook_event(HOOK_RUN_STARTED, hook, None).await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(self.clone());
         // Feature flags are read fresh per run: a hook outlives sessions and
@@ -1687,15 +1722,20 @@ impl Services {
                     }
                 };
                 let Some((next_run_at, next_delay)) = next else {
-                    self.store
-                        .update_hook_run(&hook.hook_id, &last_run_at, None)
-                        .await?;
-                    self.store
-                        .update_hook_last_logs(&hook.hook_id, logs.as_deref())
-                        .await?;
+                    let run_at = last_run_at.as_str();
+                    self.hook_store_retry(id, "update_hook_run", move || {
+                        store.update_hook_run(id, run_at, None)
+                    })
+                    .await?;
+                    let logs_ref = logs.as_deref();
+                    self.hook_store_retry(id, "update_hook_last_logs", move || {
+                        store.update_hook_last_logs(id, logs_ref)
+                    })
+                    .await?;
                     self.persist_hook_state(hook, state).await?;
                     self.persist_hook_exec_error(hook, exec_error).await?;
-                    self.store.expire_hook(&hook.hook_id).await?;
+                    self.hook_store_retry(id, "expire_hook", move || store.expire_hook(id))
+                        .await?;
                     hook.state = HookState::Expired;
                     hook.last_run_at = Some(last_run_at);
                     hook.next_run_at = None;
@@ -1709,17 +1749,23 @@ impl Services {
                     }
                     return Ok(None);
                 };
-                self.store
-                    .update_hook_run(&hook.hook_id, &last_run_at, Some(&next_run_at))
-                    .await?;
-                self.store
-                    .update_hook_last_logs(&hook.hook_id, logs.as_deref())
-                    .await?;
+                let run_at = last_run_at.as_str();
+                let next_ref = next_run_at.as_str();
+                self.hook_store_retry(id, "update_hook_run", move || {
+                    store.update_hook_run(id, run_at, Some(next_ref))
+                })
+                .await?;
+                let logs_ref = logs.as_deref();
+                self.hook_store_retry(id, "update_hook_last_logs", move || {
+                    store.update_hook_last_logs(id, logs_ref)
+                })
+                .await?;
                 self.persist_hook_state(hook, state).await?;
                 self.persist_hook_exec_error(hook, exec_error).await?;
-                self.store
-                    .update_hook_state(&hook.hook_id, HookState::Scheduled)
-                    .await?;
+                self.hook_store_retry(id, "update_hook_state(scheduled)", move || {
+                    store.update_hook_state(id, HookState::Scheduled)
+                })
+                .await?;
                 hook.state = HookState::Scheduled;
                 hook.last_run_at = Some(last_run_at);
                 hook.next_run_at = Some(next_run_at.clone());
@@ -1735,12 +1781,16 @@ impl Services {
                 state,
                 exec_error,
             } => {
-                self.store
-                    .update_hook_run(&hook.hook_id, &last_run_at, None)
-                    .await?;
-                self.store
-                    .update_hook_last_logs(&hook.hook_id, logs.as_deref())
-                    .await?;
+                let run_at = last_run_at.as_str();
+                self.hook_store_retry(id, "update_hook_run", move || {
+                    store.update_hook_run(id, run_at, None)
+                })
+                .await?;
+                let logs_ref = logs.as_deref();
+                self.hook_store_retry(id, "update_hook_last_logs", move || {
+                    store.update_hook_last_logs(id, logs_ref)
+                })
+                .await?;
                 self.persist_hook_state(hook, state).await?;
                 self.persist_hook_exec_error(hook, exec_error).await?;
                 // A perpetual hook survives its own dispatch: count the fire,
@@ -1748,9 +1798,11 @@ impl Services {
                 // loop alive. `hook:dispatched` is non-terminal here and may
                 // fire once per cadence tick.
                 if hook.perpetual {
-                    self.store
-                        .increment_hook_dispatch_count(&hook.hook_id)
-                        .await?;
+                    let dispatched = hook.dispatch_count + 1;
+                    self.hook_store_retry(id, "record_hook_dispatch", move || {
+                        store.record_hook_dispatch(id, dispatched)
+                    })
+                    .await?;
                     hook.last_run_at = Some(last_run_at);
                     hook.run_count += 1;
                     hook.dispatch_count += 1;
@@ -1785,17 +1837,21 @@ impl Services {
                     };
                     let mut next_delay = None;
                     if let Some((next_run_at, sleep)) = next {
-                        self.store
-                            .update_hook_next_run(&hook.hook_id, Some(&next_run_at))
-                            .await?;
-                        self.store
-                            .update_hook_state(&hook.hook_id, HookState::Scheduled)
-                            .await?;
+                        let next_ref = next_run_at.as_str();
+                        self.hook_store_retry(id, "update_hook_next_run", move || {
+                            store.update_hook_next_run(id, Some(next_ref))
+                        })
+                        .await?;
+                        self.hook_store_retry(id, "update_hook_state(scheduled)", move || {
+                            store.update_hook_state(id, HookState::Scheduled)
+                        })
+                        .await?;
                         hook.state = HookState::Scheduled;
                         hook.next_run_at = Some(next_run_at);
                         next_delay = Some(sleep);
                     } else {
-                        self.store.expire_hook(&hook.hook_id).await?;
+                        self.hook_store_retry(id, "expire_hook", move || store.expire_hook(id))
+                            .await?;
                         hook.state = HookState::Expired;
                         hook.next_run_at = None;
                     }
@@ -1811,12 +1867,15 @@ impl Services {
                         .await;
                     return Ok(Some(next_delay));
                 }
-                self.store
-                    .increment_hook_dispatch_count(&hook.hook_id)
-                    .await?;
-                self.store
-                    .update_hook_state(&hook.hook_id, HookState::Dispatched)
-                    .await?;
+                let dispatched = hook.dispatch_count + 1;
+                self.hook_store_retry(id, "record_hook_dispatch", move || {
+                    store.record_hook_dispatch(id, dispatched)
+                })
+                .await?;
+                self.hook_store_retry(id, "update_hook_state(dispatched)", move || {
+                    store.update_hook_state(id, HookState::Dispatched)
+                })
+                .await?;
                 hook.state = HookState::Dispatched;
                 hook.last_run_at = Some(last_run_at);
                 hook.next_run_at = None;
@@ -1835,26 +1894,33 @@ impl Services {
                 Ok(None)
             }
             RunOutcome::Failed { error, logs } => {
-                self.store
-                    .update_hook_run(&hook.hook_id, &last_run_at, None)
-                    .await?;
+                let run_at = last_run_at.as_str();
+                self.hook_store_retry(id, "update_hook_run", move || {
+                    store.update_hook_run(id, run_at, None)
+                })
+                .await?;
                 // A timed-out/engine-failed eval dies before the capture can
                 // be returned (RunLogs::Lost): leave the previous run's
                 // persisted last_logs untouched rather than clobbering it.
                 if let RunLogs::Captured(ref logs) = logs {
-                    self.store
-                        .update_hook_last_logs(&hook.hook_id, logs.as_deref())
-                        .await?;
+                    let logs_ref = logs.as_deref();
+                    self.hook_store_retry(id, "update_hook_last_logs", move || {
+                        store.update_hook_last_logs(id, logs_ref)
+                    })
+                    .await?;
                     hook.last_logs.clone_from(logs);
                 }
                 // Persist the error before the terminal state so a reader
                 // that observes `evicted` always sees `lastError`.
-                self.store
-                    .update_hook_last_error(&hook.hook_id, Some(&error))
-                    .await?;
-                self.store
-                    .update_hook_state(&hook.hook_id, HookState::Evicted)
-                    .await?;
+                let error_ref = error.as_str();
+                self.hook_store_retry(id, "update_hook_last_error", move || {
+                    store.update_hook_last_error(id, Some(error_ref))
+                })
+                .await?;
+                self.hook_store_retry(id, "update_hook_state(evicted)", move || {
+                    store.update_hook_state(id, HookState::Evicted)
+                })
+                .await?;
                 hook.state = HookState::Evicted;
                 hook.last_run_at = Some(last_run_at);
                 hook.next_run_at = None;
@@ -1878,6 +1944,69 @@ impl Services {
         }
     }
 
+    /// Run one persistence step of a hook run, retrying a store/pool failure
+    /// (`Error::Internal`) with bounded exponential backoff
+    /// (intent-hq/intent#5035): up to [`HOOK_STORE_RETRY_ATTEMPTS`] attempts,
+    /// sleeping `hook_store_retry_base` doubled per attempt and capped at
+    /// [`HOOK_STORE_RETRY_MAX_BACKOFF`]. Only the store call is repeated —
+    /// `op` must be idempotent and must not re-run the script or re-deliver
+    /// a wake. The counter writes satisfy this per run: `update_hook_run`
+    /// keys its `run_count` bump on `last_run_at`, and `record_hook_dispatch`
+    /// raises `dispatch_count` to a floor rather than incrementing it, so a
+    /// retry after an error reported on an already-committed write never
+    /// double-counts. Any other error (`NotFound`, …) is returned at once; when
+    /// the budget is exhausted the last `Internal` error is returned annotated
+    /// with the step and attempt count (so the eviction's `lastError` and
+    /// notice name both), and the scheduler loop then evicts the hook.
+    async fn hook_store_retry<T, F, Fut>(
+        &self,
+        hook_id: &HookId,
+        step: &'static str,
+        mut op: F,
+    ) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut backoff = self.hook_store_retry_base;
+        for attempt in 1..=HOOK_STORE_RETRY_ATTEMPTS {
+            #[cfg(test)]
+            let injected = self
+                .hook_store_fault
+                .as_ref()
+                .and_then(|fault| (fault.lock().unwrap())(step));
+            #[cfg(not(test))]
+            let injected: Option<Error> = None;
+            let result = match injected {
+                Some(e) => Err(e),
+                None => op().await,
+            };
+            match result {
+                Ok(v) => return Ok(v),
+                Err(Error::Internal(msg)) if attempt == HOOK_STORE_RETRY_ATTEMPTS => {
+                    return Err(Error::Internal(format!(
+                        "{step} failed after {HOOK_STORE_RETRY_ATTEMPTS} attempts: {msg}"
+                    )));
+                }
+                Err(Error::Internal(msg)) => {
+                    tracing::warn!(
+                        hook = %hook_id.0,
+                        step,
+                        attempt,
+                        max_attempts = HOOK_STORE_RETRY_ATTEMPTS,
+                        backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                        error = %msg,
+                        "hook persistence step failed; retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(HOOK_STORE_RETRY_MAX_BACKOFF);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("hook_store_retry loop returns on the final attempt")
+    }
+
     /// Persist a non-evicting run's `ws.host.exec` failure summary to
     /// `last_error` (monorepo#3231) — or clear a previously recorded one when
     /// this run's execs all succeeded, so a recovered check stops reading as
@@ -1891,9 +2020,13 @@ impl Services {
         if hook.last_error == exec_error {
             return Ok(());
         }
-        self.store
-            .update_hook_last_error(&hook.hook_id, exec_error.as_deref())
-            .await?;
+        let store = &self.store;
+        let id = &hook.hook_id;
+        let error = exec_error.as_deref();
+        self.hook_store_retry(id, "update_hook_last_error", move || {
+            store.update_hook_last_error(id, error)
+        })
+        .await?;
         hook.last_error = exec_error;
         Ok(())
     }
@@ -1901,18 +2034,23 @@ impl Services {
     /// Apply a run's [`StateUpdate`] to the persisted row and the in-memory
     /// hook (`Keep` writes nothing).
     async fn persist_hook_state(&self, hook: &mut Hook, state: StateUpdate) -> Result<()> {
+        let store = &self.store;
+        let id = &hook.hook_id;
         match state {
             StateUpdate::Keep => {}
             StateUpdate::Clear => {
-                self.store
-                    .update_hook_last_state(&hook.hook_id, None)
-                    .await?;
+                self.hook_store_retry(id, "update_hook_last_state", move || {
+                    store.update_hook_last_state(id, None)
+                })
+                .await?;
                 hook.last_state = None;
             }
             StateUpdate::Set(s) => {
-                self.store
-                    .update_hook_last_state(&hook.hook_id, Some(&s))
-                    .await?;
+                let state = Some(s.as_str());
+                self.hook_store_retry(id, "update_hook_last_state", move || {
+                    store.update_hook_last_state(id, state)
+                })
+                .await?;
                 hook.last_state = Some(s);
             }
         }
@@ -3369,6 +3507,474 @@ mod tests {
         let text = wait_for_wake(&svc, &owner, "evicted").await;
         // The eviction wake ends with the will-not-run-again note.
         assert!(text.contains("will not run again"), "{text}");
+    }
+
+    /// Build a fault injector that fails `step` with a pool-style
+    /// `Error::Internal` for the first `failures` attempts (any step) and
+    /// records every attempt it saw.
+    fn store_fault(
+        step: &'static str,
+        failures: usize,
+    ) -> (HookStoreFault, Arc<Mutex<Vec<&'static str>>>) {
+        let seen: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let mut remaining = failures;
+        let fault: HookStoreFault = Arc::new(Mutex::new(Box::new(move |name: &str| {
+            if name != step {
+                return None;
+            }
+            // `step` is a static string; map the dynamic name back for the log.
+            log.lock().unwrap().push(step);
+            if remaining == 0 {
+                return None;
+            }
+            remaining -= 1;
+            Some(Error::Internal(
+                "pool timed out while waiting for an open connection".to_string(),
+            ))
+        })));
+        (fault, seen)
+    }
+
+    /// Script that appends a `tick` to the `runs` note — a script-execution
+    /// counter independent of hook bookkeeping — and continues with a state
+    /// counter.
+    const TICK_SCRIPT: &str = "await ws.note.add('runs', { content: 'tick' }); \
+                               return { dispatch: false, state: { n: (hookState?.n ?? 0) + 1 } };";
+    /// [`TICK_SCRIPT`] plus a `ws.host.exec` whose exit code changes every
+    /// run, so each run's `lastError` summary differs and is persisted.
+    const TICK_EXEC_SCRIPT: &str = "const n = (hookState?.n ?? 0) + 1; \
+                                    await ws.note.add('runs', { content: 'tick' }); \
+                                    await ws.host.exec({ command: 'sh', args: ['-c', 'exit ' + (2 + n)] }); \
+                                    return { dispatch: false, state: { n } };";
+    /// [`TICK_SCRIPT`]'s dispatching sibling: continues until the `gate`
+    /// note reads `go`, then dispatches `flaky-fire`.
+    const TICK_DISPATCH_SCRIPT: &str = "await ws.note.add('runs', { content: 'tick' }); \
+                                        const g = await ws.note.read('gate'); \
+                                        if (g.content.includes('go')) { \
+                                          return { dispatch: true, message: 'flaky-fire' }; \
+                                        } \
+                                        return { dispatch: false };";
+
+    struct FlakyHook {
+        _tmp: TempDb,
+        _root: tempfile::TempDir,
+        svc: Services,
+        ws: WorkspaceId,
+        owner: AgentId,
+        id: HookId,
+        seen: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    /// Schedule a hook running `code` with `step` failing for the first
+    /// `HOOK_STORE_RETRY_ATTEMPTS - 1` attempts. The validation run persists
+    /// via `insert_hook` (outside the retried steps), so it passes and
+    /// counts one tick.
+    async fn flaky_hook(step: &'static str, code: &str, perpetual: bool) -> FlakyHook {
+        let (tmp, root, svc, ws, owner) = setup().await;
+        let (fault, seen) = store_fault(step, (HOOK_STORE_RETRY_ATTEMPTS - 1) as usize);
+        let svc = svc
+            .with_hook_store_retry_base(Duration::from_millis(5))
+            .with_hook_store_fault(fault);
+        svc.store()
+            .insert_note(&note(&ws, "runs", ""))
+            .await
+            .unwrap();
+        svc.store()
+            .insert_note(&note(&ws, "gate", "wait"))
+            .await
+            .unwrap();
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": format!("flaky-{step}"),
+                    "code": code,
+                    "delayMs": 10_000,
+                    "perpetual": perpetual,
+                }),
+            )
+            .await
+            .expect("schedule");
+        assert_eq!(out["dispatched"], json!(false), "{step}");
+        let id = HookId(out["hook"]["hookId"].as_str().unwrap().to_string());
+        assert_eq!(
+            ticks(&svc, &ws).await,
+            1,
+            "{step}: validation run executed once"
+        );
+        FlakyHook {
+            _tmp: tmp,
+            _root: root,
+            svc,
+            ws,
+            owner,
+            id,
+            seen,
+        }
+    }
+
+    /// Number of script executions recorded in the `runs` note.
+    async fn ticks(svc: &Services, ws: &WorkspaceId) -> usize {
+        let note = svc
+            .store()
+            .get_note(ws, &intent_core::NoteId::from("runs"))
+            .await
+            .expect("runs note");
+        note.content.matches("tick").count()
+    }
+
+    /// Flip the `gate` note so [`TICK_DISPATCH_SCRIPT`] dispatches.
+    async fn open_gate(svc: &Services, ws: &WorkspaceId) {
+        let mut gate = svc
+            .store()
+            .get_note(ws, &intent_core::NoteId::from("gate"))
+            .await
+            .expect("gate note");
+        gate.content = "go".to_string();
+        svc.store().update_note(&gate).await.unwrap();
+    }
+
+    /// Number of the owner's persisted messages containing `needle`.
+    async fn wake_count(svc: &Services, owner: &AgentId, needle: &str) -> usize {
+        let session = svc.store().get_agent_session(owner).await.unwrap();
+        session
+            .messages
+            .iter()
+            .filter(|m| serde_json::to_string(m).unwrap().contains(needle))
+            .count()
+    }
+
+    /// Poll until the owner has at least `n` messages containing `needle`
+    /// (the wake lands after the state a test gated on), then return the
+    /// count so the caller can assert it is exactly `n`.
+    async fn wait_for_wake_count(svc: &Services, owner: &AgentId, needle: &str, n: usize) -> usize {
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        loop {
+            let count = wake_count(svc, owner, needle).await;
+            if count >= n || std::time::Instant::now() >= deadline {
+                return count;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A transient store failure on any pre- or post-run persistence step of
+    /// a continuing run is retried, not fatal (intent-hq/intent#5035): the
+    /// script executes exactly once for that run, the hook returns to
+    /// `scheduled` with a fresh `nextRunAt` and its state persisted, the owner
+    /// is never woken with an eviction, and the following scheduled run
+    /// executes exactly once more.
+    #[tokio::test]
+    async fn transient_store_error_on_persistence_retries_instead_of_evicting() {
+        for step in [
+            "get_hook",
+            "update_hook_state(running)",
+            "update_hook_run",
+            "update_hook_last_logs",
+            "update_hook_last_state",
+            "update_hook_state(scheduled)",
+        ] {
+            let h = flaky_hook(step, TICK_SCRIPT, false).await;
+            h.svc.hook_run_now_op(&h.ws, &h.id).await.expect("runNow");
+            let hook = wait_for_hook(&h.svc, &h.id, |x| {
+                x.run_count == 2 && x.state == HookState::Scheduled
+            })
+            .await;
+            assert_eq!(hook.last_state.as_deref(), Some(r#"{"n":2}"#), "{step}");
+            assert!(hook.next_run_at.is_some(), "{step}: rescheduled");
+            assert_eq!(hook.last_error, None, "{step}");
+            assert_eq!(ticks(&h.svc, &h.ws).await, 2, "{step}: script ran once");
+            assert_eq!(
+                h.seen.lock().unwrap().len(),
+                HOOK_STORE_RETRY_ATTEMPTS as usize,
+                "{step}: {:?}",
+                h.seen.lock().unwrap()
+            );
+            assert!(h.svc.hook_task_alive(&h.id), "{step}: task must stay alive");
+            // The next scheduled run occurs exactly once; the step now
+            // succeeds on its first attempt.
+            h.svc
+                .hook_run_now_op(&h.ws, &h.id)
+                .await
+                .expect("runNow again");
+            let hook = wait_for_hook(&h.svc, &h.id, |x| {
+                x.run_count == 3 && x.state == HookState::Scheduled
+            })
+            .await;
+            assert_eq!(hook.last_state.as_deref(), Some(r#"{"n":3}"#), "{step}");
+            assert_eq!(ticks(&h.svc, &h.ws).await, 3, "{step}: next run ran once");
+            assert_eq!(
+                h.seen.lock().unwrap().len(),
+                HOOK_STORE_RETRY_ATTEMPTS as usize + 1,
+                "{step}"
+            );
+            assert_eq!(
+                wake_count(&h.svc, &h.owner, "store error").await,
+                0,
+                "{step}"
+            );
+            let types = hook_event_types(&h.svc, &h.ws, &[HOOK_RUN_COMPLETED]).await;
+            assert!(
+                !types.contains(&HOOK_EVICTED.to_string()),
+                "{step}: {types:?}"
+            );
+        }
+    }
+
+    /// The post-run `lastError` write (a run whose `ws.host.exec` summary
+    /// changed) recovers from a transient failure the same way, and the
+    /// following run persists its own summary.
+    #[tokio::test]
+    async fn transient_store_error_on_last_error_persistence_recovers() {
+        let h = flaky_hook("update_hook_last_error", TICK_EXEC_SCRIPT, false).await;
+        h.svc.hook_run_now_op(&h.ws, &h.id).await.expect("runNow");
+        let hook = wait_for_hook(&h.svc, &h.id, |x| {
+            x.run_count == 2 && x.state == HookState::Scheduled
+        })
+        .await;
+        let err = hook.last_error.as_deref().expect("lastError persisted");
+        assert!(err.contains("exit code 4"), "{err}");
+        assert_eq!(ticks(&h.svc, &h.ws).await, 2);
+        assert_eq!(
+            h.seen.lock().unwrap().len(),
+            HOOK_STORE_RETRY_ATTEMPTS as usize
+        );
+        h.svc
+            .hook_run_now_op(&h.ws, &h.id)
+            .await
+            .expect("runNow again");
+        let hook = wait_for_hook(&h.svc, &h.id, |x| {
+            x.run_count == 3 && x.state == HookState::Scheduled
+        })
+        .await;
+        let err = hook.last_error.as_deref().expect("lastError persisted");
+        assert!(err.contains("exit code 5"), "{err}");
+        assert_eq!(ticks(&h.svc, &h.ws).await, 3);
+        assert_eq!(wake_count(&h.svc, &h.owner, "store error").await, 0);
+    }
+
+    /// A transient store failure on any persistence step of a dispatching
+    /// run still delivers exactly ONE dispatch wake: the script executes
+    /// once, the fire is counted once, and the hook lands `dispatched`.
+    #[tokio::test]
+    async fn transient_store_error_on_dispatch_wakes_owner_once() {
+        for step in [
+            "update_hook_run",
+            "record_hook_dispatch",
+            "update_hook_state(dispatched)",
+        ] {
+            let h = flaky_hook(step, TICK_DISPATCH_SCRIPT, false).await;
+            open_gate(&h.svc, &h.ws).await;
+            h.svc.hook_run_now_op(&h.ws, &h.id).await.expect("runNow");
+            let hook = wait_for_hook(&h.svc, &h.id, |x| x.state == HookState::Dispatched).await;
+            wait_for_task_exit(&h.svc, &h.id).await;
+            assert_eq!(hook.run_count, 2, "{step}");
+            assert_eq!(hook.dispatch_count, 1, "{step}: fire counted once");
+            assert_eq!(ticks(&h.svc, &h.ws).await, 2, "{step}: script ran once");
+            assert_eq!(
+                h.seen.lock().unwrap().len(),
+                HOOK_STORE_RETRY_ATTEMPTS as usize,
+                "{step}"
+            );
+            assert_eq!(
+                wait_for_wake_count(&h.svc, &h.owner, "flaky-fire", 1).await,
+                1,
+                "{step}: exactly one dispatch wake"
+            );
+            assert_eq!(
+                wake_count(&h.svc, &h.owner, "store error").await,
+                0,
+                "{step}"
+            );
+        }
+    }
+
+    /// The perpetual dispatch branch: a transient failure on the fire count,
+    /// the reschedule, or the return to `scheduled` still wakes the owner
+    /// exactly once per fire, keeps the task alive, and the next fire occurs
+    /// exactly once.
+    #[tokio::test]
+    async fn transient_store_error_on_perpetual_dispatch_reschedules_and_wakes_once() {
+        for step in [
+            "record_hook_dispatch",
+            "update_hook_next_run",
+            "update_hook_state(scheduled)",
+        ] {
+            let h = flaky_hook(step, TICK_DISPATCH_SCRIPT, true).await;
+            open_gate(&h.svc, &h.ws).await;
+            h.svc.hook_run_now_op(&h.ws, &h.id).await.expect("runNow");
+            let hook = wait_for_hook(&h.svc, &h.id, |x| {
+                x.dispatch_count == 1 && x.state == HookState::Scheduled
+            })
+            .await;
+            assert_eq!(hook.run_count, 2, "{step}");
+            assert!(hook.next_run_at.is_some(), "{step}: rescheduled after fire");
+            assert!(h.svc.hook_task_alive(&h.id), "{step}: task must stay alive");
+            assert_eq!(ticks(&h.svc, &h.ws).await, 2, "{step}: script ran once");
+            assert_eq!(
+                h.seen.lock().unwrap().len(),
+                HOOK_STORE_RETRY_ATTEMPTS as usize,
+                "{step}"
+            );
+            assert_eq!(
+                wait_for_wake_count(&h.svc, &h.owner, "flaky-fire", 1).await,
+                1,
+                "{step}: exactly one dispatch wake"
+            );
+            // The next fire occurs exactly once.
+            h.svc
+                .hook_run_now_op(&h.ws, &h.id)
+                .await
+                .expect("runNow again");
+            let hook = wait_for_hook(&h.svc, &h.id, |x| {
+                x.dispatch_count == 2 && x.state == HookState::Scheduled
+            })
+            .await;
+            assert_eq!(hook.run_count, 3, "{step}");
+            assert_eq!(ticks(&h.svc, &h.ws).await, 3, "{step}: next fire ran once");
+            assert_eq!(
+                wait_for_wake_count(&h.svc, &h.owner, "flaky-fire", 2).await,
+                2,
+                "{step}: one wake per fire"
+            );
+            assert_eq!(
+                wake_count(&h.svc, &h.owner, "store error").await,
+                0,
+                "{step}"
+            );
+        }
+    }
+
+    /// A pre-run step that recovers only after `expiresAt` has passed must
+    /// not start the script: the scheduler loop's deadline guard ran before
+    /// the retries, so the run re-checks it and expires the hook instead.
+    #[tokio::test]
+    async fn expiry_during_pre_run_retry_expires_instead_of_running() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let attempts = Arc::new(Mutex::new(0usize));
+        let fault: HookStoreFault = {
+            let skew = Arc::clone(&skew);
+            let attempts = Arc::clone(&attempts);
+            Arc::new(Mutex::new(Box::new(move |name: &str| {
+                if name != "update_hook_state(running)" {
+                    return None;
+                }
+                let mut n = attempts.lock().unwrap();
+                *n += 1;
+                if *n > 1 {
+                    return None;
+                }
+                // The deadline passes while the first attempt is failing.
+                skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
+                Some(Error::Internal("pool timed out".to_string()))
+            })))
+        };
+        let svc = svc
+            .with_hook_clock_skew(skew)
+            .with_hook_store_retry_base(Duration::from_millis(5))
+            .with_hook_store_fault(fault);
+        svc.store()
+            .insert_note(&note(&ws, "runs", ""))
+            .await
+            .unwrap();
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "expires-mid-retry",
+                    "code": TICK_SCRIPT,
+                    "delayMs": 10_000,
+                    "ttlMs": 60_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let id = HookId(out["hook"]["hookId"].as_str().unwrap().to_string());
+        assert_eq!(ticks(&svc, &ws).await, 1);
+        svc.hook_run_now_op(&ws, &id).await.expect("runNow");
+        let hook = wait_for_hook(&svc, &id, |h| h.state == HookState::Expired).await;
+        wait_for_task_exit(&svc, &id).await;
+        assert_eq!(*attempts.lock().unwrap(), 2, "retried once, then recovered");
+        assert_eq!(hook.run_count, 1, "no run recorded after expiry");
+        assert_eq!(
+            ticks(&svc, &ws).await,
+            1,
+            "script never started after expiry"
+        );
+        assert!(hook.next_run_at.is_none());
+        let text = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
+        assert!(!text.contains("store error"), "{text}");
+        let types = hook_event_types(&svc, &ws, &[HOOK_EXPIRED]).await;
+        assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
+        assert!(!types.contains(&HOOK_EVICTED.to_string()), "{types:?}");
+    }
+
+    /// The retry budget is bounded: a store that keeps failing past
+    /// `HOOK_STORE_RETRY_ATTEMPTS` still evicts the hook, with `lastError`
+    /// and the single eviction wake naming the step, the attempt count, and
+    /// the store error.
+    #[tokio::test]
+    async fn persistent_store_error_still_evicts_after_retry_budget() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let (fault, seen) = store_fault("update_hook_last_state", usize::MAX);
+        let svc = svc
+            .with_hook_store_retry_base(Duration::from_millis(5))
+            .with_hook_store_fault(fault);
+        svc.store()
+            .insert_note(&note(&ws, "runs", ""))
+            .await
+            .unwrap();
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "dead-store",
+                    "code": TICK_SCRIPT,
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let id = HookId(out["hook"]["hookId"].as_str().unwrap().to_string());
+        svc.hook_run_now_op(&ws, &id).await.expect("runNow");
+        let hook = wait_for_hook(&svc, &id, |h| h.state == HookState::Evicted).await;
+        wait_for_task_exit(&svc, &id).await;
+        let err = hook.last_error.as_deref().expect("lastError persisted");
+        assert!(
+            err.contains("scheduler stopped after a store error"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "update_hook_last_state failed after {HOOK_STORE_RETRY_ATTEMPTS} attempts"
+            )),
+            "{err}"
+        );
+        assert!(err.contains("pool timed out"), "{err}");
+        // The failed step never landed: the validation run's state stays,
+        // and the script ran exactly once for the evicted run.
+        assert_eq!(hook.last_state.as_deref(), Some(r#"{"n":1}"#));
+        assert_eq!(ticks(&svc, &ws).await, 2);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            HOOK_STORE_RETRY_ATTEMPTS as usize
+        );
+        assert_eq!(
+            wait_for_wake_count(&svc, &owner, "store error", 1).await,
+            1,
+            "exactly one eviction wake"
+        );
+        let text = wait_for_wake(&svc, &owner, "evicted").await;
+        assert!(
+            text.contains(&format!("after {HOOK_STORE_RETRY_ATTEMPTS} attempts")),
+            "{text}"
+        );
+        assert!(text.contains("update_hook_last_state"), "{text}");
     }
 
     #[tokio::test]

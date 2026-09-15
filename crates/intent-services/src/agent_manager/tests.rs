@@ -12922,6 +12922,411 @@ fn mock_agent_script() -> String {
         .to_string()
 }
 
+/// Which `AgentManager` front door a cross-workspace activation takes:
+/// `ws.agent.send({ priority: "queue" })` lands on `send_message`; the
+/// default (omitted / `interrupt`) lands on `interrupt_send_message`; a
+/// caller-scoped `agent.sendQueuedMessageNow` lands on
+/// `send_queued_message_now`.
+#[derive(Clone, Copy, Debug)]
+enum SendRoute {
+    Queue,
+    Interrupt,
+    QueuedNow,
+}
+
+/// Captures the `agent_manager` tracing events (fields rendered as
+/// `name=value`) so a test can assert on the session-workspace rebind log.
+#[derive(Clone, Default)]
+struct AgentManagerLogCapture(Arc<Mutex<Vec<String>>>);
+
+impl AgentManagerLogCapture {
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn set_as_default(&self) -> tracing::subscriber::DefaultGuard {
+        crate::test_tracing::set_capture_default(self.clone())
+    }
+}
+
+impl tracing::Subscriber for AgentManagerLogCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata
+            .target()
+            .starts_with("intent_services::agent_manager")
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{}={value:?} ", field.name());
+            }
+        }
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Dial the live agent's per-agent MCP bridge (the `workspace_api` server the
+/// spawned child reaches) over its loopback address and run `code` through
+/// `workspace_api`, returning the text body of the tool result. Probes the
+/// bridge's ACTUAL workspace scope, not a proxy for it.
+#[expect(clippy::used_underscore_binding)] // reads the RAII `_mcp_bridge` field; underscore documents production intent
+async fn probe_bridge_workspace_api(mgr: &AgentManager, id: &AgentId, code: &str) -> String {
+    let addr = mgr
+        .handles
+        .lock()
+        .unwrap()
+        .get(id)
+        .expect("the woken agent keeps a live handle")
+        ._mcp_bridge
+        .as_ref()
+        .expect("the live handle serves a workspace_api bridge")
+        .addr();
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to the agent's mcp bridge");
+    let (read, mut write) = stream.into_split();
+    let request = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "workspace_api", "arguments": { "code": code, "summary": "probe" } },
+    });
+    write
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("write tools/call");
+    let mut line = String::new();
+    timeout(
+        Duration::from_secs(30),
+        BufReader::new(read).read_line(&mut line),
+    )
+    .await
+    .expect("bridge answers within the budget")
+    .expect("read tools/call response");
+    let response: Value = serde_json::from_str(&line).expect("bridge response is JSON");
+    assert_eq!(
+        response["result"]["isError"],
+        json!(false),
+        "workspace_api probe succeeds: {response}"
+    );
+    response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("text tool result: {response}"))
+        .to_string()
+}
+
+/// Shared driver for the intent-hq/intent#5017 regressions: seeds a cold
+/// target in `ws-5017-home` (checkout `home_dir`) and a sender in
+/// `ws-5017-sender` (checkout `sender_dir`), delivers to the target keyed
+/// on the SENDER's workspace via `route`, and asserts (a) the woken child's
+/// actual cwd is the home checkout, (b) the `agent:message` user-row echo is
+/// scoped to the home workspace, (c) the woken child's live `workspace_api`
+/// bridge answers `ws.workspace.info()` with the home workspace + checkout,
+/// and (d) the rebind logged the caller-side scope mismatch.
+async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute) {
+    let script = mock_agent_script();
+    let behavior = json!({ "response": "done", "echoCwd": true }).to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+    ]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let home_dir = test_tempdir("intentd-5017-home-");
+    let sender_dir = test_tempdir("intentd-5017-sender-");
+    let (home_ws, sender_ws) = (
+        WorkspaceId::from("ws-5017-home"),
+        WorkspaceId::from("ws-5017-sender"),
+    );
+    let (target, sender) = (
+        AgentId::from("a-5017-target"),
+        AgentId::from("a-5017-sender"),
+    );
+    seed_agent(&mgr, &home_ws, &target).await;
+    seed_agent(&mgr, &sender_ws, &sender).await;
+    set_session_provider(&mgr, &home_ws, &target, "mock").await;
+    for (ws, dir) in [(&home_ws, &home_dir), (&sender_ws, &sender_dir)] {
+        let mut row = mgr.services.store.get_workspace(ws).await.unwrap();
+        row.path = Some(dir.path().display().to_string());
+        mgr.services
+            .store
+            .update_workspace(&row)
+            .await
+            .expect("set workspace path");
+    }
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let logs = AgentManagerLogCapture::default();
+    let _log_guard = logs.set_as_default();
+    // The shape `ws.agent.send` produces: the delivery is keyed on the
+    // CALLER's bridge workspace, not the target's home.
+    let options = super::TurnOptions {
+        origin: MessageOrigin::Automatic,
+        ..super::TurnOptions::default()
+    };
+    let result = match route {
+        SendRoute::Queue => {
+            mgr.send_message(
+                target.clone(),
+                sender_ws.clone(),
+                "wake up".to_string(),
+                None,
+                options,
+            )
+            .await
+        }
+        SendRoute::Interrupt => {
+            mgr.interrupt_send_message(
+                target.clone(),
+                sender_ws.clone(),
+                "wake up".to_string(),
+                None,
+                options,
+            )
+            .await
+        }
+        SendRoute::QueuedNow => {
+            // The entry is queued on the cold target; the "send now" arrives
+            // keyed on the CALLER's router workspace.
+            let queued = mgr
+                .services
+                .agent_queue_message_op(target.clone(), "wake up".to_string(), None, None, None)
+                .await
+                .expect("queue the entry");
+            let message_id = queued["queuedMessage"]["id"]
+                .as_str()
+                .expect("queued entry id")
+                .to_string();
+            mgr.send_queued_message_now(target.clone(), sender_ws.clone(), message_id)
+                .await
+        }
+    }
+    .expect("cross-workspace send is accepted");
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "direct turn via {route:?}: {result}"
+    );
+
+    // The turn completes on a fresh child that stamps `cwd=<process.cwd()>`.
+    let echoed = timeout(Duration::from_secs(30), async {
+        loop {
+            let messages = mgr
+                .services
+                .store
+                .get_agent_messages(&target, None)
+                .await
+                .unwrap();
+            let stamped = messages.iter().find_map(|m| {
+                (m.role == "assistant")
+                    .then(|| m.content.to_string())?
+                    .split("cwd=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['"', ' ']).next())
+                    .map(str::to_string)
+            });
+            if let Some(cwd) = stamped {
+                break cwd;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the woken agent's turn completes with an echoed cwd");
+    let expected = std::fs::canonicalize(home_dir.path()).expect("home checkout");
+    let actual = std::fs::canonicalize(&echoed).unwrap_or_else(|_| PathBuf::from(&echoed));
+    assert_eq!(
+        actual, expected,
+        "via {route:?}: the woken agent spawns in ITS session workspace's checkout, not the sender's ({echoed})"
+    );
+    assert_ne!(
+        actual,
+        std::fs::canonicalize(sender_dir.path()).expect("sender checkout"),
+        "via {route:?}: the woken agent must not spawn in the sender's checkout"
+    );
+
+    // The user-row echo for the delivered message is scoped to the target's
+    // home workspace, never the sender's.
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let echo = events
+        .iter()
+        .find(|e| {
+            e.event_type == intent_core::events::AGENT_MESSAGE
+                && e.data["role"] == json!("user")
+                && e.data["agentId"] == json!(target.0)
+        })
+        .expect("user-row agent:message echo for the delivered message");
+    assert_eq!(
+        echo.workspace_id, home_ws,
+        "via {route:?}: the delivery's agent:message echo is scoped to the target's session workspace"
+    );
+
+    // The woken child's live `workspace_api` bridge is scoped to the target's
+    // session workspace: `ws.workspace.info()` answers the home id + checkout.
+    let info = probe_bridge_workspace_api(
+        &mgr,
+        &target,
+        "const i = await ws.workspace.info(); return i.id + '|' + i.path",
+    )
+    .await;
+    let home_path = home_dir.path().display().to_string();
+    assert!(
+        info.contains(&format!("{}|{home_path}", home_ws.as_str())),
+        "via {route:?}: the woken agent's workspace_api bridge is scoped to ITS session workspace (got {info})"
+    );
+    assert!(
+        !info.contains(sender_ws.as_str()),
+        "via {route:?}: the bridge must not be scoped to the sender's workspace (got {info})"
+    );
+
+    // The rebind logged the caller-side scope mismatch it corrected.
+    let lines = logs.lines();
+    let rebind = lines
+        .iter()
+        .find(|l| l.contains("intent-hq/intent#5017"))
+        .unwrap_or_else(|| {
+            panic!("via {route:?}: the session-workspace rebind is logged (got {lines:#?})")
+        });
+    assert!(
+        rebind.contains(sender_ws.as_str()) && rebind.contains(home_ws.as_str()),
+        "via {route:?}: the rebind log names the requested and session workspaces (got {rebind})"
+    );
+}
+
+/// Regression (intent-hq/intent#5017), queue route: a cross-workspace
+/// `ws.agent.send({ priority: "queue" })` reaches `send_message` with the
+/// SENDER's workspace id — the caller's bridge scope — not the target's. A
+/// cold target woken by that send must still bind to its OWN session
+/// workspace: the child spawns in the session workspace's checkout and the
+/// turn's `agent:message` echo is scoped to that workspace. Pre-fix the
+/// sender's id flowed straight into `try_begin` / `spawn_worker` /
+/// `ensure_started` / `create_agent`, so the woken agent's child ran in the
+/// SENDER's checkout with a `workspace_api` bridge scoped to the sender's
+/// workspace.
+#[tokio::test]
+async fn cross_workspace_send_binds_woken_agent_to_its_session_workspace() {
+    assert_cross_workspace_send_binds_to_session_workspace(SendRoute::Queue).await;
+}
+
+/// Regression (intent-hq/intent#5017), interrupt route: the DEFAULT
+/// `ws.agent.send` (priority omitted → `interrupt`) reaches
+/// `interrupt_send_message`, whose archived gate and hand-off to
+/// `send_message` must likewise key on the target's session workspace, not
+/// the sender's bridge scope.
+#[tokio::test]
+async fn cross_workspace_interrupt_send_binds_woken_agent_to_its_session_workspace() {
+    assert_cross_workspace_send_binds_to_session_workspace(SendRoute::Interrupt).await;
+}
+
+/// Regression (intent-hq/intent#5017), send-now route: `agent.sendQueuedMessageNow`
+/// forwards the CALLER's router `workspaceId` unchanged into
+/// `send_queued_message_now`, which reads the target session and then
+/// claims the slot, emits the queue / message events, and spawns the worker.
+/// A cold target activated from another workspace must still bind to its
+/// OWN session workspace, same as the two `ws.agent.send` routes.
+#[tokio::test]
+async fn cross_workspace_send_queued_now_binds_woken_agent_to_its_session_workspace() {
+    assert_cross_workspace_send_binds_to_session_workspace(SendRoute::QueuedNow).await;
+}
+
+/// Regression (intent-hq/intent#5017 × intent-hq/monorepo#2732): the
+/// `interrupt_send_message` archived gate must key on the TARGET's session
+/// workspace. A cross-workspace automatic interrupt keyed on a live sender
+/// workspace, aimed at a busy target whose home is archived, skips the
+/// preemption and parks front-of-queue — the live turn is never cancelled
+/// only to have the message parked behind `send_message`'s archived gate.
+/// Pre-fix the gate read the SENDER's (unarchived) row, preempted the turn,
+/// and then parked anyway.
+#[tokio::test]
+async fn cross_workspace_interrupt_archived_gate_keys_on_target_workspace() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (home_ws, sender_ws) = (
+        WorkspaceId::from("ws-5017-gate-home"),
+        WorkspaceId::from("ws-5017-gate-sender"),
+    );
+    let (target, sender) = (
+        AgentId::from("a-5017-gate-target"),
+        AgentId::from("a-5017-gate-sender"),
+    );
+    seed_agent(&mgr, &home_ws, &target).await;
+    seed_agent(&mgr, &sender_ws, &sender).await;
+
+    // A busy, cancellable turn on the target (live handle + `acpSessionId`),
+    // so a preemption — if it ran — would be observable as `agent:stream:end`.
+    let _agent = track_mock_agent(&mgr, &target, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&home_ws, &target, "acp-5017-gate")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&target, &home_ws).await);
+    // Archive the target's home AFTER the slot claim: `try_begin` records
+    // workspace activity, which would auto-unarchive a row archived earlier.
+    // Flip the flag on the row directly — `workspace.archive` refuses while
+    // an agent is running.
+    let mut row = mgr.services.store.get_workspace(&home_ws).await.unwrap();
+    row.archived = true;
+    mgr.services
+        .store
+        .update_workspace(&row)
+        .await
+        .expect("archive the target's home workspace");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let result = mgr
+        .interrupt_send_message(
+            target.clone(),
+            sender_ws.clone(),
+            "automatic interrupt".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("automatic interrupt parks");
+    assert_eq!(result["queued"], json!(true), "parked: {result}");
+    assert_eq!(
+        result["archivedParked"],
+        json!(true),
+        "archived park marker keyed on the TARGET's home: {result}"
+    );
+    assert!(
+        mgr.is_busy(&target),
+        "the live turn survives: the gate skipped preemption"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:stream:end"),
+        "no preemption stream:end when the target's home is archived (got {types:?})"
+    );
+    let queue = mgr.services.queue_snapshot(&target);
+    assert_eq!(queue.len(), 1, "the interrupt parked");
+    assert_eq!(queue[0]["content"], json!("automatic interrupt"));
+
+    mgr.end_turn(&target).await;
+}
+
 /// #547 regression (fail-closed drain): when the pre-turn `persist_user`
 /// append fails for ALL bounded retry attempts, the drain must NOT start the
 /// turn — even with a healthy provider that would succeed. The agent parks in

@@ -542,10 +542,11 @@ mod tests {
         std::fs::write(&path, "[git]\nautoCommit = true\n").expect("seed config");
         let reg = Arc::new(SettingsRegistry::load(&path).expect("load"));
 
-        // `cfg` is registered once on start; the second `watch()` is the
+        // The recursive co-tenant's pruned walk registers `cfg` first; the
+        // watcher registers it on start (2nd); the third `watch()` is the
         // survivor re-registration the ancestor's retirement sends; the
-        // third is the watcher's own re-subscription.
-        let fault = WatchFault::nth("cfg", 2);
+        // fourth is the watcher's own re-subscription.
+        let fault = WatchFault::nth("cfg", 3);
         let hub = SharedWatchHub::with_watch_fault(&fault);
         let (sub_ancestor, _rx_ancestor, _) =
             hub.subscribe_with(&ancestor, RecursiveMode::NonRecursive);
@@ -572,7 +573,7 @@ mod tests {
             .expect("subscribed")
             .wait_live(LIVENESS)
             .await;
-        assert_eq!(fault.attempts(), 1);
+        assert_eq!(fault.attempts(), 2);
         // Let the spawned loop observe the live registration and park in its
         // debounce before the ancestor retires, so the recovery under test is
         // the closed-channel path rather than a first poll that already finds
@@ -581,11 +582,11 @@ mod tests {
 
         drop(sub_ancestor);
 
-        // The re-subscription lands as the third `watch()` on `cfg`; the
+        // The re-subscription lands as the fourth `watch()` on `cfg`; the
         // fresh handle is stored right after it is enqueued.
         let probe = tokio::time::timeout(LIVENESS, async {
             loop {
-                if fault.attempts() >= 3 {
+                if fault.attempts() >= 4 {
                     if let Some(probe) = watcher.probe() {
                         break probe;
                     }
@@ -630,7 +631,9 @@ mod tests {
         std::fs::write(&path, "[git]\nautoCommit = true\n").expect("seed config");
         let reg = Arc::new(SettingsRegistry::load(&path).expect("load"));
 
-        let fault = WatchFault::nth("cfg", 2);
+        // Same `watch()` sequence on `cfg` as the test above: pruned walk,
+        // start, failing survivor re-registration, re-subscription.
+        let fault = WatchFault::nth("cfg", 3);
         let hub = SharedWatchHub::with_watch_fault(&fault);
         let (sub_ancestor, _rx_ancestor, _) =
             hub.subscribe_with(&ancestor, RecursiveMode::NonRecursive);
@@ -657,15 +660,15 @@ mod tests {
             .expect("subscribed")
             .wait_live(LIVENESS)
             .await;
-        assert_eq!(fault.attempts(), 1);
+        assert_eq!(fault.attempts(), 2);
         tokio::task::yield_now().await;
 
         drop(sub_ancestor);
 
         // The loop has dropped its dead handle and is sleeping out the backoff
-        // before the third `watch()`: nothing watches `cfg` right now.
+        // before the fourth `watch()`: nothing watches `cfg` right now.
         tokio::time::timeout(LIVENESS, async {
-            while !(fault.attempts() == 2 && watcher.probe().is_none()) {
+            while !(fault.attempts() == 3 && watcher.probe().is_none()) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -682,7 +685,7 @@ mod tests {
         assert!(notice.changed.contains("git.autoCommit"), "{notice:?}");
         assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));
         assert!(
-            fault.attempts() >= 3,
+            fault.attempts() >= 4,
             "catch-up must ride the re-subscription"
         );
     }

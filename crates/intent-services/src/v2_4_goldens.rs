@@ -33,8 +33,13 @@ const AUTO_COMMIT_CLAUSE: &str = " Auto-commit is enabled; do not include prompt
     committing or reviewing changes before committing.";
 
 #[test]
-fn v2_4_remains_registered() {
-    assert_eq!(crate::harness::resolve_entry("2.4").version, "2.4");
+fn v2_4_remains_resolvable_after_bump() {
+    let entry = crate::harness::resolve_entry("2.4");
+    assert_eq!(entry.version, "2.4");
+    assert_eq!(
+        entry.harness.suggested_next_steps_block(false),
+        NEXT_STEPS_OFF
+    );
 }
 
 /// Exact bytes of the extended block, both auto-commit variants. The

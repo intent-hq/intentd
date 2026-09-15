@@ -152,6 +152,10 @@ struct ForgeState {
     in_merge_queue: Option<bool>,
     /// The latest merge-queue removal event served by `merge_requirements`.
     merge_queue_removal: Option<MergeQueueRemoval>,
+    /// When set, `get_review_threads` fails with a non-rate-limit API error so
+    /// the requirements probe takes the REST review-comments fallback (no
+    /// per-thread resolution state).
+    review_threads_unreadable: bool,
 }
 
 impl Default for ForgeState {
@@ -164,6 +168,7 @@ impl Default for ForgeState {
             review_decision: ReviewDecision::ReviewRequired,
             in_merge_queue: None,
             merge_queue_removal: None,
+            review_threads_unreadable: false,
         }
     }
 }
@@ -373,7 +378,10 @@ impl SourceControl for StubForge {
         _: u64,
         _: PageParams,
     ) -> ScResult<Page<ReviewComment>> {
-        unsupported("list_review_comments")
+        Ok(Page {
+            items: Vec::new(),
+            next_cursor: None,
+        })
     }
     async fn reply_to_review_comment(
         &self,
@@ -390,6 +398,11 @@ impl SourceControl for StubForge {
         _: u64,
         _: PageParams,
     ) -> ScResult<Page<ReviewThread>> {
+        if self.state.lock().unwrap().review_threads_unreadable {
+            return Err(intent_sourcecontrol::Error::Api(
+                "review threads unavailable".into(),
+            ));
+        }
         Ok(Page {
             items: Vec::new(),
             next_cursor: None,
@@ -734,6 +747,13 @@ async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
     );
     assert_eq!(row["lastSnapshot"]["approvals"]["needed"], 1);
     assert_eq!(row["lastSnapshot"]["threads"]["resolutionRequired"], true);
+    // Readable thread resolution state: the known count is a number, and 0 is
+    // the ordinary clear value (never omitted for "all resolved").
+    assert_eq!(
+        row["lastSnapshot"]["threads"]["unresolved"],
+        json!(0),
+        "readable threads pin a numeric unresolved count: {row}"
+    );
 
     // The owning agent's per-turn state snapshot carries the monitor label.
     let snap = fx
@@ -742,6 +762,65 @@ async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
         .await
         .expect("agent snapshot");
     assert_eq!(snap["prMonitors"], json!(["o/r#42"]), "snapshot: {snap}");
+}
+
+/// `threads.unresolved` over the wire (PROTOCOL §5.42 presence-detected
+/// convention): when the forge's per-thread resolution state is unreadable
+/// (a non-rate-limit threads failure → REST review-comments fallback) the key
+/// is OMITTED from `prMonitor.list`'s `lastSnapshot.threads` — never `null`,
+/// never inflated, never defaulted to `0` — while `resolutionRequired` stays
+/// present; a readable forge serves the numeric count again.
+#[tokio::test]
+async fn pr_monitor_list_omits_unreadable_threads_unresolved_over_wss() {
+    let fx = boot().await;
+    fx.forge.edit(|s| s.review_threads_unreadable = true);
+    let (monitor, requirements) = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register");
+    assert_eq!(requirements.threads.unresolved, None);
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        1,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(row["monitorId"], monitor.monitor_id.as_str());
+    let threads = row["lastSnapshot"]["threads"]
+        .as_object()
+        .expect("threads object");
+    assert!(
+        threads.get("unresolved").is_none(),
+        "unreadable resolution state: the key is omitted, not null/0: {row}"
+    );
+    assert_eq!(
+        threads.get("resolutionRequired"),
+        Some(&json!(true)),
+        "resolutionRequired stays present alongside the omitted count: {row}"
+    );
+
+    // The forge becomes readable again: the next poll serves the numeric
+    // count over the wire (0 = every thread resolved, an ordinary value).
+    fx.forge.edit(|s| s.review_threads_unreadable = false);
+    fx.services.poll_pr_monitors().await;
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(
+        row["lastSnapshot"]["threads"]["unresolved"],
+        json!(0),
+        "readable again: the numeric count is back: {row}"
+    );
 }
 
 /// `isInMergeQueue` over the wire (PROTOCOL §5.42 additive-field convention):

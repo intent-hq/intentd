@@ -11,6 +11,20 @@
 //! `agent-process-registry` (acquire/register/markActive/markIdle/deregister +
 //! a global concurrency cap with LRU idle eviction); full timer/memory-pressure
 //! reaping is M5, exposed here as the [`AgentManager::reap_idle`] hook.
+//!
+//! Session-workspace invariant (intent-hq/intent#5017): an agent is always
+//! activated in ITS OWN session workspace — the `AgentSession.workspace_id`
+//! it was created in — never in the workspace the activating caller happens
+//! to be scoped to. Every delivery front door that can start a turn
+//! (`send_message`, `interrupt_send_message`, `send_queued_message_now`)
+//! rebinds the caller-supplied workspace to the session's via
+//! [`AgentManager::session_workspace`] BEFORE any scope-sensitive step (the
+//! archived gate, the `try_begin` claim, event echoes, and the spawn:
+//! `ensure_started` → `resolve_spawn` cwd + `create_agent` workspace-MCP
+//! scope). A cross-workspace `ws.agent.send` / `ws.agent.sendToTask` arrives
+//! keyed on the SENDER's bridge workspace; without the rebind the woken
+//! child would run in the sender's checkout with a `workspace_api` bridge
+//! scoped to the sender's workspace.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -5765,6 +5779,31 @@ impl AgentManager {
         self.workers.lock().unwrap().remove(agent_id);
     }
 
+    /// The workspace a delivery to `agent_id` is bound to: the target's OWN
+    /// session workspace (intent-hq/intent#5017). A cross-workspace
+    /// `ws.agent.send` / `ws.agent.sendToTask` reaches the runtime with the
+    /// SENDER's bridge workspace as `requested`; honouring it would spawn the
+    /// woken child in the sender's checkout with a `workspace_api` bridge
+    /// scoped to the sender's workspace, claim the in-flight slot under the
+    /// wrong workspace activity, and publish the turn's events into the
+    /// wrong workspace. A mismatch is logged (it names the caller-side scope
+    /// leak) and the session's workspace wins.
+    fn session_workspace(
+        agent_id: &AgentId,
+        requested: &WorkspaceId,
+        session: &AgentSession,
+    ) -> WorkspaceId {
+        if *requested != session.workspace_id {
+            tracing::debug!(
+                agent = %agent_id,
+                requested = %requested.as_str(),
+                session_workspace = %session.workspace_id.as_str(),
+                "delivery workspace differs from the target's session workspace; binding to the session workspace (intent-hq/intent#5017)"
+            );
+        }
+        session.workspace_id.clone()
+    }
+
     /// `agent.sendMessage` runtime path (§5.5/§6.8): when a turn is already in
     /// flight, enqueue (the worker flips it to in-flight when the current turn
     /// ends); otherwise persist the user message (under the client-supplied
@@ -5820,6 +5859,14 @@ impl AgentManager {
         // a truncated/mistyped id must not claim the slot or queue a phantom
         // message that never drains (the sender then waits forever).
         let session = self.services.require_agent_session(&agent_id).await?;
+        // Bind the delivery to the target's OWN session workspace
+        // (intent-hq/intent#5017): a cross-workspace `ws.agent.send` arrives
+        // with the SENDER's bridge workspace, and every scope-sensitive step
+        // below — the archived gate, the `try_begin` claim, the event echo,
+        // and the spawn (`ensure_started` → `resolve_spawn` cwd +
+        // `create_agent` workspace-MCP scope) — must key on the workspace
+        // the target lives in, not the caller's.
+        let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
         // Quarantine gate (monorepo#840): a provably-poisoned session (parked
         // in Error with a session-fatal provider block, or a streak of
         // identical terminal failures) must NOT be redriven by message
@@ -6617,6 +6664,12 @@ impl AgentManager {
         // monorepo#564: fail closed on a nonexistent target BEFORE touching
         // the queue.
         let session = self.services.require_agent_session(&agent_id).await?;
+        // Bind the activation to the target's OWN session workspace
+        // (intent-hq/intent#5017): the router forwards the CALLER's
+        // `workspaceId` unchanged, and the `try_begin` claim, the queue /
+        // status events, and the spawn below must key on the workspace the
+        // target lives in (see the module-header invariant).
+        let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
         // Quarantine gate (monorepo#840): a provably-poisoned session must
         // not be redriven by delivery — every replay deterministically
         // fails. The entry STAYS in the queue (no side effects); the absent
@@ -6964,7 +7017,11 @@ impl AgentManager {
         options.interrupt_priority = true;
         // monorepo#564: reject nonexistent targets BEFORE the dedup record or
         // any preemption — same fail-closed guard as `send_message`.
-        self.services.require_agent_session(&agent_id).await?;
+        let session = self.services.require_agent_session(&agent_id).await?;
+        // Same session-workspace binding as `send_message`
+        // (intent-hq/intent#5017): the archived gate below keys on the
+        // target's home workspace, not the sender's bridge scope.
+        let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
         // Duplicate-delivery guard: check-and-record is atomic under the lock,
         // so of two racing duplicates exactly one proceeds. Runs BEFORE the
         // archived gate below so a parked interrupt still records its id and

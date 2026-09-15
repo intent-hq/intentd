@@ -727,7 +727,7 @@ fn merge_requirements(
             changes_requested: 0,
         },
         threads: crate::pr_ops::MergeRequirementsThreads {
-            unresolved,
+            unresolved: Some(unresolved),
             resolution_required: Some(true),
         },
         merge_state_status: None,
@@ -887,6 +887,17 @@ fn golden_pr_monitor_checklist_branch_lines() {
          - checks: 2 passed, 0 failed, 1 pending (of 3) (required-check flags unavailable)\n\
          - unresolved threads: 1\n\
          - (branch rules unreadable — approval/thread requirements unknown)"
+    );
+    // Thread resolution state unreadable (`threads.unresolved` absent): the
+    // row says so instead of printing a fabricated 0.
+    let mut s = pr_snapshot("open");
+    s.requirements.threads.unresolved = None;
+    assert_eq!(
+        crate::pr_monitor::render_checklist(&s),
+        "- state: open\n\
+         - approvals: review_required (0/1 required)\n\
+         - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
+         - unresolved threads: unknown (thread resolution state unreadable) (resolution required to merge)"
     );
 }
 

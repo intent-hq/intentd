@@ -506,7 +506,9 @@ impl PrMonitorRefusal {
 /// so every checklist blocker must be clear — no failing/pending required
 /// checks, no changes-requested/review-required approvals decision (nor a
 /// `none` decision while the branch rules still demand approvals the PR
-/// does not have), no unresolved threads when resolution is required, no
+/// does not have), no unresolved threads when resolution is required (an
+/// unreadable thread count — `threads.unresolved == None` — never promotes
+/// while resolution is required, since the state is unknown, not clear), no
 /// `merge_blocked_reason`, and no blocked/behind/dirty/unknown
 /// `merge_state_status` (`UNKNOWN` means the forge has not established
 /// mergeability yet, so it never promotes). A PR already queued in the
@@ -530,7 +532,7 @@ fn requirements_ready(req: &MergeRequirements) -> bool {
                 .approvals
                 .needed
                 .is_some_and(|needed| req.approvals.have < i64::from(needed)))
-        && !(req.threads.unresolved > 0 && req.threads.resolution_required == Some(true))
+        && !(req.threads.unresolved != Some(0) && req.threads.resolution_required == Some(true))
         && !matches!(
             req.merge_state_status.as_deref(),
             Some("BLOCKED" | "BEHIND" | "DIRTY" | "UNKNOWN")
@@ -754,11 +756,15 @@ fn pr_monitor_wire(m: &PrMonitor) -> Value {
                 "changesRequested": r.approvals.changes_requested,
             },
             "threads": {
-                "unresolved": r.threads.unresolved,
                 "resolutionRequired": r.threads.resolution_required,
             },
             "rulesKnown": r.rules_known,
         });
+        // Presence-detected: the count appears only when the thread
+        // resolution state was readable (never null).
+        if let Some(unresolved) = r.threads.unresolved {
+            last["threads"]["unresolved"] = json!(unresolved);
+        }
         // Presence-detected: the key appears only when the host reported
         // the PR queued (never null).
         if let Some(queued) = r.is_in_merge_queue {
@@ -3101,7 +3107,7 @@ mod tests {
                     changes_requested: 0,
                 },
                 threads: pr_ops::MergeRequirementsThreads {
-                    unresolved: 1,
+                    unresolved: Some(1),
                     resolution_required: Some(true),
                 },
                 merge_state_status: Some("BLOCKED".into()),
@@ -3125,7 +3131,7 @@ mod tests {
         req.checks.pending_required.clear();
         req.approvals.decision = "approved".into();
         req.approvals.have = 1;
-        req.threads.unresolved = 0;
+        req.threads.unresolved = Some(0);
         req.merge_state_status = Some("CLEAN".into());
     }
 
@@ -3182,6 +3188,107 @@ mod tests {
             wire["lastSnapshot"]["mergeQueueEjection"],
             json!({ "at": "2026-01-02T03:04:05Z", "reason": "failed_checks" })
         );
+    }
+
+    /// An unreadable thread count (`threads.unresolved == None`) is unknown,
+    /// not clear: it never promotes to ready while the branch requires
+    /// resolution, reads ready when resolution is not required (the count is
+    /// irrelevant to merging), and the `lastSnapshot` summary omits the key
+    /// rather than serving `null` or `0`.
+    #[test]
+    fn an_unknown_thread_count_is_not_ready_when_resolution_is_required() {
+        let mut s = snapshot(|s| ready_requirements(&mut s.requirements));
+        assert!(requirements_ready(&s.requirements), "fixture starts ready");
+        s.requirements.threads.unresolved = None;
+        assert_eq!(s.requirements.threads.resolution_required, Some(true));
+        assert!(
+            !requirements_ready(&s.requirements),
+            "unknown resolution state never reads ready while resolution is required"
+        );
+        s.requirements.threads.resolution_required = None;
+        assert!(
+            requirements_ready(&s.requirements),
+            "unknown resolution state does not block when rules are unreadable"
+        );
+        s.requirements.threads.resolution_required = Some(false);
+        assert!(requirements_ready(&s.requirements));
+
+        s.requirements.threads.resolution_required = Some(true);
+        let ts = "2026-01-01T00:00:00Z".to_string();
+        let mut m = PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            state: PrMonitorState::Active,
+            last_snapshot: Some(serde_json::to_string(&s).unwrap()),
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        let wire = pr_monitor_wire(&m);
+        assert!(wire["lastSnapshot"]["threads"].get("unresolved").is_none());
+        assert_eq!(
+            wire["lastSnapshot"]["threads"]["resolutionRequired"],
+            json!(true)
+        );
+
+        s.requirements.threads.unresolved = Some(3);
+        m.last_snapshot = Some(serde_json::to_string(&s).unwrap());
+        let wire = pr_monitor_wire(&m);
+        assert_eq!(wire["lastSnapshot"]["threads"]["unresolved"], json!(3));
+    }
+
+    /// A thread-count delta is never reported when either side is unknown.
+    /// Baseline `Some(1)` → degraded `None` → recovered `Some(1)`: the
+    /// degraded diff carries exactly one readability line and no
+    /// `thread(s)` delta, the recovery diff a neutral "readable again" line
+    /// (no `thread(s) resolved` verb), the baseline→recovered diff (same
+    /// count) no thread line at all, and unknown→unknown is silent.
+    #[test]
+    fn diff_never_fabricates_a_thread_delta_across_an_unknown_count() {
+        let baseline = snapshot(|_| {});
+        assert_eq!(baseline.requirements.threads.unresolved, Some(1));
+        let degraded = snapshot(|s| s.requirements.threads.unresolved = None);
+        let recovered = snapshot(|_| {});
+
+        let changes = diff_snapshots(&baseline, &degraded);
+        assert!(
+            changes.iter().all(|c| !c.starts_with("thread(s)")),
+            "no thread delta on degradation: {changes:?}"
+        );
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|c| c.as_str() == "review threads unreadable (resolution state unavailable)")
+                .count(),
+            1,
+            "exactly one readability line: {changes:?}"
+        );
+
+        let changes = diff_snapshots(&degraded, &recovered);
+        assert!(
+            changes.iter().all(|c| !c.starts_with("thread(s)")),
+            "no thread delta on recovery: {changes:?}"
+        );
+        assert!(changes
+            .iter()
+            .any(|c| c == "review threads readable again: 1 unresolved"));
+
+        let changes = diff_snapshots(&baseline, &recovered);
+        assert!(
+            changes.iter().all(|c| !c.contains("thread")),
+            "same count, no thread line: {changes:?}"
+        );
+
+        assert!(diff_snapshots(&degraded, &degraded).is_empty());
     }
 
     #[test]
@@ -3242,12 +3349,12 @@ mod tests {
             .iter()
             .any(|c| c.starts_with("+1 review comment ")));
 
-        let resolved = snapshot(|s| s.requirements.threads.unresolved = 0);
+        let resolved = snapshot(|s| s.requirements.threads.unresolved = Some(0));
         assert!(diff_snapshots(&base, &resolved)
             .iter()
             .any(|c| c.starts_with("thread(s) resolved")));
 
-        let unresolved = snapshot(|s| s.requirements.threads.unresolved = 2);
+        let unresolved = snapshot(|s| s.requirements.threads.unresolved = Some(2));
         assert!(diff_snapshots(&base, &unresolved)
             .iter()
             .any(|c| c.starts_with("thread(s) unresolved/opened")));

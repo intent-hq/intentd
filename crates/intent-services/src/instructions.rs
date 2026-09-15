@@ -157,9 +157,9 @@ pub(crate) static V2_2: InstructionSet = InstructionSet {
     ..V2
 };
 
-/// Harness v2.5 adds self-contained plain-language communication guidance.
-pub(crate) static V2_5: InstructionSet = InstructionSet {
-    common: instr!("v2.5", "common"),
+/// Harness v2.6 adds self-contained plain-language communication guidance.
+pub(crate) static V2_6: InstructionSet = InstructionSet {
+    common: instr!("v2.6", "common"),
     ..V2_2
 };
 
@@ -469,8 +469,8 @@ mod tests {
         defaults()
     }
 
-    /// The latest common body includes v2.5 plain-language guidance.
-    const COMMON_LATEST: &str = V2_5.common;
+    /// The latest common body includes v2.6 plain-language guidance.
+    const COMMON_LATEST: &str = V2_6.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;

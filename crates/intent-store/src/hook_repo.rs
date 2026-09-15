@@ -295,6 +295,11 @@ impl Store {
     /// Record a completed run: bump `run_count`, set `last_run_at`, and set
     /// (or clear) `next_run_at`; `NotFound` when the row is absent.
     ///
+    /// Idempotent per run: the `run_count` bump is keyed on `last_run_at`, so
+    /// repeating the call with the same `last_run_at` (a retry after a store
+    /// error reported on an already-committed write) does not count the run
+    /// twice.
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
@@ -305,9 +310,12 @@ impl Store {
         next_run_at: Option<&str>,
     ) -> Result<()> {
         let res = sqlx::query(
-            "UPDATE hook SET run_count = run_count + 1, last_run_at = ?, next_run_at = ? \
+            "UPDATE hook SET \
+             run_count = CASE WHEN last_run_at IS ? THEN run_count ELSE run_count + 1 END, \
+             last_run_at = ?, next_run_at = ? \
              WHERE hook_id = ?",
         )
+        .bind(last_run_at)
         .bind(last_run_at)
         .bind(next_run_at)
         .bind(&hook_id.0)
@@ -323,20 +331,28 @@ impl Store {
         Ok(())
     }
 
-    /// Bump a hook's `dispatch_count`; `NotFound` when the row is absent.
+    /// Record a hook dispatch by raising `dispatch_count` to at least
+    /// `dispatch_count` (the caller's count including this fire); `NotFound`
+    /// when the row is absent.
+    ///
+    /// Idempotent: the write is a floor, not an increment, so repeating the
+    /// call for the same fire (a retry after a store error reported on an
+    /// already-committed write) leaves the count unchanged.
     ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
-    pub async fn increment_hook_dispatch_count(&self, hook_id: &HookId) -> Result<()> {
-        let res =
-            sqlx::query("UPDATE hook SET dispatch_count = dispatch_count + 1 WHERE hook_id = ?")
-                .bind(&hook_id.0)
-                .execute(self.write_pool())
-                .await
-                .map_err(|e| {
-                    intent_core::Error::Internal(format!("update hook dispatch count failed: {e}"))
-                })?;
+    pub async fn record_hook_dispatch(&self, hook_id: &HookId, dispatch_count: i64) -> Result<()> {
+        let res = sqlx::query(
+            "UPDATE hook SET dispatch_count = MAX(dispatch_count, ?) WHERE hook_id = ?",
+        )
+        .bind(dispatch_count)
+        .bind(&hook_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| {
+            intent_core::Error::Internal(format!("update hook dispatch count failed: {e}"))
+        })?;
         if res.rows_affected() == 0 {
             return Err(intent_core::Error::NotFound(format!(
                 "hook {} not found",

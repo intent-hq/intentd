@@ -777,7 +777,13 @@ pub struct MergeQueueEjection {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeRequirementsThreads {
-    pub unresolved: i64,
+    /// The number of unresolved review threads; `None` (key omitted on the
+    /// wire, presence-detected like `mergeable`) when the per-thread
+    /// resolution state was unreadable — the GraphQL threads read failed and
+    /// the REST comments fallback carries no resolution state — rather than
+    /// inflating every thread to unresolved or defaulting to zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved: Option<i64>,
     /// Whether the base branch requires every thread resolved before merging;
     /// `None` when the rules are unreadable.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -845,22 +851,23 @@ fn check_status_word(state: CheckState) -> &'static str {
 
 /// Compose the merge-requirements checklist (§ task 1) from a PR snapshot, the
 /// host's merge-requirement signals, the aggregated reviews, and the
-/// unresolved-thread count.
+/// unresolved-thread count (`None` when the resolution state was unreadable).
 ///
 /// Degradation is per-signal, never fatal: a host that reports no rollup
 /// yields `checks.requiredKnown == false` (with every `required` flag
 /// `false`), unreadable branch rules yield `rulesKnown == false` with
-/// `approvals.needed` / `threads.resolutionRequired` omitted, and a probe that
-/// failed entirely (`signals: None`) still produces the state / conflicts /
-/// approvals / threads rows from the snapshot alone. When the rollup is
-/// unavailable, the `checks` tallies fall back to `fallback_runs` (the REST
-/// check-runs the snapshot already fetched).
+/// `approvals.needed` / `threads.resolutionRequired` omitted, an unreadable
+/// thread resolution state yields `threads.unresolved` omitted, and a probe
+/// that failed entirely (`signals: None`) still produces the state /
+/// conflicts / approvals / threads rows from the snapshot alone. When the
+/// rollup is unavailable, the `checks` tallies fall back to `fallback_runs`
+/// (the REST check-runs the snapshot already fetched).
 pub(crate) fn merge_requirements(
     pr: &PullRequest,
     signals: Option<&MergeRequirementSignals>,
     fallback_runs: &[CheckRun],
     agg: &ReviewAggregate,
-    unresolved_threads: i64,
+    unresolved_threads: Option<i64>,
 ) -> MergeRequirements {
     let state = derive_status_state(pr);
     let mergeable_state = pr.mergeable_state.as_deref().unwrap_or("unknown");
@@ -958,7 +965,7 @@ pub(crate) fn merge_requirements(
 /// merge-requirements probe (non-GitHub hosts) falls back to the REST
 /// check-runs on the PR head, a failing check-run read reports an empty
 /// tally, a failing review read leaves the approvals aggregate empty, and a
-/// failing review-thread read reports zero unresolved threads. Only
+/// failing review-thread read leaves `threads.unresolved` unknown. Only
 /// [`SourceControl::get_pr`] is load-bearing, so a partially-visible forge
 /// still yields a usable checklist. The one exception is quota exhaustion:
 /// [`Error::RateLimited`] from ANY sub-read propagates (see
@@ -1079,15 +1086,19 @@ pub(crate) async fn merge_requirements_for_pr(
 
     // Inline review comments: threads via GraphQL when available, else the
     // flat REST list grouped by reply parent. Resolution state is unavailable
-    // on the fallback path, so every fallback thread counts as unresolved —
-    // both degradations are logged at `warn` so they are visible at the
-    // default log level instead of silently skewing the unresolved count.
+    // on the fallback path, so the unresolved count is reported as unknown
+    // (`None`) there rather than inflated to every thread or defaulted to
+    // zero — both degradations are logged at `warn` so they are visible at
+    // the default log level.
     let (review_comments, unresolved) = match fetch_all_pages(|p| {
         sc.get_review_threads(repo_ref, number, p)
     })
     .await
     {
-        Ok((threads, _, _)) => count_thread_comments(&threads),
+        Ok((threads, _, _)) => {
+            let (comments, unresolved) = count_thread_comments(&threads);
+            (comments, Some(unresolved))
+        }
         Err(intent_sourcecontrol::Error::RateLimited(msg)) => {
             return Err(Error::RateLimited(msg));
         }
@@ -1095,10 +1106,12 @@ pub(crate) async fn merge_requirements_for_pr(
             tracing::warn!(
                 error = %e,
                 pr_number = number,
-                "merge requirements: review threads unavailable, falling back to REST comments (thread resolution state unavailable, unresolved count may be inflated)"
+                "merge requirements: review threads unavailable, falling back to REST comments (thread resolution state unavailable, unresolved count reported as unknown)"
             );
             match fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)).await {
-                Ok((comments, _, _)) => count_thread_comments(&fallback_threads(comments)),
+                Ok((comments, _, _)) => {
+                    (count_thread_comments(&fallback_threads(comments)).0, None)
+                }
                 Err(intent_sourcecontrol::Error::RateLimited(msg)) => {
                     return Err(Error::RateLimited(msg));
                 }
@@ -1106,9 +1119,9 @@ pub(crate) async fn merge_requirements_for_pr(
                     tracing::warn!(
                         error = %e,
                         pr_number = number,
-                        "merge requirements: review comments unavailable, reporting zero unresolved"
+                        "merge requirements: review comments unavailable, reporting zero review comments and unknown unresolved"
                     );
-                    (0, 0)
+                    (0, None)
                 }
             }
         }
@@ -1628,7 +1641,7 @@ mod tests {
             is_in_merge_queue: None,
             merge_queue_removal: None,
         };
-        let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), 3);
+        let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), Some(3));
 
         assert_eq!(req.state, "open");
         assert!(!req.is_draft);
@@ -1646,7 +1659,7 @@ mod tests {
         assert_eq!(req.approvals.decision, "review_required");
         assert_eq!(req.approvals.have, 1);
         assert_eq!(req.approvals.needed, Some(2));
-        assert_eq!(req.threads.unresolved, 3);
+        assert_eq!(req.threads.unresolved, Some(3));
         assert_eq!(req.threads.resolution_required, Some(true));
         assert_eq!(req.merge_state_status.as_deref(), Some("BLOCKED"));
         assert_eq!(
@@ -1685,7 +1698,7 @@ mod tests {
             is_in_merge_queue: None,
             merge_queue_removal: None,
         };
-        let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), 0);
+        let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), Some(0));
 
         assert!(!req.rules_known);
         assert_eq!(req.approvals.needed, None);
@@ -1714,7 +1727,7 @@ mod tests {
             },
         ];
         // A probe that failed entirely still yields the snapshot-derived rows.
-        let req = merge_requirements(&p, None, &runs, &agg(0, 0), 2);
+        let req = merge_requirements(&p, None, &runs, &agg(0, 0), Some(2));
         assert_eq!(req.checks.total, 2);
         assert_eq!((req.checks.passed, req.checks.failed), (1, 1));
         assert!(!req.checks.required_known);
@@ -1724,7 +1737,7 @@ mod tests {
         assert_eq!(req.checks.items[0].url.as_deref(), Some("https://ci/1"));
         assert!(!req.rules_known);
         assert_eq!(req.approvals.decision, "none");
-        assert_eq!(req.threads.unresolved, 2);
+        assert_eq!(req.threads.unresolved, Some(2));
         assert!(req.merge_state_status.is_none());
 
         // A host that reports the signals but no rollup degrades the same way.
@@ -1733,7 +1746,7 @@ mod tests {
             checks_known: false,
             ..Default::default()
         };
-        let req = merge_requirements(&p, Some(&signals), &runs, &agg(0, 0), 0);
+        let req = merge_requirements(&p, Some(&signals), &runs, &agg(0, 0), Some(0));
         assert_eq!(req.checks.total, 2);
         assert!(!req.checks.required_known);
         assert_eq!(req.merge_state_status.as_deref(), Some("UNSTABLE"));
@@ -1746,7 +1759,7 @@ mod tests {
             merge_state_status: Some("DRAFT".into()),
             ..Default::default()
         };
-        let req = merge_requirements(&draft, Some(&signals), &[], &agg(0, 0), 0);
+        let req = merge_requirements(&draft, Some(&signals), &[], &agg(0, 0), Some(0));
         assert_eq!(req.state, "draft");
         assert!(req.is_draft);
         assert_eq!(
@@ -1755,7 +1768,7 @@ mod tests {
         );
 
         let dirty = pr(PrState::Open, false, Some(false), Some("dirty"));
-        let req = merge_requirements(&dirty, None, &[], &agg(0, 0), 0);
+        let req = merge_requirements(&dirty, None, &[], &agg(0, 0), Some(0));
         assert!(req.has_conflicts);
         assert_eq!(req.merge_blocked_reason.as_deref(), Some("merge conflicts"));
 
@@ -1766,7 +1779,7 @@ mod tests {
             merge_state_status: Some("BEHIND".into()),
             ..Default::default()
         };
-        let req = merge_requirements(&unknown, Some(&signals), &[], &agg(0, 0), 0);
+        let req = merge_requirements(&unknown, Some(&signals), &[], &agg(0, 0), Some(0));
         assert!(req.is_behind);
         assert!(!req.has_conflicts);
     }
@@ -1779,7 +1792,7 @@ mod tests {
             is_in_merge_queue: Some(true),
             ..Default::default()
         };
-        let req = merge_requirements(&p, Some(&queued), &[], &agg(0, 0), 0);
+        let req = merge_requirements(&p, Some(&queued), &[], &agg(0, 0), Some(0));
         assert_eq!(req.is_in_merge_queue, Some(true));
         let wire = serde_json::to_value(&req).unwrap();
         assert_eq!(wire["isInMergeQueue"], serde_json::json!(true));
@@ -1794,7 +1807,7 @@ mod tests {
             Some(MergeRequirementSignals::default()),
             None,
         ] {
-            let req = merge_requirements(&p, signals.as_ref(), &[], &agg(0, 0), 0);
+            let req = merge_requirements(&p, signals.as_ref(), &[], &agg(0, 0), Some(0));
             assert_eq!(req.is_in_merge_queue, None);
             let wire = serde_json::to_value(&req).unwrap();
             assert!(wire.get("isInMergeQueue").is_none());
@@ -1814,7 +1827,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), 0);
+        let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0));
         let wire = serde_json::to_value(&req).unwrap();
         assert_eq!(
             wire["mergeQueueEjection"],
@@ -1823,7 +1836,7 @@ mod tests {
 
         // No event, or no probe at all: the key is omitted, never null.
         for signals in [Some(MergeRequirementSignals::default()), None] {
-            let req = merge_requirements(&p, signals.as_ref(), &[], &agg(0, 0), 0);
+            let req = merge_requirements(&p, signals.as_ref(), &[], &agg(0, 0), Some(0));
             assert_eq!(req.merge_queue_ejection, None);
             let wire = serde_json::to_value(&req).unwrap();
             assert!(wire.get("mergeQueueEjection").is_none());
@@ -1837,7 +1850,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let req = merge_requirements(&p, Some(&no_reason), &[], &agg(0, 0), 0);
+        let req = merge_requirements(&p, Some(&no_reason), &[], &agg(0, 0), Some(0));
         let wire = serde_json::to_value(&req).unwrap();
         assert_eq!(
             wire["mergeQueueEjection"],
@@ -1848,7 +1861,7 @@ mod tests {
     #[test]
     fn merge_requirements_leaves_unknown_mergeability_unresolved() {
         let p = pr(PrState::Open, false, None, Some("unknown"));
-        let req = merge_requirements(&p, None, &[], &agg(0, 0), 0);
+        let req = merge_requirements(&p, None, &[], &agg(0, 0), Some(0));
         assert_eq!(req.mergeable, None);
         assert!(!req.has_conflicts);
         assert!(!req.is_behind);
@@ -1857,6 +1870,38 @@ mod tests {
         let wire = serde_json::to_value(&req).unwrap();
         assert!(wire.get("mergeable").is_none());
         assert!(wire.get("mergeBlockedReason").is_none());
+    }
+
+    #[test]
+    fn unknown_unresolved_thread_count_is_omitted_on_the_wire() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let req = merge_requirements(&p, None, &[], &agg(0, 0), None);
+        assert_eq!(req.threads.unresolved, None);
+        let wire = serde_json::to_value(&req).unwrap();
+        // Presence-detected: the key is omitted, never `null`.
+        assert!(wire["threads"].get("unresolved").is_none());
+        assert!(wire["threads"].get("resolutionRequired").is_none());
+        let back: MergeRequirements = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, req);
+
+        // A known count still serializes as before, and a pre-existing
+        // persisted snapshot without the key deserializes as unknown.
+        let known = merge_requirements(&p, None, &[], &agg(0, 0), Some(2));
+        let wire = serde_json::to_value(&known).unwrap();
+        assert_eq!(wire["threads"]["unresolved"], 2);
+        let present: MergeRequirementsThreads = serde_json::from_value(serde_json::json!({
+            "unresolved": 2,
+            "resolutionRequired": true
+        }))
+        .unwrap();
+        assert_eq!(present.unresolved, Some(2));
+        assert_eq!(present.resolution_required, Some(true));
+        let back: MergeRequirements = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.threads.unresolved, Some(2));
+        let legacy: MergeRequirementsThreads =
+            serde_json::from_value(serde_json::json!({ "resolutionRequired": true })).unwrap();
+        assert_eq!(legacy.unresolved, None);
+        assert_eq!(legacy.resolution_required, Some(true));
     }
 
     #[test]

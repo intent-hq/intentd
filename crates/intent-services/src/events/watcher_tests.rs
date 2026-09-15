@@ -967,10 +967,13 @@ async fn default_patterns_apply_without_gitignore_rule() {
 /// PR 903 review regression: a runtime `info/exclude` edit lands as a raw
 /// event whose path is prefiltered (it lives under `.git`), so nothing else
 /// forces a rebuild. The ingest fast-path must not consult a stale
-/// `has_whitelists` — a freshly added `!dist` negation has to rescue
-/// `dist/…` (an [`IGNORED_DIRS`] entry) on the very next event, and the
-/// exclude-path comparison must hold whether notify reports the canonical or
-/// the resolved form of the path.
+/// `has_whitelists` — a freshly added `!.augment/*` negation has to rescue
+/// `.augment/…` (a `SUBSCRIBER_OWNED_DIRS` entry) on the very next event, and
+/// the exclude-path comparison must hold whether notify reports the canonical
+/// or the resolved form of the path. A subscriber-owned dir rather than a
+/// `NOISE_DIRS` one because on Linux the shared hub holds no inotify
+/// descriptor under noise dirs (intent-hq/intent#5026): there is no raw
+/// event there for a negation to rescue.
 #[tokio::test]
 async fn runtime_info_exclude_negation_rescues_prefiltered_path() {
     let db = TempDb::new();
@@ -981,7 +984,7 @@ async fn runtime_info_exclude_negation_rescues_prefiltered_path() {
     let dir = TempDir::new("gi-excl-edit");
     git_init(&dir.path);
     std::fs::create_dir_all(dir.path.join(".git/info")).expect("mk info");
-    std::fs::create_dir_all(dir.path.join("dist")).expect("mk dist");
+    std::fs::create_dir_all(dir.path.join(".augment")).expect("mk .augment");
     let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
@@ -993,15 +996,15 @@ async fn runtime_info_exclude_negation_rescues_prefiltered_path() {
 
     // Edit info/exclude at runtime: the raw event for this path is the ONLY
     // dirty trigger — it is prefiltered, so a stale fast-path would skip the
-    // rebuild and keep dropping `dist/…` below.
-    std::fs::write(dir.path.join(".git/info/exclude"), "!dist\n").expect("write exclude");
+    // rebuild and keep dropping `.augment/…` below.
+    std::fs::write(dir.path.join(".git/info/exclude"), "!.augment/*\n").expect("write exclude");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    std::fs::write(dir.path.join("dist/bundle.js"), b"js").expect("write negated");
-    let ev = next_for(&mut sub, "dist/bundle.js", None, LIVENESS)
+    std::fs::write(dir.path.join(".augment/bundle.js"), b"js").expect("write negated");
+    let ev = next_for(&mut sub, ".augment/bundle.js", None, LIVENESS)
         .await
         .expect("runtime exclude negation must rescue the prefiltered path");
-    assert_eq!(ev.data["relativePath"], "dist/bundle.js");
+    assert_eq!(ev.data["relativePath"], ".augment/bundle.js");
 }
 
 #[tokio::test]
@@ -1017,10 +1020,12 @@ async fn user_negation_overrides_default_pattern() {
 
     let dir = TempDir::new("gi-override");
     git_init(&dir.path);
-    // `dist` is both a default pattern and an IGNORED_DIRS entry; a user
-    // negation must win over both.
-    std::fs::write(dir.path.join(".gitignore"), "!dist\n").expect("write .gitignore");
-    std::fs::create_dir_all(dir.path.join("dist")).expect("mk dist");
+    // `.augment/*` is a default pattern and `.augment` a SUBSCRIBER_OWNED_DIRS
+    // entry; a user negation must win over both. (Not a NOISE_DIRS entry: on
+    // Linux those hold no inotify descriptor, so no raw event reaches the
+    // matcher to be rescued — intent-hq/intent#5026.)
+    std::fs::write(dir.path.join(".gitignore"), "!.augment/*\n").expect("write .gitignore");
+    std::fs::create_dir_all(dir.path.join(".augment")).expect("mk .augment");
     let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
@@ -1030,11 +1035,11 @@ async fn user_negation_overrides_default_pattern() {
     watcher.wait_established(budget.remaining()).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    std::fs::write(dir.path.join("dist/bundle.js"), b"js").expect("write negated");
-    let ev = next_for(&mut sub, "dist/bundle.js", None, budget.remaining())
+    std::fs::write(dir.path.join(".augment/bundle.js"), b"js").expect("write negated");
+    let ev = next_for(&mut sub, ".augment/bundle.js", None, budget.remaining())
         .await
         .expect("negated default must emit");
-    assert_eq!(ev.data["relativePath"], "dist/bundle.js");
+    assert_eq!(ev.data["relativePath"], ".augment/bundle.js");
 }
 
 /// Setup and event waits drawn from one [`TestBudget`] spend a single

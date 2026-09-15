@@ -516,6 +516,72 @@ async fn get_review_threads_surfaces_graphql_errors() {
             .contains("Could not resolve to a Repository"),
         "error should carry the GraphQL message: {err}"
     );
+    assert!(
+        matches!(err, Error::Api(_)),
+        "a non-rate-limit GraphQL error stays a generic API error: {err:?}"
+    );
+}
+
+/// GitHub reports GraphQL quota exhaustion as an HTTP 200 envelope carrying a
+/// `RATE_LIMIT` error, not a 403/429 — the envelope must classify as
+/// [`Error::RateLimited`] so callers pause the same way they do for REST.
+fn rate_limit_envelope() -> Value {
+    json!({
+        "data": null,
+        "errors": [{ "type": "RATE_LIMIT", "message": "API rate limit already exceeded" }]
+    })
+}
+
+/// A `RATE_LIMIT` GraphQL envelope on the review-thread read surfaces as
+/// [`Error::RateLimited`] carrying GitHub's message.
+#[tokio::test]
+async fn get_review_threads_classifies_graphql_rate_limit() {
+    let mock = spawn_mock_graphql(rate_limit_envelope()).await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+        .expect("build github client");
+
+    let err = sc
+        .get_review_threads(
+            &RepoRef::new("intent-hq", "intentd"),
+            928,
+            PageParams::first(100),
+        )
+        .await
+        .expect_err("rate-limit envelope must fail");
+    assert!(
+        matches!(&err, Error::RateLimited(msg) if msg.contains("API rate limit already exceeded")),
+        "expected RateLimited carrying GitHub's message: {err:?}"
+    );
+}
+
+/// The merge-requirements probe must NOT mistake a `RATE_LIMIT` envelope for
+/// the merge-queue schema rejection: no degraded retry, the rate limit is a
+/// hard [`Error::RateLimited`] failure after exactly one request.
+#[tokio::test]
+async fn merge_requirements_classifies_graphql_rate_limit_without_retry() {
+    let requests = Arc::new(Mutex::new(0usize));
+    let seen = requests.clone();
+    let mock = spawn_mock_graphql_with(Arc::new(move |_: &str| {
+        *seen.lock().unwrap() += 1;
+        rate_limit_envelope().to_string()
+    }))
+    .await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+        .expect("build github client");
+
+    let err = sc
+        .merge_requirements(&RepoRef::new("intent-hq", "intentd"), 928)
+        .await
+        .expect_err("rate-limit envelope must fail the probe");
+    assert!(
+        matches!(&err, Error::RateLimited(msg) if msg.contains("API rate limit already exceeded")),
+        "expected RateLimited, got {err:?}"
+    );
+    assert_eq!(
+        *requests.lock().unwrap(),
+        1,
+        "a rate limit must not trigger the merge-queue schema fallback retry"
+    );
 }
 
 /// Schema tolerance for hosts that predate merge queues (older GHES): the

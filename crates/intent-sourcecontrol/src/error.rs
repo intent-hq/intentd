@@ -96,19 +96,41 @@ fn github_error_message(message: &str, errors: Option<&[serde_json::Value]>) -> 
     }
 }
 
+/// The rate-limit message carried by a GitHub GraphQL error envelope, if any.
+///
+/// GitHub answers a GraphQL quota exhaustion as HTTP **200** with `data: null`
+/// and `errors: [{ "type": "RATE_LIMIT", "message": "API rate limit already
+/// exceeded" }]` — no status code to classify on, so the message text is the
+/// discriminator, as it is for the REST 403 body. Returns the `errors[]`
+/// messages joined for the [`Error::RateLimited`] payload when any of them
+/// names the rate limit; `None` for every other GraphQL error (schema
+/// rejections, unresolvable repositories, ...), which stay [`Error::Api`].
+fn graphql_rate_limit_message(messages: &[&str]) -> Option<String> {
+    messages
+        .iter()
+        .any(|m| m.to_ascii_lowercase().contains("rate limit"))
+        .then(|| messages.join("; "))
+}
+
 impl From<octocrab::Error> for Error {
     fn from(err: octocrab::Error) -> Self {
         // octocrab's error enum is large and version-sensitive; categorize on
-        // the `GitHub` variant's HTTP status where present, otherwise fall back
-        // to a generic API error. (Status-precise mapping can be refined when
-        // the wire layer needs it.)
-        if let octocrab::Error::GitHub { source, .. } = &err {
-            return classify_github_status(
+        // the `GitHub` variant's HTTP status and the `Graphql` variant's
+        // error messages where present, otherwise fall back to a generic API
+        // error. (Status-precise mapping can be refined when the wire layer
+        // needs it.)
+        match &err {
+            octocrab::Error::GitHub { source, .. } => classify_github_status(
                 source.status_code.as_u16(),
                 github_error_message(&source.message, source.errors.as_deref()),
-            );
+            ),
+            octocrab::Error::Graphql { source, .. } => {
+                let messages: Vec<&str> = source.0.iter().map(|e| e.message.as_str()).collect();
+                graphql_rate_limit_message(&messages)
+                    .map_or_else(|| Error::Api(err.to_string()), Error::RateLimited)
+            }
+            _ => Error::Api(err.to_string()),
         }
-        Error::Api(err.to_string())
     }
 }
 
@@ -147,6 +169,42 @@ mod tests {
     fn classifies_429_as_rate_limited() {
         let err = classify_github_status(429, "too many requests".into());
         assert!(matches!(err, Error::RateLimited(_)));
+    }
+
+    #[test]
+    fn classifies_graphql_rate_limit_messages_as_rate_limited() {
+        // GitHub's GraphQL quota exhaustion wording (a `RATE_LIMIT` error on
+        // an HTTP 200 envelope) in both documented forms.
+        for msg in [
+            "API rate limit already exceeded",
+            "API rate limit exceeded for user ID 526899.",
+        ] {
+            assert_eq!(
+                graphql_rate_limit_message(&[msg]).as_deref(),
+                Some(msg),
+                "{msg}"
+            );
+        }
+        // Any rate-limit message among several marks the whole envelope.
+        assert_eq!(
+            graphql_rate_limit_message(&[
+                "Could not resolve to a Repository",
+                "API rate limit already exceeded",
+            ])
+            .as_deref(),
+            Some("Could not resolve to a Repository; API rate limit already exceeded")
+        );
+    }
+
+    #[test]
+    fn non_rate_limit_graphql_errors_stay_api_errors() {
+        for msgs in [
+            &["Could not resolve to a Repository"][..],
+            &["Field 'isInMergeQueue' doesn't exist on type 'PullRequest'"][..],
+            &[][..],
+        ] {
+            assert_eq!(graphql_rate_limit_message(msgs), None, "{msgs:?}");
+        }
     }
 
     #[test]

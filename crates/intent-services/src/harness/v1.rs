@@ -937,12 +937,13 @@ impl Harness for V1 {
             checks.push_str(" (required-check flags unavailable)");
         }
         lines.push(checks);
+        let count = match r.threads.unresolved {
+            Some(n) => n.to_string(),
+            None => "unknown (thread resolution state unreadable)".to_string(),
+        };
         let threads = match r.threads.resolution_required {
-            Some(true) => format!(
-                "unresolved threads: {} (resolution required to merge)",
-                r.threads.unresolved
-            ),
-            _ => format!("unresolved threads: {}", r.threads.unresolved),
+            Some(true) => format!("unresolved threads: {count} (resolution required to merge)"),
+            _ => format!("unresolved threads: {count}"),
         };
         lines.push(threads);
         if r.has_conflicts {
@@ -1040,16 +1041,26 @@ impl Harness for V1 {
                 new.review_comment_count
             ));
         }
-        if o.threads.unresolved != n.threads.unresolved {
-            let verb = if n.threads.unresolved < o.threads.unresolved {
-                "thread(s) resolved"
-            } else {
-                "thread(s) unresolved/opened"
-            };
-            changes.push(format!(
-                "{verb}: {} → {} unresolved",
-                o.threads.unresolved, n.threads.unresolved
-            ));
+        // A count delta is only meaningful when both sides are known; a
+        // readability transition is reported as such, never as a `n → 0` /
+        // `0 → n` delta.
+        match (o.threads.unresolved, n.threads.unresolved) {
+            (Some(before), Some(after)) if before != after => {
+                let verb = if after < before {
+                    "thread(s) resolved"
+                } else {
+                    "thread(s) unresolved/opened"
+                };
+                changes.push(format!("{verb}: {before} → {after} unresolved"));
+            }
+            (Some(_), None) => {
+                changes
+                    .push("review threads unreadable (resolution state unavailable)".to_string());
+            }
+            (None, Some(after)) => {
+                changes.push(format!("review threads readable again: {after} unresolved"));
+            }
+            _ => {}
         }
 
         changes.extend(diff_checks(old, new));

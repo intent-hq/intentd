@@ -65,11 +65,20 @@ const BURST_COOLDOWN: Duration = Duration::from_secs(1);
 /// Leftovers are picked up by the next `recv`/flush iteration.
 const DRAIN_MAX_PER_CALL: usize = 10_000;
 
-/// Directory names ignored at any depth, mirroring the `IGNORE_PATTERNS` of
-/// `unified-workspace-watcher.ts` plus the `.workspace-notes` additions of
-/// `tracking.config.ts`. A path is dropped if any component matches.
-const IGNORED_DIRS: &[&str] = &[
-    ".git",
+/// Directory names ignored at any depth (a path is dropped if any component
+/// matches), mirroring the `IGNORE_PATTERNS` of `unified-workspace-watcher.ts`
+/// plus the `.workspace-notes` additions of `tracking.config.ts`. Split in two
+/// because the shared hub treats them differently (intent-hq/intent#5026):
+///
+/// - [`NOISE_DIRS`]: third-party build / dependency / cache / foreign-VCS
+///   clutter that no hub subscriber ever wants. On Linux the hub prunes these
+///   subtrees from the OS watch itself, so they cost no inotify descriptors.
+/// - [`SUBSCRIBER_OWNED_DIRS`]: trees the daemon or a hub subscriber owns and
+///   filters on its own — the git metadata watcher reads `.git/HEAD|index|
+///   refs/**` and the project-tier skills/specialists watches read
+///   `.intent/**` / `.augment/**` through the recursive workspace-root watch.
+///   They stay watched; only the `file:*` stream drops them.
+pub(super) const NOISE_DIRS: &[&str] = &[
     "node_modules",
     "target",
     "dist",
@@ -95,12 +104,23 @@ const IGNORED_DIRS: &[&str] = &[
     "temp",
     ".tmp",
     ".temp",
+];
+
+/// See [`NOISE_DIRS`].
+pub(super) const SUBSCRIBER_OWNED_DIRS: &[&str] = &[
+    ".git",
     ".augment",
     ".intent",
     ".workspace-notes",
     ".workspace-notes.backup",
     ".workspace",
 ];
+
+/// Whether a directory `name` is filtered from the `file:*` stream at any
+/// depth: the union of [`NOISE_DIRS`] and [`SUBSCRIBER_OWNED_DIRS`].
+fn is_ignored_dir(name: &str) -> bool {
+    NOISE_DIRS.contains(&name) || SUBSCRIBER_OWNED_DIRS.contains(&name)
+}
 
 /// Default ignore patterns applied below every gitignore source, ported from
 /// the pre-port TS `GitignoreManager.DEFAULT_PATTERNS`. They hold even in
@@ -187,7 +207,7 @@ fn action_for(kind: EventKind) -> Option<Action> {
 /// True when `relative` lives under an ignored directory (component match).
 fn should_ignore(relative: &Path) -> bool {
     relative.components().any(|c| match c {
-        Component::Normal(name) => name.to_str().is_some_and(|n| IGNORED_DIRS.contains(&n)),
+        Component::Normal(name) => name.to_str().is_some_and(is_ignored_dir),
         _ => false,
     })
 }
@@ -198,7 +218,7 @@ enum IgnoreVerdict {
     /// Some gitignore source ignores the path — suppress the event.
     Ignore,
     /// A negation (`!pattern`) explicitly re-includes the path; also rescues
-    /// paths the [`IGNORED_DIRS`] prefilter would drop.
+    /// paths the [`is_ignored_dir`] prefilter would drop.
     Whitelist,
     /// No gitignore source matched.
     None,
@@ -268,7 +288,7 @@ fn resolve_exclude_file(git_dir: &Path) -> PathBuf {
 struct GitignoreMatcher {
     root: PathBuf,
     /// Resolved `<gitdir>/info/exclude` (worktree-aware), watched for edits.
-    /// Detected on the absolute path before the [`IGNORED_DIRS`] prefilter,
+    /// Detected on the absolute path before the [`is_ignored_dir`] prefilter,
     /// which would otherwise drop everything under `.git`. Both the resolved
     /// and canonicalized forms are kept (deduped): `notify` may report either
     /// shape (symlinked roots, `..` segments from a worktree `commondir`), so
@@ -282,7 +302,7 @@ struct GitignoreMatcher {
     defaults: Option<Gitignore>,
     /// Whether any source carries a `!` negation. When false, nothing can
     /// rescue a prefiltered path, so ingest skips the match entirely for
-    /// [`IGNORED_DIRS`] paths (the fast path).
+    /// [`is_ignored_dir`] paths (the fast path).
     has_whitelists: bool,
     dirty: bool,
 }
@@ -307,7 +327,7 @@ impl GitignoreMatcher {
     /// a `.gitignore` at any depth or the repo's `info/exclude`. Rebuilding is
     /// deferred to the next [`Self::verdict`] call.
     ///
-    /// `.gitignore` files under [`IGNORED_DIRS`] (e.g. `target/.gitignore`
+    /// `.gitignore` files under [`is_ignored_dir`] dirs (e.g. `target/.gitignore`
     /// written by cargo, or files shipped inside `vendor/`) are skipped by the
     /// discovery walk in [`Self::rebuild`], so a rebuild for them would be a
     /// no-op — don't mark dirty for those (checked via `rel`, the
@@ -337,7 +357,7 @@ impl GitignoreMatcher {
 
     /// Whether any source carries a `!` negation. Rebuilds first when the
     /// matcher is dirty so the ingest fast-path never consults a stale
-    /// answer: a stale `false` would let the [`IGNORED_DIRS`] prefilter drop
+    /// answer: a stale `false` would let the [`is_ignored_dir`] prefilter drop
     /// a path that a freshly added negation rescues.
     fn has_whitelists(&mut self) -> bool {
         if self.dirty {
@@ -387,7 +407,7 @@ impl GitignoreMatcher {
 
     /// (Re)load every source. Runs at watcher start and after ignore-rule
     /// edits; the `.gitignore` discovery walk is itself gitignore-aware and
-    /// skips [`IGNORED_DIRS`], so it stays cheap even on large trees.
+    /// skips [`is_ignored_dir`] dirs, so it stays cheap even on large trees.
     fn rebuild(&mut self) {
         self.dirty = false;
         self.gitignores.clear();
@@ -404,7 +424,7 @@ impl GitignoreMatcher {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "failed to build default ignore matcher; only IGNORED_DIRS filtering applies"
+                    "failed to build default ignore matcher; only ignored-dir filtering applies"
                 );
                 None
             }
@@ -455,10 +475,7 @@ impl GitignoreMatcher {
                 .git_exclude(false)
                 .filter_entry(|entry| {
                     !entry.file_type().is_some_and(|t| t.is_dir())
-                        || !entry
-                            .file_name()
-                            .to_str()
-                            .is_some_and(|n| IGNORED_DIRS.contains(&n))
+                        || !entry.file_name().to_str().is_some_and(is_ignored_dir)
                 })
                 .build();
             for entry in walker.flatten() {
@@ -645,7 +662,7 @@ fn ingest(
     let deadline = tokio::time::Instant::now() + DEBOUNCE;
     for abs in &event.paths {
         // Observe ignore-rule edits before any filtering: info/exclude lives
-        // under `.git`, which the IGNORED_DIRS prefilter drops.
+        // under `.git`, which the ignored-dir prefilter drops.
         let rel = relative_path(root, abs);
         matcher.note_raw_change(abs, rel.as_deref());
         let Some(rel) = rel else {
