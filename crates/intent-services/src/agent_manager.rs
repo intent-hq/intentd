@@ -2207,6 +2207,8 @@ pub struct AgentManager {
     agent_config_root: Option<PathBuf>,
     /// Persistent Antigravity conversation profiles, never startup-swept.
     antigravity_state_root: Option<PathBuf>,
+    /// Persistent Codex homes and routing markers, never startup-swept.
+    codex_state_root: Option<PathBuf>,
     /// Dedicated, daemon-owned, empty spawn cwd for chief provider children
     /// (STAB-50). The composition root wires `<data_dir>/chief-cwd`; `None`
     /// (tests / bare wiring) falls back to the temp dir.
@@ -2404,6 +2406,7 @@ impl AgentManager {
             agent_log_root: None,
             agent_config_root: None,
             antigravity_state_root: None,
+            codex_state_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
             reap_claims: Arc::new(Mutex::new(HashSet::new())),
@@ -2491,6 +2494,32 @@ impl AgentManager {
     pub fn with_antigravity_state_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.antigravity_state_root = Some(root.into());
         self
+    }
+
+    /// Set the private persistent root for Intent-created Codex sessions.
+    /// Isolation currently requires Unix symlinks. Other platforms retain
+    /// their existing Codex home so unsupported linking cannot block launches.
+    #[must_use]
+    pub fn with_codex_state_root(mut self, root: impl Into<PathBuf>) -> Self {
+        if cfg!(unix) {
+            self.codex_state_root = Some(root.into());
+        }
+        self
+    }
+
+    /// Render the login remedy for the home actually selected for this agent.
+    pub(crate) fn provider_auth_message(&self, provider_id: &str, agent_id: &AgentId) -> String {
+        let message = crate::provider_auth::not_authenticated_message(provider_id);
+        if provider_id == "codex" {
+            if let Some(command) = self
+                .codex_state_root
+                .as_ref()
+                .and_then(|root| crate::codex_home::login_command(root, &agent_id.to_string()))
+            {
+                return message.replace("codex login", &command);
+            }
+        }
+        message
     }
 
     /// Set the dedicated spawn cwd for chief provider children (STAB-50).
@@ -2928,6 +2957,36 @@ impl AgentManager {
                     "Cannot configure unattended Antigravity launch: {err}"
                 ))
             })?);
+        }
+
+        if opts.provider.id == "codex" {
+            if let Some(root) = &self.codex_state_root {
+                let (_, last_provider) = self
+                    .services
+                    .store
+                    .get_agent_session_last_turn_model(&workspace_id, &agent_id)
+                    .await?;
+                let source = match opts.extra_env.get("CODEX_HOME") {
+                    Some(path) => std::path::absolute(path),
+                    None => crate::codex_home::user_home(),
+                };
+                let home = source
+                    .and_then(|source| {
+                        crate::codex_home::prepare(
+                            root,
+                            &source,
+                            &agent_id.to_string(),
+                            session.acp_session_id.is_some()
+                                && last_provider.as_deref().is_none_or(|p| p == "codex"),
+                        )
+                    })
+                    .map_err(|error| {
+                        Error::Internal(format!("Cannot prepare Intent Codex storage: {error}"))
+                    })?;
+                spawn_opts
+                    .extra_env
+                    .insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
+            }
         }
 
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
@@ -8185,6 +8244,18 @@ impl AgentManager {
                     // through the fast path. Fresh candidates are not committed
                     // until confirmation; a failed load keeps its prior ID.
                     self.kill_child_only(agent_id).await;
+                }
+                if resolved.provider.id == "codex" {
+                    if let Error::InvalidParams(message) = &error {
+                        if message
+                            .contains(&crate::provider_auth::not_authenticated_message("codex"))
+                        {
+                            return Err(Error::InvalidParams(message.replace(
+                                &crate::provider_auth::not_authenticated_message("codex"),
+                                &self.provider_auth_message("codex", agent_id),
+                            )));
+                        }
+                    }
                 }
                 return Err(error);
             }

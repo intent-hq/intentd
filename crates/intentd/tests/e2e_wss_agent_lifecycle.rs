@@ -347,6 +347,159 @@ fn gate(test: &str) -> Option<String> {
 
 const MARKER: &str = "MCP_TOOL_MARKER_wss_e2e";
 
+#[tokio::test]
+async fn codex_storage_is_isolated_and_reused_after_daemon_restart_over_wss() {
+    check_codex_storage_over_wss(false).await;
+}
+
+#[tokio::test]
+async fn codex_prompt_auth_remedy_uses_isolated_home_over_wss() {
+    check_codex_storage_over_wss(true).await;
+}
+
+async fn check_codex_storage_over_wss(auth_failure: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(script) = gate("Codex storage isolation") else {
+        return;
+    };
+    let data = temp_data_dir();
+    let source = data.path().join("user-codex");
+    // Exercise first-time setup with no pre-existing Codex home or login.
+    assert!(!source.exists());
+    let homes = data.path().join("homes.jsonl");
+    let lifecycle = data.path().join("sessions.jsonl");
+    let wrapper = data.path().join("codex-acp.mjs");
+    std::fs::write(&wrapper, format!(
+        "#!/usr/bin/env node\nimport fs from 'node:fs';\nfs.appendFileSync({}, JSON.stringify(process.env.CODEX_HOME) + '\\n');\nawait import({});\n",
+        json!(homes), json!(script),
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        data.path().join("config.toml"),
+        format!("[providers.paths]\ncodex = {}\n", json!(wrapper)),
+    )
+    .unwrap();
+    let source_str = source.to_string_lossy().into_owned();
+    let lifecycle_str = lifecycle.to_string_lossy().into_owned();
+    let behavior = if auth_failure {
+        "{\"advertiseLoadSession\":true,\"promptRpcError\":{\"code\":401,\"message\":\"Unauthorized\"}}"
+    } else {
+        "{\"advertiseLoadSession\":true,\"response\":\"isolated turn completed\"}"
+    };
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("CODEX_HOME", source_str.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior),
+        ("MOCK_AGENT_SESSION_LOG", lifecycle_str.as_str()),
+    ];
+    let (workspace, _) = seed_workspace_and_note(data.path()).await;
+    let mut daemon = Daemon {
+        child: spawn_serve(data.path(), "both", &env),
+    };
+    let socket = data.path().join("intentd.sock");
+    let mut agent = String::new();
+    for turn in 0..2 {
+        assert!(await_uds(&socket).await);
+        let status = common::await_wss_status(&socket).await;
+        let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+        let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+        let mut sub = connect_ws(port, cfg.clone()).await;
+        wss_rpc(
+            &mut sub,
+            1,
+            "events.subscribe",
+            json!({"eventTypes": if auth_failure { vec!["agent:failed"] } else { vec!["agent:stream:end"] },"workspaceId":workspace}),
+        )
+        .await;
+        let mut rpc = connect_ws(port, cfg).await;
+        if turn == 0 {
+            let result = wss_rpc(&mut rpc, 2, "agent.create", json!({"workspaceId":workspace,"name":"Isolated Codex","provider":"codex","model":"default"})).await;
+            agent = result["agent"]["id"].as_str().unwrap().to_string();
+        }
+        let result = wss_rpc(
+            &mut rpc,
+            3,
+            "agent.sendMessage",
+            json!({"workspaceId":workspace,"agentId":agent,"content":"test isolation"}),
+        )
+        .await;
+        assert_eq!(result["success"], true);
+        let end = wss_event(&mut sub, 30).await;
+        assert_eq!(
+            end["params"]["event"]["type"],
+            if auth_failure {
+                "agent:failed"
+            } else {
+                "agent:stream:end"
+            }
+        );
+        let conversation = wss_rpc(
+            &mut rpc,
+            4,
+            "agent.getConversation",
+            json!({"workspaceId":workspace,"agentId":agent}),
+        )
+        .await;
+        if auth_failure {
+            let home: PathBuf = serde_json::from_str(
+                std::fs::read_to_string(&homes)
+                    .unwrap()
+                    .lines()
+                    .last()
+                    .unwrap(),
+            )
+            .unwrap();
+            let remedy = format!("CODEX_HOME='{}' codex login", home.display());
+            assert!(end.to_string().contains(&remedy), "{end}");
+            std::fs::write(home.join("auth.json"), "test-login").unwrap();
+            assert_eq!(
+                std::fs::read_to_string(source.join("auth.json")).unwrap(),
+                "test-login"
+            );
+            let created = wss_rpc(&mut rpc, 5, "agent.create", json!({"workspaceId":workspace,"name":"After auth failure","provider":"codex","model":"default"})).await;
+            assert!(created["agent"]["id"].is_string(), "{created}");
+        } else {
+            assert!(
+                conversation.to_string().contains("isolated turn completed"),
+                "{conversation}"
+            );
+        }
+        if turn == 0 {
+            // Drop connections before restarting; kill the child process group
+            // as well so this really tests a fresh ACP process and native load.
+            drop(rpc);
+            drop(sub);
+            drop(daemon);
+            daemon = Daemon {
+                child: spawn_serve(data.path(), "both", &env),
+            };
+        }
+    }
+    let observed: Vec<PathBuf> = std::fs::read_to_string(homes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(observed.len() >= 2, "must respawn the adapter");
+    assert!(observed.iter().all(|home| home == &observed[0]));
+    assert!(observed[0].starts_with(data.path().join("codex/homes")));
+    assert_eq!(
+        std::fs::read_link(observed[0].join("auth.json")).unwrap(),
+        source.join("auth.json")
+    );
+    assert!(!source.join("sessions").exists());
+    let calls: Vec<Value> = std::fs::read_to_string(lifecycle)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        calls.iter().any(|call| call["method"] == "session/load"),
+        "{calls:?}"
+    );
+}
+
 /// Full agent lifecycle over WSS (steps 1–9 of the task note): events.subscribe
 /// + client.hello → agent.create → agent.sendMessage → the mock agent calls
 /// `ws.note.saveAsset` and `ws.note.add` through MCP → note.readAsset proves the

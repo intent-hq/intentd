@@ -1774,6 +1774,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log`.
         .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir))
         .with_antigravity_state_root(config.data_dir.join("antigravity"))
+        .with_codex_state_root(config.data_dir.join("codex"))
         // Per-agent generated config files (`--mcp-config`, `--rules`,
         // pi-extension delivery) are written under the daemon-owned
         // `<data_dir>/agent-configs` instead of the global OS temp dir

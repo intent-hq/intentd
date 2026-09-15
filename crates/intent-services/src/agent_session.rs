@@ -3474,7 +3474,10 @@ impl Services {
                         crate::provider_auth::demote_auth_verdict(&provider_id);
                         format!(
                             "session/prompt: {}",
-                            crate::provider_auth::not_authenticated_message(&provider_id)
+                            self.agent_manager().map_or_else(
+                                || crate::provider_auth::not_authenticated_message(&provider_id),
+                                |manager| manager.provider_auth_message(&provider_id, agent_id),
+                            )
                         )
                     }),
                     Err(e) => {
