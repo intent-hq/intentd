@@ -4461,14 +4461,20 @@ impl PresenceClient {
             .flatten()
     }
 
-    /// Round-trip one request; pushes and events arriving first are skipped.
-    async fn call(&mut self, id: u64, method: &str, params: Value) -> Value {
+    /// Send one request without waiting for its reply (pipelining); pair
+    /// with [`Self::reply`].
+    async fn send(&mut self, id: u64, method: &str, params: Value) {
         let frame =
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         self.tx
             .send(Message::Text(frame.to_string().into()))
             .await
             .expect("send");
+    }
+
+    /// The reply to request `id`; pushes and events arriving first are
+    /// skipped.
+    async fn reply(&mut self, id: u64, method: &str) -> Value {
         loop {
             let v = self
                 .next_within(Duration::from_secs(10))
@@ -4479,6 +4485,12 @@ impl PresenceClient {
             }
             self.skipped.push(v);
         }
+    }
+
+    /// Round-trip one request; pushes and events arriving first are skipped.
+    async fn call(&mut self, id: u64, method: &str, params: Value) -> Value {
+        self.send(id, method, params).await;
+        self.reply(id, method).await
     }
 
     /// The params of the next `subscription.push` on `sub` (other frames are
@@ -4821,15 +4833,32 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(v["error"]["data"]["code"], "not-found", "{v}");
 
     // Unsubscribe → `left`; resubscribe → `joined`; clean close → `left`
-    // again and Bob goes offline.
-    let v = bob_c
-        .call(
+    // again and Bob goes offline. The unsubscribe releases the lease with
+    // the service layer BEFORE it is acknowledged, so a caret pipelined right
+    // behind it (no round-trip in between) is already lease-less: refused,
+    // and Alice sees `left` with no trailing `updated`.
+    bob_c
+        .send(
             4,
             "note.presence.unsubscribe",
             json!({ "subscriptionId": sub_b }),
         )
         .await;
+    bob_c
+        .send(
+            40,
+            "note.presence.update",
+            json!({ "workspaceId": ws, "noteId": "spec", "rev": 4, "anchor": 1, "head": 1 }),
+        )
+        .await;
+    let v = bob_c.reply(4, "note.presence.unsubscribe").await;
     assert_eq!(v["result"], json!({ "success": true }), "{v}");
+    let v = bob_c.reply(40, "note.presence.update").await;
+    assert_eq!(
+        v["error"]["code"], -32602,
+        "pipelined caret after unsubscribe: {v}"
+    );
+    assert_eq!(v["error"]["data"]["code"], "invalid-params", "{v}");
     let p = alice_c.push(&sub_a).await;
     assert_eq!(p["seq"], 4, "{p}");
     assert_eq!(p["delta"]["kind"], "left", "{p}");
