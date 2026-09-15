@@ -16,15 +16,17 @@
 //! activated in ITS OWN session workspace — the `AgentSession.workspace_id`
 //! it was created in — never in the workspace the activating caller happens
 //! to be scoped to. Every delivery front door that can start a turn
-//! (`send_message`, `interrupt_send_message`, `send_queued_message_now`)
-//! rebinds the caller-supplied workspace to the session's via
-//! [`AgentManager::session_workspace`] BEFORE any scope-sensitive step (the
-//! archived gate, the `try_begin` claim, event echoes, and the spawn:
-//! `ensure_started` → `resolve_spawn` cwd + `create_agent` workspace-MCP
-//! scope). A cross-workspace `ws.agent.send` / `ws.agent.sendToTask` arrives
-//! keyed on the SENDER's bridge workspace; without the rebind the woken
-//! child would run in the sender's checkout with a `workspace_api` bridge
-//! scoped to the sender's workspace.
+//! (`send_message`, `interrupt_send_message`, `send_queued_message_now`, and
+//! `Services::deliver_wake_message` — the `agent.wakeOrCreate` / hook /
+//! PR-monitor wake path, intent-hq/intent#5046) rebinds the caller-supplied
+//! workspace to the session's via [`AgentManager::session_workspace`] BEFORE
+//! any scope-sensitive step (the archived gate, the `try_begin` claim, event
+//! echoes, and the spawn: `ensure_started` → `resolve_spawn` cwd +
+//! `create_agent` workspace-MCP scope). A cross-workspace `ws.agent.send` /
+//! `ws.agent.sendToTask` / `ws.agent.wakeOrCreate` arrives keyed on the
+//! SENDER's bridge workspace; without the rebind the woken child would run
+//! in the sender's checkout with a `workspace_api` bridge scoped to the
+//! sender's workspace.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -5787,8 +5789,10 @@ impl AgentManager {
     /// scoped to the sender's workspace, claim the in-flight slot under the
     /// wrong workspace activity, and publish the turn's events into the
     /// wrong workspace. A mismatch is logged (it names the caller-side scope
-    /// leak) and the session's workspace wins.
-    fn session_workspace(
+    /// leak) and the session's workspace wins. Shared with
+    /// `Services::deliver_wake_message` (intent-hq/intent#5046), whose
+    /// `agent.wakeOrCreate` callers pass the waking caller's workspace.
+    pub(crate) fn session_workspace(
         agent_id: &AgentId,
         requested: &WorkspaceId,
         session: &AgentSession,

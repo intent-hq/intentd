@@ -12922,16 +12922,18 @@ fn mock_agent_script() -> String {
         .to_string()
 }
 
-/// Which `AgentManager` front door a cross-workspace activation takes:
+/// Which delivery front door a cross-workspace activation takes:
 /// `ws.agent.send({ priority: "queue" })` lands on `send_message`; the
 /// default (omitted / `interrupt`) lands on `interrupt_send_message`; a
 /// caller-scoped `agent.sendQueuedMessageNow` lands on
-/// `send_queued_message_now`.
+/// `send_queued_message_now`; `ws.agent.wakeOrCreate` lands on
+/// `agent_wake_or_create_op` → `deliver_wake_message`.
 #[derive(Clone, Copy, Debug)]
 enum SendRoute {
     Queue,
     Interrupt,
     QueuedNow,
+    WakeOrCreate,
 }
 
 /// Captures the `agent_manager` tracing events (fields rendered as
@@ -13051,9 +13053,11 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute
         WorkspaceId::from("ws-5017-home"),
         WorkspaceId::from("ws-5017-sender"),
     );
+    // `agent-{uuid}` shaped so the wake route's `assign_agent` accepts the
+    // target; the send routes do not care.
     let (target, sender) = (
-        AgentId::from("a-5017-target"),
-        AgentId::from("a-5017-sender"),
+        AgentId::from("agent-00005017-0000-4000-8000-000000000001"),
+        AgentId::from("agent-00005017-0000-4000-8000-000000000002"),
     );
     seed_agent(&mgr, &home_ws, &target).await;
     seed_agent(&mgr, &sender_ws, &sender).await;
@@ -13113,10 +13117,80 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute
             mgr.send_queued_message_now(target.clone(), sender_ws.clone(), message_id)
                 .await
         }
+        SendRoute::WakeOrCreate => {
+            // The target is assigned to a task in the SENDER's workspace and
+            // woken by the sender via `agent.wakeOrCreate`, whose delivery is
+            // keyed on the sender's (task-owning) workspace, not the target's
+            // home. `check_watch_scope` admits the pair. The route enters
+            // through `Services::deliver_wake_message`, which drives a real
+            // turn only with the manager attached (else it takes the
+            // store-only persist and no child ever spawns); attached here
+            // only, since an attached manager's queue kick would consume the
+            // `QueuedNow` route's parked entry before its "send now".
+            mgr.services.attach_agent_manager(&mgr);
+            let note = mgr
+                .services
+                .create_note(
+                    sender_ws.clone(),
+                    intent_core::NoteCreate {
+                        title: "cross-workspace wake".into(),
+                        content: Some("body".into()),
+                        tags: None,
+                        parent_id: None,
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .expect("create task note")
+                .note;
+            WorkspaceApi::mark_as_task(
+                &mgr.services,
+                sender_ws.clone(),
+                note.id.clone(),
+                "not_started".into(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mark as task");
+            mgr.services
+                .assign_agent(sender_ws.clone(), note.id.clone(), target.0.clone(), None)
+                .await
+                .expect("assign the home-workspace target to the sender's task");
+            mgr.services
+                .agent_wake_or_create_op(
+                    sender_ws.clone(),
+                    note.id,
+                    "wake up".to_string(),
+                    intent_core::AgentWakeOrCreateInput {
+                        caller_agent_id: Some(sender.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+        }
     }
     .expect("cross-workspace send is accepted");
+    // `agent.wakeOrCreate` nests the delivery result under `result` and
+    // names the branch in `action`; the send routes return the delivery
+    // result directly.
+    let delivery = match route {
+        SendRoute::WakeOrCreate => {
+            assert_eq!(
+                result["action"],
+                json!("woke_existing"),
+                "the cold target is woken, not recreated: {result}"
+            );
+            &result["result"]
+        }
+        _ => &result,
+    };
     assert_eq!(
-        result["queued"],
+        delivery["queued"],
         json!(false),
         "direct turn via {route:?}: {result}"
     );
@@ -13243,6 +13317,20 @@ async fn cross_workspace_interrupt_send_binds_woken_agent_to_its_session_workspa
 #[tokio::test]
 async fn cross_workspace_send_queued_now_binds_woken_agent_to_its_session_workspace() {
     assert_cross_workspace_send_binds_to_session_workspace(SendRoute::QueuedNow).await;
+}
+
+/// Regression (intent-hq/intent#5046), wake route: `agent.wakeOrCreate`
+/// hands `deliver_wake_message` the waking CALLER's workspace (the one that
+/// owns the task note), and `check_watch_scope` lets that differ from the
+/// target's home — a sibling caller waking a chief-homed assignee. Pre-fix
+/// the caller's id flowed straight into the archived gate / `try_begin` /
+/// `finish_prepersisted_turn_spawn` / `ensure_started` / `create_agent`, so
+/// the woken agent ran in the caller's checkout with a `workspace_api`
+/// bridge scoped to the caller's workspace. Same binding contract as the
+/// three `ws.agent.send` routes above.
+#[tokio::test]
+async fn cross_workspace_wake_or_create_binds_woken_agent_to_its_session_workspace() {
+    assert_cross_workspace_send_binds_to_session_workspace(SendRoute::WakeOrCreate).await;
 }
 
 /// Regression (intent-hq/intent#5017 × intent-hq/monorepo#2732): the

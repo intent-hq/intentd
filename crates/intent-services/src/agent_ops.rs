@@ -12242,6 +12242,11 @@ impl Services {
             // Failed migrations stay assigned (and out of the response's
             // `cleanedUpAgentIds`) so the next wakeOrCreate retries them.
             cleaned_up.retain(|id| !failed.contains(id));
+            // `deliver_wake_message` rebinds to the target's session
+            // workspace itself (intent-hq/intent#5046); the explicit drain
+            // kick below keys on the same home so the drained turn spawns
+            // where the wake did, never under the caller's workspace.
+            let target_home_ws = session.workspace_id.clone();
             let result = self
                 .deliver_wake_message(
                     &workspace_id,
@@ -12267,7 +12272,7 @@ impl Services {
                     tokio::spawn({
                         let mgr = mgr.clone();
                         let agent_id = agent_id.clone();
-                        let workspace_id = workspace_id.clone();
+                        let workspace_id = target_home_ws;
                         async move {
                             mgr.try_drain_queue(agent_id, workspace_id).await;
                         }
@@ -12773,16 +12778,42 @@ impl Services {
         // without it a wake racing an `agent.delete` parks a phantom entry no
         // drain can ever deliver. The append-failure arms keep their own
         // NotFound re-check as the check-then-act race guard.
-        if matches!(
-            self.store.get_agent_session_status(agent_id).await,
-            Err(Error::NotFound(_))
-        ) {
-            self.drop_queue(agent_id);
-            return Err(Error::InvalidParams(format!(
-                "unknown agent id: {}",
-                agent_id.0
-            )));
-        }
+        //
+        // The same session read binds the delivery to the target's OWN
+        // session workspace (intent-hq/intent#5046, the wake-path residual
+        // of intent-hq/intent#5017): `agent.wakeOrCreate` passes the waking
+        // CALLER's workspace, which `check_watch_scope` lets differ from the
+        // target's home (a sibling caller waking a chief-homed agent), and
+        // every scope-sensitive step below — the archived gate, the
+        // `try_begin` claim, the event echo, the drain kicks, and the spawn
+        // (`ensure_started` → `resolve_spawn` cwd + `create_agent`
+        // workspace-MCP scope) — must key on the workspace the target lives
+        // in. Fail open on a non-NotFound lookup error: the requested
+        // workspace stands, matching the archived/retired gates below.
+        let workspace_id = match self.store.get_agent_session(agent_id).await {
+            Ok(session) => crate::agent_manager::AgentManager::session_workspace(
+                agent_id,
+                workspace_id,
+                &session,
+            ),
+            Err(Error::NotFound(_)) => {
+                self.drop_queue(agent_id);
+                return Err(Error::InvalidParams(format!(
+                    "unknown agent id: {}",
+                    agent_id.0
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.as_str(),
+                    error = %e,
+                    "wake delivery: session lookup failed; binding to the requested workspace"
+                );
+                workspace_id.clone()
+            }
+        };
+        let workspace_id = &workspace_id;
         // A2A sender header (intent-hq/intent#3721, monorepo#1015): the wake front door — the
         // `agent.wakeOrCreate` context message carries the daemon-stamped
         // attribution, and this path persists/enqueues directly (it never
