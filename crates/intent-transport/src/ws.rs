@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -82,8 +82,9 @@ const REVOKE_FLUSH_GRACE: Duration = Duration::from_secs(5);
 /// Caps on WSS connections held by guests — connections admitted on a
 /// per-principal credential (`sharing.maxGuestConnections` /
 /// `sharing.maxConnectionsPerGuest`; `0` = unlimited). The primary
-/// credential (the legacy bearer token) is never counted. Sized at listener
-/// construction, so a settings change applies on daemon restart.
+/// credential (the legacy bearer token) is never counted. Read live through
+/// [`SharedGuestLimits`] on every admission, so a settings change applies to
+/// the next upgrade without a listener restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestConnectionLimits {
     /// Listener-wide cap on concurrent guest connections.
@@ -99,6 +100,92 @@ impl Default for GuestConnectionLimits {
             max_connections_per_guest:
                 intent_core::config::DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST,
         }
+    }
+}
+
+/// The live [`GuestConnectionLimits`] cell shared by every listener of one
+/// daemon. The composition root builds it ONCE (like [`RpcLimiter`]) and
+/// hands the same handle to each listener the runtime toggle builds, so a
+/// toggle never resurrects boot-time values. [`GuestRegistry::admit`] reads
+/// it on every call; [`set`](Self::set) applies to new admissions only —
+/// seats already held are never revoked, so lowering a cap below the current
+/// count refuses the next upgrade until connections drain below it.
+#[derive(Debug, Clone)]
+pub struct SharedGuestLimits(Arc<RwLock<GuestConnectionLimits>>);
+
+impl SharedGuestLimits {
+    /// A live cell starting at `limits`.
+    #[must_use]
+    pub fn new(limits: GuestConnectionLimits) -> Self {
+        Self(Arc::new(RwLock::new(limits)))
+    }
+
+    /// The limits in effect for the next admission.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cell's lock is poisoned (a prior panic while holding it).
+    #[must_use]
+    pub fn get(&self) -> GuestConnectionLimits {
+        *self.0.read().expect("guest limits poisoned")
+    }
+
+    /// Replace the live limits for every listener sharing this cell.
+    /// Affects new admissions only.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cell's lock is poisoned (a prior panic while holding it).
+    pub fn set(&self, limits: GuestConnectionLimits) {
+        *self.0.write().expect("guest limits poisoned") = limits;
+    }
+
+    /// Follow `sharing.maxGuestConnections` / `sharing.maxConnectionsPerGuest`
+    /// in `registry` for as long as the returned task runs: every registry
+    /// change notification (`settings.update` and config.toml live-reload
+    /// alike) re-reads the effective values and stores them when they differ,
+    /// so a coalesced notification burst can never skip a change. The task
+    /// ends when the registry is dropped.
+    pub fn follow(
+        &self,
+        registry: Arc<intent_services::SettingsRegistry>,
+    ) -> tokio::task::JoinHandle<()> {
+        let limits = self.clone();
+        let mut rx = registry.subscribe();
+        intent_core::spawn_daemon(async move {
+            while rx.changed().await.is_ok() {
+                let sharing = &registry.snapshot().effective.sharing;
+                let next = GuestConnectionLimits {
+                    max_guest_connections: sharing.max_guest_connections,
+                    max_connections_per_guest: sharing.max_connections_per_guest,
+                };
+                let previous = limits.get();
+                if previous == next {
+                    continue;
+                }
+                limits.set(next);
+                tracing::info!(
+                    max_guest_connections = next.max_guest_connections,
+                    max_connections_per_guest = next.max_connections_per_guest,
+                    previous_max_guest_connections = previous.max_guest_connections,
+                    previous_max_connections_per_guest = previous.max_connections_per_guest,
+                    "guest connection caps updated; applies to new admissions only \
+                     (0 = unlimited)"
+                );
+            }
+        })
+    }
+}
+
+impl Default for SharedGuestLimits {
+    fn default() -> Self {
+        Self::new(GuestConnectionLimits::default())
+    }
+}
+
+impl From<GuestConnectionLimits> for SharedGuestLimits {
+    fn from(limits: GuestConnectionLimits) -> Self {
+        Self::new(limits)
     }
 }
 
@@ -118,12 +205,12 @@ struct GuestCounts {
 /// unwind, and when the heartbeat reaper aborts the task.
 #[derive(Debug)]
 pub(crate) struct GuestRegistry {
-    limits: GuestConnectionLimits,
+    limits: SharedGuestLimits,
     counts: Mutex<GuestCounts>,
 }
 
 impl GuestRegistry {
-    pub(crate) fn new(limits: GuestConnectionLimits) -> Arc<Self> {
+    pub(crate) fn new(limits: SharedGuestLimits) -> Arc<Self> {
         Arc::new(Self {
             limits,
             counts: Mutex::new(GuestCounts::default()),
@@ -132,14 +219,16 @@ impl GuestRegistry {
 
     /// Take a listener-wide seat and a per-principal seat for `principal`,
     /// or `None` when either cap is spent (`0` = unlimited for that cap).
+    /// The caps are read live from the shared cell under the counts lock,
+    /// so a change applies to the very next call.
     pub(crate) fn admit(
         self: &Arc<Self>,
         principal: &intent_core::PrincipalId,
     ) -> Option<GuestAdmission> {
         let mut counts = self.counts.lock().expect("guest counts poisoned");
-        let listener_cap = usize::try_from(self.limits.max_guest_connections).unwrap_or(usize::MAX);
-        let per_guest_cap =
-            usize::try_from(self.limits.max_connections_per_guest).unwrap_or(usize::MAX);
+        let limits = self.limits.get();
+        let listener_cap = usize::try_from(limits.max_guest_connections).unwrap_or(usize::MAX);
+        let per_guest_cap = usize::try_from(limits.max_connections_per_guest).unwrap_or(usize::MAX);
         if listener_cap != 0 && counts.total >= listener_cap {
             return None;
         }
@@ -219,7 +308,10 @@ pub struct WsOptions {
     pub tunnel_limits: crate::tunnel::TunnelLimits,
     /// Guest (per-principal credential) connection caps
     /// (`sharing.maxGuestConnections` / `sharing.maxConnectionsPerGuest`).
-    pub guest_limits: GuestConnectionLimits,
+    /// The composition root builds ONE live cell and hands the same handle
+    /// to every listener, so a settings change reaches them all at once and
+    /// a runtime listener toggle keeps the current values.
+    pub guest_limits: SharedGuestLimits,
     /// Test-only seam: when set, a closing connection's loop parks after it
     /// has left the reverse registry and before the rest of its cleanup runs,
     /// until the watched value becomes `true`. Lets a test hold that window
@@ -246,7 +338,7 @@ impl Default for WsOptions {
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
             rpc_limiter: RpcLimiter::unlimited(),
             tunnel_limits: crate::tunnel::TunnelLimits::default(),
-            guest_limits: GuestConnectionLimits::default(),
+            guest_limits: SharedGuestLimits::default(),
             cleanup_gate: None,
             heartbeat_gate: None,
         }
@@ -1405,14 +1497,80 @@ pub(crate) fn mono_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{mono_ms, negotiate_extensions, GuestConnectionLimits, GuestRegistry};
+    use super::{
+        mono_ms, negotiate_extensions, GuestConnectionLimits, GuestRegistry, SharedGuestLimits,
+    };
     use intent_core::PrincipalId;
 
-    fn limits(listener: u32, per_guest: u32) -> GuestConnectionLimits {
+    fn caps(listener: u32, per_guest: u32) -> GuestConnectionLimits {
         GuestConnectionLimits {
             max_guest_connections: listener,
             max_connections_per_guest: per_guest,
         }
+    }
+
+    fn limits(listener: u32, per_guest: u32) -> SharedGuestLimits {
+        SharedGuestLimits::new(caps(listener, per_guest))
+    }
+
+    /// A live limits change applies to the next `admit` without touching
+    /// held seats: lowering the listener-wide cap below the current count
+    /// refuses the next guest (and releases nothing); raising it admits
+    /// again. Held per-principal counts are compared against the NEW
+    /// per-guest cap on the next admit.
+    #[test]
+    fn guest_registry_reads_live_limits_on_every_admit() {
+        let live = limits(3, 0);
+        let registry = GuestRegistry::new(live.clone());
+        let (a, b) = (PrincipalId::new(), PrincipalId::new());
+        let a1 = registry.admit(&a).expect("a's first seat");
+        let a2 = registry.admit(&a).expect("a's second seat");
+        assert_eq!(registry.connections(), 2);
+
+        // Lower the listener-wide cap below the held count: nothing is
+        // evicted, the next admission is refused.
+        live.set(caps(1, 0));
+        assert_eq!(live.get(), caps(1, 0));
+        assert_eq!(registry.connections(), 2, "no eviction on lowering");
+        assert!(registry.admit(&b).is_none(), "listener over its new cap");
+        assert!(registry.admit(&a).is_none());
+
+        // Raise it again: the next admission succeeds.
+        live.set(caps(3, 0));
+        let b1 = registry.admit(&b).expect("raised cap admits again");
+        assert_eq!(registry.connections(), 3);
+
+        // A per-guest cap set below what `a` already holds refuses `a` only;
+        // `b` (under the new cap) is still admitted once the listener has room.
+        drop(b1);
+        live.set(caps(0, 1));
+        assert!(
+            registry.admit(&a).is_none(),
+            "a holds more than the new cap"
+        );
+        let _b2 = registry
+            .admit(&b)
+            .expect("b is under the new per-guest cap");
+        drop(a1);
+        assert!(registry.admit(&a).is_none(), "a still at the new cap");
+        drop(a2);
+        let _a3 = registry.admit(&a).expect("a drained below the new cap");
+    }
+
+    /// Every listener handed the same cell sees one change.
+    #[test]
+    fn shared_guest_limits_are_shared_across_registries() {
+        let live = limits(1, 0);
+        let first = GuestRegistry::new(live.clone());
+        let second = GuestRegistry::new(live.clone());
+        let a = PrincipalId::new();
+        let _first_seat = first.admit(&a).expect("first listener's seat");
+        let _second_seat = second.admit(&a).expect("counts are per listener");
+        assert!(first.admit(&a).is_none());
+        live.set(caps(2, 0));
+        assert!(first.admit(&a).is_some());
+        assert!(second.admit(&a).is_some());
+        assert_eq!(live.get(), caps(2, 0));
     }
 
     /// The listener-wide cap refuses any guest once spent, whoever holds the
