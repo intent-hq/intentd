@@ -524,6 +524,22 @@ pub(crate) fn build_repo_search_query(input: &str) -> String {
     }
 }
 
+/// Rewrite raw user-search input into GitHub `/search/users` syntax: trim, drop
+/// one leading `@`, then narrow to login matches on user accounts
+/// (`<q> in:login type:user`). Empty input yields an empty query so the caller
+/// can skip the network round trip.
+pub(crate) fn build_user_search_query(input: &str) -> String {
+    let trimmed = input
+        .trim()
+        .strip_prefix('@')
+        .unwrap_or(input.trim())
+        .trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!("{trimmed} in:login type:user")
+}
+
 pub(crate) fn map_review(value: Value) -> Result<Review> {
     let r: dto::Review = serde_json::from_value(value)?;
     Ok(Review {
@@ -1424,6 +1440,22 @@ impl SourceControl for GitHubSourceControl {
             .get(format!("/users/{login}"), None::<&()>)
             .await?;
         map_user_identity(v)
+    }
+
+    async fn search_users(&self, query: &str, limit: u8) -> Result<Vec<UserIdentity>> {
+        let search_query = build_user_search_query(query);
+        if search_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let params: Vec<(&str, String)> =
+            vec![("q", search_query), ("per_page", limit.max(1).to_string())];
+        let v: Value = self.client.get("/search/users", Some(&params)).await?;
+        let items: Vec<Value> = serde_json::from_value(
+            v.get("items")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        )?;
+        items.into_iter().map(map_user_identity).collect()
     }
 
     async fn list_repos(&self, page: PageParams) -> Result<Page<Repo>> {
@@ -3009,6 +3041,21 @@ mod tests {
         );
         assert_eq!(build_repo_search_query("   "), "");
         assert_eq!(build_repo_search_query(""), "");
+    }
+
+    #[test]
+    fn rewrites_user_search_query() {
+        assert_eq!(
+            build_user_search_query("octocat"),
+            "octocat in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("  @octocat  "),
+            "octocat in:login type:user"
+        );
+        assert_eq!(build_user_search_query("@"), "");
+        assert_eq!(build_user_search_query("   "), "");
+        assert_eq!(build_user_search_query(""), "");
     }
 
     #[test]
