@@ -89,12 +89,33 @@ fn not_a_member(workspace_id: &WorkspaceId) -> Error {
     Error::NotFound(format!("workspace {workspace_id}"))
 }
 
+/// The owner tag a search registers its cancel token under: the collaborator
+/// principal, or `None` for an unconstrained caller. `search.cancel` from a
+/// collaborator flips only tokens registered under its own tag; an
+/// unconstrained caller cancels any (`CancelRegistry::cancel_as`).
+pub(crate) fn search_owner() -> Option<String> {
+    collaborator_caller().map(|principal_id| principal_id.0)
+}
+
 /// The `workspace.update` fields a member (collaborator) may set: the
 /// workspace-card metadata the catalog promises. Every other field is
 /// owner-only. `changes` is the serialised (camelCase) `WorkspaceUpdate`
 /// delta, so a field is "touched" iff its key is present.
 pub(crate) fn collaborator_editable_update(changes: &Value) -> bool {
     const EDITABLE: [&str; 4] = ["title", "tags", "statusMessage", "statusImageAssetId"];
+    match changes.as_object() {
+        Some(fields) => fields.keys().all(|k| EDITABLE.contains(&k.as_str())),
+        None => false,
+    }
+}
+
+/// The `agent.update` fields a member (collaborator) may set: the display
+/// metadata the catalog promises (name, background flag). Every other field
+/// — lifecycle (`status` / `isActive`), session ids, model / provider /
+/// system prompt, task linkage, completion report, delegation depth, initial
+/// message and attachment / context state — is owner-only.
+pub(crate) fn collaborator_editable_agent_update(changes: &Value) -> bool {
+    const EDITABLE: [&str; 3] = ["name", "nameExplicitlySet", "isBackground"];
     match changes.as_object() {
         Some(fields) => fields.keys().all(|k| EDITABLE.contains(&k.as_str())),
         None => false,
@@ -171,6 +192,28 @@ impl Services {
         }
         let workspace_id = self.agent_workspace(agent_id).await?;
         self.require_member(&workspace_id).await
+    }
+
+    /// [`Self::require_agent_member`] for a call that also names the
+    /// workspace the turn runs against (`agent.sendMessage`,
+    /// `agent.sendQueuedMessageNow`, `agent.editAndRegenerate`): a
+    /// collaborator's caller-supplied `workspace_id` must be the agent's own
+    /// workspace, otherwise the agent is `NotFound` there — the turn's side
+    /// effects (archived check, `try_begin`, events, spawn cwd) are keyed by
+    /// that id, so a member of A must not run A's agent "in" workspace B.
+    pub(crate) async fn require_agent_member_in(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<()> {
+        if gated_collaborator_caller("member").is_none() {
+            return Ok(());
+        }
+        let agent_workspace = self.agent_workspace(agent_id).await?;
+        if agent_workspace != *workspace_id {
+            return Err(Error::NotFound(format!("agent {agent_id}")));
+        }
+        self.require_member(&agent_workspace).await
     }
 
     /// Owner-only gate keyed by agent (see [`Self::require_agent_member`]).

@@ -707,11 +707,13 @@ pub const EVENT_DISCRIMINATORS: &[EventDiscriminator] = &[
             "isRemote",
             "lastActivity",
             "mcpServerToggled",
+            "members",
             "path",
             "prNumber",
             "prStatus",
             "prUrl",
             "pullRequests",
+            "removedPrincipalId",
             "repositoryName",
             "repositoryOwner",
             "repositoryPath",
@@ -852,7 +854,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (WORKSPACE_SETUP_COMPLETED, "Workspace: setup finished; id and outcome."),
     (WORKSPACE_SETUP_STARTED, "Workspace: setup started; id only."),
     (WORKSPACE_TOKEN_USAGE_CHANGED, "Workspace: token usage counters changed (workspace.getTokenUsage is Collaborator+)."),
-    (WORKSPACE_UPDATED, "Workspace: title / tags / status fields changed (workspace channel delta)."),
+    (WORKSPACE_UPDATED, "Workspace: title / tags / status fields changed (workspace channel delta); `changes.members` + `removedPrincipalId` on a membership removal."),
     (WORKSPACE_WAITING_CHANGED, "Workspace: the waiting marker changed (workspace channel delta)."),
 ];
 

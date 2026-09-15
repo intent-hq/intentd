@@ -16709,7 +16709,7 @@ impl WorkspaceApi for Services {
             };
             // Validate opts (incl. regex) before registering, so a bad regex is
             // surfaced as InvalidParams without leaving a stale cancel token.
-            let token = registry.register(&request_id);
+            let token = registry.register_as(&request_id, capability::search_owner());
             let outcome = {
                 let token = token.clone();
                 tokio::task::spawn_blocking(move || {
@@ -16748,7 +16748,7 @@ impl WorkspaceApi for Services {
                     "truncated": false,
                 }));
             };
-            let token = registry.register(&request_id);
+            let token = registry.register_as(&request_id, capability::search_owner());
             let outcome = {
                 let token = token.clone();
                 tokio::task::spawn_blocking(move || {
@@ -16771,7 +16771,11 @@ impl WorkspaceApi for Services {
         let registry = self.search_cancels.clone();
         Box::pin(async move {
             // Idempotent: cancelling an unknown/finished id is a no-op success.
-            let _ = registry.cancel(&request_id);
+            // A collaborator cancels only searches it started (the id is
+            // visible to every workspace subscriber via `search:*` events);
+            // the mismatch is the same silent no-op, so nothing is disclosed.
+            let owner = capability::search_owner();
+            let _ = registry.cancel_as(&request_id, owner.as_deref());
             Ok(serde_json::json!({ "ok": true }))
         })
     }
@@ -16805,7 +16809,7 @@ impl WorkspaceApi for Services {
                     _ => vec![workspace_id.clone()],
                 };
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let token = registry.register(&request_id);
+            let token = registry.register_as(&request_id, capability::search_owner());
             // User-typed queries are never handed to the FTS5 parser verbatim
             // (as-you-type input would surface `fts5: syntax error`); a query
             // with no searchable tokens yields empty matches, not an error.
@@ -16857,7 +16861,7 @@ impl WorkspaceApi for Services {
                 self.require_member(ws).await?;
             }
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let token = registry.register(&request_id);
+            let token = registry.register_as(&request_id, capability::search_owner());
             let limit = limit.and_then(|n| usize::try_from(n).ok());
             let mut q = EventQuery {
                 workspace_id: workspace_id.clone(),
@@ -16892,7 +16896,7 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let token = registry.register(&request_id);
+            let token = registry.register_as(&request_id, capability::search_owner());
             let mut notes = store.list_all_notes().await?;
             // Multiplayer w3: a collaborator matches only its member
             // workspaces' notes (filtered before matching — unbounded list).
@@ -16922,7 +16926,7 @@ impl WorkspaceApi for Services {
             let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
                 return Ok(serde_json::json!({ "requestId": request_id, "matches": [] }));
             };
-            let token = registry.register(&request_id);
+            let token = registry.register_as(&request_id, capability::search_owner());
 
             // Prefer the context engine when it is available, mapping its hits
             // to `CodebaseMatch` (§5.15 parity). When the engine is `Unavailable`
@@ -27809,6 +27813,13 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
+            // A collaborator may touch only the display metadata (name /
+            // background flag); lifecycle, session, model, prompt, task and
+            // attachment fields are the owner's.
+            if !capability::collaborator_editable_agent_update(&changes) {
+                self.require_agent_owner(&agent_id, "agent.update (protected fields)")
+                    .await?;
+            }
             self.agent_update_op(agent_id, changes).await
         })
     }
@@ -28005,7 +28016,8 @@ impl WorkspaceApi for Services {
         origin: intent_core::MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_agent_member(&agent_id).await?;
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
             // Principal stamp (multiplayer w2), applied once here so the
             // runtime path (direct persist, busy enqueue, quarantine park,
             // auto-queue) and the store-only fallback persist the same
@@ -28083,7 +28095,8 @@ impl WorkspaceApi for Services {
         message_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_agent_member(&agent_id).await?;
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
             match self.agent_manager() {
                 Some(manager) => {
                     manager
@@ -28108,7 +28121,8 @@ impl WorkspaceApi for Services {
         message_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_agent_member(&agent_id).await?;
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
             self.agent_dismiss_questions_op(workspace_id, agent_id, message_id)
                 .await
         })
@@ -28123,7 +28137,8 @@ impl WorkspaceApi for Services {
         detail: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_agent_member(&agent_id).await?;
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
             self.agent_resolve_proposal_op(workspace_id, agent_id, proposal_id, outcome, detail)
                 .await
         })
@@ -28136,7 +28151,8 @@ impl WorkspaceApi for Services {
         message_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_agent_member(&agent_id).await?;
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
             self.agent_mark_seen_op(workspace_id, agent_id, message_id)
                 .await
         })
@@ -28153,7 +28169,8 @@ impl WorkspaceApi for Services {
         model: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_agent_member(&agent_id).await?;
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
             if let Some(model) = model.as_deref() {
                 reject_compound_model("model", model)?;
             }
