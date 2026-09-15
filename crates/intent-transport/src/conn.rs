@@ -435,9 +435,10 @@ pub(crate) async fn process_frame(
             let bus = bus.clone();
             let reverse = reverse.clone();
             let is_tcp = crate::context::is_tcp_connection();
+            let caller = crate::context::current_caller();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                crate::context::with_connection_context(is_tcp, async {
+                crate::context::with_request_context(is_tcp, caller, async {
                     finish_slow_path_rpc(
                         permit,
                         panic_guard::guard_frame(
@@ -491,9 +492,10 @@ pub(crate) async fn process_frame(
                 .flatten();
             let registry = reverse_guard.registry();
             let is_tcp = crate::context::is_tcp_connection();
+            let caller = crate::context::current_caller();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                crate::context::with_connection_context(is_tcp, async {
+                crate::context::with_request_context(is_tcp, caller, async {
                     let tabs = browser::TabContext {
                         api: api.as_ref(),
                         client_id: host_client_id.as_ref(),
@@ -635,8 +637,9 @@ pub(crate) async fn process_frame(
     let api = api.clone();
     let raw = raw.to_string();
     let is_tcp = crate::context::is_tcp_connection();
+    let caller = crate::context::current_caller();
     tokio::spawn(async move {
-        crate::context::with_connection_context(is_tcp, async {
+        crate::context::with_request_context(is_tcp, caller, async {
             finish_slow_path_rpc(
                 permit,
                 panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)),
@@ -960,7 +963,7 @@ pub(crate) async fn handle_sub_fast_path(
                         return false;
                     }
                 }
-                let handle = tokio::spawn(forward_note_subscription(
+                let handle = spawn_forwarder(forward_note_subscription(
                     api.clone(),
                     WorkspaceId::from(workspace_id),
                     projection,
@@ -1035,7 +1038,7 @@ pub(crate) async fn handle_sub_fast_path(
                     scope: agent_id.clone(),
                     subscription_id: subscription_id.clone(),
                 };
-                let handle = tokio::spawn(forward_chat_subscription(
+                let handle = spawn_forwarder(forward_chat_subscription(
                     api.clone(),
                     AgentId::from(agent_id),
                     since_message_id,
@@ -1097,7 +1100,7 @@ pub(crate) async fn handle_sub_fast_path(
                             return false;
                         }
                     }
-                    let handle = tokio::spawn(forward_channel_subscription(
+                    let handle = spawn_forwarder(forward_channel_subscription(
                         api.clone(),
                         channel,
                         workspace_id
@@ -1126,6 +1129,23 @@ pub(crate) async fn handle_sub_fast_path(
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
         },
     }
+}
+
+/// Spawn a subscription forwarder with the subscribing connection's request
+/// context re-established for the task's whole lifetime: the seq-0 snapshot
+/// and every later delta re-read run through `api`, so they need the same
+/// transport origin and [`Caller`](crate::context::Caller) the inline
+/// request had (multiplayer w1 — without it `workspace.subscribe` rows
+/// carried no `myRole`, intent-hq/intentd#1868).
+fn spawn_forwarder<F>(forwarder: F) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let is_tcp = crate::context::is_tcp_connection();
+    let caller = crate::context::current_caller();
+    tokio::spawn(crate::context::with_request_context(
+        is_tcp, caller, forwarder,
+    ))
 }
 
 /// Per-subscription forwarder for the `note` collection channel. Materializes

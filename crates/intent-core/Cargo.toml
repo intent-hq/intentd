@@ -19,6 +19,7 @@ toml.workspace = true
 tracing.workspace = true
 serde_path_to_error = "0.1.20"
 libc = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -33,6 +34,7 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 ctor = "1.0.10"
 tempfile = "3"
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 [lints]
 workspace = true

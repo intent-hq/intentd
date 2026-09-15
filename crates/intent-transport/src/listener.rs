@@ -284,6 +284,12 @@ where
     let reverse_guard = reverse_registry.register(reverse.clone(), ReverseTransport::Uds);
     // Per-connection logical-client binding (§16): `None` until `client.hello`.
     let mut client_id: Option<intent_core::ClientId> = None;
+    // UDS is the local user's transport: bind the primary principal as
+    // administrator for the life of the connection (multiplayer w1). Without
+    // a principal store (test stubs) the connection runs unbound.
+    let caller = crate::auth::ResolvedCredential::Legacy
+        .into_caller(api.as_ref())
+        .await;
     let mut line = Vec::new();
     let io_result = loop {
         line.clear();
@@ -321,8 +327,8 @@ where
         // A send failure means the writer/client is gone → end the connection.
         // UDS is the local control transport, so `is_local = true` (§12.3).
         // Wrap in connection context (is_tcp=false for UDS) so server.* RPCs can
-        // gate on real origin (§5.2).
-        let frame_ok = crate::context::with_connection_context(false, async {
+        // gate on real origin (§5.2), with the primary principal bound.
+        let frame_ok = crate::context::with_request_context(false, caller.clone(), async {
             process_frame(
                 trimmed,
                 &api,
