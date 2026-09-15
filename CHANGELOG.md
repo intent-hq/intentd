@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.57] - 2026-09-15
+
+### 🚀 Features
+
+- Share PR context in harness 2.5 ([#1679](https://github.com/intent-hq/intentd/pull/1679))
+
+### 🐛 Bug Fixes
+
+- Report unreadable review threads as unknown and classify GraphQL rate limits ([#1908](https://github.com/intent-hq/intentd/pull/1908))
+
+
 ## [0.9.56] - 2026-09-15
 
 ### 🚀 Features
