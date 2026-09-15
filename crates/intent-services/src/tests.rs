@@ -42928,6 +42928,127 @@ mod derived_workspace_unread {
             .expect("batch probe");
         assert!(!set.contains(h.ws.as_str()), "seen workspace drained");
     }
+
+    /// `agent.retire` on the last unread top-level session settles the
+    /// workspace like the final seen-marker advance: stored flag cleared,
+    /// exactly one `workspace:attention-changed { none }`, reads serve
+    /// `none`. `agent.restore` is SILENT: no stored-flag change and no
+    /// attention event — reads re-derive `unread` for the restored session.
+    #[tokio::test]
+    async fn agent_retire_settles_unread_and_restore_is_silent() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        let mut sub = subscribe_attention(&h);
+        let res = h
+            .services
+            .agent_retire_op(AgentId::from("agent-a"), Some(h.ws.clone()), None)
+            .await
+            .expect("retire");
+        assert_eq!(res["success"], true);
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+
+        // Restore: silent, reads re-derive unread.
+        let res = h
+            .services
+            .agent_restore_op(AgentId::from("agent-a"), Some(h.ws.clone()))
+            .await
+            .expect("restore");
+        assert_eq!(res["restored"], true);
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.attention,
+            WorkspaceAttention::None,
+            "restore must not re-raise the stored flag"
+        );
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+    }
+
+    /// Retiring one of two unread top-level sessions is a partial read:
+    /// nothing is emitted at the workspace level and the stored flag stays.
+    #[tokio::test]
+    async fn agent_retire_partial_stays_silent() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        seed_session(&h, "agent-b", &["user", "assistant"]).await;
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        let mut sub = subscribe_attention(&h);
+        h.services
+            .agent_retire_op(AgentId::from("agent-a"), Some(h.ws.clone()), None)
+            .await
+            .expect("retire a");
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::Unread);
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        // Retiring the last unread session is the final clear.
+        h.services
+            .agent_retire_op(AgentId::from("agent-b"), Some(h.ws.clone()), None)
+            .await
+            .expect("retire b");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+    }
+
+    /// A stored `review_required` is never touched by retire or restore:
+    /// no attention event, stored and served value unchanged.
+    #[tokio::test]
+    async fn agent_retire_and_restore_leave_review_required_untouched() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.attention = WorkspaceAttention::ReviewRequired;
+        h.store.update_workspace(&ws).await.expect("seed review");
+
+        let mut sub = subscribe_attention(&h);
+        h.services
+            .agent_retire_op(AgentId::from("agent-a"), Some(h.ws.clone()), None)
+            .await
+            .expect("retire");
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::ReviewRequired);
+        assert_eq!(
+            served_attention(&h).await,
+            WorkspaceAttention::ReviewRequired
+        );
+
+        h.services
+            .agent_restore_op(AgentId::from("agent-a"), Some(h.ws.clone()))
+            .await
+            .expect("restore");
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::ReviewRequired);
+        assert_eq!(
+            served_attention(&h).await,
+            WorkspaceAttention::ReviewRequired
+        );
+    }
 }
 
 /// `workspace.localChanges` (§5.1): per-root aggregation over the primary

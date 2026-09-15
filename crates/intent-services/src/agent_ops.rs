@@ -5009,6 +5009,16 @@ impl Services {
         reason: Option<&str>,
     ) -> Result<Option<String>> {
         let now = now_iso();
+        // Derived unread observed BEFORE the retire write: a retired session
+        // drops out of the unread derivation, so this is the `was_unread`
+        // input the post-retire settle below needs (a probe failure reads as
+        // unread, which only makes the settle more conservative).
+        let was_unread = !session.workspace_id.is_chief()
+            && self
+                .store
+                .workspace_has_unread_top_level_session(&session.workspace_id)
+                .await
+                .unwrap_or(true);
         // CAS write: only the request that actually flips NULL → set emits
         // the event.
         let transitioned = self
@@ -5068,6 +5078,18 @@ impl Services {
         // pending attention request or unanswered question goes inert with
         // the row): recompute-and-compare (§6.5 step 0).
         self.maybe_emit_display_status_changed(&session.workspace_id)
+            .await;
+        // A retired session no longer counts toward the workspace's derived
+        // `unread` (the FE cannot land on a hidden agent to read it), so
+        // settle the stored flag exactly as the last seen-marker advance
+        // would: when this was the last unread top-level session, clear the
+        // stored `unread` and emit ONE `workspace:attention-changed { none }`
+        // (`review_required` untouched; a still-unread workspace stays
+        // silent). Runs after the displayStatus recompute so the attention
+        // rungs settle before the blue dot; the cascade retires children
+        // through this same path, and the guarded UPDATE inside the settle
+        // ensures the clear emits at most once per actual transition.
+        self.settle_workspace_unread_after_seen(&session.workspace_id, was_unread)
             .await;
         // The watch/group sweep above may have removed the workspace's last
         // waiting reason (watches feed
@@ -5129,6 +5151,11 @@ impl Services {
         .await;
         self.maybe_emit_display_status_changed(&session.workspace_id)
             .await;
+        // Restore is SILENT for the workspace `unread` state (decision): the
+        // stored flag is NOT re-raised and no `workspace:attention-changed`
+        // is emitted. Read paths (`workspace.get` / `workspace.list`)
+        // re-derive unread from the store predicate, so a restored session
+        // with an unseen assistant last message surfaces on the next fetch.
         // Re-engage the queue parked by the retired gates (`try_drain_queue`
         // / `deliver_wake_message`): nothing kicks the restored agent's drain
         // organically, so without this a wake parked during retirement would
