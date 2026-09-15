@@ -3709,6 +3709,235 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
     srv.ws.stop().await;
 }
 
+/// Multiplayer w3: a collaborator's `clientId` is a principal-scoped handle,
+/// never an identity. Two collaborators of one workspace: B observes A's
+/// `clientId` on A's `draft:changed`, re-hellos with it, and still cannot
+/// read, overwrite, or clear A's draft — the hello lands in B's own namespace
+/// and A's draft is untouched. A collaborator hello advertising `browserExec`
+/// never shows up in the administrator's `client.list` either.
+#[tokio::test]
+async fn wss_collaborator_client_ids_are_principal_scoped() {
+    use intent_core::{Principal, PrincipalId, WorkspaceRole};
+    use serde_json::json;
+
+    type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
+
+    async fn rpc(ws: &mut Ws, id: u64, method: &str, params: Value) -> Value {
+        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        ws.send(Message::Text(frame.to_string().into()))
+            .await
+            .expect("send");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == id {
+                            return v;
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{method} reply within 10s"))
+    }
+
+    async fn event(ws: &mut Ws, ty: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event" && v["params"]["event"]["type"] == ty {
+                            return v["params"]["event"].clone();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{ty} event within 10s"))
+    }
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", json!("auggie"));
+
+    // Owner side: a workspace and one agent the drafts hang off.
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"W3 Drafts"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let agent = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Drafted"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = agent["result"]["agent"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("agent id: {agent}"))
+        .to_string();
+
+    // Two collaborators with their own credentials.
+    let mut principals = Vec::new();
+    for (login, token) in [
+        (
+            "alice",
+            "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        ),
+        (
+            "bob",
+            "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        ),
+    ] {
+        let principal = Principal {
+            id: PrincipalId::new(),
+            github_user_id: None,
+            login: Some(login.to_string()),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        srv.store.upsert_principal(&principal).await.expect(login);
+        srv.store
+            .insert_principal_credential(&principal.id, &sha256_hex(token.as_bytes()))
+            .await
+            .expect("credential");
+        srv.store
+            .add_workspace_member(
+                &WorkspaceId::from(ws_id.as_str()),
+                &principal.id,
+                WorkspaceRole::Collaborator,
+            )
+            .await
+            .expect("add collaborator");
+        let url = format!("wss://localhost:{}/ws?token={token}", srv.port);
+        let ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+        principals.push((principal, ws));
+    }
+    let (bob, mut b) = principals.pop().expect("bob");
+    let (alice, mut a) = principals.pop().expect("alice");
+
+    // Alice hellos with a self-chosen id; the daemon hands back the scoped one.
+    let hello = rpc(
+        &mut a,
+        10,
+        "client.hello",
+        json!({ "clientId": "shared-cli", "name": "Alice", "capabilities": { "browserExec": true } }),
+    )
+    .await;
+    assert!(hello.get("error").is_none(), "{hello}");
+    let alice_cid = format!("{}:shared-cli", alice.id.as_str());
+    assert_eq!(hello["result"]["clientId"], alice_cid, "{hello}");
+    // Re-hello with the returned id is stable (the FE persists it).
+    let again = rpc(&mut a, 11, "client.hello", json!({ "clientId": alice_cid })).await;
+    assert_eq!(again["result"]["clientId"], alice_cid, "{again}");
+
+    // Bob watches draft:changed in the shared workspace.
+    let sub = rpc(
+        &mut b,
+        20,
+        "events.subscribe",
+        json!({ "eventTypes": ["draft:changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub.get("error").is_none(), "{sub}");
+
+    let draft = json!({ "workspaceId": ws_id, "agentId": agent_id });
+    let set = rpc(
+        &mut a,
+        12,
+        "drafts.set",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "text": "alice draft" }),
+    )
+    .await;
+    assert_eq!(set["result"]["ok"], true, "{set}");
+    let seen = event(&mut b, "draft:changed").await;
+    assert_eq!(seen["data"]["clientId"], alice_cid, "{seen}");
+    assert_eq!(seen["data"]["hasDraft"], true, "{seen}");
+    let observed = seen["data"]["clientId"].as_str().unwrap().to_string();
+
+    // Bob re-hellos as the observed id: it lands in Bob's namespace.
+    let spoof = rpc(
+        &mut b,
+        21,
+        "client.hello",
+        json!({ "clientId": observed, "capabilities": { "browserExec": true } }),
+    )
+    .await;
+    assert!(spoof.get("error").is_none(), "{spoof}");
+    let bob_cid = format!("{}:{alice_cid}", bob.id.as_str());
+    assert_eq!(spoof["result"]["clientId"], bob_cid, "{spoof}");
+
+    // Bob cannot read, overwrite, or clear Alice's draft.
+    let get = rpc(&mut b, 22, "drafts.get", draft.clone()).await;
+    assert_eq!(
+        get["result"],
+        Value::Null,
+        "Bob never sees Alice's draft: {get}"
+    );
+    let set = rpc(
+        &mut b,
+        23,
+        "drafts.set",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "text": "bob draft" }),
+    )
+    .await;
+    assert_eq!(set["result"]["ok"], true, "{set}");
+    let mine = rpc(&mut a, 13, "drafts.get", draft.clone()).await;
+    assert_eq!(mine["result"]["text"], "alice draft", "{mine}");
+    let clear = rpc(&mut b, 24, "drafts.clear", draft.clone()).await;
+    assert_eq!(clear["result"]["ok"], true, "{clear}");
+    let mine = rpc(&mut a, 14, "drafts.get", draft.clone()).await;
+    assert_eq!(mine["result"]["text"], "alice draft", "{mine}");
+    let bobs = rpc(&mut b, 25, "drafts.get", draft).await;
+    assert_eq!(bobs["result"], Value::Null, "{bobs}");
+
+    // Collaborator hellos advertising browserExec never reach the
+    // administrator's client roster.
+    let listed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"client.list","params":{}}"#,
+    )
+    .await;
+    let clients = listed["result"]["clients"]
+        .as_array()
+        .unwrap_or_else(|| panic!("clients array: {listed}"));
+    assert!(
+        clients.iter().all(|c| {
+            let id = c["clientId"].as_str().unwrap_or_default();
+            id != "shared-cli" && id != alice_cid && id != bob_cid
+        }),
+        "collaborator hellos must not be listed as clients: {listed}"
+    );
+
+    drop(a);
+    drop(b);
+    srv.ws.stop().await;
+}
+
 /// Multiplayer w3: a connection bound to a non-administrator principal may
 /// call only the vetted `COLLABORATOR_METHODS`; everything else is refused
 /// before dispatch with the forbidden error (`-32003`, docs/protocol §9).
