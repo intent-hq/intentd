@@ -1,0 +1,39 @@
+[package]
+name = "intentd-microvm-helper"
+# Tracks intentd's version (release-plz `version_group = "intentd"`): the
+# helper ships in the daemon's `vX.Y.Z` release, and cargo-dist only picks a
+# package up under a tag when its version matches the tag.
+version = "0.9.55"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+description = "Signed libkrun microVM launcher supervised by intentd (macOS aarch64; stub elsewhere)"
+
+# Shipped by the cargo-dist daemon pipeline (v-release.yml) as its own app in
+# the same `vX.Y.Z` GitHub Release as intentd:
+# `intentd-microvm-helper-aarch64-apple-darwin.tar.xz` (+ `.sha256`), so the
+# cloudlands-fe macOS build fetches it by the existing `intentd.version` pin.
+# aarch64-apple-darwin only: libkrun supports Hypervisor.framework on Apple
+# Silicon only, and every other target would ship the exit-69 stub — excluded
+# rather than published. The libkrun/libkrunfw dylibs are NOT in this
+# archive; they come from the separate `libkrun-bundle-v*` release
+# (.github/workflows/libkrun-bundle.yml) and the fe stages both next to
+# intentd and signs the helper with the hypervisor entitlement
+# (entitlements/). The workspace-level `include` (packaging/libexec, the
+# tailcat sidecar) is cleared here so it is not duplicated into this archive.
+# Dev flow: build + ad-hoc sign via scripts/sign-microvm-helper.sh.
+[package.metadata.dist]
+dist = true
+targets = ["aarch64-apple-darwin"]
+include = []
+
+[dependencies]
+clap = { workspace = true }
+
+[target."cfg(target_os = \"macos\")".dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

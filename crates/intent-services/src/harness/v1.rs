@@ -253,7 +253,10 @@ impl Harness for V1 {
         format!(
             "## Workspace Isolation\n\n\
              You are working in an **isolated CoW (copy-on-write) sandbox** at `{sandbox_path}` \
-             on branch `{sandbox_branch}` ({base_sha_note}). Your dependency caches (node_modules, \
+             on branch `{sandbox_branch}` ({base_sha_note}). Your workspace is **isolated at the \
+             filesystem level from other agents**: each agent works in its own copy-on-write \
+             clone, so your file reads and writes cannot see or affect other agents' concurrent \
+             changes (or the canonical checkout) until merge-back. Your dependency caches (node_modules, \
              target/, .venv, etc.) are warm — you inherited them from the canonical workspace.\n\n\
              **Critical constraints:**\n\
              - Do NOT switch branches or checkout other refs in your sandbox.\n\
@@ -266,23 +269,67 @@ impl Harness for V1 {
         )
     }
 
-    fn coordinator_cow_hint(&self) -> String {
-        "## Agent Delegation & Isolation\n\n\
-         Delegated agents in this workspace run in **isolated CoW sandboxes** when you \
-         use `isolation: \"cow\"` (or when the workspace's `cowIsolation` setting defaults it). \
-         Each sandboxed agent works in its own copy-on-write clone of the workspace directory, \
-         so parallel delegation is safe even when tasks touch overlapping files — agents cannot \
-         stomp each other's work.\n\n\
-         **Merge-back is automatic:** when a sandboxed agent completes, the system merges its \
-         commits back into the canonical workspace **before** waking you. Clean merges propagate \
-         completion normally. Conflicts suppress completion propagation and wake the agent (not you) \
-         with conflict paths and resolution instructions; the agent fixes its sandbox and retries \
-         the merge (up to 2 attempts).\n\n\
-         **You only handle `blocked` outcomes:** if the canonical workspace has uncommitted changes \
-         overlapping with the agent's work, or if conflict retries are exhausted, completion propagates \
-         with `merge_pending` status. Use `sandbox.cow.merge` or `sandbox.cow.discard` RPCs, or ask the user \
-         to commit/stash their WIP, then manually merge."
-            .to_string()
+    fn microvm_isolation_hint(&self, guest_dir: &str) -> String {
+        format!(
+            "## Workspace Isolation\n\n\
+             You are running in an **isolated sandbox (microVM)** with **a copy of the \
+             workspace provided** to you: the workspace at `{guest_dir}` is your own \
+             copy-on-write clone of the canonical checkout, mounted into the VM. Your \
+             workspace is **isolated at the filesystem level from other agents**: each \
+             agent's VM has its own private clone, so your file reads and writes cannot \
+             see or affect other agents' concurrent changes until merge-back. When your \
+             work completes, **automatic merging of your changes back** to the canonical \
+             checkout is offered. The host filesystem outside your workspace is not \
+             accessible from inside the VM."
+        )
+    }
+
+    fn coordinator_cow_hint(
+        &self,
+        uniform_isolation: bool,
+        standalone_cow_checkout: bool,
+    ) -> String {
+        // The lead sentence must match how isolation is actually resolved: in
+        // an `executionEnvironment: cow` workspace the param/setting are
+        // ignored (sandboxing is unconditional); legacy rows keep the
+        // param-then-setting wording.
+        let lead = if uniform_isolation {
+            "Delegated agents in this workspace **always** run in isolated CoW sandboxes \
+             — the workspace's execution environment is `cow`, so per-agent isolation is \
+             unconditional (the `isolation` param and global settings do not change it)."
+        } else {
+            "Delegated agents in this workspace run in **isolated CoW sandboxes** when you \
+             use `isolation: \"cow\"` (or when the workspace's `cowIsolation` setting defaults it)."
+        };
+        let checkout_note = if uniform_isolation {
+            "\n\nThis workspace's checkout is itself a **standalone CoW clone** of the \
+                 source repository (checkout-level isolation). **Every agent** in this \
+                 workspace — including you and top-level agents, not just delegates — \
+                 runs in its own per-agent CoW sandbox sourced from this checkout and \
+                 merged back on turn end."
+        } else if standalone_cow_checkout {
+            "\n\nThis workspace's checkout is itself a **standalone CoW clone** of the \
+                 source repository (checkout-level isolation); the per-agent CoW sandboxes \
+                 described above apply to your delegated agents, sourced from this checkout."
+        } else {
+            ""
+        };
+        format!(
+            "## Agent Delegation & Isolation\n\n\
+             {lead} \
+             Each sandboxed agent works in its own copy-on-write clone of the workspace directory, \
+             so parallel delegation is safe even when tasks touch overlapping files — agents cannot \
+             stomp each other's work.\n\n\
+             **Merge-back is automatic:** when a sandboxed agent completes, the system merges its \
+             commits back into the canonical workspace **before** waking you. Clean merges propagate \
+             completion normally. Conflicts suppress completion propagation and wake the agent (not you) \
+             with conflict paths and resolution instructions; the agent fixes its sandbox and retries \
+             the merge (up to 2 attempts).\n\n\
+             **You only handle `blocked` outcomes:** if the canonical workspace has uncommitted changes \
+             overlapping with the agent's work, or if conflict retries are exhausted, completion propagates \
+             with `merge_pending` status. Use `sandbox.cow.merge` or `sandbox.cow.discard` RPCs, or ask the user \
+             to commit/stash their WIP, then manually merge.{checkout_note}"
+        )
     }
 
     fn specialist_role_section(&self, behavior_prompt: &str) -> String {

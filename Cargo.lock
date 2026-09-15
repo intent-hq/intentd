@@ -2342,6 +2342,7 @@ dependencies = [
  "sqlx",
  "sysinfo",
  "tempfile",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "toml_edit",
@@ -2483,6 +2484,15 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "intentd-microvm-helper"
+version = "0.9.55"
+dependencies = [
+ "clap",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

@@ -186,6 +186,7 @@ fn seed_workspace(title: &str, worktree_path: Option<String>, skip_worktree: boo
         cow_supported: None,
         browser_client_id: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     }

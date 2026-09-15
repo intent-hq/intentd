@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
 use crate::repo_ref::RepoRef;
+use crate::settings_file::SandboxType;
 
 /// Builds a [`RepoRef`] from an optional owner/name pair: `Some` only when
 /// both halves are present and non-empty.
@@ -310,6 +311,13 @@ pub struct Workspace {
     /// `worktreePath`, non-git repo paths, pre-existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_mode: Option<CheckoutMode>,
+    /// The execution environment selected for this workspace at creation
+    /// (§5.1): `direct` | `worktree` | `cow` | `microvm`. Persisted from the
+    /// `workspace.create` `executionEnvironment` param (or derived from the
+    /// legacy `skipIsolation`/CoW-settings path when the param is omitted).
+    /// Omitted for pre-existing rows created before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_environment: Option<SandboxType>,
     /// Per-workspace browser-client pin (REV-2): the logical `clientId`
     /// agent-initiated `browser.exec` requests for this workspace are routed
     /// to (`workspace.setBrowserClient`). Omitted (not `null`) when unpinned
@@ -466,6 +474,7 @@ pub fn chief_workspace() -> Workspace {
         cow_supported: None,
         browser_client_id: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     }
@@ -736,9 +745,44 @@ pub struct RepoConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cow_clone_exclude: Option<Vec<String>>,
 
+    /// Execution-environment overrides for microVM-sandboxed workspaces
+    /// (monorepo#1120). Today only carries the guest-image override; absent ⇒
+    /// profile default → built-in pin (see
+    /// `intent-services::sandbox_image::resolve_image_ref`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_environment: Option<ExecutionEnvironmentRepoConfig>,
+
     /// Unknown/extra keys preserved on round-trip to avoid dropping fields other tools add.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// `executionEnvironment` block of `.intent/config.json` (monorepo#1120).
+/// Unknown keys round-trip via `extra` like the parent [`RepoConfig`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExecutionEnvironmentRepoConfig {
+    /// Guest-image override: the repo pins its own conforming image manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<GuestImageRef>,
+
+    /// Unknown/extra keys preserved on round-trip.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// A reference to a guest-image manifest: where to fetch it and (optionally)
+/// the expected sha256 of the manifest document itself. The rootfs digest
+/// lives inside the manifest; this outer pin protects the manifest fetch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GuestImageRef {
+    /// Absolute URL of the image `manifest.json`.
+    pub manifest_url: String,
+    /// Hex sha256 of the manifest document; absent ⇒ manifest fetched
+    /// unpinned (rootfs is still always sha256-verified via the manifest).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// One chat-context attachment for a workspace (PROTOCOL §5.1 —
@@ -942,6 +986,12 @@ pub struct WorkspaceCreate {
     /// keeps the legacy behavior (non-git paths skip provisioning); `true` on
     /// an existing git repo is a no-op.
     pub is_new_repo: Option<bool>,
+    /// Explicit execution-environment selection (PROTOCOL §5.1):
+    /// `direct` | `worktree` | `cow` | `microvm`. Validated against the
+    /// enabled sandbox profiles and host capabilities; `microvm` is not yet
+    /// implemented and returns a structured error. When omitted the legacy
+    /// `skipIsolation`/CoW-settings derivation applies.
+    pub execution_environment: Option<SandboxType>,
     /// Client-supplied correlation id (PROTOCOL §5.1): when present, every
     /// `git:clone:progress` / `git:clone:done` frame this create emits echoes
     /// it as `data.progressId`, and provisioning paths that stream nothing
@@ -3786,6 +3836,16 @@ pub struct AgentDelegateInput {
     /// When "cow" and `CoW` is supported, the agent runs in an isolated `CoW` clone of
     /// the workspace directory. Falls back to shared mode if `CoW` is unsupported.
     pub isolation: Option<String>,
+    /// Whether the child's sandbox auto-merges back into canonical when its
+    /// turn ends (default `true` = today's behavior). `false` keeps the
+    /// sandbox live at turn end so the parent can inspect it and merge later
+    /// via `sandbox.cow.merge`. Advisory when the agent has no sandbox.
+    pub merge_on_turn_end: Option<bool>,
+    /// Per-agent microVM sizing override (`vmResources: { vcpus?, memMib? }`).
+    /// Missing fields fall back to the `sandbox.microvm.vcpus`/`memMib`
+    /// settings, then the built-in defaults. Accepted-and-ignored on
+    /// non-microVM workspaces (advisory, like `merge_on_turn_end`).
+    pub vm_resources: Option<VmResources>,
     /// Occupancy override: a task that already has a live assigned agent
     /// rejects a second delegation unless `force: true` is passed to
     /// intentionally add another agent.
@@ -3861,6 +3921,50 @@ pub struct BatchTaskOptions {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub agent_instructions: Option<String>,
+}
+
+/// Per-agent microVM sizing override (`vmResources` on `agent.delegate` /
+/// `agent.create`): both fields optional — a missing field falls back to the
+/// corresponding `sandbox.microvm.*` setting, then the built-in default
+/// (2 vCPUs / 2048 MiB). Bounds mirror the microVM helper: vcpus 1–16,
+/// memMib >= 128; validated at delegate/create time so bad input errors
+/// before the VM boots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct VmResources {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vcpus: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_mib: Option<u32>,
+}
+
+impl VmResources {
+    /// Validate the override against the microVM helper's bounds
+    /// (`vcpus` 1–16, `memMib` >= 128). Called at delegate/create time so
+    /// invalid sizing errors immediately instead of at VM boot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` when a field is out of bounds.
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        if let Some(v) = self.vcpus {
+            if v == 0 || v > crate::settings_file::MAX_MICROVM_VCPUS {
+                return Err(crate::Error::InvalidParams(format!(
+                    "vmResources.vcpus: must be between 1 and {}, got {v}",
+                    crate::settings_file::MAX_MICROVM_VCPUS
+                )));
+            }
+        }
+        if let Some(m) = self.mem_mib {
+            if m < crate::settings_file::MIN_MICROVM_MEM_MIB {
+                return Err(crate::Error::InvalidParams(format!(
+                    "vmResources.memMib: must be >= {}, got {m}",
+                    crate::settings_file::MIN_MICROVM_MEM_MIB
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Optional `create.*` payload on [`AgentWakeOrCreateInput`] — the fields the
@@ -5549,6 +5653,7 @@ mod tests {
             cow_supported: None,
             browser_client_id: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -6001,6 +6106,7 @@ mod tests {
                 "node_modules".to_string(),
                 "packages/big/cache".to_string(),
             ]),
+            execution_environment: None,
             extra: {
                 let mut m = BTreeMap::new();
                 m.insert("customKey".to_string(), serde_json::json!("customValue"));
@@ -6809,6 +6915,69 @@ mod tests {
         let update: WorkspaceUpdate =
             serde_json::from_value(json!({ "skipWorktree": false })).unwrap();
         assert_eq!(update.skip_isolation, Some(false));
+    }
+
+    #[test]
+    fn vm_resources_validate_enforces_helper_bounds() {
+        // In-range and partial overrides pass (missing fields fall back
+        // later, at spawn resolution).
+        for vm in [
+            VmResources {
+                vcpus: Some(1),
+                mem_mib: Some(128),
+            },
+            VmResources {
+                vcpus: Some(16),
+                mem_mib: None,
+            },
+            VmResources {
+                vcpus: None,
+                mem_mib: Some(8192),
+            },
+            VmResources::default(),
+        ] {
+            vm.validate().unwrap_or_else(|e| panic!("{vm:?}: {e}"));
+        }
+        // Out-of-range values error naming the offending field.
+        for (vm, field) in [
+            (
+                VmResources {
+                    vcpus: Some(0),
+                    mem_mib: None,
+                },
+                "vmResources.vcpus",
+            ),
+            (
+                VmResources {
+                    vcpus: Some(17),
+                    mem_mib: None,
+                },
+                "vmResources.vcpus",
+            ),
+            (
+                VmResources {
+                    vcpus: None,
+                    mem_mib: Some(64),
+                },
+                "vmResources.memMib",
+            ),
+        ] {
+            let err = vm.validate().unwrap_err();
+            assert!(err.to_string().contains(field), "{vm:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn vm_resources_wire_shape_is_camel_case_and_partial() {
+        let vm: VmResources = serde_json::from_value(json!({ "memMib": 4096 })).unwrap();
+        assert_eq!(vm.vcpus, None);
+        assert_eq!(vm.mem_mib, Some(4096));
+        let v = serde_json::to_value(VmResources {
+            vcpus: Some(4),
+            mem_mib: Some(4096),
+        })
+        .unwrap();
+        assert_eq!(v, json!({ "vcpus": 4, "memMib": 4096 }));
     }
 
     #[test]
