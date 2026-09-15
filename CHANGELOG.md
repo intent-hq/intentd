@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.58] - 2026-09-15
+
+### 🐛 Bug Fixes
+
+- *(agent-manager)* Bind the wake_or_create delivery path to the target's session workspace ([#1907](https://github.com/intent-hq/intentd/pull/1907))
+- *(services)* Prune .git to its consumed metadata dirs in the shared watch walk ([#1906](https://github.com/intent-hq/intentd/pull/1906))
+
+
 ## [0.9.57] - 2026-09-15
 
 ### 🚀 Features
