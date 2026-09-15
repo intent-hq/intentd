@@ -32,6 +32,7 @@ use ignore::{Match, WalkBuilder};
 use intent_core::{now_iso, ActorType, EventActor, WorkspaceId};
 use intent_store::NewEvent;
 use notify::event::{EventKind, ModifyKind};
+use notify::RecursiveMode;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -268,6 +269,19 @@ fn resolve_exclude_file(git_dir: &Path) -> PathBuf {
         Err(_) => git_dir.to_path_buf(),
     };
     base.join("info").join("exclude")
+}
+
+/// The directory holding `root`'s `info/exclude` when that lies **outside**
+/// `root` (canonical): a linked worktree's `<common>/info`, or the `info/` of
+/// a `--separate-git-dir` checkout. The recursive workspace-root watch never
+/// sees edits there, so [`FileWatcher::start`] subscribes to this directory
+/// non-recursively to keep the matcher's invalidation working
+/// (intent-hq/intent#5057). `None` for non-git roots, primary checkouts
+/// (`.git/info` is under the root) and a missing `info/` directory.
+fn external_exclude_dir(root: &Path) -> Option<PathBuf> {
+    let exclude = resolve_exclude_file(&resolve_git_dir(root)?);
+    let dir = std::fs::canonicalize(exclude.parent()?).ok()?;
+    (!dir.starts_with(root)).then_some(dir)
 }
 
 /// Ingest-time gitignore evaluation, mirroring how the pre-port TS filtered
@@ -549,6 +563,12 @@ fn parent_dir(path: &str) -> String {
 /// clean-shutdown contract for `serve`.
 pub struct FileWatcher {
     _sub: SubHandle,
+    /// Non-recursive subscription on [`external_exclude_dir`] when there is
+    /// one: a linked worktree's `<common>/info`, whose `exclude` edits would
+    /// otherwise never reach the gitignore matcher (intent-hq/intent#5057).
+    /// On Linux the git metadata watcher already holds the common dir
+    /// recursively, so this root shares its descriptor rather than adding one.
+    _exclude_sub: Option<SubHandle>,
     task: JoinHandle<()>,
 }
 
@@ -573,8 +593,19 @@ impl FileWatcher {
         // relative-path strip works against the paths the OS reports (macOS
         // FSEvents resolves `/var/...` → `/private/var/...`).
         let (sub, raw_rx, root) = hub.subscribe(root);
-        let task = tokio::spawn(debounce_loop(bus, workspace_id, root, raw_rx));
-        Self { _sub: sub, task }
+        let (exclude_sub, exclude_rx) = match external_exclude_dir(&root) {
+            Some(dir) => {
+                let (sub, rx, _) = hub.subscribe_with(&dir, RecursiveMode::NonRecursive);
+                (Some(sub), Some(rx))
+            }
+            None => (None, None),
+        };
+        let task = tokio::spawn(debounce_loop(bus, workspace_id, root, raw_rx, exclude_rx));
+        Self {
+            _sub: sub,
+            _exclude_sub: exclude_sub,
+            task,
+        }
     }
 
     /// Await the shared watch on this workspace's root actually being live.
@@ -588,17 +619,25 @@ impl FileWatcher {
     #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     pub(super) async fn wait_established(&self, timeout: Duration) {
         self._sub.probe().wait_live(timeout).await;
+        if let Some(sub) = &self._exclude_sub {
+            sub.probe().wait_live(timeout).await;
+        }
     }
 }
 
 /// Coalesce raw FS events per path within [`DEBOUNCE`], then publish one
 /// `file:changed` per path. A path is flushed `DEBOUNCE` after its last raw
 /// event (timer reset on each new event, as in the TS `handleFileEvent`).
+///
+/// `exclude_rx` is the out-of-root `info/` stream of a linked worktree (see
+/// [`external_exclude_dir`]); its events only ever mark the matcher dirty,
+/// since nothing under it is a workspace path.
 async fn debounce_loop(
     bus: EventBus,
     workspace_id: WorkspaceId,
     root: PathBuf,
     mut raw_rx: mpsc::UnboundedReceiver<notify::Event>,
+    mut exclude_rx: Option<mpsc::UnboundedReceiver<notify::Event>>,
 ) {
     let mut matcher = GitignoreMatcher::new(root.clone());
     let mut pending: HashMap<String, (Action, tokio::time::Instant)> = HashMap::new();
@@ -614,6 +653,16 @@ async fn debounce_loop(
                     // Watcher dropped: flush whatever is pending, then stop.
                     flush_all(&bus, &workspace_id, &mut pending).await;
                     return;
+                }
+            },
+            maybe = recv_some(&mut exclude_rx), if exclude_rx.is_some() => {
+                match maybe {
+                    // Outside `root`, so `ingest` only runs the ignore-rule
+                    // observation (`note_raw_change`) and never queues it.
+                    Some(event) => ingest(&root, &mut matcher, &event, &mut pending),
+                    // The out-of-root watch is gone (a lost registration
+                    // closes the channel); stop polling it rather than spin.
+                    None => exclude_rx = None,
                 }
             },
             () = sleep_until(next_deadline), if next_deadline.is_some() => {
@@ -687,6 +736,17 @@ fn ingest(
             _ => action,
         };
         pending.insert(rel, (merged, deadline));
+    }
+}
+
+/// `recv` on an optional channel; callers gate the `select!` branch on
+/// `is_some`, so the `None` arm is never awaited.
+async fn recv_some(
+    rx: &mut Option<mpsc::UnboundedReceiver<notify::Event>>,
+) -> Option<notify::Event> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -981,5 +1041,34 @@ mod tests {
             git_dir.join("../..").join("info").join("exclude")
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn external_exclude_dir_only_for_out_of_root_info() {
+        let guard = crate::test_support::test_tempdir("intentd-ext-excl-");
+        let tmp = std::fs::canonicalize(guard.path()).unwrap();
+
+        // Primary checkout: `.git/info` is under the root.
+        std::fs::create_dir_all(tmp.join("main/.git/info")).unwrap();
+        assert_eq!(external_exclude_dir(&tmp.join("main")), None);
+
+        // Non-git root.
+        std::fs::create_dir_all(tmp.join("plain")).unwrap();
+        assert_eq!(external_exclude_dir(&tmp.join("plain")), None);
+
+        // Linked worktree: gitdir pointer + commondir resolve to the primary's
+        // `.git/info`, which lies outside the worktree root.
+        std::fs::create_dir_all(tmp.join("main/.git/worktrees/wt")).unwrap();
+        std::fs::write(tmp.join("main/.git/worktrees/wt/commondir"), "../..\n").unwrap();
+        std::fs::create_dir_all(tmp.join("wt")).unwrap();
+        std::fs::write(tmp.join("wt/.git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
+        assert_eq!(
+            external_exclude_dir(&tmp.join("wt")),
+            Some(tmp.join("main/.git/info"))
+        );
+
+        // Missing `info/` directory: nothing to watch.
+        std::fs::remove_dir_all(tmp.join("main/.git/info")).unwrap();
+        assert_eq!(external_exclude_dir(&tmp.join("wt")), None);
     }
 }
