@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.59] - 2026-09-15
+
+### 🐛 Bug Fixes
+
+- *(services)* Invalidate the gitignore matcher on common-dir info/exclude edits in linked worktrees ([#1910](https://github.com/intent-hq/intentd/pull/1910))
+
+
 ## [0.9.58] - 2026-09-15
 
 ### 🐛 Bug Fixes
