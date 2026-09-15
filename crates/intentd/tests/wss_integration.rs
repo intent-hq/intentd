@@ -220,7 +220,6 @@ struct Server {
     port: u16,
     cfg: Arc<ClientConfig>,
     api: Arc<dyn WorkspaceApi>,
-    #[cfg_attr(not(unix), expect(dead_code))]
     bus: EventBus,
     store: Store,
     registry: Arc<intent_services::SettingsRegistry>,
@@ -2491,15 +2490,16 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     assert_eq!(owner_ws["memberCount"], 1);
     assert_eq!(owner_ws["openInviteCount"], 0);
 
+    // Multiplayer w3: a non-member's `workspace.get` is `NotFound` — the
+    // same `-32602 { code: "not-found" }` as a nonexistent id, so membership
+    // itself is not disclosed.
     let non_member_view = guest_ws_call(get_frame.clone()).await;
-    assert!(non_member_view.get("error").is_none(), "{non_member_view}");
-    let non_member_ws = &non_member_view["result"]["workspace"];
-    assert_eq!(non_member_ws["ownerPrincipalId"], primary.id.0);
-    assert!(
-        non_member_ws.get("myRole").is_none(),
-        "non-member must not carry myRole: {non_member_ws}"
+    assert_eq!(
+        non_member_view["error"]["code"], -32602,
+        "non-member workspace.get: {non_member_view}"
     );
-    assert_eq!(non_member_ws["memberCount"], 1);
+    assert_eq!(non_member_view["error"]["message"], "Workspace not found");
+    assert_eq!(non_member_view["error"]["data"]["code"], "not-found");
 
     srv.store
         .add_workspace_member(&ws_id, &guest.id, WorkspaceRole::Collaborator)
@@ -2530,6 +2530,1053 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     srv.ws.stop().await;
 }
 
+/// Multiplayer w3: the capability matrix is enforced in the service layer,
+/// keyed on the caller the connection was bound to. On a workspace the
+/// primary user created, a **non-member** guest is answered `NotFound`
+/// (`-32602 { code: "not-found" }`, membership undisclosed) by
+/// `workspace.get`, `workspace.members.list`, `note.setContent`,
+/// `agent.sendMessage` and `git.push`, and `workspace.list` omits the row.
+/// Once added as a **collaborator** (store seam; invites are wave 4) the same
+/// connection reads the workspace with `myRole`, lists the roster, edits the
+/// note, steers the agent, and reaches `git.push` past the guard; Owner-only
+/// `agent.delete`, `workspace.export.start`, `hook.cancel` and
+/// `workspace.members.remove` stay refused with `-32003`, as is an
+/// `agent.update` touching anything beyond display metadata; pairing this
+/// workspace's agent with another member workspace's id is `NotFound`. The owner's
+/// `workspace.members.remove` over the wire drops the collaborator: its
+/// open workspace channel receives a `removedIds` delta and its next read is
+/// `NotFound` again; removing the owner row is rejected.
+#[tokio::test]
+async fn wss_collaborator_capability_matrix_in_service_layer() {
+    use intent_core::{Principal, PrincipalId, WorkspaceRole};
+    use serde_json::json;
+
+    type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
+
+    async fn reply(ws: &mut Ws, id: u64) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == id {
+                            return v;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("reply within 10s")
+    }
+
+    async fn push(ws: &mut Ws, kind: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "subscription.push" && v["params"]["kind"] == kind {
+                            return v;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{kind} push within 10s"))
+    }
+
+    fn assert_not_found(v: &Value, what: &str) {
+        assert_eq!(v["error"]["code"], -32602, "{what}: {v}");
+        assert_eq!(v["error"]["data"]["code"], "not-found", "{what}: {v}");
+        assert!(v.get("result").is_none(), "{what}: {v}");
+    }
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", json!("auggie"));
+    let primary = srv
+        .store
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+
+    // Owner side: a workspace (owner by trigger), one agent, one note.
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"W3 Matrix"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let agent = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Steered"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = agent["result"]["agent"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("agent id: {agent}"))
+        .to_string();
+    let note = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"note.create","params":{{"workspaceId":"{ws_id}","title":"Shared","content":"owner draft"}}}}"#
+        ),
+    )
+    .await;
+    let note_id = note["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    // A guest principal with its own credential.
+    let guest_token = "edededededededededededededededededededededededededededededededed";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: Some("Guest User".to_string()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    srv.store.upsert_principal(&guest).await.expect("guest");
+    srv.store
+        .insert_principal_credential(&guest.id, &sha256_hex(guest_token.as_bytes()))
+        .await
+        .expect("guest credential");
+
+    let url = format!("wss://localhost:{}/ws?token={guest_token}", srv.port);
+    let mut ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+    let mut next_id = 10u64;
+    let mut call = |method: &str, params: Value| {
+        next_id += 1;
+        let frame = json!({ "jsonrpc": "2.0", "id": next_id, "method": method, "params": params });
+        (next_id, frame.to_string())
+    };
+
+    let member_calls = |ws_id: &str| {
+        vec![
+            ("workspace.get", json!({ "workspaceId": ws_id })),
+            ("workspace.members.list", json!({ "workspaceId": ws_id })),
+            (
+                "note.setContent",
+                json!({ "workspaceId": ws_id, "noteId": note_id, "content": "guest edit" }),
+            ),
+            (
+                "agent.sendMessage",
+                json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello from guest" }),
+            ),
+            ("git.push", json!({ "workspaceId": ws_id })),
+        ]
+    };
+
+    // Non-member: every workspace-scoped call is NotFound, never Forbidden.
+    for (method, params) in member_calls(&ws_id) {
+        let (id, frame) = call(method, params);
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_not_found(&v, &format!("non-member {method}"));
+    }
+    let (id, frame) = call("workspace.list", json!({}));
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let list = reply(&mut ws, id).await;
+    assert!(list.get("error").is_none(), "{list}");
+    assert!(
+        list["result"]["workspaces"]
+            .as_array()
+            .expect("workspaces")
+            .iter()
+            .all(|w| w["id"] != ws_id),
+        "non-member must not see the workspace: {list}"
+    );
+
+    // Owner adds the guest as a collaborator (store seam; no invite RPC yet).
+    let ws_typed = WorkspaceId::from(ws_id.as_str());
+    srv.store
+        .add_workspace_member(&ws_typed, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("add collaborator");
+
+    // Collaborator: Read / Steer & edit pass on the same connection.
+    for (method, params) in member_calls(&ws_id) {
+        let (id, frame) = call(method, params);
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_ne!(v["error"]["code"], -32003, "collaborator {method}: {v}");
+        assert_ne!(
+            v["error"]["data"]["code"], "not-found",
+            "collaborator {method}: {v}"
+        );
+        match method {
+            "workspace.get" => {
+                assert_eq!(v["result"]["workspace"]["myRole"], "collaborator", "{v}");
+                assert_eq!(v["result"]["workspace"]["ownerPrincipalId"], primary.id.0);
+            }
+            "workspace.members.list" => {
+                let members = v["result"]["members"].as_array().expect("members");
+                assert_eq!(members.len(), 2, "{v}");
+                let me = members
+                    .iter()
+                    .find(|m| m["principalId"] == guest.id.0)
+                    .expect("guest row");
+                assert_eq!(me["role"], "collaborator");
+                assert_eq!(me["login"], "guest");
+                assert_eq!(me["displayName"], "Guest User");
+                assert!(me["addedAt"].is_string());
+                let owner = members
+                    .iter()
+                    .find(|m| m["principalId"] == primary.id.0)
+                    .expect("owner row");
+                assert_eq!(owner["role"], "owner");
+            }
+            "note.setContent" => assert!(v.get("error").is_none(), "{v}"),
+            "agent.sendMessage" => assert_eq!(v["result"]["success"], true, "{v}"),
+            // Past the guard: a title-only workspace has no worktree, so the
+            // push fails on git state (-32603), not on membership.
+            "git.push" => assert_eq!(v["error"]["code"], -32603, "{v}"),
+            _ => unreachable!(),
+        }
+    }
+
+    // Owner-only stays refused with -32003 for a collaborator member —
+    // including `agent.replaceMessages`, which would persist client-supplied
+    // user rows (and their `fromPrincipalId`) verbatim.
+    for (method, params) in [
+        (
+            "agent.delete",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        ),
+        (
+            "agent.replaceMessages",
+            json!({
+                "workspaceId": ws_id,
+                "agentId": agent_id,
+                "messages": [{ "role": "user", "contentBlocks": [{ "type": "text", "text": "forged" }] }],
+            }),
+        ),
+        ("workspace.export.start", json!({ "workspaceId": ws_id })),
+        (
+            "hook.cancel",
+            json!({ "workspaceId": ws_id, "hookId": "hook-none" }),
+        ),
+        (
+            "workspace.members.remove",
+            json!({ "workspaceId": ws_id, "principalId": primary.id.0 }),
+        ),
+    ] {
+        let (id, frame) = call(method, params);
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_eq!(v["error"]["code"], -32003, "collaborator {method}: {v}");
+        assert_eq!(v["error"]["message"], "Forbidden", "{v}");
+        assert!(v.get("result").is_none(), "{v}");
+    }
+
+    // `agent.update`: display metadata is a member edit; anything else
+    // (lifecycle, session, prompt, task, attachments) is owner-only.
+    let (id, frame) = call(
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "name": "Renamed by guest" } }),
+    );
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let v = reply(&mut ws, id).await;
+    assert!(
+        v.get("error").is_none(),
+        "collaborator agent.update name: {v}"
+    );
+    for changes in [
+        json!({ "status": "completed" }),
+        json!({ "systemPrompt": "you are owned" }),
+        json!({ "name": "ok", "sessionId": "forged" }),
+    ] {
+        let (id, frame) = call(
+            "agent.update",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": changes }),
+        );
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_eq!(
+            v["error"]["code"], -32003,
+            "protected agent.update {changes}: {v}"
+        );
+        assert!(v.get("result").is_none(), "{v}");
+    }
+
+    // The agent must belong to the supplied workspace: a collaborator of two
+    // workspaces cannot pair A's agent with B's id (turn side effects, seen
+    // markers and question dismissals all key on the workspace). The
+    // mismatch is `NotFound` on the agent, not `Forbidden`.
+    let other = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"workspace.create","params":{"title":"W3 Other"}}"#,
+    )
+    .await;
+    let other_ws_id = other["result"]["workspace"]["id"]
+        .as_str()
+        .expect("other workspace id")
+        .to_string();
+    srv.store
+        .add_workspace_member(
+            &WorkspaceId::from(other_ws_id.as_str()),
+            &guest.id,
+            WorkspaceRole::Collaborator,
+        )
+        .await
+        .expect("add collaborator to other");
+    for (method, params) in [
+        (
+            "agent.sendMessage",
+            json!({ "workspaceId": other_ws_id, "agentId": agent_id, "content": "cross" }),
+        ),
+        (
+            "agent.markSeen",
+            json!({ "workspaceId": other_ws_id, "agentId": agent_id, "messageId": "m-none" }),
+        ),
+        (
+            "agent.dismissQuestions",
+            json!({ "workspaceId": other_ws_id, "agentId": agent_id, "messageId": "m-none" }),
+        ),
+    ] {
+        let (id, frame) = call(method, params);
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_not_found(&v, &format!("cross-workspace {method}"));
+    }
+
+    // The collaborator's workspace channel: the member row is in the
+    // snapshot, and the owner's removal arrives as a `removedIds` delta.
+    let (id, frame) = call("workspace.subscribe", json!({}));
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let sub = reply(&mut ws, id).await;
+    let sub_id = sub["result"]["subscriptionId"]
+        .as_str()
+        .expect("subscriptionId")
+        .to_string();
+    let snapshot = push(&mut ws, "snapshot").await;
+    assert_eq!(snapshot["params"]["subscriptionId"], sub_id);
+    let rows = snapshot["params"]["snapshot"]
+        .as_array()
+        .expect("snapshot workspaces");
+    assert!(
+        rows.iter().any(|w| w["id"] == ws_id),
+        "member row missing from snapshot: {snapshot}"
+    );
+    assert!(
+        rows.iter().all(|w| w["myRole"] == "collaborator"),
+        "snapshot must carry only member rows: {snapshot}"
+    );
+
+    let removed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"workspace.members.remove","params":{{"workspaceId":"{ws_id}","principalId":"{}"}}}}"#,
+            guest.id.0
+        ),
+    )
+    .await;
+    assert_eq!(removed["result"]["removed"], true, "{removed}");
+
+    let delta = push(&mut ws, "delta").await;
+    assert_eq!(delta["params"]["subscriptionId"], sub_id);
+    assert_eq!(
+        delta["params"]["delta"]["removedIds"],
+        json!([ws_id]),
+        "unshare delta: {delta}"
+    );
+
+    let (id, frame) = call("workspace.get", json!({ "workspaceId": ws_id }));
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let after = reply(&mut ws, id).await;
+    assert_not_found(&after, "removed member workspace.get");
+    drop(ws);
+
+    // Idempotent no-op on a non-member; the owner row cannot be removed.
+    let again = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"workspace.members.remove","params":{{"workspaceId":"{ws_id}","principalId":"{}"}}}}"#,
+            guest.id.0
+        ),
+    )
+    .await;
+    assert_eq!(again["result"]["removed"], false, "{again}");
+    let owner_row = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"workspace.members.remove","params":{{"workspaceId":"{ws_id}","principalId":"{}"}}}}"#,
+            primary.id.0
+        ),
+    )
+    .await;
+    assert_eq!(owner_row["error"]["code"], -32602, "{owner_row}");
+    assert_eq!(owner_row["error"]["data"]["code"], "invalid-params");
+    let roster = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"workspace.members.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        roster["result"]["members"]
+            .as_array()
+            .expect("members")
+            .len(),
+        1,
+        "{roster}"
+    );
+
+    srv.ws.stop().await;
+}
+
+/// Multiplayer w3: a collaborator's `clientId` is a principal-scoped handle,
+/// never an identity. Two collaborators of one workspace: B observes A's
+/// `clientId` on A's `draft:changed`, re-hellos with it, and still cannot
+/// read, overwrite, or clear A's draft — the hello lands in B's own namespace
+/// and A's draft is untouched. A collaborator hello advertising `browserExec`
+/// never shows up in the administrator's `client.list` either.
+#[tokio::test]
+async fn wss_collaborator_client_ids_are_principal_scoped() {
+    use intent_core::{Principal, PrincipalId, WorkspaceRole};
+    use serde_json::json;
+
+    type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
+
+    async fn rpc(ws: &mut Ws, id: u64, method: &str, params: Value) -> Value {
+        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        ws.send(Message::Text(frame.to_string().into()))
+            .await
+            .expect("send");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == id {
+                            return v;
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{method} reply within 10s"))
+    }
+
+    async fn event(ws: &mut Ws, ty: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event" && v["params"]["event"]["type"] == ty {
+                            return v["params"]["event"].clone();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{ty} event within 10s"))
+    }
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", json!("auggie"));
+
+    // Owner side: a workspace and one agent the drafts hang off.
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"W3 Drafts"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let agent = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Drafted"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = agent["result"]["agent"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("agent id: {agent}"))
+        .to_string();
+
+    // Two collaborators with their own credentials.
+    let mut principals = Vec::new();
+    for (login, token) in [
+        (
+            "alice",
+            "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        ),
+        (
+            "bob",
+            "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        ),
+    ] {
+        let principal = Principal {
+            id: PrincipalId::new(),
+            github_user_id: None,
+            login: Some(login.to_string()),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        srv.store.upsert_principal(&principal).await.expect(login);
+        srv.store
+            .insert_principal_credential(&principal.id, &sha256_hex(token.as_bytes()))
+            .await
+            .expect("credential");
+        srv.store
+            .add_workspace_member(
+                &WorkspaceId::from(ws_id.as_str()),
+                &principal.id,
+                WorkspaceRole::Collaborator,
+            )
+            .await
+            .expect("add collaborator");
+        let url = format!("wss://localhost:{}/ws?token={token}", srv.port);
+        let ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+        principals.push((principal, ws));
+    }
+    let (bob, mut b) = principals.pop().expect("bob");
+    let (alice, mut a) = principals.pop().expect("alice");
+
+    // Alice hellos with a self-chosen id; the daemon hands back the scoped one.
+    let hello = rpc(
+        &mut a,
+        10,
+        "client.hello",
+        json!({ "clientId": "shared-cli", "name": "Alice", "capabilities": { "browserExec": true } }),
+    )
+    .await;
+    assert!(hello.get("error").is_none(), "{hello}");
+    let alice_cid = format!("{}:shared-cli", alice.id.as_str());
+    assert_eq!(hello["result"]["clientId"], alice_cid, "{hello}");
+    // Re-hello with the returned id is stable (the FE persists it).
+    let again = rpc(&mut a, 11, "client.hello", json!({ "clientId": alice_cid })).await;
+    assert_eq!(again["result"]["clientId"], alice_cid, "{again}");
+
+    // Bob watches draft:changed in the shared workspace.
+    let sub = rpc(
+        &mut b,
+        20,
+        "events.subscribe",
+        json!({ "eventTypes": ["draft:changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub.get("error").is_none(), "{sub}");
+
+    let draft = json!({ "workspaceId": ws_id, "agentId": agent_id });
+    let set = rpc(
+        &mut a,
+        12,
+        "drafts.set",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "text": "alice draft" }),
+    )
+    .await;
+    assert_eq!(set["result"]["ok"], true, "{set}");
+    let seen = event(&mut b, "draft:changed").await;
+    assert_eq!(seen["data"]["clientId"], alice_cid, "{seen}");
+    assert_eq!(seen["data"]["hasDraft"], true, "{seen}");
+    let observed = seen["data"]["clientId"].as_str().unwrap().to_string();
+
+    // Bob re-hellos as the observed id: it lands in Bob's namespace.
+    let spoof = rpc(
+        &mut b,
+        21,
+        "client.hello",
+        json!({ "clientId": observed, "capabilities": { "browserExec": true } }),
+    )
+    .await;
+    assert!(spoof.get("error").is_none(), "{spoof}");
+    let bob_cid = format!("{}:{alice_cid}", bob.id.as_str());
+    assert_eq!(spoof["result"]["clientId"], bob_cid, "{spoof}");
+
+    // Bob cannot read, overwrite, or clear Alice's draft.
+    let get = rpc(&mut b, 22, "drafts.get", draft.clone()).await;
+    assert_eq!(
+        get["result"],
+        Value::Null,
+        "Bob never sees Alice's draft: {get}"
+    );
+    let set = rpc(
+        &mut b,
+        23,
+        "drafts.set",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "text": "bob draft" }),
+    )
+    .await;
+    assert_eq!(set["result"]["ok"], true, "{set}");
+    let mine = rpc(&mut a, 13, "drafts.get", draft.clone()).await;
+    assert_eq!(mine["result"]["text"], "alice draft", "{mine}");
+    let clear = rpc(&mut b, 24, "drafts.clear", draft.clone()).await;
+    assert_eq!(clear["result"]["ok"], true, "{clear}");
+    let mine = rpc(&mut a, 14, "drafts.get", draft.clone()).await;
+    assert_eq!(mine["result"]["text"], "alice draft", "{mine}");
+    let bobs = rpc(&mut b, 25, "drafts.get", draft).await;
+    assert_eq!(bobs["result"], Value::Null, "{bobs}");
+
+    // Collaborator hellos advertising browserExec never reach the
+    // administrator's client roster.
+    let listed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"client.list","params":{}}"#,
+    )
+    .await;
+    let clients = listed["result"]["clients"]
+        .as_array()
+        .unwrap_or_else(|| panic!("clients array: {listed}"));
+    assert!(
+        clients.iter().all(|c| {
+            let id = c["clientId"].as_str().unwrap_or_default();
+            id != "shared-cli" && id != alice_cid && id != bob_cid
+        }),
+        "collaborator hellos must not be listed as clients: {listed}"
+    );
+
+    drop(a);
+    drop(b);
+    srv.ws.stop().await;
+}
+
+/// Multiplayer w3: a connection bound to a non-administrator principal may
+/// call only the vetted `COLLABORATOR_METHODS`; everything else is refused
+/// before dispatch with the forbidden error (`-32003`, docs/protocol §9).
+/// The happy-path client boot trace (`client.hello`, `system.capabilities`,
+/// `host.status`, `principal.me`, `workspace.list`, `events.subscribe`,
+/// `workspace.subscribe`) succeeds; `host.exec`, `browser.exec`,
+/// `forward.create`, `github.authStatus`, `mcp.servers.list` are refused;
+/// the alias `git.diff` is canonicalised to `git.diffs` before the lookup
+/// (allowed, so it reaches the router and fails on params, not on -32003);
+/// a `/tunnel` upgrade with the collaborator credential is refused (403). The
+/// legacy token keeps the administrator's unrestricted surface.
+#[tokio::test]
+async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
+    use intent_core::{Principal, PrincipalId};
+    use serde_json::json;
+
+    async fn reply(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        id: u64,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == id {
+                            return v;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("reply within 10s")
+    }
+
+    let srv = start(WsOptions::default()).await;
+
+    let guest_token = "dcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    srv.store.upsert_principal(&guest).await.expect("guest");
+    srv.store
+        .insert_principal_credential(&guest.id, &sha256_hex(guest_token.as_bytes()))
+        .await
+        .expect("guest credential");
+
+    // One collaborator connection; each frame gets its own id so the reply
+    // can be matched even when a subscription snapshot arrives in between.
+    let url = format!("wss://localhost:{}/ws?token={guest_token}", srv.port);
+    let mut ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+    let mut next_id = 0u64;
+    let mut call = |method: &str, params: Value| {
+        next_id += 1;
+        let id = next_id;
+        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        (id, frame.to_string())
+    };
+
+    // Happy-path boot trace: every call succeeds.
+    for (method, params) in [
+        (
+            "client.hello",
+            json!({ "clientId": "w3-guest", "name": "guest fe", "capabilities": {} }),
+        ),
+        ("system.capabilities", json!({})),
+        ("host.status", json!({})),
+        ("principal.me", json!({})),
+        ("workspace.list", json!({})),
+        (
+            "events.subscribe",
+            json!({ "eventTypes": ["workspace:updated"] }),
+        ),
+        ("workspace.subscribe", json!({})),
+    ] {
+        let (id, frame) = call(method, params);
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert!(
+            v.get("error").is_none(),
+            "{method} must succeed for a collaborator: {v}"
+        );
+    }
+
+    // Owner-only methods are refused before dispatch with -32003.
+    for (method, params) in [
+        ("host.exec", json!({ "command": "true" })),
+        (
+            "browser.exec",
+            json!({ "actions": [{ "action": "listTabs" }] }),
+        ),
+        (
+            "forward.create",
+            json!({ "workspaceId": WorkspaceId::new().0, "port": 3000 }),
+        ),
+        ("github.authStatus", json!({})),
+        ("mcp.servers.list", json!({})),
+        ("settings.get", json!({ "key": "theme" })),
+        ("workspace.create", json!({ "path": "/nonexistent/w3" })),
+    ] {
+        let (id, frame) = call(method, params);
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(
+            v["error"]["code"], -32003,
+            "{method} must be refused for a collaborator: {v}"
+        );
+        assert!(v.get("result").is_none(), "{v}");
+    }
+
+    // The alias `git.diff` is canonicalised to `git.diffs` (allowed): it is
+    // not refused by the allowlist, so it reaches the router and fails on its
+    // params (unknown workspace) rather than with -32003.
+    let (id, frame) = call("git.diff", json!({ "workspaceId": WorkspaceId::new().0 }));
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let v = reply(&mut ws, id).await;
+    assert_ne!(
+        v["error"]["code"], -32003,
+        "git.diff must classify like git.diffs (allowed): {v}"
+    );
+    drop(ws);
+
+    // `/tunnel` is owner-only: the upgrade is refused (403) for a
+    // per-principal credential, while `/ws` with the same credential was
+    // accepted above.
+    let resp = https_request(
+        srv.port,
+        srv.cfg.clone(),
+        &upgrade_req("/tunnel", None, Some(guest_token)),
+    )
+    .await;
+    assert_eq!(
+        status_code(&resp),
+        403,
+        "collaborator /tunnel upgrade: {resp}"
+    );
+
+    // The administrator's connection keeps the unrestricted surface.
+    let admin = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.authStatus","params":{}}"#,
+    )
+    .await;
+    assert_ne!(
+        admin["error"]["code"], -32003,
+        "administrator must not be allowlisted: {admin}"
+    );
+
+    srv.ws.stop().await;
+}
+
+/// Multiplayer w3: non-administrators receive only vetted event types, live
+/// and durable. A collaborator subscribed to the `note:*` / `terminal:*` /
+/// `host:*` categories on a workspace it is a member of receives
+/// `note:updated` but never `terminal:data`, `host:exec:stdout` or
+/// `terminal:exit` while the owner drives all four through the bus; the
+/// owner's identical subscription still sees every one. `event.query` from
+/// the collaborator returns no excluded rows (an explicit `terminal:*` filter
+/// yields `[]`) while the administrator's query returns them all.
+#[tokio::test]
+async fn wss_collaborator_event_fan_out_and_query_are_allowlisted() {
+    use intent_core::events::{HOST_EXEC_STDOUT, NOTE_UPDATED, TERMINAL_DATA, TERMINAL_EXIT};
+    use intent_core::{ActorType, EventActor, Principal, PrincipalId, WorkspaceRole};
+    use intent_store::NewEvent;
+    use serde_json::json;
+
+    type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
+
+    async fn reply(ws: &mut Ws, id: u64) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == id {
+                            return v;
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("reply within 10s")
+    }
+
+    /// Collect delivered `events.event` types until `until` arrives.
+    async fn delivered_until(ws: &mut Ws, until: &str) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut types = Vec::new();
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] != "events.event" {
+                            continue;
+                        }
+                        let ty = v["params"]["event"]["type"]
+                            .as_str()
+                            .expect("event type")
+                            .to_string();
+                        let done = ty == until;
+                        types.push(ty);
+                        if done {
+                            return types;
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {until}"))
+    }
+
+    let srv = start(WsOptions::default()).await;
+    let ws_id = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws_id))
+        .await
+        .expect("insert workspace");
+
+    let guest_token = "ececececececececececececececececececececececececececececececececec";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    srv.store.upsert_principal(&guest).await.expect("guest");
+    srv.store
+        .insert_principal_credential(&guest.id, &sha256_hex(guest_token.as_bytes()))
+        .await
+        .expect("guest credential");
+    srv.store
+        .add_workspace_member(&ws_id, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("add collaborator");
+
+    // Collaborator: the patterns name owner-only categories too; the
+    // subscription is still accepted.
+    let guest_url = format!("wss://localhost:{}/ws?token={guest_token}", srv.port);
+    let mut guest_ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &guest_url).await;
+    let sub = json!({ "jsonrpc": "2.0", "id": 1, "method": "events.subscribe",
+        "params": { "eventTypes": ["note:*", "terminal:*", "host:*"], "workspaceId": ws_id.0 } });
+    guest_ws
+        .send(Message::Text(sub.to_string().into()))
+        .await
+        .expect("send");
+    let v = reply(&mut guest_ws, 1).await;
+    assert!(
+        v["result"]["subscriptionId"].is_string(),
+        "collaborator subscribe returns an id whatever the patterns: {v}"
+    );
+
+    // Owner (legacy token): the same subscription as a positive control.
+    let mut owner_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    owner_ws
+        .send(Message::Text(sub.to_string().into()))
+        .await
+        .expect("send");
+    let v = reply(&mut owner_ws, 1).await;
+    assert!(v["result"]["subscriptionId"].is_string(), "{v}");
+
+    // The owner drives three excluded types and then one allowlisted type.
+    // `publish` resolves after the durable commit + broadcast, so delivery
+    // order matches publish order and `note:updated` is last.
+    let event = |event_type: &str, data: Value| NewEvent {
+        workspace_id: ws_id.clone(),
+        timestamp: now_iso(),
+        event_type: event_type.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::User,
+            id: Some("owner".to_string()),
+            ..Default::default()
+        },
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    };
+    for (ty, data) in [
+        (
+            TERMINAL_DATA,
+            json!({ "terminalId": "t-1", "data": "secret" }),
+        ),
+        (
+            HOST_EXEC_STDOUT,
+            json!({ "execId": "x-1", "chunk": "secret" }),
+        ),
+        (TERMINAL_EXIT, json!({ "terminalId": "t-1", "exitCode": 0 })),
+        (
+            NOTE_UPDATED,
+            json!({ "noteId": "spec", "action": "update" }),
+        ),
+    ] {
+        srv.bus.publish(&event(ty, data)).await.expect("publish");
+    }
+
+    assert_eq!(
+        delivered_until(&mut owner_ws, NOTE_UPDATED).await,
+        vec![TERMINAL_DATA, HOST_EXEC_STDOUT, TERMINAL_EXIT, NOTE_UPDATED],
+        "the owner's subscription sees every type"
+    );
+    assert_eq!(
+        delivered_until(&mut guest_ws, NOTE_UPDATED).await,
+        vec![NOTE_UPDATED],
+        "the collaborator's subscription sees only allowlisted types"
+    );
+
+    // Durable reads: the owner sees all four rows; the collaborator's query
+    // is narrowed to the allowlist, and an explicit excluded filter is empty.
+    let query = |id: u64, params: Value| {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "event.query", "params": params }).to_string()
+    };
+    let types_of = |rows: &Value| -> Vec<String> {
+        rows.as_array()
+            .unwrap_or_else(|| panic!("rows array: {rows}"))
+            .iter()
+            .map(|e| e["type"].as_str().expect("type").to_string())
+            .collect()
+    };
+
+    owner_ws
+        .send(Message::Text(
+            query(2, json!({ "workspaceId": ws_id.0 })).into(),
+        ))
+        .await
+        .expect("send");
+    let owner_rows = reply(&mut owner_ws, 2).await;
+    let mut owner_types = types_of(&owner_rows["result"]);
+    owner_types.sort_unstable();
+    assert_eq!(
+        owner_types,
+        vec![HOST_EXEC_STDOUT, NOTE_UPDATED, TERMINAL_DATA, TERMINAL_EXIT],
+        "administrator event.query returns every persisted row: {owner_rows}"
+    );
+
+    guest_ws
+        .send(Message::Text(
+            query(2, json!({ "workspaceId": ws_id.0 })).into(),
+        ))
+        .await
+        .expect("send");
+    let guest_rows = reply(&mut guest_ws, 2).await;
+    assert!(guest_rows.get("error").is_none(), "{guest_rows}");
+    assert_eq!(
+        types_of(&guest_rows["result"]),
+        vec![NOTE_UPDATED],
+        "collaborator event.query returns no excluded rows: {guest_rows}"
+    );
+
+    guest_ws
+        .send(Message::Text(
+            query(
+                3,
+                json!({ "workspaceId": ws_id.0, "eventType": "terminal:*" }),
+            )
+            .into(),
+        ))
+        .await
+        .expect("send");
+    let filtered = reply(&mut guest_ws, 3).await;
+    assert_eq!(
+        filtered["result"],
+        json!([]),
+        "an excluded-only filter yields no rows for a collaborator: {filtered}"
+    );
+
+    drop(guest_ws);
+    drop(owner_ws);
+    srv.ws.stop().await;
+}
+
 /// Multiplayer w2: every human-authored chat entry is stamped with the wire
 /// caller's principal — `agent.sendMessage` (direct persist),
 /// `agent.appendMessage` (`user` role) and `agent.queueMessage` (queue entry
@@ -2540,7 +3587,7 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
 /// author; a non-user role never gets a stamp.
 #[tokio::test]
 async fn wss_user_messages_stamp_principal_and_serve_author() {
-    use intent_core::{Principal, PrincipalId};
+    use intent_core::{Principal, PrincipalId, WorkspaceRole};
 
     async fn next_event(
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
@@ -2637,6 +3684,14 @@ async fn wss_user_messages_stamp_principal_and_serve_author() {
         .expect("agent id")
         .to_string();
     let agent = intent_core::AgentId::from_string(agent_id.clone());
+
+    // Multiplayer w3: the guest must be a member before it may steer the
+    // workspace's agents (a non-member's `agent.sendMessage` is `NotFound`).
+    let ws_id_typed = WorkspaceId::from(ws_id.as_str());
+    srv.store
+        .add_workspace_member(&ws_id_typed, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("add collaborator");
 
     // A pre-multiplayer row: persisted straight into the store with no
     // stamp, before any wire write.

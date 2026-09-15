@@ -8,10 +8,128 @@
 //! `ws-sub-<n>` id counter, and the `events.event` notification envelope). The
 //! connection orchestration that consumes these lives in [`crate::listener`].
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use intent_core::Event;
+use intent_core::events::WORKSPACE_UPDATED;
+use intent_core::{Caller, Event, PrincipalId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Map, Value};
+
+/// Delivery-time membership boundary for a non-administrator connection's
+/// raw `events.subscribe` stream and its per-agent `chat` channel
+/// (multiplayer w3). The bus filter only narrows event *types*; this gate
+/// decides, per event, whether the subscriber may see the event's
+/// *workspace*, by re-reading it through the API under the subscriber's
+/// caller (`workspace.get` is `NotFound` for a non-member). Verdicts are
+/// cached per workspace for [`Self::TTL`] so a busy stream costs one read
+/// per workspace per window, and an unshare
+/// (`workspace:updated { changes: { members, removedPrincipalId } }`)
+/// invalidates the entry immediately: the removed member sees that one
+/// event as its final notification and nothing after it.
+pub(crate) struct MembershipGate {
+    api: Arc<dyn WorkspaceApi>,
+    principal_id: PrincipalId,
+    verdicts: HashMap<String, (bool, Instant)>,
+}
+
+impl MembershipGate {
+    const TTL: Duration = Duration::from_secs(30);
+
+    /// A gate for the current request's caller, or `None` when the caller is
+    /// an administrator (or unbound): those connections see every workspace.
+    pub(crate) fn for_current_caller(api: &Arc<dyn WorkspaceApi>) -> Option<Self> {
+        match crate::context::current_caller() {
+            Some(Caller::Wire {
+                principal_id,
+                is_administrator: false,
+            }) => Some(Self {
+                api: Arc::clone(api),
+                principal_id,
+                verdicts: HashMap::new(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The `changes.removedPrincipalId` of an unshare event, if any.
+    fn unshared_principal(event: &Event) -> Option<&str> {
+        if event.event_type != WORKSPACE_UPDATED {
+            return None;
+        }
+        event
+            .data
+            .get("changes")
+            .and_then(|c| c.get("removedPrincipalId"))
+            .and_then(Value::as_str)
+    }
+
+    /// Whether `event` names a membership change (add or remove) of its
+    /// workspace — the cached verdict for that workspace is stale.
+    fn is_membership_change(event: &Event) -> bool {
+        event.event_type == WORKSPACE_UPDATED
+            && event
+                .data
+                .get("changes")
+                .and_then(|c| c.get("members"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    }
+
+    /// Whether `event` is the subscriber's own removal from its workspace.
+    pub(crate) fn is_own_unshare(&self, event: &Event) -> bool {
+        Self::unshared_principal(event) == Some(self.principal_id.as_str())
+    }
+
+    /// Forget the verdict for a workspace whose membership just changed. Fed
+    /// by the side subscription on `workspace:updated`, so a removal takes
+    /// effect even when the subscriber's own patterns exclude that type.
+    pub(crate) fn observe_membership_event(&mut self, event: &Event) {
+        if !Self::is_membership_change(event) {
+            return;
+        }
+        let workspace_id = event.workspace_id.as_str();
+        if self.is_own_unshare(event) {
+            self.verdicts
+                .insert(workspace_id.to_string(), (false, Instant::now()));
+        } else {
+            self.verdicts.remove(workspace_id);
+        }
+    }
+
+    /// Whether the subscriber may receive `event`.
+    pub(crate) async fn allows(&mut self, event: &Event) -> bool {
+        let workspace_id = event.workspace_id.as_str();
+        if workspace_id.is_empty() {
+            // Every collaborator-visible type is workspace-scoped; a global
+            // event reaching here has nothing to authorize against.
+            return false;
+        }
+        if self.is_own_unshare(event) {
+            // The removed member's own final notification.
+            self.verdicts
+                .insert(workspace_id.to_string(), (false, Instant::now()));
+            return true;
+        }
+        if Self::is_membership_change(event) {
+            self.verdicts.remove(workspace_id);
+        }
+        if let Some((allowed, at)) = self.verdicts.get(workspace_id) {
+            if at.elapsed() < Self::TTL {
+                return *allowed;
+            }
+        }
+        let allowed = self
+            .api
+            .get_workspace(WorkspaceId::from(workspace_id))
+            .await
+            .is_ok();
+        self.verdicts
+            .insert(workspace_id.to_string(), (allowed, Instant::now()));
+        allowed
+    }
+}
 
 /// The `id` member of a fast-path request: whether it was present (a response is
 /// only sent for requests, not notifications) and the value to echo (`id ?? null`).

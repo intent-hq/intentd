@@ -8,11 +8,58 @@
 
 use std::collections::{HashMap, HashSet};
 
-use intent_core::events::{AGENT_TOOL_CALL, FILE_CHANGED};
-use intent_core::{
-    ActorType, AgentActivity, Event, FileActivity, TopChangedFile, WorkspaceEventSummary,
+use intent_core::events::{
+    is_collaborator_event_type, AGENT_TOOL_CALL, COLLABORATOR_EVENT_TYPES, FILE_CHANGED,
 };
+use intent_core::{
+    ActorType, AgentActivity, Caller, Event, FileActivity, TopChangedFile, WorkspaceEventSummary,
+};
+use intent_store::EventQuery;
 use serde_json::Value;
+
+/// Whether the current request is bound to a **non-administrator** wire
+/// caller — a collaborator connection whose durable event reads are narrowed
+/// to [`COLLABORATOR_EVENT_TYPES`] (multiplayer w3). Agents and the daemon
+/// act on their own authority (their reads are governed by the agent
+/// subscription rules, not the collaborator allowlist); an unbound request is
+/// never a collaborator here because the transport binds every wire caller.
+pub(crate) fn is_collaborator_caller() -> bool {
+    matches!(
+        intent_core::current_caller(),
+        Some(Caller::Wire {
+            is_administrator: false,
+            ..
+        })
+    )
+}
+
+/// Narrow a durable event read to the collaborator allowlist when the caller
+/// is a collaborator ([`is_collaborator_caller`]); a no-op for everyone
+/// else. The narrowing is pushed into the SQL type filter so paging and
+/// limits stay exact: an explicit type list keeps only allowlisted entries,
+/// a `prefix:*` category is expanded to the allowlisted types under it, and
+/// an unfiltered query becomes the whole allowlist. Returns `false` when the
+/// narrowed query can match nothing (the caller should return an empty
+/// result without hitting the store).
+pub(crate) fn narrow_query_for_caller(q: &mut EventQuery) -> bool {
+    if !is_collaborator_caller() {
+        return true;
+    }
+    if !q.event_types.is_empty() {
+        q.event_types
+            .retain(|t| is_collaborator_event_type(t.as_str()));
+        return !q.event_types.is_empty();
+    }
+    let allowed = COLLABORATOR_EVENT_TYPES.iter().map(|(t, _)| *t);
+    q.event_types = match q.event_type_prefix.take() {
+        Some(prefix) => allowed
+            .filter(|t| t.starts_with(prefix.as_str()))
+            .map(str::to_string)
+            .collect(),
+        None => allowed.map(str::to_string).collect(),
+    };
+    !q.event_types.is_empty()
+}
 
 /// The lowercase wire string for an [`ActorType`] (matches the serde form).
 fn actor_type_str(actor_type: ActorType) -> &'static str {

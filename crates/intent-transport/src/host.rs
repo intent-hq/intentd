@@ -229,6 +229,22 @@ pub(crate) async fn handle_with_host_environment(
         id_echo,
         params,
     } = req;
+    // Owner-only host surface (multiplayer w3): a non-administrator connection
+    // may only reach the two display probes the desktop needs to render
+    // (`host.status`, `host.toolAvailability` — no paths, nothing runs); every
+    // other `host.*` method gets `-32003`. The allowlist in `process_frame`
+    // refuses these first; this is the defence-in-depth gate at the surface.
+    if crate::context::is_non_administrator_caller()
+        && !matches!(method, HostMethod::Status | HostMethod::ToolAvailability)
+    {
+        return id_present.then(|| {
+            error_frame(
+                &id_echo,
+                crate::catalog::FORBIDDEN_ERROR_CODE,
+                crate::catalog::FORBIDDEN_ERROR_MESSAGE,
+            )
+        });
+    }
     let frame = match method {
         HostMethod::Status => {
             let hostname = host_environment
