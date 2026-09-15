@@ -500,9 +500,17 @@
 //! carry the additive `url` — the open invite's `intent://invite?…` link
 //! rebuilt from the stored secret — omitted when the row predates the
 //! stored secret or no link can be built right now (listener down, no
-//! dialable route); the secret itself never appears as a field. The catalog
-//! contains 324 router methods, 53 fast-path methods, and two aliases: 379
-//! client-callable names.
+//! dialable route); the secret itself never appears as a field. Also within
+//! 10.2, guest caps: `workspace.invite.create` refuses with
+//! `error.data.code` `guest-limit` once a workspace's collaborators plus
+//! open invites reach `sharing.maxGuestsPerWorkspace`, the join refuses with
+//! `workspace-full` (the invite stays open) once its collaborators do, and
+//! `workspace.members.list` carries the additive `guestCount` / `guestLimit`;
+//! a per-principal credential's `/ws` upgrade is refused with `503` while
+//! `sharing.maxGuestConnections` / `sharing.maxConnectionsPerGuest` are
+//! spent, and `GET /health` carries the additive `guestConnections`. The
+//! catalog contains 324 router methods, 53 fast-path methods, and two
+//! aliases: 379 client-callable names.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

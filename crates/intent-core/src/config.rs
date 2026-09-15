@@ -111,6 +111,23 @@ pub const DEFAULT_HOOKS_MAX_PER_AGENT: u32 = 5;
 /// (`server.maxOutstandingRpcs`); `0` means unlimited.
 pub const DEFAULT_SERVER_MAX_OUTSTANDING_RPCS: u32 = 256;
 
+/// Default for `sharing.maxGuestsPerWorkspace` — how many guests
+/// (collaborators plus open invites) one workspace admits besides its owner.
+pub const DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE: u32 = 10;
+
+/// Ceiling for `sharing.maxGuestsPerWorkspace`; `0` closes every workspace
+/// to guests.
+pub const MAX_SHARING_MAX_GUESTS_PER_WORKSPACE: u32 = 100;
+
+/// Default for `sharing.maxGuestConnections` — the listener-wide cap on
+/// concurrent WSS connections held by non-primary principals; `0` means
+/// unlimited. The primary credential is never counted.
+pub const DEFAULT_SHARING_MAX_GUEST_CONNECTIONS: u32 = 40;
+
+/// Default for `sharing.maxConnectionsPerGuest` — concurrent WSS connections
+/// one guest principal may hold; `0` means unlimited.
+pub const DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST: u32 = 4;
+
 /// Default for `wakeResume.enabled` — whether the daemon detects host
 /// sleep/wake and resumes work on wake. On by default.
 pub const DEFAULT_WAKE_RESUME_ENABLED: bool = true;

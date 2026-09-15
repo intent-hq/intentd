@@ -128,6 +128,9 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "prMonitor.debounceSeconds",
     "prMonitor.pollSeconds",
     "prMonitor.hourlyRequestBudget",
+    "sharing.maxGuestsPerWorkspace",
+    "sharing.maxGuestConnections",
+    "sharing.maxConnectionsPerGuest",
 ];
 
 /// Where a key's effective value comes from (lowest to highest precedence).
