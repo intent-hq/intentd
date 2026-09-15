@@ -79,6 +79,12 @@ pub(crate) const MAX_INVITE_MESSAGE_BYTES: usize = 16 * 1024;
 /// responses (its own `principal.revokeSelf` result) before the policy close.
 const REVOKE_FLUSH_GRACE: Duration = Duration::from_secs(5);
 
+/// `Retry-After` delta-seconds on the `503` that refuses a guest upgrade
+/// over a spent guest connection cap. A seat frees on a disconnect or a
+/// raised cap — neither predictable — so a fixed hint keeps refused guests
+/// from hammering the listener. Only the guest-cap refusal carries it.
+pub const GUEST_CAP_RETRY_AFTER_SECS: u64 = 30;
+
 /// Caps on WSS connections held by guests — connections admitted on a
 /// per-principal credential (`sharing.maxGuestConnections` /
 /// `sharing.maxConnectionsPerGuest`; `0` = unlimited). The primary
@@ -858,7 +864,7 @@ impl WsInner {
         let guest = match &credential {
             ResolvedCredential::Principal(principal_id) => {
                 let Some(admission) = self.guests.admit(principal_id) else {
-                    return reject(&mut stream, 503, "Service Unavailable").await;
+                    return reject_guest_cap_spent(&mut stream).await;
                 };
                 Some(admission)
             }
@@ -1436,8 +1442,33 @@ async fn reject<W>(stream: &mut W, code: u16, reason: &str) -> std::io::Result<(
 where
     W: AsyncWrite + Unpin,
 {
-    let response =
-        format!("HTTP/1.1 {code} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    reject_with_headers(stream, code, reason, "").await
+}
+
+/// The guest-cap refusal: `503` plus `Retry-After` (see
+/// [`GUEST_CAP_RETRY_AFTER_SECS`]). No other refusal carries the header.
+async fn reject_guest_cap_spent<W>(stream: &mut W) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let retry_after = format!("Retry-After: {GUEST_CAP_RETRY_AFTER_SECS}\r\n");
+    reject_with_headers(stream, 503, "Service Unavailable", &retry_after).await
+}
+
+/// Write a bodyless HTTP error status line (plus `extra_headers`, each
+/// CRLF-terminated) and destroy the socket.
+async fn reject_with_headers<W>(
+    stream: &mut W,
+    code: u16,
+    reason: &str,
+    extra_headers: &str,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let response = format!(
+        "HTTP/1.1 {code} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n{extra_headers}\r\n"
+    );
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     let _ = stream.shutdown().await;
