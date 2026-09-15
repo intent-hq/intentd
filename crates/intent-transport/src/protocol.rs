@@ -489,8 +489,8 @@
 //! codes; `{ flowId }` → the collaborator credential once). Invite refusals
 //! carry `error.data.code` (`invite-expired`, `invite-revoked`,
 //! `invite-redeemed`, `invite-pin-mismatch`, `invite-flow-denied`, …). The
-//! catalog contains 311 router methods, 51 fast-path methods, and two
-//! aliases: 364 client-callable names.
+//! catalog contains 322 router methods, 51 fast-path methods, and two
+//! aliases: 375 client-callable names.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
