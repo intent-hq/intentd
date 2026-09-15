@@ -348,6 +348,9 @@ impl InviteLinkBuilder for InviteLinkResolver {
 /// (`{ invite, secret }`) extended with `url`, `hosts`, `port`,
 /// `fingerprint`, `version` and the additive `tcAddress`. Owner-only in the
 /// service layer (`-32003` otherwise); the secret appears exactly once, here.
+/// The envelope is resolved exactly once per create and the one link it
+/// formats is stamped as both the top-level `url` and `invite.url`, so the
+/// two are identical by construction.
 pub(crate) async fn handle_create(
     req: InviteRequest,
     api: &Arc<dyn WorkspaceApi>,
@@ -380,6 +383,11 @@ async fn create_json(
         .ok_or_else(|| Error::Internal("invite result carries no secret".to_string()))?
         .to_string();
     let url = envelope.invite_url(&invite_id, &secret);
+    result
+        .pointer_mut("/invite")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| Error::Internal("invite result carries no invite object".to_string()))?
+        .insert("url".into(), url.clone().into());
     let obj = result
         .as_object_mut()
         .ok_or_else(|| Error::Internal("invite result is not an object".to_string()))?;

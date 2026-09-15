@@ -258,6 +258,89 @@ async fn link_resolver_rebuilds_the_minted_link_and_is_none_when_undialable() {
         .is_none());
 }
 
+/// Service half of `workspace.invite.create`: answers `{ invite, secret }`
+/// with no `url` (the transport stamps it) and counts its calls.
+struct CreateStub {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl WorkspaceApi for CreateStub {
+    fn workspace_invite_create(
+        &self,
+        workspace_id: WorkspaceId,
+        _pin_login: Option<String>,
+        _expires_in_secs: Option<u64>,
+    ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            Ok(json!({
+                "invite": { "id": "inv-1", "workspaceId": workspace_id },
+                "secret": "s3cret",
+            }))
+        })
+    }
+}
+
+/// `create` resolves the envelope once and stamps the one link it formats
+/// as both the top-level `url` and `invite.url`; when no link can be built
+/// (listener down) the create is refused before the service mints anything,
+/// so neither `url` can exist without the other.
+#[tokio::test]
+async fn create_stamps_the_same_link_as_url_and_invite_url() {
+    let stub = Arc::new(CreateStub {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let api: Arc<dyn WorkspaceApi> = stub.clone();
+    let create_req = || {
+        classify(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "workspace.invite.create",
+            "params": { "workspaceId": "ws" }
+        }))
+        .unwrap()
+    };
+
+    let (provider, _dir) = stub_provider(Some(7443), Some("tc-abc"));
+    let frame: Value = serde_json::from_str(
+        &handle_create(create_req(), &api, Some(&provider))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(frame.get("error").is_none(), "{frame}");
+    let r = &frame["result"];
+    let url = r["url"].as_str().expect("url");
+    assert_eq!(r["invite"]["url"], json!(url), "{r}");
+    assert_eq!(
+        url,
+        link_envelope(Some(&provider))
+            .await
+            .expect("envelope")
+            .invite_url("inv-1", "s3cret")
+    );
+    assert_eq!(r["secret"], json!("s3cret"));
+    assert_eq!(r["invite"]["id"], json!("inv-1"));
+    assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let (down, _dir) = stub_provider(None, Some("tc-abc"));
+    let frame: Value = serde_json::from_str(
+        &handle_create(create_req(), &api, Some(&down))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        frame["error"]["data"]["code"],
+        json!("listener-down"),
+        "{frame}"
+    );
+    assert!(frame.get("result").is_none(), "{frame}");
+    assert_eq!(
+        stub.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "nothing minted without an envelope"
+    );
+}
+
 #[test]
 fn non_invite_method_on_invite_endpoint_is_unauthorized() {
     let frame =
