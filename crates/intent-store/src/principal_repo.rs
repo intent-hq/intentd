@@ -764,18 +764,21 @@ impl Store {
     }
 
     /// Revoke an invite. Idempotent: returns whether the row flipped from
-    /// open to revoked (`false` when unknown, redeemed or already revoked).
+    /// open to revoked (`false` when unknown, redeemed, expired or already
+    /// revoked — a closed invite keeps its terminal state).
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn revoke_workspace_invite(&self, id: &str) -> Result<bool> {
+        let now = now_iso();
         let res = sqlx::query(
             "UPDATE workspace_invite SET revoked_at = ? \
-             WHERE id = ? AND redeemed_at IS NULL AND revoked_at IS NULL",
+             WHERE id = ? AND redeemed_at IS NULL AND revoked_at IS NULL AND expires_at > ?",
         )
-        .bind(now_iso())
+        .bind(&now)
         .bind(id)
+        .bind(&now)
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("revoke workspace invite failed: {e}")))?;

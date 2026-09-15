@@ -47,6 +47,11 @@ const MAX_CONSECUTIVE_POLL_ERRORS: u32 = github_auth_ops::MAX_CONSECUTIVE_POLL_E
 /// How long a settled flow's result stays collectable before it is dropped.
 const SETTLED_FLOW_GRACE: Duration = Duration::from_secs(120);
 
+/// How much longer a timed-out waiter stays attached once the poll task has
+/// started committing the join, so the one outcome carrying the credential
+/// is collected rather than dropped with the slot.
+const JOIN_COMMIT_GRACE: Duration = Duration::from_secs(30);
+
 /// Env override for the GitHub API base the identity flow's `GET /user`
 /// talks to — the spawned-daemon test seam (e2e points it at a local mock).
 /// Honored under the same loopback-or-https rule as the login host.
@@ -59,6 +64,9 @@ pub(crate) struct InviteFlowSlot {
     invite_id: String,
     deadline: Instant,
     settled_at: Option<Instant>,
+    /// Set once the grant is in hand and the join is being committed: a
+    /// waiter that times out meanwhile must not purge the slot.
+    committing: bool,
     outcome: Option<Result<Value>>,
     done: watch::Sender<bool>,
     /// The [`MAX_INFLIGHT_INVITE_FLOWS`] permit; released when the slot is
@@ -306,17 +314,20 @@ impl Services {
                     "the inviting GitHub identity changed while minting; retry".to_string(),
                 ));
             }
-            self.store.insert_workspace_invite(&invite).await?;
-        }
-        // The first invite of a workspace pins its legacy author: content
-        // authored before anyone else could have joined is the owner's.
-        if let Some(fallback) = self.store.get_workspace_author_fallback(&ws.id).await? {
-            if fallback.legacy_author_principal_id.is_none() {
-                let owner = fallback.owner_principal_id.unwrap_or(creator.id.clone());
-                self.store
-                    .set_workspace_legacy_author_principal_id(&ws.id, Some(&owner))
-                    .await?;
+            // The first invite of a workspace pins its legacy author:
+            // content authored before anyone else could have joined is the
+            // owner's. Pinned *before* the insert — the secret travels only
+            // in this response, so nothing fallible may follow the insert
+            // or a failure would leave an open link the owner never saw.
+            if let Some(fallback) = self.store.get_workspace_author_fallback(&ws.id).await? {
+                if fallback.legacy_author_principal_id.is_none() {
+                    let owner = fallback.owner_principal_id.unwrap_or(creator.id.clone());
+                    self.store
+                        .set_workspace_legacy_author_principal_id(&ws.id, Some(&owner))
+                        .await?;
+                }
             }
+            self.store.insert_workspace_invite(&invite).await?;
         }
         crate::publish_event(
             self.event_bus.as_ref(),
@@ -505,6 +516,7 @@ impl Services {
                 invite_id: invite.id.clone(),
                 deadline,
                 settled_at: None,
+                committing: false,
                 outcome: None,
                 done,
                 _permit: permit,
@@ -542,9 +554,26 @@ impl Services {
         let budget = deadline
             .saturating_duration_since(Instant::now())
             .saturating_add(Duration::from_secs(5));
-        let settled = tokio::time::timeout(budget, done.wait_for(|d| *d))
+        let mut settled = tokio::time::timeout(budget, done.wait_for(|d| *d))
             .await
             .is_ok_and(|r| r.is_ok());
+        // A timeout while the poll task is committing the join must not
+        // purge the slot: the grant is spent and the credential is (about to
+        // be) stored, and this outcome is the only copy of the token. Stay
+        // attached for the commit's grace and collect it.
+        if !settled {
+            let committing = {
+                let flows = self.invite_flows.lock().await;
+                flows
+                    .get(flow_id)
+                    .is_some_and(|slot| slot.committing && slot.outcome.is_none())
+            };
+            if committing {
+                settled = tokio::time::timeout(JOIN_COMMIT_GRACE, done.wait_for(|d| *d))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+            }
+        }
         let mut flows = self.invite_flows.lock().await;
         let Some(slot) = flows.remove(flow_id) else {
             return Err(Error::Invite(InviteErrorKind::FlowNotFound));
@@ -574,9 +603,16 @@ impl Services {
             match flow.poll_once().await {
                 Ok(IdentityPollStatus::Pending) => consecutive_errors = 0,
                 Ok(IdentityPollStatus::Authorized(user)) => {
+                    // Claim the slot for the commit under the lock: from
+                    // here a timed-out waiter keeps the slot (see
+                    // `invite_redeem_wait_op`) instead of dropping the
+                    // outcome that carries the credential.
                     let invite_id = {
-                        let flows = self.invite_flows.lock().await;
-                        flows.get(&flow_id).map(|s| s.invite_id.clone())
+                        let mut flows = self.invite_flows.lock().await;
+                        flows.get_mut(&flow_id).map(|s| {
+                            s.committing = true;
+                            s.invite_id.clone()
+                        })
                     };
                     let Some(invite_id) = invite_id else {
                         return;

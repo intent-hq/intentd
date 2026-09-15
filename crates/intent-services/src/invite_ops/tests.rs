@@ -630,6 +630,97 @@ async fn invite_lifecycle_create_list_revoke() {
     assert_ne!(listed["invites"][0]["id"], json!(id));
 }
 
+/// An expired invite is already closed: revoking it reports `false` and
+/// keeps its terminal state (no `revokedAt`).
+#[tokio::test]
+async fn revoke_leaves_an_expired_invite_expired() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(Some(3600)).await;
+    let mut expired = f
+        .store
+        .get_workspace_invite(&id_of(&created))
+        .await
+        .expect("get")
+        .expect("row");
+    expired.id = "expired".to_string();
+    expired.secret_hash = hash_secret("expired-secret");
+    expired.expires_at = "2000-01-01T00:00:00.000Z".to_string();
+    f.store
+        .insert_workspace_invite(&expired)
+        .await
+        .expect("insert expired");
+
+    let revoked = with_caller(
+        wire(&f.owner),
+        f.services.workspace_invite_revoke_op(&f.ws, "expired"),
+    )
+    .await
+    .expect("revoke expired");
+    assert_eq!(revoked, json!({ "revoked": false }));
+    let stored = f
+        .store
+        .get_workspace_invite("expired")
+        .await
+        .expect("get")
+        .expect("row");
+    assert!(stored.revoked_at.is_none());
+    assert_eq!(
+        closed_kind(&stored, &now_iso()),
+        Some(InviteErrorKind::Expired)
+    );
+}
+
+/// A waiter whose budget runs out while the poll task is committing the
+/// join stays attached and collects the outcome: the grant is spent and the
+/// credential stored, and this outcome is the only copy of the token.
+#[tokio::test]
+async fn timed_out_waiter_collects_a_committing_join() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let permit = f
+        .services
+        .invite_flow_permits
+        .clone()
+        .try_acquire_owned()
+        .expect("permit");
+    let (done, _) = watch::channel(false);
+    let flow_id = "committing-flow".to_string();
+    f.services.invite_flows.lock().await.insert(
+        flow_id.clone(),
+        InviteFlowSlot {
+            invite_id: "invite".to_string(),
+            deadline: Instant::now(),
+            settled_at: None,
+            committing: true,
+            outcome: None,
+            done,
+            _permit: permit,
+        },
+    );
+    let services = f.services.clone();
+    let settle = tokio::spawn({
+        let flow_id = flow_id.clone();
+        async move {
+            // Past the waiter's own budget (deadline + 5 s).
+            tokio::time::sleep(Duration::from_millis(5_500)).await;
+            let mut flows = services.invite_flows.lock().await;
+            let slot = flows.get_mut(&flow_id).expect("slot kept while committing");
+            slot.outcome = Some(Ok(json!({ "status": "authorized", "token": "t" })));
+            slot.settled_at = Some(Instant::now());
+            let _ = slot.done.send(true);
+        }
+    });
+    let outcome = f
+        .services
+        .invite_redeem_wait_op(&flow_id)
+        .await
+        .expect("outcome collected after the commit");
+    assert_eq!(outcome["token"], json!("t"));
+    settle.await.expect("settle task");
+    assert!(!f.services.invite_flows.lock().await.contains_key(&flow_id));
+}
+
 /// Owner-only: a collaborator cannot mint or list; an out-of-range TTL is
 /// `InvalidParams`; revoking an invite through another workspace is
 /// `NotFound`; an owner without a GitHub identity cannot mint.
