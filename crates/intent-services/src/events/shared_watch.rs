@@ -338,12 +338,29 @@ struct Root {
 /// being auto-watched for the ancestor), and unwatching it would strip them
 /// from the ancestor's coverage outright. Such a root is therefore always
 /// registered in the ancestor's mode and never unwatched while the ancestor
-/// survives. On macOS nested roots have distinct parents and so live in
-/// distinct groups; this never fires there.
+/// survives. On Linux an ancestor whose pruned walk skips `path` (a root
+/// under one of its noise subtrees, see [`prunes`]) holds no descriptor there
+/// and so does NOT cover it: such a root is registered in its own mode and
+/// unwatched normally, otherwise its descriptors would outlive its
+/// subscribers until the ancestor retired. On macOS nested roots have
+/// distinct parents and so live in distinct groups; this never fires there.
 fn covered_recursively(roots: &HashMap<PathBuf, Root>, path: &Path) -> bool {
-    roots
-        .iter()
-        .any(|(root, state)| state.recursive && root.as_path() != path && path.starts_with(root))
+    roots.iter().any(|(root, state)| {
+        state.recursive
+            && root.as_path() != path
+            && path.starts_with(root)
+            && !pruned_under(root, path)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn pruned_under(root: &Path, path: &Path) -> bool {
+    prunes(root, path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pruned_under(_root: &Path, _path: &Path) -> bool {
+    false
 }
 
 /// The mode `path` must be registered in: recursive when its own subscribers
@@ -1150,10 +1167,12 @@ impl PrunedWatches {
 
     /// Walk `start` (which lies under `root`, whose prune rules apply) and
     /// register one non-recursive descriptor per surviving directory,
-    /// returning how many. The walk aborts on a failure of `start` itself or
-    /// on `MaxFilesWatch` anywhere — coverage is genuinely lost and the caller
-    /// settles the root as failed, as `notify`'s own walk would; the
-    /// descriptors added so far stay tracked so an unwatch still releases
+    /// returning how many. `start` itself is registered first and outside the
+    /// walk, so a missing or unreadable `start` fails with the backend's own
+    /// error (the walk would merely yield nothing for it) and the caller
+    /// settles the root as failed, as `notify`'s own watch would. The walk
+    /// also aborts on `MaxFilesWatch` anywhere — coverage is genuinely lost;
+    /// the descriptors added so far stay tracked so an unwatch still releases
     /// them. Any other per-directory failure (vanished or unreadable
     /// directory) is skipped.
     #[cfg(target_os = "linux")]
@@ -1163,14 +1182,16 @@ impl PrunedWatches {
         root: &Path,
         start: &Path,
     ) -> notify::Result<usize> {
-        let mut count = 0;
-        for dir in pruned_dirs(root, start) {
+        watcher.watch(start, RecursiveMode::NonRecursive)?;
+        self.dirs.insert(start.to_path_buf());
+        let mut count = 1;
+        for dir in pruned_dirs(root, start).filter(|dir| dir != start) {
             match watcher.watch(&dir, RecursiveMode::NonRecursive) {
                 Ok(()) => {
                     self.dirs.insert(dir);
                     count += 1;
                 }
-                Err(e) if dir == start || matches!(e.kind, notify::ErrorKind::MaxFilesWatch) => {
+                Err(e) if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) => {
                     return Err(e);
                 }
                 Err(e) => {
@@ -2199,6 +2220,96 @@ mod tests {
                 "unwatch must release the descriptor for {rel:?}"
             );
         }
+    }
+
+    /// A recursive root that does not exist must settle as FAILED, as the
+    /// backend's own recursive watch did: the pruned walk yields nothing for
+    /// a missing start, and a registration settled live with zero
+    /// descriptors would bypass the caller's failed-registration recovery.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_missing_recursive_root_settles_as_failed() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("prune-missing");
+        let missing = base.path.join("ws");
+
+        let hub = SharedWatchHub::new();
+        let (sub, _rx, _) = hub.subscribe(&missing);
+        sub.wait_established(LIVENESS).await;
+        assert!(
+            sub.registration.settled(),
+            "registration must settle for a missing root"
+        );
+        assert!(
+            sub.registration.failed(),
+            "a missing recursive root must settle as failed, not live"
+        );
+    }
+
+    /// A root nested inside a noise subtree of a recursive co-tenant
+    /// (`ws/target/repo` under `ws`) shares no descriptors with it — the
+    /// co-tenant's walk pruned `target` — so it is not "covered": it must be
+    /// registered in its own mode and, when its last subscriber drops, be
+    /// unwatched outright rather than left holding (and growing) descriptors
+    /// until the outer root retires.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_root_under_a_pruned_subtree_is_retired_with_its_subscriber() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("prune-nested");
+        let ws = base.path.join("ws");
+        let nested = ws.join("target").join("repo");
+        std::fs::create_dir_all(nested.join("src")).expect("mk tree");
+        std::fs::create_dir_all(ws.join("src")).expect("mk src");
+
+        let hub = SharedWatchHub::new();
+        let (sub_ws, _rx_ws, ws) = hub.subscribe(&ws);
+        sub_ws.probe().wait_live(LIVENESS).await;
+        let nested = ws.join("target").join("repo");
+        assert!(
+            !inotify_watched_inodes().contains(&inode_of(&nested)),
+            "precondition: the outer root prunes target/"
+        );
+
+        let (sub_nested, mut rx_nested, _) = hub.subscribe(&nested);
+        sub_nested.probe().wait_live(LIVENESS).await;
+        let inodes = inotify_watched_inodes();
+        assert!(inodes.contains(&inode_of(&nested)), "nested root watched");
+        assert!(
+            inodes.contains(&inode_of(&nested.join("src"))),
+            "nested root's own walk covers its subtree"
+        );
+        assert!(
+            touch_until_seen(&mut rx_nested, &nested, "src/file.txt").await,
+            "the nested root delivers while subscribed"
+        );
+
+        drop(sub_nested);
+        for rel in ["", "src"] {
+            assert!(
+                wait_watched(&nested.join(rel), false).await,
+                "dropping the nested root's last subscriber must release {rel:?}"
+            );
+        }
+        // Nor does the registrar keep growing it: a directory created under
+        // the retired root lands under the outer root's pruned subtree and
+        // stays unwatched.
+        std::fs::create_dir_all(nested.join("later")).expect("mk later");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !inotify_watched_inodes().contains(&inode_of(&nested.join("later"))),
+            "no descriptors may be added under a retired nested root"
+        );
+        assert!(
+            sub_ws.registration.live(),
+            "the outer root is untouched by the nested root's retirement"
+        );
     }
 
     /// macOS keeps parent-directory grouping: the `FSEvents` stream rebuild on
