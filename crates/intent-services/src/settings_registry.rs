@@ -132,6 +132,9 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "updates.checkOnIdle",
     "updates.idleCheckIntervalMinutes",
     "updates.idleGraceSeconds",
+    "sharing.maxGuestsPerWorkspace",
+    "sharing.maxGuestConnections",
+    "sharing.maxConnectionsPerGuest",
 ];
 
 /// Where a key's effective value comes from (lowest to highest precedence).
