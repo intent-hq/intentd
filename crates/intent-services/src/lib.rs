@@ -27963,7 +27963,7 @@ impl WorkspaceApi for Services {
                 .map(|c| c.name.as_str())
                 .collect();
 
-            Ok(serde_json::json!({
+            let mut snapshot = serde_json::json!({
                 "repo": repo_slug,
                 "prNumber": pr_number,
                 "title": pr.title,
@@ -27992,14 +27992,20 @@ impl WorkspaceApi for Services {
                 "comments": {
                     "conversationCount": conversation_count,
                     "reviewCommentCount": review_comment_count,
-                    "unresolvedThreadCount": unresolved_thread_count,
                     "totalCount": conversation_count + review_comment_count,
                 },
                 // The merge-requirements checklist: the same object
                 // `ws.pr.monitor` returns and monitor wakes / list summaries
                 // carry.
                 "requirements": requirements,
-            }))
+            });
+            // Presence-detected like `requirements.threads.unresolved`: the
+            // key is omitted (never null or 0) when the per-thread
+            // resolution state was unreadable.
+            if let Some(count) = unresolved_thread_count {
+                snapshot["comments"]["unresolvedThreadCount"] = serde_json::json!(count);
+            }
+            Ok(snapshot)
         })
     }
 

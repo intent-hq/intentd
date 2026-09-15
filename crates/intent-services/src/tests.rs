@@ -15284,6 +15284,13 @@ mod pr {
     #[derive(Default)]
     struct StubForge {
         fail_threads: bool,
+        /// When set, `get_review_threads` fails with `RateLimited` (the
+        /// GraphQL quota is exhausted), exercising the checklist's
+        /// quota-exhaustion propagation instead of the REST fallback.
+        rate_limited_threads: bool,
+        /// When set, `list_review_comments` fails too, so a `fail_threads`
+        /// checklist has no comment source at all.
+        fail_review_comments: bool,
         /// When set, `list_prs` returns the sample PR so PR-refresh discovery can
         /// link an unlinked workspace by head ref.
         discover: bool,
@@ -15724,6 +15731,9 @@ mod pr {
             _: u64,
             page: PageParams,
         ) -> ScResult<Page<ReviewComment>> {
+            if self.fail_review_comments {
+                return Err(ScError::Api("rest down".into()));
+            }
             if self.review_comment_pages > 0 {
                 let n = page
                     .cursor
@@ -15786,6 +15796,11 @@ mod pr {
             _: u64,
             page: PageParams,
         ) -> ScResult<Page<ReviewThread>> {
+            if self.rate_limited_threads {
+                return Err(ScError::RateLimited(
+                    "API rate limit exceeded for user ID 526899.".into(),
+                ));
+            }
             if self.fail_threads {
                 return Err(ScError::Api("graphql down".into()));
             }
@@ -16008,7 +16023,7 @@ mod pr {
         assert_eq!(req.approvals.decision, "review_required");
         assert_eq!(req.approvals.have, 1);
         assert_eq!(req.approvals.needed, Some(2));
-        assert_eq!(req.threads.unresolved, 1);
+        assert_eq!(req.threads.unresolved, Some(1));
         assert_eq!(req.threads.resolution_required, Some(true));
         assert_eq!(req.merge_state_status.as_deref(), Some("BLOCKED"));
         assert!(req.rules_known);
@@ -16031,21 +16046,72 @@ mod pr {
         assert_eq!(req.threads.resolution_required, None);
         // The aggregate still drives the decision (alice approved).
         assert_eq!(req.approvals.decision, "approved");
-        assert_eq!(req.threads.unresolved, 1);
+        assert_eq!(req.threads.unresolved, Some(1));
     }
 
     #[tokio::test]
     async fn merge_requirements_survives_a_failing_thread_read() {
-        // A GraphQL thread failure falls back to the flat REST comments
-        // (resolution state unavailable, so each fallback thread counts as
-        // unresolved) rather than failing the whole checklist.
-        let req = merge_requirements_of(StubForge {
+        // A GraphQL thread failure falls back to the flat REST comments for
+        // the review-comment tally, but the REST list carries no resolution
+        // state, so `threads.unresolved` is reported as unknown (absent on
+        // the wire) rather than inflated to every thread — and the checklist
+        // as a whole still succeeds.
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
             fail_threads: true,
+            review_comment_pages: 3,
             ..Default::default()
-        })
-        .await;
-        assert_eq!(req.threads.unresolved, 1);
+        });
+        let repo = RepoRef::new("o", "r");
+        let pr = sc.get_pr(&repo, 42).await.expect("pr");
+        let (req, review_comment_count, _) =
+            crate::pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo, 42, &pr)
+                .await
+                .expect("merge requirements");
+        assert_eq!(review_comment_count, 3);
+        assert_eq!(req.threads.unresolved, None);
         assert_eq!(req.state, "open");
+        let wire = serde_json::to_value(&req).expect("serialize");
+        assert!(wire["threads"].get("unresolved").is_none());
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_reports_unknown_threads_when_both_reads_fail() {
+        // Neither the GraphQL threads nor the REST comments are readable:
+        // the review-comment tally degrades to zero and the unresolved count
+        // stays unknown — never a fabricated 0.
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            fail_threads: true,
+            fail_review_comments: true,
+            ..Default::default()
+        });
+        let repo = RepoRef::new("o", "r");
+        let pr = sc.get_pr(&repo, 42).await.expect("pr");
+        let (req, review_comment_count, _) =
+            crate::pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo, 42, &pr)
+                .await
+                .expect("merge requirements");
+        assert_eq!(review_comment_count, 0);
+        assert_eq!(req.threads.unresolved, None);
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_propagates_a_rate_limited_thread_read() {
+        // Quota exhaustion on the GraphQL threads read is not a degradation
+        // to fall back from: it propagates as `RateLimited` so the caller
+        // pauses instead of spending more quota on the REST fallback.
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            rate_limited_threads: true,
+            ..Default::default()
+        });
+        let repo = RepoRef::new("o", "r");
+        let pr = sc.get_pr(&repo, 42).await.expect("pr");
+        let err = crate::pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo, 42, &pr)
+            .await
+            .expect_err("rate limit propagates");
+        assert!(
+            matches!(err, crate::Error::RateLimited(_)),
+            "expected RateLimited, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -16543,14 +16609,16 @@ mod pr {
         assert_eq!(v["comments"]["totalCount"], 3);
         // Pin the unified merge-requirements field name on the snapshot shape.
         assert!(v["requirements"].is_object());
+        assert_eq!(v["requirements"]["threads"]["unresolved"], 1);
     }
 
     #[tokio::test]
     async fn state_snapshot_counts_via_rest_fallback() {
         // GraphQL threads unavailable: inline comments are counted from the
         // flat REST list (replies included); resolution is unavailable there,
-        // so every fallback thread counts as unresolved (the degradation is
-        // logged at `warn`).
+        // so the unresolved count is unknown — `unresolvedThreadCount` and
+        // `requirements.threads.unresolved` are both omitted (never null or
+        // 0; the degradation is logged at `warn`).
         let (_t, svc, ws) = setup_with(
             StubForge {
                 fail_threads: true,
@@ -16563,8 +16631,9 @@ mod pr {
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
-        assert_eq!(v["comments"]["unresolvedThreadCount"], 2);
+        assert!(v["comments"].get("unresolvedThreadCount").is_none());
         assert_eq!(v["comments"]["totalCount"], 3);
+        assert!(v["requirements"]["threads"].get("unresolved").is_none());
     }
 
     #[tokio::test]
