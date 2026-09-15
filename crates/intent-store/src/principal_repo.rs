@@ -39,6 +39,38 @@ pub struct WorkspaceAuthorFallback {
     pub owner_principal_id: Option<PrincipalId>,
 }
 
+/// What a workspace's guest cap (`sharing.maxGuestsPerWorkspace`) is spent
+/// on (see [`Store::count_workspace_guests`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkspaceGuestCount {
+    /// `collaborator` memberships (the owner is never a guest).
+    pub collaborators: u64,
+    /// Invites not yet redeemed, revoked or expired.
+    pub open_invites: u64,
+}
+
+impl WorkspaceGuestCount {
+    /// Collaborators plus open invites — the number an invite mint compares
+    /// against the cap.
+    #[must_use]
+    pub fn committed(self) -> u64 {
+        self.collaborators.saturating_add(self.open_invites)
+    }
+}
+
+/// Result of [`Store::join_workspace_by_invite`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InviteJoinOutcome {
+    /// The join committed; the principal is the joined one (existing row
+    /// refreshed, or the minted one).
+    Joined(Principal),
+    /// The invite was no longer open at redemption; nothing was written.
+    Closed,
+    /// The workspace's collaborators already reach the guest cap; nothing
+    /// was written and the invite stays open.
+    WorkspaceFull,
+}
+
 impl Store {
     /// Fetch a principal by id.
     ///
@@ -690,6 +722,36 @@ impl Store {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
+    /// The guest-cap usage of one workspace: its `collaborator` memberships
+    /// and its open invites, in one round trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_workspace_guests(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceGuestCount> {
+        let row = sqlx::query(
+            "SELECT \
+                (SELECT COUNT(*) FROM workspace_member m \
+                    WHERE m.workspace_id = ? AND m.role = 'collaborator') AS collaborators, \
+                (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = ? \
+                    AND i.redeemed_at IS NULL AND i.revoked_at IS NULL \
+                    AND i.expires_at > ?) AS open_invites",
+        )
+        .bind(&workspace_id.0)
+        .bind(&workspace_id.0)
+        .bind(now_iso())
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("count workspace guests failed: {e}")))?;
+        Ok(WorkspaceGuestCount {
+            collaborators: u64::try_from(row.get::<i64, _>("collaborators")).unwrap_or(0),
+            open_invites: u64::try_from(row.get::<i64, _>("open_invites")).unwrap_or(0),
+        })
+    }
+
     /// Persist a freshly minted invite (multiplayer w4). `secret_hash` is the
     /// hex SHA-256 of the link secret — the service layer hashes; the
     /// plaintext `secret` is kept alongside so the link can be rebuilt on
@@ -827,10 +889,16 @@ impl Store {
     /// lookup and race a duplicate `github_user_id` insert.
     ///
     /// `identity.id` is used only when no principal has linked the account;
-    /// `identity.is_primary` / `created_at` likewise. Returns the joined
-    /// principal (existing row refreshed, or the minted one), or `None` when
-    /// the invite was no longer open at redemption — checked first, inside
-    /// the transaction, so a closed invite writes nothing at all.
+    /// `identity.is_primary` / `created_at` likewise. Returns
+    /// [`InviteJoinOutcome::Joined`] with the principal (existing row
+    /// refreshed, or the minted one); [`InviteJoinOutcome::Closed`] when the
+    /// invite was no longer open at redemption; or
+    /// [`InviteJoinOutcome::WorkspaceFull`] when the workspace already has
+    /// `max_guests` collaborators and the joining account is not one of them
+    /// (a returning collaborator re-joining takes no new seat). Both refusals
+    /// are checked first, inside the transaction, so they write nothing at
+    /// all — and, under `BEGIN IMMEDIATE`, two concurrent joins cannot both
+    /// pass the cap check and overshoot it.
     ///
     /// # Errors
     ///
@@ -843,7 +911,8 @@ impl Store {
         workspace_id: &WorkspaceId,
         identity: &Principal,
         credential_hash: &str,
-    ) -> Result<Option<Principal>> {
+        max_guests: u32,
+    ) -> Result<InviteJoinOutcome> {
         let github_user_id = identity
             .github_user_id
             .ok_or_else(|| Error::Internal("invite join requires a github_user_id".to_string()))?;
@@ -857,7 +926,7 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("invite join begin failed: {e}")))?;
 
-        let body_result: Result<Option<Principal>> = async {
+        let body_result: Result<InviteJoinOutcome> = async {
             let now = now_iso();
             // Open-invite check before any write: under IMMEDIATE no other
             // writer can close it between here and the UPDATE below, so a
@@ -874,7 +943,7 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("invite join open check failed: {e}")))?;
             if open.is_none() {
-                return Ok(None);
+                return Ok(InviteJoinOutcome::Closed);
             }
             let lookup =
                 format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE github_user_id = ?");
@@ -885,6 +954,33 @@ impl Store {
                 .map_err(|e| Error::Internal(format!("invite join principal lookup failed: {e}")))?
                 .as_ref()
                 .map(map_principal_row);
+            // Guest-cap check, same transaction as the membership insert: a
+            // seat is only needed when the account is not already a member.
+            let already_member = match &existing {
+                Some(p) => sqlx::query_scalar::<_, i64>(
+                    "SELECT 1 FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
+                )
+                .bind(&workspace_id.0)
+                .bind(&p.id.0)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("invite join member check failed: {e}")))?
+                .is_some(),
+                None => false,
+            };
+            if !already_member {
+                let collaborators: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM workspace_member \
+                     WHERE workspace_id = ? AND role = 'collaborator'",
+                )
+                .bind(&workspace_id.0)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("invite join guest count failed: {e}")))?;
+                if u64::try_from(collaborators).unwrap_or(u64::MAX) >= u64::from(max_guests) {
+                    return Ok(InviteJoinOutcome::WorkspaceFull);
+                }
+            }
             let mut principal = existing.unwrap_or_else(|| identity.clone());
             principal.github_user_id = Some(github_user_id);
             principal.login.clone_from(&identity.login);
@@ -958,7 +1054,7 @@ impl Store {
             .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("invite join insert credential failed: {e}")))?;
-            Ok(Some(principal))
+            Ok(InviteJoinOutcome::Joined(principal))
         }
         .await;
 
