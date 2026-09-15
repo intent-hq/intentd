@@ -38042,6 +38042,35 @@ mod turn_end_unread_gate {
         );
     }
 
+    /// A soft-retired top-level foreground session (`retired_at` set) is
+    /// inert: its drain end must NOT raise the blue dot. Restoring it
+    /// (clearing `retired_at`) brings the raise back.
+    #[tokio::test]
+    async fn retired_agent_skips_raise_until_restored() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        let mut s = session(&agent_id, &h.ws);
+        s.retired_at = Some(now_iso());
+        h.store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "a retired agent must not raise the turn-end blue dot"
+        );
+        let restored = h
+            .store
+            .set_agent_session_retired_at(&h.ws, &agent_id, None, &now_iso())
+            .await
+            .expect("restore session");
+        assert!(restored, "restore is a real transition");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "a restored top-level foreground agent raises again"
+        );
+    }
+
     /// A genuine store failure FAILS OPEN: a missed blue dot for a real
     /// top-level turn is worse than a spurious one on a rare store fault.
     #[tokio::test]
@@ -42114,14 +42143,14 @@ mod context_usage_projection {
     }
 }
 
-/// Regression tests for the `agentSummary` soft-delete filter: sessions with
-/// `AgentStatus::Deleted` must be excluded from the card aggregate's
-/// `count`/`agents`/`agentIds` (all three consistent, §5.1) so clients never
-/// render soft-deleted rows — mirroring the `workspace_attention_signals`
-/// filter.
+/// Regression tests for the `agentSummary` soft-delete/soft-retire filter:
+/// sessions with `AgentStatus::Deleted` or `retired_at` set must be excluded
+/// from the card aggregate's `count`/`agents`/`agentIds` (all three
+/// consistent, §5.1) so clients never render soft-deleted or retired rows —
+/// mirroring the `workspace_attention_signals` filter.
 #[cfg(test)]
 mod agent_summary_excludes_deleted {
-    use intent_core::{AgentId, AgentStatus, WorkspaceId};
+    use intent_core::{now_iso, AgentId, AgentStatus, WorkspaceId};
     use intent_store::Store;
 
     use super::turn_end_unread_gate::session;
@@ -42175,6 +42204,70 @@ mod agent_summary_excludes_deleted {
             vec![active_id],
             "agentIds stays consistent with agents"
         );
+    }
+
+    /// A workspace with one active + one soft-retired session yields an
+    /// `agentSummary` containing only the active one (count=1); restoring
+    /// the retired session puts it back.
+    #[tokio::test]
+    async fn enriched_summary_skips_retired_sessions() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("temp store");
+        let ws_id = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws_id))
+            .await
+            .expect("seed workspace");
+        let root = tempfile::tempdir().expect("temp workspaces root");
+        let services = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+
+        let active_id = AgentId::new();
+        let mut active = session(&active_id, &ws_id);
+        active.status = AgentStatus::Active;
+        store
+            .insert_agent_session(&active)
+            .await
+            .expect("insert active session");
+
+        let retired_id = AgentId::new();
+        let mut retired = session(&retired_id, &ws_id);
+        retired.status = AgentStatus::Idle;
+        retired.retired_at = Some(now_iso());
+        store
+            .insert_agent_session(&retired)
+            .await
+            .expect("insert retired session");
+
+        let mut ws = store.get_workspace(&ws_id).await.expect("get ws");
+        services.enrich_workspace_aggregates(&mut ws).await;
+
+        let summary = ws.agent_summary.expect("agentSummary present");
+        assert_eq!(summary.count, 1, "retired session excluded from count");
+        assert_eq!(
+            summary.agents.iter().map(|a| &a.id).collect::<Vec<_>>(),
+            vec![&active_id],
+            "agents lists only the active session"
+        );
+        assert_eq!(
+            summary.agent_ids,
+            vec![active_id.clone()],
+            "agentIds stays consistent with agents"
+        );
+
+        let restored = store
+            .set_agent_session_retired_at(&ws_id, &retired_id, None, &now_iso())
+            .await
+            .expect("restore session");
+        assert!(restored, "restore is a real transition");
+        let mut ws = store.get_workspace(&ws_id).await.expect("get ws");
+        services.enrich_workspace_aggregates(&mut ws).await;
+        let summary = ws.agent_summary.expect("agentSummary present");
+        assert_eq!(summary.count, 2, "restored session counts again");
+        let mut ids = summary.agent_ids.clone();
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected = vec![active_id, retired_id];
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(ids, expected, "restored session listed again");
     }
 }
 

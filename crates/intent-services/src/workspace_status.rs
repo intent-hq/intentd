@@ -578,6 +578,7 @@ impl Services {
                 s.parent_agent_id.is_none()
                     && !s.is_background
                     && s.status != intent_core::AgentStatus::Deleted
+                    && s.retired_at.is_none()
             })
             .collect();
         for s in &top_level {
@@ -3255,11 +3256,11 @@ mod display_status {
 
 /// Per-workspace attention-axis probe (`Services::workspace_attention_signals`,
 /// PROTOCOL §6.5): `needs_attention` is true iff a **top-level** session (no
-/// parent, not background, not deleted) carries a pending discussion request
-/// or pending structured questions (or the workspace flag is
-/// `review_required`); `blocked` iff one carries a pending blocker request;
+/// parent, not background, not deleted, not retired) carries a pending
+/// discussion request or pending structured questions (or the workspace flag
+/// is `review_required`); `blocked` iff one carries a pending blocker request;
 /// `failed` iff one is parked in `error`. The `unread` workspace flag never
-/// feeds the signals. Child/background/deleted sessions never count.
+/// feeds the signals. Child/background/deleted/retired sessions never count.
 #[cfg(test)]
 mod workspace_needs_attention {
     use intent_core::{
@@ -3272,6 +3273,9 @@ mod workspace_needs_attention {
     use super::AttentionSignals;
     use crate::tests::{workspace, TempDb};
     use crate::Services;
+
+    /// One attention axis read off the probed signals.
+    type Axis = fn(&AttentionSignals) -> bool;
 
     /// Probe the session-derived axes with a `None` workspace flag.
     async fn signals(svc: &Services, ws: &WorkspaceId) -> AttentionSignals {
@@ -3444,6 +3448,68 @@ mod workspace_needs_attention {
         svc.store.insert_agent_session(&failed_bg).await.unwrap();
 
         assert_eq!(signals(&svc, &ws).await, AttentionSignals::default());
+    }
+
+    /// A soft-retired top-level session (`retired_at` set) is inert: its
+    /// `error` status, pending blocker/discussion request, and pending
+    /// questions marker feed none of the axes. Restoring it (clearing
+    /// `retired_at`) brings each signal back.
+    #[tokio::test]
+    async fn retired_top_level_sessions_never_count_until_restored() {
+        let (svc, ws, _tmp) = setup().await;
+        let ts = now_iso();
+
+        let mut failed = mk_session(&ws, "agent-retired-error");
+        failed.status = AgentStatus::Error;
+        failed.retired_at = Some(ts.clone());
+        svc.store.insert_agent_session(&failed).await.unwrap();
+
+        let mut blocker = mk_session(&ws, "agent-retired-blocker");
+        blocker.attention_request_kind = Some("blocker".to_string());
+        blocker.retired_at = Some(ts.clone());
+        svc.store.insert_agent_session(&blocker).await.unwrap();
+
+        let mut discuss = mk_session(&ws, "agent-retired-discussion");
+        discuss.attention_request_kind = Some("discussion".to_string());
+        discuss.retired_at = Some(ts.clone());
+        svc.store.insert_agent_session(&discuss).await.unwrap();
+
+        let mut questions = mk_session(&ws, "agent-retired-questions");
+        questions.metadata = Some(json!({
+            (intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY): "msg-pending"
+        }));
+        questions.retired_at = Some(ts.clone());
+        svc.store.insert_agent_session(&questions).await.unwrap();
+
+        assert_eq!(
+            signals(&svc, &ws).await,
+            AttentionSignals::default(),
+            "retired sessions feed no attention axis"
+        );
+
+        let cases: [(&AgentId, Axis); 4] = [
+            (&failed.id, |s| s.failed),
+            (&blocker.id, |s| s.blocked),
+            (&discuss.id, |s| s.needs_attention),
+            (&questions.id, |s| s.needs_attention),
+        ];
+        for (id, expect) in cases {
+            let restored = svc
+                .store
+                .set_agent_session_retired_at(&ws, id, None, &now_iso())
+                .await
+                .unwrap();
+            assert!(restored, "restore transitions {}", id.0);
+            assert!(
+                expect(&signals(&svc, &ws).await),
+                "restoring {} surfaces its signal again",
+                id.0
+            );
+            svc.store
+                .set_agent_session_retired_at(&ws, id, Some(&now_iso()), &now_iso())
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]

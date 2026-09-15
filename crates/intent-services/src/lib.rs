@@ -10342,13 +10342,13 @@ fn note_to_workspace_task(
 /// root agents. `isBackground` (monorepo#3789) carries the session's persisted
 /// `is_background` flag (the value surfaced as `metadata.isBackground` on
 /// full agent loads), omitted for foreground agents. Soft-deleted sessions
-/// (`AgentStatus::Deleted`) are excluded from `count`/`agents`/`agentIds` so
-/// clients never render deleted rows (mirrors the
-/// `workspace_attention_signals` filter).
+/// (`AgentStatus::Deleted`) and soft-retired sessions (`retired_at` set) are
+/// excluded from `count`/`agents`/`agentIds` so clients never render deleted
+/// or retired rows (mirrors the `workspace_attention_signals` filter).
 fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
     let live: Vec<&AgentSession> = sessions
         .iter()
-        .filter(|s| s.status != intent_core::AgentStatus::Deleted)
+        .filter(|s| s.status != intent_core::AgentStatus::Deleted && s.retired_at.is_none())
         .collect();
     let agents: Vec<WorkspaceAgentInfo> = live
         .iter()

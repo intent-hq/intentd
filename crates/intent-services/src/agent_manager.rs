@@ -10586,7 +10586,8 @@ async fn run_message_worker(
 /// completion is its parent/coordinator's attention surface, not the
 /// user's. Same sub-agent definition as the attention-clear gate above and
 /// rules.rs. `NotFound` means the agent was deleted while its drain
-/// finished — nothing to surface, skip. Archived workspaces additionally
+/// finished — nothing to surface, skip. A soft-retired session (`retired_at`
+/// set) is inert and skips the raise too. Archived workspaces additionally
 /// stay quiet: a turn finishing in a workspace whose status is `Archived`
 /// skips the raise (the user parked the workspace; unarchiving restores
 /// normal behavior — no persisted suppression state). FAIL OPEN on any
@@ -10606,7 +10607,7 @@ pub(crate) async fn should_raise_turn_end_unread(services: &Services, agent_id: 
             return true;
         }
     };
-    if session.parent_agent_id.is_some() || session.is_background {
+    if session.parent_agent_id.is_some() || session.is_background || session.retired_at.is_some() {
         return false;
     }
     match services.store.get_workspace(&session.workspace_id).await {
