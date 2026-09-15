@@ -23,7 +23,7 @@ const MEMBER_COLUMNS: &str = "workspace_id, principal_id, role, added_at";
 
 const CREDENTIAL_COLUMNS: &str = "token_hash, principal_id, created_at, last_used_at, revoked_at";
 
-const INVITE_COLUMNS: &str = "id, workspace_id, secret_hash, created_by_principal_id, \
+const INVITE_COLUMNS: &str = "id, workspace_id, secret_hash, secret, created_by_principal_id, \
      pin_github_user_id, pin_login, created_at, expires_at, redeemed_at, \
      redeemed_by_principal_id, revoked_at";
 
@@ -691,19 +691,22 @@ impl Store {
     }
 
     /// Persist a freshly minted invite (multiplayer w4). `secret_hash` is the
-    /// hex SHA-256 of the link secret — the service layer hashes.
+    /// hex SHA-256 of the link secret — the service layer hashes; the
+    /// plaintext `secret` is kept alongside so the link can be rebuilt on
+    /// `workspace.invite.list`.
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_workspace_invite(&self, invite: &WorkspaceInvite) -> Result<()> {
         let sql = format!(
-            "INSERT INTO workspace_invite ({INVITE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+            "INSERT INTO workspace_invite ({INVITE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&invite.id)
             .bind(&invite.workspace_id.0)
             .bind(&invite.secret_hash)
+            .bind(&invite.secret)
             .bind(&invite.created_by_principal_id.0)
             .bind(invite.pin_github_user_id)
             .bind(&invite.pin_login)
@@ -968,6 +971,7 @@ fn map_invite_row(r: &SqliteRow) -> WorkspaceInvite {
         id: r.get("id"),
         workspace_id: WorkspaceId(r.get("workspace_id")),
         secret_hash: r.get("secret_hash"),
+        secret: r.get("secret"),
         created_by_principal_id: PrincipalId(r.get("created_by_principal_id")),
         pin_github_user_id: r.get("pin_github_user_id"),
         pin_login: r.get("pin_login"),
