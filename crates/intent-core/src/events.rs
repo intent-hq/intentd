@@ -370,11 +370,14 @@ pub const COMMENT_RESOLVED: &str = "comment:resolved";
 // persisted — `event.query` has no presence rows) and workspace-scoped, so
 // the collaborator gate narrows them by membership like any other row.
 // `presence:changed` → `{ workspaceId, members: [{ principalId, login?,
-// displayName?, avatarUrl?, online, focus: [{ workspaceId, agentId?,
-// noteId? }], typing: [agentId] }] }` — the workspace's currently-online
-// members with their focus items *in this workspace* and the agents they
-// are typing to; emitted on every connect / disconnect / `presence.update`
-// that changes the aggregate. `note:presence` → `{ workspaceId, noteId,
+// displayName?, avatarUrl?, focus: [{ workspaceId, agentId?, noteId? }],
+// typing: [{ source, agentId, since, pulse }] }] }` — the workspace's
+// currently-online members (a row's presence IS its online state; there is
+// no `online` flag) with their focus items *in this workspace* and one
+// typing entry per typing connection, keyed by the connection's opaque
+// daemon-minted `source` (`since` = episode start, `pulse` = per-source
+// activity counter); emitted on every connect / disconnect /
+// `presence.update` that changes the aggregate. `note:presence` → `{ workspaceId, noteId,
 // principalId, login?, displayName?, avatarUrl?, kind: "joined" | "updated"
 // | "left", cursor?: { rev, anchor, head } }` — a per-note viewer delta
 // (the `note.presence` channel filters by `data.noteId`); the daemon stamps
