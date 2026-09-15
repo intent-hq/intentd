@@ -1472,6 +1472,328 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Retired agents drop out of attention and unread over the real WSS
+/// transport (§5.1 derived `attention`, §5.5 "Retire cascade & cleanup",
+/// §6.5): a top-level foreground agent with an unseen assistant tail and a
+/// pending discussion request reads `attention: "unread"` /
+/// `displayStatus: "needs_attention"`; retiring it settles both —
+/// `workspace.get` serves `attention: "none"`, a `displayStatus` other than
+/// `needs_attention`, and `agentSummary.count == 0` — and an
+/// `events.subscribe` subscriber sees `agent:retired`, exactly ONE
+/// `workspace:attention-changed { none }`, and a
+/// `workspace:displayStatus-changed` away from `needs_attention`.
+/// `agent.restore` is SILENT for the unread state: `workspace.get` re-derives
+/// `attention: "unread"` and `agentSummary.count == 1`, but the restore emits
+/// no `workspace:attention-changed`.
+///
+/// The assistant tail lands through the `agent.appendMessage` wire method;
+/// the discussion request and the retire go through the `WorkspaceApi` seams
+/// the MCP `ws.agent.requestDiscussion` / `ws.agent.retire` bindings route to
+/// (this harness has no agent runtime, and there is deliberately no wire
+/// `agent.retire`). A live self-retire always runs mid-turn, where the tail
+/// is the turn's user message, so the post-turn unread state under test is
+/// only reachable this way.
+#[tokio::test]
+async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent() {
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+    /// Next `events.event` frame of any type before `deadline`; `None` once
+    /// the deadline passes with no event.
+    async fn next_event_until(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        deadline: tokio::time::Instant,
+    ) -> Option<Value> {
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event" {
+                            return v["params"]["event"].clone();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Retire Unread"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let workspace_id = WorkspaceId(ws_id.clone());
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Elder"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = intent_core::AgentId::from(agent_id.as_str());
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.get","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+
+    // An unseen assistant tail: the derived `unread` reads on.
+    let appended = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"assistant","contentBlocks":[{{"type":"text","text":"done with the review"}}]}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        appended["result"]["message"]["id"].is_string(),
+        "appendMessage: {appended}"
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let ws_row = &got["result"]["workspace"];
+    assert_eq!(
+        ws_row["attention"], "unread",
+        "unseen assistant tail: {ws_row}"
+    );
+    assert_eq!(ws_row["agentSummary"]["count"], 1, "{ws_row}");
+    assert!(
+        ws_row["displayStatus"].is_string() && ws_row["displayStatus"] != "needs_attention",
+        "no attention request yet: {ws_row}"
+    );
+
+    // Subscribe BEFORE the raise/retire so no event can be missed.
+    let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
+    let subscribed = send_and_wait(
+        &mut sub,
+        format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"events.subscribe","params":{{"eventTypes":["agent:retired","agent:restored","workspace:attention-changed","workspace:displayStatus-changed"],"workspaceId":"{ws_id}"}}}}"#
+        ),
+        5,
+    )
+    .await;
+    assert!(
+        subscribed["result"]["subscriptionId"].is_string(),
+        "subscribe: {subscribed}"
+    );
+
+    // Pending discussion request → `needs_attention` (surfaces immediately:
+    // no turn in flight).
+    let raised = srv
+        .api
+        .agent_request_attention(
+            workspace_id.clone(),
+            "discussion".to_string(),
+            "need a decision before continuing".to_string(),
+            Some(agent.clone()),
+        )
+        .await
+        .expect("requestDiscussion");
+    assert_eq!(raised["ok"], serde_json::json!(true), "{raised}");
+    let promoted = next_event_until(
+        &mut sub,
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    )
+    .await
+    .expect("displayStatus promotion event");
+    assert_eq!(
+        promoted["type"], "workspace:displayStatus-changed",
+        "{promoted}"
+    );
+    assert_eq!(
+        promoted["data"],
+        serde_json::json!({ "workspaceId": ws_id, "displayStatus": "needs_attention" }),
+        "{promoted}"
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let ws_row = &got["result"]["workspace"];
+    assert_eq!(ws_row["attention"], "unread", "{ws_row}");
+    assert_eq!(ws_row["displayStatus"], "needs_attention", "{ws_row}");
+
+    // Retire via the WorkspaceApi seam (the MCP `ws.agent.retire` binding).
+    let retired = srv
+        .api
+        .agent_retire(
+            agent.clone(),
+            Some(workspace_id.clone()),
+            Some("handing off".to_string()),
+        )
+        .await
+        .expect("retire");
+    assert_eq!(retired["success"], serde_json::json!(true), "{retired}");
+
+    // Collect the retire's events: `agent:retired`, ONE
+    // `workspace:attention-changed { none }`, and a
+    // `workspace:displayStatus-changed` away from `needs_attention`
+    // (relative order not asserted). Keep draining for a quiet window after
+    // the three arrive so a duplicate attention event would still be caught.
+    let mut retired_evt: Option<Value> = None;
+    let mut attention_evts: Vec<Value> = Vec::new();
+    let mut display_evts: Vec<Value> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut quiet_until: Option<tokio::time::Instant> = None;
+    loop {
+        let until = quiet_until.unwrap_or(deadline);
+        let Some(evt) = next_event_until(&mut sub, until).await else {
+            break;
+        };
+        match evt["type"].as_str().unwrap_or_default() {
+            "agent:retired" => retired_evt = Some(evt),
+            "workspace:attention-changed" => attention_evts.push(evt),
+            "workspace:displayStatus-changed" => display_evts.push(evt),
+            other => panic!("unexpected event after retire: {other}: {evt}"),
+        }
+        if quiet_until.is_none()
+            && retired_evt.is_some()
+            && !attention_evts.is_empty()
+            && !display_evts.is_empty()
+        {
+            quiet_until = Some(tokio::time::Instant::now() + Duration::from_millis(1500));
+        }
+    }
+    let retired_evt = retired_evt.expect("agent:retired");
+    assert_eq!(retired_evt["workspaceId"], ws_id.as_str(), "{retired_evt}");
+    assert_eq!(
+        retired_evt["data"]["agentId"],
+        agent_id.as_str(),
+        "{retired_evt}"
+    );
+    assert_eq!(retired_evt["data"]["agentName"], "Elder", "{retired_evt}");
+    assert_eq!(
+        retired_evt["data"]["reason"], "handing off",
+        "{retired_evt}"
+    );
+    assert_eq!(
+        retired_evt["data"]["retiredAt"], retired["retiredAt"],
+        "{retired_evt}"
+    );
+    assert_eq!(
+        attention_evts.len(),
+        1,
+        "retiring the last unread session emits exactly one attention event: {attention_evts:?}"
+    );
+    assert_eq!(attention_evts[0]["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        attention_evts[0]["data"],
+        serde_json::json!({ "workspaceId": ws_id, "attention": "none" }),
+        "{:?}",
+        attention_evts[0]
+    );
+    assert!(
+        !display_evts.is_empty(),
+        "retire recomputes displayStatus away from needs_attention"
+    );
+    for evt in &display_evts {
+        assert_eq!(evt["workspaceId"], ws_id.as_str(), "{evt}");
+        assert_eq!(evt["data"]["workspaceId"], ws_id.as_str(), "{evt}");
+        assert_ne!(
+            evt["data"]["displayStatus"], "needs_attention",
+            "a retired session's request must not promote: {evt}"
+        );
+    }
+
+    // Read path after the retire.
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let ws_row = &got["result"]["workspace"];
+    assert_eq!(
+        ws_row["attention"], "none",
+        "retired tail is not unread: {ws_row}"
+    );
+    assert!(
+        ws_row["displayStatus"].is_string() && ws_row["displayStatus"] != "needs_attention",
+        "retired request no longer promotes: {ws_row}"
+    );
+    assert_eq!(
+        ws_row["agentSummary"]["count"], 0,
+        "retired row leaves the card aggregate: {ws_row}"
+    );
+
+    // `agent.restore` over the wire: reads re-derive `unread`, and the
+    // restore itself emits NO `workspace:attention-changed`.
+    let restored = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.restore","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        restored["result"]["restored"],
+        serde_json::json!(true),
+        "{restored}"
+    );
+    let mut restored_evt: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut quiet_until: Option<tokio::time::Instant> = None;
+    loop {
+        let until = quiet_until.unwrap_or(deadline);
+        let Some(evt) = next_event_until(&mut sub, until).await else {
+            break;
+        };
+        match evt["type"].as_str().unwrap_or_default() {
+            "agent:restored" => {
+                assert_eq!(evt["data"]["agentId"], agent_id.as_str(), "{evt}");
+                restored_evt = Some(evt);
+                quiet_until = Some(tokio::time::Instant::now() + Duration::from_millis(1500));
+            }
+            "workspace:attention-changed" => {
+                panic!("agent.restore must be silent for the unread state: {evt}")
+            }
+            // The restored request may re-promote displayStatus; not under test.
+            "workspace:displayStatus-changed" => {}
+            other => panic!("unexpected event after restore: {other}: {evt}"),
+        }
+    }
+    assert!(restored_evt.is_some(), "agent:restored");
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let ws_row = &got["result"]["workspace"];
+    assert_eq!(
+        ws_row["attention"], "unread",
+        "restore re-derives the unseen tail on read: {ws_row}"
+    );
+    assert_eq!(
+        ws_row["agentSummary"]["count"], 1,
+        "restored row is back in the card aggregate: {ws_row}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// Retire cascade + cleanup over the real WSS transport (PROTOCOL §5.5):
 /// retiring a parent with an ACTIVE child is rejected (`InvalidParams`
 /// naming the child, nothing mutated); after the child settles the retire
