@@ -70,6 +70,7 @@ pub mod lifecycle;
 pub mod listener;
 pub mod pairing;
 mod panic_guard;
+mod presence;
 mod protocol;
 mod provider_setup;
 pub mod reverse;

@@ -232,6 +232,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "prMonitor.cancel",
     "prMonitor.flush",
     "prMonitor.list",
+    "presence.snapshot",
     "primitive.addAgentAction",
     "primitive.addCli",
     "primitive.addPatch",
@@ -382,9 +383,9 @@ pub(crate) fn canonical_method(method: &str) -> &str {
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 51 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 53 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
-/// `pairing.rs`, `server.rs`, `invite.rs`) before reaching the main router. They share the same JSON-RPC
+/// `pairing.rs`, `server.rs`, `invite.rs`, `presence.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
 /// performance or to access per-connection state (e.g., `client_id` binding for
 /// drafts and the host-only `browser.*Tab*` registry reports).
@@ -428,7 +429,9 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "host.status",
     "host.toolAvailability",
     "invite.redeem",
+    "note.presence.update",
     "pairing.getInfo",
+    "presence.update",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -612,6 +615,9 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("note.list", "Read: notes of a workspace."),
     ("note.listTasks", "Read: checkbox tasks of a note."),
     ("note.listVersions", "Read: revision list of a note."),
+    ("note.presence.subscribe", "Presence: per-note viewer channel fast path; member-gated join, snapshot + transient joined/updated/left deltas of profile fields already exposed by workspace.members.list plus a caret position."),
+    ("note.presence.unsubscribe", "Presence: drops a note presence subscription (releases the viewer lease)."),
+    ("note.presence.update", "Presence: the caller's own caret on a note it is subscribed to; coalesced daemon-side, never persisted."),
     ("note.readAsset", "Read: a note asset (image/video) from the workspace asset store."),
     ("note.restoreVersion", "Edit: restores a note revision."),
     ("note.saveAsset", "Edit: stores a note asset in the workspace asset store."),
@@ -623,6 +629,8 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("pr.refresh", "Read+: re-fetches the workspace's PR (owner/repo/number from the workspace record, no caller-controlled target) with the primary user's GitHub quota (decided) and persists the badge state on the workspace — the trio's only write."),
     ("pr.status", "Read: the workspace PR badge summary. Target resolved from the workspace record only."),
     ("prMonitor.list", "Read: PR monitors of the workspace. Cancel/flush stay owner-only."),
+    ("presence.snapshot", "Presence: the current online roster of a member workspace (the presence:changed payload on demand); ephemeral read, no host reach."),
+    ("presence.update", "Presence: the connection's own focus set and typing target, member workspaces only; transient, never persisted. Returns the connection's opaque typing source handle."),
     ("primitive.addAgentAction", "Edit: adds an agent-action block to a note. Note content only."),
     ("primitive.addCli", "Edit: adds a CLI block to a note. Note content only; nothing runs."),
     ("primitive.addPatch", "Edit: adds a patch block to a note. Note content only; nothing applies."),
