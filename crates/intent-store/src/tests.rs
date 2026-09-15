@@ -8399,6 +8399,120 @@ async fn workspace_owner_mirror_keeps_current_owner_on_promotion() {
     );
 }
 
+/// Migration `0126` applies on a database that already holds several owner
+/// rows per workspace (the pre-index membership APIs allowed it): instead of
+/// aborting on the unique index it keeps one owner — the primary principal
+/// when present, else the earliest-added — demotes the rest to collaborator
+/// (nobody loses membership), and then installs the index.
+#[tokio::test]
+async fn one_owner_migration_repairs_duplicate_owners_before_indexing() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let with_primary = WorkspaceId::from("ws-dup-primary");
+    let without_primary = WorkspaceId::from("ws-dup-guests");
+    for ws in [&with_primary, &without_primary] {
+        store
+            .insert_workspace(&sample_workspace(ws, "D", false))
+            .await
+            .expect("insert ws");
+    }
+    let guest = |login: &str| Principal {
+        id: PrincipalId::from(format!("p-{login}")),
+        github_user_id: None,
+        login: Some(login.to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    let (early, late) = (guest("early"), guest("late"));
+    for p in [&early, &late] {
+        store.upsert_principal(p).await.expect("principal");
+    }
+
+    // Rewind to the pre-0126 shape and seed the duplicates the index forbids.
+    sqlx::query("DROP INDEX workspace_member_owner_uq")
+        .execute(store.write_pool())
+        .await
+        .expect("drop index");
+    for (ws, principal, added_at) in [
+        (&with_primary, &early.id, "2026-01-01T00:00:00Z"),
+        (&with_primary, &late.id, "2026-01-03T00:00:00Z"),
+        (&without_primary, &late.id, "2026-01-02T00:00:00Z"),
+        (&without_primary, &early.id, "2026-01-01T00:00:00Z"),
+    ] {
+        sqlx::query(
+            "INSERT INTO workspace_member (workspace_id, principal_id, role, added_at) \
+             VALUES (?, ?, 'owner', ?)",
+        )
+        .bind(&ws.0)
+        .bind(&principal.0)
+        .bind(added_at)
+        .execute(store.write_pool())
+        .await
+        .expect("seed duplicate owner");
+    }
+    // The trigger made the primary owner of `without_primary` too; take that
+    // row away so the workspace has only guest owners.
+    sqlx::query("DELETE FROM workspace_member WHERE workspace_id = ? AND principal_id = ?")
+        .bind(&without_primary.0)
+        .bind(&primary.id.0)
+        .execute(store.write_pool())
+        .await
+        .expect("remove primary membership");
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/0126_one_owner_per_workspace.sql"
+    ))
+    .execute(store.write_pool())
+    .await
+    .expect("0126 repairs the duplicates instead of aborting");
+
+    let roles = |ws: &WorkspaceId| {
+        let store = store.clone();
+        let ws = ws.clone();
+        async move {
+            let mut members = store
+                .list_workspace_members(&ws)
+                .await
+                .expect("members")
+                .into_iter()
+                .map(|m| (m.principal_id.0, m.role))
+                .collect::<Vec<_>>();
+            members.sort_by(|a, b| a.0.cmp(&b.0));
+            members
+        }
+    };
+    let mut expected = vec![
+        ("p-early".to_string(), WorkspaceRole::Collaborator),
+        ("p-late".to_string(), WorkspaceRole::Collaborator),
+        (primary.id.0.clone(), WorkspaceRole::Owner),
+    ];
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        roles(&with_primary).await,
+        expected,
+        "the primary principal keeps ownership; the others are demoted"
+    );
+    assert_eq!(
+        roles(&without_primary).await,
+        vec![
+            ("p-early".to_string(), WorkspaceRole::Owner),
+            ("p-late".to_string(), WorkspaceRole::Collaborator),
+        ],
+        "without the primary, the earliest-added owner is kept"
+    );
+    // The index is in place again: a second owner is refused.
+    assert!(matches!(
+        store
+            .set_workspace_member_role(&without_primary, &late.id, WorkspaceRole::Owner)
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
+}
+
 /// `workspace_membership_summaries` is scoped to exactly the requested ids:
 /// workspaces outside the selection (e.g. archived rows `workspace.list`
 /// filters out) never appear, an empty selection issues no query, and the
