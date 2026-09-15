@@ -7,6 +7,7 @@
 //! `dispatch` call sends the outbound frame to the resolved channel's queue
 //! and no other, so the receivers themselves witness the routing decision.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use intent_core::{
@@ -452,6 +453,71 @@ fn bind_and_drop_queue_logical_client_transitions_in_mutation_order() {
     let (c3, _rx3) = idle_channel();
     let g3 = reg.register(c3, ReverseTransport::Uds);
     drop(g3);
+    assert!(reg.is_empty());
+    assert!(drain(&mut rx).is_empty());
+}
+
+/// Multiplayer w3: a non-administrator connection that hellos as an owner's
+/// `clientId` with `browserExec: true` is never bound — no `client:*`
+/// transition, no `live_clients` row, no `host_presence` entry, no tab-host
+/// binding — and it cannot keep the owner's presence alive once the real
+/// owner connection is gone.
+#[test]
+fn non_administrator_hellos_never_enter_presence_projections() {
+    let reg = PrimaryReverseRegistry::new();
+    let mut rx = reg.take_transitions().expect("queue");
+    let (guest_tx, _rx_guest) = mpsc::channel::<String>(4);
+    let guest = ReverseChannel::new(guest_tx).with_administrator(false);
+    let g_guest = reg.register(guest, ReverseTransport::Wss);
+    g_guest.bind(identity("owner", true));
+
+    let owner_id = ClientId::from_string("owner");
+    assert!(
+        drain(&mut rx).is_empty(),
+        "a guest hello queues no transition"
+    );
+    assert!(
+        reg.live_clients().is_empty(),
+        "a guest hello lists no client"
+    );
+    assert!(
+        reg.host_presence(&HashSet::from([&owner_id])).is_empty(),
+        "a guest hello is not host presence"
+    );
+    assert!(
+        g_guest.bound_client_id().is_none(),
+        "a guest is never a tab host"
+    );
+    assert!(!reg.is_connected());
+
+    // The real owner comes and goes; the guest sharing the id changes nothing.
+    let (owner, _rx_owner) = idle_channel();
+    let g_owner = reg.register(owner, ReverseTransport::Wss);
+    g_owner.bind(identity("owner", true));
+    assert_eq!(
+        drain(&mut rx),
+        vec![ClientTransition::Connected(identity("owner", true))]
+    );
+    let live = reg.live_clients();
+    assert_eq!(live.len(), 1);
+    assert_eq!(
+        live[0].connections, 1,
+        "the guest connection is not counted"
+    );
+    assert!(reg
+        .host_presence(&HashSet::from([&owner_id]))
+        .contains_key(&owner_id));
+    drop(g_owner);
+    assert_eq!(
+        drain(&mut rx),
+        vec![ClientTransition::Disconnected(identity("owner", true))],
+        "the owner goes offline even though a guest still hellos as it"
+    );
+    assert!(reg.live_clients().is_empty());
+    assert!(reg.host_presence(&HashSet::from([&owner_id])).is_empty());
+
+    // The guest leaving is as silent as an un-hello'd connection.
+    drop(g_guest);
     assert!(reg.is_empty());
     assert!(drain(&mut rx).is_empty());
 }

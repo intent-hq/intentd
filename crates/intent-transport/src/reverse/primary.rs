@@ -11,7 +11,9 @@
 //!   `JsonRpcClient`s) are never candidates — this is what fixes the REV-1
 //!   misrouting where the first arrival won regardless of what it could do.
 //!   A connection bound to a non-administrator principal is never a
-//!   candidate either (multiplayer w3; [`super::ReverseChannel::is_administrator`]).
+//!   candidate either (multiplayer w3; [`super::ReverseChannel::is_administrator`]):
+//!   its `client.hello` is not bound onto the entry, so it is also absent from
+//!   the presence projections and the `client:*` transitions.
 //! - [`ReverseTarget::Default`] → the **first-connected** eligible connection
 //!   (unchanged single-desktop behaviour); none → `NoClient`.
 //! - [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`] → the **newest**
@@ -693,6 +695,12 @@ impl PrimaryReverseGuard {
     /// connection was the last of, then a `Connected` for a new `clientId`
     /// with no other live connection) under the registry lock.
     ///
+    /// A non-administrator connection's hello is not bound at all (multiplayer
+    /// w3): the entry keeps no identity, so it never appears in
+    /// [`PrimaryReverseRegistry::live_clients`] / `host_presence`, never
+    /// reports as a tab host, and never queues a `client:*` transition —
+    /// whatever `clientId` or `browserExec` it advertised.
+    ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
@@ -704,6 +712,9 @@ impl PrimaryReverseGuard {
         let Some(pos) = state.entries.iter().position(|e| e.id == self.id) else {
             return;
         };
+        if !state.entries[pos].channel.is_administrator() {
+            return;
+        }
         state.entries[pos].hello_seq = inner.next_hello_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let previous = state.entries[pos].identity.replace(identity.clone());
         state.bound.insert(self.id, identity.client_id.clone());
