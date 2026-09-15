@@ -669,8 +669,9 @@ fn encode_path_segments(path: &str) -> String {
 ///
 /// `octocrab::Octocrab::graphql` already unwraps the envelope — it returns the
 /// `data` object on success and turns an `errors` array into
-/// `octocrab::Error::Graphql` (mapped onto [`Error::Api`]) — so the only
-/// remaining failure mode is a `null` payload with no accompanying error.
+/// `octocrab::Error::Graphql` (mapped onto [`Error::RateLimited`] when a
+/// message names the rate limit, else [`Error::Api`]) — so the only remaining
+/// failure mode is a `null` payload with no accompanying error.
 fn graphql_data(data: Value) -> Result<Value> {
     if data.is_null() {
         return Err(Error::Api("graphql response returned no data".to_string()));
@@ -952,7 +953,8 @@ fn merge_requirements_query_without_merge_queue() -> String {
 /// without merge queues likewise rejects the `RemovedFromMergeQueueEvent`
 /// timeline selection; octocrab folds GraphQL errors into their message text,
 /// which [`From`] maps onto [`Error::Api`]). Any other error — auth, rate
-/// limit, network — stays a hard failure.
+/// limit (a `RATE_LIMIT` envelope maps onto [`Error::RateLimited`], never
+/// `Api`), network — stays a hard failure.
 fn merge_queue_field_unsupported(err: &Error) -> bool {
     matches!(
         err,
