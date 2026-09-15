@@ -329,31 +329,10 @@ impl<'a> MessageAuthorResolver<'a> {
         }
     }
 
-    /// Attach `author` to every `user`-role message object in `messages`
-    /// (the serialized transcript page). Non-user rows are untouched.
-    pub(crate) async fn attach(&mut self, messages: &mut [Value]) {
-        let stamps = messages
-            .iter()
-            .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-            .map(|m| lift_from_principal_id(m.get("metadata")))
-            .collect();
-        self.prefetch(stamps).await;
-        for message in messages.iter_mut() {
-            if message.get("role").and_then(Value::as_str) != Some("user") {
-                continue;
-            }
-            let Some(author) = self.resolve(message.get("metadata")).await else {
-                continue;
-            };
-            if let Some(obj) = message.as_object_mut() {
-                obj.insert("author".to_string(), author);
-            }
-        }
-    }
-
-    /// Typed twin of [`Self::attach`] for reads that serve
-    /// [`intent_core::AgentMessage`] rows directly (`agent.getSession`):
-    /// same resolution, same `author` shape, so both hydration routes agree.
+    /// Attach `author` to every `user`-role row of a transcript page
+    /// (`agent.getConversation`, `agent.getSession`) before it is serialized,
+    /// so the slim page budget counts the profile bytes. Non-user rows keep
+    /// `author: None`, which the wire shape omits.
     pub(crate) async fn attach_typed(&mut self, messages: &mut [intent_core::AgentMessage]) {
         let stamps = messages
             .iter()
@@ -668,19 +647,8 @@ mod tests {
         let legacy = resolver.resolve(None).await.expect("legacy fallback");
         assert_eq!(legacy["principalId"], guest.id.0);
 
-        // `attach` annotates user rows only.
-        let mut page = vec![
-            json!({ "role": "user", "metadata": { "fromPrincipalId": primary.id.0 } }),
-            json!({ "role": "assistant" }),
-            json!({ "role": "user" }),
-        ];
-        resolver.attach(&mut page).await;
-        assert_eq!(page[0]["author"]["principalId"], primary.id.0);
-        assert!(page[1].get("author").is_none());
-        assert_eq!(page[2]["author"]["principalId"], guest.id.0);
-
-        // The typed twin (`agent.getSession`) produces the identical `author`
-        // per row — stamped, legacy-fallback and non-user alike.
+        // `attach_typed` annotates user rows only — stamped, legacy-fallback
+        // and non-user alike.
         let typed_row = |role: &str, metadata: Option<Value>| intent_core::AgentMessage {
             id: format!("m-{role}"),
             agent_id: AgentId::from("agent-typed"),
@@ -697,11 +665,16 @@ mod tests {
             typed_row("assistant", None),
             typed_row("user", None),
         ];
-        let mut resolver = MessageAuthorResolver::new(&services, &ws);
         resolver.attach_typed(&mut typed).await;
-        assert_eq!(typed[0].author, page[0].get("author").cloned());
+        assert_eq!(
+            typed[0].author.as_ref().map(|a| a["principalId"].clone()),
+            Some(json!(primary.id.0))
+        );
         assert_eq!(typed[1].author, None);
-        assert_eq!(typed[2].author, page[2].get("author").cloned());
+        assert_eq!(
+            typed[2].author.as_ref().map(|a| a["principalId"].clone()),
+            Some(json!(guest.id.0))
+        );
         let serialized = serde_json::to_value(&typed[1]).expect("serialize");
         assert!(
             serialized.get("author").is_none(),
@@ -710,9 +683,8 @@ mod tests {
     }
 
     /// RPC cost contract: a transcript page with D distinct authors (stamped
-    /// and unstamped, known and vanished) costs ONE principal statement on
-    /// both hydration routes, not D — and rows the batch already answered
-    /// never trigger a single lookup.
+    /// and unstamped, known and vanished) costs ONE principal statement, not
+    /// D — and rows the batch already answered never trigger a single lookup.
     #[tokio::test]
     async fn resolver_batches_a_page_into_one_principal_lookup() {
         let tmp = TempDb::new();
@@ -726,60 +698,66 @@ mod tests {
         }
         let services = Services::new(store);
 
-        let mut page = Vec::new();
-        for g in &guests {
-            for _ in 0..2 {
-                page.push(json!({ "role": "user", "metadata": { "fromPrincipalId": g.id.0 } }));
-            }
-        }
-        page.push(json!({ "role": "user", "metadata": { "fromPrincipalId": "gone" } }));
-        page.push(json!({ "role": "user" }));
-        page.push(json!({ "role": "assistant" }));
-        page.push(json!({ "role": "user", "metadata": { "fromPrincipalId": primary.id.0 } }));
-
-        let mut resolver = MessageAuthorResolver::new(&services, &ws);
-        resolver.attach(&mut page).await;
-        assert_eq!(
-            resolver.principal_lookups, 1,
-            "one batched statement for the whole page"
-        );
-        for (i, g) in guests.iter().enumerate() {
-            assert_eq!(page[2 * i]["author"]["principalId"], g.id.0);
-            assert_eq!(page[2 * i]["author"]["login"], format!("g{i}"));
-        }
-        assert_eq!(
-            page[6]["author"],
-            json!({ "principalId": "gone", "login": null, "displayName": null, "avatarUrl": null })
-        );
-        assert_eq!(page[7]["author"]["principalId"], primary.id.0);
-        assert!(page[8].get("author").is_none());
-        assert_eq!(page[9]["author"]["principalId"], primary.id.0);
-
-        // The typed route batches identically.
-        let typed_row = |metadata: Option<Value>| intent_core::AgentMessage {
+        let row = |role: &str, metadata: Option<Value>| intent_core::AgentMessage {
             id: "m".to_string(),
             agent_id: AgentId::from("agent-typed"),
             seq: 0,
-            role: "user".to_string(),
+            role: role.to_string(),
             content: json!([]),
             metadata,
             app_message_id: None,
             author: None,
             created_at: now_iso(),
         };
-        let mut typed: Vec<_> = guests
-            .iter()
-            .map(|g| typed_row(Some(json!({ "fromPrincipalId": g.id.0 }))))
-            .chain(std::iter::once(typed_row(None)))
-            .collect();
+        let author_of =
+            |m: &intent_core::AgentMessage, key: &str| m.author.as_ref().map(|a| a[key].clone());
+
+        let mut page = Vec::new();
+        for g in &guests {
+            for _ in 0..2 {
+                page.push(row("user", Some(json!({ "fromPrincipalId": g.id.0 }))));
+            }
+        }
+        page.push(row("user", Some(json!({ "fromPrincipalId": "gone" }))));
+        page.push(row("user", None));
+        page.push(row("assistant", None));
+        page.push(row(
+            "user",
+            Some(json!({ "fromPrincipalId": primary.id.0 })),
+        ));
+
         let mut resolver = MessageAuthorResolver::new(&services, &ws);
-        resolver.attach_typed(&mut typed).await;
-        assert_eq!(resolver.principal_lookups, 1);
-        assert!(typed.iter().all(|m| m.author.is_some()));
+        resolver.attach_typed(&mut page).await;
+        assert_eq!(
+            resolver.principal_lookups, 1,
+            "one batched statement for the whole page"
+        );
+        for (i, g) in guests.iter().enumerate() {
+            assert_eq!(author_of(&page[2 * i], "principalId"), Some(json!(g.id.0)));
+            assert_eq!(
+                author_of(&page[2 * i], "login"),
+                Some(json!(format!("g{i}")))
+            );
+        }
+        assert_eq!(
+            page[6].author,
+            Some(
+                json!({ "principalId": "gone", "login": null, "displayName": null, "avatarUrl": null })
+            )
+        );
+        assert_eq!(
+            author_of(&page[7], "principalId"),
+            Some(json!(primary.id.0))
+        );
+        assert_eq!(page[8].author, None);
+        assert_eq!(
+            author_of(&page[9], "principalId"),
+            Some(json!(primary.id.0))
+        );
 
         // An empty / non-user page issues no principal statement at all.
         let mut resolver = MessageAuthorResolver::new(&services, &ws);
-        resolver.attach(&mut [json!({ "role": "assistant" })]).await;
+        resolver.attach_typed(&mut [row("assistant", None)]).await;
         assert_eq!(resolver.principal_lookups, 0);
     }
 

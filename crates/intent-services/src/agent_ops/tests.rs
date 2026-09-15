@@ -7606,6 +7606,100 @@ async fn get_conversation_slim_pages_are_byte_budgeted() {
     assert_eq!(walked, all, "token walk has no gaps or duplicates");
 }
 
+/// Multiplayer w2 × slim page budget: the serve-time `author` projection is
+/// attached BEFORE the page is budgeted, so the profile strings count toward
+/// [`SLIM_PAGE_BUDGET_BYTES`] instead of landing on top of an at-budget page.
+/// The author profile is deliberately oversized (8 KiB display name) so the
+/// arithmetic is unambiguous: 100 KiB rows alone admit five per page
+/// (500 KiB), rows + author admit four (4 × 108 KiB) — a page sized without
+/// the authors would serve ~540 KiB, over the budget it just enforced.
+#[tokio::test]
+async fn get_conversation_slim_budget_counts_attached_author_bytes() {
+    use intent_core::{ConversationProjection, Principal, PrincipalId, SLIM_PAGE_BUDGET_BYTES};
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "AuthorBudget").await;
+    let guest = PrincipalId::new();
+    let long_name = "N".repeat(8 * 1024);
+    svc.store()
+        .upsert_principal(&Principal {
+            id: guest.clone(),
+            github_user_id: None,
+            login: Some("guest".into()),
+            display_name: Some(long_name.clone()),
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("principal");
+    let chunk = "y".repeat(100 * 1024);
+    let stamp = json!({ "fromPrincipalId": guest.0 });
+    for i in 0..12 {
+        let c = json!([{ "type": "text", "text": format!("{i}:{chunk}") }]);
+        svc.store()
+            .append_agent_message_with_metadata(&id, "user", &c, Some(&stamp), &now_iso())
+            .await
+            .expect("append");
+    }
+
+    let mut walked: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut first_page_len = None;
+    loop {
+        let page = svc
+            .agent_get_conversation_op(
+                id.clone(),
+                None,
+                None,
+                token.clone(),
+                None,
+                None,
+                Some(ConversationProjection::Slim),
+                false,
+            )
+            .await
+            .expect("slim page");
+        let msgs = page["messages"].as_array().unwrap();
+        assert!(!msgs.is_empty(), "budgeted pages are never empty");
+        for m in msgs {
+            assert_eq!(
+                m["author"]["displayName"].as_str().map(str::len),
+                Some(long_name.len()),
+                "every served user row carries the resolved author: {}",
+                m["id"]
+            );
+        }
+        // No single row exceeds the budget, so the SERVED page — authors
+        // included — must fit inside it.
+        let page_bytes = serde_json::to_string(&page["messages"]).unwrap().len();
+        assert!(
+            page_bytes <= SLIM_PAGE_BUDGET_BYTES,
+            "served page (with authors) exceeds the budget: {page_bytes}"
+        );
+        first_page_len.get_or_insert(msgs.len());
+        let ids: Vec<String> = msgs
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        walked.splice(0..0, ids);
+        match page["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(
+        first_page_len,
+        Some(4),
+        "author bytes are budgeted: four 108 KiB rows fit, five do not"
+    );
+    assert_eq!(walked.len(), 12, "token walk has no gaps or duplicates");
+    let mut dedup = walked.clone();
+    dedup.sort();
+    dedup.dedup();
+    assert_eq!(dedup.len(), 12, "token walk has no duplicates");
+}
+
 /// Slim page budget edge: a single message over the whole page budget still
 /// serves alone (never an empty page, no infinite token loop), and the walk
 /// continues past it into older history.
@@ -13549,7 +13643,9 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
 async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_point() {
     use intent_core::{with_caller, AgentWakeOrCreateInput, Caller, Principal, PrincipalId};
 
-    let (_t, svc, ws) = setup().await;
+    let (tmp, svc, ws) = setup().await;
+    // A hermetic workspaces root for the `workspace.create` arm below.
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
     let alice = PrincipalId::new();
     let bob = PrincipalId::new();
     for (id, login) in [(&alice, "alice"), (&bob, "bob")] {
@@ -13913,6 +14009,43 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
         kickoff.messages
     );
 
+    // workspace.create: the `initialAgent.prompt` kickoff IS a persisted user
+    // row (delivered daemon-side, no `agent.sendMessage` follows), stamped
+    // with the creating caller — a collaborator's first message must never
+    // fall back to the workspace owner.
+    let created_ws = with_caller(wire(&bob), async {
+        WorkspaceApi::create_workspace(
+            &svc,
+            intent_core::WorkspaceCreate {
+                title: Some("Bob's workspace".into()),
+                skip_isolation: Some(true),
+                initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                    prompt: Some("initial kickoff".into()),
+                    provider: Some("auggie".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("workspace.create");
+    let initial_agent = AgentId::from(
+        created_ws
+            .initial_agent
+            .as_ref()
+            .and_then(|a| a["id"].as_str())
+            .expect("initial agent id"),
+    );
+    let initial_row = latest_row_containing(&svc, &initial_agent, "initial kickoff").await;
+    assert_eq!(
+        stamp_of(initial_row.metadata.as_ref()).as_deref(),
+        Some(bob.0.as_str()),
+        "workspace.create: the initialAgent kickoff row carries the creator: {initial_row:?}"
+    );
+
     // Negative controls: Agent / Daemon callers strip the spoof and stamp
     // nothing on the direct-persist and queue entry points.
     for (label, caller) in [
@@ -14083,6 +14216,100 @@ async fn non_object_message_metadata_is_rejected_on_every_user_origin_entry_poin
         svc.queue_snapshot(&agent).is_empty(),
         "nothing was enqueued"
     );
+}
+
+/// Multiplayer w2: a durable pre-attribution user-origin queue entry may
+/// carry scalar `messageMetadata`, which the editor restamp rejects. The
+/// rejection must leave the entry EXACTLY as it was — content, metadata and
+/// editing flag — rather than a half-applied mutation that never published
+/// and that a later queue write would persist.
+#[tokio::test]
+async fn edit_queued_message_restamp_rejection_leaves_entry_untouched() {
+    use intent_core::{with_caller, Caller, PrincipalId};
+
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let agent = create_agent(&svc, &ws, "Legacy").await;
+    let (legacy, _) = svc.enqueue_message(
+        &agent,
+        "original".into(),
+        None,
+        None,
+        Some(json!("legacy")),
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    let before = svc
+        .queue_snapshot(&agent)
+        .into_iter()
+        .find(|q| q["id"] == legacy.id.as_str())
+        .expect("seeded entry");
+    assert_eq!(before["content"], "original");
+    assert_eq!(before["messageMetadata"], json!("legacy"));
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+    let err = with_caller(
+        Caller::Wire {
+            principal_id: PrincipalId::new(),
+            is_administrator: false,
+        },
+        async {
+            svc.agent_edit_queued_message(
+                agent.clone(),
+                legacy.id.clone(),
+                "edited by wire".into(),
+                Some(true),
+            )
+            .await
+        },
+    )
+    .await
+    .expect_err("scalar metadata cannot be restamped");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("messageMetadata must be an object")),
+        "{err:?}"
+    );
+
+    let after = svc
+        .queue_snapshot(&agent)
+        .into_iter()
+        .find(|q| q["id"] == legacy.id.as_str())
+        .expect("entry still queued");
+    assert_eq!(after, before, "rejected edit mutated the entry: {after}");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), sub.recv())
+            .await
+            .is_err(),
+        "a rejected edit publishes no queue update"
+    );
+
+    // An agent-origin edit (no restamp) still succeeds on the same entry.
+    with_caller(
+        Caller::Agent {
+            agent_id: agent.clone(),
+        },
+        async {
+            svc.agent_edit_queued_message(
+                agent.clone(),
+                legacy.id.clone(),
+                "agent edit".into(),
+                None,
+            )
+            .await
+        },
+    )
+    .await
+    .expect("agent edit leaves the stamp alone");
+    let edited = svc
+        .queue_snapshot(&agent)
+        .into_iter()
+        .find(|q| q["id"] == legacy.id.as_str())
+        .expect("entry still queued");
+    assert_eq!(edited["content"], "agent edit");
+    assert_eq!(edited["messageMetadata"], json!("legacy"));
 }
 
 /// monorepo#564 regression: `agent.sendMessage` to a nonexistent agent id

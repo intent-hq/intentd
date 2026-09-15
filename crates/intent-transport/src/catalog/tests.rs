@@ -421,6 +421,10 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
         "agent.wakeOrCreate",
         "stamped on the input in `WorkspaceApi::agent_wake_or_create`; the wake row, parked queue entry and worker options carry it",
     ),
+    (
+        "workspace.create",
+        "the `initialAgent.prompt` kickoff is the creator's first user row, stamped in `WorkspaceApi::create_workspace` before the runtime / store-only delivery",
+    ),
 ];
 
 /// The complement of [`USER_ORIGIN_MESSAGE_ENTRY_POINTS`]: every other method
@@ -433,7 +437,7 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
 /// Classification notes for the entries a reader might question:
 /// - `agent.replaceMessages` swaps the transcript wholesale (compaction /
 ///   restore); it re-persists rows with the metadata they already carry and
-///   is not a human authoring event, so the Product Brief's ten-entry set
+///   is not a human authoring event, so the Product Brief's entry-point set
 ///   excludes it. Provenance is intentionally preserved verbatim there —
 ///   including any `fromPrincipalId` on restored user rows — because it is an
 ///   administrator-only historical restore/compaction operation: wave-3
@@ -767,7 +771,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.archive",
     "workspace.cancelDelete",
     "workspace.cleanup",
-    "workspace.create",
     "workspace.delete",
     "workspace.detectProjectType",
     "workspace.diskUsage",
@@ -898,9 +901,10 @@ fn user_origin_message_entry_points_frozen() {
     }
     assert_eq!(
         USER_ORIGIN_MESSAGE_ENTRY_POINTS.len(),
-        10,
-        "the Product Brief enumerates ten user-origin entry points; a change here needs \
-         the service matrix and docs/protocol/ updated alongside"
+        11,
+        "the Product Brief's ten user-origin entry points plus `workspace.create`'s \
+         initialAgent kickoff; a change here needs the service matrix and \
+         docs/protocol/ updated alongside"
     );
 
     // Exhaustive partition of the FULL catalog (router + fast path): a new
