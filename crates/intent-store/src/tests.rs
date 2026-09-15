@@ -8134,12 +8134,40 @@ async fn workspace_membership_add_set_role_remove() {
     assert!(members.iter().all(|m| m.role == WorkspaceRole::Owner));
     assert_eq!(
         store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(primary.id.clone()),
+        "the earliest-added owner stays the mirrored owner"
+    );
+    store
+        .set_workspace_member_role(&ws_id, &primary.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("demote primary");
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(guest.id.clone()),
+        "demoting the mirrored owner re-derives the column from the remaining owner"
+    );
+    assert_eq!(
+        store
             .list_workspace_members(&other_ws)
             .await
             .expect("other")
             .len(),
         1,
         "role change is scoped to the workspace"
+    );
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&other_ws)
+            .await
+            .expect("other owner"),
+        Some(primary.id.clone()),
+        "owner mirror is scoped to the workspace"
     );
     assert!(matches!(
         store
@@ -8177,6 +8205,56 @@ async fn workspace_membership_add_set_role_remove() {
     let members = store.list_workspace_members(&ws_id).await.expect("members");
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].principal_id, primary.id);
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        None,
+        "removing the only owner clears the mirrored column"
+    );
+    store
+        .set_workspace_member_role(&ws_id, &primary.id, WorkspaceRole::Owner)
+        .await
+        .expect("re-promote primary");
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(primary.id.clone()),
+        "promoting a member sets the mirrored column"
+    );
+    let outsider = Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(8),
+        login: Some("outsider".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store
+        .upsert_principal(&outsider)
+        .await
+        .expect("insert outsider");
+    store
+        .remove_workspace_member(&ws_id, &primary.id)
+        .await
+        .expect("remove primary");
+    assert!(store
+        .add_workspace_member(&ws_id, &outsider.id, WorkspaceRole::Owner)
+        .await
+        .expect("add owner"));
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(outsider.id.clone()),
+        "adding an owner member sets the mirrored column"
+    );
 }
 
 /// `workspace_membership_summaries` is scoped to exactly the requested ids:
