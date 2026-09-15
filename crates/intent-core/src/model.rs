@@ -8,6 +8,18 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
+use crate::repo_ref::RepoRef;
+
+/// Builds a [`RepoRef`] from an optional owner/name pair: `Some` only when
+/// both halves are present and non-empty.
+fn repo_ref_from_parts(owner: Option<&str>, name: Option<&str>) -> Option<RepoRef> {
+    match (owner, name) {
+        (Some(owner), Some(name)) if !owner.is_empty() && !name.is_empty() => {
+            Some(RepoRef::new(owner, name))
+        }
+        _ => None,
+    }
+}
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the `PascalCase` variant names (`Active`/`Inactive`/`Archived`/
@@ -172,7 +184,7 @@ pub enum WorkspaceDisplayStatus {
 /// Workspace entity (§9.1).
 // The bool fields mirror the protocol's wire shape; grouping them would
 // change the serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -339,6 +351,19 @@ impl Workspace {
         .into_iter()
         .flatten()
         .find(|p| !p.is_empty())
+    }
+
+    /// The workspace's forge repository as a case-insensitive [`RepoRef`]
+    /// (`repositoryOwner` / `repositoryName`). Compare and key on this rather
+    /// than the raw fields: two workspaces whose slugs differ only in ASCII
+    /// case name the same repository. `None` when either half is missing or
+    /// empty.
+    #[must_use]
+    pub fn repo(&self) -> Option<RepoRef> {
+        repo_ref_from_parts(
+            self.repository_owner.as_deref(),
+            self.repository_name.as_deref(),
+        )
     }
 }
 
@@ -537,7 +562,7 @@ pub struct ContextUsage {
 }
 
 // serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -1076,7 +1101,7 @@ pub struct WorkspaceUpdate {
 /// Deserialize a JSON `null` as `Some(None)` (explicit clear) and a missing
 /// field as `None` (no change), so `Option<Option<T>>` on [`WorkspaceUpdate`]
 /// can distinguish the two. A present non-null value maps to `Some(Some(v))`.
-#[allow(clippy::option_option)] // the nesting IS the absent-vs-null distinction
+#[expect(clippy::option_option)] // the nesting IS the absent-vs-null distinction
 fn deserialize_optional_field<'de, T, D>(
     deserializer: D,
 ) -> std::result::Result<Option<Option<T>>, D::Error>
@@ -1518,6 +1543,10 @@ pub struct NoteSetContentResult {
     /// [`TaskConvertBlocksResult::warnings`]).
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// The note's `rev` after the write (post auto-conversion refetch): the
+    /// base a follow-up conditional write should send as `expectedVersion`.
+    #[serde(default)]
+    pub rev: i64,
 }
 
 /// Result of `note.updateMetadata`. Either a normal title/tags update or a
@@ -1745,6 +1774,12 @@ pub struct TaskUpdateNoteStatusResult {
     pub note_id: NoteId,
     pub status: TaskStatus,
     pub note: Note,
+    /// Presence-detected: set only when the caller-aware terminal guard
+    /// refused the write (a task's own linked agent tried to move it out of
+    /// `complete` / `cancelled`). `status` / `note` then echo the unchanged
+    /// task; absent (never `null`) on every write that went through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory: Option<String>,
 }
 
 /// Result of `task.update` (atomic single-line edit).
@@ -2687,7 +2722,7 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
 /// defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "2.4";
+pub const CURRENT_HARNESS_VERSION: &str = "2.5";
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching
@@ -2837,7 +2872,7 @@ pub const WORKSPACE_STATUS_MESSAGE_MAX_LENGTH: usize = 500;
 /// (not persisted, §19.2). `provider` is immutable once set on first real use.
 // The bool fields mirror the TS wire shape; grouping them would change the
 // serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSession {
@@ -2937,9 +2972,11 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_blocks: Option<serde_json::Value>,
     /// Session-level file blocks captured at spawn (FE top-level
-    /// `fileBlocks`); an opaque JSON array persisted verbatim. Entries carry
-    /// EITHER inline `data` or an attachment-registry `attachmentId`
-    /// reference (PROTOCOL §5.5).
+    /// `fileBlocks`); an opaque JSON array persisted verbatim. Since
+    /// protocol 10.0 every entry carries an attachment-registry
+    /// `attachmentId` reference — inline `data` is rejected `-32602` at every
+    /// input seam (PROTOCOL §5.5); rows persisted before 10.0 may still hold
+    /// legacy inline entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_blocks: Option<serde_json::Value>,
     /// Sandbox ID when this agent runs in a CoW-isolated sandbox (direct-mode
@@ -3290,7 +3327,7 @@ pub struct AgentMetadata {
 /// iOS coverflow reads.
 // The bool fields mirror the TS wire shape; grouping them would change the
 // serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLite {
@@ -3701,9 +3738,10 @@ pub struct AgentCreateExtra {
     pub workspace_context: Option<serde_json::Value>,
     pub context_references: Option<serde_json::Value>,
     pub image_blocks: Option<serde_json::Value>,
-    /// Session-level file blocks captured at spawn (PROTOCOL §5.5): entries
-    /// carry EITHER inline `data` or an attachment-registry `attachmentId`
-    /// reference; validated at the create seam like send/queue.
+    /// Session-level file blocks captured at spawn (PROTOCOL §5.5, v10.0):
+    /// every entry carries an attachment-registry `attachmentId` reference
+    /// (inline `data` is rejected `-32602`); validated at the create seam
+    /// like send/queue.
     pub file_blocks: Option<serde_json::Value>,
     pub is_background: Option<bool>,
     /// Internal override for the created session's `nameExplicitlySet` flag.
@@ -3943,7 +3981,7 @@ pub struct FileStatus {
 /// The bools mirror the wire contract 1:1 (each an independent flag on the
 /// `git.status` result), so folding them into enums would diverge the model
 /// from the protocol shape.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitStatus {
@@ -4061,15 +4099,20 @@ pub enum ScriptMode {
 }
 
 /// Runtime status of a script process (ported from the TS `ScriptStatus`,
-/// plus `restarting` — new in intentd, monorepo#1318). `restarting` covers the
-/// restart-in-flight window (the auto-restart backoff and the `script.restart`
-/// stop→start gap) so clients can distinguish it from a final exit; the
-/// respawn flips it back to `running`.
+/// plus `restarting` — new in intentd, monorepo#1318 — and `starting` —
+/// intent-hq/intent#4858). `restarting` covers the restart-in-flight window
+/// (the auto-restart backoff and the `script.restart` stop→start gap) so
+/// clients can distinguish it from a final exit; the respawn flips it back to
+/// `running`. `starting` covers the `script.start` launch window: it is set
+/// synchronously before `script.start` replies and holds until the spawn's
+/// `running` (or `exited` on a spawn failure), so a status read after `start`
+/// returns never observes the pre-launch `idle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptStatus {
     #[default]
     Idle,
+    Starting,
     Running,
     Restarting,
     Exited,
@@ -4302,6 +4345,17 @@ pub struct PrMonitor {
     pub updated_at: String,
 }
 
+impl PrMonitor {
+    /// The monitored repository as a case-insensitive [`RepoRef`]
+    /// (`repoOwner` / `repoName`). Compare and key on this rather than the
+    /// raw fields: monitors whose slugs differ only in ASCII case watch the
+    /// same repository.
+    #[must_use]
+    pub fn repo(&self) -> RepoRef {
+        RepoRef::new(self.repo_owner.as_str(), self.repo_name.as_str())
+    }
+}
+
 /// How a [`WorkspaceGitRoot`] came to be tracked. Wire/DB words are the
 /// lowercase variant names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4359,6 +4413,17 @@ pub struct WorkspaceGitRoot {
     pub pull_requests: Option<Vec<PullRequestInfo>>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl WorkspaceGitRoot {
+    /// The root's detected forge repository as a case-insensitive [`RepoRef`]
+    /// (`repoOwner` / `repoName`). Compare and key on this rather than the
+    /// raw fields: roots whose slugs differ only in ASCII case name the same
+    /// repository. `None` when either half is missing or empty.
+    #[must_use]
+    pub fn repo(&self) -> Option<RepoRef> {
+        repo_ref_from_parts(self.repo_owner.as_deref(), self.repo_name.as_deref())
+    }
 }
 
 /// Host identification a client supplies about *its own* device in
@@ -4464,6 +4529,13 @@ pub struct BrowserTabSize {
 /// `url` / `title`; every other client is a viewer. `tab_id` is minted by the
 /// host and unique per daemon. Panel geometry is client-local and never
 /// stored.
+///
+/// `displayed` is the host-reported **layout fact** of the hidden-by-default
+/// contract (§5.9, monorepo#3045): `true` when the tab is not hidden AND is
+/// the active tab of the panel holding it in the workspace's saved layout.
+/// `None` means the host has never reported it (a pre-`displayed` host, or
+/// no report yet since the daemon started — see the store's process-local
+/// overlay); it is never `false` by default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserTab {
@@ -4483,6 +4555,8 @@ pub struct BrowserTab {
     pub visibility: BrowserTabVisibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emulated_size: Option<BrowserTabSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed: Option<bool>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -4543,6 +4617,9 @@ impl BrowserTab {
                 serde_json::json!(input.emulated_size),
             );
         }
+        if self.displayed != input.displayed {
+            changes.insert("displayed".to_string(), serde_json::json!(input.displayed));
+        }
         changes
     }
 
@@ -4559,6 +4636,7 @@ impl BrowserTab {
             owner_agent_name,
             visibility,
             emulated_size,
+            displayed,
         } = input;
         self.workspace_id = workspace_id;
         self.url = url;
@@ -4568,6 +4646,7 @@ impl BrowserTab {
         self.owner_agent_name = owner_agent_name;
         self.visibility = visibility;
         self.emulated_size = emulated_size;
+        self.displayed = displayed;
     }
 }
 
@@ -4593,6 +4672,10 @@ pub struct BrowserTabInput {
     pub visibility: BrowserTabVisibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emulated_size: Option<BrowserTabSize>,
+    /// Layout fact (see [`BrowserTab::displayed`]); omitted / `null` when
+    /// the host does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed: Option<bool>,
 }
 
 /// Outcome of a host-reported `browser.upsertTab`: the persisted row plus
@@ -4687,6 +4770,105 @@ mod tests {
         assert_eq!(ws.effective_path(), Some("/repo"));
         ws.repository_path = Some(String::new());
         assert_eq!(ws.effective_path(), None);
+    }
+
+    /// [`Workspace::repo`]: case-variant `repositoryOwner` / `repositoryName`
+    /// fold to one [`RepoRef`] identity; `None` when either half is missing or
+    /// empty.
+    #[test]
+    fn workspace_repo_folds_case_and_requires_both_halves() {
+        let mut ws = chief_workspace();
+        assert_eq!(ws.repo(), None);
+
+        ws.repository_owner = Some("Intent-HQ".to_string());
+        assert_eq!(ws.repo(), None);
+        ws.repository_name = Some(String::new());
+        assert_eq!(ws.repo(), None);
+
+        ws.repository_name = Some("IntentD".to_string());
+        let upper = ws.repo().expect("both halves present");
+        assert_eq!(upper, RepoRef::new("intent-hq", "intentd"));
+        assert_eq!(upper.owner, "Intent-HQ");
+        assert_eq!(upper.name, "IntentD");
+
+        let mut lower = ws.clone();
+        lower.repository_owner = Some("intent-hq".to_string());
+        lower.repository_name = Some("intentd".to_string());
+        assert_eq!(lower.repo(), ws.repo());
+
+        ws.repository_owner = Some(String::new());
+        assert_eq!(ws.repo(), None);
+        ws.repository_owner = None;
+        assert_eq!(ws.repo(), None);
+    }
+
+    fn git_root_with_repo(owner: Option<&str>, name: Option<&str>) -> WorkspaceGitRoot {
+        WorkspaceGitRoot {
+            id: WorkspaceGitRootId::from("root-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            path: "/repo".to_string(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: owner.map(str::to_string),
+            repo_name: name.map(str::to_string),
+            registered_by_agent_ids: Vec::new(),
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+        }
+    }
+
+    /// [`WorkspaceGitRoot::repo`]: same contract as [`Workspace::repo`] —
+    /// case-variant slugs are one identity, and a missing or empty half
+    /// yields `None`.
+    #[test]
+    fn workspace_git_root_repo_folds_case_and_requires_both_halves() {
+        assert_eq!(
+            git_root_with_repo(Some("Intent-HQ"), Some("IntentD")).repo(),
+            git_root_with_repo(Some("intent-hq"), Some("intentd")).repo()
+        );
+        assert_eq!(
+            git_root_with_repo(Some("Intent-HQ"), Some("IntentD")).repo(),
+            Some(RepoRef::new("INTENT-HQ", "INTENTD"))
+        );
+        assert_eq!(git_root_with_repo(None, None).repo(), None);
+        assert_eq!(git_root_with_repo(Some("intent-hq"), None).repo(), None);
+        assert_eq!(git_root_with_repo(None, Some("intentd")).repo(), None);
+        assert_eq!(git_root_with_repo(Some(""), Some("intentd")).repo(), None);
+        assert_eq!(git_root_with_repo(Some("intent-hq"), Some("")).repo(), None);
+    }
+
+    /// [`PrMonitor::repo`] equals a case-variant [`RepoRef`] while keeping
+    /// the stored casing on the fields.
+    #[test]
+    fn pr_monitor_repo_equals_case_variant_repo_ref() {
+        let monitor = PrMonitor {
+            monitor_id: PrMonitorId::from("m-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "Intent-HQ".to_string(),
+            repo_name: "IntentD".to_string(),
+            pr_number: 7,
+            state: PrMonitorState::Active,
+            last_snapshot: None,
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+        };
+        let repo = monitor.repo();
+        assert_eq!(repo, RepoRef::new("intent-hq", "intentd"));
+        assert_eq!(repo.identity_key(), "intent-hq/intentd");
+        assert_eq!(repo.owner, "Intent-HQ");
+        assert_eq!(repo.name, "IntentD");
+        assert_ne!(repo, RepoRef::new("other-org", "intentd"));
     }
 
     /// [`note_list_slim_row`] projection (§5.2, monorepo#3573): `content` is

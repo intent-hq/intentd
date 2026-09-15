@@ -25,6 +25,7 @@ use crate::model::{
     TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
     WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
+use crate::repo_ref::RepoRef;
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
 /// as `Arc<dyn WorkspaceApi>` (the agent→BE callback handle, §6.8).
@@ -861,6 +862,11 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `note.add`: append/prepend/insert content (PROTOCOL §5.2).
     ///
+    /// The transform runs against the row
+    /// the op read and persists through the read-merge-persist loop described
+    /// on [`WorkspaceApi::set_note_content`], gated on that read's `rev`: a
+    /// write that lands in between is merged into rather than overwritten.
+    ///
     /// `caller_agent_id` attributes the captured note version to the invoking
     /// agent (the MCP front door passes it); `None` → user-authored.
     fn add_to_note(
@@ -879,6 +885,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `note.edit`: first exact-match replacement (PROTOCOL §5.2).
+    ///
+    /// Persists through the same read-merge-persist loop as
+    /// [`WorkspaceApi::add_to_note`] (see [`WorkspaceApi::set_note_content`]).
     ///
     /// `caller_agent_id` attributes the captured note version to the invoking
     /// agent (the MCP front door passes it); `None` → user-authored.
@@ -899,6 +908,9 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `note.editLines`: 1-based inclusive line replace/delete/insert (PROTOCOL §5.2).
     ///
+    /// Persists through the same read-merge-persist loop as
+    /// [`WorkspaceApi::add_to_note`] (see [`WorkspaceApi::set_note_content`]).
+    ///
     /// `caller_agent_id` attributes the captured note version to the invoking
     /// agent (the MCP front door passes it); `None` → user-authored.
     fn edit_note_lines(
@@ -917,7 +929,23 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `note.setContent`: full replace with the reduction guard (PROTOCOL §5.2).
-    /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
+    /// `expected_version` is the base `rev` the writer read, resolved per
+    /// attempt of a bounded read-merge-persist loop (§5.2, §5.6):
+    ///
+    /// - `None`, or equal to the current `rev`: `content` replaces as-is.
+    /// - Below the current `rev` with a snapshot for that rev: the writer's
+    ///   intent `diff(base → content)` is three-way-merged onto the current
+    ///   text (a same-span conflict keeps both variants).
+    /// - Below the current `rev` with no surviving snapshot: honest
+    ///   last-writer-wins, `content` replaces as-is.
+    /// - Above the current `rev`: a rev this note never served, so `Conflict`
+    ///   (`-32005` carrying the current entity) immediately, without a write.
+    ///
+    /// Each attempt persists gated on the rev it read; a write that lands in
+    /// between is merged into on the next attempt, and only when every
+    /// attempt of the bounded loop misses its gate does the last `Conflict`
+    /// surface — again without a write. The guard is measured against the base
+    /// when one is recoverable. The result carries the post-write `rev`.
     ///
     /// `caller_agent_id` attributes the captured note version to the invoking
     /// agent (the MCP front door passes it); `None` → user-authored.
@@ -1174,7 +1202,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `task.update`: atomic single-line edit with `expected` conflict check (§5.4).
     /// `caller_agent_id` attributes a write redirected to a linked task note
     /// (its `task:status-changed` / flipped-completion) to the calling agent.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn task_update(
         &self,
         workspace_id: WorkspaceId,
@@ -1261,7 +1289,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `caller_agent_id` attributes the resulting `task:created` /
     /// `task:status-changed` event to the invoking agent (the MCP front door
     /// passes it); `None` → system-attributed.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn mark_as_task(
         &self,
         workspace_id: WorkspaceId,
@@ -1508,7 +1536,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// turn's partial assistant message (streamed blocks so far) is appended
     /// as a trailing `inProgress: true` row (monorepo#3647); absent all
     /// optional params, behavior is byte-identical to before.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn agent_get_conversation(
         &self,
         agent_id: AgentId,
@@ -1736,7 +1764,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// Only `provider` currently lands on the persisted session; the other
     /// fields are accepted so the FE seam can bind to the wire shape ahead of
     /// full persistence.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn agent_create(
         &self,
         workspace_id: WorkspaceId,
@@ -1813,7 +1841,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// [`MessageOrigin::Automatic`], which enqueues instead of starting a
     /// turn while the target's workspace is archived. Pending questions gate
     /// neither origin.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn agent_send_message(
         &self,
         workspace_id: WorkspaceId,
@@ -1943,7 +1971,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `agent.sendMessage`. An explicit `model` must be a bare model id
     /// (compound `provider:model` ids reject `-32602` at the wire boundary,
     /// §5.5).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn agent_edit_and_regenerate(
         &self,
         workspace_id: WorkspaceId,
@@ -2875,7 +2903,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `<!--anchor:{id}:start/end-->` markers, so a client that inserted
     /// optimistic anchors under that id converges with the daemon's rewrite.
     /// Absent → the daemon mints a fresh UUID (backward compatible).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn comment_add(
         &self,
         workspace_id: WorkspaceId,
@@ -2953,7 +2981,7 @@ pub trait WorkspaceApi: Send + Sync {
     ///
     /// `author_type` is the optional wire `authorType` (`"user"` | `"agent"`);
     /// it defaults to `agent` for backward compatibility with agent/MCP callers.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn comment_respond(
         &self,
         workspace_id: WorkspaceId,
@@ -3359,7 +3387,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// root instead of the workspace worktree (monorepo#2053): an unknown id
     /// — or one registered to a different workspace — is `InvalidParams`
     /// (`-32602`). `None` preserves the primary-worktree behavior exactly.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         workspace_id: WorkspaceId,
@@ -3835,7 +3863,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.pulls.create`: open a PR with `head` sent **verbatim** (no
     /// `owner:branch` login prefix) — `{ pull }` (PROTOCOL §5.27).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn github_pulls_create(
         &self,
         owner: String,
@@ -3870,7 +3898,7 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `github.pulls.list`: `GET /repos/{owner}/{repo}/pulls` → `{ pulls, nextToken }`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn github_pulls_list(
         &self,
         owner: String,
@@ -3914,8 +3942,10 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `github.pulls.search`: `GET /search/issues` (`is:pr` + `@me`
-    /// involvement + free-text `query`) → `{ pulls, nextToken }`.
-    #[allow(clippy::too_many_arguments)]
+    /// involvement + free-text `query`, optionally spanning the `repos`
+    /// extras in one request) → `{ pulls, nextToken }`; every pull carries
+    /// its own `owner` / `repo`.
+    #[expect(clippy::too_many_arguments)]
     fn github_pulls_search(
         &self,
         owner: String,
@@ -3923,10 +3953,11 @@ pub trait WorkspaceApi: Send + Sync {
         filter: Option<String>,
         state: Option<String>,
         query: Option<String>,
+        repos: Vec<RepoRef>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, filter, state, query, limit, next_token);
+        let _ = (owner, repo, filter, state, query, repos, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_pulls_search not implemented".to_string(),
@@ -3952,7 +3983,6 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.pulls.merge`: `PUT /repos/{owner}/{repo}/pulls/{number}/merge`
     /// → `{ merged, message, sha? }`.
-    #[allow(clippy::too_many_arguments)]
     fn github_pulls_merge(
         &self,
         owner: String,
@@ -4011,6 +4041,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.relatedRepos.list`: the GitHub repositories a remote
+    /// repository's `.gitmodules` references, fetched via the contents API
+    /// (no clone) → `{ repos: [{ owner, repo, path }] }` in file order,
+    /// deduplicated, the parent excluded, capped at 5. A missing or
+    /// unparsable `.gitmodules` yields `{ repos: [] }` (never an error).
+    fn github_related_repos_list(
+        &self,
+        owner: String,
+        repo: String,
+        git_ref: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, git_ref);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_related_repos_list not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `github.pulls.updateBranch`:
     /// `PUT /repos/{owner}/{repo}/pulls/{number}/update-branch` → `{ message, url? }`.
     fn github_pulls_update_branch(
@@ -4045,7 +4094,6 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.issues.list`: `GET /repos/{owner}/{repo}/issues` (PRs filtered
     /// out) → `{ issues, nextToken }`.
-    #[allow(clippy::too_many_arguments)]
     fn github_issues_list(
         &self,
         owner: String,
@@ -4102,8 +4150,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `github.issues.search`: `GET /search/issues` (`is:issue` + free-text
-    /// `query`) → `{ issues, nextToken }`.
-    #[allow(clippy::too_many_arguments)]
+    /// `query`, optionally spanning the `repos` extras in one request) →
+    /// `{ issues, nextToken }`; every issue carries its own `owner` / `repo`.
+    #[expect(clippy::too_many_arguments)]
     fn github_issues_search(
         &self,
         owner: String,
@@ -4111,10 +4160,11 @@ pub trait WorkspaceApi: Send + Sync {
         filter: Option<String>,
         state: Option<String>,
         query: Option<String>,
+        repos: Vec<RepoRef>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, filter, state, query, limit, next_token);
+        let _ = (owner, repo, filter, state, query, repos, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_issues_search not implemented".to_string(),
@@ -5436,7 +5486,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `{ requestId, matches: MessageMatch[] }` inline, or
     /// `{ requestId, matches: [] }` (a prompt ack) when the result set is
     /// streamed via `search:result`/`search:done` (PROTOCOL §5.15 / §6.5).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn search_messages(
         &self,
         workspace_id: Option<WorkspaceId>,
@@ -6192,7 +6242,13 @@ pub trait WorkspaceApi: Send + Sync {
     /// `uploadedAt` result fields (presence-detected; old clients unaffected)
     /// — so agents can retrieve it later via `ws.file.getAttachment`.
     /// `mime_type` is the optional client-supplied MIME type, recorded
-    /// verbatim.
+    /// verbatim. `idempotency_key` (optional, 1–128 chars, client-minted;
+    /// intent-hq/intent#4691) binds the placement per `(workspace, key)`:
+    /// a repeat with a live binding and the same payload identity replays
+    /// the ORIGINAL result plus `replayed: true` without placing anything,
+    /// a repeat with a different payload identity is
+    /// `Error::InvalidParams` ("already used with a different payload"),
+    /// and an absent key is byte-identical to the unkeyed behavior.
     fn file_place_attachment(
         &self,
         workspace_id: WorkspaceId,
@@ -6200,8 +6256,16 @@ pub trait WorkspaceApi: Send + Sync {
         data: Option<String>,
         source_path: Option<String>,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, file_name, data, source_path, mime_type);
+        let _ = (
+            workspace_id,
+            file_name,
+            data,
+            source_path,
+            mime_type,
+            idempotency_key,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_place_attachment not implemented".to_string(),
@@ -6214,6 +6278,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// §5.9). Validates the header — the workspace must exist, `file_name`
     /// non-empty, `size_bytes` positive and within the 1 GiB attachment cap,
     /// `sha256` 64 hex chars — and returns `{ uploadId, maxChunkBytes }`.
+    /// `idempotency_key` (optional; intent-hq/intent#4691) is carried to the
+    /// commit, which binds it like a keyed `file.placeAttachment`; a begin
+    /// whose key is already bound to a committed attachment is
+    /// `Error::InvalidParams` ("already committed; look it up"), so the
+    /// response stays shape-stable.
     fn file_attachment_upload_begin(
         &self,
         workspace_id: WorkspaceId,
@@ -6221,8 +6290,16 @@ pub trait WorkspaceApi: Send + Sync {
         size_bytes: u64,
         sha256: String,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, file_name, size_bytes, sha256, mime_type);
+        let _ = (
+            workspace_id,
+            file_name,
+            size_bytes,
+            sha256,
+            mime_type,
+            idempotency_key,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_attachment_upload_begin not implemented".to_string(),
@@ -6294,6 +6371,26 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_get_attachment_info not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.getAttachmentInfo { workspaceId, idempotencyKey }` arm
+    /// (PROTOCOL §5.9; intent-hq/intent#4691): resolve a live
+    /// `(workspace, idempotencyKey)` binding to the same result shape as the
+    /// `attachmentId` arm. A key with no live binding (never committed,
+    /// another workspace's, or past the 7-day retention) is
+    /// `Error::InvalidParams` ("unknown idempotency key") — the client's
+    /// "outcome unknown ⇒ safe to retry with the same key" signal.
+    fn file_get_attachment_info_by_key(
+        &self,
+        workspace_id: WorkspaceId,
+        idempotency_key: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, idempotency_key);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_get_attachment_info_by_key not implemented".to_string(),
             ))
         })
     }

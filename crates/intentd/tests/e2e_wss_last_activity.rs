@@ -9,15 +9,18 @@
 //!   `lastActivity` that matches a subsequent `workspace.get`.
 //! - Negative: no `workspace:updated { lastActivity }` for a workspace with no
 //!   activity.
-//! - Debounce: rapid burst coalesces into one emission with the latest value.
+//! - Debounce: a rapid burst coalesces into at most one emission per debounce
+//!   window it spans, the last one carrying the latest value.
 //!
 //! Uses the mock ACP agent fixture for deterministic behavior. The test
-//! overrides `LAST_ACTIVITY_DEBOUNCE_TEST_MS` to 500ms for fast execution.
+//! overrides `LAST_ACTIVITY_DEBOUNCE_TEST_MS` to [`DEBOUNCE_MS`] for fast
+//! execution.
 
 #![cfg(unix)]
 
 mod common;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -36,12 +39,12 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
     child: Child,
+    _data_dir_guard: tempfile::TempDir,
     data_dir: PathBuf,
 }
 
@@ -49,15 +52,11 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-lastact-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-lastact-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -299,6 +298,17 @@ where
     }
 }
 
+/// `try_next_event` yields `None` both when the deadline elapses and when the
+/// subscription socket closes or errors; name which one it was so a failure
+/// under load is triaged from the panic message alone.
+fn wait_failure_kind(deadline: tokio::time::Instant) -> &'static str {
+    if tokio::time::Instant::now() >= deadline {
+        "timed out"
+    } else {
+        "subscription socket closed before the deadline"
+    }
+}
+
 /// Wait until `count` terminal `agent:stream:end` events for `agent_id` have
 /// arrived on an `agent:*` subscription. One overall deadline bounds the whole
 /// wait so a missing event fails fast instead of polling a fixed iteration
@@ -314,7 +324,10 @@ where
         let evt = try_next_event(ws, &["agent:stream:end"], remaining)
             .await
             .unwrap_or_else(|| {
-                panic!("timed out waiting for {count} agent:stream:end events (saw {seen})")
+                panic!(
+                    "{} waiting for {count} agent:stream:end events (saw {seen})",
+                    wait_failure_kind(deadline)
+                )
             });
         if evt["data"]["agentId"] == agent_id {
             seen += 1;
@@ -322,20 +335,90 @@ where
     }
 }
 
+/// Wait until `user_rows` user messages for `agent_id` have been persisted AND
+/// every turn carrying one of them has ended.
+///
+/// Burst messages do not map 1:1 onto turns: a message sent while the agent is
+/// still mid-turn is queued, and the default `agents.flushQueuedMessages`
+/// mode (`all`) drains two or more queued entries into ONE combined turn. On a
+/// loaded host a 3-message burst can therefore legitimately end with 3, 2, or
+/// 1 `agent:stream:end` events, so counting stream:ends is a flake
+/// (intent-hq/intent#4947). Correlate on turn identity instead: every
+/// persisted user row emits `agent:message { role: "user", turnId }` before
+/// its turn's worker spawns (the combined turn stamps the head entry's id on
+/// each row), and the terminal `agent:stream:end` names the same `turnId`.
+/// Both ride the same event bus, so the row echo always precedes its turn's
+/// stream:end on the wire.
+///
+/// Returns the distinct turn ids the `user_rows` rows were carried by, so a
+/// caller that forced a particular folding can assert it actually happened.
+async fn await_user_turns_ended<S>(
+    ws: &mut WebSocketStream<S>,
+    agent_id: &str,
+    user_rows: usize,
+) -> HashSet<String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    let mut rows_seen = 0usize;
+    let mut open_turns: HashSet<String> = HashSet::new();
+    let mut ended_turns: HashSet<String> = HashSet::new();
+    while rows_seen < user_rows || open_turns.iter().any(|t| !ended_turns.contains(t)) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let evt = try_next_event(ws, &["agent:message", "agent:stream:end"], remaining)
+            .await
+            .unwrap_or_else(|| {
+                let still_open = open_turns
+                    .iter()
+                    .filter(|t| !ended_turns.contains(*t))
+                    .count();
+                panic!(
+                    "{} waiting for {user_rows} user rows and their turns to end \
+                     (saw {rows_seen} user rows, {still_open} turns still open)",
+                    wait_failure_kind(deadline)
+                )
+            });
+        if evt["data"]["agentId"] != agent_id {
+            continue;
+        }
+        let turn_id = evt["data"]["turnId"].as_str().map(str::to_string);
+        match evt["type"].as_str() {
+            Some("agent:message") if evt["data"]["role"] == json!("user") => {
+                rows_seen += 1;
+                open_turns.insert(turn_id.expect("user agent:message carries turnId"));
+            }
+            Some("agent:stream:end") => {
+                if let Some(tid) = turn_id {
+                    ended_turns.insert(tid);
+                }
+            }
+            _ => {}
+        }
+    }
+    open_turns
+}
+
+/// Debounce window the booted daemon runs with (`LAST_ACTIVITY_DEBOUNCE_TEST_MS`
+/// override): short for fast execution, large enough that CI scheduler stalls
+/// between activity touches don't routinely split a burst across windows.
+const DEBOUNCE_MS: u64 = 500;
+
 async fn boot(mock_script: &str, behavior: &str) -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = scratch_dir("data");
-    // Override debounce to 500ms for fast test execution (large enough that
-    // CI scheduler stalls between activity touches don't split the window).
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let debounce_ms = DEBOUNCE_MS.to_string();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
-        ("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "500"),
+        ("LAST_ACTIVITY_DEBOUNCE_TEST_MS", debounce_ms.as_str()),
         ("MOCK_AGENT_SCRIPT_PATH", mock_script),
         ("MOCK_AGENT_BEHAVIOR", behavior),
     ];
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
@@ -703,15 +786,62 @@ async fn no_last_activity_event_for_idle_workspace() {
 }
 
 /// Debounce case: a burst of rapid activity coalesces into at most one
-/// `workspace:updated { lastActivity }` with the latest derived value.
+/// `workspace:updated { lastActivity }` per debounce window the burst spans —
+/// exactly one when the whole burst lands inside a single window — with the
+/// last emission carrying the latest derived value.
+///
+/// The burst is three back-to-back agent turns whose wall-clock span the test
+/// does not control: under host load (intent-hq/intent#4999) the turns can
+/// straddle a window boundary, which legitimately yields two emissions. So
+/// the assertion bounds the emission count by the windows the burst provably
+/// spanned instead of assuming a single window; see [`burst_debounce_case`].
 #[tokio::test]
 async fn last_activity_debounce_coalesces_burst() {
     let Some(script) = gate("WSS lastActivity debounce") else {
         return;
     };
+    burst_debounce_case(&script, json!({ "response": "burst" }), None).await;
+}
 
-    let behavior = json!({ "response": "burst" }).to_string();
-    let (daemon, port, cfg) = boot(&script, &behavior).await;
+/// Same burst, with the first burst turn held open by a file barrier until
+/// the remaining two messages have provably queued behind it, so they drain
+/// as ONE combined flush turn. Pins the turn-identity wait in
+/// [`await_user_turns_ended`]: this is the interleaving a loaded host produces
+/// nondeterministically (intent-hq/intent#4947), and a fixed count of three
+/// `agent:stream:end` events times out here. A barrier rather than a timer:
+/// the msg 0 turn cannot end before the test releases it, so the queued sends
+/// and the two-turn folding are asserted, not hoped for.
+///
+/// The barrier deliberately spreads the burst over wall-clock time the test
+/// does not bound (three RPC round trips plus the release), so this variant
+/// asserts `lastActivity` convergence — the announced value advanced past the
+/// pre-burst value and matches `workspace.get` — not the coalescing bound,
+/// which only the plain burst above pins.
+#[tokio::test]
+async fn last_activity_debounce_coalesces_burst_with_queued_flush() {
+    let Some(script) = gate("WSS lastActivity debounce (queued flush)") else {
+        return;
+    };
+    let release_dir = scratch_dir("release");
+    let release_file = release_dir.path().join("release-msg-0");
+    burst_debounce_case(
+        &script,
+        json!({
+            "response": "burst",
+            "rules": [{ "ifPromptContains": "msg 0", "releaseFile": release_file }],
+        }),
+        Some(&release_file),
+    )
+    .await;
+}
+
+/// `release_file`: when set, the mock holds the msg 0 turn open until this
+/// file exists; the burst then asserts msgs 1 and 2 queued behind it and folded
+/// into exactly one combined turn, and asserts `lastActivity` convergence
+/// instead of the coalescing bound.
+async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option<&Path>) {
+    let behavior = behavior.to_string();
+    let (daemon, port, cfg) = boot(script, &behavior).await;
 
     let socket = daemon.data_dir.join("intentd.sock");
     let create = uds_rpc(
@@ -790,20 +920,62 @@ async fn last_activity_debounce_coalesces_burst() {
         );
     }
 
-    // Drive a rapid burst: 3 messages within the 500ms debounce window
+    // Pre-burst baseline the burst's announced lastActivity must advance past.
+    let before = wss_rpc(
+        &mut rpc,
+        5,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let before_activity = before["workspace"]["lastActivity"]
+        .as_str()
+        .expect("pre-burst lastActivity")
+        .to_string();
+
+    // Drive a rapid burst: 3 messages sent 50ms apart, normally well inside one
+    // debounce window. Every debounce schedule the burst triggers postdates
+    // this instant, which anchors the windows-spanned bound below. Wall clock
+    // on purpose: it is compared against the daemon's own event timestamps.
+    let burst_started = chrono::Utc::now();
+    let mut sends = Vec::new();
     for i in 0..3 {
-        wss_rpc(
+        let sent = wss_rpc(
             &mut rpc,
             10 + i,
             "agent.sendMessage",
             json!({ "workspaceId": ws_id, "agentId": agent_id, "content": format!("msg {i}") }),
         )
         .await;
+        assert_eq!(sent["success"], json!(true), "msg {i} send: {sent}");
+        sends.push(sent);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Wait (bounded) until all three burst turns completed.
-    await_stream_ends(&mut agent_sub, agent_id, 3).await;
+    // Barrier variant: msg 0 is still held open, so msgs 1 and 2 must have
+    // queued behind it. Only now let the msg 0 turn end.
+    if let Some(release) = release_file {
+        for (i, sent) in sends.iter().enumerate().skip(1) {
+            assert_eq!(
+                sent["queued"],
+                json!(true),
+                "msg {i} must queue behind the held msg 0 turn: {sent}"
+            );
+        }
+        std::fs::write(release, b"go").expect("write release file");
+    }
+
+    // Wait (bounded) until every turn carrying a burst message has completed.
+    // Not "three stream:ends": messages that queue behind an in-flight turn
+    // drain as one combined turn, so the burst may end in fewer turns.
+    let burst_turns = await_user_turns_ended(&mut agent_sub, agent_id, 3).await;
+    if release_file.is_some() {
+        assert_eq!(
+            burst_turns.len(),
+            2,
+            "held msg 0 turn + one combined flush turn for msgs 1 and 2: {burst_turns:?}"
+        );
+    }
 
     // Collect workspace:updated events until the subscription has been quiet
     // for well over one debounce window (covers the trailing debounce fire).
@@ -826,15 +998,67 @@ async fn last_activity_debounce_coalesces_burst() {
         }
     }
 
-    // Assert exactly one event (debounce coalesced the burst into a single
-    // non-vacuous emission).
+    // Non-vacuous: the burst announced a lastActivity at all.
     assert!(
         !last_activity_events.is_empty(),
         "expected the burst to emit a workspace:updated {{ lastActivity }}"
     );
+
+    if release_file.is_none() {
+        // Plain rapid burst: bound the emission count by the debounce windows
+        // the burst provably spanned. The debounce is trailing-edge: an
+        // emission fires only after one full window of quiet following the
+        // schedule that armed it, and a schedule that arms a further emission
+        // must postdate the previous timer's expiry (an earlier one would have
+        // cancelled that timer instead). So `n` emissions need at least
+        // `n * DEBOUNCE_MS` between the first burst schedule — which postdates
+        // `burst_started` — and the daemon timestamp of the last emission:
+        // `n <= floor((last_emit - burst_started) / DEBOUNCE_MS)`. A burst that
+        // lands inside one window therefore still gets exactly one emission,
+        // while a burst that straddled a boundary under load (#4999) is
+        // allowed its second — and a debounce that fires per touch, or on the
+        // leading edge, still fails.
+        let last_emit = last_activity_events
+            .last()
+            .and_then(|evt| evt["timestamp"].as_str())
+            .map(|ts| DateTime::parse_from_rfc3339(ts).expect("parse emission timestamp"))
+            .expect("last emission carries a timestamp");
+        let spanned_ms =
+            u64::try_from((last_emit.to_utc() - burst_started).num_milliseconds()).unwrap_or(0);
+        let windows_spanned = spanned_ms / DEBOUNCE_MS;
+        assert!(
+            u64::try_from(last_activity_events.len()).expect("emission count fits in u64")
+                <= windows_spanned,
+            "expected at most {windows_spanned} workspace:updated (last emission {spanned_ms}ms \
+             after the burst started, {DEBOUNCE_MS}ms debounce), got {}",
+            last_activity_events.len()
+        );
+    }
+
+    // Convergence (both variants): the latest announced value advanced past
+    // the pre-burst baseline and is what workspace.get now serves.
+    let announced = last_activity_events
+        .last()
+        .and_then(|evt| evt["data"]["changes"]["lastActivity"].as_str())
+        .expect("lastActivity string");
+    let before_dt =
+        DateTime::parse_from_rfc3339(&before_activity).expect("parse pre-burst lastActivity");
+    let announced_dt =
+        DateTime::parse_from_rfc3339(announced).expect("parse announced lastActivity");
     assert!(
-        last_activity_events.len() <= 1,
-        "expected at most 1 workspace:updated, got {}",
-        last_activity_events.len()
+        announced_dt > before_dt,
+        "lastActivity did not advance across the burst: {before_activity} -> {announced}"
+    );
+    let get = wss_rpc(
+        &mut rpc,
+        6,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        get["workspace"]["lastActivity"].as_str(),
+        Some(announced),
+        "workspace.get must serve the last announced lastActivity"
     );
 }

@@ -110,7 +110,7 @@ pub(crate) fn resolve_binary_path(name: &str, common_paths: &[String]) -> Option
 /// directories from an injected `home` (via
 /// [`path_utils::enriched_tool_dirs_with_home`]) instead of the real
 /// environment, so tests never mutate process-global `HOME`.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn resolve_binary_path_with_home(
     name: &str,
     common_paths: &[String],
@@ -213,7 +213,7 @@ where
     None
 }
 
-#[allow(clippy::similar_names)] // nvm's literal directory layout (versions/<version>)
+#[expect(clippy::similar_names)] // nvm's literal directory layout (versions/<version>)
 fn is_nvm_node_bin_dir(path: &Path) -> bool {
     let Some(version_dir) = path.parent() else {
         return false;

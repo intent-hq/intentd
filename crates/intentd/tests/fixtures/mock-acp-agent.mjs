@@ -647,6 +647,16 @@ async function handlePrompt(id, params) {
   if (ruleDelayMs > 0) {
     await new Promise((r) => setTimeout(r, ruleDelayMs));
   }
+  // Optional per-rule barrier: hold the turn open until `releaseFile` exists.
+  // Unlike `delayMs` this is not a timer — the test decides exactly when the
+  // turn may end (e.g. only after follow-up sends have provably queued behind
+  // it), so the interleaving it pins cannot drift under CPU load.
+  if (typeof active.releaseFile === 'string' && active.releaseFile.length > 0) {
+    log(`releaseFile: holding turn until ${active.releaseFile} exists`);
+    while (!fs.existsSync(active.releaseFile)) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
   const toolCalls = Array.isArray(active.toolCalls)
     ? active.toolCalls
     : active.toolCall
@@ -933,6 +943,15 @@ async function dispatch(msg) {
           return;
         }
       }
+      // Deterministic session-setup rejection: fail EVERY session/new with
+      // the configured JSON-RPC error object (e.g. a bridge-wrapped 429 whose
+      // upstream body lives in `data`), modelling a provider whose allowance
+      // is already spent when the daemon opens the session — before any
+      // prompt — so spawn-path failure attribution can be pinned.
+      if (behavior.sessionNewRpcError) {
+        log(`failing session/new with JSON-RPC error ${behavior.sessionNewRpcError.code}`);
+        return send({ jsonrpc: '2.0', id: msg.id, error: behavior.sessionNewRpcError });
+      }
       // Stash the session-setup-delivered MCP servers (STAB-156) so
       // `callWorkspaceTool` can reach the bridge without an `--mcp-config`.
       // Always overwritten (defaulting to []) so a later session/new that
@@ -1179,6 +1198,10 @@ if (treePidFile) {
 // The literal token `<NEWLINE_ONLY>` on a line emits one chunk whose text is
 // a bare "\n" (the monorepo#3262 incident shape — a whitespace-only wake
 // response); plain whitespace-only lines stay filtered as before.
+// The poll fires only once it reads ≥1 non-empty line: an existing-but-empty
+// file is a writer caught between create and write (a non-atomic publish),
+// not a trigger, so keep polling instead of clearing on it and losing the
+// wake for the life of the process (intent-hq/intent#4943).
 const wakeTriggerFile = process.env.MOCK_AGENT_WAKE_TRIGGER_FILE;
 if (wakeTriggerFile) {
   const poll = setInterval(() => {
@@ -1190,6 +1213,9 @@ if (wakeTriggerFile) {
         .filter((l) => l.trim().length > 0);
     } catch {
       return; // trigger not created yet
+    }
+    if (lines.length === 0) {
+      return; // created but not yet written
     }
     clearInterval(poll);
     log(`wake trigger fired: emitting ${lines.length} unsolicited chunk(s)`);

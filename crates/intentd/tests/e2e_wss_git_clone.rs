@@ -28,13 +28,13 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    _data_dir_guard: tempfile::TempDir,
+    _scratch_guard: tempfile::TempDir,
     scratch: PathBuf,
 }
 
@@ -42,16 +42,11 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-        let _ = std::fs::remove_dir_all(&self.scratch);
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-clone-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-clone-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -295,13 +290,16 @@ fn make_source_repo(dir: &Path) -> PathBuf {
 }
 
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = scratch_dir("data");
-    let scratch = scratch_dir("scratch");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let scratch_guard = scratch_dir("scratch");
+    let scratch = scratch_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        _data_dir_guard: data_dir_guard,
+        _scratch_guard: scratch_guard,
         scratch,
     };
     let socket = data_dir.join("intentd.sock");
@@ -522,8 +520,10 @@ fn make_stub_git(dir: &Path, capture: &Path) -> String {
 /// Seed a secrets file carrying the stored GitHub token and boot a daemon
 /// whose `git` is the capturing stub (monorepo#825 regression harness).
 async fn boot_with_stub_git() -> (Daemon, u16, Arc<ClientConfig>, PathBuf) {
-    let data_dir = scratch_dir("data");
-    let scratch = scratch_dir("scratch");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let scratch_guard = scratch_dir("scratch");
+    let scratch = scratch_guard.path().to_path_buf();
     let secrets = data_dir.join("secrets.json");
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::write(
@@ -543,7 +543,8 @@ async fn boot_with_stub_git() -> (Daemon, u16, Arc<ClientConfig>, PathBuf) {
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        _data_dir_guard: data_dir_guard,
+        _scratch_guard: scratch_guard,
         scratch,
     };
     let socket = data_dir.join("intentd.sock");

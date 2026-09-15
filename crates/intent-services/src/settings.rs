@@ -867,7 +867,7 @@ fn memory_budget_max_mb() -> f64 {
 /// asymmetry strictly one-directional (catalog bound ≤ parse bound), which is
 /// the invariant every claim in these doc comments depends on.
 // MiB counts above 2^53 do not occur; loss-free in f64.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
     match total_memory_bytes.filter(|&bytes| bytes > 0) {
         // INVARIANT: this bound may be tighter than the `config.toml` parse
@@ -2098,7 +2098,7 @@ pub(crate) fn wire_value(def: &SettingDefinition, value: Value) -> Value {
 /// integers via the schema's lenient deserializer.
 // The `n.abs() <= i64::MAX as f64` guard bounds the float→int cast; the
 // i64::MAX→f64 comparison constant rounding up by one ULP is harmless here.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
     if let SettingType::Number { .. } = def.ty {
         if let Some(n) = value.as_f64() {
@@ -3033,7 +3033,7 @@ mod tests {
     /// always succeeds; a zero reading is treated as undetected so the max
     /// never collapses onto the minimum.
     #[test]
-    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
+    #[expect(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn memory_budget_max_tracks_detected_ram_with_static_fallback() {
         assert_eq!(
             memory_budget_max_mb_for(Some(48 * 1024 * 1024 * 1024)),
@@ -3083,7 +3083,7 @@ mod tests {
     /// the parse bound, which is every real one but need not be assumed.
     #[test]
     // The advertised max is a small whole-valued float: casts are exact.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn memory_budget_catalog_bound_is_never_looser_than_the_parse_bound() {
         let def = find_definition("agents.memoryBudgetMb").expect("in catalog");
         let max = memory_budget_max_mb();
@@ -3122,7 +3122,7 @@ mod tests {
     /// `settings.update` to config.toml (never `SQLite`) and rejects
     /// out-of-range values.
     #[tokio::test]
-    #[allow(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
+    #[expect(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
     async fn agents_acp_node_max_old_space_mb_round_trip_via_registry() {
         let path = "agents.acpNodeMaxOldSpaceMb";
         let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
@@ -4551,7 +4551,7 @@ mod tests {
     /// PROTOCOL §5.12, v4.6); it persists through `settings.update` to
     /// config.toml (never `SQLite`) and rejects out-of-range values.
     #[tokio::test]
-    #[allow(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
+    #[expect(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
     async fn voice_workspace_vocabulary_max_terms_is_a_bounded_toml_number() {
         let path = "voice.workspaceVocabulary.maxTerms";
         let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));

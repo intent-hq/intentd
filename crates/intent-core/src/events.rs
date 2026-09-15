@@ -24,6 +24,13 @@ pub(crate) const FILE_RENAMED: &str = "file:renamed";
 // Agent lifecycle events.
 pub const AGENT_STARTED: &str = "agent:started";
 pub const AGENT_COMPLETED: &str = "agent:completed";
+// Terminal turn failure. Payload: `{ agentId, error, turnId? }`, plus — when
+// the failure classifies as a provider usage/quota rejection
+// (`intent_acp::is_quota_exceeded`) — the additive pair `errorCode:
+// "quota-exceeded"` and `providerId` (the provider whose allowance ran out,
+// omitted when it cannot be resolved). Both are ABSENT on every other
+// failure, never `false`/`null`: they exist so clients can offer "retry on
+// another provider" without pattern-matching the rendered `error` prose.
 pub const AGENT_FAILED: &str = "agent:failed";
 pub const AGENT_TOOL_CALL: &str = "agent:tool:call";
 pub const AGENT_MESSAGE: &str = "agent:message";
@@ -616,6 +623,99 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     BROWSER_TAB_OPENED,
     BROWSER_TAB_UPDATED,
     BROWSER_TAB_CLOSED,
+];
+
+/// How an [`EventDiscriminator`]'s `values` relate to the field at its `path`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscriminatorKind {
+    /// The field is a string drawn from `values`.
+    Value,
+    /// The field is an object whose keys are drawn from `values`.
+    Keys,
+}
+
+impl DiscriminatorKind {
+    /// The golden's `kind` string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Value => "value",
+            Self::Keys => "keys",
+        }
+    }
+}
+
+/// A payload value clients classify on inside one event type's `data`.
+/// Mirrored into the checked-in golden `tests/goldens/event_types.json`
+/// (`discriminators`), which downstream clients copy verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventDiscriminator {
+    /// The event type whose payload carries the discriminator.
+    pub event_type: &'static str,
+    /// Dotted path from the event envelope to the discriminating field.
+    pub path: &'static str,
+    pub kind: DiscriminatorKind,
+    /// Sorted, deduplicated.
+    pub values: &'static [&'static str],
+    /// What a payload WITHOUT the field means, when the daemon emits that
+    /// shape too; `None` when the field is always present.
+    pub absent: Option<&'static str>,
+}
+
+/// Every payload discriminator the daemon emits. `task:ready-tasks-changed`
+/// carries `triggeredBy.reason` only for non-status triggers (a status
+/// change emits `triggeredBy: { noteId, previousStatus, newStatus }`
+/// instead); `workspace:updated` carries the applied delta under `changes`,
+/// whose keys are the camelCase `WorkspaceUpdate` fields plus the ad-hoc
+/// keys of the archive / unarchive / auto-commit / browser-client /
+/// MCP-toggle emitters.
+pub const EVENT_DISCRIMINATORS: &[EventDiscriminator] = &[
+    EventDiscriminator {
+        event_type: TASK_READY_TASKS_CHANGED,
+        path: "data.triggeredBy.reason",
+        kind: DiscriminatorKind::Value,
+        values: &["note-deleted", "relations-changed"],
+        absent: Some("status change: triggeredBy is { noteId, previousStatus, newStatus }"),
+    },
+    EventDiscriminator {
+        event_type: WORKSPACE_UPDATED,
+        path: "data.changes",
+        kind: DiscriminatorKind::Keys,
+        values: &[
+            "activePullRequest",
+            "archived",
+            "archivedAt",
+            "attention",
+            "autoCommitEnabled",
+            "autoUnarchive",
+            "baseCommitSha",
+            "baseRef",
+            "branch",
+            "browserClientId",
+            "defaultModel",
+            "isRemote",
+            "lastActivity",
+            "mcpServerToggled",
+            "path",
+            "prNumber",
+            "prStatus",
+            "prUrl",
+            "pullRequests",
+            "repositoryName",
+            "repositoryOwner",
+            "repositoryPath",
+            "scope",
+            "setupScript",
+            "skipIsolation",
+            "status",
+            "statusImageAssetId",
+            "statusMessage",
+            "tags",
+            "title",
+            "worktreePath",
+        ],
+        absent: None,
+    },
 ];
 
 /// True iff `event_type` is part of the canonical taxonomy.

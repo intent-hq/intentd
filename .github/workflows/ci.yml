@@ -24,10 +24,13 @@ on:
   # coverage wall time is paid once, on the merged tree, instead of on every
   # push to the PR. The gate is event-aware about this (see the gate
   # comment): it requires the coverage jobs outright on merge_group and
-  # accepts their skip on pull_request / push. Merge groups are created by
-  # the repo's own ruleset from already-filed PRs, so they need no same-repo
-  # fork guard. pr-title / conflict-markers are PR-metadata checks that stay
-  # pull_request-only — the gate accepts their skip.
+  # accepts their skip on pull_request / push. The build job's target-gated
+  # clippy step runs on both pull_request and merge_group (see its comment),
+  # so the queue lints the merged tree's macOS / Windows-only code too.
+  # Merge groups are created by the repo's own ruleset from already-filed
+  # PRs, so they need no same-repo fork guard. pr-title / conflict-markers
+  # are PR-metadata checks that stay pull_request-only — the gate accepts
+  # their skip.
   merge_group:
 
 permissions:
@@ -356,7 +359,7 @@ jobs:
         run: |
           channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
@@ -371,6 +374,21 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Repo-slug fold lint (intent-hq/intentd#1809 → #1815): GitHub owner/name
+      # slugs are case-insensitive, and every hand-rolled `to_lowercase` /
+      # `eq_ignore_ascii_case` on a slug outside `intent_core::RepoRef` was a
+      # place the fold could be missed. This source-scanning test fails naming
+      # file:line; it runs here, next to Clippy, so every PR gets the verdict
+      # from the lint job rather than buried in the test matrix.
+      - name: Repo-slug fold lint
+        run: cargo test -p intent-core --test repo_slug_fold_lint
+      # Event-type literal lint: fails naming file:line for any
+      # `note:`/`task:`/`workspace:`/`agent:` string literal outside test code
+      # that is not in `intent_core::events::ALL_EVENT_TYPES` (the catalog
+      # mirrored into tests/goldens/event_types.json), so an emitter cannot
+      # introduce a type the golden does not know.
+      - name: Event-type literal lint
+        run: cargo test -p intent-core --test event_type_lint
       # Per-slot HOME for install-action — see the coverage-e2e job's comment
       # for the full rationale (shared ~/.install-action tmp/bin race across
       # the 8 tinybox slots; monorepo#1239).
@@ -521,10 +539,11 @@ jobs:
     # required check context as an all-steps-skipped success (see the
     # release-fast-path comment for why a job-level skip breaks matrix
     # required checks). Steps run unless the output is exactly 'true': on
-    # push the fast-path job is skipped and the output is empty, and a
-    # fast-path failure leaves it empty too, so both fall back to running
-    # the full job. `!cancelled()` keeps the job from being auto-skipped
-    # when its `needs` dependency was skipped (push) — which is exactly why
+    # push and merge_group the fast-path job is skipped and the output is
+    # empty, and a fast-path failure leaves it empty too, so all fall back
+    # to running the full job. `!cancelled()` keeps the job from being
+    # auto-skipped when its `needs` dependency was skipped (push /
+    # merge_group) — which is exactly why
     # the fork guard must be explicit here: on a fork PR release-fast-path
     # is skipped, and without the guard `!cancelled()` would still run this
     # job on the self-hosted macOS/Windows runners.
@@ -590,13 +609,13 @@ jobs:
         run: |
           channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
         if: needs.release-fast-path.outputs.fast_path != 'true'
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
-          # clippy is needed by the macOS lint step below; installing it
-          # matrix-wide keeps this step unconditional (negligible on Windows).
+          # clippy is needed by the target-gated lint step below, which runs
+          # on both the macOS and the Windows matrix entries.
           components: clippy
       # Ephemeral GitHub-hosted runners have no persistent target dir, so
       # use the GH cache there instead (mirrors the `check` job's
@@ -613,19 +632,30 @@ jobs:
       - name: Check (PR compilation proof)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name != 'push'
         run: cargo check --workspace --target ${{ matrix.target }}
-      # Clippy over macOS-gated code (intent-hq/monorepo#3285): the `check`
-      # job lints on Linux, where `#[cfg(target_os = "macos")]` code is never
-      # compiled, so warnings in macOS-only files land silently and break
-      # `make check` on every macOS dev box. Linting here (PRs only, same
-      # invocation as the check job) closes the gap. It runs on this runner
-      # rather than as a Linux cross-target run because `cargo clippy
-      # --target aarch64-apple-darwin` still executes the native build
+      # Clippy over target-gated code (intent-hq/monorepo#3285 for macOS,
+      # intent-hq/intentd#1813 for Windows): the `check` job lints on Linux,
+      # where `#[cfg(target_os = "macos")]` / `#[cfg(windows)]` /
+      # `#[cfg(not(unix))]` code is never compiled, so warnings in
+      # target-only code (including outer `#[allow]`s that only expand there
+      # and trip `clippy::allow_attributes`) land silently and break
+      # `make check` on every macOS or Windows dev box. Linting here (same
+      # invocation as the check job) closes the gap. It runs on PRs and on
+      # merge-queue runs, not on push: the queue tests the actual merged
+      # tree, and a PR-only step let intent-hq/intentd#1825 (green on its
+      # own PR run) land a Windows-only E0433 via the queue — main's push
+      # run skipped the step, so ~8 open PRs failed the required gate until
+      # intent-hq/intentd#1835 fixed it. Main's push run builds a tree the
+      # queue already linted, so it stays skipped there. It runs on the
+      # native runners rather than as Linux cross-target runs because
+      # `cargo clippy --target <triple>` still executes the native build
       # scripts (libz-sys and friends try-compile C for the target even when
-      # pkg-config resolves a system lib), which would require a full darwin
-      # cross C toolchain on Linux; the native runner needs nothing extra and
-      # shares this job's warm target dir.
-      - name: Clippy (macOS-gated code)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'pull_request' && runner.os == 'macOS'
+      # pkg-config resolves a system lib), which would require a full
+      # darwin / MSVC cross C toolchain on Linux; the native runners need
+      # nothing extra and share this job's warm target dir. release-fast-path
+      # is pull_request-only, so its output is empty on merge_group and the
+      # `!= 'true'` guard lets the step run there (same as the check step).
+      - name: Clippy (target-gated code)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (runner.os == 'macOS' || runner.os == 'Windows')
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Build (release)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
@@ -761,7 +791,7 @@ jobs:
         run: |
           channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
@@ -965,7 +995,7 @@ jobs:
         run: |
           channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
@@ -1158,12 +1188,14 @@ jobs:
           dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/bin/intentd$'
           dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/lib/systemd/user/intentd\.service$'
 
-  # Release-script regression tests: runs the stubbed-gh harness for
+  # Release-script regression tests: runs the stubbed-gh harnesses for
   # scripts/aggregate-channel-notes.sh (an idempotent re-promotion must
   # rebuild the aggregate from the notes-base marker, and a legacy body
-  # without a marker is left untouched — never collapsed to one section).
-  # Seconds-long like the other utility jobs, so it runs directly on
-  # ubuntu-latest.
+  # without a marker is left untouched — never collapsed to one section)
+  # and scripts/notify-fixed-issues.sh (a mention-only reference or an open
+  # issue never earns a release comment; a closed issue with a delivered
+  # linked fix PR does). Seconds-long like the other utility jobs, so it
+  # runs directly on ubuntu-latest.
   release-scripts:
     runs-on: ubuntu-latest
     # Runs on push and same-repo PRs; skipped on fork PRs (see the
@@ -1174,6 +1206,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Test aggregate-channel-notes.sh
         run: ./scripts/test-aggregate-channel-notes.sh
+      - name: Test notify-fixed-issues.sh
+        run: ./scripts/test-notify-fixed-issues.sh
 
   # Single required status check for branch protection: fans in check, build,
   # coverage-e2e, coverage-all, pr-title, conflict-markers, deb-packaging,

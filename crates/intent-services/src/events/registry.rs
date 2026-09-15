@@ -100,26 +100,45 @@ impl WatcherRegistry {
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
     ) -> Self {
-        Self::start_with_health(bus, services, refresher, &WatchHealth::default()).await
+        Self::start_with_health(
+            &SharedWatchHub::new(),
+            bus,
+            services,
+            refresher,
+            &WatchHealth::default(),
+        )
+        .await
     }
 
-    /// [`Self::start`] that additionally attaches `health` to the shared hub,
-    /// so `system.status` can render live watch coverage
-    /// (intent-hq/intent#3708). The composition root creates the handle before
-    /// this backgrounded start runs; until attachment the handle snapshots
-    /// `None` (rendered as an absent field).
+    /// [`Self::start`] over a caller-provided `hub` that additionally attaches
+    /// `health` to it, so `system.status` can render live watch coverage
+    /// (intent-hq/intent#3708). The composition root creates both before this
+    /// backgrounded start runs — the hub so the `config.toml` watcher can share
+    /// its stream (intent-hq/intent#4953), the health handle so `DaemonControl`
+    /// can hold it; until attachment the handle snapshots `None` (rendered as
+    /// an absent field).
     pub async fn start_with_health(
+        hub: &Arc<SharedWatchHub>,
         bus: EventBus,
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
         health: &WatchHealth,
     ) -> Self {
-        Self::start_with_backstop(bus, services, refresher, health, SETUP_COMPLETION_BACKSTOP).await
+        Self::start_with_backstop(
+            hub,
+            bus,
+            services,
+            refresher,
+            health,
+            SETUP_COMPLETION_BACKSTOP,
+        )
+        .await
     }
 
     /// [`Self::start`] with an explicit setup-completion backstop, so tests
     /// can exercise the backstop without waiting out the production window.
     async fn start_with_backstop(
+        hub: &Arc<SharedWatchHub>,
         bus: EventBus,
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
@@ -162,7 +181,7 @@ impl WatcherRegistry {
         // FSEvents stream count follows the number of distinct parent
         // directories the workspace roots live under, not the workspace count
         // times the number of watch roots each one used to register.
-        let hub = SharedWatchHub::new();
+        let hub = Arc::clone(hub);
         health.attach(&hub);
         tracing::info!(
             os_watch_limits = %super::shared_watch::os_watch_limits(),
@@ -242,10 +261,18 @@ impl WatcherRegistry {
         self.hub.root_established(root)
     }
 
-    /// Live shared `FSEvents` stream count — the consolidation metric.
+    /// Human-readable registration state of one root, for wait diagnostics —
+    /// see [`SharedWatchHub::root_registration_state`].
     #[cfg(test)]
-    fn stream_count(&self) -> usize {
-        self.hub.stream_count()
+    fn root_registration_state(&self, root: &std::path::Path) -> &'static str {
+        self.hub.root_registration_state(root)
+    }
+
+    /// Which shared stream a root rides — the consolidation metric. See
+    /// [`SharedWatchHub::stream_for_root`].
+    #[cfg(test)]
+    fn stream_for_root(&self, root: &std::path::Path) -> Option<std::path::PathBuf> {
+        self.hub.stream_for_root(root)
     }
 
     /// Live shared common-dir watch count — the linked-worktree refcount
@@ -283,7 +310,7 @@ fn start_git_metadata_watch(
 
 /// Start (or replace) the file + `.git` metadata watches for one workspace.
 /// `suffix` distinguishes the triggering transition in the logs.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn start_watches(
     hub: &Arc<SharedWatchHub>,
     common_watches: &Arc<GitCommonDirWatches>,
@@ -334,7 +361,7 @@ fn archived_delta(ev: &Event) -> Option<bool> {
 }
 
 /// Follow workspace lifecycle events, registering/deregistering watch roots.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn lifecycle_loop(
     hub: Arc<SharedWatchHub>,
     common_watches: Arc<GitCommonDirWatches>,
@@ -588,7 +615,7 @@ mod tests {
     use tokio::time::{timeout, Instant};
 
     use super::*;
-    use crate::events::LIVENESS;
+    use crate::events::{TestBudget, LIVENESS};
 
     /// Self-cleaning temp directory (workspace roots).
     struct TempDir {
@@ -827,6 +854,7 @@ mod tests {
             Arc::new(crate::git_status_cache::GitStatusCache::new()),
         ));
         WatcherRegistry::start_with_backstop(
+            &SharedWatchHub::new(),
             bus.clone(),
             api,
             refresher,
@@ -846,19 +874,59 @@ mod tests {
     /// race ahead of the registration it actually cares about. The short
     /// trailing sleep is the usual FSEvents/inotify settle margin: `watch()` has
     /// returned, but the backend needs a moment before it reports changes.
+    ///
+    /// `want = true` waits for the registration to be LIVE, not merely settled:
+    /// under inotify-instance exhaustion the hub settles the root as failed at
+    /// once and re-registers it when watcher creation later succeeds, so a
+    /// test that mutates the tree on "settled" writes against a dead watch and
+    /// then waits out its whole event budget. Expiry panics with the root's
+    /// registration state rather than falling through into the next wait: a
+    /// silent expiry left the stalled wait unidentifiable in the nextest kill
+    /// (intent-hq/intent#4872).
     async fn wait_for_root(registry: &WatcherRegistry, root: &std::path::Path, want: bool) {
-        let deadline = tokio::time::Instant::now() + LIVENESS;
-        loop {
-            let ready = match registry.root_established(root) {
-                Some(established) => want && established,
-                None => !want,
-            };
-            if ready || tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for_root_within(registry, root, want, &TestBudget::liveness()).await;
+    }
+
+    /// [`wait_for_root`] drawing its deadline from a budget shared with the
+    /// test's other waits, so a multi-phase test cannot stack several full
+    /// `LIVENESS` waits past the 180s nextest kill (intent-hq/intent#4872).
+    async fn wait_for_root_within(
+        registry: &WatcherRegistry,
+        root: &std::path::Path,
+        want: bool,
+        budget: &TestBudget,
+    ) {
+        try_wait_for_root(registry, root, want, budget.remaining())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    /// Poll the root's registration state until it matches `want` or
+    /// `remaining` runs out; the error names what the hub still reports.
+    async fn try_wait_for_root(
+        registry: &WatcherRegistry,
+        root: &std::path::Path,
+        want: bool,
+        remaining: Duration,
+    ) -> std::result::Result<(), String> {
+        let deadline = tokio::time::Instant::now() + remaining;
+        let target = if want { "live" } else { "unwatched" };
+        loop {
+            let state = registry.root_registration_state(root);
+            if state == target {
+                return Ok(());
+            }
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Err(format!(
+                    "root {} did not become {target} within {remaining:?}: registration {state} ({})",
+                    root.display(),
+                    super::super::shared_watch::os_watch_limits(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10).min(left)).await;
+        }
     }
 
     /// Actively confirm `ws_id`'s watch is live: rewrite a throwaway probe file
@@ -895,7 +963,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn boot_time_workspace_is_watched() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -919,7 +987,7 @@ mod tests {
     /// `repositoryPath` that exists at daemon start must be watched, not
     /// silently skipped on every restart.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn boot_time_repository_only_workspace_is_watched() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -945,7 +1013,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn workspace_created_after_start_gains_watching_and_deletion_stops_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -995,7 +1063,7 @@ mod tests {
     /// and `workspace:setup:completed` starts the watchers, after which
     /// events flow normally.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn created_workspace_defers_watching_until_setup_completes() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1043,7 +1111,7 @@ mod tests {
     /// `workspace:created`, so the deferral is just the event round-trip:
     /// watchers start promptly and events flow.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn no_script_completion_starts_watching_promptly() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1075,7 +1143,7 @@ mod tests {
     /// event, hung script), the watchers must start anyway once the backstop
     /// elapses.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn backstop_starts_watchers_when_setup_completion_never_arrives() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1104,7 +1172,7 @@ mod tests {
     /// A delete during the setup window discards the pending entry: neither
     /// the (late) completion nor the backstop may start watchers for it.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn delete_while_pending_discards_the_deferred_start() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1142,7 +1210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn workspace_opened_resolves_path_via_services() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1154,27 +1222,74 @@ mod tests {
         // list), like a workspace opened later: `workspace:opened` carries
         // only the id, so the registry must resolve the path via the api.
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+        // One deadline for every wait below: three registration waits plus
+        // the event wait must not stack four full `LIVENESS` windows
+        // (intent-hq/intent#4872).
+        let budget = TestBudget::liveness();
 
         let registry = start_registry(&bus, api).await;
-        wait_for_root(&registry, &root.path, true).await;
+        wait_for_root_within(&registry, &root.path, true, &budget).await;
 
         // Simulate close → open: after close the watchers are gone, and the
         // reopen path exercises the get_workspace lookup.
         bus.publish(&lifecycle_event(WORKSPACE_CLOSED, &ws, false))
             .await
             .expect("publish closed");
-        wait_for_root(&registry, &root.path, false).await;
+        wait_for_root_within(&registry, &root.path, false, &budget).await;
 
         bus.publish(&lifecycle_event(WORKSPACE_OPENED, &ws, false))
             .await
             .expect("publish opened");
-        wait_for_root(&registry, &root.path, true).await;
+        wait_for_root_within(&registry, &root.path, true, &budget).await;
 
         std::fs::write(root.path.join("after-open.txt"), "hi").expect("write file");
-        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
+        let ev = next_file_event(&mut sub, &ws.id, budget.remaining()).await;
         assert!(
             ev.is_some(),
-            "reopened workspace must emit file events (path resolved via services)"
+            "reopened workspace must emit file events (path resolved via services); \
+             registration {}",
+            registry.root_registration_state(&root.path)
+        );
+    }
+
+    /// Regression for intent-hq/intent#4872: a root wait draws from the
+    /// shared budget and fails with a diagnostic when it runs out, instead of
+    /// silently expiring after a fresh `LIVENESS` and handing the next wait
+    /// another full window. Paused clock, so the bound is a virtual-time fact.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn wait_for_root_is_bounded_by_the_shared_budget_and_names_the_stall() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, _sub) = bus_and_sub().await;
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![]));
+        let registry = start_registry(&bus, api).await;
+        tokio::time::pause();
+
+        let total = Duration::from_millis(600);
+        let setup = Duration::from_millis(400);
+        let remainder = total.saturating_sub(setup);
+        let tick = Duration::from_millis(2);
+        let budget = TestBudget::new(total);
+        tokio::time::sleep(setup).await;
+
+        let never = std::path::Path::new("/nonexistent/never-registered");
+        let started = Instant::now();
+        let err = try_wait_for_root(&registry, never, true, budget.remaining())
+            .await
+            .expect_err("a root the registry never saw cannot become established");
+        assert!(
+            started.elapsed().abs_diff(remainder) <= tick,
+            "the wait must take only the budget's remainder, not a fresh {LIVENESS:?}: took {:?}",
+            started.elapsed()
+        );
+        assert!(budget.remaining().is_zero(), "budget must be spent");
+        assert!(
+            err.contains("never-registered")
+                && err.contains("become live")
+                && err.contains("registration unwatched"),
+            "diagnostic must name the root, the wanted state and the hub's state: {err}"
         );
     }
 
@@ -1184,7 +1299,7 @@ mod tests {
     /// paths only — a leak here would attribute one workspace's edits to the
     /// other.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn workspaces_sharing_a_consolidated_root_receive_only_their_own_file_events() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1237,30 +1352,50 @@ mod tests {
     /// workspaces meant ~40+. Now roots join shared streams (per parent
     /// directory on macOS, one global group on Linux — see
     /// `shared_watch::group_key`), so sibling workspaces ride ONE stream.
+    ///
+    /// Asserted per group rather than as a global total: the hub also
+    /// supervises roots this test did not create (the user-tier skill roots,
+    /// via their nearest existing ancestor), and how many groups THOSE occupy
+    /// is a grouping-policy detail — one on Linux, several on macOS
+    /// (intent-hq/intent#4986).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn many_workspaces_share_a_single_stream_per_parent_directory() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, _sub) = bus_and_sub().await;
         let parent = TempDir::new("count");
-        let workspaces: Vec<_> = (0..8)
+        let roots: Vec<_> = (0..8)
             .map(|i| {
                 let root = parent.path.join(format!("ws-{i}"));
                 std::fs::create_dir_all(&root).expect("mk ws");
-                test_workspace(&format!("ws-count-{i}"), &root)
+                root
             })
+            .collect();
+        let workspaces: Vec<_> = roots
+            .iter()
+            .enumerate()
+            .map(|(i, root)| test_workspace(&format!("ws-count-{i}"), root))
             .collect();
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(workspaces.clone()));
 
         let registry = start_registry(&bus, api).await;
         registry.wait_established(workspaces.len(), LIVENESS).await;
 
+        let streams: Vec<_> = roots
+            .iter()
+            .map(|root| {
+                registry
+                    .stream_for_root(root)
+                    .unwrap_or_else(|| panic!("{} must ride a shared stream", root.display()))
+            })
+            .collect();
+        let distinct: std::collections::HashSet<_> = streams.iter().collect();
         assert_eq!(
-            registry.stream_count(),
+            distinct.len(),
             1,
-            "8 sibling workspaces must consolidate onto a single shared stream"
+            "8 sibling workspaces must consolidate onto a single shared stream, got {streams:?}"
         );
     }
 
@@ -1272,7 +1407,7 @@ mod tests {
     /// specific here is that the stream itself stays up for the sibling, so
     /// exclusion can only come from the demux table.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn archiving_one_workspace_leaves_its_shared_stream_co_tenant_watched() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1328,7 +1463,7 @@ mod tests {
     /// Before the fix only `workspace:deleted`/`workspace:closed` deregistered,
     /// so every archived workspace leaked its `FSEvents` streams until restart.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn archived_workspace_stops_watching_and_unarchive_resumes_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1444,7 +1579,7 @@ mod tests {
     /// and common-dir ref changes stop triggering it; unarchiving re-registers
     /// it and triggers resume.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn archived_worktree_workspace_releases_common_dir_watch_and_unarchive_rearms_it() {
         use git2::{Repository, Signature};
         use intent_core::events::CHANGES_GIT_STATUS;
@@ -1600,7 +1735,7 @@ mod tests {
     /// guard drop must not remove the successor's registration (per-guard
     /// identity token). Ref changes must keep triggering after replacement.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn replacing_worktree_watcher_keeps_common_dir_registration_alive() {
         use git2::{Repository, Signature};
         use intent_core::events::CHANGES_GIT_STATUS;
@@ -1687,7 +1822,7 @@ mod tests {
     /// A `workspace:updated` with no `archived` key (title rename, status
     /// message, …) must not disturb the watch roots.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn unrelated_workspace_update_leaves_watching_intact() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1720,7 +1855,7 @@ mod tests {
     /// must get a `changes:git-status` refresh even though no `.git` event was
     /// observed during the unwatched window.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn unarchive_triggers_git_status_catch_up_refresh() {
         use git2::{Repository, Signature};
         use intent_core::events::CHANGES_GIT_STATUS;
@@ -1781,7 +1916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn git_workspace_created_after_start_gains_metadata_watch_and_deletion_stops_it() {
         use git2::{Repository, Signature};
         use intent_core::events::CHANGES_GIT_STATUS;

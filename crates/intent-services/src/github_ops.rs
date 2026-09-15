@@ -16,13 +16,84 @@
 use base64::Engine as _;
 use intent_core::{Error, Result};
 use intent_sourcecontrol::{
-    Issue, PrInvolvement, PrState, PullRequest, ReviewComment, ReviewThread,
+    Issue, PrInvolvement, PrState, PullRequest, RepoRef, ReviewComment, ReviewThread,
 };
 use serde_json::{json, Value};
 
 /// §5.5 pagination: default page size and the inclusive cap.
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 200;
+
+/// Cap on the repositories one `github.*.search` call may span: the addressed
+/// repo plus the `repos` extras (§5.27).
+pub(crate) const MAX_SEARCH_REPOS: usize = 6;
+
+/// Normalize the optional `repos` extras of a search addressed at `primary`:
+/// entries naming the primary and repeats among the extras are dropped
+/// (case-insensitive [`RepoRef`] identity, first occurrence wins), then the
+/// total repo count is capped at [`MAX_SEARCH_REPOS`] → `-32602`.
+pub(crate) fn normalize_extra_repos(
+    primary: &RepoRef,
+    repos: Vec<RepoRef>,
+) -> Result<Vec<RepoRef>> {
+    let mut extras: Vec<RepoRef> = Vec::with_capacity(repos.len());
+    for repo in repos {
+        if repo == *primary || extras.contains(&repo) {
+            continue;
+        }
+        extras.push(repo);
+    }
+    if 1 + extras.len() > MAX_SEARCH_REPOS {
+        return Err(Error::InvalidParams(format!(
+            "repos: a search may span at most {MAX_SEARCH_REPOS} repositories (the addressed repo plus {} extras); got {}",
+            MAX_SEARCH_REPOS - 1,
+            1 + extras.len()
+        )));
+    }
+    Ok(extras)
+}
+
+/// The repository a search hit belongs to, for a `scope` of the addressed
+/// repo followed by the extras. A single-repo scope echoes the addressed repo
+/// (the pre-multi-repo contract, byte-identical). A multi-repo scope derives
+/// `owner`/`repo` from the hit's `html_url` path (`/{owner}/{repo}/issues/{n}`
+/// or `/pull/{n}` on any GitHub host) and maps it back onto the matching
+/// `scope` entry so the wire echoes the caller's casing; a URL naming a repo
+/// outside the scope is surfaced as parsed, and an unparsable URL falls back
+/// to the addressed repo.
+pub(crate) fn hit_repo(scope: &[RepoRef], html_url: &str) -> RepoRef {
+    let primary = scope
+        .first()
+        .cloned()
+        .unwrap_or_else(|| RepoRef::new("", ""));
+    if scope.len() <= 1 {
+        return primary;
+    }
+    let Some(parsed) = repo_from_html_url(html_url) else {
+        tracing::debug!(
+            html_url,
+            owner = %primary.owner,
+            repo = %primary.name,
+            "search hit html_url is empty or unparsable; attributing the item to the addressed repo"
+        );
+        return primary;
+    };
+    scope
+        .iter()
+        .find(|r| **r == parsed)
+        .cloned()
+        .unwrap_or(parsed)
+}
+
+/// Parse `{owner}/{repo}` off a GitHub `html_url` (`https://<host>/{owner}/
+/// {repo}/...`); `None` when the path carries fewer than two segments.
+fn repo_from_html_url(html_url: &str) -> Option<RepoRef> {
+    let rest = html_url.split_once("://").map_or(html_url, |(_, r)| r);
+    let mut segments = rest.split('/').skip(1).filter(|s| !s.is_empty());
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    Some(RepoRef::new(owner, repo))
+}
 
 /// Clamp an optional `limit` / `perPage` into the §5.5 `[1, 200]` window
 /// (default 50) and cast to the engine's `u8` query width.
@@ -167,6 +238,18 @@ pub(crate) fn pull_to_json(pr: &PullRequest) -> Value {
         "deletions": 0,
         "changedFiles": 0,
     })
+}
+
+/// [`pull_to_json`] plus the `owner` / `repo` the PR belongs to — the
+/// `github.pulls.search` item shape, where a multi-repo scope makes the
+/// addressing part of every hit.
+pub(crate) fn pull_to_json_with_repo(pr: &PullRequest, repo: &RepoRef) -> Value {
+    let mut v = pull_to_json(pr);
+    if let Value::Object(map) = &mut v {
+        map.insert("owner".into(), json!(repo.owner));
+        map.insert("repo".into(), json!(repo.name));
+    }
+    v
 }
 
 /// Render a forge [`Issue`] to the `GithubIssue` wire DTO (§5.27); `owner`/`repo`
@@ -385,6 +468,96 @@ mod tests {
             normalize_search_query(Some("  login bug  ".into())),
             Some("login bug".to_string())
         );
+    }
+
+    /// `repos` extras: the primary and repeats drop (case-insensitive), order
+    /// is preserved, 1..=6 total repos pass, and a seventh is `-32602`.
+    #[test]
+    fn normalizes_extra_repos_and_caps_total() {
+        let primary = RepoRef::new("o", "r");
+        assert_eq!(normalize_extra_repos(&primary, vec![]).unwrap(), vec![]);
+
+        let extras = normalize_extra_repos(
+            &primary,
+            vec![
+                RepoRef::new("O", "R"),
+                RepoRef::new("a", "b"),
+                RepoRef::new("A", "B"),
+                RepoRef::new("c", "d"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(extras, vec![RepoRef::new("a", "b"), RepoRef::new("c", "d")]);
+
+        for n in 0..MAX_SEARCH_REPOS {
+            let repos: Vec<RepoRef> = (0..n)
+                .map(|i| RepoRef::new(format!("o{i}"), format!("r{i}")))
+                .collect();
+            assert_eq!(
+                normalize_extra_repos(&primary, repos).unwrap().len(),
+                n,
+                "{} total repos must pass",
+                n + 1
+            );
+        }
+        let too_many: Vec<RepoRef> = (0..MAX_SEARCH_REPOS)
+            .map(|i| RepoRef::new(format!("o{i}"), format!("r{i}")))
+            .collect();
+        let err = normalize_extra_repos(&primary, too_many).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "over-cap must be InvalidParams: {err}"
+        );
+        // Duplicates are dropped BEFORE the cap applies.
+        let dup_heavy: Vec<RepoRef> = (0..10).map(|_| RepoRef::new("a", "b")).collect();
+        assert_eq!(normalize_extra_repos(&primary, dup_heavy).unwrap().len(), 1);
+    }
+
+    /// Per-hit attribution: a single-repo scope echoes the addressed repo
+    /// regardless of the URL; a multi-repo scope reads the URL and echoes the
+    /// caller's casing for a scoped repo, the parsed form otherwise, and the
+    /// addressed repo for an unparsable URL.
+    #[test]
+    fn attributes_hits_to_their_repo() {
+        let single = [RepoRef::new("Intent-HQ", "IntentD")];
+        assert_eq!(
+            hit_repo(&single, "https://github.com/other/repo/issues/1"),
+            RepoRef::new("Intent-HQ", "IntentD")
+        );
+
+        let scope = [
+            RepoRef::new("intent-hq", "intent"),
+            RepoRef::new("Intent-HQ", "IntentD"),
+            RepoRef::new("intent-hq", "cloudlands-fe"),
+        ];
+        let hit = hit_repo(&scope, "https://github.com/intent-hq/intentd/pull/7");
+        assert_eq!(
+            (hit.owner.as_str(), hit.name.as_str()),
+            ("Intent-HQ", "IntentD")
+        );
+        let hit = hit_repo(
+            &scope,
+            "https://github.com/intent-hq/cloudlands-fe/issues/9",
+        );
+        assert_eq!(hit.name, "cloudlands-fe");
+        // GitHub Enterprise hosts parse the same path shape.
+        let hit = hit_repo(&scope, "https://ghe.example.com/intent-hq/intent/issues/3");
+        assert_eq!(hit.name, "intent");
+        // Out-of-scope repos surface as parsed.
+        let hit = hit_repo(&scope, "https://github.com/x/y/pull/1");
+        assert_eq!((hit.owner.as_str(), hit.name.as_str()), ("x", "y"));
+        // Unparsable URLs fall back to the addressed repo.
+        assert_eq!(hit_repo(&scope, "").name, "intent");
+        assert_eq!(hit_repo(&scope, "https://github.com/only").name, "intent");
+    }
+
+    #[test]
+    fn pull_dto_with_repo_adds_owner_and_repo_keys() {
+        let v = pull_to_json_with_repo(&pr(PrState::Open, false), &RepoRef::new("o", "r"));
+        assert_eq!(v["number"], json!(42));
+        assert_eq!(v["owner"], json!("o"));
+        assert_eq!(v["repo"], json!("r"));
+        assert_eq!(v["headRef"], json!("feature/x"));
     }
 
     #[test]

@@ -436,7 +436,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Increment 6: full restart scenario - wait for the aggregated wake with both reports.
 #[tokio::test]
 async fn baseline_plus_aggregated_wake() {
@@ -445,12 +445,12 @@ async fn baseline_plus_aggregated_wake() {
     const REPORT_A: &str = "REPORT_ALPHA finished the alpha task";
     const REPORT_B: &str = "REPORT_BETA finished the beta task";
     const PARENT_GO: &str = "WAKE1_PARENT_GO";
-    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
-                                    // DETERMINISTIC CHILD2 DELAY: daemon1 gets child2 delay=60000ms (1 minute)
-                                    // so child2 cannot complete before the kill (~15s into test). Daemon2 gets
-                                    // delay=0ms so child2 completes quickly and fires the aggregated wake post-restart.
-                                    // Build TWO behavior JSONs, one per daemon, so each daemon's mock agent sees
-                                    // the correct delayMs for child2.
+    #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+                                     // DETERMINISTIC CHILD2 DELAY: daemon1 gets child2 delay=60000ms (1 minute)
+                                     // so child2 cannot complete before the kill (~15s into test). Daemon2 gets
+                                     // delay=0ms so child2 completes quickly and fires the aggregated wake post-restart.
+                                     // Build TWO behavior JSONs, one per daemon, so each daemon's mock agent sees
+                                     // the correct delayMs for child2.
     fn build_behavior(
         child2_delay_ms: u64,
         report_a_js: &str,

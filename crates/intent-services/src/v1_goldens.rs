@@ -87,23 +87,18 @@ fn workspace(id: &WorkspaceId) -> Workspace {
     }
 }
 
+/// `SQLite` db (plus its `.config.toml` sibling) inside an RAII temp dir; the
+/// dir sweep on drop also covers the `-wal`/`-shm` sidecars.
 struct TempDb {
     path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("intentd-goldens-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm", ".config.toml"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = crate::test_support::test_tempdir("intentd-goldens-");
+        let path = dir.path().join("goldens.db");
+        Self { path, _dir: dir }
     }
 }
 
@@ -743,7 +738,7 @@ fn merge_requirements(
     }
 }
 
-fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
+pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
     crate::pr_monitor::PrMonitorSnapshot {
         title: "feat: add adapter".to_string(),
         url: "https://github.com/o/r/pull/42".to_string(),
@@ -1619,7 +1614,8 @@ fn golden_supervisor_history_truncation_markers() {
 /// via a hermetic assembly with no workspace path (no rule files, no skills,
 /// no RTK — only the always-on layers). Assembled under a session pinned to
 /// `harnessVersion: "1.0"` so the bytes stay frozen as later versions reword
-/// surfaces (v2.3 rewords the next-steps layer; `v2_3_goldens` pins that).
+/// surfaces (v2.3/v2.4 reword the next-steps layer; `v2_3_goldens` /
+/// `v2_4_goldens` pin those).
 #[tokio::test]
 async fn golden_assembled_prompt_static_layers() {
     let (_t, svc, ws) = setup().await;
@@ -1857,8 +1853,8 @@ async fn golden_v1_session_assembles_v1_doctrine() {
     assert!(latest.contains("ws.workspace.proposeSibling"));
     // Only the doctrine layer differs between v1 and v2.2 (the last version
     // on v1 text surfaces): the static layers after the specialization
-    // rules are byte-identical. Latest (v2.3) additionally rewords the
-    // next-steps layer and nothing else.
+    // rules are byte-identical. Latest (v2.4, like v2.3) additionally
+    // rewords the next-steps layer and nothing else.
     session.harness_version = "2.2".to_string();
     let pinned_v2_2 = assemble(Some(session.clone())).await;
     let v2_2_rules = crate::instructions::get_instruction_with_common_for(
@@ -1933,14 +1929,14 @@ fn golden_bundled_doctrine_hashes() {
         })
         .collect();
     let expected = vec![
-        "task-loop: f18d40f5c74b12b45c9f656900665c82398fc5aaa716c5770e22068dd839a560".to_string(),
-        "interactive: 072a355b7c77a499b00701c9e175673a4ff4224c486f51677f7caa23986d5788".to_string(),
-        "workspace-agent: 202521ab3e7055486384e3093fc6d1f2b4f507c0248a9808597cae465a4cb268"
+        "task-loop: cc1f40de9643f88529dd5fa61d1f868ae269020aa3ef5d08986a721e19c64c44".to_string(),
+        "interactive: 013e064b03286569622d905efd0ee4c2a227fc18f0364d3277a95b548dd1f6c3".to_string(),
+        "workspace-agent: 6dfa5d333a6a2e8f07192595828772dad2aad6868def3737e5cd9c50363a2718"
             .to_string(),
-        "task-breakdown: 55aeb42266161ca997549cfe887bbc807c3511920d6304f5d4508c327fbad3be"
+        "task-breakdown: 1e9e1e2daf42a8adadd8c31d7697f0bac02bf5a7c818b00ae4e50074e40b9e66"
             .to_string(),
-        "common: e098afd3a53c2313c8e4207a8c07f011119a5f7767270328f4dfa541cf455185".to_string(),
-        "workspace: fe126c3dc9450fdef98bffc0cffdc170e488b26b926e1e2e137dd6f42702b308".to_string(),
+        "common: 45db6f16aec87f11050b5cc1979370c06f00f00149df20e245fce83acd73b2f0".to_string(),
+        "workspace: d0b0ecd88bed6224442633dc3dc026a1276d37536478730969703a35e6a91a90".to_string(),
     ];
     assert_eq!(actual, expected);
 }

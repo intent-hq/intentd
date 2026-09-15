@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,15 +24,11 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-scr-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-scr-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path) -> Child {
@@ -263,9 +259,9 @@ fn stop(mut child: Child) {
 
 /// A minimal committed git repo for `workspace.create` (the store row is what
 /// `script.*` needs; `skipWorktree` keeps provisioning out of the test).
-fn create_test_repo() -> PathBuf {
-    let repo_path = std::env::temp_dir().join(format!("scr-persist-repo-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&repo_path).expect("create temp repo dir");
+fn create_test_repo() -> tempfile::TempDir {
+    let repo = common::test_tempdir("scr-persist-repo-");
+    let repo_path = repo.path().to_path_buf();
     let git = |args: &[&str]| {
         let status = Command::new("git")
             .args(args)
@@ -281,7 +277,7 @@ fn create_test_repo() -> PathBuf {
     std::fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
     git(&["add", "."]);
     git(&["commit", "-m", "initial commit"]);
-    repo_path
+    repo
 }
 
 /// Poll `script.status` until `pred` holds (pure-liveness deadline).
@@ -323,7 +319,8 @@ where
 /// causal barrier mutations prove failure silence and workspace isolation.
 #[tokio::test]
 async fn script_definition_changes_emit_over_authenticated_wss() {
-    let data_dir = scratch_dir("change-events");
+    let data_dir_guard = scratch_dir("change-events");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (child, port, cfg) = boot(&data_dir).await;
     let mut rpc = connect_ws(port, cfg.clone()).await;
     let mut sub_a = connect_ws(port, cfg.clone()).await;
@@ -483,7 +480,6 @@ async fn script_definition_changes_emit_over_authenticated_wss() {
     drop(sub_a);
     drop(sub_b);
     stop(child);
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// `script.create` persists the definition; a daemon restart on the same data
@@ -491,7 +487,8 @@ async fn script_definition_changes_emit_over_authenticated_wss() {
 /// `script.remove` unpersists it across yet another restart.
 #[tokio::test]
 async fn scripts_survive_daemon_restart_over_wss() {
-    let data_dir = scratch_dir("data");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Boot #1: create a script over WSS.
     let (child, port, cfg) = boot(&data_dir).await;
@@ -573,7 +570,6 @@ async fn scripts_survive_daemon_restart_over_wss() {
     );
     drop(ws);
     stop(child);
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// A service running when the daemon is killed hydrates on the next boot as
@@ -584,8 +580,10 @@ async fn scripts_survive_daemon_restart_over_wss() {
 /// it across yet another restart.
 #[tokio::test]
 async fn was_running_marker_survives_daemon_kill_over_wss() {
-    let data_dir = scratch_dir("marker");
-    let repo_path = create_test_repo();
+    let data_dir_guard = scratch_dir("marker");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let repo_guard = create_test_repo();
+    let repo_path = repo_guard.path().to_path_buf();
 
     // Boot #1: create a workspace + service script, start it, and kill the
     // daemon while the service is running (no stop).
@@ -705,6 +703,4 @@ async fn was_running_marker_survives_daemon_kill_over_wss() {
     );
     drop(ws);
     stop(child);
-    let _ = std::fs::remove_dir_all(&repo_path);
-    let _ = std::fs::remove_dir_all(&data_dir);
 }

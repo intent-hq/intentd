@@ -62,7 +62,7 @@ impl SkillsWatcher {
         let mut user_watchers = Vec::new();
         let user_roots = get_user_skill_roots();
         for root in user_roots {
-            user_watchers.push(watch_directory(root, None, raw_tx.clone()));
+            user_watchers.push(watch_directory(hub, root, None, raw_tx.clone()));
         }
 
         // Start project-tier watchers (per-workspace)
@@ -106,7 +106,7 @@ impl SkillsWatcher {
     /// ride the shared stream and need no separate sync point — subscribing is
     /// synchronous bookkeeping.
     #[cfg(test)]
-    #[allow(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
+    #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: Duration) {
         for watch in &self._user_watchers {
             watch.wait_established(timeout).await;
@@ -228,11 +228,12 @@ async fn skills_fingerprint(workspace_path: &Path) -> u64 {
 /// nearest existing ancestor is promoted to a recursive watch on the root
 /// once it appears.
 fn watch_directory(
+    hub: &Arc<SharedWatchHub>,
     root: PathBuf,
     workspace_id: Option<WorkspaceId>,
     tx: mpsc::UnboundedSender<SkillsMsg>,
 ) -> RootWatch {
-    watch_root(root, is_skill_md, move || {
+    watch_root(hub, root, is_skill_md, move || {
         let _ = tx.send(SkillsMsg::Change(workspace_id.clone()));
     })
 }
@@ -526,7 +527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn workspace_added_after_start_gains_watching_and_removal_stops_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -585,7 +586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn resume_catch_up_survives_a_discovery_cache_refresh_while_suspended() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()

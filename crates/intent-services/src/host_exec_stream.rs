@@ -32,6 +32,7 @@ use crate::system_actor;
 /// Grace period between SIGTERM and SIGKILL when reaping a cancelled / timed-out
 /// stream, mirroring [`host_exec`]'s constant so both surfaces settle helper
 /// subprocesses the same way.
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
 /// Chunk size for reads off the child's stdout/stderr pipes. Small enough that
@@ -514,6 +515,7 @@ async fn run_wait_loop(
 /// cancel/timeout. Descendants that escaped into their OWN process groups
 /// survive the group kill, so they are snapshotted before signalling and
 /// swept afterwards (`intent_acp::descendant_sweep`).
+#[cfg_attr(not(unix), expect(clippy::unused_async))] // only the unix arm awaits
 async fn reap_child_group(child: &mut tokio::process::Child, pid: Option<u32>) {
     #[cfg(unix)]
     {

@@ -17,8 +17,9 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// ID is derived from the prompt via `extract_local_slug` ("fix auth" → "auth-fix").
 #[tokio::test]
 async fn workspace_id_derived_from_initial_agent_prompt() {
-    let db = std::env::temp_dir().join(format!("intentd-e2e-core-{}.db", uuid::Uuid::new_v4()));
-    let ws_root = std::env::temp_dir().join(format!("itd-e2e-ws-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("intentd-e2e-core-");
+    let db = tmp.path().join("intentd.db");
+    let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(&ws_root).expect("create ws root");
     let store = Store::open(&db).await.expect("open store");
     let services = Services::new(store.clone())
@@ -48,21 +49,58 @@ async fn workspace_id_derived_from_initial_agent_prompt() {
         "workspace id should be derived from prompt via extract_local_slug"
     );
 
-    // Clean up (drop store/services before removing SQLite files)
+    // Drop store/services before the tempdir guard removes the SQLite files.
     drop(services);
     drop(store);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
+}
+
+/// Regression (intent-hq/intent#4801): a prompt with an `@` followed by a
+/// multi-byte char used to panic inside the slug heuristic's mention stripping,
+/// taking `workspace.create` down with an internal error.
+#[tokio::test]
+async fn workspace_create_survives_multibyte_char_after_at_in_prompt() {
+    let tmp = common::test_tempdir("intentd-e2e-core-");
+    let db = tmp.path().join("intentd.db");
+    let ws_root = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws_root).expect("create ws root");
+    let store = Store::open(&db).await.expect("open store");
+    let services = Services::new(store.clone())
+        .with_workspaces_root(ws_root.clone())
+        .with_settings_registry(common::registry_with_default_provider(&ws_root));
+
+    let result = services
+        .create_workspace(
+            WorkspaceCreate {
+                title: None,
+                initial_agent: Some(WorkspaceCreateInitialAgent {
+                    prompt: Some("@foo — bar baz".to_string()),
+                    name: Some("Test Agent".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some(format!("idem-{}", uuid::Uuid::new_v4())),
+        )
+        .await
+        .expect("create workspace must not fail on a multi-byte char after '@'");
+
+    assert_eq!(
+        result.workspace.id.0.as_str(),
+        "foo-bar",
+        "workspace id should be derived from the prompt with the em dash dropped"
+    );
+
+    drop(services);
+    drop(store);
 }
 
 /// Create a workspace with no prompt and verify the ID is a random slug
 /// (adjective-animal from `generate_workspace_slug`).
 #[tokio::test]
 async fn workspace_id_random_slug_when_no_prompt() {
-    let db = std::env::temp_dir().join(format!("intentd-e2e-core-{}.db", uuid::Uuid::new_v4()));
-    let ws_root = std::env::temp_dir().join(format!("itd-e2e-ws-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("intentd-e2e-core-");
+    let db = tmp.path().join("intentd.db");
+    let ws_root = tmp.path().join("ws");
     let store = Store::open(&db).await.expect("open store");
     let services = Services::new(store.clone()).with_workspaces_root(ws_root.clone());
 
@@ -88,19 +126,16 @@ async fn workspace_id_random_slug_when_no_prompt() {
         "random slug should be recognized as a workspace slug: {ws_id}"
     );
 
-    // Clean up (drop store/services before removing SQLite files)
+    // Drop store/services before the tempdir guard removes the SQLite files.
     drop(services);
     drop(store);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 /// Verify `Config::resolve` parses env vars and fills defaults.
 #[tokio::test]
 async fn config_resolve_fills_defaults() {
-    let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("intentd-cfg-");
+    let tmp_dir = tmp.path().to_path_buf();
     let tmp_cfg = tmp_dir.join("nonexistent-config.toml");
 
     let guard = ENV_LOCK.lock().unwrap();
@@ -119,14 +154,13 @@ async fn config_resolve_fills_defaults() {
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
     drop(guard);
-    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 /// Verify `Config::resolve` reads `idle_reap_minutes` from config.toml.
 #[tokio::test]
 async fn config_resolve_reads_idle_reap_from_file() {
-    let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let tmp = common::test_tempdir("intentd-cfg-");
+    let tmp_dir = tmp.path().to_path_buf();
 
     let cfg_path = tmp_dir.join("config.toml");
     std::fs::write(
@@ -148,5 +182,4 @@ idleReapMinutes = 50
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
     drop(guard);
-    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

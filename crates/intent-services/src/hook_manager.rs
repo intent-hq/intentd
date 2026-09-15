@@ -5202,8 +5202,11 @@ mod tests {
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
+        // Wait on state too — `run_count` and `last_error` persist before
+        // the Running→Scheduled write (intent-hq/monorepo#3055,
+        // intent-hq/intent#5006).
         let hook = wait_for_hook(&svc, &hook.hook_id, |h| {
-            h.run_count == 2 && h.last_error.is_none()
+            h.run_count == 2 && h.last_error.is_none() && h.state == HookState::Scheduled
         })
         .await;
         assert_eq!(hook.last_error, None);

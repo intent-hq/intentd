@@ -455,7 +455,7 @@ impl Services {
     ///   to hear monitoring-idle advisories (PR #1686 review). The ask path
     ///   (`register_completion_watch_strict_durable`) never adopts through
     ///   here, so it cannot re-narrow a full watch.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn insert_watch_in_memory(
         &self,
         parent_workspace_id: &WorkspaceId,
@@ -1884,6 +1884,17 @@ impl Services {
     /// STAB-108 FIX: Reconciles each rehydrated group against current agent state.
     /// If an expected child is already idle/completed (or deleted/missing), records
     /// its completion using the persisted `completion_report`, then fires ready groups.
+    ///
+    /// Reconciliation and this invocation's own [`Services::try_fire_group`]
+    /// attempt are awaited per group — nothing is spawned between them. A
+    /// successful, uncontended store-only delivery appends the wake to the
+    /// parent's transcript before that attempt returns; the attempt otherwise
+    /// keeps `try_fire_group`'s semantics (it yields to a delivery claim
+    /// already held by a concurrent caller, and a permanently gone parent is
+    /// dropped without a retry). Only the members recorded in the persisted
+    /// row are reconciled: an enrollment upsert still in the persistence lane
+    /// at read time is not part of the rehydrated group, and a memberless
+    /// group is never complete.
     pub(crate) async fn rehydrate_delegation_groups(
         &self,
         workspace_id: &WorkspaceId,

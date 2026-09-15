@@ -7,22 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Identifies a repository on a forge (host-agnostic).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepoRef {
-    pub owner: String,
-    pub name: String,
-}
-
-impl RepoRef {
-    /// Convenience constructor.
-    pub fn new(owner: impl Into<String>, name: impl Into<String>) -> Self {
-        Self {
-            owner: owner.into(),
-            name: name.into(),
-        }
-    }
-}
+/// Case-insensitive repository identity; defined in `intent-core` so every
+/// slug-holding crate shares one type, re-exported here at its historical path.
+pub use intent_core::RepoRef;
 
 /// Repository metadata (parity with the FE `GithubRepo`). Backs the
 /// `github.repos.list/search/get` browse surface. `url` carries GitHub's
@@ -201,10 +188,11 @@ pub enum PrInvolvement {
 
 /// Filter for listing pull requests.
 ///
-/// When `involvement` or `search` is set, listing routes through
-/// `GET /search/issues` (`is:pr repo:o/r is:<state> [<filter>:@me] [<text>]`)
-/// so callers can express author/assignee/review-requested/involves @me and
-/// free text; otherwise the plain `GET /repos/{o}/{r}/pulls` path is used with
+/// When `involvement`, `search`, or `extra_repos` is set, listing routes
+/// through `GET /search/issues` (`is:pr repo:o/r [repo:o2/r2 …] is:<state>
+/// [<filter>:@me] [<text>]`) so callers can express
+/// author/assignee/review-requested/involves @me, free text, and a multi-repo
+/// scope; otherwise the plain `GET /repos/{o}/{r}/pulls` path is used with
 /// client-side `author` filtering.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -218,6 +206,12 @@ pub struct PrQuery {
     /// non-blank value routes the listing through `/search/issues` even
     /// without `involvement`. Blank/absent leaves listing behavior unchanged.
     pub search: Option<String>,
+    /// Additional repositories searched alongside the addressed repo in ONE
+    /// `/search/issues` request (a `repo:` qualifier each); GitHub blends and
+    /// orders the hits natively. Non-empty routes the listing through search
+    /// even with a blank `search`; empty leaves listing behavior unchanged.
+    #[serde(default)]
+    pub extra_repos: Vec<RepoRef>,
     pub limit: Option<u8>,
     /// Engine-native continuation cursor (a REST page number); `None` is the
     /// first page. The opaque wire `nextToken` is owned by the services layer.
@@ -345,9 +339,10 @@ pub struct Issue {
 
 /// Filter for listing issues.
 ///
-/// When `search` is set, listing routes through `GET /search/issues`
-/// (`is:issue repo:o/r [state:<state>] <text>`) so callers can express free
-/// text; otherwise the plain `GET /repos/{o}/{r}/issues` listing is used.
+/// When `search` or `extra_repos` is set, listing routes through
+/// `GET /search/issues` (`is:issue repo:o/r [repo:o2/r2 …] [state:<state>]
+/// <text>`) so callers can express free text and a multi-repo scope;
+/// otherwise the plain `GET /repos/{o}/{r}/issues` listing is used.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueQuery {
@@ -356,6 +351,12 @@ pub struct IssueQuery {
     /// Free-text search term; a non-blank value routes the listing through
     /// `/search/issues`. Blank/absent leaves listing behavior unchanged.
     pub search: Option<String>,
+    /// Additional repositories searched alongside the addressed repo in ONE
+    /// `/search/issues` request (a `repo:` qualifier each); GitHub blends and
+    /// orders the hits natively. Non-empty routes the listing through search
+    /// even with a blank `search`; empty leaves listing behavior unchanged.
+    #[serde(default)]
+    pub extra_repos: Vec<RepoRef>,
     pub limit: Option<u8>,
     /// Engine-native continuation cursor (a REST page number); `None` is the
     /// first page. The opaque wire `nextToken` is owned by the services layer.
@@ -390,7 +391,7 @@ pub struct AuthStatus {
 
 /// Capabilities a concrete host may or may not support (FE gates UI on these).
 // One bool per independent capability; the flat shape IS the wire contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScCapabilities {

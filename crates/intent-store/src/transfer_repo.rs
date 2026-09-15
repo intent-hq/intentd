@@ -125,6 +125,13 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "per-daemon RPC replay-protection bookkeeping, not workspace state",
     ),
     (
+        "attachment_idempotency_keys",
+        "7-day lost-reply recovery bookkeeping for keyed attachment placements against \
+         THIS daemon (intent-hq/intent#4691); a client retrying against the target is \
+         talking to a different daemon, and the bound `attachments` rows transfer on \
+         their own",
+    ),
+    (
         "deleted_workspace_id",
         "source-local tombstones guarding workspace-id reuse, not live workspace state",
     ),
@@ -323,6 +330,16 @@ impl Store {
     /// payload the export archive writes to `rows/<table>.jsonl` and
     /// [`Store::transfer_import_rows`] round-trips on the target.
     ///
+    /// Every table is read inside ONE deferred read transaction on a single
+    /// read-pool connection, so the whole export observes a single WAL
+    /// snapshot: a write committing mid-export can no longer land a `note`
+    /// row and a `note_version` snapshot from different revisions in the
+    /// same archive (intent-hq/intent#4876). Readers never block the writer
+    /// in WAL mode, so concurrent writes still proceed; the cost is that a
+    /// checkpoint cannot advance past this snapshot while it is held, so the
+    /// WAL can grow for the duration of a large export under sustained
+    /// writes (one-shot RPC, reclaimed at the next checkpoint after commit).
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
@@ -330,12 +347,17 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
+        let mut tx = self
+            .read_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("transfer export begin failed: {e}")))?;
         let mut out = Vec::with_capacity(TRANSFER_TABLES.len());
         for (table, predicate) in TRANSFER_TABLES {
             let sql = format!("SELECT * FROM \"{table}\" WHERE {predicate}");
             let rows = sqlx::query(&sql)
                 .bind(&workspace_id.0)
-                .fetch_all(self.read_pool())
+                .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("transfer export {table} failed: {e}")))?;
             let mut objects = Vec::with_capacity(rows.len());
@@ -344,6 +366,9 @@ impl Store {
             }
             out.push(((*table).to_string(), objects));
         }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("transfer export commit failed: {e}")))?;
         Ok(out)
     }
 
@@ -544,7 +569,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 /// Inverse of [`base64_encode`]; `None` on any malformed input.
 // Byte extraction from a 24-bit accumulator: truncation is the point.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {
@@ -769,6 +794,99 @@ mod tests {
         assert_eq!(exported, re_exported, "round-trip must be lossless");
     }
 
+    /// Regression for intent-hq/intent#4876: the export reads every table
+    /// from ONE snapshot. A writer commits versioned note updates (`note.rev`
+    /// bump + matching `note_version` row, one write transaction each) in a
+    /// tight loop while the export runs repeatedly; every export must pair
+    /// the `note` row with a newest `note_version` of the SAME revision and
+    /// content. Before the fix each table was read with its own statement on
+    /// its own pooled connection, so a write landing between the `note` and
+    /// `note_version` reads exported a row at rev N next to a snapshot at
+    /// rev N+1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transfer_export_pairs_note_row_with_same_rev_snapshot_under_concurrent_writes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const FILLER_NOTES: usize = 64;
+        const EXPORTS: usize = 200;
+
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.expect("open");
+        let ws = "ws-snap";
+        let t = "2026-01-01T00:00:00Z";
+        run(&store, format!("INSERT INTO workspace (id, title, branch, created_at, updated_at) VALUES ('{ws}', 'T', 'main', '{t}', '{t}')")).await;
+        // Filler notes widen the gap between the `note` and `note_version`
+        // reads (each exported row is serialized before the next table).
+        for i in 0..FILLER_NOTES {
+            run(&store, format!("INSERT INTO note (id, workspace_id, title, content, created_at, updated_at, rev) VALUES ('f{i}', '{ws}', 'F', 'body', '{t}', '{t}', 1)")).await;
+            run(&store, format!("INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, author_type, title, content) VALUES ('f{i}', '{ws}', 1, '{t}', 'u', 'U', 'user', 'F', 'body')")).await;
+        }
+        run(&store, format!("INSERT INTO note (id, workspace_id, title, content, created_at, updated_at, rev) VALUES ('hot', '{ws}', 'H', 'c1', '{t}', '{t}', 1)")).await;
+        run(&store, format!("INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, author_type, title, content) VALUES ('hot', '{ws}', 1, '{t}', 'u', 'U', 'user', 'H', 'c1')")).await;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let store = store.clone();
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let mut k: i64 = 1;
+                while !stop.load(Ordering::Relaxed) {
+                    k += 1;
+                    let mut conn = store.write_pool().acquire().await.expect("acquire");
+                    for sql in [
+                        "BEGIN IMMEDIATE".to_string(),
+                        format!("UPDATE note SET content = 'c{k}', rev = {k} WHERE id = 'hot' AND workspace_id = '{ws}'"),
+                        format!("INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, author_type, title, content) VALUES ('hot', '{ws}', {k}, '{t}', 'u', 'U', 'user', 'H', 'c{k}')"),
+                        format!("DELETE FROM note_version WHERE note_id = 'hot' AND workspace_id = '{ws}' AND v < {k} - 20"),
+                        "COMMIT".to_string(),
+                    ] {
+                        sqlx::query(&sql)
+                            .execute(&mut *conn)
+                            .await
+                            .unwrap_or_else(|e| panic!("writer failed: {sql}: {e}"));
+                    }
+                }
+                k
+            })
+        };
+
+        let ws_id = WorkspaceId(ws.to_string());
+        for i in 0..EXPORTS {
+            let exported = store.transfer_export_rows(&ws_id).await.expect("export");
+            let table = |name: &str| {
+                &exported
+                    .iter()
+                    .find(|(t, _)| t == name)
+                    .unwrap_or_else(|| panic!("{name} exported"))
+                    .1
+            };
+            let note = table("note")
+                .iter()
+                .find(|r| r["id"] == "hot")
+                .expect("hot note exported");
+            let rev = note["rev"].as_i64().expect("rev");
+            let newest = table("note_version")
+                .iter()
+                .filter(|r| r["note_id"] == "hot")
+                .max_by_key(|r| r["v"].as_i64().expect("v"))
+                .expect("hot note_version exported");
+            assert_eq!(
+                newest["v"], rev,
+                "export {i}: note row rev {rev} must match newest exported \
+                 note_version — the export captured note/history at different times"
+            );
+            assert_eq!(
+                newest["content"], note["content"],
+                "export {i}: newest note_version content must match the note row"
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let last = writer.await.expect("writer task");
+        assert!(last > 1, "writer must have committed at least one update");
+    }
+
     /// The import transaction is atomic: a batch whose LAST table row
     /// violates the schema leaves nothing behind — not even the earlier
     /// valid workspace row.
@@ -892,7 +1010,7 @@ mod tests {
     const TRANSFERRED_COLUMNS: &str = "\
 workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id
 note: id, workspace_id, title, content, content_type, tags, is_pinned, is_archived, is_default, parent_id, visibility, task_json, created_at, updated_at, rev
-note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content
+note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content, rev
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments

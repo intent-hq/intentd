@@ -5,14 +5,18 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{run_one_shot_acp, run_one_shot_acp_in, OneShotCommand, OneShotError};
+#[cfg(unix)]
+use super::run_one_shot_acp_in;
+use super::{run_one_shot_acp, OneShotCommand, OneShotError};
+#[cfg(unix)]
 use crate::acp_adapter::AdapterSlots;
+use crate::test_support::test_tempdir;
 
 /// Write `body` as an executable-by-node mock adapter script and return a
 /// launch command for it. The tempdir is returned so the caller keeps it
 /// alive for the duration of the run.
 fn mock_adapter(body: &str) -> (OneShotCommand, tempfile::TempDir) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = test_tempdir("intent-one-shot-");
     let script = dir.path().join("mock-one-shot-adapter.mjs");
     std::fs::write(&script, body).expect("write mock adapter");
     let cmd = OneShotCommand::binary(
@@ -57,10 +61,60 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "say hi", None, Duration::from_secs(30))
+    let text = run_one_shot_acp(cmd, "say hi", None, None, Duration::from_secs(30))
         .await
         .expect("one-shot succeeds");
     assert_eq!(text, "Hello, world!");
+}
+
+/// Mock adapter that echoes the `session/new` params it received as the
+/// reply, so the wire shape of setup is assertable.
+const SESSION_NEW_ECHO_ADAPTER: &str = r"
+let sessionNew = null;
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'session/new') sessionNew = msg.params;
+});
+const onPrompt = (id) => {
+  chunk(JSON.stringify(sessionNew));
+  result(id, { stopReason: 'end_turn' });
+};
+";
+
+#[tokio::test]
+async fn session_meta_rides_session_new_verbatim() {
+    let (cmd, _dir) = mock_adapter(&format!("{ADAPTER_PRELUDE}{SESSION_NEW_ECHO_ADAPTER}"));
+    let meta = serde_json::json!({
+        "systemPrompt": "utility",
+        "claudeCode": { "options": { "tools": [] } },
+    });
+    let text = run_one_shot_acp(
+        cmd,
+        "hello",
+        None,
+        Some(meta.clone()),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("one-shot succeeds");
+    let params: serde_json::Value = serde_json::from_str(&text).expect("echoed params parse");
+    assert_eq!(params["_meta"], meta);
+    assert_eq!(params["mcpServers"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn session_new_omits_meta_when_none_given() {
+    let (cmd, _dir) = mock_adapter(&format!("{ADAPTER_PRELUDE}{SESSION_NEW_ECHO_ADAPTER}"));
+    let text = run_one_shot_acp(cmd, "hello", None, None, Duration::from_secs(30))
+        .await
+        .expect("one-shot succeeds");
+    let params: serde_json::Value = serde_json::from_str(&text).expect("echoed params parse");
+    assert!(
+        params.get("_meta").is_none(),
+        "no session_meta must mean no `_meta` key at all, got: {params}"
+    );
+    assert_eq!(params["mcpServers"], serde_json::json!([]));
 }
 
 #[cfg(unix)]
@@ -68,8 +122,8 @@ const onPrompt = (id) => {{
 async fn prompt_timeout_reports_timeout_and_reaps_child() {
     // The adapter answers setup, then never resolves the prompt. The runner
     // must bound the prompt phase and leave no surviving process.
-    let pidfile =
-        std::env::temp_dir().join(format!("intent-one-shot-{}.pid", uuid::Uuid::new_v4()));
+    let scratch = test_tempdir("intent-one-shot-pid-");
+    let pidfile = scratch.path().join("adapter.pid");
     let (cmd, _dir) = mock_adapter(&format!(
         "import fs from 'node:fs';
 fs.writeFileSync({pidfile:?}, String(process.pid));
@@ -83,7 +137,7 @@ const onPrompt = () => {{}};
     // sibling tests for longer than 500ms, which would turn the asserted
     // PromptTimeout into a QueueTimeout (monorepo#2379).
     let slots = AdapterSlots::new(1);
-    let err = run_one_shot_acp_in(&slots, cmd, "hang", None, Duration::from_millis(500))
+    let err = run_one_shot_acp_in(&slots, cmd, "hang", None, None, Duration::from_millis(500))
         .await
         .unwrap_err();
     assert!(
@@ -96,7 +150,6 @@ const onPrompt = () => {{}};
         .trim()
         .parse()
         .expect("pid parses");
-    std::fs::remove_file(&pidfile).ok();
     // `kill(pid, 0)` returns ESRCH once the reaped child is gone.
     for _ in 0..100 {
         if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
@@ -127,7 +180,7 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "touch a file", None, Duration::from_secs(30))
+    let text = run_one_shot_acp(cmd, "touch a file", None, None, Duration::from_secs(30))
         .await
         .expect("one-shot succeeds after the auto-deny");
     assert_eq!(text, "denied=\"cancelled\"");
@@ -167,7 +220,7 @@ rl.on('line', (line) => {{
 }});
 "
     ));
-    let text = run_one_shot_acp(cmd, "hello", None, Duration::from_secs(30))
+    let text = run_one_shot_acp(cmd, "hello", None, None, Duration::from_secs(30))
         .await
         .expect("setup-phase permission requests are auto-denied, not hung");
     assert_eq!(text, "setup-denials=2");
@@ -195,7 +248,7 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "hello", Some("opus-x"), Duration::from_secs(30))
+    let text = run_one_shot_acp(cmd, "hello", Some("opus-x"), None, Duration::from_secs(30))
         .await
         .expect("one-shot succeeds");
     assert_eq!(text, "applied=model=opus-x@s1");
@@ -221,9 +274,15 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "hello", Some("bogus-model"), Duration::from_secs(30))
-        .await
-        .expect("a rejected set_config_option must not fail the one-shot");
+    let text = run_one_shot_acp(
+        cmd,
+        "hello",
+        Some("bogus-model"),
+        None,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("a rejected set_config_option must not fail the one-shot");
     assert_eq!(text, "default-model-reply");
 }
 
@@ -234,7 +293,7 @@ async fn nonzero_exit_surfaces_typed_exited_error() {
         PathBuf::from("/bin/sh"),
         vec!["-c".to_string(), "echo boom >&2; exit 7".to_string()],
     );
-    let err = run_one_shot_acp(cmd, "anything", None, Duration::from_secs(30))
+    let err = run_one_shot_acp(cmd, "anything", None, None, Duration::from_secs(30))
         .await
         .unwrap_err();
     let OneShotError::Exited(detail) = err else {
@@ -253,7 +312,7 @@ async fn garbage_stdout_surfaces_typed_transport_error() {
         PathBuf::from("/bin/sh"),
         vec!["-c".to_string(), "echo not json; exit 0".to_string()],
     );
-    let err = run_one_shot_acp(cmd, "anything", None, Duration::from_secs(30))
+    let err = run_one_shot_acp(cmd, "anything", None, None, Duration::from_secs(30))
         .await
         .unwrap_err();
     assert!(
@@ -268,7 +327,7 @@ async fn missing_adapter_binary_surfaces_typed_spawn_error() {
         PathBuf::from("/nonexistent/intentd-one-shot-adapter"),
         Vec::new(),
     );
-    let err = run_one_shot_acp(cmd, "anything", None, Duration::from_secs(5))
+    let err = run_one_shot_acp(cmd, "anything", None, None, Duration::from_secs(5))
         .await
         .unwrap_err();
     assert!(
@@ -354,9 +413,9 @@ const onPrompt = (id) => {{
     let runs: Vec<_> = (0..burst)
         .map(|_| {
             let cmd = launch();
-            tokio::spawn(
-                async move { run_one_shot_acp(cmd, "go", None, Duration::from_secs(30)).await },
-            )
+            tokio::spawn(async move {
+                run_one_shot_acp(cmd, "go", None, None, Duration::from_secs(30)).await
+            })
         })
         .collect();
 
@@ -372,7 +431,7 @@ const onPrompt = (id) => {{
 
     // A caller arriving into that full queue with a short timeout fails as a
     // queue timeout — and still spawns nothing.
-    let queued_out = run_one_shot_acp(launch(), "go", None, Duration::from_millis(300))
+    let queued_out = run_one_shot_acp(launch(), "go", None, None, Duration::from_millis(300))
         .await
         .unwrap_err();
     let OneShotError::QueueTimeout {

@@ -137,7 +137,7 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
 /// `eval_budget` is the caller's effective `workspace_api` wall-clock budget,
 /// so bindings that wait on a process (`ws.script.run`) can refuse a wait the
 /// transport could never honor.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn try_dispatch(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
@@ -317,7 +317,7 @@ pub(crate) fn opt_vec_str(args: &Value, key: &str) -> Option<Vec<String>> {
 /// throughout these bindings (the trait's `Display` impl already renders the
 /// message content the reference builders threw).
 // By-value so it slots point-free into `map_err(map_err)` in every binding.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub(crate) fn map_err(e: intent_core::Error) -> String {
     e.to_string()
 }

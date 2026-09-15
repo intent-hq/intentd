@@ -36,7 +36,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -48,11 +47,8 @@ const QUEUED_TWO: &str = "preserved queue message two";
 /// per-resume humanized outage duration, so asserts match on this prefix.
 const CONTINUATION_PREFIX: &str = "You were interrupted for about ";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-queue-order-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-queue-order-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -643,7 +639,8 @@ async fn resume_rpc_continuation_first_then_queue_fifo() {
     let Some(script) = gate("resume_rpc_continuation_first_then_queue_fifo") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, agent_id) = interrupt_midturn_with_queued_messages(&data_dir, &script).await;
 
     eprintln!("Phase 2: restart daemon, verify rehydrated pending state over WSS");
@@ -676,8 +673,6 @@ async fn resume_rpc_continuation_first_then_queue_fifo() {
     eprintln!("Phase 4: assert transcript ordering");
     let users = user_message_texts(&data_dir, &agent_id).await;
     assert_continuation_first_then_fifo(&users);
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Abandon path: the preserved queue stays intact and inert (no auto-send),
@@ -688,7 +683,8 @@ async fn abandon_keeps_preserved_queue_inert() {
     let Some(script) = gate("abandon_keeps_preserved_queue_inert") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, agent_id) = interrupt_midturn_with_queued_messages(&data_dir, &script).await;
 
     eprintln!("Phase 2: restart daemon, verify rehydrated pending state over WSS");
@@ -796,8 +792,6 @@ async fn abandon_keeps_preserved_queue_inert() {
         let blocks = last.content.as_array().expect("content blocks");
         assert_eq!(blocks[0]["meta"]["kind"], json!("interruption"));
     }
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Headless `serve --resume-all`: the startup sweep resumes the agent with
@@ -808,7 +802,8 @@ async fn resume_all_continuation_first_then_queue_fifo() {
     let Some(script) = gate("resume_all_continuation_first_then_queue_fifo") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, agent_id) = interrupt_midturn_with_queued_messages(&data_dir, &script).await;
 
     eprintln!("Phase 2: restart daemon with --resume-all, await headless drain");
@@ -833,6 +828,4 @@ async fn resume_all_continuation_first_then_queue_fifo() {
     eprintln!("Phase 3: assert transcript ordering");
     let users = user_message_texts(&data_dir, &agent_id).await;
     assert_continuation_first_then_fifo(&users);
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }

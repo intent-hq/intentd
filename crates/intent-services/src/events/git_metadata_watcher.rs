@@ -155,7 +155,7 @@ impl GitMetadataWatcher {
     /// linked worktrees). Registration is deferred off the caller's thread
     /// (monorepo#1572), so tests must wait for it before mutating `.git`.
     #[cfg(test)]
-    #[allow(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
+    #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: std::time::Duration) {
         self._sub.wait_established(timeout).await;
         if let Some(common) = &self._common {
@@ -289,7 +289,7 @@ impl GitCommonDirWatches {
         });
         lock(&entry.workspaces).insert(ws_id.clone(), Registration { token, refresher });
         #[cfg(test)]
-        #[allow(clippy::used_underscore_binding)]
+        #[expect(clippy::used_underscore_binding)]
         // RAII field; underscore documents production lifetime-only intent
         let sub = Arc::clone(&entry._sub);
         drop(state);
@@ -720,7 +720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn external_git_operation_triggers_status_refresh_without_file_events() {
         // Serialized with the other real-watcher tests: these now ride shared
         // streams, and running several of them concurrently delays registration
@@ -801,7 +801,7 @@ mod tests {
     /// yield `changes:git-status` — mirroring
     /// `external_git_operation_triggers_status_refresh_without_file_events`.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn external_head_change_in_linked_worktree_triggers_status_refresh() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -868,7 +868,7 @@ mod tests {
     /// the shared repo fans out to both workspaces, and the watch retires only
     /// when the last workspace's watcher drops (monorepo#1663).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn shared_common_dir_ref_change_fans_out_to_all_worktrees() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -961,7 +961,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn irrelevant_git_file_does_not_trigger_refresh() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()

@@ -900,7 +900,7 @@ impl Default for HooksSettings {
 /// changes apply to new agent sessions only.
 // One bool per independent settings toggle; the flat shape IS the settings
 // file contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentFeaturesSettings {
@@ -1047,12 +1047,12 @@ where
             Ok(v)
         }
         // Precision loss beyond 2^53 is accepted for JSON-sourced numbers.
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<f64, E> {
             Ok(v as f64)
         }
         // Precision loss beyond 2^53 is accepted for JSON-sourced numbers.
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<f64, E> {
             Ok(v as f64)
         }
@@ -1806,7 +1806,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
+    #[expect(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn defaults_match_catalog() {
         let d = SettingsFile::default();
         assert_eq!(d.providers.active, None);
@@ -2229,7 +2229,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
+    #[expect(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn floats_accept_integer_literals() {
         let parsed = SettingsFile::parse_str("[notifications]\nvolume = 1\n").unwrap();
         assert_eq!(parsed.notifications.volume, 1.0);

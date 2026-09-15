@@ -449,7 +449,7 @@ async fn build_rtk_instruction(
 /// the prompt under [`intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING`] (the
 /// section the compact header points at). `None` — every non-flagged
 /// provider — leaves the prompt byte-identical to before.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn assemble_system_prompt(
     store: &Store,
     workspace_path: Option<&Path>,

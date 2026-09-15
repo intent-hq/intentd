@@ -42,15 +42,11 @@ impl Drop for Daemon {
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-setup-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-setup-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -345,9 +341,9 @@ where
 const COMMITTED_CONFIG: &str = r#"{"setupScript": "pnpm install"}"#;
 
 /// Create a git repo without any committed `.intent/config.json`.
-fn create_bare_test_repo() -> PathBuf {
-    let repo_path = std::env::temp_dir().join(format!("setup-repo-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&repo_path).expect("create temp repo dir");
+fn create_bare_test_repo() -> tempfile::TempDir {
+    let repo_dir = common::test_tempdir("setup-repo-");
+    let repo_path = repo_dir.path().to_path_buf();
     let status = std::process::Command::new("git")
         .args(["init", "--initial-branch=main"])
         .current_dir(&repo_path)
@@ -380,11 +376,12 @@ fn create_bare_test_repo() -> PathBuf {
         .expect("git commit spawn");
     assert!(status.success(), "git commit failed");
 
-    repo_path
+    repo_dir
 }
 
-fn create_test_repo() -> PathBuf {
-    let repo_path = create_bare_test_repo();
+fn create_test_repo() -> tempfile::TempDir {
+    let repo_dir = create_bare_test_repo();
+    let repo_path = repo_dir.path().to_path_buf();
 
     // Commit a setup script in .intent/config.json to test inheritance
     std::fs::create_dir_all(repo_path.join(".intent")).expect("create .intent dir");
@@ -402,7 +399,7 @@ fn create_test_repo() -> PathBuf {
         .expect("git commit config spawn");
     assert!(status.success(), "git commit config failed");
 
-    repo_path
+    repo_dir
 }
 
 /// WSS e2e coverage for setup script methods: workspace.create's setupScript is
@@ -410,7 +407,8 @@ fn create_test_repo() -> PathBuf {
 /// getSetupScript reads from repo config with legacy DB fallback (§5.1 / §5.25).
 #[tokio::test]
 async fn setup_script_repo_config_sole_source() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -420,7 +418,8 @@ async fn setup_script_repo_config_sole_source() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
-    let repo_path = create_test_repo();
+    let repo_dir = create_test_repo();
+    let repo_path = repo_dir.path().to_path_buf();
 
     // Create a workspace with an explicit setupScript
     let create_resp = uds_rpc(
@@ -581,9 +580,6 @@ async fn setup_script_repo_config_sole_source() {
         json!("pnpm install"),
         "new workspace should inherit committed repo config script from main branch"
     );
-
-    // Cleanup
-    let _ = std::fs::remove_dir_all(&repo_path);
 }
 
 /// WSS e2e coverage for setup script execution: workspace.create with setupScript
@@ -591,7 +587,8 @@ async fn setup_script_repo_config_sole_source() {
 /// without persisting it, env vars are visible, failing script doesn't fail create.
 #[tokio::test]
 async fn setup_script_executes_on_create() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -611,7 +608,8 @@ async fn setup_script_executes_on_create() {
 
     let mut wss = wss_connect(actual_port, fingerprint).await;
 
-    let repo_path = create_test_repo();
+    let repo_dir = create_test_repo();
+    let repo_path = repo_dir.path().to_path_buf();
 
     // Create hermetic marker paths under the worktree (not /tmp) to avoid parallel collisions
     let test_run_id = Uuid::new_v4().simple().to_string();
@@ -807,7 +805,8 @@ exit 1
     // Regression (monorepo#1870), file-absent case: creating from a repo with NO
     // committed .intent/config.json and an explicit setupScript must not create
     // the config file — the script still executes.
-    let bare_repo_path = create_bare_test_repo();
+    let bare_repo_dir = create_bare_test_repo();
+    let bare_repo_path = bare_repo_dir.path().to_path_buf();
     let bare_run_id = Uuid::new_v4().simple().to_string();
     let bare_script = format!(
         r#"#!/bin/sh
@@ -850,7 +849,7 @@ touch "${{WORKTREE_PATH}}/.setup-bare-ran-{bare_run_id}"
             .exists(),
         "workspace.create must not create .intent/config.json for an explicit setupScript"
     );
-    let _ = std::fs::remove_dir_all(&bare_repo_path);
+    drop(bare_repo_dir);
 
     // Test that skipWorktree workspace does not execute the script
     let skip_marker_id = Uuid::new_v4().simple().to_string();
@@ -895,7 +894,4 @@ touch "${{MAIN_CHECKOUT}}/.should-not-run-{skip_marker_id}"
         !skip_marker_path.exists(),
         "skipWorktree should not execute setup script (marker not found under repo)"
     );
-
-    // Cleanup
-    let _ = std::fs::remove_dir_all(&repo_path);
 }

@@ -60,11 +60,11 @@ fn counting_fetch(
 }
 
 // `try_from` is not const-callable; the TTLs are far below `u64::MAX` millis.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 const NEG_TTL_MS: u64 = super::MODELS_NEGATIVE_TTL.as_millis() as u64;
 
 /// The staleness threshold in millis (see `NEG_TTL_MS` for the cast note).
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 const STALE_MS: u64 = super::MODELS_STALE_AFTER.as_millis() as u64;
 
 /// Await a detached background-refresh outcome: poll `cond` until it holds

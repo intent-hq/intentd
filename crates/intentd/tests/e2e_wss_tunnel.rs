@@ -436,7 +436,7 @@ async fn tunnel_duplicate_stream_id_rejected() {
     srv.ws.stop().await;
 }
 
-/// The 33rd concurrent stream (default cap 32) is refused with `OPEN_ERR`,
+/// The 33rd concurrent stream on one port (default per-port cap 32) is refused with `OPEN_ERR`,
 /// and closing one stream frees a slot for a new `OPEN`.
 #[tokio::test]
 async fn tunnel_concurrent_stream_cap_enforced() {
@@ -444,8 +444,7 @@ async fn tunnel_concurrent_stream_cap_enforced() {
     let echo_port = spawn_echo_listener().await;
     let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
 
-    let cap =
-        u32::try_from(intent_transport::tunnel::MAX_STREAMS_PER_CONNECTION).expect("small cap");
+    let cap = u32::try_from(intent_transport::tunnel::MAX_STREAMS_PER_PORT).expect("small cap");
     for id in 0..cap {
         send_frame(
             &mut ws,
@@ -1047,5 +1046,220 @@ async fn heartbeat_keeps_responsive_tunnel_client_alive() {
         "responsive tunnel client must survive heartbeat cycles"
     );
     poller.abort();
+    srv.ws.stop().await;
+}
+
+/// Real TLS mux: seven independent preview ports retain their HMR/keep-alive
+/// traffic while fresh entry traffic opens, echoes and retires on every port.
+#[tokio::test]
+async fn tunnel_seven_ports_progress_with_held_streams() {
+    let srv = start().await;
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    let mut ports = Vec::new();
+    for index in 0..7 {
+        let port = spawn_echo_listener().await;
+        ports.push(port);
+        for held in 0..5 {
+            let stream_id = index * 5 + held;
+            send_frame(&mut ws, Frame::Open { stream_id, port }).await;
+            assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id });
+        }
+    }
+    for (index, port) in ports.into_iter().enumerate() {
+        let stream_id = 100 + u32::try_from(index).unwrap();
+        send_frame(&mut ws, Frame::Open { stream_id, port }).await;
+        assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id });
+        send_frame(
+            &mut ws,
+            Frame::Data {
+                stream_id,
+                payload: b"entry".to_vec(),
+            },
+        )
+        .await;
+        assert_eq!(
+            recv_frame(&mut ws).await,
+            Frame::Data {
+                stream_id,
+                payload: b"entry".to_vec()
+            }
+        );
+        send_frame(&mut ws, Frame::Close { stream_id }).await;
+        assert_eq!(recv_frame(&mut ws).await, Frame::Close { stream_id });
+    }
+    // The long-lived sibling remains usable, not reclaimed to fake progress.
+    send_frame(
+        &mut ws,
+        Frame::Data {
+            stream_id: 0,
+            payload: b"hmr".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_frame(&mut ws).await,
+        Frame::Data {
+            stream_id: 0,
+            payload: b"hmr".to_vec()
+        }
+    );
+    ws.close(None).await.unwrap();
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn tunnel_global_cap_applies_across_ports() {
+    let srv = start_with(TunnelLimits {
+        max_streams: 2,
+        max_streams_per_port: 2,
+        ..TunnelLimits::default()
+    })
+    .await;
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    for stream_id in 0..2 {
+        let port = spawn_echo_listener().await;
+        send_frame(&mut ws, Frame::Open { stream_id, port }).await;
+        assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id });
+    }
+    let port = spawn_echo_listener().await;
+    send_frame(&mut ws, Frame::Open { stream_id: 2, port }).await;
+    assert_eq!(
+        recv_frame(&mut ws).await,
+        Frame::OpenErr {
+            stream_id: 2,
+            message: "too many concurrent streams (max 2)".into()
+        }
+    );
+    send_frame(&mut ws, Frame::Close { stream_id: 0 }).await;
+    assert_eq!(recv_frame(&mut ws).await, Frame::Close { stream_id: 0 });
+    send_frame(&mut ws, Frame::Open { stream_id: 2, port }).await;
+    assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id: 2 });
+    ws.close(None).await.unwrap();
+    srv.ws.stop().await;
+}
+
+/// Exercise the production shared byte budget over WSS. No individual stream
+/// receives enough frames to hit its 32-frame queue limit.
+#[tokio::test]
+async fn tunnel_shared_byte_budget_exhaustion_and_release() {
+    let srv = start().await;
+    let socket = TcpSocket::new_v4().expect("socket");
+    socket.set_recv_buffer_size(1024).expect("receive window");
+    socket.bind((Ipv4Addr::LOCALHOST, 0).into()).expect("bind");
+    let listener = socket.listen(8).expect("listen");
+    let port = listener.local_addr().expect("addr").port();
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    let mut held = Vec::new();
+    for id in 1..=4 {
+        send_frame(
+            &mut ws,
+            Frame::Open {
+                stream_id: id,
+                port,
+            },
+        )
+        .await;
+        assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id: id });
+        held.push(listener.accept().await.expect("accept").0);
+    }
+    let outcome = tokio::time::timeout(common::test_timeout(Duration::from_secs(30)), async {
+        let (mut writer, mut reader) = ws.split();
+        let upload = async {
+            for _ in 0..24 {
+                for id in 1..=4 {
+                    writer
+                        .send(Message::Binary(
+                            Frame::Data {
+                                stream_id: id,
+                                payload: vec![0; 1024 * 1024],
+                            }
+                            .encode()
+                            .into(),
+                        ))
+                        .await
+                        .expect("upload");
+                }
+            }
+            writer
+                .send(Message::Ping(b"budget-barrier".to_vec().into()))
+                .await
+                .expect("ping");
+        };
+        let observe = async {
+            let mut closed = std::collections::HashSet::new();
+            loop {
+                match reader
+                    .next()
+                    .await
+                    .expect("open connection")
+                    .expect("message")
+                {
+                    Message::Pong(p) if p.as_ref() == b"budget-barrier" => break,
+                    Message::Binary(b) => match Frame::decode(&b).expect("frame") {
+                        Frame::Close { stream_id } => {
+                            closed.insert(stream_id);
+                        }
+                        other => panic!("unexpected frame: {other:?}"),
+                    },
+                    other => panic!("unexpected message: {other:?}"),
+                }
+            }
+            assert!(
+                !closed.is_empty(),
+                "aggregate budget must reject excess bytes"
+            );
+        };
+        tokio::join!(upload, observe);
+        let mut ws = writer.reunite(reader).expect("same connection");
+        for id in 1..=4 {
+            send_frame(&mut ws, Frame::Close { stream_id: id }).await;
+        }
+        held.clear();
+        // New streams get a full 64 MiB of admitted payload without a CLOSE.
+        // Leaking permits from aborted writes/queues would reject this batch.
+        for id in 5..=8 {
+            send_frame(
+                &mut ws,
+                Frame::Open {
+                    stream_id: id,
+                    port,
+                },
+            )
+            .await;
+            loop {
+                match recv_frame(&mut ws).await {
+                    Frame::Close { stream_id: 1..=4 } => {}
+                    frame => {
+                        assert_eq!(frame, Frame::OpenOk { stream_id: id });
+                        break;
+                    }
+                }
+            }
+            held.push(listener.accept().await.expect("accept").0);
+        }
+        for _ in 0..16 {
+            for id in 5..=8 {
+                send_frame(
+                    &mut ws,
+                    Frame::Data {
+                        stream_id: id,
+                        payload: vec![0; 1024 * 1024],
+                    },
+                )
+                .await;
+            }
+        }
+        ws.send(Message::Ping(b"released".to_vec().into()))
+            .await
+            .expect("ping");
+        assert_eq!(
+            ws.next().await.expect("connected").expect("pong"),
+            Message::Pong(b"released".to_vec().into())
+        );
+        ws
+    })
+    .await;
+    drop(held);
+    drop(outcome.expect("budget test completes without blocking mux"));
     srv.ws.stop().await;
 }

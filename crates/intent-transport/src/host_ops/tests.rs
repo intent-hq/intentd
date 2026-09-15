@@ -160,7 +160,8 @@ fn resolve_auggie_ignores_blank_configured_path() {
 
 #[test]
 fn resolve_auggie_ignores_nonexistent_configured_path() {
-    let bogus = std::env::temp_dir().join("intent-host-auggie-does-not-exist-xyzzy");
+    let bogus = std::env::temp_dir() // tmp-hygiene: allow — never created
+        .join("intent-host-auggie-does-not-exist-xyzzy");
     // Even though `bogus` does not exist, resolve falls through to discovery;
     // we only assert it doesn't return the bogus path verbatim.
     let resolved = resolve_auggie_path(Some(bogus.to_str().unwrap()));

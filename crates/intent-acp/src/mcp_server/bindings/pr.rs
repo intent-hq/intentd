@@ -168,7 +168,7 @@ mod tests {
     /// were reached — the caller-context guards must reject before the
     /// service layer sees the call.
     #[derive(Default)]
-    #[allow(clippy::struct_field_names)] // fields mirror the spied method names
+    #[expect(clippy::struct_field_names)] // fields mirror the spied method names
     struct SpyApi {
         start_called: AtomicBool,
         stop_called: AtomicBool,

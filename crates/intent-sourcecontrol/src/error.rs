@@ -76,6 +76,26 @@ fn classify_github_status(status: u16, msg: String) -> Error {
     }
 }
 
+/// The message carried onto an [`Error`] for a GitHub REST error body: the
+/// top-level `message` followed by each `errors[].message` detail (`"Validation
+/// Failed: <detail>; <detail>"`). GitHub's 422 bodies put the discriminating
+/// text (e.g. the unsearchable-scope rejection, the 1000-result window, the
+/// 256-character query limit) in `errors[]`, so callers matching on the reason
+/// need it folded in.
+fn github_error_message(message: &str, errors: Option<&[serde_json::Value]>) -> String {
+    let details: Vec<&str> = errors
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+        .filter(|m| !m.is_empty())
+        .collect();
+    if details.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}: {}", details.join("; "))
+    }
+}
+
 impl From<octocrab::Error> for Error {
     fn from(err: octocrab::Error) -> Self {
         // octocrab's error enum is large and version-sensitive; categorize on
@@ -83,7 +103,10 @@ impl From<octocrab::Error> for Error {
         // to a generic API error. (Status-precise mapping can be refined when
         // the wire layer needs it.)
         if let octocrab::Error::GitHub { source, .. } = &err {
-            return classify_github_status(source.status_code.as_u16(), source.message.clone());
+            return classify_github_status(
+                source.status_code.as_u16(),
+                github_error_message(&source.message, source.errors.as_deref()),
+            );
         }
         Error::Api(err.to_string())
     }
@@ -124,5 +147,24 @@ mod tests {
     fn classifies_429_as_rate_limited() {
         let err = classify_github_status(429, "too many requests".into());
         assert!(matches!(err, Error::RateLimited(_)));
+    }
+
+    #[test]
+    fn folds_error_details_into_the_message() {
+        assert_eq!(github_error_message("Not Found", None), "Not Found");
+        assert_eq!(
+            github_error_message("Validation Failed", Some(&[])),
+            "Validation Failed"
+        );
+        let errors = [
+            serde_json::json!({ "message": "first detail", "code": "invalid" }),
+            serde_json::json!({ "code": "missing_field" }),
+            serde_json::json!({ "message": "" }),
+            serde_json::json!({ "message": "second detail" }),
+        ];
+        assert_eq!(
+            github_error_message("Validation Failed", Some(&errors)),
+            "Validation Failed: first detail; second detail"
+        );
     }
 }

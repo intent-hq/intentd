@@ -1,6 +1,8 @@
 //! End-to-end UDS slice test: seed via the store, then drive the daemon as a
 //! JSON-RPC client over a temp Unix-domain socket (§5.7 `DoD`).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::Path;
@@ -123,9 +125,8 @@ async fn send_session(socket: &Path, frames: &[&str]) -> Vec<Value> {
 async fn uds_slice_end_to_end() {
     // Use a short base path: macOS caps UDS paths at ~104 bytes (SUN_LEN) and
     // `temp_dir()` resolves to a long `/var/folders/...` path.
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = Path::new("/tmp").join(format!("intentd-it-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir_in("/tmp", "intentd-it-");
+    let dir = dir_guard.path().to_path_buf();
     std::env::set_var("INTENTD_DATA_DIR", &dir);
     let config = Config::resolve().expect("resolve config");
 
@@ -1012,5 +1013,4 @@ async fn uds_slice_end_to_end() {
 
     let _ = tx.send(());
     let _ = server.await;
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -23,8 +23,10 @@ use intent_core::{
 };
 use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
 use intent_store::Store;
+#[cfg(unix)]
+use intent_transport::serve_uds;
 use intent_transport::{
-    ensure_tls_certificate, serve_uds, AsyncTokenStore, FileWatchStatus, PrimaryReverseRegistry,
+    ensure_tls_certificate, AsyncTokenStore, FileWatchStatus, PrimaryReverseRegistry,
     SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions, MAX_INBOUND_MESSAGE_BYTES,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -218,6 +220,7 @@ struct Server {
     port: u16,
     cfg: Arc<ClientConfig>,
     api: Arc<dyn WorkspaceApi>,
+    #[cfg_attr(not(unix), expect(dead_code))]
     bus: EventBus,
     store: Store,
     registry: Arc<intent_services::SettingsRegistry>,
@@ -1469,6 +1472,328 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Retired agents drop out of attention and unread over the real WSS
+/// transport (§5.1 derived `attention`, §5.5 "Retire cascade & cleanup",
+/// §6.5): a top-level foreground agent with an unseen assistant tail and a
+/// pending discussion request reads `attention: "unread"` /
+/// `displayStatus: "needs_attention"`; retiring it settles both —
+/// `workspace.get` serves `attention: "none"`, a `displayStatus` other than
+/// `needs_attention`, and `agentSummary.count == 0` — and an
+/// `events.subscribe` subscriber sees `agent:retired`, exactly ONE
+/// `workspace:attention-changed { none }`, and a
+/// `workspace:displayStatus-changed` away from `needs_attention`.
+/// `agent.restore` is SILENT for the unread state: `workspace.get` re-derives
+/// `attention: "unread"` and `agentSummary.count == 1`, but the restore emits
+/// no `workspace:attention-changed`.
+///
+/// The assistant tail lands through the `agent.appendMessage` wire method;
+/// the discussion request and the retire go through the `WorkspaceApi` seams
+/// the MCP `ws.agent.requestDiscussion` / `ws.agent.retire` bindings route to
+/// (this harness has no agent runtime, and there is deliberately no wire
+/// `agent.retire`). A live self-retire always runs mid-turn, where the tail
+/// is the turn's user message, so the post-turn unread state under test is
+/// only reachable this way.
+#[tokio::test]
+async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent() {
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+    /// Next `events.event` frame of any type before `deadline`; `None` once
+    /// the deadline passes with no event.
+    async fn next_event_until(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        deadline: tokio::time::Instant,
+    ) -> Option<Value> {
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event" {
+                            return v["params"]["event"].clone();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Retire Unread"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let workspace_id = WorkspaceId(ws_id.clone());
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Elder"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = intent_core::AgentId::from(agent_id.as_str());
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.get","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+
+    // An unseen assistant tail: the derived `unread` reads on.
+    let appended = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"assistant","contentBlocks":[{{"type":"text","text":"done with the review"}}]}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        appended["result"]["message"]["id"].is_string(),
+        "appendMessage: {appended}"
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let ws_row = &got["result"]["workspace"];
+    assert_eq!(
+        ws_row["attention"], "unread",
+        "unseen assistant tail: {ws_row}"
+    );
+    assert_eq!(ws_row["agentSummary"]["count"], 1, "{ws_row}");
+    assert!(
+        ws_row["displayStatus"].is_string() && ws_row["displayStatus"] != "needs_attention",
+        "no attention request yet: {ws_row}"
+    );
+
+    // Subscribe BEFORE the raise/retire so no event can be missed.
+    let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
+    let subscribed = send_and_wait(
+        &mut sub,
+        format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"events.subscribe","params":{{"eventTypes":["agent:retired","agent:restored","workspace:attention-changed","workspace:displayStatus-changed"],"workspaceId":"{ws_id}"}}}}"#
+        ),
+        5,
+    )
+    .await;
+    assert!(
+        subscribed["result"]["subscriptionId"].is_string(),
+        "subscribe: {subscribed}"
+    );
+
+    // Pending discussion request → `needs_attention` (surfaces immediately:
+    // no turn in flight).
+    let raised = srv
+        .api
+        .agent_request_attention(
+            workspace_id.clone(),
+            "discussion".to_string(),
+            "need a decision before continuing".to_string(),
+            Some(agent.clone()),
+        )
+        .await
+        .expect("requestDiscussion");
+    assert_eq!(raised["ok"], serde_json::json!(true), "{raised}");
+    let promoted = next_event_until(
+        &mut sub,
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    )
+    .await
+    .expect("displayStatus promotion event");
+    assert_eq!(
+        promoted["type"], "workspace:displayStatus-changed",
+        "{promoted}"
+    );
+    assert_eq!(
+        promoted["data"],
+        serde_json::json!({ "workspaceId": ws_id, "displayStatus": "needs_attention" }),
+        "{promoted}"
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let ws_row = &got["result"]["workspace"];
+    assert_eq!(ws_row["attention"], "unread", "{ws_row}");
+    assert_eq!(ws_row["displayStatus"], "needs_attention", "{ws_row}");
+
+    // Retire via the WorkspaceApi seam (the MCP `ws.agent.retire` binding).
+    let retired = srv
+        .api
+        .agent_retire(
+            agent.clone(),
+            Some(workspace_id.clone()),
+            Some("handing off".to_string()),
+        )
+        .await
+        .expect("retire");
+    assert_eq!(retired["success"], serde_json::json!(true), "{retired}");
+
+    // Collect the retire's events: `agent:retired`, ONE
+    // `workspace:attention-changed { none }`, and a
+    // `workspace:displayStatus-changed` away from `needs_attention`
+    // (relative order not asserted). Keep draining for a quiet window after
+    // the three arrive so a duplicate attention event would still be caught.
+    let mut retired_evt: Option<Value> = None;
+    let mut attention_evts: Vec<Value> = Vec::new();
+    let mut display_evts: Vec<Value> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut quiet_until: Option<tokio::time::Instant> = None;
+    loop {
+        let until = quiet_until.unwrap_or(deadline);
+        let Some(evt) = next_event_until(&mut sub, until).await else {
+            break;
+        };
+        match evt["type"].as_str().unwrap_or_default() {
+            "agent:retired" => retired_evt = Some(evt),
+            "workspace:attention-changed" => attention_evts.push(evt),
+            "workspace:displayStatus-changed" => display_evts.push(evt),
+            other => panic!("unexpected event after retire: {other}: {evt}"),
+        }
+        if quiet_until.is_none()
+            && retired_evt.is_some()
+            && !attention_evts.is_empty()
+            && !display_evts.is_empty()
+        {
+            quiet_until = Some(tokio::time::Instant::now() + Duration::from_millis(1500));
+        }
+    }
+    let retired_evt = retired_evt.expect("agent:retired");
+    assert_eq!(retired_evt["workspaceId"], ws_id.as_str(), "{retired_evt}");
+    assert_eq!(
+        retired_evt["data"]["agentId"],
+        agent_id.as_str(),
+        "{retired_evt}"
+    );
+    assert_eq!(retired_evt["data"]["agentName"], "Elder", "{retired_evt}");
+    assert_eq!(
+        retired_evt["data"]["reason"], "handing off",
+        "{retired_evt}"
+    );
+    assert_eq!(
+        retired_evt["data"]["retiredAt"], retired["retiredAt"],
+        "{retired_evt}"
+    );
+    assert_eq!(
+        attention_evts.len(),
+        1,
+        "retiring the last unread session emits exactly one attention event: {attention_evts:?}"
+    );
+    assert_eq!(attention_evts[0]["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        attention_evts[0]["data"],
+        serde_json::json!({ "workspaceId": ws_id, "attention": "none" }),
+        "{:?}",
+        attention_evts[0]
+    );
+    assert!(
+        !display_evts.is_empty(),
+        "retire recomputes displayStatus away from needs_attention"
+    );
+    for evt in &display_evts {
+        assert_eq!(evt["workspaceId"], ws_id.as_str(), "{evt}");
+        assert_eq!(evt["data"]["workspaceId"], ws_id.as_str(), "{evt}");
+        assert_ne!(
+            evt["data"]["displayStatus"], "needs_attention",
+            "a retired session's request must not promote: {evt}"
+        );
+    }
+
+    // Read path after the retire.
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let ws_row = &got["result"]["workspace"];
+    assert_eq!(
+        ws_row["attention"], "none",
+        "retired tail is not unread: {ws_row}"
+    );
+    assert!(
+        ws_row["displayStatus"].is_string() && ws_row["displayStatus"] != "needs_attention",
+        "retired request no longer promotes: {ws_row}"
+    );
+    assert_eq!(
+        ws_row["agentSummary"]["count"], 0,
+        "retired row leaves the card aggregate: {ws_row}"
+    );
+
+    // `agent.restore` over the wire: reads re-derive `unread`, and the
+    // restore itself emits NO `workspace:attention-changed`.
+    let restored = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.restore","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        restored["result"]["restored"],
+        serde_json::json!(true),
+        "{restored}"
+    );
+    let mut restored_evt: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut quiet_until: Option<tokio::time::Instant> = None;
+    loop {
+        let until = quiet_until.unwrap_or(deadline);
+        let Some(evt) = next_event_until(&mut sub, until).await else {
+            break;
+        };
+        match evt["type"].as_str().unwrap_or_default() {
+            "agent:restored" => {
+                assert_eq!(evt["data"]["agentId"], agent_id.as_str(), "{evt}");
+                restored_evt = Some(evt);
+                quiet_until = Some(tokio::time::Instant::now() + Duration::from_millis(1500));
+            }
+            "workspace:attention-changed" => {
+                panic!("agent.restore must be silent for the unread state: {evt}")
+            }
+            // The restored request may re-promote displayStatus; not under test.
+            "workspace:displayStatus-changed" => {}
+            other => panic!("unexpected event after restore: {other}: {evt}"),
+        }
+    }
+    assert!(restored_evt.is_some(), "agent:restored");
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let ws_row = &got["result"]["workspace"];
+    assert_eq!(
+        ws_row["attention"], "unread",
+        "restore re-derives the unseen tail on read: {ws_row}"
+    );
+    assert_eq!(
+        ws_row["agentSummary"]["count"], 1,
+        "restored row is back in the card aggregate: {ws_row}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// Retire cascade + cleanup over the real WSS transport (PROTOCOL §5.5):
 /// retiring a parent with an ACTIVE child is rejected (`InvalidParams`
 /// naming the child, nothing mutated); after the child settles the retire
@@ -2519,7 +2844,7 @@ async fn wss_agent_queue_message_rejects_unknown_agent() {
     srv.ws.stop().await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `agent.diagnostics` reports real pending-message queue snapshots over the
 /// WSS wire: after `agent.queueMessage`, `diagnostics.queues` carries the
 /// target's queue (drain-order entries with `queuedAt`, content truncated to
@@ -3300,6 +3625,10 @@ async fn wss_agent_set_model_provider_id_param() {
         Some(dir.path().to_path_buf()),
     )
     .await;
+    // Hermeticity (monorepo#3162): the cross-provider switch onto grok below
+    // runs the availability gate, so point discovery at a deterministic
+    // executable instead of depending on a real grok on the test host.
+    srv.set_setting("providers.paths", serde_json::json!({ "grok": "/bin/sh" }));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3397,6 +3726,30 @@ async fn wss_agent_set_model_provider_id_param() {
             .contains("agent.setModel: providerId must be a string"),
         "error must name the malformed param: {rejected}"
     );
+
+    // A cross-provider switch onto an UNAVAILABLE target is -32602 at the
+    // front door (the same availability bar as create/delegate), naming the
+    // target. Disabled in settings rather than "uninstalled" so the
+    // precondition does not depend on what the test host has on PATH.
+    srv.set_setting("providers.enabled", serde_json::json!({ "grok": false }));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":10,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast","providerId":"grok"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&rejected, 10);
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "switch onto a disabled provider must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent.setModel: provider \"grok\" (Grok Build) is not enabled"),
+        "availability rejection must name the target provider: {rejected}"
+    );
+    srv.set_setting("providers.enabled", serde_json::json!({}));
 
     // All rejections left the session untouched.
     let get_frame = format!(
@@ -5008,6 +5361,49 @@ async fn multi_bind_serves_every_configured_address() {
     }
 }
 
+/// Reserve one port on both loopback stacks for the partial-bind-failure
+/// test: a listening blocker on `127.0.0.1` (the address meant to fail) and a
+/// bound-but-NOT-listening `SO_REUSEADDR` guard on `::1` (the address meant
+/// to succeed). Without the guard, a parallel test could take the
+/// to-succeed endpoint between the reservation and the server's bind, and
+/// `start()` would fail on the wrong address (intent-hq/intent#4978).
+///
+/// What each socket excludes while held:
+/// - the listening blocker refuses every other bind of `127.0.0.1:port`,
+///   including the `SO_REUSEADDR` bind+listen a fixed-port test performs when
+///   it rebinds a remembered `free_port()` (they see `AddrInUse` and retry);
+/// - the guard takes `::1:port` out of every process's ephemeral (port 0)
+///   selection and refuses plain explicit binds, while the server's own
+///   `SO_REUSEADDR` listen on it still succeeds (two reuse-address sockets may
+///   share an endpoint when the earlier one is not listening). What it does
+///   NOT exclude is another explicit `SO_REUSEADDR` bind+listen on `::1:port`
+///   — and no remembered-port rebind in this suite can reach one: the
+///   IPv4-only rebinders (`free_port()` callers, the daemon's default bind
+///   set) never touch `::1`, and the dual-stack rebinders
+///   (`runtime_bind_address_list_applies_and_validates`,
+///   `multi_bind_serves_every_configured_address`) bind `127.0.0.1` first, so
+///   the listening blocker fails them before their `::1` bind runs. That is
+///   why the IPv6 side is the one meant to succeed.
+///
+/// Reservation of the pair is retried on a fresh ephemeral port when
+/// `::1:port` happens to be taken already; the server bind itself is never
+/// retried.
+fn reserve_dual_stack_port_with_v4_blocker() -> (StdTcpListener, tokio::net::TcpSocket, u16) {
+    for _ in 0..16 {
+        let blocker = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("blocker bind");
+        let port = blocker.local_addr().expect("blocker addr").port();
+        let guard = tokio::net::TcpSocket::new_v6().expect("guard socket");
+        guard.set_reuseaddr(true).expect("guard SO_REUSEADDR");
+        if guard
+            .bind((std::net::Ipv6Addr::LOCALHOST, port).into())
+            .is_ok()
+        {
+            return (blocker, guard, port);
+        }
+    }
+    panic!("could not reserve one port on both 127.0.0.1 and ::1");
+}
+
 /// monorepo#3314: partial bind failure is a hard error — when any address in
 /// the set cannot bind, `start()` fails and the addresses that DID bind are
 /// released (never silently serve fewer interfaces than configured).
@@ -5017,9 +5413,9 @@ async fn multi_bind_partial_failure_is_all_or_nothing() {
         eprintln!("skipping: IPv6 loopback unavailable");
         return;
     }
-    // Occupy a port on ::1 only, then ask for [127.0.0.1, ::1] on it.
-    let blocker = StdTcpListener::bind(("::1", 0)).expect("blocker bind");
-    let port = blocker.local_addr().expect("blocker addr").port();
+    // Occupy a port on 127.0.0.1 (listening) while keeping ::1 on the same
+    // port owned but bindable, then ask for [::1, 127.0.0.1] on it.
+    let (_blocker, _v6_guard, port) = reserve_dual_stack_port_with_v4_blocker();
 
     let (api, bus, _store, _registry, dir) = make_services(None, None).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
@@ -5029,8 +5425,8 @@ async fn multi_bind_partial_failure_is_all_or_nothing() {
     let opts = WsOptions {
         base_port: port,
         bind_addresses: vec![
-            Ipv4Addr::LOCALHOST.into(),
             std::net::Ipv6Addr::LOCALHOST.into(),
+            Ipv4Addr::LOCALHOST.into(),
         ],
         ..WsOptions::default()
     };
@@ -5038,18 +5434,20 @@ async fn multi_bind_partial_failure_is_all_or_nothing() {
     let err = ws
         .start()
         .await
-        .expect_err("start must fail when ::1 is occupied");
+        .expect_err("start must fail when 127.0.0.1 is occupied");
     assert!(
-        err.to_string().contains("::1"),
+        err.to_string().contains("127.0.0.1"),
         "bind error names the failing address: {err}"
     );
 
-    // All-or-nothing: the successfully-bound 127.0.0.1 listener was released.
+    // All-or-nothing: the successfully-bound ::1 listener was released. The
+    // non-listening guard answers connects with RST, so only a leaked server
+    // listener could make this connect succeed.
     assert!(
-        TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))
             .await
             .is_err(),
-        "127.0.0.1:{port} must not accept after a partial bind failure"
+        "[::1]:{port} must not accept after a partial bind failure"
     );
 }
 
@@ -6365,6 +6763,86 @@ async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() 
         resp["result"],
         serde_json::json!({ "text": "fix-login-flow" }),
         "the ACP route returns the §5.32 `{{ text }}` envelope, like the auggie route"
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
+    // intent-hq/intent#4587: over the real WSS transport, a claude-code
+    // `agent.completeOnce` opens the ephemeral session with a slimming
+    // `_meta` — the caller's `systemPrompt` as a STRING (replaces the
+    // `claude_code` preset), `tools: []`, `settingSources: ["user"]`,
+    // `strictMcpConfig: true` — and the turn carries the bare prompt (no
+    // `System:` composition). The mock
+    // fixture records the `session/new` `_meta` verbatim through its
+    // `MOCK_AGENT_SESSION_LOG` seam; a prompt-content rule proves the turn
+    // shape through the returned `{ text }`.
+    use std::os::unix::fs::PermissionsExt;
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping claude-code completeOnce e2e: node not on PATH");
+        return;
+    }
+    let fixture = format!(
+        "{}/tests/fixtures/mock-acp-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let dir = test_tempdir("intentd-wss-acp-claude-slim-");
+    let session_log = dir.path().join("sessions.jsonl");
+    let behavior = r#"{"response":"🤖\nbare-turn","rules":[{"ifPromptContains":"System:","response":"🤖\ncomposed-turn"}]}"#;
+    let bin = dir.path().join("claude-agent-acp");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nMOCK_AGENT_SESSION_LOG={:?} MOCK_AGENT_BEHAVIOR='{behavior}' exec node {fixture:?} \"$@\"\n",
+            session_log.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "claude-code": bin.to_string_lossy() }),
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":51,"method":"agent.completeOnce","params":{"prompt":"slug for login fix","systemPrompt":"be terse"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 51);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({ "text": "bare-turn" }),
+        "the claude-code turn carries the bare prompt, not the `System:` composition"
+    );
+
+    let log = std::fs::read_to_string(&session_log).expect("mock session log");
+    let calls: Vec<Value> = log
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("session log line"))
+        .collect();
+    assert_eq!(calls.len(), 1, "exactly one session/new, got: {log}");
+    assert_eq!(calls[0]["method"], "session/new");
+    assert_eq!(
+        calls[0]["meta"],
+        serde_json::json!({
+            "systemPrompt": "be terse",
+            "claudeCode": {
+                "options": {
+                    "tools": [],
+                    "settingSources": ["user"],
+                    "strictMcpConfig": true,
+                }
+            },
+        }),
+        "claude-code session/new `_meta` on the wire"
     );
     srv.ws.stop().await;
 }
@@ -8884,7 +9362,7 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     srv.ws.stop().await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `file-tracking.loadCommits` with workspace boundary over WSS: proves the
 /// daemon returns `boundarySha` and bounds commits to `boundary..HEAD`, and
 /// the `includeOlder` parameter fetches pre-boundary commits.
@@ -9262,7 +9740,7 @@ async fn wss_git_branch_status_round_trip() {
     srv.ws.stop().await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `git.pull` over WSS — the workspace-create auto-pull seam (§5.6).
 /// Path-based like `git.getBranches`: the repo is never registered as a
 /// workspace. Drives the checked-out fast-forward pull (`{ ok: true }`), the
@@ -9561,14 +10039,12 @@ async fn wss_note_list_slim_projection_bounds_large_frames() {
 
 /// Regression for monorepo#721 over the real WSS wire: full-content note
 /// writes (`note.setContent`) with non-ASCII content (emoji/CJK) must not
-/// corrupt content or panic the daemon. The CRDT merge engine computes
-/// UTF-16 code-unit offsets, but the `yrs` doc used byte offsets — so the
-/// second full-content write (the diff path over a doc already holding
-/// multi-byte chars) landed at wrong byte positions, panicking inside `yrs`
-/// and poisoning the sessions mutex (every later CRDT call then panicked,
-/// dropping the WSS connection). Post-fix: setContent with emoji/CJK, an
-/// edited setContent (diff path), a surgical `note.add`, and a reseeded
-/// setContent after the add all succeed with the expected merged content.
+/// corrupt content or panic the daemon. The original defect was an offset
+/// mismatch (UTF-16 code units vs. byte offsets) in the since-retired
+/// session-cache merge engine, which panicked on the second full-content
+/// write and dropped the WSS connection. The sequence — setContent with
+/// emoji/CJK, an edited setContent, a surgical `note.add`, and another
+/// setContent after the add — must all succeed with the expected content.
 #[tokio::test]
 async fn wss_note_set_content_non_ascii_merge_round_trip() {
     let srv = start(WsOptions::default()).await;
@@ -10144,7 +10620,7 @@ async fn wss_git_gitlink_status_and_diffs_wire_shape() {
 /// returns `{ assetId, path, url }` and the asset round-trips back through
 /// `note.readAsset`; a missing `data` param is -32602.
 #[tokio::test]
-#[allow(clippy::case_sensitive_file_extension_comparisons)] // extensions generated by our own code with fixed case
+#[expect(clippy::case_sensitive_file_extension_comparisons)] // extensions generated by our own code with fixed case
 async fn wss_note_save_asset_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -10726,8 +11202,8 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
 
     // workspace.findRepositories returns { repositories: string[] }. Seed a
     // scratch dir with a fake `.git` folder so the scan produces a match.
-    let scratch =
-        std::env::temp_dir().join(format!("itd-find-repos-{}", uuid::Uuid::new_v4().simple()));
+    let scratch_guard = common::test_tempdir("itd-find-repos-");
+    let scratch = scratch_guard.path().to_path_buf();
     let repo_a = scratch.join("repo-a");
     std::fs::create_dir_all(repo_a.join(".git")).expect("mkdir repo-a/.git");
     std::fs::create_dir_all(scratch.join("plain")).expect("mkdir plain");
@@ -10749,7 +11225,6 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
             .any(|r| r.as_str() == Some(repo_a.to_str().unwrap())),
         "repo-a must be in {repos:?}"
     );
-    let _ = std::fs::remove_dir_all(&scratch);
 
     // workspace.findRepositories without `directory` → -32602.
     let find_missing = wss_call(
@@ -10770,8 +11245,9 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
         .status()
         .is_ok_and(|s| s.success())
     {
-        let init_path =
-            std::env::temp_dir().join(format!("itd-init-{}", uuid::Uuid::new_v4().simple()));
+        // The RPC creates `init_path` itself; only its parent pre-exists.
+        let init_guard = common::test_tempdir("itd-init-");
+        let init_path = init_guard.path().join("repo");
         let init = wss_call(
             srv.port,
             srv.cfg.clone(),
@@ -10785,7 +11261,6 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
         assert!(init_path.join(".git").exists(), ".git directory seeded");
         assert!(init_path.join("README.md").exists(), "README seeded");
         assert!(init_path.join(".gitignore").exists(), ".gitignore seeded");
-        let _ = std::fs::remove_dir_all(&init_path);
     }
 
     // workspace.initializeRepository without `path` → -32602.
@@ -10800,7 +11275,7 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
     srv.ws.stop().await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#958 — the bounded agent read paths over the real WSS transport:
 /// `agent.list` / `agent.get` (metadata + last-rows projection), a full
 /// `agent.getConversation` multi-page `nextToken` walk plus the
@@ -13143,6 +13618,213 @@ async fn wss_file_place_attachment_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Idempotent attachment placement over the real WSS wire (PROTOCOL §5.9
+/// "Idempotent placement", intent-hq/intent#4691): a keyed
+/// `file.placeAttachment` retried with the same payload answers the
+/// ORIGINAL result plus `replayed: true` and places no second file; a
+/// different payload under the key is `-32602`; `file.getAttachmentInfo`
+/// resolves `{ workspaceId, idempotencyKey }` (unknown key, both/neither
+/// selector, and a non-string key are `-32602`); and a keyed
+/// `file.attachmentUpload.begin` replays a live session's `uploadId`, then
+/// after `commit` rejects a re-begin shape-stably ("already committed") while
+/// the key resolves to the committed attachment.
+#[tokio::test]
+async fn wss_file_attachment_idempotency_key_round_trip() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-attidem-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"idempotent bytes");
+    let place = |id: u64, data: &str, key: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"idem.bin","data":"{data}","mimeType":"application/octet-stream","idempotencyKey":{key}}}}}"#,
+            ws.0
+        )
+    };
+
+    // First keyed placement: the plain success shape (no `replayed`).
+    let first = wss_call(srv.port, srv.cfg.clone(), &place(1, &b64, "\"k-1\"")).await;
+    assert_eq!(first["jsonrpc"], "2.0", "{first}");
+    assert_eq!(first["id"], 1, "{first}");
+    assert_eq!(first["result"]["ok"], serde_json::json!(true), "{first}");
+    assert_eq!(
+        first["result"]["path"],
+        serde_json::json!(".intent/attachments/idem.bin"),
+        "{first}"
+    );
+    assert!(first["result"].get("replayed").is_none(), "{first}");
+    let attachment_id = first["result"]["attachmentId"]
+        .as_str()
+        .expect("attachmentId")
+        .to_string();
+
+    // Lost-reply retry: identical result + `replayed: true`, no `idem-2.bin`.
+    let replay = wss_call(srv.port, srv.cfg.clone(), &place(2, &b64, "\"k-1\"")).await;
+    let mut expected = first["result"].clone();
+    expected["replayed"] = serde_json::json!(true);
+    assert_eq!(replay["result"], expected, "{replay}");
+    assert!(!root.join(".intent/attachments/idem-2.bin").exists());
+
+    // Same key, different bytes → -32602 naming the conflict.
+    let other_b64 = base64::engine::general_purpose::STANDARD.encode(b"different bytes!");
+    let conflict = wss_call(srv.port, srv.cfg.clone(), &place(3, &other_b64, "\"k-1\"")).await;
+    assert_eq!(
+        conflict["error"]["code"].as_i64(),
+        Some(-32602),
+        "{conflict}"
+    );
+    assert!(
+        conflict["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("different payload")),
+        "{conflict}"
+    );
+
+    // A non-string key is -32602, never silently treated as "no key".
+    let bad_key = wss_call(srv.port, srv.cfg.clone(), &place(4, &b64, "42")).await;
+    assert_eq!(bad_key["error"]["code"].as_i64(), Some(-32602), "{bad_key}");
+    assert!(
+        bad_key["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("idempotencyKey must be a string")),
+        "{bad_key}"
+    );
+    // An explicit `null` key is the unkeyed path (collision-suffixed copy).
+    let unkeyed = wss_call(srv.port, srv.cfg.clone(), &place(5, &b64, "null")).await;
+    assert_eq!(unkeyed["result"]["fileName"], "idem-2.bin", "{unkeyed}");
+    assert!(unkeyed["result"].get("replayed").is_none(), "{unkeyed}");
+
+    // `file.getAttachmentInfo` by key resolves the bound attachment.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"file.getAttachmentInfo","params":{{"workspaceId":"{}","idempotencyKey":"k-1"}}}}"#,
+        ws.0
+    );
+    let info = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        info["result"]["attachmentId"],
+        serde_json::json!(attachment_id),
+        "{info}"
+    );
+    assert_eq!(info["result"]["fileName"], "idem.bin", "{info}");
+    assert_eq!(info["result"]["exists"], serde_json::json!(true), "{info}");
+
+    // Unknown key → -32602 "unknown idempotency key".
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"file.getAttachmentInfo","params":{{"workspaceId":"{}","idempotencyKey":"k-nope"}}}}"#,
+        ws.0
+    );
+    let unknown = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(unknown["error"]["code"].as_i64(), Some(-32602), "{unknown}");
+    assert!(
+        unknown["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unknown idempotency key")),
+        "{unknown}"
+    );
+
+    // Exactly one selector: both and neither are -32602.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"file.getAttachmentInfo","params":{{"workspaceId":"{}","attachmentId":"{attachment_id}","idempotencyKey":"k-1"}}}}"#,
+        ws.0
+    );
+    let both = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(both["error"]["code"].as_i64(), Some(-32602), "{both}");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"file.getAttachmentInfo","params":{{"workspaceId":"{}"}}}}"#,
+        ws.0
+    );
+    let neither = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(neither["error"]["code"].as_i64(), Some(-32602), "{neither}");
+    // A key without a workspaceId is -32602 too (the selector needs both).
+    let frame = r#"{"jsonrpc":"2.0","id":10,"method":"file.getAttachmentInfo","params":{"idempotencyKey":"k-1"}}"#;
+    let no_ws = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(no_ws["error"]["code"].as_i64(), Some(-32602), "{no_ws}");
+
+    // Keyed chunked upload: a same-key re-begin replays the live session.
+    let payload = b"keyed chunked bytes".to_vec();
+    let sha = sha256_hex(&payload);
+    let begin_frame = |id: u64| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"keyed.bin","sizeBytes":{},"sha256":"{sha}","idempotencyKey":"k-up"}}}}"#,
+            ws.0,
+            payload.len()
+        )
+    };
+    let opened = wss_call(srv.port, srv.cfg.clone(), &begin_frame(11)).await;
+    let upload_id = opened["result"]["uploadId"]
+        .as_str()
+        .expect("uploadId")
+        .to_string();
+    assert!(opened["result"].get("replayed").is_none(), "{opened}");
+    let reopened = wss_call(srv.port, srv.cfg.clone(), &begin_frame(12)).await;
+    assert_eq!(
+        reopened["result"]["uploadId"],
+        serde_json::json!(upload_id),
+        "{reopened}"
+    );
+    assert_eq!(
+        reopened["result"]["maxChunkBytes"], opened["result"]["maxChunkBytes"],
+        "{reopened}"
+    );
+    assert_eq!(
+        reopened["result"]["replayed"],
+        serde_json::json!(true),
+        "{reopened}"
+    );
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":13,"method":"file.attachmentUpload.chunk","params":{{"uploadId":"{upload_id}","seq":0,"data":"{}"}}}}"#,
+        base64::engine::general_purpose::STANDARD.encode(&payload)
+    );
+    let chunk = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        chunk["result"]["receivedBytes"].as_u64(),
+        Some(payload.len() as u64),
+        "{chunk}"
+    );
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":14,"method":"file.attachmentUpload.commit","params":{{"uploadId":"{upload_id}"}}}}"#
+    );
+    let committed = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        committed["result"]["ok"],
+        serde_json::json!(true),
+        "{committed}"
+    );
+    assert_eq!(committed["result"]["fileName"], "keyed.bin", "{committed}");
+    assert!(committed["result"].get("replayed").is_none(), "{committed}");
+
+    // Committed key: re-begin is -32602 "already committed; look it up",
+    // and the lookup resolves to the committed attachment.
+    let after = wss_call(srv.port, srv.cfg.clone(), &begin_frame(15)).await;
+    assert_eq!(after["error"]["code"].as_i64(), Some(-32602), "{after}");
+    assert!(
+        after["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("already committed")),
+        "{after}"
+    );
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":16,"method":"file.getAttachmentInfo","params":{{"workspaceId":"{}","idempotencyKey":"k-up"}}}}"#,
+        ws.0
+    );
+    let up_info = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        up_info["result"]["attachmentId"], committed["result"]["attachmentId"],
+        "{up_info}"
+    );
+    assert_eq!(up_info["result"]["fileName"], "keyed.bin", "{up_info}");
+
+    srv.ws.stop().await;
+}
+
 /// `file.readChunk` over the real WSS wire (PROTOCOL §5.9, v6.18,
 /// monorepo#2458): raw bytes of a binary workspace file are served as
 /// offset-windowed base64 chunks `{ content, bytesRead, size }` and
@@ -13277,7 +13959,9 @@ async fn wss_file_ops_unknown_workspace_fail_closed() {
     let w = fixture_workspace(&pathless);
     srv.store.insert_workspace(&w).await.expect("insert ws");
 
-    let escape = std::env::temp_dir().join(format!("intentd-wss-escape-{}", uuid::Uuid::new_v4()));
+    // `escape` is never created: the guarded parent exists, the file must not.
+    let escape_guard = common::test_tempdir("intentd-wss-escape-");
+    let escape = escape_guard.path().join("escape.txt");
     let escape_s = escape.to_string_lossy().into_owned();
 
     for ws_id in ["ws-does-not-exist", pathless.0.as_str()] {
@@ -13514,7 +14198,7 @@ async fn wss_file_attachment_upload_round_trip() {
     srv.ws.stop().await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `workspace.import.begin` / `.chunk` / `.commit` / `.abort` (§5.1): the
 /// staged, atomic import lifecycle over the real WSS transport. A fixture
 /// zip archive (manifest + rows) is uploaded in two chunks and committed;
@@ -13818,7 +14502,7 @@ async fn wss_workspace_import_lifecycle() {
     srv.ws.stop().await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `workspace.export.start` / `.read` / `.finalize` / `.abort` (§5.1): the
 /// source-side export lifecycle over the real WSS transport. A subscriber
 /// receives the `workspace:transfer:progress` and `:ready` events (§6.5)
@@ -15541,8 +16225,14 @@ async fn system_status_surfaces_file_watch_coverage_over_wss() {
         api.clone(),
         status_cache,
     ));
-    let _watcher_registry =
-        WatcherRegistry::start_with_health(bus.clone(), api.clone(), refresher, &health).await;
+    let _watcher_registry = WatcherRegistry::start_with_health(
+        &intent_services::SharedWatchHub::new(),
+        bus.clone(),
+        api.clone(),
+        refresher,
+        &health,
+    )
+    .await;
 
     let resp = wss_call(port, cfg, frame).await;
     let fw = &resp["result"]["fileWatch"];

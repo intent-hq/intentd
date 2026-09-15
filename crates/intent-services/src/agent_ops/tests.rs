@@ -37,28 +37,23 @@ use crate::agent_subscriptions::GroupPersistOp;
 use crate::Services;
 use intent_core::MAX_DELEGATION_DEPTH;
 
+/// `SQLite` db (plus its `.config.toml` sibling) inside an RAII temp dir; the
+/// dir sweep on drop also covers the `-wal`/`-shm` sidecars.
 pub(super) struct TempDb {
     pub(super) path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     pub(super) fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("intentd-agentops-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
+        let dir = crate::test_support::test_tempdir("intentd-agentops-");
+        let path = dir.path().join("agentops.db");
+        Self { path, _dir: dir }
     }
 }
 
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm", ".config.toml"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
-    }
-}
-
-/// A settings registry (backed by a config file next to the temp db, removed
-/// by [`TempDb`]'s drop) seeding a configured default provider: since
+/// A settings registry (backed by a config file next to the temp db, swept
+/// with [`TempDb`]'s dir) seeding a configured default provider: since
 /// monorepo#3044 there is no positional fallback, so ops that resolve a
 /// provider need `model.defaultProvider` set. The `providers.paths` override
 /// points auggie at a deterministic executable so availability checks
@@ -78,6 +73,21 @@ pub(super) fn test_registry_with_default_provider(tmp: &TempDb) -> Arc<crate::Se
         ])
         .expect("seed default provider");
     registry
+}
+
+/// Point one more provider at a deterministic executable so availability
+/// checks (`ensure_provider_available` — used by `agent.delegate` and by
+/// `agent.setModel`'s cross-provider gate) pass without the real binary on the
+/// test host. Merges into the `providers.paths` map seeded by
+/// [`test_registry_with_default_provider`] rather than replacing it, so
+/// auggie's override survives.
+pub(super) fn seed_provider_path(svc: &Services, provider_id: &str) {
+    let mut paths = svc.effective_settings().providers.paths;
+    paths.insert(provider_id.to_string(), "/bin/sh".to_string());
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.paths".into(), json!(paths))])
+        .expect("seed provider path");
 }
 
 pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
@@ -8040,6 +8050,11 @@ async fn set_model_clears_resolved_display_model() {
 #[tokio::test]
 async fn set_model_reconciles_provider_on_cross_provider_switch() {
     let (_t, svc, ws) = setup().await;
+    // The cross-provider gate holds the TARGET provider to the create/delegate
+    // availability bar, so point opencode at a deterministic executable the
+    // same way the shared registry does for auggie — the real binary is not on
+    // the test host.
+    seed_provider_path(&svc, "opencode");
     let id = create_agent(&svc, &ws, "Switch").await;
     // Initial state: auggie provider.
     let session = svc.agent_get_session_op(id.clone()).await.expect("get");
@@ -8068,6 +8083,7 @@ async fn set_model_reconciles_provider_on_cross_provider_switch() {
 #[tokio::test]
 async fn set_model_reconciles_provider_after_first_real_use() {
     let (_t, svc, ws) = setup().await;
+    seed_provider_path(&svc, "opencode");
     let id = create_agent(&svc, &ws, "SwitchLate").await;
     svc.store()
         .set_acp_session_id(&ws, &id, "acp-first-use")
@@ -8088,6 +8104,144 @@ async fn set_model_reconciles_provider_after_first_real_use() {
         Some("acp-first-use"),
         "acp session id untouched by the switch"
     );
+}
+
+/// A cross-provider `agent.setModel` holds the TARGET provider to the same
+/// availability bar as the create/delegate front door: switching onto a
+/// provider that is not available is rejected `-32602` at the front door
+/// instead of leaving the session parked on a dead provider until the next
+/// turn's spawn fails with a raw binary error. The session is left untouched.
+///
+/// The target is made unavailable by disabling it in `providers.enabled`
+/// rather than by relying on it being uninstalled: the installed-probe scans
+/// the host PATH, so an "uninstalled" fixture would pass or fail depending on
+/// whether the test host happens to have the binary.
+#[tokio::test]
+async fn set_model_cross_provider_rejects_unavailable_provider() {
+    let (_t, svc, ws) = setup().await;
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.enabled".into(), json!({ "opencode": false }))])
+        .expect("disable opencode");
+    let id = create_agent(&svc, &ws, "DeadTarget").await;
+    let before = svc.agent_get_session_op(id.clone()).await.expect("get");
+    let err = svc
+        .agent_set_model_op(
+            id.clone(),
+            "opencode-go/kimi-k3".into(),
+            Some("opencode".into()),
+        )
+        .await
+        .expect_err("switch onto an unavailable provider");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string()
+            .contains("agent.setModel: provider \"opencode\" (OpenCode) is not enabled"),
+        "availability rejection names the target: {err}"
+    );
+    let after = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(after.model, before.model, "model must be unchanged");
+    assert_eq!(
+        after.provider, before.provider,
+        "provider must be unchanged"
+    );
+}
+
+/// The availability gate is scoped to a switch that MOVES the session: an
+/// explicit `providerId` naming the provider the session is ALREADY on stays
+/// ungated, so an agent can still change its model while its own provider
+/// fails the availability probe (uninstalled on this host, disabled in
+/// settings after the agent was created).
+#[tokio::test]
+async fn set_model_same_provider_is_not_gated_by_availability() {
+    let (_t, svc, ws) = setup().await;
+    // Make the provider unavailable EXPLICITLY (disabled in settings) rather
+    // than relying on it being uninstalled: the installed-probe scans the
+    // host PATH, so a host that happens to carry the binary would otherwise
+    // pass this test vacuously with the gate applied.
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.enabled".into(), json!({ "opencode": false }))])
+        .expect("disable opencode");
+    let id = create_agent(&svc, &ws, "SameProvider").await;
+    // Park the session on the now-unavailable provider, through the narrow
+    // writer that owns the `provider` column.
+    svc.store()
+        .set_agent_session_model(
+            &ws,
+            &id,
+            "opencode-go/kimi-k3",
+            Some("opencode"),
+            &now_iso(),
+        )
+        .await
+        .expect("park session on opencode");
+    // Same provider, new model: allowed despite opencode being unavailable.
+    svc.agent_set_model_op(
+        id.clone(),
+        "opencode-go/kimi-k4".into(),
+        Some("opencode".into()),
+    )
+    .await
+    .expect("same-provider model change stays ungated");
+    let after = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(after.model.as_deref(), Some("opencode-go/kimi-k4"));
+    assert_eq!(after.provider.as_deref(), Some("opencode"));
+}
+
+/// The same-provider exemption compares the session's EFFECTIVE provider, not
+/// the raw column: a session persisted under the legacy `acp` alias runs
+/// auggie (`provider_config` normalizes it, exactly as the spawn path and the
+/// model-ownership check do), so an explicit `providerId: "auggie"` is a
+/// same-provider model change and must stay ungated even while auggie is
+/// disabled. Comparing the raw `"acp"` against `"auggie"` would misread it as
+/// a cross-provider switch and reject it.
+#[tokio::test]
+async fn set_model_same_provider_via_legacy_alias_is_not_gated() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "AliasSame").await;
+    let mut session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    session.provider = Some("acp".into());
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("persist legacy alias");
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.enabled".into(), json!({ "auggie": false }))])
+        .expect("disable auggie");
+    svc.agent_set_model_op(id.clone(), "opus4.7".into(), Some("auggie".into()))
+        .await
+        .expect("explicit providerId naming the alias's effective provider stays ungated");
+    let after = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(after.model.as_deref(), Some("opus4.7"));
+    assert_eq!(after.provider.as_deref(), Some("auggie"));
+}
+
+/// Same exemption for a NULL `provider` column: the session's effective
+/// provider is the settings-derived default (auggie in this fixture), so an
+/// explicit `providerId: "auggie"` does not move the session and must stay
+/// ungated while auggie is disabled.
+#[tokio::test]
+async fn set_model_same_provider_via_default_fallback_is_not_gated() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "NullSame").await;
+    let mut session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    session.provider = None;
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("persist NULL provider");
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.enabled".into(), json!({ "auggie": false }))])
+        .expect("disable auggie");
+    svc.agent_set_model_op(id.clone(), "opus4.7".into(), Some("auggie".into()))
+        .await
+        .expect("explicit providerId naming the default provider stays ungated");
+    let after = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(after.model.as_deref(), Some("opus4.7"));
+    assert_eq!(after.provider.as_deref(), Some("auggie"));
 }
 
 /// `agent.setModel` leaves session.provider unchanged when no explicit
@@ -8731,6 +8885,10 @@ async fn set_model_normalizes_legacy_provider_aliases() {
 #[tokio::test]
 async fn set_model_bare_model_with_explicit_provider_id() {
     let (_t, svc, ws) = setup().await;
+    // The cross-provider switch below runs the availability gate against the
+    // target, so pin claude-code to a deterministic executable rather than
+    // depending on whether the test host happens to have it installed.
+    seed_provider_path(&svc, "claude-code");
     // Warm caches: claude-code claims `haiku`, auggie's catalog lacks it.
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
@@ -12735,7 +12893,7 @@ async fn send_message_op_preserves_attachments_on_auto_queue() {
         { "type": "image", "data": "base64data", "mimeType": "image/png" }
     ]);
     let file_blocks = json!([
-        { "type": "file", "data": "filedata", "mimeType": "text/plain", "fileName": "test.txt" }
+        { "type": "file", "attachmentId": "att-test", "mimeType": "text/plain", "fileName": "test.txt" }
     ]);
     let r = svc
         .agent_send_message_op(
@@ -12826,7 +12984,7 @@ async fn send_message_op_persists_attachment_blocks_in_transcript() {
         { "type": "image", "data": "imgdata", "mimeType": "image/png" }
     ]);
     let file_blocks = json!([
-        { "type": "file", "data": "filedata", "mimeType": "text/plain", "fileName": "notes.txt" }
+        { "type": "file", "attachmentId": "att-notes", "mimeType": "text/plain", "fileName": "notes.txt" }
     ]);
     let r = svc
         .agent_send_message_op(
@@ -12853,9 +13011,1306 @@ async fn send_message_op_persists_attachment_blocks_in_transcript() {
     assert_eq!(blocks[1]["data"], "imgdata");
     assert_eq!(blocks[1]["mimeType"], "image/png");
     assert_eq!(blocks[2]["type"], "file");
-    assert_eq!(blocks[2]["data"], "filedata");
+    assert_eq!(blocks[2]["attachmentId"], "att-notes");
     assert_eq!(blocks[2]["fileName"], "notes.txt");
     assert_eq!(blocks[2]["mimeType"], "text/plain");
+    assert!(blocks[2].get("data").is_none());
+}
+
+/// v10.0: every `fileBlocks` input seam rejects an inline `data` entry with
+/// `InvalidParams` (→ `-32602`) naming the seam and the index, before any
+/// state change; a reference-only payload on the same seams behaves as
+/// before.
+#[tokio::test]
+async fn file_blocks_inline_data_rejected_on_every_seam() {
+    let (_t, svc, ws, _bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "InlineReject").await;
+    let inline = json!([
+        { "type": "file", "attachmentId": "att-ok", "fileName": "ok.txt" },
+        { "type": "file", "data": "QQ==", "mimeType": "text/plain", "fileName": "a.txt" }
+    ]);
+    let expect_rejected = |method: &str, err: intent_core::Error| {
+        assert!(
+            matches!(err, intent_core::Error::InvalidParams(_)),
+            "{method}: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("{method}: fileBlocks[1]")), "{msg}");
+        assert!(
+            msg.contains("inline file data is no longer accepted"),
+            "{msg}"
+        );
+    };
+
+    let err = svc
+        .agent_send_message_op(
+            id.clone(),
+            "hi".into(),
+            None,
+            None,
+            Some(inline.clone()),
+            None,
+        )
+        .await
+        .expect_err("sendMessage rejects inline data");
+    expect_rejected("agent.sendMessage", err);
+
+    let err = svc
+        .agent_queue_message_op(id.clone(), "hi".into(), None, Some(inline.clone()), None)
+        .await
+        .expect_err("queueMessage rejects inline data");
+    expect_rejected("agent.queueMessage", err);
+
+    let err = svc
+        .agent_update_op(id.clone(), json!({ "fileBlocks": inline.clone() }))
+        .await
+        .expect_err("update rejects inline data");
+    expect_rejected("agent.update", err);
+
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("InlineCreate".to_string()),
+            Some("sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                provider: Some("auggie".into()),
+                file_blocks: Some(inline.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("create rejects inline data");
+    expect_rejected("agent.create", err);
+
+    let err = WorkspaceApi::agent_edit_and_regenerate(
+        &svc,
+        ws.clone(),
+        id.clone(),
+        "msg-1".into(),
+        "edited".into(),
+        None,
+        Some(inline.clone()),
+        None,
+    )
+    .await
+    .expect_err("editAndRegenerate rejects inline data");
+    expect_rejected("agent.editAndRegenerate", err);
+
+    // workspace.create rejects BEFORE any side effect: no workspace row, no
+    // spec note and no `workspace:created` event is left behind (both the
+    // top-level `initialAgent.fileBlocks` and its `metadata.fileBlocks`
+    // mirror).
+    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let notes_before = svc.store().list_all_notes().await.expect("notes").len();
+    let created_events = || async {
+        svc.store()
+            .query_events(&intent_store::EventQuery {
+                event_types: vec![intent_core::events::WORKSPACE_CREATED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query workspace:created")
+            .len()
+    };
+    let events_before = created_events().await;
+    for initial_agent in [
+        intent_core::WorkspaceCreateInitialAgent {
+            prompt: Some("go".into()),
+            file_blocks: Some(inline.clone()),
+            ..Default::default()
+        },
+        intent_core::WorkspaceCreateInitialAgent {
+            prompt: Some("go".into()),
+            metadata: Some(json!({ "fileBlocks": inline.clone() })),
+            ..Default::default()
+        },
+    ] {
+        let err = WorkspaceApi::create_workspace(
+            &svc,
+            intent_core::WorkspaceCreate {
+                title: Some("W".into()),
+                skip_isolation: Some(true),
+                initial_agent: Some(initial_agent),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("workspace.create rejects inline data");
+        expect_rejected("workspace.create", err);
+    }
+    assert_eq!(
+        svc.list_workspaces(true).await.expect("list").len(),
+        workspaces_before,
+        "workspace.create rejection must precede the workspace row"
+    );
+    assert_eq!(
+        svc.store().list_all_notes().await.expect("notes").len(),
+        notes_before,
+        "workspace.create rejection must precede the spec note"
+    );
+    assert_eq!(
+        created_events().await,
+        events_before,
+        "workspace.create rejection must precede workspace:created"
+    );
+
+    // Nothing was queued or persisted on the way to the rejection.
+    let queue = svc
+        .agent_get_queue_op(id.clone(), None)
+        .await
+        .expect("queue");
+    assert_eq!(queue["queue"].as_array().map(Vec::len), Some(0), "{queue}");
+    let conv = svc
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
+        .await
+        .expect("conv");
+    assert_eq!(conv["totalMessages"], 0, "{conv}");
+}
+
+/// Restores a seeded auth verdict to cached-unknown (permissive) on drop so a
+/// panicking arm cannot leave a hard-false verdict in the process-wide cache
+/// (60s TTL) for other tests to trip over.
+struct AuthVerdictReset(&'static str);
+impl Drop for AuthVerdictReset {
+    fn drop(&mut self) {
+        crate::provider_auth::seed_auth_verdict_for_tests(self.0, None);
+    }
+}
+
+/// Every `-32602` producer reachable from `workspace.create` rejects BEFORE
+/// any side effect: for each named arm the request fails `InvalidParams`
+/// naming that arm's own validator, and the workspace row count, note count,
+/// and `workspace:created` event count are unchanged against the baseline
+/// captured before the loop. Guards the ordering of
+/// `Services::preflight_workspace_create` arm by arm — moving any single
+/// check below `insert_workspace_with_auto_commit` fails this test naming
+/// the arm.
+#[tokio::test]
+async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
+    // (arm, `model.defaultProvider` in force for the arm, request, expected
+    // message fragment naming the arm's own validator).
+    struct Arm {
+        name: &'static str,
+        default_provider: &'static str,
+        create: intent_core::WorkspaceCreate,
+        expect: &'static str,
+    }
+    let (tmp, svc, _ws, _bus) = setup_with_bus().await;
+    // A hermetic workspaces root, so a check that regresses below the row
+    // insert fails on THIS test's side-effect assertions (naming the arm)
+    // rather than on the hermetic-tests `default_workspaces_root()` guard.
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
+    // Hermetic specialist tiers (user + bundled both point at one temp dir):
+    // `no-such-specialist` is unknown, and `xhigh-pinned` pins `sonnet4.5`
+    // with a frontmatter effort the seeded catalog row below does not list.
+    let specialists_dir = tmp.path.with_extension("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("specialists dir");
+    std::fs::write(
+        specialists_dir.join("xhigh-pinned.md"),
+        "---\nname: \"xhigh-pinned\"\ndescription: \"Test specialist\"\nmodel: \"sonnet4.5\"\nreasoningEffort: \"xhigh\"\n---\n\nTest prompt",
+    )
+    .expect("write specialist");
+    let svc = svc.with_specialist_dirs(Some(specialists_dir.clone()), Some(specialists_dir));
+    // Fixture for the provider/model arms (all keyed on providers no other
+    // arm uses, so each arm trips exactly its own gate): opencode disabled
+    // in settings, claude-code with a cached hard-false auth verdict, and
+    // cached catalogs proving `sonnet4.5` belongs to auggie (with effort
+    // evidence `low`/`high`) and not grok.
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.enabled".into(), json!({ "opencode": false }))])
+        .expect("disable opencode");
+    let _auth_reset = AuthVerdictReset("claude-code");
+    crate::provider_auth::seed_auth_verdict_for_tests("claude-code", Some(false));
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        vec![
+            json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie",
+                     "effortLevels": ["low", "high"] }),
+        ],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "grok",
+        "",
+        vec![json!({ "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" })],
+        now,
+    );
+
+    let inline_file = json!([
+        { "type": "file", "data": "QQ==", "mimeType": "text/plain", "fileName": "a.txt" }
+    ]);
+    let link = |url: &str, number: u64| intent_core::ContextLink {
+        kind: intent_core::ContextLinkKind::Issue,
+        url: url.into(),
+        owner: "intent-hq".into(),
+        repo: "intent".into(),
+        number,
+    };
+    let agent = |a: intent_core::WorkspaceCreateInitialAgent| intent_core::WorkspaceCreate {
+        title: Some("W".into()),
+        skip_isolation: Some(true),
+        initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+            prompt: Some("go".into()),
+            ..a
+        }),
+        ..Default::default()
+    };
+    let links = |links: Vec<intent_core::ContextLink>| intent_core::WorkspaceCreate {
+        title: Some("W".into()),
+        skip_isolation: Some(true),
+        context_links: Some(links),
+        ..Default::default()
+    };
+
+    let arm =
+        |name: &'static str, create: intent_core::WorkspaceCreate, expect: &'static str| Arm {
+            name,
+            default_provider: "auggie",
+            create,
+            expect,
+        };
+    let arms = vec![
+        arm(
+            "compound model",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                model: Some("auggie:sonnet4.5".into()),
+                ..Default::default()
+            }),
+            "initialAgent.model",
+        ),
+        arm(
+            "inline fileBlocks (top-level)",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                file_blocks: Some(inline_file.clone()),
+                ..Default::default()
+            }),
+            "workspace.create: fileBlocks[0]",
+        ),
+        arm(
+            "inline fileBlocks (metadata mirror)",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                metadata: Some(json!({ "fileBlocks": inline_file.clone() })),
+                ..Default::default()
+            }),
+            "workspace.create: fileBlocks[0]",
+        ),
+        arm(
+            "imageBlocks with both data and attachmentId",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                image_blocks: Some(json!([
+                    { "type": "image", "data": "aW1n", "mimeType": "image/png", "attachmentId": "att-1" }
+                ])),
+                ..Default::default()
+            }),
+            "workspace.create: imageBlocks[0] must carry exactly one",
+        ),
+        arm(
+            "imageBlocks with neither data nor attachmentId",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                image_blocks: Some(json!([{ "type": "image", "mimeType": "image/png" }])),
+                ..Default::default()
+            }),
+            "workspace.create: imageBlocks[0] must carry exactly one",
+        ),
+        arm(
+            "image attachmentId that does not exist",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                image_blocks: Some(json!([{ "type": "image", "attachmentId": "att-missing" }])),
+                ..Default::default()
+            }),
+            "workspace.create: unknown attachment id: att-missing",
+        ),
+        arm(
+            "unknown specialist",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                specialist: Some("no-such-specialist".into()),
+                ..Default::default()
+            }),
+            "unknown specialist: no-such-specialist",
+        ),
+        arm(
+            "unsupported specialist-derived reasoning effort",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                specialist: Some("xhigh-pinned".into()),
+                ..Default::default()
+            }),
+            "workspace.create: reasoningEffort xhigh is not supported by model sonnet4.5",
+        ),
+        arm(
+            "unknown provider",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                provider: Some("no-such-provider".into()),
+                ..Default::default()
+            }),
+            "workspace.create: unknown provider: no-such-provider",
+        ),
+        Arm {
+            name: "no default provider",
+            // Unregistered `model.defaultProvider` reads as unset.
+            default_provider: "typo",
+            create: agent(intent_core::WorkspaceCreateInitialAgent::default()),
+            expect: "workspace.create: no default provider/model is configured",
+        },
+        arm(
+            "provider disabled via settings",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                provider: Some("opencode".into()),
+                ..Default::default()
+            }),
+            "workspace.create: provider \"opencode\"",
+        ),
+        arm(
+            "provider with cached auth verdict false",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                provider: Some("claude-code".into()),
+                ..Default::default()
+            }),
+            "workspace.create: provider \"claude-code\"",
+        ),
+        arm(
+            "client-supplied bare model owned by another provider",
+            agent(intent_core::WorkspaceCreateInitialAgent {
+                provider: Some("grok".into()),
+                model: Some("sonnet4.5".into()),
+                ..Default::default()
+            }),
+            "workspace.create: model sonnet4.5 does not belong to provider grok",
+        ),
+        arm(
+            "contextLinks > 20",
+            links(
+                (1..=21)
+                    .map(|n| link("https://github.com/intent-hq/intent/issues/1", n))
+                    .collect(),
+            ),
+            "contextLinks: at most 20 entries",
+        ),
+        arm(
+            "contextLinks empty url",
+            links(vec![link("", 1)]),
+            "contextLinks[0].url must be a non-empty string",
+        ),
+        arm(
+            "contextLinks zero number",
+            links(vec![link(
+                "https://github.com/intent-hq/intent/issues/1",
+                0,
+            )]),
+            "contextLinks[0].number must be a positive integer",
+        ),
+    ];
+
+    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let notes_before = svc.store().list_all_notes().await.expect("notes").len();
+    let created_events = || async {
+        svc.store()
+            .query_events(&intent_store::EventQuery {
+                event_types: vec![intent_core::events::WORKSPACE_CREATED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query workspace:created")
+            .len()
+    };
+    let events_before = created_events().await;
+
+    for Arm {
+        name,
+        default_provider,
+        create,
+        expect,
+    } in arms
+    {
+        svc.settings_registry()
+            .expect("registry")
+            .apply(&[("model.defaultProvider".into(), json!(default_provider))])
+            .expect("set default provider");
+        let err = WorkspaceApi::create_workspace(&svc, create, None)
+            .await
+            .expect_err(&format!("{name}: workspace.create must reject"));
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "{name}: expected InvalidParams, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expect),
+            "{name}: rejection must come from this arm's validator; got: {msg}"
+        );
+        assert_eq!(
+            svc.list_workspaces(true).await.expect("list").len(),
+            workspaces_before,
+            "{name}: workspace.create rejection must precede the workspace row"
+        );
+        assert_eq!(
+            svc.store().list_all_notes().await.expect("notes").len(),
+            notes_before,
+            "{name}: workspace.create rejection must precede the spec note"
+        );
+        assert_eq!(
+            created_events().await,
+            events_before,
+            "{name}: workspace.create rejection must precede workspace:created"
+        );
+    }
+}
+
+/// Names an [`AgentPersistError`](crate::agent_ops::AgentPersistError) for a
+/// failure message. Exhaustive on purpose — no wildcard arm — so the persist
+/// half's error vocabulary is pinned at compile time: adding an
+/// input-rejection variant (or widening the return type back to
+/// [`Error`]) fails this module's build, not just a runtime assertion.
+fn persist_error_text(e: crate::agent_ops::AgentPersistError) -> String {
+    use crate::agent_ops::AgentPersistError;
+    match e {
+        AgentPersistError::Store(msg) => format!("store: {msg}"),
+        AgentPersistError::Internal(msg) => format!("internal: {msg}"),
+        AgentPersistError::Join(e) => format!("join: {e}"),
+    }
+}
+
+/// The plan/persist seam is not re-validated (intentd#1882 gap 1): a plan
+/// built while its provider was enabled and authenticated persists unchanged
+/// after the provider is disabled in settings AND observed not-logged-in
+/// between the two halves — `persist_agent_create` returns `Ok` and the
+/// session row carries the planned `model` / `provider` / `reasoningEffort`.
+/// The same inputs re-planned after the demotion are rejected, proving the
+/// gate would have fired had the persist half consulted it.
+#[tokio::test]
+async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
+    let (_tmp, svc, ws) = setup().await;
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        vec![
+            json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie",
+                     "effortLevels": ["low", "high"] }),
+        ],
+        now,
+    );
+    // Plan-time state: auggie enabled (no `providers.enabled` opt-out) and
+    // observed logged-in — not merely cached-unknown.
+    let _auth_reset = AuthVerdictReset("auggie");
+    crate::provider_auth::seed_auth_verdict_for_tests("auggie", Some(true));
+    assert_ne!(
+        svc.effective_settings()
+            .providers
+            .enabled
+            .as_ref()
+            .and_then(|m| m.get("auggie")),
+        Some(&false),
+        "auggie must be enabled at plan time"
+    );
+    let extra = || intent_core::AgentCreateExtra {
+        provider: Some("auggie".into()),
+        reasoning_effort: Some("high".into()),
+        ..Default::default()
+    };
+    let plan = svc
+        .plan_agent_create(
+            "agent.create",
+            Some("Planned".into()),
+            Some("sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            extra(),
+            None,
+        )
+        .await
+        .expect("plan while auggie is enabled and authenticated");
+    assert_eq!(plan.model.as_deref(), Some("sonnet4.5"));
+    assert_eq!(plan.provider.as_deref(), Some("auggie"));
+    assert_eq!(plan.reasoning_effort.as_deref(), Some("high"));
+
+    // Demote the planned provider on both create-seam gates between plan and
+    // persist.
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.enabled".into(), json!({ "auggie": false }))])
+        .expect("disable auggie");
+    crate::provider_auth::seed_auth_verdict_for_tests("auggie", Some(false));
+    let replan = svc
+        .plan_agent_create(
+            "agent.create",
+            Some("Planned".into()),
+            Some("sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            extra(),
+            None,
+        )
+        .await
+        .expect_err("the demotion must reject a fresh plan");
+    assert!(
+        matches!(replan, Error::InvalidParams(_))
+            && replan.to_string().contains("provider \"auggie\""),
+        "fresh plan must trip the provider gate: {replan:?}"
+    );
+
+    let created = svc
+        .persist_agent_create(plan, ws.clone(), None)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "persist must not re-run the plan's gates: {}",
+                persist_error_text(e)
+            )
+        });
+    let id = AgentId::from(created["agent"]["id"].as_str().expect("agent id"));
+    let session = svc
+        .store()
+        .get_agent_session(&id)
+        .await
+        .expect("session row");
+    assert_eq!(session.name, "Planned");
+    assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+    assert_eq!(session.reasoning_effort.as_deref(), Some("high"));
+}
+
+/// Tier parity (intentd#1882 gap 2): the plan's project-tier root is the
+/// single decider for specialist acceptance. With a specialist present only
+/// in one root's `.intent/specialists`, `agent.create` (stored workspace's
+/// worktree root) and an isolated `workspace.create` (the `repositoryPath`
+/// checkout root) each reject the OTHER root's specialist before any side
+/// effect — no session, workspace row, spec note, `workspace:created` event,
+/// workspaces-root entry, or git worktree — while a specialist known at the
+/// plan's own root is accepted, alias included, with the canonical id
+/// persisted on the session row. The checkout's specialist is untracked, so
+/// the worktree `workspace.create` provisions at `baseRef` does not carry it:
+/// the persist half's non-failing prompt snapshot reads that worktree, finds
+/// nothing, and the create still succeeds — the snapshot root has no say.
+#[tokio::test]
+async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
+    let (tmp, svc, _ws, _bus) = setup_with_bus().await;
+    let workspaces_root = tmp.path.with_extension("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("workspaces root");
+    let svc = svc.with_workspaces_root(workspaces_root.clone());
+    // Hermetic user + bundled tiers (one empty dir) so only the per-root
+    // project tiers below can supply the two specialists.
+    let empty_tier = tmp.path.with_extension("specialists");
+    std::fs::create_dir_all(&empty_tier).expect("specialists dir");
+    let svc = svc.with_specialist_dirs(Some(empty_tier.clone()), Some(empty_tier));
+    let project_specialist = |root: &std::path::Path, id: &str, name: &str, alias: &str| {
+        let dir = root.join(".intent").join("specialists");
+        std::fs::create_dir_all(&dir).expect("project specialists dir");
+        std::fs::write(
+            dir.join(format!("{id}.md")),
+            format!(
+                "---\nname: \"{name}\"\ndescription: \"Test specialist\"\naliases: [\"{alias}\"]\n---\n\n{name} prompt"
+            ),
+        )
+        .expect("write project specialist");
+    };
+    // Root A: a local git repo (one commit) that `workspace.create` adopts via
+    // `repositoryPath` and provisions a worktree from. Its specialist is
+    // written AFTER the commit and never staged, so no ref carries it.
+    let checkout_root = tmp.path.with_extension("checkout");
+    let head_branch = {
+        let repo = git2::Repository::init(&checkout_root).expect("init checkout repo");
+        let mut cfg = repo.config().expect("repo config");
+        cfg.set_str("user.name", "Tester").expect("user.name");
+        cfg.set_str("user.email", "t@e.dev").expect("user.email");
+        std::fs::write(checkout_root.join("README.md"), "init\n").expect("README");
+        let mut index = repo.index().expect("index");
+        index
+            .add_path(std::path::Path::new("README.md"))
+            .expect("add README");
+        index.write().expect("write index");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write tree"))
+            .expect("tree");
+        let sig = git2::Signature::now("Tester", "t@e.dev").expect("signature");
+        repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+            .expect("initial commit");
+        let branch = repo
+            .head()
+            .expect("head")
+            .shorthand()
+            .expect("branch name")
+            .to_string();
+        branch
+    };
+    project_specialist(&checkout_root, "checkout-only", "Checkout Only", "co");
+    let checkout_worktrees = || {
+        git2::Repository::open(&checkout_root)
+            .expect("open checkout repo")
+            .worktrees()
+            .expect("list worktrees")
+            .len()
+    };
+    let workspaces_root_entries = || {
+        std::fs::read_dir(&workspaces_root)
+            .expect("read workspaces root")
+            .count()
+    };
+    // Root B: the stored workspace's worktree `agent.create` resolves against.
+    let worktree_root = tmp.path.with_extension("worktree");
+    project_specialist(&worktree_root, "worktree-only", "Worktree Only", "wo");
+    let stored_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&Workspace {
+            worktree_path: Some(worktree_root.to_string_lossy().into_owned()),
+            ..workspace(&stored_ws)
+        })
+        .await
+        .expect("stored workspace");
+
+    let sessions = || async {
+        svc.store()
+            .list_all_agent_sessions()
+            .await
+            .expect("sessions")
+            .len()
+    };
+    let agent_create = |specialist: &str| {
+        svc.agent_create_op(
+            stored_ws.clone(),
+            None,
+            Some("sonnet4.5".into()),
+            Some(specialist.to_string()),
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                provider: Some("auggie".into()),
+                ..Default::default()
+            },
+        )
+    };
+    let workspace_create = |specialist: &str| {
+        WorkspaceApi::create_workspace(
+            &svc,
+            intent_core::WorkspaceCreate {
+                title: Some("W".into()),
+                repository_path: Some(checkout_root.to_string_lossy().into_owned()),
+                repository_name: Some("Checkout".into()),
+                base_ref: Some(head_branch.clone()),
+                initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                    model: Some("sonnet4.5".into()),
+                    provider: Some("auggie".into()),
+                    specialist: Some(specialist.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+    };
+
+    // `agent.create` on the stored workspace: root B decides.
+    let sessions_before = sessions().await;
+    let err = agent_create("checkout-only")
+        .await
+        .expect_err("agent.create must not see root A's specialist");
+    assert!(
+        matches!(err, Error::InvalidParams(_))
+            && err
+                .to_string()
+                .contains("unknown specialist: checkout-only"),
+        "agent.create: {err:?}"
+    );
+    assert_eq!(
+        sessions().await,
+        sessions_before,
+        "agent.create rejection must persist no session"
+    );
+    let created = agent_create("wo")
+        .await
+        .expect("agent.create accepts root B's alias");
+    let id = AgentId::from(created["agent"]["id"].as_str().expect("agent id"));
+    let session = svc
+        .store()
+        .get_agent_session(&id)
+        .await
+        .expect("session row");
+    assert_eq!(
+        session.specialist.as_deref(),
+        Some("worktree-only"),
+        "canonical id persisted"
+    );
+
+    // `workspace.create` adopting root A: root A decides.
+    let sessions_before = sessions().await;
+    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let notes_before = svc.store().list_all_notes().await.expect("notes").len();
+    let created_events = || async {
+        svc.store()
+            .query_events(&intent_store::EventQuery {
+                event_types: vec![intent_core::events::WORKSPACE_CREATED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query workspace:created")
+            .len()
+    };
+    let events_before = created_events().await;
+    let entries_before = workspaces_root_entries();
+    let worktrees_before = checkout_worktrees();
+    let err = workspace_create("worktree-only")
+        .await
+        .expect_err("workspace.create must not see root B's specialist");
+    assert!(
+        matches!(err, Error::InvalidParams(_))
+            && err
+                .to_string()
+                .contains("unknown specialist: worktree-only"),
+        "workspace.create: {err:?}"
+    );
+    assert_eq!(
+        sessions().await,
+        sessions_before,
+        "rejection must persist no session"
+    );
+    assert_eq!(
+        svc.list_workspaces(true).await.expect("list").len(),
+        workspaces_before,
+        "rejection must precede the workspace row"
+    );
+    assert_eq!(
+        svc.store().list_all_notes().await.expect("notes").len(),
+        notes_before,
+        "rejection must precede the spec note"
+    );
+    assert_eq!(
+        created_events().await,
+        events_before,
+        "rejection must precede workspace:created"
+    );
+    assert_eq!(
+        workspaces_root_entries(),
+        entries_before,
+        "rejection must leave the workspaces root untouched"
+    );
+    assert_eq!(
+        checkout_worktrees(),
+        worktrees_before,
+        "rejection must provision no worktree"
+    );
+    let result = workspace_create("co")
+        .await
+        .expect("workspace.create accepts root A's alias");
+    let initial = result.initial_agent.expect("initialAgent persisted");
+    let id = AgentId::from(initial["id"].as_str().expect("agent id"));
+    let session = svc
+        .store()
+        .get_agent_session(&id)
+        .await
+        .expect("session row");
+    assert_eq!(session.workspace_id, result.workspace.id);
+    assert_eq!(
+        session.specialist.as_deref(),
+        Some("checkout-only"),
+        "canonical id persisted"
+    );
+    assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+    // The snapshot root is the provisioned worktree at `baseRef`, which does
+    // not carry the untracked specialist the plan accepted at the checkout
+    // root — so the frozen identity snapshot is absent while the create
+    // succeeded on the plan root's verdict alone.
+    let worktree = PathBuf::from(
+        result
+            .workspace
+            .worktree_path
+            .as_deref()
+            .expect("isolated create provisions a worktree"),
+    );
+    assert!(
+        worktree.starts_with(&workspaces_root),
+        "worktree {} must live under the workspaces root",
+        worktree.display()
+    );
+    assert_eq!(checkout_worktrees(), worktrees_before + 1);
+    let specialist_rel = std::path::Path::new(".intent")
+        .join("specialists")
+        .join("checkout-only.md");
+    assert!(checkout_root.join(&specialist_rel).is_file());
+    assert!(
+        !worktree.join(&specialist_rel).exists(),
+        "the specialist must be absent at the snapshot root"
+    );
+    let meta = session.metadata.expect("harness stamps write metadata");
+    assert!(
+        meta.get("specialistName").is_none() && meta.get("behaviorPrompt").is_none(),
+        "no identity snapshot from the specialist-less snapshot root: {meta}"
+    );
+}
+
+/// Blank comments and string / char literals in Rust source, length- and
+/// newline-preserving (per char), so brace matching and token scans see code
+/// only. Same lexing rules as the intent-core repo-slug fold lint: `//` and
+/// nested `/* */` comments, `"…"` with escapes, `r#"…"#` raw strings, and
+/// `'x'` / `'\…'` char literals (lifetimes are kept).
+fn blank_rust_non_code(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out: Vec<char> = chars
+        .iter()
+        .map(|&c| if c == '\n' { '\n' } else { ' ' })
+        .collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '/' && next == Some('/') {
+            while i < n && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < n {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if c == 'r'
+            && {
+                let prev_ok = |k: usize| k == 0 || !is_ident(chars[k - 1]);
+                prev_ok(i) || (chars[i - 1] == 'b' && prev_ok(i - 1))
+            }
+            && {
+                let mut j = i + 1;
+                while chars.get(j) == Some(&'#') {
+                    j += 1;
+                }
+                chars.get(j) == Some(&'"')
+            }
+        {
+            let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
+            i += 1 + hashes + 1;
+            while i < n {
+                if chars[i] == '"'
+                    && chars[i + 1..].iter().take(hashes).all(|&h| h == '#')
+                    && i + hashes < n
+                {
+                    i += 1 + hashes;
+                    break;
+                }
+                i += 1;
+            }
+        } else if c == '"' {
+            i += 1;
+            while i < n && chars[i] != '"' {
+                i += if chars[i] == '\\' { 2 } else { 1 };
+            }
+            i += 1;
+        } else if c == '\'' && next == Some('\\') {
+            i += 3;
+            while i < n && chars[i] != '\'' {
+                i += 1;
+            }
+            i += 1;
+        } else if c == '\'' && chars.get(i + 2) == Some(&'\'') {
+            i += 3;
+        } else {
+            out[i] = c;
+            i += 1;
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// `(body_start, body)` of the first fn whose signature starts with
+/// `signature` in `blanked` (the comment- and literal-free text of `file`):
+/// the text between the body's braces. A vanished signature panics naming
+/// `file:1` so the guard's failure always carries a `file:line` anchor.
+fn fn_body<'a>(file: &str, blanked: &'a str, signature: &str) -> (usize, &'a str) {
+    let sig = blanked
+        .find(signature)
+        .unwrap_or_else(|| panic!("{file}:1: signature not found: `{signature}`"));
+    let open = sig
+        + blanked[sig..].find('{').unwrap_or_else(|| {
+            panic!(
+                "{file}:{}: no body after `{signature}`",
+                line_of(blanked, sig)
+            )
+        });
+    let mut depth = 0usize;
+    for (off, c) in blanked[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (open + 1, &blanked[open + 1..open + off]);
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!(
+        "{file}:{}: unbalanced body for `{signature}`",
+        line_of(blanked, sig)
+    );
+}
+
+fn line_of(blanked: &str, offset: usize) -> usize {
+    blanked[..offset].matches('\n').count() + 1
+}
+
+/// Every `-32602` producer the plan half owns, plus the pre-split wrapper
+/// (`agent_create_op`, which plans AND persists — an invocation after the
+/// row insert re-validates input past the first side effect); none may
+/// appear in the persist half or after `workspace.create`'s row insert.
+const PERSIST_FORBIDDEN: &[&str] = &[
+    "ensure_effort_supported_by_model(",
+    "canonical_id_or_err(",
+    "resolve_create_model_and_effort(",
+    "validate_file_blocks(",
+    "validate_image_blocks(",
+    "validate_image_block_refs(",
+    "agent_create_op(",
+    "InvalidParams",
+];
+
+/// Source guard for the plan/persist split: the body of
+/// `persist_agent_create` (`agent_ops.rs`) calls none of the plan half's
+/// `-32602` producers, and `create_workspace` (`lib.rs`) runs
+/// `plan_agent_create` BEFORE its single `insert_workspace_with_auto_commit`
+/// and `persist_agent_create` AFTER it, with no producer, no re-plan and no
+/// `agent_create_op` wrapper anywhere after the insert. Scans the code with
+/// comments and literals blanked; every failure names `file:line` (a missing
+/// anchor names the fn body's first line, a vanished signature `file:1`).
+/// Moving `resolve_create_model_and_effort` into the persist half fails the
+/// first assertion; moving the plan call below the insert fails the ordering
+/// one; adding an `agent_create_op(...)` call after the insert fails the
+/// post-insert scan.
+///
+/// This is exact-text matching on the blanked source, not call resolution:
+/// a comment or whitespace between a producer's name and its `(`, or a call
+/// through an alias / re-import, is outside its detection, and a helper
+/// whose name ENDS with a forbidden name (e.g. `my_canonical_id_or_err(`)
+/// matches. Accepted for a rung-2 backstop behind the [`AgentPersistError`]
+/// type guard — no parser dependency or semantic proof is intended.
+#[test]
+fn persist_agent_create_and_workspace_create_carry_no_input_validation_after_the_plan() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let agent_ops = blank_rust_non_code(
+        &std::fs::read_to_string(src.join("agent_ops.rs")).expect("read agent_ops.rs"),
+    );
+    let (start, body) = fn_body("agent_ops.rs", &agent_ops, "async fn persist_agent_create(");
+    for token in PERSIST_FORBIDDEN.iter().chain(&["plan_agent_create("]) {
+        if let Some(hit) = body.find(token) {
+            panic!(
+                "agent_ops.rs:{}: persist_agent_create must not reach `{token}` — it belongs to the plan half",
+                line_of(&agent_ops, start + hit)
+            );
+        }
+    }
+
+    let lib =
+        blank_rust_non_code(&std::fs::read_to_string(src.join("lib.rs")).expect("read lib.rs"));
+    let (start, body) = fn_body("lib.rs", &lib, "fn create_workspace(");
+    let at = |needle: &str| {
+        body.find(needle).unwrap_or_else(|| {
+            panic!(
+                "lib.rs:{}: create_workspace must call `{needle}`",
+                line_of(&lib, start)
+            )
+        })
+    };
+    let plan = at(".plan_agent_create(");
+    let insert = at(".insert_workspace_with_auto_commit(");
+    let persist = at(".persist_agent_create(");
+    if let Some(dup) = body[insert + 1..].find(".insert_workspace_with_auto_commit(") {
+        panic!(
+            "lib.rs:{}: second row insert — create_workspace must insert its row exactly once (first at lib.rs:{})",
+            line_of(&lib, start + insert + 1 + dup),
+            line_of(&lib, start + insert)
+        );
+    }
+    assert!(
+        plan < insert,
+        "lib.rs:{}: plan_agent_create must run before the row insert (lib.rs:{})",
+        line_of(&lib, start + plan),
+        line_of(&lib, start + insert)
+    );
+    assert!(
+        insert < persist,
+        "lib.rs:{}: persist_agent_create must run after the row insert (lib.rs:{})",
+        line_of(&lib, start + persist),
+        line_of(&lib, start + insert)
+    );
+    let after_insert = &body[insert..];
+    for token in PERSIST_FORBIDDEN.iter().chain(&[".plan_agent_create("]) {
+        if let Some(hit) = after_insert.find(token) {
+            panic!(
+                "lib.rs:{}: `{token}` after the row insert — an initialAgent rejection here would strand the workspace row",
+                line_of(&lib, start + insert + hit)
+            );
+        }
+    }
+}
+
+/// Lexical table for [`blank_rust_non_code`]: every case keeps the char count
+/// and every newline in place, replaces chars only with `' '` (never shifts
+/// them), and leaves exactly `kept` (the non-space chars) standing — so
+/// braces and forbidden names inside comments, escaped / raw strings and
+/// char literals are invisible to the guard's brace matching and token
+/// scans, while lifetimes and Unicode code survive.
+#[test]
+fn blank_rust_non_code_blanks_comments_and_literals_only() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("nested block comment", "a /* x /* y */ z */ b", "ab"),
+        (
+            "nested block comment hiding braces and a forbidden name",
+            "f(); /* { InvalidParams( /* } */ */ g();",
+            "f();g();",
+        ),
+        (
+            "line comment hiding a forbidden name, newline kept",
+            "x // agent_create_op( {\ny",
+            "x\ny",
+        ),
+        (
+            "escaped string with braces and a forbidden name",
+            r#"let s = "{ \" InvalidParams( } \\";"#,
+            "lets=;",
+        ),
+        (
+            "raw string with hashes, an inner quote-hash and a forbidden name",
+            r###"let s = r##"} "# agent_create_op( {"##;"###,
+            "lets=;",
+        ),
+        (
+            "char literals blanked, lifetimes kept",
+            r"let c = '{'; let q = '\''; let e = '\n'; fn f<'a>(s: &'a str) -> &'a str { s }",
+            "letc=;letq=;lete=;fnf<'a>(s:&'astr)->&'astr{s}",
+        ),
+        (
+            "unicode in a literal and a comment, unicode code kept",
+            "let grüße = \"héllo { ✓ }\"; // wörld }\nfn f() {}",
+            "letgrüße=;\nfnf(){}",
+        ),
+    ];
+    for (name, src, kept) in cases {
+        let blanked = blank_rust_non_code(src);
+        assert_eq!(
+            blanked.chars().count(),
+            src.chars().count(),
+            "{name}: char count changed"
+        );
+        for (i, (s, b)) in src.chars().zip(blanked.chars()).enumerate() {
+            assert!(
+                b == s || b == ' ',
+                "{name}: char {i} shifted or replaced with {b:?} (was {s:?})"
+            );
+            assert_eq!(
+                b == '\n',
+                s == '\n',
+                "{name}: newline at char {i} not preserved"
+            );
+        }
+        let visible: String = blanked.chars().filter(|c| *c != ' ').collect();
+        assert_eq!(visible, *kept, "{name}: blanked to {blanked:?}");
+    }
+}
+
+/// [`fn_body`] returns the text strictly between the fn's outer braces —
+/// nested blocks included, the closing brace of a blanked `"}"` literal
+/// ignored, the following fn excluded — with `body_start` pointing just past
+/// the opening brace; `line_of` on an offset inside the body reports the
+/// source line even when multi-byte Unicode precedes it.
+#[test]
+fn fn_body_isolates_the_target_body_and_line_numbers_survive_unicode() {
+    let src = "\
+/// Grüße — “smart quotes” ✓
+const GREETING: &str = \"héllo { world }\";
+fn target(x: u32) -> u32 {
+    let s = \"}\";
+    if x > 0 { { x } } else { 0 }
+    needle(
+}
+fn other() { needle( }
+";
+    let blanked = blank_rust_non_code(src);
+    let (start, body) = fn_body("x.rs", &blanked, "fn target(");
+    assert_eq!(
+        &blanked[start - 1..start],
+        "{",
+        "body_start is just past the opening brace"
+    );
+    assert_eq!(line_of(&blanked, start), 3);
+    assert!(!body.contains('"'), "literals are blanked: {body:?}");
+    assert!(
+        body.contains("if x > 0 { { x } } else { 0 }"),
+        "nested blocks kept: {body:?}"
+    );
+    assert!(!body.contains("fn other"), "next fn excluded: {body:?}");
+    assert_eq!(body.matches("needle(").count(), 1, "{body:?}");
+    let hit = body.find("needle(").unwrap();
+    assert_eq!(line_of(&blanked, start + hit), 6);
+    assert_eq!(
+        body.matches('{').count(),
+        body.matches('}').count(),
+        "body is brace-balanced: {body:?}"
+    );
+}
+
+/// Every [`fn_body`] failure panics naming `file:line`: a vanished
+/// signature anchors at `file:1`, a signature without a body and an
+/// unbalanced body at the signature's line.
+#[test]
+fn fn_body_panics_name_file_and_line() {
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "missing signature",
+            "fn a() {}\n",
+            "fn missing(",
+            "x.rs:1: signature not found: `fn missing(`",
+        ),
+        (
+            "signature without a body",
+            "\n\nfn decl();\n",
+            "fn decl(",
+            "x.rs:3: no body after `fn decl(`",
+        ),
+        (
+            "unbalanced body",
+            "\nfn open() {\n    {\n",
+            "fn open(",
+            "x.rs:2: unbalanced body for `fn open(`",
+        ),
+    ];
+    for (name, src, signature, expected) in cases {
+        let blanked = blank_rust_non_code(src);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fn_body("x.rs", &blanked, signature).0
+        }));
+        let payload = outcome.expect_err(name);
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(ToString::to_string))
+            .unwrap_or_else(|| panic!("{name}: non-string panic payload"));
+        assert_eq!(message, *expected, "{name}");
+    }
+}
+
+/// v10.0: a legacy inline file block already persisted on a user row (no
+/// `attachmentId`) is served as a `text` block naming the file — with no
+/// `data` key — on `agent.getConversation` in both projections and on
+/// `agent.getMessageBlock`; a missing `fileName` falls back to
+/// `"Attached file"`; attachment-reference file blocks are untouched. The
+/// stored row is never rewritten.
+#[tokio::test]
+async fn legacy_inline_file_blocks_served_as_text() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "LegacyInline").await;
+    let stored = json!([
+        { "type": "text", "text": "see attached" },
+        { "type": "file", "data": "ZmlsZWRhdGE=", "mimeType": "text/plain", "fileName": "notes.txt" },
+        { "type": "file", "data": "eA==", "mimeType": "application/octet-stream" },
+        { "type": "file", "attachmentId": "att-1", "fileName": "ref.pdf", "mimeType": "application/pdf" },
+    ]);
+    let message_id = svc
+        .store
+        .append_agent_message(&id, "user", &stored, &now_iso())
+        .await
+        .expect("append")
+        .id;
+
+    let expected = |blocks: &[serde_json::Value], surface: &str| {
+        assert_eq!(blocks.len(), 4, "{surface}: {blocks:?}");
+        assert_eq!(blocks[0]["type"], "text", "{surface}");
+        assert_eq!(blocks[0]["text"], "see attached", "{surface}");
+        assert_eq!(blocks[1]["type"], "text", "{surface}: {:?}", blocks[1]);
+        assert_eq!(blocks[1]["text"], "Attached file: notes.txt", "{surface}");
+        assert_eq!(blocks[1]["id"], format!("{message_id}:1"), "{surface}");
+        assert_eq!(blocks[2]["type"], "text", "{surface}: {:?}", blocks[2]);
+        assert_eq!(blocks[2]["text"], "Attached file", "{surface}");
+        assert_eq!(blocks[3]["type"], "file", "{surface}");
+        assert_eq!(blocks[3]["attachmentId"], "att-1", "{surface}");
+        assert_eq!(blocks[3]["fileName"], "ref.pdf", "{surface}");
+        for b in blocks {
+            assert!(b.get("data").is_none(), "{surface}: bytes served: {b}");
+            assert!(
+                b.get("mimeType").is_none() || b["type"] == "file",
+                "{surface}: {b}"
+            );
+        }
+        assert!(
+            !serde_json::to_string(blocks)
+                .unwrap()
+                .contains("ZmlsZWRhdGE="),
+            "{surface}: inline bytes leaked"
+        );
+    };
+
+    let full = svc
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
+        .await
+        .expect("full conv");
+    expected(
+        full["messages"][0]["contentBlocks"].as_array().unwrap(),
+        "getConversation (full)",
+    );
+    let slim = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(intent_core::ConversationProjection::Slim),
+            false,
+        )
+        .await
+        .expect("slim conv");
+    expected(
+        slim["messages"][0]["contentBlocks"].as_array().unwrap(),
+        "getConversation (slim)",
+    );
+
+    let block = svc
+        .agent_get_message_block_op(
+            id.clone(),
+            message_id.clone(),
+            format!("{message_id}:1"),
+            None,
+        )
+        .await
+        .expect("getMessageBlock");
+    assert_eq!(block["block"]["type"], "text", "{block}");
+    assert_eq!(
+        block["block"]["text"], "Attached file: notes.txt",
+        "{block}"
+    );
+    assert!(block["block"].get("data").is_none(), "{block}");
+
+    // Stored row untouched: no migration, serve-time only.
+    let raw = svc
+        .store
+        .get_agent_message_by_id(&id, &message_id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(raw.content, stored);
 }
 
 /// STAB-133 parity: `agent_send_queued_message_now_op` must persist the
@@ -13314,7 +14769,7 @@ async fn fetch_session_stats_child_path_includes_binary_dir() {
 
 #[tokio::test]
 async fn auggie_fetches_return_none_for_unresolvable_binary() {
-    let missing = std::env::temp_dir()
+    let missing = std::env::temp_dir() // tmp-hygiene: allow — never created
         .join(format!("intentd-missing-{}", uuid::Uuid::new_v4()))
         .join("auggie");
     assert!(fetch_auggie_models_rich(Some(missing.clone()))
@@ -28151,7 +29606,12 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
         "late completion wake expected, got: {msgs}"
     );
 
-    // The watch is consumed by the delivery.
+    // The watch is consumed by the delivery. The registry removal lands only
+    // after the durable wake AND the store-side watch retirement commit
+    // (the persisted watch is the crash-retry recovery record), so the
+    // transcript write synchronized on above can be visible before the
+    // registry entry is gone — poll the registry (intent-hq/intent#4957).
+    wait_for_child_watch_cleanup(&svc, &child_b).await;
     let watches_after = svc.list_watches_for_parent(&parent);
     assert!(
         !watches_after.iter().any(|w| w.child_agent_id == child_b),
@@ -28702,26 +30162,59 @@ async fn held_entry_excluded_from_drain_until_release() {
 
 /// The per-entry release timer flushes the hold at `holdUntil`: the entry
 /// becomes ready-to-send without any manual release call.
+///
+/// Both wall-clock races are kept out of the assertions:
+/// - The "held before the deadline" check runs against a FAR deadline; the
+///   enqueue awaits a persisted write-through, which under load can outlast a
+///   short hold, so a short deadline would already have passed here. The
+///   same-key upsert then shortens the deadline in place and re-arms the
+///   timer.
+/// - The flush is observed directly — the `holdKind` marker disappearing
+///   from the queue snapshot — rather than via `has_ready_to_send`.
+///   Readiness derives from `is_held()`, which compares `holdUntil` against
+///   the wall clock, so it flips true the instant the deadline passes,
+///   possibly before the spawned timer task has run `flush_expired_hold`;
+///   dequeuing at that point would race the flush and see the marker still
+///   set. Only the marker clearing proves the timer ran.
 #[tokio::test]
 async fn hold_timer_flush_makes_entry_ready() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "TimerFlush").await;
 
-    let soon = intent_core::iso_ms_from_now(150);
-    svc.enqueue_held_message(&id, "debounced".into(), None, "debounce", &soon, "child-1")
+    let far = intent_core::iso_ms_from_now(60_000);
+    let (held, _) = svc
+        .enqueue_held_message(&id, "debounced".into(), None, "debounce", &far, "child-1")
         .await;
     assert!(!svc.has_ready_to_send(&id), "held before the deadline");
 
-    // Wait past the deadline for the spawned timer to flush the hold.
+    // Same-key upsert: shorten the deadline and re-arm the release timer.
+    let soon = intent_core::iso_ms_from_now(150);
+    let (refreshed, _) = svc
+        .enqueue_held_message(&id, "debounced".into(), None, "debounce", &soon, "child-1")
+        .await;
+    assert_eq!(refreshed.id, held.id, "upsert keeps the entry id");
+
+    // Wait for the spawned timer to flush the hold: the marker clears in
+    // the queue snapshot. The deadline is a liveness bound only.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while !svc.has_ready_to_send(&id) {
+    loop {
+        let snapshot = svc.queue_snapshot(&id);
+        let entry = snapshot
+            .iter()
+            .find(|e| e["id"] == json!(held.id))
+            .expect("held entry stays queued");
+        if entry["holdKind"].is_null() {
+            break;
+        }
         assert!(
             tokio::time::Instant::now() < deadline,
             "timer flush did not release the hold in time"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    assert!(svc.has_ready_to_send(&id), "flushed entry is ready");
     let drained = svc.dequeue_message(&id).expect("flushed entry drains");
+    assert_eq!(drained.id, held.id);
     assert!(drained.hold_kind.is_none(), "flush cleared the marker");
     assert_eq!(drained.content, "debounced");
 }
@@ -30554,9 +32047,9 @@ async fn fake_provisioned_sandbox(
     svc: &Services,
     ws: &WorkspaceId,
     aid: &AgentId,
-) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("intentd-orphan-sandbox-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("create sandbox dir");
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let guard = crate::test_support::test_tempdir("intentd-orphan-sandbox-");
+    let dir = guard.path().to_path_buf();
     std::fs::write(dir.join("file.txt"), "x").expect("write sandbox file");
     let sandbox = intent_store::Sandbox {
         id: uuid::Uuid::new_v4().to_string(),
@@ -30575,7 +32068,7 @@ async fn fake_provisioned_sandbox(
         .insert_sandbox(&sandbox)
         .await
         .expect("insert sandbox record");
-    dir
+    (guard, dir)
 }
 
 #[tokio::test]
@@ -30586,7 +32079,7 @@ async fn settle_provisioned_sandbox_discards_when_session_missing() {
     // removed and no sandbox:cow:created event fires.
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let aid = create_agent(&svc, &ws, "Doomed").await;
-    let dir = fake_provisioned_sandbox(&svc, &ws, &aid).await;
+    let (_sandbox_dir, dir) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
     svc.store()
         .delete_agent_session(&ws, &aid)
         .await
@@ -30640,7 +32133,7 @@ async fn settle_provisioned_sandbox_discards_when_session_soft_deleted() {
         .update_agent_session(&ws, &session)
         .await
         .expect("flag deleted");
-    let dir = fake_provisioned_sandbox(&svc, &ws, &aid).await;
+    let (_sandbox_dir, dir) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
 
     svc.settle_provisioned_sandbox(
         &ws,
@@ -30677,7 +32170,7 @@ async fn settle_provisioned_sandbox_attaches_fields_for_live_session() {
     // Control: with a live session, settlement persists the sandbox fields.
     let (_t, svc, ws) = setup().await;
     let aid = create_agent(&svc, &ws, "Live").await;
-    let dir = fake_provisioned_sandbox(&svc, &ws, &aid).await;
+    let (_sandbox_dir, dir) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
 
     svc.settle_provisioned_sandbox(
         &ws,
@@ -30713,7 +32206,6 @@ async fn settle_provisioned_sandbox_attaches_fields_for_live_session() {
         Some(format!("sb/{}", aid.0).as_str()),
         "live session gains the sandbox branch"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// monorepo#958: the bounded `agent.get`/`agent.list` projection (metadata-only
@@ -32277,7 +33769,7 @@ async fn record_pending_proposals_error_paths_leave_metadata_intact() {
             intent_core::PENDING_PROPOSALS_KEY,
             "corrupt",
             None,
-            &now_iso(),
+            Some(&now_iso()),
         )
         .await
         .expect("corrupt marker");
@@ -33618,7 +35110,7 @@ async fn dismiss_questions_event_reflects_concurrent_marker_clear() {
             intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
             "",
             None,
-            &now_iso(),
+            Some(&now_iso()),
         )
         .await
         .expect("clear marker"));
@@ -35214,7 +36706,7 @@ async fn assign_agent_occupancy_guard_and_idempotent_reassign() {
 // agent.watch / agent.unwatch (monorepo#1229): explicit watches
 // ===========================================================================
 
-#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+#[expect(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// `agent.watch` registers a `wake_on_attention` watch; like every ungrouped
 /// watch it is deliver-once — the `agent:idle` wake retires it, and a second
 /// idle with no re-arm delivers nothing.
@@ -35787,7 +37279,11 @@ async fn group_rehydration_settles_retired_child() {
             Some(gid.clone()),
         )
         .expect("grouped watch");
-        // Persist the open group before the "crash".
+        // Persist the open group before the "crash". Group creation and the
+        // enrollment are two separate lane upserts (intent#5007): the row
+        // exists after the first (no members yet), so wait for the second —
+        // the row carrying the enrolled child — or the restarted instance
+        // rehydrates a memberless group that can never be complete.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             let rows = svc
@@ -35795,12 +37291,19 @@ async fn group_rehydration_settles_retired_child() {
                 .list_undelivered_groups(&ws)
                 .await
                 .expect("list groups");
-            if rows.iter().any(|r| r.group_id == gid) {
+            if rows
+                .iter()
+                .any(|r| r.group_id == gid && r.expected_agent_ids.contains(&child))
+            {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "group row persisted");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "group row persisted with the enrolled child"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        wait_for_persisted_watches(&svc, 1).await;
         (parent, child)
     };
 
@@ -36059,7 +37562,7 @@ async fn agent_watch_attention_fanout_excludes_parent() {
     );
 }
 
-#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+#[expect(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// monorepo#3443: the attention fan-out reaches EVERY active completion
 /// watch, not just explicit `agent.watch` registrations — a watcher holding
 /// only an auto-registered (wakeOrCreate/delegate SUB-1 shape,
@@ -36114,7 +37617,7 @@ async fn attention_fanout_reaches_auto_registered_watch() {
     assert!(!watches[0].wake_on_attention, "attention flag unchanged");
 }
 
-#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+#[expect(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// monorepo#3443: an auto-registered GROUPED watch (`wake_on_attention:
 /// false`, `group_id` set — the `after_all` delegation shape) also receives
 /// the attention wake, with the grouped settlement-promise wording.
@@ -36363,7 +37866,7 @@ async fn agent_watch_unwatch_validation_and_removal() {
     ));
 }
 
-#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+#[expect(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// Restart durability: an explicit watch survives daemon restart with its
 /// `wake_on_attention` flag intact.
 #[tokio::test]
@@ -37592,6 +39095,52 @@ async fn agent_snapshot_prs_terminal_state_anywhere_suppresses_stale_open_duplic
         svc.agent_state_snapshot_line(&agent).await,
         None,
         "all-suppressed pools keep the snapshot trivial"
+    );
+}
+
+/// The `(repo, number)` dedup key is the case-insensitive `RepoRef` identity:
+/// a git root recorded as `Intent-HQ/IntentD` and a workspace recorded as
+/// `intent-hq/intentd` are one repository, so the root's merged #1
+/// suppresses the workspace's stale open #1 and the workspace's open #2
+/// wins over the root's case-variant duplicate (label keeps the workspace
+/// casing).
+#[tokio::test]
+async fn agent_snapshot_prs_dedups_case_variant_repo_slugs() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Watcher").await;
+
+    let mut row = svc.store().get_workspace(&ws).await.expect("workspace");
+    row.repository_owner = Some("intent-hq".into());
+    row.repository_name = Some("intentd".into());
+    row.pull_requests = Some(vec![
+        tracked_pr(1, PullRequestStatus::Open, Some(true), Some("clean"), None),
+        tracked_pr(2, PullRequestStatus::Open, Some(true), Some("clean"), None),
+    ]);
+    svc.store().update_workspace(&row).await.expect("update ws");
+
+    let root = tracked_git_root(
+        &ws,
+        "/roots/same-repo-other-case",
+        Some("Intent-HQ"),
+        Some("IntentD"),
+        vec![
+            tracked_pr(1, PullRequestStatus::Merged, None, None, None),
+            tracked_pr(2, PullRequestStatus::Open, Some(true), Some("dirty"), None),
+        ],
+    );
+    svc.store()
+        .upsert_workspace_git_root(&root)
+        .await
+        .expect("upsert root");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["prs"],
+        json!({ "mergeable": ["intent-hq/intentd#2"] }),
+        "case-variant pools dedupe as one repository: {v}"
     );
 }
 

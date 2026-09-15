@@ -11,7 +11,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,17 +27,13 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-scrst-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-scrst-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path) -> Child {
@@ -249,9 +245,9 @@ fn stop(mut child: Child) {
 
 /// A minimal committed git repo for `workspace.create` (the store row is what
 /// `script.*` needs; `skipWorktree` keeps provisioning out of the test).
-fn create_test_repo() -> PathBuf {
-    let repo_path = std::env::temp_dir().join(format!("scrst-repo-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&repo_path).expect("create temp repo dir");
+fn create_test_repo() -> tempfile::TempDir {
+    let repo = common::test_tempdir("scrst-repo-");
+    let repo_path = repo.path().to_path_buf();
     let git = |args: &[&str]| {
         let status = Command::new("git")
             .args(args)
@@ -267,21 +263,25 @@ fn create_test_repo() -> PathBuf {
     std::fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
     git(&["add", "."]);
     git(&["commit", "-m", "initial commit"]);
-    repo_path
+    repo
 }
 
 /// The `restarting` status (monorepo#1318) is observable over the wire, in
 /// order, for both restart flavors:
 ///
 /// 1. Auto-restart: a service that outlives the too-fast floor (2s) and then
-///    exits emits `running` → `exited` → `restarting` (counter bumped to 1)
-///    strictly before the respawn's `running`.
+///    exits emits `starting` (the `script.start` launch window,
+///    intent-hq/intent#4858) → `running` → `exited` → `restarting` (counter
+///    bumped to 1) strictly before the respawn's `running`.
 /// 2. `script.restart`: the manual stop→start gap emits `exited` →
-///    `restarting` (counter reset to 0) → `running`.
+///    `restarting` (counter reset to 0) → `running` — no `starting`, the gap
+///    keeps its own status.
 #[tokio::test]
 async fn restarting_status_is_observable_over_wss() {
-    let data_dir = scratch_dir("data");
-    let repo_path = create_test_repo();
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let repo_guard = create_test_repo();
+    let repo_path = repo_guard.path().to_path_buf();
     let (child, port, cfg) = boot(&data_dir).await;
 
     // SUBSCRIBER conn — create the workspace and subscribe to script:* BEFORE
@@ -339,9 +339,30 @@ async fn restarting_status_is_observable_over_wss() {
     )
     .await;
     assert_eq!(started["ok"], json!(true));
+    // A status read issued right after the `script.start` reply never observes
+    // the pre-launch `idle` (intent-hq/intent#4858). Only the negative is
+    // asserted: the service exits on its own after three seconds, so a slow
+    // round trip may legitimately read a later state — the subscribed stream
+    // below checks the launch/restart sequence.
+    let status = wss_rpc(
+        &mut rpc,
+        14,
+        "script.status",
+        json!({ "workspaceId": ws_id, "scriptId": "restarting-1" }),
+    )
+    .await;
+    assert_ne!(
+        status["status"], "idle",
+        "status after start reply: {status}"
+    );
 
-    // Auto-restart cycle: running → exited → restarting → running, in strict
-    // stream order (nothing else can interleave on the state stream).
+    // Launch + auto-restart cycle: starting → running → exited → restarting →
+    // running, in strict stream order (nothing else can interleave on the
+    // state stream). `starting` is published before `script.start` replies,
+    // so a status read after the reply never sees the pre-launch `idle`.
+    let st = next_state(&mut sub, "restarting-1", 120).await;
+    assert_eq!(st["status"], "starting", "launch window: {st}");
+    assert!(st["pid"].is_null(), "no pid before the spawn: {st}");
     let st = next_state(&mut sub, "restarting-1", 120).await;
     assert_eq!(st["status"], "running", "first run: {st}");
     let st = next_state(&mut sub, "restarting-1", 120).await;
@@ -384,6 +405,4 @@ async fn restarting_status_is_observable_over_wss() {
     drop(rpc);
     drop(sub);
     stop(child);
-    let _ = std::fs::remove_dir_all(&repo_path);
-    let _ = std::fs::remove_dir_all(&data_dir);
 }

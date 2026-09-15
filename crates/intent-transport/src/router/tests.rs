@@ -570,6 +570,7 @@ impl WorkspaceApi for FakeApi {
                 created_task_note_ids: vec![],
                 created_tasks: vec![],
                 warnings: vec![],
+                rev: 1,
             })
         })
     }
@@ -665,7 +666,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         _workspace_id: WorkspaceId,
@@ -688,7 +688,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_add(
         &self,
         _workspace_id: WorkspaceId,
@@ -722,7 +721,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_respond(
         &self,
         _workspace_id: WorkspaceId,
@@ -805,7 +803,7 @@ impl WorkspaceApi for FakeApi {
     }
 
     // Small test values: loss-free in f64.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn event_workspace_summary(
         &self,
         _workspace_id: WorkspaceId,
@@ -1315,7 +1313,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         _workspace_id: WorkspaceId,
@@ -5733,6 +5730,114 @@ async fn github_missing_required_params_are_minus_32602() {
     }
 }
 
+/// `repos[]` slugs (§5.27 multi-repo search) are interpolated into
+/// `repo:{owner}/{repo}` search qualifiers, so a value carrying whitespace,
+/// `:` or `/` could smuggle in a second qualifier and bypass the repo cap.
+/// Each malformed entry is `-32602` naming its index; well-formed slugs pass
+/// through to the trait (→ -32603 on the default impl).
+#[tokio::test]
+async fn github_search_repos_entries_must_be_valid_slugs() {
+    for (method, repos, needle) in [
+        // qualifier injection via whitespace
+        (
+            "github.issues.search",
+            r#"[{"owner":"o","repo":"r repo:other/private"}]"#,
+            "repos[0].repo",
+        ),
+        (
+            "github.pulls.search",
+            r#"[{"owner":"o","repo":"r repo:other/private"}]"#,
+            "repos[0].repo",
+        ),
+        // colon / slash
+        (
+            "github.issues.search",
+            r#"[{"owner":"o:x","repo":"r"}]"#,
+            "repos[0].owner",
+        ),
+        (
+            "github.pulls.search",
+            r#"[{"owner":"o","repo":"r"},{"owner":"o","repo":"a/b"}]"#,
+            "repos[1].repo",
+        ),
+        // empty / whitespace-only
+        (
+            "github.issues.search",
+            r#"[{"owner":"","repo":"r"}]"#,
+            "repos[0].owner",
+        ),
+        (
+            "github.pulls.search",
+            r#"[{"owner":"o","repo":"  "}]"#,
+            "repos[0].repo",
+        ),
+        // owner may not carry `_` / `.`; repo may not be `.` / `..`
+        (
+            "github.issues.search",
+            r#"[{"owner":"o_x","repo":"r"}]"#,
+            "repos[0].owner",
+        ),
+        (
+            "github.issues.search",
+            r#"[{"owner":"o","repo":".."}]"#,
+            "repos[0].repo",
+        ),
+    ] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"owner":"o","repo":"r","repos":{repos}}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "msg={msg}");
+        let text = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(text.contains(needle), "msg={msg} error={text}");
+    }
+
+    // Well-formed slugs (letters, digits, `-`, and `.`/`_` in repo names) route.
+    for method in ["github.issues.search", "github.pulls.search"] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"owner":"o","repo":"r","repos":[{{"owner":"intent-hq","repo":"cloudlands-fe"}},{{"owner":"acme","repo":"my_lib.rs"}}]}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "msg={msg}");
+    }
+}
+
+/// The addressed `owner` / `repo` of the search methods and
+/// `github.relatedRepos.list` get the same slug validation as `repos[]`.
+#[tokio::test]
+async fn github_search_addressed_owner_repo_must_be_valid_slugs() {
+    for method in [
+        "github.issues.search",
+        "github.pulls.search",
+        "github.relatedRepos.list",
+    ] {
+        for (owner, repo, needle) in [
+            ("o", "r repo:other/private", "repo"),
+            ("o x", "r", "owner"),
+            ("o", "r:x", "repo"),
+            ("o/x", "r", "owner"),
+            ("", "r", "owner"),
+            ("o", "", "repo"),
+        ] {
+            let msg = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"owner":"{owner}","repo":"{repo}"}}}}"#
+            );
+            let v = call(&msg).await.unwrap();
+            assert_eq!(err_code(&v), -32602, "msg={msg}");
+            let text = v["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                text.contains(&format!("{needle} is not a valid GitHub")),
+                "msg={msg} error={text}"
+            );
+        }
+        let ok = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"owner":"Intent-HQ","repo":"intent.d_2"}}}}"#
+        );
+        let v = call(&ok).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "msg={ok}");
+    }
+}
+
 /// FIX 1 parity: `agent.sendMessage` must forward the FE-side per-turn
 /// prompt-assembly hints (`noteIds`, `stdinContext`, `contextReferences`)
 /// verbatim to the [`WorkspaceApi`] call — the daemon previously dropped
@@ -5753,7 +5858,7 @@ mod send_message_payload_forwarding {
     /// observed shape.
     #[derive(Default, Debug, Clone)]
     // Unasserted fields are written but never read; kept to document the shape.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Capture {
         workspace_id: Option<WorkspaceId>,
         agent_id: Option<AgentId>,
@@ -5776,7 +5881,6 @@ mod send_message_payload_forwarding {
     }
 
     impl WorkspaceApi for RecordingApi {
-        #[allow(clippy::too_many_arguments)]
         fn agent_send_message(
             &self,
             workspace_id: WorkspaceId,
@@ -5949,7 +6053,7 @@ mod send_message_payload_forwarding {
                 "agentId":"agent-1",
                 "content":"hi",
                 "imageBlocks":[{"data":"aGVsbG8=","mimeType":"image/png"}],
-                "fileBlocks":[{"data":"Zm9v","mimeType":"text/plain","fileName":"notes.txt"}]
+                "fileBlocks":[{"attachmentId":"att-1","mimeType":"text/plain","fileName":"notes.txt"}]
             }
         }"#;
         handle_message(&api, msg).await.expect("response");
@@ -5961,7 +6065,9 @@ mod send_message_payload_forwarding {
         );
         assert_eq!(
             cap.file_blocks,
-            Some(json!([{"data": "Zm9v", "mimeType": "text/plain", "fileName": "notes.txt"}])),
+            Some(
+                json!([{"attachmentId": "att-1", "mimeType": "text/plain", "fileName": "notes.txt"}])
+            ),
             "fileBlocks must be forwarded verbatim"
         );
     }
@@ -6411,7 +6517,6 @@ mod edit_and_regenerate {
     }
 
     impl WorkspaceApi for RecordingApi {
-        #[allow(clippy::too_many_arguments)]
         fn agent_edit_and_regenerate(
             &self,
             workspace_id: WorkspaceId,
@@ -6454,7 +6559,7 @@ mod edit_and_regenerate {
                 "messageId":"msg-7",
                 "content":"edited text",
                 "imageBlocks":[{"data":"aGk=","mimeType":"image/png"}],
-                "fileBlocks":[{"data":"aGk=","mimeType":"text/plain","fileName":"a.txt"}],
+                "fileBlocks":[{"attachmentId":"att-a","mimeType":"text/plain","fileName":"a.txt"}],
                 "model":"auggie:sonnet4.5"
             }
         }"#;
@@ -6482,7 +6587,7 @@ mod edit_and_regenerate {
         );
         assert_eq!(
             cap.file_blocks,
-            Some(json!([{"data":"aGk=","mimeType":"text/plain","fileName":"a.txt"}]))
+            Some(json!([{"attachmentId":"att-a","mimeType":"text/plain","fileName":"a.txt"}]))
         );
         assert_eq!(cap.model.as_deref(), Some("auggie:sonnet4.5"));
     }
@@ -6542,7 +6647,6 @@ mod edit_and_regenerate {
     struct RejectingApi;
 
     impl WorkspaceApi for RejectingApi {
-        #[allow(clippy::too_many_arguments)]
         fn agent_edit_and_regenerate(
             &self,
             _workspace_id: WorkspaceId,
@@ -6801,7 +6905,6 @@ mod oversized_response {
     struct HugeApi;
 
     impl WorkspaceApi for HugeApi {
-        #[allow(clippy::too_many_arguments)]
         fn agent_edit_and_regenerate(
             &self,
             _workspace_id: WorkspaceId,

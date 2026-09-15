@@ -26,7 +26,7 @@
 mod common;
 
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,13 +41,12 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
 struct Daemon {
     child: std::process::Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
@@ -62,8 +61,8 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         if std::thread::panicking() {
             eprintln!("\n=== DAEMON CLEANUP (test panicked) ===");
-            eprintln!("Data dir: {}", self.data_dir.display());
-            let log_path = self.data_dir.join("daemon.log");
+            eprintln!("Data dir: {}", self.data_dir.path().display());
+            let log_path = self.data_dir.path().join("daemon.log");
             if let Ok(log) = std::fs::read_to_string(&log_path) {
                 let lines: Vec<_> = log.lines().rev().take(40).collect();
                 eprintln!("Last 40 lines of daemon.log:");
@@ -72,7 +71,6 @@ impl Drop for Daemon {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -244,11 +242,8 @@ where
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-unblk-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-unblk-")
 }
 
 fn gate(test: &str) -> Option<String> {
@@ -385,7 +380,8 @@ async fn unblocked_section_reaches_parent_wake_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_and_task_notes(&data_dir).await;
 
     // The unblocked-wake section is gated behind `agentFeatures.taskGraph`
@@ -443,7 +439,7 @@ async fn unblocked_section_reaches_parent_wake_over_wss() {
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -576,13 +572,14 @@ const VF_SPAWN_MARK: &str = "UNBLK_VF_SPAWN_VERIFIER";
 const VF_VERIFIER_MARK: &str = "UNBLK_VF_VERIFIER_TURN";
 
 /// Drive the verifier-flip flow over the real transport and return the
-/// parent's transcript messages once every parent turn has settled:
-/// delegate implementor (idle 1) → report wake spawns the verifier (idle 2)
-/// → verifier flips the implementor's task `complete`, idles, and its
-/// completion wake reaches the parent (idle 3). The daemon handle is
-/// returned so a failing assertion still dumps `daemon.log` on drop.
+/// parent's transcript messages once the verifier's completion wake has
+/// landed in it: delegate implementor → report wake spawns the verifier →
+/// verifier flips the implementor's task `complete`, idles, and its
+/// completion wake reaches the parent. The daemon handle is returned so a
+/// failing assertion still dumps `daemon.log` on drop.
 async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemon, Vec<Value>) {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_and_task_notes(&data_dir).await;
 
     // Seed the toggle explicitly (it defaults on, so the disabled flow needs
@@ -669,7 +666,7 @@ async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemo
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -733,32 +730,48 @@ async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemo
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Three parent turns: delegate, report-wake (spawns verifier), and the
-    // verifier's completion wake.
-    let mut parent_idles = 0u32;
+    // The parent runs several turns (delegate, report wake that spawns the
+    // verifier, completion wakes). How many `agent:idle` events those produce
+    // is not fixed: an idle is suppressed while a ready-to-send entry is
+    // queued and queued wakes may batch into one turn, so counting idles can
+    // be satisfied before the verifier's completion wake has been delivered
+    // (intent-hq/intent#4967). Poll the observable condition instead: on each
+    // parent idle, re-read the transcript until the verifier's completion
+    // wake is in it (both taskGraph gate states deliver that wake).
+    let mut rpc_id = 20;
+    let mut messages: Vec<Value> = Vec::new();
+    let mut verifier_wake_seen = false;
     for _ in 0..400 {
         let frame = wss_event(&mut sub, 90).await;
         let ev = &frame["params"]["event"];
-        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == json!(parent_id) {
-            parent_idles += 1;
-            if parent_idles >= 3 {
-                break;
-            }
+        if ev["type"] != "agent:idle" || ev["data"]["agentId"] != json!(parent_id) {
+            continue;
+        }
+        let mut conv = wss_rpc(
+            &mut rpc,
+            rpc_id,
+            "agent.getConversation",
+            json!({ "agentId": &parent_id }),
+        )
+        .await;
+        rpc_id += 1;
+        messages = match conv["messages"].take() {
+            Value::Array(items) => items,
+            other => panic!("messages array, got {other}"),
+        };
+        if messages.iter().any(|m| {
+            let text = blocks_text(m);
+            text.contains("Child agent Verifier") && text.contains("completed")
+        }) {
+            verifier_wake_seen = true;
+            break;
         }
     }
     assert!(
-        parent_idles >= 3,
-        "parent idled after the delegate, spawn-verifier, and wake turns"
+        verifier_wake_seen,
+        "verifier completion wake delivered to the parent; transcript: {}",
+        serde_json::to_string_pretty(&messages).unwrap_or_default()
     );
-
-    let conv = wss_rpc(
-        &mut rpc,
-        20,
-        "agent.getConversation",
-        json!({ "agentId": &parent_id }),
-    )
-    .await;
-    let messages = conv["messages"].as_array().expect("messages array").clone();
     (daemon, messages)
 }
 

@@ -106,6 +106,10 @@ pub struct ConnectionHooks {
     /// lines are dropped when the writer stalls or fails, so capture never
     /// backpressures the stderr drain or the agent runtime.
     pub stderr_log_dir: Option<PathBuf>,
+    /// Diagnostics-only owner of this connection: the agent id the reader
+    /// attributes an unparseable stdout line to. `None` for connections with
+    /// no agent (e.g. ephemeral adapter runs); never affects behavior.
+    pub agent_id: Option<String>,
 }
 
 /// Lines buffered between the stderr drain and the log writer task before
@@ -409,6 +413,7 @@ impl Connection {
         let auth_marker = hooks.auth_required_stdout_marker;
         let auth_required_reader = Arc::clone(&auth_required);
         let auth_error_reader = Arc::clone(&auth_error);
+        let agent_id_reader = hooks.agent_id;
         tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -438,7 +443,15 @@ impl Connection {
                         &notify_reader,
                         &client_req_seq_reader,
                     ),
-                    Err(e) => tracing::warn!(error = %e, "failed to parse ACP stdout line"),
+                    // Attribution without content: the agent id and the line
+                    // length locate the offending child, the line itself is
+                    // never logged.
+                    Err(e) => tracing::warn!(
+                        agent = agent_id_reader.as_deref().unwrap_or("unknown"),
+                        line_len = line.len(),
+                        error = %e,
+                        "failed to parse ACP stdout line"
+                    ),
                 }
             }
             // stdout closed: fail every still-pending request.
@@ -561,6 +574,77 @@ impl Connection {
         timeout: Duration,
     ) -> AcpResult<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.request_with_id(id, method, params, timeout).await
+    }
+
+    /// [`Connection::request_timeout`] that also tells the peer about an
+    /// abandoned request: when the request times out, the notification
+    /// `cancel(id)` yields (`(method, params)`, e.g. MCP's
+    /// `notifications/cancelled { requestId, reason }`) is sent for the
+    /// abandoned request id. The pending slot is already gone by then, so a
+    /// late reply to that id is discarded rather than delivered. The cancel
+    /// is best-effort and never waits: it is queued only if the writer has
+    /// room right now (a full queue means the peer has stopped reading its
+    /// stdin, and the timed-out caller must not block behind it). A cancel
+    /// that is dropped or fails to send is logged, never surfaced — the
+    /// timeout is the caller-facing outcome either way, on the timer's
+    /// schedule.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Connection::request_timeout`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub async fn request_timeout_with_cancel(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        cancel: impl FnOnce(i64) -> (String, Value),
+    ) -> AcpResult<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let result = self.request_with_id(id, method, params, timeout).await;
+        if matches!(result, Err(AcpError::Timeout(_))) {
+            let (cancel_method, cancel_params) = cancel(id);
+            if let Err(e) = self.try_notify(&cancel_method, &cancel_params) {
+                tracing::debug!(
+                    method,
+                    id,
+                    error = %e,
+                    "cancel notification for timed-out request not sent"
+                );
+            }
+        }
+        result
+    }
+
+    /// [`Connection::notify`] that never waits for writer capacity: the line
+    /// is queued if the outbound channel has room right now, else dropped.
+    fn try_notify(&self, method: &str, params: &Value) -> AcpResult<()> {
+        let line = encode_message(None, method, params)?;
+        self.writer_tx.try_send(line).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                AcpError::Transport("writer queue full".to_string())
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                AcpError::Transport("writer task closed".to_string())
+            }
+        })
+    }
+
+    /// The request body shared by the `request_timeout*` entry points. The
+    /// pending slot for `id` is dropped with the guard on return, so a caller
+    /// that names the request to the peer afterwards does so with no slot
+    /// left for a late reply to land in.
+    async fn request_with_id(
+        &self,
+        id: i64,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> AcpResult<Value> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         // Drop-guard cleanup: covers the error/timeout arms below AND the
@@ -769,7 +853,8 @@ mod watermark_tests {
 
     /// A duplex-backed `Connection` whose "agent" never responds on its own:
     /// the test holds both remote ends and writes response lines by hand.
-    fn silent_connection() -> (Connection, tokio::io::DuplexStream, tokio::io::DuplexStream) {
+    pub(super) fn silent_connection(
+    ) -> (Connection, tokio::io::DuplexStream, tokio::io::DuplexStream) {
         let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
         let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
         let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
@@ -910,5 +995,139 @@ mod watermark_tests {
             1,
             "response watermark untouched by requests"
         );
+    }
+}
+
+#[cfg(test)]
+mod cancel_on_timeout_tests {
+    use super::watermark_tests::silent_connection;
+    use super::*;
+    use serde_json::json;
+
+    fn cancelled(id: i64) -> (String, Value) {
+        (
+            "notifications/cancelled".to_string(),
+            json!({ "requestId": id, "reason": "test" }),
+        )
+    }
+
+    async fn read_json(reader: &mut BufReader<tokio::io::DuplexStream>) -> Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// A timed-out request is followed on the wire by the cancel notification
+    /// naming its id, sent once the pending slot is gone.
+    #[tokio::test]
+    async fn timed_out_request_sends_cancel_for_its_id() {
+        let (conn, c2a_agent, _a2c_agent) = silent_connection();
+        let err = conn
+            .request_timeout_with_cancel(
+                "tools/call",
+                json!({ "name": "slow" }),
+                Duration::from_millis(50),
+                cancelled,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AcpError::Timeout(_)), "got: {err}");
+        assert!(!conn.has_pending_requests(), "slot dropped on timeout");
+
+        let mut reader = BufReader::new(c2a_agent);
+        let request = read_json(&mut reader).await;
+        assert_eq!(request["method"], json!("tools/call"));
+        let id = request["id"].as_i64().unwrap();
+        let cancel = read_json(&mut reader).await;
+        assert_eq!(cancel["method"], json!("notifications/cancelled"));
+        assert!(cancel.get("id").is_none(), "notification: {cancel}");
+        assert_eq!(cancel["params"]["requestId"], json!(id));
+        assert_eq!(cancel["params"]["reason"], json!("test"));
+    }
+
+    /// A peer that has stopped reading its stdin with the writer queue full
+    /// must not hold the timed-out caller hostage: the cancel is dropped and
+    /// the request returns `Timeout` on the timer's schedule.
+    ///
+    /// Paused time: the clock only advances when the runtime is idle, so the
+    /// 20ms settle below always fires before the request's 200ms timer no
+    /// matter how the host schedules the test, and the 2s guard measures the
+    /// wedged send by advancing past it rather than by waiting it out.
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_request_with_full_writer_queue_still_returns_on_time() {
+        let (conn, _c2a_agent_unread, _a2c_agent) = silent_connection();
+        let mut fut = Box::pin(conn.request_timeout_with_cancel(
+            "tools/call",
+            json!({}),
+            Duration::from_millis(200),
+            cancelled,
+        ));
+        // Let the request line reach the writer before the flood.
+        tokio::select! {
+            _ = &mut fut => panic!("request must still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        // Wedge the writer: one line larger than the duplex buffer (which the
+        // peer never drains) parks it mid-write, then the bounded channel
+        // behind it is filled to capacity. Top off after yielding, since the
+        // writer takes one item off the channel before it parks.
+        let noise = json!({ "pad": "x".repeat(8192) });
+        for _ in 0..8 {
+            loop {
+                match conn.try_notify("noise", &noise) {
+                    Ok(()) => {}
+                    Err(AcpError::Transport(msg)) => {
+                        assert_eq!(msg, "writer queue full");
+                        break;
+                    }
+                    Err(e) => panic!("unexpected: {e}"),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if conn.writer_tx.capacity() == 0 {
+                break;
+            }
+        }
+        assert_eq!(conn.writer_tx.capacity(), 0, "writer queue wedged full");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), fut).await;
+        let err = outcome
+            .expect("timed-out call returned within budget")
+            .unwrap_err();
+        assert!(matches!(err, AcpError::Timeout(_)), "got: {err}");
+        assert!(!conn.has_pending_requests(), "slot dropped on timeout");
+    }
+
+    /// A request settled by the peer (here with a JSON-RPC error) sends no
+    /// cancel: only the request itself is on the wire.
+    #[tokio::test]
+    async fn answered_request_sends_no_cancel() {
+        let (conn, c2a_agent, mut a2c_agent) = silent_connection();
+        let mut fut = Box::pin(conn.request_timeout_with_cancel(
+            "tools/call",
+            json!({}),
+            Duration::from_secs(60),
+            cancelled,
+        ));
+        tokio::select! {
+            _ = &mut fut => panic!("request must still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        a2c_agent
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"nope\"}}\n")
+            .await
+            .unwrap();
+        a2c_agent.flush().await.unwrap();
+        let err = fut.await.unwrap_err();
+        assert!(matches!(err, AcpError::Rpc(_)), "got: {err}");
+
+        let mut reader = BufReader::new(c2a_agent);
+        let request = read_json(&mut reader).await;
+        assert_eq!(request["id"], json!(1));
+        let mut extra = String::new();
+        let quiet = tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut extra))
+            .await
+            .is_err();
+        assert!(quiet, "unexpected line after the request: {extra}");
     }
 }

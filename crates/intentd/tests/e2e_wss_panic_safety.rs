@@ -211,6 +211,12 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
     // The guard removes the var on drop, including during unwinding.
     let _env = PanicMethodEnv::set("note.list,events.subscribe");
     let (_srv, port, cfg, _dir) = start_server().await;
+    // The injected panics are caught on this (current-thread runtime) test
+    // thread, so suppress failure-time tempdir retention for the rest of the
+    // test or a passing run leaves a `failed-itd-panic-*` dir behind. A real
+    // failure below still retains `_dir`: the guard is declared after it, so
+    // unwinding drops the guard (which runs the retention) before the TempDir.
+    let _retain = common::suppress_failure_retention();
     let mut ws = connect_ws(port, cfg).await;
 
     // 1) Panicking REQUEST (spawned router path) → -32603 with echoed id.

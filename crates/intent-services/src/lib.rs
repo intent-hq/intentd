@@ -31,13 +31,13 @@ use intent_core::{
     CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
     CommentWire, ContentType, ContextItem, CreatedTaskEntry, Draft, Event, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, LineAttributionAuthor,
-    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitRemoteUrl,
+    LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
-    ProjectType, PullRequestInfo, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
+    ProjectType, PullRequestInfo, ReadAssetResult, RepoRef, SaveAssetResult, ScriptCreateParams,
     SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
     TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
@@ -70,8 +70,9 @@ mod clone_ops;
 mod complete_ops;
 #[cfg(test)]
 mod completion_interception_tests;
+#[cfg(test)]
+mod conditional_write_precedence_tests;
 mod config_watcher;
-mod crdt_notes;
 mod create_progress;
 mod delete_grace;
 mod discovery_cache;
@@ -102,6 +103,7 @@ mod line_attribution;
 mod linear_ops;
 mod model_catalog;
 mod nested_repos;
+mod note_merge;
 pub mod note_ops;
 mod one_shot_acp;
 pub mod pagination;
@@ -144,6 +146,8 @@ mod workspace_status;
 pub mod workspace_vocabulary;
 
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod test_tracing;
 #[cfg(test)]
 mod tests;
@@ -157,6 +161,8 @@ mod v2_1_goldens;
 mod v2_2_goldens;
 #[cfg(test)]
 mod v2_3_goldens;
+#[cfg(test)]
+mod v2_4_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;
@@ -191,12 +197,13 @@ pub use agent_manager::{
 pub use agent_session::SuspendOverlapQuery;
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
-// The individual watcher families are constructed only by `WatcherRegistry`
-// (they now take the crate-private shared-stream hub), so only the registry and
-// the bus/refresher surface leave the crate.
+// The individual watcher families are constructed only by `WatcherRegistry`,
+// so only the registry, the shared-stream hub it and `ConfigWatcher` ride
+// (created by the composition root; intent-hq/intent#4953), and the
+// bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatchHealth,
-    WatchHealthSnapshot, WatcherRegistry,
+    Delivery, EventBus, GitStatusRefresher, SharedWatchHub, Subscription, SubscriptionFilter,
+    WatchHealth, WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
@@ -334,6 +341,12 @@ struct WorkspaceAggregateSnapshot {
     active_hooks: HashSet<WorkspaceId>,
     active_pr_monitors: HashSet<WorkspaceId>,
     monitor_pr_signals: HashMap<WorkspaceId, workspace_status::MonitorPrSignals>,
+    /// PRs persisted on each workspace's secondary git roots
+    /// (`workspace_git_root.pull_requests`): the list's ONE bulk git-root
+    /// read, fed to the displayStatus PR rungs during enrichment and then
+    /// handed to [`Services::merge_external_pull_requests`] for the wire
+    /// `pullRequests` merge. Empty lists are never inserted.
+    git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>>,
     legacy_question_holds: HashSet<AgentId>,
     cow_supported: Option<bool>,
 }
@@ -371,6 +384,30 @@ pub struct Services {
     /// never shows the entry gone before its row exists. Never persisted.
     /// Lock order: this mutex is taken BEFORE `agent_queues`, never after.
     draining_queue_entries: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Queue-entry id of an `agent.sendMessage` into an `Error` session that
+    /// lost the in-flight slot to a worker still holding it
+    /// (intent-hq/intent#4962). The documented recovery for an `Error`
+    /// session is a fresh send, but a send landing between the
+    /// terminal-failure handler's `Error` persist and its slot release is
+    /// parked in the queue — where the STAB-52 gate refuses to redrive it
+    /// and the exiting worker never drains. A send parked behind a
+    /// still-`Active` turn is never recorded: it is an ordinary mid-turn
+    /// queue entry and stays behind the gate if that turn fails. Recorded
+    /// atomically with the enqueue ([`agent_ops::Services::enqueue_recovery_send`]);
+    /// the releasing worker's exit and the send side's post-enqueue probe
+    /// both redrive THAT entry through
+    /// [`agent_ops::Services::claim_parked_recovery_send`], which pops the
+    /// entry and retires the marker INSIDE the in-flight slot claim — the
+    /// marker is the only authorization, never a copy held across awaits.
+    /// Retired by every committed delivery of the entry
+    /// ([`agent_ops::Services::commit_recovery_send_delivery`]) so a marker
+    /// never outlives its send: a context-size requeue restores entries
+    /// under their ORIGINAL ids, and without the clear a marker left by an
+    /// already-delivered send would lift the gate with no fresh send. Lock
+    /// order: `draining_queue_entries` → `agent_queues` → this mutex, all
+    /// nested inside the `AgentManager` `busy` lock when taken from the slot
+    /// claim. Never persisted.
+    parked_recovery_sends: Arc<Mutex<HashMap<AgentId, String>>>,
     /// Serializes [`agent_ops`] queue write-through persists. Each persist
     /// snapshots the live queue *inside* this async lock, so the last write to
     /// the `agent_queue` table always reflects the newest in-memory state — an
@@ -439,7 +476,7 @@ pub struct Services {
     /// `intent_providers::find_npx`; `Some(inner)` pins the result — including
     /// `Some(None)` to simulate a host without npx, which cannot be arranged
     /// hermetically through the real discovery.
-    #[allow(clippy::option_option)] // the nesting IS the no-override vs pinned distinction
+    #[expect(clippy::option_option)] // the nesting IS the no-override vs pinned distinction
     one_shot_npx: Option<Option<PathBuf>>,
     /// Test-only override (milliseconds) for the auto-commit message
     /// generation timeout. Production composition leaves this `None` and the
@@ -672,11 +709,9 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
-    /// Test park seams (monorepo#1180, monorepo#1194) for the `script.*` race
-    /// windows (supervisor pre-registration, `start()` spawn-to-registration).
-    /// All `None` in production wiring; tests inject via the
-    /// `#[cfg(test)]`-only `with_script_supervise_park` /
-    /// `with_script_start_registration_park`.
+    /// Test park seam (monorepo#1180) for the `script.*` supervisor
+    /// pre-registration race window. `None` in production wiring; tests
+    /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
     script_parks: script_ops::ScriptParks,
     /// Test park seam (issue intent-hq/monorepo#1468 follow-up) for the
     /// completion-delivery classify→mark window: parks
@@ -714,6 +749,13 @@ pub struct Services {
     /// inside that window is deterministic. `None` in production wiring;
     /// tests inject via the `#[cfg(test)]`-only `with_wake_archived_park`.
     wake_archived_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seam (intent-hq/intentd#1857) for the `task.update`
+    /// linked-line redirect: parks the first attempt after the line is
+    /// projected from the task read and before the gated parent write, so a
+    /// concurrent task completion + materialization inside that window is
+    /// deterministic. `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_task_update_projection_park`.
+    task_update_projection_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/.secrets.json`); tests inject
@@ -817,17 +859,6 @@ pub struct Services {
     /// service handle observes the same in-flight timers.
     line_attribution_debouncers:
         Arc<Mutex<HashMap<(WorkspaceId, NoteId), tokio::task::AbortHandle>>>,
-    /// Session-only CRDT merge engine for note full-content writes (PROTOCOL
-    /// `note.setContent` / `note.update` with content, §5.2). Ported from the
-    /// reference `CRDTDocumentManager` / `CRDTNotesService` — a yrs `Doc` is
-    /// seeded from the note's stored content on first touch and subsequent
-    /// full-content writes apply a char-level diff inside a yrs transaction;
-    /// the merged text is what the daemon persists, so concurrent writes
-    /// converge instead of last-write-wins. Surgical `note.*` / `task.*`
-    /// mutations invalidate the cached session so the next full-content write
-    /// reseeds from disk. Shared across clones like the other in-memory
-    /// registries.
-    crdt_notes: Arc<crdt_notes::CrdtNoteManager>,
     /// Per-workspace debouncers for `workspace:updated { lastActivity }` event
     /// emission (§10.1). Each write that can move derived `lastActivity`
     /// schedules a trailing-edge debounced emit; rapid bumps coalesce into one
@@ -1085,6 +1116,12 @@ pub struct Services {
     /// lazily by the next `begin`), and the client simply restarts the
     /// upload.
     attachment_uploads: Arc<Mutex<HashMap<String, attachment_upload::AttachmentUploadSession>>>,
+    /// Per-`(workspace, idempotencyKey)` in-flight guard for keyed attachment
+    /// placements (intent-hq/intent#4691): a same-key caller racing the
+    /// first placement waits on the key's lock and then replays the binding
+    /// instead of racing it to the store (whose primary key is the last line
+    /// of defence). Entries are dropped once no caller holds them.
+    attachment_idempotency_inflight: Arc<Mutex<attachment_upload::IdempotencyInflight>>,
     /// In-flight source-side exports (`workspace.export.*`, keyed by
     /// `exportId`): build state + sealed archive + WIP bookkeeping between
     /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
@@ -1151,6 +1188,7 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
+            parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -1202,6 +1240,7 @@ impl Services {
             completion_flip_take_park: None,
             attention_write_park: None,
             wake_archived_park: None,
+            task_update_projection_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -1221,7 +1260,6 @@ impl Services {
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
-            crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
             last_activity_debounce_gen: Arc::new(Mutex::new(0)),
             idle_debouncers: Arc::new(Mutex::new(HashMap::new())),
@@ -1262,6 +1300,7 @@ impl Services {
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
             attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
+            attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
@@ -1857,16 +1896,16 @@ impl Services {
         self
     }
 
-    /// Test seam (monorepo#1194): park `script.start` between spawning the
-    /// supervisor task and taking the registration lock so remove+recreate
-    /// races inside that window are deterministic. Production wiring keeps
-    /// `None` (no parking).
+    /// Test seam (monorepo#4952): park `mark_running` after its eligibility
+    /// check, before the `was_running` marker write and the in-memory flip to
+    /// `running`, so persist-before-observable ordering is testable.
+    /// Production wiring keeps `None` (no parking).
     #[cfg(test)]
-    pub(crate) fn with_script_start_registration_park(
+    pub(crate) fn with_script_mark_running_park(
         mut self,
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
-        self.script_parks.start_registration = Some(park);
+        self.script_parks.mark_running_persist = Some(park);
         self
     }
 
@@ -1931,6 +1970,31 @@ impl Services {
     pub(crate) fn with_wake_archived_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
         self.wake_archived_park = Some(park);
         self
+    }
+
+    /// Test seam (intent-hq/intentd#1857): park the first `task.update`
+    /// attempt between the linked-line projection and the gated parent write
+    /// so a concurrent task completion + materialization inside that window
+    /// is deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_task_update_projection_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.task_update_projection_park = Some(park);
+        self
+    }
+
+    /// Park the first `task.update` attempt before its parent write when the
+    /// test seam is armed (no-op in production wiring and on retries).
+    async fn park_task_update_projection(&self, attempt: usize) {
+        if attempt != 1 {
+            return;
+        }
+        if let Some(park) = &self.task_update_projection_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
     }
 
     /// Test seam: park one selected pending-question marker mutation before it
@@ -2022,8 +2086,8 @@ impl Services {
         self.ac_status_inflight.waiters(workspace_id)
     }
 
-    /// Test-only: rebuild the status cache with a compressed fallback TTL so
-    /// expiry coverage completes in milliseconds.
+    /// Test-only: rebuild the status cache with an explicit fallback TTL
+    /// (expiry coverage advances the paused runtime clock past it).
     #[cfg(test)]
     pub(crate) fn with_git_status_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.git_status_cache = Arc::new(git_status_cache::GitStatusCache::with_ttl(ttl));
@@ -2510,9 +2574,12 @@ impl Services {
 
     /// Load every store-backed list aggregate in a constant number of
     /// statements, then pre-fold the PR and legacy-question projections.
+    /// `include_archived` mirrors the list call's flag so the git-root PR
+    /// bulk read never pays for archived workspaces the list won't return.
     async fn workspace_aggregate_snapshot(
         &self,
         workspace_ids: &[WorkspaceId],
+        include_archived: bool,
     ) -> WorkspaceAggregateSnapshot {
         let (max_note_updated_at, task_stats, sessions, unread, cow_supported) = tokio::join!(
             self.store.max_note_updated_at_by_workspace(workspace_ids),
@@ -2523,12 +2590,14 @@ impl Services {
                 .workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids),
             self.compute_cow_supported(),
         );
-        let (active_hooks, monitors, legacy_question_tails) = tokio::join!(
+        let (active_hooks, monitors, legacy_question_tails, git_roots) = tokio::join!(
             self.store.workspaces_with_active_hooks(workspace_ids),
             self.store
                 .list_display_status_pr_monitors_by_workspaces(workspace_ids),
             self.store
                 .list_legacy_question_tail_candidates_by_workspace(workspace_ids),
+            self.store
+                .list_workspace_git_roots_with_prs(include_archived),
         );
 
         let task_stats = match task_stats {
@@ -2599,6 +2668,25 @@ impl Services {
             .into_iter()
             .map(|(id, monitors)| (id, pr_monitor::fold_monitor_pr_signals(&monitors)))
             .collect();
+        // A read failure degrades to no git-root PRs (the pre-fold
+        // derivation) rather than failing the list.
+        let mut git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>> = HashMap::new();
+        match git_roots {
+            Ok(roots) => {
+                for root in roots {
+                    if let Some(prs) = root.pull_requests.filter(|prs| !prs.is_empty()) {
+                        git_root_prs
+                            .entry(root.workspace_id)
+                            .or_default()
+                            .extend(prs);
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "batch git-root PR read failed; displayStatus derives without git-root PRs"
+            ),
+        }
 
         let sessions_by_agent: HashMap<&AgentId, &AgentSession> = sessions
             .iter()
@@ -2649,6 +2737,7 @@ impl Services {
             active_hooks: active_hooks.unwrap_or_default(),
             active_pr_monitors,
             monitor_pr_signals,
+            git_root_prs,
             legacy_question_holds,
             cow_supported,
         }
@@ -2721,6 +2810,11 @@ impl Services {
                     .get(&ws.id)
                     .copied()
                     .unwrap_or_default(),
+                git_root_prs: snapshot
+                    .git_root_prs
+                    .get(&ws.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
                 legacy_question_holds: &snapshot.legacy_question_holds,
             }),
         )
@@ -2748,45 +2842,54 @@ impl Services {
     /// pool the FE builds after opening a workspace, PROTOCOL §6.9). Purely
     /// an emit-path merge: nothing is persisted, `workspace.pull_requests`
     /// stays daemon-owned, and no forge calls are made (rung 1 of the
-    /// derived-field ladder: two SQL-filtered bulk reads + in-memory merge,
-    /// O(PR-bearing rows) regardless of workspace count; the monitor read is
-    /// the narrow [`intent_store::PrMonitorListEntry`] projection — snapshot
-    /// blobs never hydrate on this path, intent-hq/monorepo#3878). Dedup is by PR
+    /// derived-field ladder: one SQL-filtered monitor bulk read + the
+    /// git-root PRs the caller's aggregate snapshot already bulk-read —
+    /// `git_root_prs`, keyed by workspace, the list's single git-root
+    /// statement — + in-memory merge, O(PR-bearing rows) regardless of
+    /// workspace count; the monitor read is the narrow
+    /// [`intent_store::PrMonitorListEntry`] projection — snapshot blobs
+    /// never hydrate on this path, intent-hq/monorepo#3878). Dedup is by PR
     /// `url` — the one field every source carries that stays unambiguous
     /// across repos — first-wins in source-priority order: workspace's own
-    /// PRs, then git-root PRs, then monitor-derived entries. One exception
-    /// to first-wins: a lower-priority duplicate whose status sits higher
-    /// on the lifecycle ladder (open/draft < closed < merged) upgrades the
-    /// present entry's `status` + `updatedAt` + `isDraft` in place, so a
-    /// stale git-root/workspace entry can never shadow a monitor that
-    /// already saw the PR merge (intent-hq/monorepo#3127). Status only ever
-    /// moves up the ladder: `merged` is irreversible so it wins over
-    /// everything (including a stale `closed`), while `closed` — the
-    /// snapshotless completed-monitor fallback among others — never
-    /// downgrades a `merged` verdict, and reopened-after-close is left to
-    /// the sweep re-fetch. A row with nothing to merge is left untouched (a `None`
+    /// PRs, then git-root PRs, then monitor-derived entries. Identity
+    /// fields always keep the higher-priority entry; the lifecycle fields
+    /// of a duplicate follow the source:
+    /// - a git-root duplicate takes the SAME same-URL rule the
+    ///   `displayStatus` derivation folds git-root PRs with
+    ///   ([`workspace_status::canonicalize_pr_url_copies`]): the copy with
+    ///   the highest (lifecycle rank, `updatedAt`) wins `status` +
+    ///   `updatedAt` + `isDraft` + `mergeable` + `mergeableState` as one
+    ///   coherent snapshot, for the pooled entry AND the linked
+    ///   `activePullRequest`, so the served PR fields can never disagree
+    ///   with `displayStatus` (a merged root copy lifts a stale open linked
+    ///   copy beside `pr_merged`; a newer clean root copy lifts an older
+    ///   draft pooled copy beside `pr_ready`; the result is independent of
+    ///   git-root order). The read-path enrichment already applied this to
+    ///   the workspace-owned copies; re-applying here is idempotent and
+    ///   also covers root-only URLs carried by several roots.
+    /// - a monitor-derived duplicate upgrades only on a strictly higher
+    ///   lifecycle rank (open/draft < closed < merged) — `status` +
+    ///   `updatedAt` + `isDraft` ([`workspace_status::upgrade_pr_lifecycle`]),
+    ///   so a stale git-root/workspace entry can never shadow a monitor that
+    ///   already saw the PR merge (intent-hq/monorepo#3127). Status only
+    ///   ever moves up the ladder: `merged` is irreversible so it wins over
+    ///   everything (including a stale `closed`), while `closed` — the
+    ///   snapshotless completed-monitor fallback among others — never
+    ///   downgrades a `merged` verdict, and reopened-after-close is left to
+    ///   the sweep re-fetch.
+    ///
+    /// A row with nothing to merge is left untouched (a `None`
     /// stays omitted on the wire, and an empty git-root list contributes
     /// nothing rather than materializing `[]`); a store read failure
     /// degrades to serving the base rows. `include_archived` mirrors the
-    /// list call's flag so the bulk reads never pay for archived workspaces
-    /// the list won't return.
+    /// list call's flag so the monitor bulk read never pays for archived
+    /// workspaces the list won't return.
     pub(crate) async fn merge_external_pull_requests(
         &self,
         list: &mut [Workspace],
         include_archived: bool,
+        git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>>,
     ) {
-        use std::collections::HashMap;
-        let roots = match self
-            .store
-            .list_workspace_git_roots_with_prs(include_archived)
-            .await
-        {
-            Ok(roots) => roots,
-            Err(e) => {
-                tracing::warn!(error = %e, "workspace.list: git-root PR read failed; skipping");
-                Vec::new()
-            }
-        };
         let monitors = match self
             .store
             .load_non_cancelled_pr_monitor_list_entries(include_archived)
@@ -2798,118 +2901,51 @@ impl Services {
                 Vec::new()
             }
         };
-        if roots.is_empty() && monitors.is_empty() {
+        if git_root_prs.is_empty() && monitors.is_empty() {
             return;
         }
-        // Group externally sourced PRs per workspace, git-root entries before
-        // monitor-derived ones so the first-wins dedup below encodes the
-        // source priority. Empty lists are skipped so they can't flip an
-        // omitted workspace `pullRequests` into `[]`.
-        let mut extras: HashMap<String, Vec<PullRequestInfo>> = HashMap::new();
-        for root in &roots {
-            if let Some(prs) = &root.pull_requests {
-                if prs.is_empty() {
-                    continue;
-                }
-                extras
-                    .entry(root.workspace_id.0.clone())
-                    .or_default()
-                    .extend(prs.iter().cloned());
-            }
-        }
+        // Group monitor-derived PRs per workspace; they merge after the
+        // git-root entries so the first-wins dedup below encodes the source
+        // priority. The snapshot never carries an empty git-root list, so no
+        // entry here can flip an omitted workspace `pullRequests` into `[]`.
+        let mut git_root_prs = git_root_prs;
+        let mut monitor_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>> = HashMap::new();
         for monitor in &monitors {
-            extras
-                .entry(monitor.workspace_id.0.clone())
+            monitor_prs
+                .entry(monitor.workspace_id.clone())
                 .or_default()
                 .push(pr_monitor::pr_monitor_pr_info(monitor));
         }
-        // Lifecycle-ladder rank: status only ever moves up (open/draft <
-        // closed < merged) — merged is irreversible, closed must never
-        // overwrite it (see the doc comment).
-        let status_rank = |s: intent_core::PullRequestStatus| match s {
-            intent_core::PullRequestStatus::Merged => 2,
-            intent_core::PullRequestStatus::Closed => 1,
-            intent_core::PullRequestStatus::Open | intent_core::PullRequestStatus::Draft => 0,
-        };
         for ws in list.iter_mut() {
-            let Some(candidates) = extras.remove(ws.id.as_str()) else {
+            let roots = git_root_prs.remove(&ws.id).unwrap_or_default();
+            let monitored = monitor_prs.remove(&ws.id).unwrap_or_default();
+            if roots.is_empty() && monitored.is_empty() {
                 continue;
-            };
+            }
             let merged = ws.pull_requests.get_or_insert_with(Vec::new);
-            for info in candidates {
+            for mut info in roots {
+                // The derivation's same-URL step: the linked and pooled
+                // copies of this URL move to the canonical snapshot; a URL
+                // the pool does not carry is appended, itself canonicalized
+                // (it may duplicate the linked `activePullRequest`, and a
+                // URL's copies always agree).
+                let copies = workspace_status::canonicalize_pr_url_copies(
+                    ws.active_pull_request.as_mut(),
+                    merged,
+                    &info,
+                );
+                if !copies.pooled {
+                    workspace_status::canonicalize_pr_lifecycle(&mut info, &copies.canonical);
+                    merged.push(info);
+                }
+            }
+            for info in monitored {
                 match merged.iter_mut().find(|p| p.url == info.url) {
                     None => merged.push(info),
-                    // Status-ladder upgrade: identity/fields keep the
-                    // higher-priority entry, but a lower-priority source
-                    // whose status ranks higher wins the lifecycle fields —
-                    // `isDraft` moves with `status` so an upgraded entry
-                    // never reads merged/closed while still claiming draft.
-                    Some(present) => {
-                        if status_rank(info.status) > status_rank(present.status) {
-                            present.status = info.status;
-                            present.updated_at = info.updated_at;
-                            present.is_draft = info.is_draft;
-                        }
-                    }
+                    Some(present) => workspace_status::upgrade_pr_lifecycle(present, &info),
                 }
             }
         }
-    }
-
-    /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
-    /// `github.com`. Rejects URLs with hosts like `github.com.evil.com`.
-    fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
-        let trimmed = url.trim();
-
-        // HTTPS: extract host from scheme://host/... form.
-        if let Some(rest) = trimmed
-            .strip_prefix("https://")
-            .or_else(|| trimmed.strip_prefix("http://"))
-        {
-            let host_end = rest.find('/').unwrap_or(rest.len());
-            let host = &rest[..host_end];
-            if host != "github.com" {
-                return None;
-            }
-            let path = &rest[host_end..];
-            return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
-        }
-
-        // SSH URL: ssh://[user@]host[:port]/owner/repo(.git) form.
-        if let Some(rest) = trimmed.strip_prefix("ssh://") {
-            let rest = rest.split_once('@').map_or(rest, |(_, r)| r);
-            let host_end = rest.find('/').unwrap_or(rest.len());
-            let host = &rest[..host_end];
-            // Strip a numeric port; a non-numeric suffix stays part of the
-            // host and fails the strict check below.
-            let host = host.split_once(':').map_or(host, |(h, port)| {
-                if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
-                    h
-                } else {
-                    host
-                }
-            });
-            if host != "github.com" {
-                return None;
-            }
-            let path = &rest[host_end..];
-            return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
-        }
-
-        // SSH scp-like: git@host:path form. Extract host before the colon.
-        if let Some(at_idx) = trimmed.find('@') {
-            let after_at = &trimmed[at_idx + 1..];
-            if let Some(colon_idx) = after_at.find(':') {
-                let host = &after_at[..colon_idx];
-                if host != "github.com" {
-                    return None;
-                }
-                let path = &after_at[colon_idx + 1..];
-                return clone_ops::parse_owner_repo(&format!("git@github.com:{path}"));
-            }
-        }
-
-        None
     }
 
     /// Start the one-time repository owner/name backfill after daemon listeners
@@ -2999,11 +3035,11 @@ impl Services {
             intent_git::remote::origin_url(&repo_path)
                 .ok()
                 .flatten()
-                .and_then(|url| Self::parse_github_owner_repo(&url))
+                .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
         })
         .await
         .map_err(|error| Error::Internal(format!("repository metadata probe failed: {error}")))?;
-        let Some((owner, name)) = metadata else {
+        let Some(RepoRef { owner, name }) = metadata else {
             return Ok(());
         };
 
@@ -3458,28 +3494,74 @@ impl Services {
         }
     }
 
-    /// Post-seen-marker settlement of the workspace-level `unread` state
-    /// (§5.1): when advancing a per-agent seen marker (`agent.markSeen`, or
-    /// the `workspace.markSeen` mark-all loop) leaves the workspace with no
-    /// unread top-level session, clear the stored legacy flag and emit ONE
-    /// self-sufficient `workspace:attention-changed { none }` — clients
-    /// clear the blue dot together whether they track the derived or the
-    /// stored flag. The clear is ATOMIC
-    /// ([`intent_store::Store::clear_workspace_unread_if_all_seen`]): the
-    /// guarded UPDATE re-checks the derivation inside the write itself
+    /// Take the [`UnreadSnapshot`] for `workspace_id`: the derivation probe
+    /// plus one primary-key read of the stored flag. Both reads fail CLOSED
+    /// on emission — a probe failure records `derived = false` and a
+    /// stored-flag read failure records `stored_unread = true`, each of
+    /// which keeps the settle's fallback emit off (recording `derived =
+    /// true` on error would be the opposite: a transient probe failure
+    /// followed by a successful post-write fallback would publish a
+    /// spurious `{ none }`). Chief has no attention state and snapshots as
+    /// not-unread.
+    pub(crate) async fn snapshot_workspace_unread(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> UnreadSnapshot {
+        if workspace_id.is_chief() {
+            return UnreadSnapshot {
+                derived: false,
+                stored_unread: true,
+            };
+        }
+        let derived = self
+            .store
+            .workspace_has_unread_top_level_session(workspace_id)
+            .await
+            .unwrap_or(false);
+        let stored_unread = match self.store.get_workspace(workspace_id).await {
+            Ok(ws) => ws.attention == WorkspaceAttention::Unread,
+            Err(_) => true,
+        };
+        UnreadSnapshot {
+            derived,
+            stored_unread,
+        }
+    }
+
+    /// Post-write settlement of the workspace-level `unread` state (§5.1):
+    /// when a write that drops a session out of the unread derivation (a
+    /// per-agent seen-marker advance via `agent.markSeen`, or a retire via
+    /// `agent.retire`) leaves the workspace with no unread top-level
+    /// session, clear the stored legacy flag and emit ONE self-sufficient
+    /// `workspace:attention-changed { none }` — clients clear the blue dot
+    /// together whether they track the derived or the stored flag. The clear
+    /// is ATOMIC ([`intent_store::Store::clear_workspace_unread_if_all_seen`]):
+    /// the guarded UPDATE re-checks the derivation inside the write itself
     /// (`attention = unread AND NOT EXISTS <unread session>`), so an
     /// assistant message landing between the probe below and the write can
     /// never have a freshly-raised unread retired — the write declines and
     /// stays silent (`review_required` is likewise never touched).
-    /// `was_unread` is the derivation observed before the marker write; a
-    /// still-unread workspace (other sessions pending) is a silent no-op, so
-    /// partial reads never emit. Best-effort: a probe failure fails closed
+    ///
+    /// `before` is the [`UnreadSnapshot`] taken before the caller's write.
+    /// A still-unread workspace (other sessions pending) is a silent no-op,
+    /// so partial reads never emit. Exact-once: when the stored flag WAS
+    /// `unread` at snapshot time, only the settle whose guarded clear
+    /// affects the row emits — a concurrent settle (two sessions retired or
+    /// read at once) finds the clear declined and stays silent, since the
+    /// winner already emitted (or a fresh raise re-armed the flag and
+    /// reads serve `unread` again). The fallback emit below exists for the
+    /// other case only — the derivation read unread while the stored flag
+    /// was ALREADY clear (a skipped turn-end raise, a dropped store write),
+    /// so no clear can ever affect a row and clients tracking the derived
+    /// value would never get their `{ none }`; two concurrent settles of
+    /// such an unflagged workspace can both take it (the emit is
+    /// idempotent for clients). Best-effort: a probe failure fails closed
     /// (no emit we cannot confirm) and a write failure skips the settle —
-    /// the marker write is the contract; reads re-derive.
+    /// the caller's write is the contract; reads re-derive.
     pub(crate) async fn settle_workspace_unread_after_seen(
         &self,
         workspace_id: &WorkspaceId,
-        was_unread: bool,
+        before: UnreadSnapshot,
     ) {
         if workspace_id.is_chief() {
             return;
@@ -3509,7 +3591,7 @@ impl Services {
             .await;
             return;
         }
-        if was_unread {
+        if before.derived && !before.stored_unread {
             // The derivation transitioned while the stored flag was already
             // clear (e.g. a turn-end raise was skipped, or a store error
             // dropped it): the read paths were serving derived `unread`, so
@@ -3517,7 +3599,11 @@ impl Services {
             // the dot (it wins on reads; emitting `none` would wrongly
             // retire it), or the derivation flipped back to unread in the
             // park gap (a new assistant message landed; emitting `none`
-            // would contradict what reads now serve).
+            // would contradict what reads now serve). A stored `unread` at
+            // snapshot time never takes this branch: the declined clear
+            // means a concurrent settle already cleared-and-emitted (or a
+            // fresh raise re-armed the flag) — emitting again would
+            // duplicate the `{ none }`.
             let derived_unread = self
                 .store
                 .workspace_has_unread_top_level_session(workspace_id)
@@ -3937,8 +4023,9 @@ impl Services {
 
     /// Override the auto-commit message generation timeout (defaults to the
     /// ~30s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
-    /// the timeout-fallback path completes in milliseconds.
-    #[cfg(test)]
+    /// the timeout-fallback path completes in milliseconds. Its only callers
+    /// spawn a fake CLI via a shell script, so they (and it) are unix-only.
+    #[cfg(all(test, unix))]
     pub(crate) fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
         self.auto_commit_timeout_ms = Some(ms);
         self
@@ -4073,7 +4160,10 @@ impl Services {
     /// persisted as supplied; on merge the existing value is always retained
     /// (the store upsert never touches the column). Returns the stored row.
     /// Callers (the `ws.git.registerRoot` MCP binding, submodule
-    /// auto-detection) validate the path before reaching this.
+    /// auto-detection) validate the path before reaching this. A fresh
+    /// insert that already carries PR data feeds the displayStatus
+    /// derivation, so it routes through the transition-only recompute
+    /// (a merge never touches the PR columns, so it cannot move the rung).
     pub(crate) async fn register_git_root(
         &self,
         root: &intent_core::WorkspaceGitRoot,
@@ -4089,12 +4179,18 @@ impl Services {
             git_root_changed_event(event_type, &stored),
         )
         .await;
+        if inserted && git_root_carries_pr_data(&stored) {
+            self.maybe_emit_display_status_changed(&stored.workspace_id)
+                .await;
+        }
         Ok(stored)
     }
 
     /// Delete a workspace git root and emit `gitRoot:unregistered`
     /// (monorepo#2053). `NotFound` when the id is unknown. Used by the
     /// `ws.git.unregisterRoot` MCP binding and the auto-prune sweep.
+    /// Removing a PR-bearing root can lapse the displayStatus PR rung, so
+    /// that case routes through the transition-only recompute.
     pub(crate) async fn unregister_git_root(&self, git_root_id: &WorkspaceGitRootId) -> Result<()> {
         let root = self.store.get_workspace_git_root(git_root_id).await?;
         self.store.delete_workspace_git_root(git_root_id).await?;
@@ -4103,6 +4199,10 @@ impl Services {
             git_root_unregistered_event(&root.workspace_id, &root.id, &root.path),
         )
         .await;
+        if git_root_carries_pr_data(&root) {
+            self.maybe_emit_display_status_changed(&root.workspace_id)
+                .await;
+        }
         Ok(())
     }
 
@@ -4188,8 +4288,8 @@ impl Services {
                 .ok()
                 .and_then(std::result::Result::ok)
                 .flatten()
-                .and_then(|url| Self::parse_github_owner_repo(&url))
-                .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+                .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+                .map_or((None, None), |r| (Some(r.owner), Some(r.name)));
                 // Stamp the root's HEAD at registration time (fail-soft:
                 // unreadable HEAD ⇒ NULL, backfilled by a later sweep pass).
                 let registered_commit_sha = Self::read_git_root_head_sha(&canonical).await;
@@ -4391,17 +4491,19 @@ impl Services {
     /// [`PR_REFRESH_FETCH_TIMEOUT`] wrap, never RPC-time.
     ///
     /// Persists via the scoped `update_workspace_git_root_pr` and emits
-    /// `gitRoot:updated` once, only on change.
+    /// `gitRoot:updated` once, only on change. A persisted change also routes
+    /// through the transition-only displayStatus recompute, so a root PR
+    /// merging (or opening) regroups the sidebar live instead of waiting for
+    /// the next `workspace.list`.
     async fn refresh_git_root_pr(
         &self,
         mut root: intent_core::WorkspaceGitRoot,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
         use pr_ops::PrRefreshOutcome;
-        let (Some(owner), Some(name)) = (root.repo_owner.clone(), root.repo_name.clone()) else {
+        let Some(repo_ref) = root.repo() else {
             return Ok(PrRefreshOutcome::Skipped);
         };
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, name);
         // The live HEAD read is git I/O (roots may live on network/FUSE
         // mounts), so it runs on the blocking pool — never inline on the
         // runtime.
@@ -4567,6 +4669,8 @@ impl Services {
                 git_root_changed_event(GIT_ROOT_UPDATED, &root),
             )
             .await;
+            self.maybe_emit_display_status_changed(&root.workspace_id)
+                .await;
         }
         // A relink discovery or heal re-fetch that hit the forge quota
         // surfaces AFTER the delta persist (the paid-for snapshots land)
@@ -4645,10 +4749,9 @@ impl Services {
         if ws.is_remote || ws.archived {
             return Ok(PrRefreshOutcome::Skipped);
         }
-        let Ok((owner, repo)) = pr_ops::repo_of(&ws) else {
+        let Ok(repo_ref) = pr_ops::repo_of(&ws) else {
             return Ok(PrRefreshOutcome::Skipped);
         };
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         if let Some(number) = ws.pr_number {
             let pr = sc
@@ -4927,31 +5030,6 @@ impl Services {
                 ticker.tick().await;
                 services.refresh_all_workspace_prs(tick).await;
                 tick = tick.wrapping_add(1);
-            }
-        })
-    }
-
-    /// Spawn the CRDT session-sweeper loop (A5, reference parity with the
-    /// `CRDTNotesService` idle sweep): every [`crdt_notes::SESSION_SWEEP_INTERVAL`]
-    /// tick, drop cached `yrs` docs whose last access is older than
-    /// [`crdt_notes::SESSION_IDLE_TIMEOUT`] so long-lived daemons do not hold
-    /// per-note session state indefinitely. The first sweep runs after one
-    /// interval; missed ticks are skipped (no pile-up). Returns the task handle
-    /// so the composition root can hold/abort it.
-    #[must_use]
-    pub fn spawn_crdt_session_sweep_loop(&self) -> tokio::task::JoinHandle<()> {
-        let crdt_notes = self.crdt_notes.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(crdt_notes::SESSION_SWEEP_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Consume the immediate first tick so the loop waits one interval.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                let removed = crdt_notes.sweep_stale(crdt_notes::SESSION_IDLE_TIMEOUT);
-                if removed > 0 {
-                    tracing::info!(removed, "crdt session sweep evicted stale sessions");
-                }
             }
         })
     }
@@ -7476,7 +7554,7 @@ impl Services {
     /// indefinitely; the retry replays the advisory-allowed delivery pass
     /// and the stable message id keeps every attempt idempotent. `grouped`
     /// (STAB-160 shape when `true`) only picks the wake's trailer wording.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn deliver_monitoring_idle_advisory(
         &self,
         child_id: &AgentId,
@@ -8682,7 +8760,8 @@ async fn fetch_note(store: &Store, workspace_id: &WorkspaceId, note_id: &NoteId)
 }
 
 /// Author stamp for daemon-internal note-version writes (the workspace-seed
-/// spec note snapshot). All user- and agent-originated writes resolve the
+/// spec note snapshot, `workspace.duplicate` note copies, linked-checkbox
+/// materialization). All user- and agent-originated writes resolve the
 /// author from the caller instead (see [`resolve_note_version_author`]).
 fn system_version_author() -> NoteVersionAuthor {
     NoteVersionAuthor {
@@ -8733,17 +8812,342 @@ async fn resolve_note_version_author(
     }
 }
 
-/// Append a full-snapshot version of `note`'s *current* (post-mutation) state,
-/// stamped with `author` and the note's `updated_at` (PROTOCOL §5.2
-/// version-history extensions). The store prunes to the newest 50 on append.
-async fn capture_note_version(
+/// Insert a new note row and its initial version snapshot (at `note.rev`,
+/// stamped with `author` and the note's `updated_at`) in one store transaction
+/// ([`Store::insert_note_with_version`]): the fresh row is never visible while
+/// its rev has no recoverable base, so a writer that reads the new note and
+/// later sends that rev as a stale base merges from the initial content
+/// instead of degrading to last-writer-wins (PROTOCOL §5.2 version-history
+/// extensions). Every note insert goes through here. Returns the version
+/// number.
+async fn persist_new_note(store: &Store, note: &Note, author: &NoteVersionAuthor) -> Result<i64> {
+    store
+        .insert_note_with_version(note, author, &note.updated_at)
+        .await
+}
+
+/// Persist a note content write and its version snapshot in one store
+/// transaction ([`Store::update_note_with_version`]): the row's new `rev` and
+/// the snapshot that makes it a recoverable merge base become visible
+/// together, so no concurrent writer can read the new rev and resolve it to
+/// the previous content, and a snapshot can never land out of rev order.
+/// Every persisted content *update* goes through here; inserts commit row and
+/// snapshot together via [`persist_new_note`]. Gated on `expected_version`
+/// when `Some` (`Conflict` on a mismatch, like
+/// [`Store::update_note_versioned`]). Returns the post-write `rev`.
+async fn persist_note_content(
     store: &Store,
     note: &Note,
+    expected_version: Option<i64>,
     author: &NoteVersionAuthor,
 ) -> Result<i64> {
     store
-        .append_note_version(note, author, &note.updated_at)
+        .update_note_with_version(note, expected_version, author, &note.updated_at)
         .await
+        .map(|(rev, _)| rev)
+}
+
+/// [`persist_new_note`] with the daemon-internal system author, for
+/// noninteractive note inserts that live outside this crate (the `intentd`
+/// importers). Imported notes are loaded by clients like any other, so their
+/// initial `rev` must be a recoverable base too — the row and its snapshot
+/// commit together.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the insert or the version append fails.
+pub async fn persist_system_new_note(store: &Store, note: &Note) -> Result<i64> {
+    persist_new_note(store, note, &system_version_author()).await
+}
+
+/// [`persist_note_content`] with the daemon-internal system author and no
+/// `expectedVersion` gate, for noninteractive full-note *updates* outside this
+/// crate (the `intentd` importers re-writing an existing note). The row and
+/// its snapshot commit together, so an imported rev is never visible while
+/// its base still resolves to the previous content. Returns the post-write
+/// `rev`.
+///
+/// # Errors
+///
+/// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the write fails.
+pub async fn persist_system_note_content(store: &Store, note: &Note) -> Result<i64> {
+    persist_note_content(store, note, None, &system_version_author()).await
+}
+
+/// Bounded read-merge-persist attempts for `note.setContent`: on a store
+/// `Conflict` (another versioned write landed between the fetch and the
+/// persist) the loop re-fetches and re-merges against the new current; the
+/// last attempt's `Conflict` propagates unchanged.
+const SET_CONTENT_MAX_ATTEMPTS: usize = 5;
+
+/// Text `note.setContent` persists for one attempt, plus the baseline the
+/// reduction guard is measured against.
+struct SetContentMerge {
+    /// Content to clean and persist.
+    text: String,
+    /// The writer's base when `expected_version` was stale and its snapshot
+    /// was recoverable; `None` on the exact / LWW paths (guard measures
+    /// current → incoming).
+    base: Option<String>,
+    outcome: &'static str,
+    conflicting_spans: usize,
+    /// Checkbox lines whose conflicting marker was collapsed back to one
+    /// valid marker after the merge (intent-hq/intent#4930).
+    repaired_markers: usize,
+}
+
+/// Resolve what a `note.setContent` write persists on top of the stored
+/// `current` row. An absent or matching `expected_version` is the exact path
+/// (`incoming` replaces the current text). A stale `expected_version` (below
+/// `current.rev`) recovers the writer's base via
+/// [`Store::get_note_version_content_by_rev`] and applies the writer's intent
+/// onto the current text with [`note_merge::three_way_merge`]; when no
+/// snapshot survives for that rev the write degrades to honest
+/// last-writer-wins. Only revs that could have been read merge: an
+/// `expected_version` above `current.rev` was never served by this note, so
+/// it is the plain optimistic-concurrency mismatch (`Error::Conflict`,
+/// `-32005`) rather than a base to merge from.
+async fn merge_set_content(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    current: &Note,
+    incoming: &str,
+    expected_version: Option<i64>,
+) -> Result<SetContentMerge> {
+    let stale = match expected_version {
+        Some(v) if v > current.rev => {
+            let current = serde_json::to_value(current)
+                .map_err(|e| Error::Internal(format!("encode current note failed: {e}")))?;
+            return Err(Error::Conflict { current });
+        }
+        Some(v) if v < current.rev => v,
+        _ => {
+            return Ok(SetContentMerge {
+                text: incoming.to_string(),
+                base: None,
+                outcome: "exact",
+                conflicting_spans: 0,
+                repaired_markers: 0,
+            })
+        }
+    };
+    let current = current.content.as_str();
+    match store
+        .get_note_version_content_by_rev(workspace_id, note_id, stale)
+        .await?
+    {
+        Some(base) => {
+            let merged = note_merge::three_way_merge(&base, current, incoming);
+            // Only a conflicting span can concatenate two marker variants;
+            // clean merges persist the merged text verbatim, and the repair
+            // is scoped to the spans that actually conflicted.
+            let (text, repaired_markers) = if merged.conflicting_spans > 0 {
+                note_merge::repair_checkbox_markers(&merged.text, &merged.conflict_ranges)
+            } else {
+                (merged.text, 0)
+            };
+            Ok(SetContentMerge {
+                text,
+                base: Some(base),
+                outcome: "merged",
+                conflicting_spans: merged.conflicting_spans,
+                repaired_markers,
+            })
+        }
+        None => Ok(SetContentMerge {
+            text: incoming.to_string(),
+            base: None,
+            outcome: "lww-no-base",
+            conflicting_spans: 0,
+            repaired_markers: 0,
+        }),
+    }
+}
+
+/// `note.setContent` reduction guard: reject an unconfirmed write whose
+/// `incoming` text is more than 50 % shorter than `baseline` (the writer's
+/// base when known, else the stored current).
+fn check_set_content_reduction(
+    baseline: &str,
+    incoming: &str,
+    confirm_replacement: bool,
+) -> Result<()> {
+    if baseline.is_empty() || confirm_replacement {
+        return Ok(());
+    }
+    // Note sizes are far below 2^53 (loss-free in f64); the rounded
+    // percentage is in [0, 100] so the float→int cast is exact.
+    #[expect(clippy::cast_precision_loss)]
+    let old_len = baseline.chars().count() as f64;
+    #[expect(clippy::cast_precision_loss)]
+    let new_len = incoming.chars().count() as f64;
+    let reduction = (old_len - new_len) / old_len * 100.0;
+    if reduction > 50.0 {
+        // The rounded percentage is in (50, 100]: exact in i64.
+        #[expect(clippy::cast_possible_truncation)]
+        let reduction_pct = reduction.round() as i64;
+        return Err(Error::Internal(format!(
+            "⚠️ CONTENT REDUCTION DETECTED: Your new content ({} chars) is {}% shorter than the existing content ({} chars).\n\nThis will REPLACE the entire note. If you intended to:\n- ADD content: Use note.add instead\n- EDIT a section: Use note.edit instead\n- PROCEED with replacement: Call note.setContent again with confirmReplacement=true",
+            incoming.chars().count(),
+            reduction_pct,
+            baseline.chars().count()
+        )));
+    }
+    Ok(())
+}
+
+/// How [`persist_merged_content`] turns one attempt's merged text into the
+/// text it persists.
+#[derive(Clone, Copy)]
+enum ContentWritePolicy {
+    /// `note.setContent`: the set-content normalizer runs once on the
+    /// writer's text before any merge, then each attempt applies the
+    /// reduction guard (measured against the writer's base when known, else
+    /// the stored current) and validates the merged text before persisting.
+    SetContent { confirm_replacement: bool },
+    /// `note.add` / `note.edit` / `note.editLines`: the surgical transform
+    /// already ran against the content the caller read; the merged text
+    /// persists verbatim.
+    Surgical,
+}
+
+/// One persisted content write from [`persist_merged_content`].
+struct MergedContentWrite {
+    /// The note as persisted (`content` / `updated_at` are the written
+    /// values; `rev` is the pre-write rev the last attempt read — use `rev`).
+    note: Note,
+    /// The stored content the final attempt replaced.
+    old_content: String,
+    /// The persisted content (post-clean, post-reanchor).
+    content: String,
+    /// `updated_at` stamped on the write.
+    now: String,
+    /// Post-write rev.
+    rev: i64,
+}
+
+/// One client content write for [`persist_merged_content`].
+struct ContentWrite<'a> {
+    /// A row the caller already fetched: attempt 1 reuses it instead of
+    /// re-reading.
+    seed: Option<Note>,
+    /// The text the writer wants persisted (for surgical ops, the transform's
+    /// result against the `seed` content).
+    incoming: &'a str,
+    /// The rev the writer's `incoming` is based on (`None`: unconditional);
+    /// surgical callers pass the rev of their `seed` read.
+    expected_version: Option<i64>,
+    policy: ContentWritePolicy,
+    author: &'a NoteVersionAuthor,
+    /// Method label for the merge trace.
+    op: &'static str,
+}
+
+/// Read-merge-persist loop every client content write runs through
+/// (`note.setContent` and the surgical `note.add` / `note.edit` /
+/// `note.editLines`): each attempt fetches the current row, resolves what to
+/// persist with [`merge_set_content`] (`incoming` verbatim when
+/// `expected_version` is absent or matches the current rev; when it is below
+/// the current rev, the writer's intent three-way-merged onto the current text
+/// from the snapshot at `expected_version`, degrading to last-writer-wins when
+/// no snapshot survives; when it is above the current rev, `Conflict` without
+/// a write), applies `policy`, runs comment-anchor recovery, and persists
+/// gated on the rev it read via [`persist_note_content`] — so a write that
+/// lands in between is merged into on the next attempt rather than
+/// overwritten. The last attempt's `Conflict` propagates unchanged.
+///
+/// The `SetContent` cleaner is split around the merge: normalization
+/// (quote strip, JSON-value extraction) runs on `incoming` once, before any
+/// merge, so the merge (and the checkbox repair) sees the shape that will
+/// persist — a quoted payload no longer hides a bullet behind its quote —
+/// while current text that legitimately starts with a quote is not stripped
+/// by someone else's write. Validation (empty / truncated) runs on the
+/// merged text of each attempt, since a zero-conflict merge of two partial
+/// deletions can empty a note neither side emptied.
+async fn persist_merged_content(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    write: ContentWrite<'_>,
+) -> Result<MergedContentWrite> {
+    let ContentWrite {
+        mut seed,
+        incoming,
+        expected_version,
+        policy,
+        author,
+        op,
+    } = write;
+    let normalized;
+    let merge_input = match policy {
+        ContentWritePolicy::SetContent { .. } => {
+            normalized = note_ops::normalize_set_content(incoming);
+            normalized.as_str()
+        }
+        ContentWritePolicy::Surgical => incoming,
+    };
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut note = match seed.take() {
+            Some(note) => note,
+            None => fetch_note_peer(store, workspace_id, note_id).await?,
+        };
+        let old_content = note.content.clone();
+        let current_rev = note.rev;
+        let merge = merge_set_content(
+            store,
+            workspace_id,
+            note_id,
+            &note,
+            merge_input,
+            expected_version,
+        )
+        .await?;
+        if let ContentWritePolicy::SetContent {
+            confirm_replacement,
+        } = policy
+        {
+            check_set_content_reduction(
+                merge.base.as_deref().unwrap_or(&old_content),
+                incoming,
+                confirm_replacement,
+            )?;
+            note_ops::validate_set_content(&merge.text)?;
+        }
+        let text = merge.text;
+        tracing::debug!(
+            note = %note_id.0,
+            op,
+            attempt,
+            current_rev,
+            expected_version,
+            outcome = merge.outcome,
+            conflicting_spans = merge.conflicting_spans,
+            repaired_markers = merge.repaired_markers,
+            "note content merge"
+        );
+        let mut plan = reanchor_note_comments(store, workspace_id, note_id, text).await?;
+        let content = std::mem::take(&mut plan.content);
+        note.content = content.clone();
+        let now = now_iso();
+        note.updated_at = now.clone();
+        match persist_note_content(store, &note, Some(current_rev), author).await {
+            Ok(rev) => {
+                plan.apply_orphaned(store, workspace_id).await?;
+                return Ok(MergedContentWrite {
+                    note,
+                    old_content,
+                    content,
+                    now,
+                    rev,
+                });
+            }
+            Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Comment anchor recovery pass, called by every note-content mutation before
@@ -8756,8 +9160,9 @@ async fn capture_note_version(
 /// Returns a [`ReanchorPlan`]: the possibly-rewritten markdown plus the set
 /// of comments whose `is_orphaned` flag needs to be flipped to `true`.
 /// Already-orphaned comments are left as-is. The plan does **no** store
-/// writes — callers apply the note-content change first via `update_note`
-/// and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
+/// writes — callers first persist the note-content change via an atomic
+/// versioned write (`persist_note_content` / the `*_with_version` store
+/// helpers) and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
 /// cannot leave comment rows flagged orphaned while the persisted markdown
 /// still contains the original anchors.
 ///
@@ -9059,6 +9464,36 @@ impl Services {
         }
     }
 
+    /// The caller-aware terminal guard predicate: `true` when moving `task`
+    /// (the note `note_id`) to `next` must be refused — the task is already
+    /// `complete` / `cancelled`, `next` differs, and `caller` is the task's
+    /// OWN linked agent (in its `assignedAgentIds`, or the agent whose session
+    /// `task_note_id` names the task). `None` caller and every other agent
+    /// are never blocked.
+    async fn terminal_guard_blocks(
+        &self,
+        task: &TaskMetadata,
+        note_id: &NoteId,
+        next: TaskStatus,
+        caller: Option<&AgentId>,
+    ) -> bool {
+        if task.status == next
+            || !matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled)
+        {
+            return false;
+        }
+        let Some(agent_id) = caller else {
+            return false;
+        };
+        task.assigned_agent_ids.contains(agent_id)
+            || self
+                .store
+                .get_agent_session(agent_id)
+                .await
+                .ok()
+                .is_some_and(|s| s.task_note_id.as_ref() == Some(note_id))
+    }
+
     /// Write a task note's metadata status — the single implementation behind
     /// `task.updateNoteStatus` and the checkbox-level writes (`task.updateStatus`
     /// / `task.update`) redirected from a linked line (intent-hq/intent#4255).
@@ -9066,6 +9501,21 @@ impl Services {
     /// ready-task set, re-announces dependents across the complete boundary
     /// and probes the displayStatus rollup; either way it then materializes
     /// the status char onto every line linking the task.
+    ///
+    /// Caller-aware terminal guard: when the task is already `complete` /
+    /// `cancelled` and the caller is the task's OWN linked agent (session
+    /// `task_note_id` names the task, or the agent is in the task's
+    /// `assignedAgentIds`), a move to a different status is refused as a
+    /// no-op — the result echoes the unchanged task plus `advisory` and none
+    /// of the task's own events (`task:status-changed`,
+    /// `task:ready-tasks-changed`, dependent `note:updated`) fire. The
+    /// checkbox materialization still runs, so a linked line whose marker
+    /// had drifted from the terminal status is healed with one parent write
+    /// and its `note:updated`; an already-correct marker stays untouched. Every
+    /// other caller (unlinked agent, the caller-less router path) is
+    /// unaffected. [`Self::terminal_guard_blocks`] is the predicate; the
+    /// `task.update` redirect consults it before its parent write so the
+    /// line projects the status this write actually leaves.
     pub(crate) async fn set_task_note_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -9083,11 +9533,34 @@ impl Services {
             ));
         };
         let previous_status = task.status;
+        if self
+            .terminal_guard_blocks(&task, &note.id, new_status, caller_agent_id.as_ref())
+            .await
+        {
+            let word = match previous_status {
+                TaskStatus::Cancelled => "cancelled",
+                _ => "complete",
+            };
+            self.materialize_linked_checkboxes(&note.workspace_id, &note.id)
+                .await;
+            return Ok(TaskUpdateNoteStatusResult {
+                ok: true,
+                note_id: note.id.clone(),
+                status: previous_status,
+                note,
+                advisory: Some(format!(
+                    "Task is {word}; a task's own linked agent cannot reopen it. \
+                     Ask the coordinator or user to reopen the task if more work is needed."
+                )),
+            });
+        }
         let now = now_iso();
         apply_status_transition(&mut task, new_status, &now);
         note.metadata.task = Some(task);
         note.updated_at = now.clone();
-        store.update_note_versioned(&note, expected_version).await?;
+        store
+            .update_note_metadata_versioned(&note, expected_version)
+            .await?;
         // Mirror `notes.service.ts`: emit only when the status actually changed.
         let all = if previous_status == new_status {
             None
@@ -9175,17 +9648,8 @@ impl Services {
             note_id: note.id.clone(),
             status: new_status,
             note,
+            advisory: None,
         })
-    }
-
-    /// Drop any cached CRDT session for `(workspace, note)` after a surgical
-    /// content mutation (`note.add` / `note.edit` / `note.editLines`,
-    /// `task.updateStatus` / `task.update`, `note.restoreVersion`,
-    /// `note.convertBlocks`, `comment.add`) writes directly to storage. The
-    /// next full-content write (`note.setContent`) will reseed the yrs doc
-    /// from the fresh persisted content so the merge baseline stays coherent.
-    pub(crate) fn invalidate_crdt_note(&self, workspace_id: &WorkspaceId, note_id: &NoteId) {
-        self.crdt_notes.invalidate(workspace_id, note_id);
     }
 }
 
@@ -9266,9 +9730,8 @@ async fn ensure_spec_note(
         rev: 0,
         updated_at: now,
     };
-    store.insert_note(&note).await?;
     // Workspace-seed spec is daemon-internal; no caller agent applies.
-    capture_note_version(store, &note, &system_version_author()).await?;
+    persist_new_note(store, &note, &system_version_author()).await?;
     publish_event(
         bus,
         note_change_event(
@@ -9336,18 +9799,20 @@ async fn sibling_workspace_or_throw(
 }
 
 /// Normalized GitHub `(owner, name)` for sibling matching: both parts
-/// non-empty, lowercased (GitHub owner/repo names are case-insensitive), with a
-/// trailing `.git` stripped from the lowercased name so `INTENT.GIT` matches
-/// `intent`. `None` when the workspace has no complete GitHub identity
-/// (local-only repo, or not yet backfilled).
+/// non-empty, case-folded through the [`intent_sourcecontrol::RepoRef`]
+/// identity (GitHub owner/repo names are case-insensitive), with a trailing
+/// `.git` stripped from the folded name so `INTENT.GIT` matches `intent`.
+/// `None` when the workspace has no complete GitHub identity (local-only
+/// repo, or not yet backfilled).
 fn github_repository_identity(ws: &Workspace) -> Option<(String, String)> {
-    let owner = ws.repository_owner.as_deref()?.trim().to_ascii_lowercase();
-    let name = ws.repository_name.as_deref()?.trim().to_ascii_lowercase();
-    let name = name.strip_suffix(".git").unwrap_or(&name);
+    let (owner, name) = ws.repo()?.identity_parts();
+    let owner = owner.trim();
+    let name = name.trim();
+    let name = name.strip_suffix(".git").unwrap_or(name);
     if owner.is_empty() || name.is_empty() {
         return None;
     }
-    Some((owner, name.to_string()))
+    Some((owner.to_string(), name.to_string()))
 }
 
 fn nonempty_repository_path(ws: &Workspace) -> Option<&str> {
@@ -9394,6 +9859,34 @@ fn number_lines(content: &str) -> String {
 /// Fresh v4 uuid string for an agent-authored primitive id (TS `uuidv4()`).
 fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// `file.getAttachmentInfo` result for one registry row (PROTOCOL §5.9):
+/// `{ attachmentId, fileName, mimeType?, size, uploadedAt, path, exists }`.
+/// `exists` reflects the file on disk NOW (the user may have deleted it
+/// out-of-band); resolved against the canonical workspace root, never a
+/// sandbox, with the same within-root containment guard as the copy path —
+/// a tampered `stored_path` must not probe file existence outside the store.
+async fn attachment_info_result(
+    store: &Store,
+    record: &intent_store::AttachmentRecord,
+) -> serde_json::Value {
+    let root = file_ops::resolve_root(store, &record.workspace_id, None).await;
+    let exists = !root.is_empty()
+        && file_ops::resolve_attachment_source(&root, &record.stored_path)
+            .is_ok_and(|p| p.is_file());
+    let mut result = serde_json::json!({
+        "attachmentId": record.id,
+        "fileName": record.file_name,
+        "size": record.size,
+        "uploadedAt": record.uploaded_at,
+        "path": record.stored_path,
+        "exists": exists,
+    });
+    if let Some(mime) = &record.mime_type {
+        result["mimeType"] = serde_json::json!(mime);
+    }
+    result
 }
 
 /// Whitespace-only strings collapse to `None` (TS truthy-string parity for
@@ -9517,11 +10010,28 @@ async fn append_primitive(
     block_type: &str,
     primitive_id: &str,
 ) -> Result<serde_json::Value> {
-    let mut note = fetch_note_peer(store, workspace_id, note_id).await?;
-    let new_content = primitive_ops::append_block(&note.content, primitive, block_type);
-    note.content = new_content.clone();
-    note.updated_at = now_iso();
-    store.update_note(&note).await?;
+    let note = fetch_note_peer(store, workspace_id, note_id).await?;
+    let incoming = primitive_ops::append_block(&note.content, primitive, block_type);
+    let read_rev = note.rev;
+    let author = user_version_author();
+    let MergedContentWrite {
+        note,
+        content: new_content,
+        ..
+    } = persist_merged_content(
+        store,
+        workspace_id,
+        note_id,
+        ContentWrite {
+            seed: Some(note),
+            incoming: &incoming,
+            expected_version: Some(read_rev),
+            policy: ContentWritePolicy::Surgical,
+            author: &author,
+            op: "primitive.append",
+        },
+    )
+    .await?;
     publish_event(
         bus,
         note_change_event(
@@ -9884,13 +10394,13 @@ fn note_to_workspace_task(
 /// root agents. `isBackground` (monorepo#3789) carries the session's persisted
 /// `is_background` flag (the value surfaced as `metadata.isBackground` on
 /// full agent loads), omitted for foreground agents. Soft-deleted sessions
-/// (`AgentStatus::Deleted`) are excluded from `count`/`agents`/`agentIds` so
-/// clients never render deleted rows (mirrors the
-/// `workspace_attention_signals` filter).
+/// (`AgentStatus::Deleted`) and soft-retired sessions (`retired_at` set) are
+/// excluded from `count`/`agents`/`agentIds` so clients never render deleted
+/// or retired rows (mirrors the `workspace_attention_signals` filter).
 fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
     let live: Vec<&AgentSession> = sessions
         .iter()
-        .filter(|s| s.status != intent_core::AgentStatus::Deleted)
+        .filter(|s| s.status != intent_core::AgentStatus::Deleted && s.retired_at.is_none())
         .collect();
     let agents: Vec<WorkspaceAgentInfo> = live
         .iter()
@@ -10300,13 +10810,10 @@ fn assert_hermetic_root_absent() {
 /// workspace's agent streams and file paths with the new one's).
 async fn derive_workspace_id(
     store: &Store,
-    input: &WorkspaceCreate,
+    initial_prompt: Option<&str>,
     workspaces_root: &Path,
 ) -> WorkspaceId {
-    let base = input
-        .initial_agent
-        .as_ref()
-        .and_then(|a| a.prompt.as_deref())
+    let base = initial_prompt
         .and_then(intent_core::slug::extract_local_slug)
         .unwrap_or_else(intent_core::slug::generate_workspace_slug);
     let candidate = WorkspaceId::from_string(base.clone());
@@ -10369,6 +10876,7 @@ fn write_workspace_metadata_file(root: &Path, ws: &Workspace) -> Result<()> {
 /// `"repo"` fallback.
 pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
     let mut slug = String::new();
+    // repo-slug-fold: allow — folder-name slugifier, not repo identity
     for c in repo_name.chars().flat_map(char::to_lowercase) {
         if slug.len() >= 50 {
             break;
@@ -10644,6 +11152,37 @@ fn validate_context_links(links: Option<&[intent_core::ContextLink]>) -> Result<
         }
     }
     Ok(())
+}
+
+impl Services {
+    /// The request-shape `-32602` (`InvalidParams`) producers of
+    /// `workspace.create` that are not agent-create planning. `create_workspace`
+    /// calls this once at the top of its idempotency closure — BEFORE the
+    /// first store write, worktree provisioning, or event publish:
+    /// - compound `initialAgent.model` (`reject_compound_model`, PROTOCOL §5.5
+    ///   — the wire-boundary guard the RPC layer applies to `agent.create`);
+    /// - `contextLinks` (PROTOCOL §5.1).
+    ///
+    /// Every other `initialAgent` check — blocks shape and attachment
+    /// references, specialist canonicalization, the provider / model /
+    /// reasoning-effort chain — is owned by [`Self::plan_agent_create`], which
+    /// the closure runs right after this preflight, still before the
+    /// workspaces-root resolution or any other state change; the plan is
+    /// then persisted after the row insert via
+    /// [`Self::persist_agent_create`], whose return type cannot express an
+    /// input rejection. The
+    /// `workspace_create_rejects_every_invalid_input_before_side_effects`
+    /// test guards the ordering arm by arm.
+    pub(crate) fn preflight_workspace_create(input: &WorkspaceCreate) -> Result<()> {
+        if let Some(model) = input
+            .initial_agent
+            .as_ref()
+            .and_then(|agent| agent.model.as_deref())
+        {
+            reject_compound_model("initialAgent.model", model)?;
+        }
+        validate_context_links(input.context_links.as_deref())
+    }
 }
 
 /// Locked phase of the blocking `workspace.delete` cleanup (ports the TS
@@ -11222,7 +11761,7 @@ impl Services {
     /// `in_progress` → `[/]`, else `[ ]`. Notes whose linked lines already
     /// carry the marker are left untouched (no write, no event); each
     /// rewritten note takes a `note:updated` and — like every other surgical
-    /// content mutation — drops its cached CRDT session and schedules its
+    /// content mutation — schedules its
     /// line-attribution recompute. Every parent write is versioned against a
     /// fresh read (retried on conflict), so a concurrent status write on a
     /// sibling task or an editor save landing in the window is never reverted.
@@ -11306,19 +11845,16 @@ impl Services {
             };
             note.content = content;
             note.updated_at = now_iso();
-            match self
-                .store
-                .update_note_versioned(&note, Some(note.rev))
+            match persist_note_content(&self.store, &note, Some(note.rev), &system_version_author())
                 .await
             {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(Error::Conflict { .. }) if attempt < MAX_ATTEMPTS => continue,
                 Err(e) => {
                     tracing::warn!(note = %note.id.0, task = %task_id.0, attempt, error = %e, "materialize linked checkboxes: update failed");
                     return;
                 }
             }
-            self.invalidate_crdt_note(workspace_id, &note.id);
             self.schedule_line_attribution_recompute(workspace_id, &note.id);
             publish_event(
                 self.event_bus.as_ref(),
@@ -11330,18 +11866,18 @@ impl Services {
     }
 }
 
-/// Resolve the task note a checkbox line links to: `Some((id, status))` when
+/// Resolve the task note a checkbox line links to: `Some((id, task))` when
 /// `task_id` names a task note in `workspace_id`. Dangling links and links to
 /// non-task notes yield `None`, keeping the raw checkbox write.
 async fn resolve_linked_task(
     store: &Store,
     workspace_id: &WorkspaceId,
     task_id: &str,
-) -> Option<(NoteId, TaskStatus)> {
+) -> Option<(NoteId, TaskMetadata)> {
     let id = NoteId::from(task_id);
     let note = store.get_note(workspace_id, &id).await.ok()?;
-    let status = note.metadata.task.as_ref()?.status;
-    Some((id, status))
+    let task = note.metadata.task?;
+    Some((id, task))
 }
 
 /// Task-note status a checkbox word (`todo` / `in-progress` / `done`) written
@@ -11365,6 +11901,44 @@ fn redirected_task_status(word: &str, current: TaskStatus) -> Option<TaskStatus>
         }
     };
     (next != current).then_some(next)
+}
+
+/// Build (without persisting) a child task note nested under `parent_id`,
+/// marked a task with `status` (and optional `peer_order` /
+/// `estimated_effort`) at `rev` 0. Shared by `createPrerequisite` (which
+/// persists it on its own) and `convertBlocks` (which commits it in the same
+/// transaction as the parent rewrite that links to it).
+fn build_child_task_note(
+    workspace_id: &WorkspaceId,
+    parent_id: &NoteId,
+    title_raw: &str,
+    content: String,
+    status: TaskStatus,
+    peer_order: Option<i64>,
+    estimated_effort: Option<String>,
+) -> Note {
+    let now = now_iso();
+    let mut task_meta = fresh_task_metadata(status, &now, peer_order);
+    task_meta.estimated_effort = estimated_effort;
+    Note {
+        id: NoteId::new(),
+        workspace_id: workspace_id.clone(),
+        title: note_ops::strip_markdown_formatting(title_raw),
+        content,
+        content_type: ContentType::Markdown,
+        tags: Vec::new(),
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: Some(parent_id.clone()),
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata {
+            task: Some(task_meta),
+        },
+        created_at: now.clone(),
+        rev: 0,
+        updated_at: now,
+    }
 }
 
 /// Build a `task:created` event with the payload
@@ -11653,6 +12227,21 @@ fn activity_changed_event(workspace_id: &WorkspaceId, activity: WorkspaceActivit
             "activity": activity,
         }),
     }
+}
+
+/// Pre-write observation of a workspace's unread state, taken by the settle
+/// callers ([`Services::settle_workspace_unread_after_seen`]) BEFORE the
+/// write that drops a session out of the unread derivation (a seen-marker
+/// advance or a retire), via [`Services::snapshot_workspace_unread`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnreadSnapshot {
+    /// The derivation read unread (an unread top-level session existed). A
+    /// probe failure records `false`: the fallback emit stays off.
+    pub(crate) derived: bool,
+    /// The stored legacy `attention` flag read `unread`. A read failure
+    /// records `true`: the settle then only ever emits through the atomic
+    /// clear, never the fallback (conservative — silent).
+    pub(crate) stored_unread: bool,
 }
 
 /// Build a `workspace:attention-changed` change event with the self-sufficient
@@ -12216,6 +12805,18 @@ pub(crate) fn git_root_changed_event(
             "gitRoot": root,
         }),
     }
+}
+
+/// Whether a git-root row carries any PR input the displayStatus derivation
+/// reads (a linked PR or a non-empty persisted pool), i.e. whether inserting
+/// or deleting the row can move the PR rung.
+fn git_root_carries_pr_data(root: &intent_core::WorkspaceGitRoot) -> bool {
+    root.pr_number.is_some()
+        || root.pr_status.is_some()
+        || root
+            .pull_requests
+            .as_deref()
+            .is_some_and(|items| !items.is_empty())
 }
 
 /// Serialize persisted [`intent_core::WorkspaceGitRoot`] rows into their wire
@@ -12854,7 +13455,7 @@ pub(crate) fn event_completion_report(data: &serde_json::Value) -> Option<&str> 
 /// `agent:failed` / `agent:deleted`). Returned so the seal callers share the
 /// delivery pass's probes instead of re-probing (monorepo#1281).
 #[derive(Clone, Copy, Debug, Default)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub(crate) struct CompletionIdleClassification {
     /// Queue/busy interim (monorepo#1281/#1297): ready-to-send entries remain
     /// or a worker turn is in flight — the agent's delegating turn is not
@@ -13546,6 +14147,17 @@ impl Services {
     /// `None`) and the note-write auto-conversion (which forwards the outer
     /// mutation's caller) attribute the resulting "Converted task blocks"
     /// version snapshot to the acting agent when applicable.
+    ///
+    /// The conversion is derived from one read of the parent and committed
+    /// in one store transaction gated on exactly that rev
+    /// ([`Store::update_note_with_version_and_children`]): the new child
+    /// task notes exist only if the parent rewrite (fence → link) lands. A
+    /// save that landed in between — including one that already converted
+    /// the same fence (`note.setContent` auto-converts) — makes the gate
+    /// miss, and the loop re-derives from the fresh content instead of
+    /// merging: a block already converted is no longer a fence, so no work
+    /// remains for it, and generated ids never pass through the three-way
+    /// merge (which would char-interleave two different ids for one block).
     async fn convert_task_blocks_op(
         &self,
         workspace_id: WorkspaceId,
@@ -13553,64 +14165,68 @@ impl Services {
         caller_agent_id: Option<&AgentId>,
     ) -> Result<TaskConvertBlocksResult> {
         let store = &self.store;
-        let mut note = fetch_note_peer(store, &workspace_id, &note_id).await?;
-        if note.content.is_empty() {
-            return Ok(TaskConvertBlocksResult {
-                ok: true,
-                converted_count: 0,
-                created_note_ids: Vec::new(),
-                created_tasks: Vec::new(),
-                warnings: Vec::new(),
-            });
-        }
-        // Mirror the TS guard: only parse when a `@@@task` fence exists.
-        let parsed = if note_ops::has_task_blocks(&note.content) {
-            note_ops::extract_task_blocks(&note.content)
-        } else {
-            note_ops::TaskBlocksResult {
-                tasks: Vec::new(),
-                content_without_blocks: note.content.clone(),
+        let author = resolve_note_version_author(store, caller_agent_id).await;
+        let mut attempt = 0;
+        let (note, parsed, mut warnings, created, block_note_ids) = loop {
+            attempt += 1;
+            let mut note = fetch_note_peer(store, &workspace_id, &note_id).await?;
+            if note.content.is_empty() {
+                return Ok(TaskConvertBlocksResult {
+                    ok: true,
+                    converted_count: 0,
+                    created_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
+                });
             }
-        };
-        // Idempotency: map existing child note titles (normalized) → id.
-        let all = store.list_notes(&workspace_id).await?;
-        let mut existing_by_title: std::collections::HashMap<String, NoteId> = all
-            .iter()
-            .filter(|n| n.parent_id.as_ref() == Some(&note.id))
-            .map(|n| (n.title.trim().to_lowercase(), n.id.clone()))
-            .collect();
-
-        // Start from the placeholder-substituted content; each valid block
-        // is `<!-- task-block-placeholder-{i} -->` to be replaced below.
-        let mut working = parsed.content_without_blocks.clone();
-        let mut warnings: Vec<String> = Vec::new();
-        let mut created_note_ids: Vec<String> = Vec::new();
-        let mut created_tasks: Vec<CreatedTaskEntry> = Vec::new();
-        let mut block_note_ids: Vec<NoteId> = Vec::with_capacity(parsed.tasks.len());
-        let mut peer_order = 100i64;
-        for (i, task) in parsed.tasks.iter().enumerate() {
-            let body = if task.content.is_empty() {
-                format!("# {}\n\nCreated as a prerequisite task.", task.title)
+            // Mirror the TS guard: only parse when a `@@@task` fence exists.
+            let parsed = if note_ops::has_task_blocks(&note.content) {
+                note_ops::extract_task_blocks(&note.content)
             } else {
-                format!("# {}\n\n{}", task.title, task.content)
-            };
-            let normalized = task.title.trim().to_lowercase();
-            let task_note_id = if let Some(existing_id) = existing_by_title.get(&normalized) {
-                // Reused child: `effort=` only applies at creation — it
-                // never overwrites a possibly user-edited estimate on the
-                // existing note — so an explicit attribute is surfaced as
-                // dropped rather than silently ignored.
-                if task.effort.is_some() {
-                    warnings.push(format!(
-                        "task block {}: effort= ignored — a task note with this \
-                         title already exists and its estimate is preserved",
-                        task_block_label(task)
-                    ));
+                note_ops::TaskBlocksResult {
+                    tasks: Vec::new(),
+                    content_without_blocks: note.content.clone(),
                 }
-                existing_id.clone()
-            } else {
-                let child = self
-                    .create_child_task_note(
+            };
+            // Idempotency: map existing child note titles (normalized) → id.
+            let all = store.list_notes(&workspace_id).await?;
+            let mut existing_by_title: std::collections::HashMap<String, NoteId> = all
+                .iter()
+                .filter(|n| n.parent_id.as_ref() == Some(&note.id))
+                .map(|n| (n.title.trim().to_lowercase(), n.id.clone()))
+                .collect();
+
+            // Start from the placeholder-substituted content; each valid
+            // block is `<!-- task-block-placeholder-{i} -->` to be replaced
+            // below. New children are built here and persisted with the
+            // parent rewrite.
+            let mut working = parsed.content_without_blocks.clone();
+            let mut warnings: Vec<String> = Vec::new();
+            let mut created: Vec<(Note, CreatedTaskEntry)> = Vec::new();
+            let mut block_note_ids: Vec<NoteId> = Vec::with_capacity(parsed.tasks.len());
+            let mut peer_order = 100i64;
+            for (i, task) in parsed.tasks.iter().enumerate() {
+                let body = if task.content.is_empty() {
+                    format!("# {}\n\nCreated as a prerequisite task.", task.title)
+                } else {
+                    format!("# {}\n\n{}", task.title, task.content)
+                };
+                let normalized = task.title.trim().to_lowercase();
+                let task_note_id = if let Some(existing_id) = existing_by_title.get(&normalized) {
+                    // Reused child: `effort=` only applies at creation — it
+                    // never overwrites a possibly user-edited estimate on the
+                    // existing note — so an explicit attribute is surfaced
+                    // as dropped rather than silently ignored.
+                    if task.effort.is_some() {
+                        warnings.push(format!(
+                            "task block {}: effort= ignored — a task note with this \
+                             title already exists and its estimate is preserved",
+                            task_block_label(task)
+                        ));
+                    }
+                    existing_id.clone()
+                } else {
+                    let child = build_child_task_note(
                         &workspace_id,
                         &note.id,
                         &task.title,
@@ -13618,26 +14234,87 @@ impl Services {
                         TaskStatus::NotStarted,
                         Some(peer_order),
                         task.effort.clone(),
-                        caller_agent_id,
-                    )
-                    .await?;
-                existing_by_title.insert(normalized, child.id.clone());
-                created_note_ids.push(child.id.0.clone());
-                created_tasks.push(CreatedTaskEntry {
-                    key: task.key.clone(),
-                    title: task.title.clone(),
-                    note_id: child.id.0.clone(),
+                    );
+                    existing_by_title.insert(normalized, child.id.clone());
+                    let id = child.id.clone();
+                    created.push((
+                        child,
+                        CreatedTaskEntry {
+                            key: task.key.clone(),
+                            title: task.title.clone(),
+                            note_id: id.0.clone(),
+                        },
+                    ));
+                    id
+                };
+                let placeholder = format!("<!-- task-block-placeholder-{i} -->");
+                let linked = format!(
+                    "- [ ] [{}](intent://local/task/{})",
+                    task.title, task_note_id.0
+                );
+                working = working.replace(&placeholder, &linked);
+                block_note_ids.push(task_note_id);
+                peer_order += 100;
+            }
+
+            if working == note.content && created.is_empty() {
+                // Nothing to convert: surface header issues only.
+                for task in &parsed.tasks {
+                    for issue in &task.issues {
+                        warnings.push(format!("task block {}: {issue}", task_block_label(task)));
+                    }
+                }
+                return Ok(TaskConvertBlocksResult {
+                    ok: true,
+                    converted_count: 0,
+                    created_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings,
                 });
-                child.id
-            };
-            let placeholder = format!("<!-- task-block-placeholder-{i} -->");
-            let linked = format!(
-                "- [ ] [{}](intent://local/task/{})",
-                task.title, task_note_id.0
-            );
-            working = working.replace(&placeholder, &linked);
-            block_note_ids.push(task_note_id);
-            peer_order += 100;
+            }
+            // TS parity: the reference pushes a version snapshot ("Converted
+            // task blocks to linked Task Notes") as part of the conversion
+            // save, so the newest stored version matches the fence-free
+            // content that line-attribution/history consumers diff against.
+            let read_rev = note.rev;
+            let mut plan = reanchor_note_comments(store, &workspace_id, &note_id, working).await?;
+            note.content = std::mem::take(&mut plan.content);
+            note.updated_at = now_iso();
+            let children: Vec<Note> = created.iter().map(|(child, _)| child.clone()).collect();
+            match store
+                .update_note_with_version_and_children(
+                    &note,
+                    Some(read_rev),
+                    &children,
+                    &author,
+                    &note.updated_at,
+                )
+                .await
+            {
+                Ok((rev, _)) => {
+                    tracing::debug!(
+                        note = %note_id.0,
+                        op = "task.convertBlocks",
+                        attempt,
+                        read_rev,
+                        rev,
+                        created = created.len(),
+                        "task blocks converted"
+                    );
+                    plan.apply_orphaned(store, &workspace_id).await?;
+                    break (note, parsed, warnings, created, block_note_ids);
+                }
+                Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
+                Err(e) => return Err(e),
+            }
+        };
+        let mut created_note_ids: Vec<String> = Vec::with_capacity(created.len());
+        let mut created_tasks: Vec<CreatedTaskEntry> = Vec::with_capacity(created.len());
+        for (child, entry) in created {
+            self.emit_child_task_created(&child, TaskStatus::NotStarted, caller_agent_id)
+                .await;
+            created_note_ids.push(entry.note_id.clone());
+            created_tasks.push(entry);
         }
 
         // Convert-with-warnings: bad header attributes or relation references
@@ -13769,27 +14446,7 @@ impl Services {
             }
         }
 
-        let content_changed = working != note.content;
-        if !content_changed && created_note_ids.is_empty() {
-            return Ok(TaskConvertBlocksResult {
-                ok: true,
-                converted_count: 0,
-                created_note_ids: Vec::new(),
-                created_tasks: Vec::new(),
-                warnings,
-            });
-        }
-        note.content = working;
-        note.updated_at = now_iso();
-        store.update_note(&note).await?;
-        // TS parity: the reference pushes a version snapshot ("Converted
-        // task blocks to linked Task Notes") as part of the conversion
-        // save, so the newest stored version matches the fence-free
-        // content that line-attribution/history consumers diff against.
-        let author = resolve_note_version_author(store, caller_agent_id).await;
-        capture_note_version(store, &note, &author).await?;
-        self.invalidate_crdt_note(&note.workspace_id, &note.id);
-        self.schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
+        self.schedule_line_attribution_recompute(&note.workspace_id, &note.id);
         // Emit `note:updated` for the rewritten parent so subscribers
         // refresh the fence-free content live (TS parity: the reference
         // emits `note:updated` after saving the converted note).
@@ -13819,11 +14476,12 @@ impl Services {
     }
 
     /// Create a child task note nested under `parent_id`, marking it a task with
-    /// `status` (and optional `peer_order` / `estimated_effort`). Shared by
-    /// `createPrerequisite` and `convertBlocks`. `caller_agent_id` attributes
-    /// the emitted `task:created` to the acting agent when the creation is
-    /// agent-driven.
-    #[allow(clippy::too_many_arguments)]
+    /// `status` (and optional `peer_order` / `estimated_effort`), for
+    /// `createPrerequisite`. `caller_agent_id` attributes the version snapshot
+    /// and the emitted `task:created` to the acting agent when the creation
+    /// is agent-driven. `convertBlocks` builds its children with
+    /// [`build_child_task_note`] and persists them with the parent rewrite.
+    #[expect(clippy::too_many_arguments)]
     async fn create_child_task_note(
         &self,
         workspace_id: &WorkspaceId,
@@ -13835,32 +14493,34 @@ impl Services {
         estimated_effort: Option<String>,
         caller_agent_id: Option<&AgentId>,
     ) -> Result<Note> {
-        let now = now_iso();
-        let mut task_meta = fresh_task_metadata(status, &now, peer_order);
-        task_meta.estimated_effort = estimated_effort;
-        let note = Note {
-            id: NoteId::new(),
-            workspace_id: workspace_id.clone(),
-            title: note_ops::strip_markdown_formatting(title_raw),
+        let note = build_child_task_note(
+            workspace_id,
+            parent_id,
+            title_raw,
             content,
-            content_type: ContentType::Markdown,
-            tags: Vec::new(),
-            is_pinned: false,
-            is_archived: false,
-            is_default: false,
-            parent_id: Some(parent_id.clone()),
-            visibility: NoteVisibility::Workspace,
-            metadata: NoteMetadata {
-                task: Some(task_meta),
-            },
-            created_at: now.clone(),
-            rev: 0,
-            updated_at: now,
-        };
-        self.store.insert_note(&note).await?;
-        // Emit `note:created` so task-channel subscribers (spec UI) pick up
-        // the new child task note live (TS parity: `createPrerequisiteNote`
-        // routes through `createNote`, which emits `note:created`).
+            status,
+            peer_order,
+            estimated_effort,
+        );
+        let author = resolve_note_version_author(&self.store, caller_agent_id).await;
+        persist_new_note(&self.store, &note, &author).await?;
+        self.emit_child_task_created(&note, status, caller_agent_id)
+            .await;
+        Ok(note)
+    }
+
+    /// Emit the creation events for a persisted child task note:
+    /// `note:created` so task-channel subscribers (spec UI) pick up the new
+    /// child live (TS parity: `createPrerequisiteNote` routes through
+    /// `createNote`, which emits `note:created`), then `task:created` (§6.5)
+    /// since the note is born a task — feed/task subscribers see the new task
+    /// without inferring task-ness from the `note:created` payload.
+    async fn emit_child_task_created(
+        &self,
+        note: &Note,
+        status: TaskStatus,
+        caller_agent_id: Option<&AgentId>,
+    ) {
         publish_event(
             self.event_bus.as_ref(),
             note_change_event(
@@ -13872,9 +14532,6 @@ impl Services {
             ),
         )
         .await;
-        // The note is born a task, so the creation also emits `task:created`
-        // (§6.5) — feed/task subscribers see the new task without inferring
-        // task-ness from the `note:created` payload.
         let agent = resolve_event_agent(&self.store, caller_agent_id).await;
         publish_event(
             self.event_bus.as_ref(),
@@ -13888,7 +14545,6 @@ impl Services {
             ),
         )
         .await;
-        Ok(note)
     }
 
     /// Deliver a store-adapter search result (§5.15 / §6.5). Small sets (or any
@@ -14012,7 +14668,7 @@ impl Services {
                         {
                             // Settings schema bounds the port to u16 range;
                             // the float→int cast saturates anyway.
-                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             let port = new_port as u16;
                             // Check if listener is running
                             if let Some(current_port) = control.ws_listener_port().await {
@@ -15924,9 +16580,10 @@ impl WorkspaceApi for Services {
         data: Option<String>,
         source_path: Option<String>,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
         Box::pin(async move {
+            let idempotency_key = attachment_upload::validate_idempotency_key(idempotency_key)?;
             let decoded;
             let source = match (&data, &source_path) {
                 (Some(b64), None) => {
@@ -15958,61 +16615,42 @@ impl WorkspaceApi for Services {
                     ))
                 }
             };
-            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
-            if root.is_empty() {
-                return Err(Error::Internal(
-                    "workspace has no resolved filesystem root".to_string(),
-                ));
-            }
-            // The exclusion contract (monorepo#1948) rides on the default
-            // `.intent/.gitignore` (ignore everything except config.json), so
-            // make sure the directory + gitignore exist before placing.
-            // `place_attachment` additionally drops an ignore-all `.gitignore`
-            // inside `attachments/` to cover repos with a customized
-            // `.intent/.gitignore`.
-            repo_config::ensure_intent_dir(std::path::Path::new(&root)).await?;
-            let mut result =
-                file_ops::place_attachment(&root, &file_name, &source).map_err(|e| {
-                    // Surface placement failures in the daemon log so field
-                    // reports are diagnosable without a client-side trace
-                    // (monorepo#2144).
-                    tracing::warn!(
-                        workspace = %workspace_id.as_str(),
-                        file_name = %file_name,
-                        error = %e,
-                        "file.placeAttachment failed"
-                    );
-                    e
-                })?;
-            // Attachment registry (PROTOCOL §5.9): record the placed file
-            // under a daemon-minted UUID so agents can retrieve it later via
-            // `ws.file.getAttachment`, and return the registry fields
-            // additively (presence-detected; old clients unaffected).
-            let record = intent_store::AttachmentRecord {
-                id: new_uuid(),
+            // Payload identity for the idempotency lookup: the base64 arm
+            // hashes the decoded bytes; the sourcePath arm fingerprints on
+            // `(fileName, size)` only (a possibly huge local file is not
+            // re-read for a hash; b31e decision D). An unreadable source
+            // leaves the lookup fingerprint unset and lets placement
+            // classify it. The BOUND fingerprint takes its size from the
+            // placed bytes (see `KeyedPlacement`).
+            let idempotency = idempotency_key.map(|key| match &source {
+                file_ops::AttachmentSource::Bytes(bytes) => {
+                    let sha = attachment_upload::sha256_hex(bytes);
+                    attachment_upload::KeyedPlacement {
+                        key,
+                        lookup_fingerprint: Some(attachment_upload::attachment_fingerprint(
+                            &file_name,
+                            bytes.len() as u64,
+                            Some(&sha),
+                        )),
+                        sha256: Some(sha),
+                    }
+                }
+                file_ops::AttachmentSource::CopyFrom(src) => attachment_upload::KeyedPlacement {
+                    key,
+                    lookup_fingerprint: std::fs::metadata(src).ok().map(|md| {
+                        attachment_upload::attachment_fingerprint(&file_name, md.len(), None)
+                    }),
+                    sha256: None,
+                },
+            });
+            self.place_attachment_registered(
                 workspace_id,
-                file_name: result["fileName"]
-                    .as_str()
-                    .unwrap_or(&file_name)
-                    .to_string(),
-                mime_type: mime_type.filter(|m| !m.trim().is_empty()),
-                size: result["size"].as_i64().unwrap_or_default(),
-                uploaded_at: now_iso(),
-                stored_path: result["path"].as_str().unwrap_or_default().to_string(),
-            };
-            if let Err(e) = store.insert_attachment(&record).await {
-                // Don't leave a durable-but-unregistered file behind: a
-                // retry would place a collision-suffixed second copy that
-                // no attachmentId can ever retrieve.
-                let _ = std::fs::remove_file(std::path::Path::new(&root).join(&record.stored_path));
-                return Err(e);
-            }
-            result["attachmentId"] = serde_json::json!(record.id);
-            result["uploadedAt"] = serde_json::json!(record.uploaded_at);
-            if let Some(mime) = &record.mime_type {
-                result["mimeType"] = serde_json::json!(mime);
-            }
-            Ok(result)
+                &file_name,
+                &source,
+                mime_type,
+                idempotency,
+            )
+            .await
         })
     }
 
@@ -16023,6 +16661,7 @@ impl WorkspaceApi for Services {
         size_bytes: u64,
         sha256: String,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.file_attachment_upload_begin_op(
@@ -16031,6 +16670,7 @@ impl WorkspaceApi for Services {
                 size_bytes,
                 sha256,
                 mime_type,
+                idempotency_key,
             )
             .await
         })
@@ -16077,27 +16717,34 @@ impl WorkspaceApi for Services {
                     }
                     other => other,
                 })?;
-            // `exists` reflects the file on disk NOW (the user may have
-            // deleted it out-of-band); resolved against the canonical
-            // workspace root, never a sandbox, with the same within-root
-            // containment guard as the copy path — a tampered stored_path
-            // must not probe file existence outside the store.
-            let root = file_ops::resolve_root(&store, &record.workspace_id, None).await;
-            let exists = !root.is_empty()
-                && file_ops::resolve_attachment_source(&root, &record.stored_path)
-                    .is_ok_and(|p| p.is_file());
-            let mut result = serde_json::json!({
-                "attachmentId": record.id,
-                "fileName": record.file_name,
-                "size": record.size,
-                "uploadedAt": record.uploaded_at,
-                "path": record.stored_path,
-                "exists": exists,
-            });
-            if let Some(mime) = &record.mime_type {
-                result["mimeType"] = serde_json::json!(mime);
-            }
-            Ok(result)
+            Ok(attachment_info_result(&store, &record).await)
+        })
+    }
+
+    fn file_get_attachment_info_by_key(
+        &self,
+        workspace_id: WorkspaceId,
+        idempotency_key: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let key = attachment_upload::validate_idempotency_key(Some(idempotency_key))?
+                .unwrap_or_default();
+            let bound = store
+                .get_attachment_by_idempotency_key(
+                    &workspace_id,
+                    &key,
+                    &attachment_upload::idempotency_retention_cutoff(),
+                )
+                .await?;
+            let Some((_, record)) = bound else {
+                // Never committed, another workspace's key, or past
+                // retention — all read as unknown (fail closed).
+                return Err(Error::InvalidParams(format!(
+                    "unknown idempotency key: {key}"
+                )));
+            };
+            Ok(attachment_info_result(&store, &record).await)
         })
     }
 
@@ -16390,7 +17037,7 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.start(&workspace_id, &script_id).await })
+        Box::pin(async move { mgr.start(&workspace_id, &script_id) })
     }
 
     fn script_stop(
@@ -16466,7 +17113,9 @@ impl WorkspaceApi for Services {
             let started = std::time::Instant::now();
             let count = list.len();
             let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
-            let snapshot = this.workspace_aggregate_snapshot(&workspace_ids).await;
+            let snapshot = this
+                .workspace_aggregate_snapshot(&workspace_ids, include_archived)
+                .await;
             for ws in &mut list {
                 this.enrich_workspace_from_snapshot(ws, &snapshot, true)
                     .await;
@@ -16498,9 +17147,15 @@ impl WorkspaceApi for Services {
                 "workspace.list: aggregate enrichment"
             );
             // Emit-path PR merge: fold git-root + monitor PRs into each
-            // row's `pullRequests` (after enrichment so displayStatus
-            // derivation still sees only the persisted workspace PRs).
-            this.merge_external_pull_requests(&mut list, include_archived)
+            // row's `pullRequests`. Runs after enrichment: the displayStatus
+            // derivation already folded the git-root PRs and the monitor
+            // signals with the same per-URL priority (and canonicalized the
+            // row's own `activePullRequest` / `pullRequests` copies to the
+            // same lifecycle), so it must not see them a second time via the
+            // merged `pullRequests`. The git-root PRs move out of the
+            // snapshot — the list's one bulk git-root read serves both the
+            // derivation and the wire merge.
+            this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
                 .await;
             Ok(list)
         })
@@ -16524,7 +17179,9 @@ impl WorkspaceApi for Services {
             // `cowSupported` (lifetime-cached probe, effectively free).
             let mut list = store.list_workspaces(include_archived).await?;
             let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
-            let snapshot = this.workspace_aggregate_snapshot(&workspace_ids).await;
+            let snapshot = this
+                .workspace_aggregate_snapshot(&workspace_ids, include_archived)
+                .await;
             for ws in &mut list {
                 this.enrich_workspace_from_snapshot(ws, &snapshot, false)
                     .await;
@@ -16534,8 +17191,10 @@ impl WorkspaceApi for Services {
             }
             // Emit-path PR merge, same as the full list path: the seq-0
             // snapshot must carry the same `pullRequests` a later
-            // `workspace.list` would.
-            this.merge_external_pull_requests(&mut list, include_archived)
+            // `workspace.list` would (and, like there, the displayStatus
+            // above already folded the git-root PRs, whose one bulk read
+            // now moves out of the snapshot into the merge).
+            this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
                 .await;
             Ok(list)
         })
@@ -16653,15 +17312,6 @@ impl WorkspaceApi for Services {
         input: WorkspaceCreate,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
-        if let Some(model) = input
-            .initial_agent
-            .as_ref()
-            .and_then(|a| a.model.as_deref())
-        {
-            if let Err(e) = reject_compound_model("initialAgent.model", model) {
-                return Box::pin(async move { Err(e) });
-            }
-        }
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
         let workspaces_root = self.workspaces_root.clone();
@@ -16720,42 +17370,13 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
-                    // Attachment-reference validation (PROTOCOL §5.5,
-                    // monorepo#3338), hoisted BEFORE any state change so a
-                    // bad `initialAgent.imageBlocks` reference rejects
-                    // `-32602` without leaving a partially created workspace
-                    // (row/metadata/event/spec note) behind. Same harvest as
-                    // `agent_create_op` (top-level param wins over the
-                    // `metadata.imageBlocks` copy); the create op re-runs
-                    // the same checks harmlessly.
-                    if let Some(agent) = input.initial_agent.as_ref() {
-                        let effective_image_blocks = agent
-                            .image_blocks
-                            .clone()
-                            .or_else(|| {
-                                agent
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("imageBlocks").cloned())
-                            })
-                            .filter(|v| !v.is_null());
-                        crate::agent_ops::validate_image_blocks(
-                            "workspace.create",
-                            effective_image_blocks.as_ref(),
-                        )?;
-                        services
-                            .validate_image_block_refs(
-                                "workspace.create",
-                                effective_image_blocks.as_ref(),
-                            )
-                            .await?;
-                    }
-                    // Context-links validation (PROTOCOL §5.1), also hoisted
-                    // BEFORE any state change: a malformed `contextLinks`
-                    // rejects `-32602` without leaving a partially created
-                    // workspace behind. Bounded list, non-empty string
-                    // fields, positive PR/issue number.
-                    validate_context_links(input.context_links.as_deref())?;
+                    // Request-shape `-32602`s run here, BEFORE any state
+                    // change (row / metadata file / event / spec note /
+                    // initial agent): compound `initialAgent.model` and
+                    // `contextLinks` (see `preflight_workspace_create`). The
+                    // remaining `initialAgent` checks are the agent-create
+                    // plan right below, still ahead of the first side effect.
+                    Services::preflight_workspace_create(&input)?;
                     // Caller-supplied paths may carry a leading `~` (the FE
                     // onboarding default is `~/Developer`); expand to `$HOME`
                     // before the existing-repo check, clone targeting, and
@@ -16780,6 +17401,136 @@ impl WorkspaceApi for Services {
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    // Initial-agent plan (§5.1): every remaining `-32602`
+                    // producer of the create — blocks shape and attachment
+                    // references, specialist canonicalization, the provider /
+                    // model / reasoning-effort chain — runs HERE, pure with
+                    // respect to the store and the filesystem, before the
+                    // workspaces-root resolution (which may create the
+                    // configured `worktreesLocation`), the first progress
+                    // frame, the clone, the row insert, or any other side
+                    // effect. The typed plan is carried across provisioning
+                    // and persisted after the insert by
+                    // `persist_agent_create`, which cannot raise an input
+                    // rejection, so a rejected `initialAgent` can never strand
+                    // a workspace row. The inputs are shaped to their final
+                    // form first so the plan sees exactly what is persisted;
+                    // the trimmed prompt and effective image blocks ride along
+                    // for id / branch naming and the first turn. The plan
+                    // carries no workspace identity — the planner never reads
+                    // it — so the id derived below goes straight to the
+                    // persist half as an argument.
+                    let planned_initial_agent = match input.initial_agent.take() {
+                        Some(agent) => {
+                            let prompt = agent
+                                .prompt
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string);
+                            // Persist the prompt (when present) as
+                            // `AgentSession.initial_message` via the
+                            // `metadata.initialMessage` harvest key (delegate
+                            // parity: a wake-up can resume from it) and stamp the
+                            // reference-parity
+                            // `isInitialAgent`/`isFirstWorkspaceAgent` flags the
+                            // FE surface (`agent-backend-handler.service.ts`,
+                            // `instruction-service.ts` prompt-cache `':initial'`
+                            // suffix, `agent-persistence.ts`) uses to classify the
+                            // workspace's coordinator. Both flags are persisted on
+                            // the raw `AgentSession.metadata` JSON; the strict
+                            // `AgentLite.metadata` projection surfaces
+                            // `isInitialAgent` (presence-detected, `true`-only —
+                            // PROTOCOL §5.5). The caller's metadata object is
+                            // forwarded as-is; like agent.create, only the
+                            // harvested gap fields persist today (P2-12a) —
+                            // `behaviorPrompt` has no session column and the
+                            // behavior derives from the persisted `specialist`.
+                            let mut metadata = match agent.metadata {
+                                Some(serde_json::Value::Object(m)) => m,
+                                _ => serde_json::Map::new(),
+                            };
+                            metadata.insert("isInitialAgent".to_string(), serde_json::json!(true));
+                            metadata.insert(
+                                "isFirstWorkspaceAgent".to_string(),
+                                serde_json::json!(true),
+                            );
+                            // Own the initial-message invariant on the
+                            // `metadata.initialMessage` harvest key: when
+                            // the daemon has a non-empty prompt, stamp it (delegate
+                            // parity — a wake-up can resume from it); otherwise
+                            // drop any caller-supplied `initialMessage` so the
+                            // plan's metadata harvest cannot persist a stale
+                            // prompt for a no-prompt workspace.
+                            if let Some(ref p) = prompt {
+                                metadata.insert(
+                                    "initialMessage".to_string(),
+                                    serde_json::json!(p.clone()),
+                                );
+                            } else {
+                                metadata.remove("initialMessage");
+                            }
+                            // The effective session-level image blocks, mirroring
+                            // the plan's harvest (top-level param wins over the
+                            // `metadata.imageBlocks` fallback). Captured here
+                            // because the created `AgentLite` no longer serves
+                            // `imageBlocks` (list-projection cost contract) and
+                            // the first-turn threading below still needs them.
+                            let image_blocks = agent
+                                .image_blocks
+                                .or_else(|| metadata.get("imageBlocks").cloned())
+                                .filter(|v| !v.is_null());
+                            let extra = intent_core::AgentCreateExtra {
+                                provider: nonempty_owned(agent.provider),
+                                agent_type: nonempty_owned(agent.agent_type),
+                                metadata: Some(serde_json::Value::Object(metadata)),
+                                context_references: agent
+                                    .context_references
+                                    .filter(|v| !v.is_null()),
+                                image_blocks: image_blocks.clone(),
+                                file_blocks: agent.file_blocks.filter(|v| !v.is_null()),
+                                // The initial agent is the workspace's
+                                // foreground agent (top-level wins over any
+                                // metadata.isBackground copy).
+                                is_background: Some(false),
+                                ..Default::default()
+                            };
+                            // Project-tier root for the plan's failing
+                            // specialist reads: the (tilde-expanded)
+                            // repository checkout, only when it is an existing
+                            // local directory — the same client-supplied path
+                            // the create already trusts enough to provision a
+                            // worktree from. No worktree exists yet; the
+                            // non-failing prompt snapshot reads it at `baseRef`
+                            // in the persist half.
+                            let spec_wp = input
+                                .repository_path
+                                .as_deref()
+                                .map(PathBuf::from)
+                                .filter(|p| p.is_dir());
+                            // Post-plan input, stamped on the plan later:
+                            // `skip_auto_commit`, which depends on the
+                            // workspace's effective auto-commit seeded by
+                            // the insert, right before persist. The workspace
+                            // id is derived after the plan and handed to the
+                            // persist half directly.
+                            let plan = services
+                                .plan_agent_create(
+                                    "workspace.create",
+                                    nonempty_owned(agent.name),
+                                    nonempty_owned(agent.model),
+                                    nonempty_owned(agent.specialist),
+                                    None,
+                                    None,
+                                    false,
+                                    extra,
+                                    spec_wp,
+                                )
+                                .await?;
+                            Some((plan, prompt, image_blocks))
+                        }
+                        None => None,
+                    };
                     // Kept alongside the resolved parent below: the known-repo
                     // registration hook checks BOTH roots (a configured
                     // `worktreesLocation` may differ from the boot root, and a
@@ -16799,7 +17550,14 @@ impl WorkspaceApi for Services {
                     // tombstone, or leftover directory) so the on-disk
                     // directory reflects intent and deleted ids are never
                     // recycled.
-                    let id = derive_workspace_id(&store, &input, &workspaces_root).await;
+                    let id = derive_workspace_id(
+                        &store,
+                        planned_initial_agent
+                            .as_ref()
+                            .and_then(|(_, prompt, _)| prompt.as_deref()),
+                        &workspaces_root,
+                    )
+                    .await;
                     let progress = progress_id.and_then(|pid| {
                         bus.clone().map(|b| {
                             std::sync::Arc::new(create_progress::CreateProgress::new(
@@ -16883,9 +17641,9 @@ impl WorkspaceApi for Services {
                             {
                                 None
                             } else {
-                                clone_ops::parse_owner_repo(url)
+                                GitRemoteUrl::parse(url).and_then(|u| u.repo_slug())
                             };
-                            if let Some((owner, name)) = cache_owner_repo {
+                            if let Some(RepoRef { owner, name }) = cache_owner_repo {
                                 let request_id = uuid::Uuid::new_v4().to_string();
                                 // Stream the same `git:clone:*` frames as a
                                 // network clone so the FE initializer shows
@@ -16930,7 +17688,8 @@ impl WorkspaceApi for Services {
                                     url,
                                 )
                                 .await;
-                                let cache_root = workspaces_root.join(".repo-cache");
+                                let cache_root =
+                                    intent_git::repo_cache::cache_root_for(&workspaces_root);
                                 // Real streaming progress for the ensure: the
                                 // callback forwards raw git output to a pump
                                 // task that parses it (submodule-aware) and
@@ -17052,8 +17811,10 @@ impl WorkspaceApi for Services {
                                 // trusts them), so only a strict `github.com`
                                 // URL seeds them; the host-agnostic pair above
                                 // keys the cache slot only.
-                                if let Some((gh_owner, gh_name)) =
-                                    Self::parse_github_owner_repo(url)
+                                if let Some(RepoRef {
+                                    owner: gh_owner,
+                                    name: gh_name,
+                                }) = GitRemoteUrl::parse(url).and_then(|u| u.github_repo())
                                 {
                                     if input.repository_owner.is_none() {
                                         input.repository_owner = Some(gh_owner);
@@ -17149,7 +17910,9 @@ impl WorkspaceApi for Services {
                             // Strict `github.com` host only: persisted owner/name
                             // are trusted as GitHub identity by the
                             // `crossWorkspace.*` sibling predicate.
-                            if let Some((owner, name)) = Self::parse_github_owner_repo(url) {
+                            if let Some(RepoRef { owner, name }) =
+                                GitRemoteUrl::parse(url).and_then(|u| u.github_repo())
+                            {
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
                                 }
@@ -17225,7 +17988,7 @@ impl WorkspaceApi for Services {
                         intent_git::remote::origin_url(&repo_path)
                             .ok()
                             .flatten()
-                            .and_then(|url| Self::parse_github_owner_repo(&url))
+                            .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
                     } else {
                         None
                     };
@@ -17234,8 +17997,8 @@ impl WorkspaceApi for Services {
                         .repository_owner
                         .as_deref().is_none_or(str::is_empty)
                     {
-                        if let Some((owner, _)) = origin_derived.as_ref() {
-                            input.repository_owner = Some(owner.clone());
+                        if let Some(derived) = origin_derived.as_ref() {
+                            input.repository_owner = Some(derived.owner.clone());
                         }
                     }
                     // Apply derived name when caller left it blank; fall back to
@@ -17244,8 +18007,8 @@ impl WorkspaceApi for Services {
                         .repository_name
                         .as_deref().is_none_or(str::is_empty)
                     {
-                        if let Some((_, name)) = origin_derived {
-                            input.repository_name = Some(name);
+                        if let Some(derived) = origin_derived {
+                            input.repository_name = Some(derived.name);
                         } else if let Some(name) = input
                             .repository_path
                             .as_deref()
@@ -17281,13 +18044,17 @@ impl WorkspaceApi for Services {
                     // or STAB-64-derived above) is ignored with a warn —
                     // deriving another repository's branch names onto this
                     // checkout would silently check out unrelated content or
-                    // fail the create on an unresolvable `baseRef`.
+                    // fail the create on an unresolvable `baseRef`. Each
+                    // known part is compared under `RepoRef` identity (the
+                    // other part held to the link's own) so a missing part
+                    // never counts as a mismatch.
                     let pr_link = pr_link.filter(|link| {
+                        let link_ref = intent_sourcecontrol::RepoRef::new(&link.owner, &link.repo);
                         let owner_mismatch = input.repository_owner.as_deref().is_some_and(|o| {
-                            !o.is_empty() && !o.eq_ignore_ascii_case(&link.owner)
+                            !o.is_empty() && intent_sourcecontrol::RepoRef::new(o, &link.repo) != link_ref
                         });
                         let name_mismatch = input.repository_name.as_deref().is_some_and(|n| {
-                            !n.is_empty() && !n.eq_ignore_ascii_case(&link.repo)
+                            !n.is_empty() && intent_sourcecontrol::RepoRef::new(&link.owner, n) != link_ref
                         });
                         if owner_mismatch || name_mismatch {
                             tracing::warn!(
@@ -17386,10 +18153,9 @@ impl WorkspaceApi for Services {
                     let branch_auto_generated =
                         input.branch.as_deref().is_none_or(str::is_empty);
                     let branch = if let Some(explicit) = input.branch.clone().filter(|b| !b.is_empty()) { explicit } else {
-                        let slug = input
-                            .initial_agent
+                        let slug = planned_initial_agent
                             .as_ref()
-                            .and_then(|a| a.prompt.as_deref())
+                            .and_then(|(_, prompt, _)| prompt.as_deref())
                             .and_then(intent_core::slug::extract_local_slug)
                             .unwrap_or_else(intent_core::slug::generate_workspace_slug);
                         // Branch prefix fallback: repo config > global setting
@@ -18260,7 +19026,8 @@ impl WorkspaceApi for Services {
                     // row (reference parity: `workspace.service.ts` persists the
                     // session whenever `initialAgent` is present — the turn only
                     // starts when a prompt exists). The agent is parentless,
-                    // non-background (delegate parity: `agent_create_op`). When
+                    // non-background (delegate parity: `agent_create_op`),
+                    // persisted from the plan derived above. When
                     // the prompt is non-empty it is stored as
                     // `AgentSession.initial_message` (harvested from the
                     // `metadata.initialMessage` create param; served by
@@ -18270,97 +19037,24 @@ impl WorkspaceApi for Services {
                     // prompt persists the row without a message; the FE first
                     // send starts the turn.
                     let mut initial_agent = None;
-                    if let Some(agent) = input.initial_agent {
-                        let prompt = agent
-                            .prompt
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string);
-                        // Persist the prompt (when present) as
-                        // `AgentSession.initial_message` via the
-                        // `metadata.initialMessage` harvest key (delegate
-                        // parity: a wake-up can resume from it) and stamp the
-                        // reference-parity
-                        // `isInitialAgent`/`isFirstWorkspaceAgent` flags the
-                        // FE surface (`agent-backend-handler.service.ts`,
-                        // `instruction-service.ts` prompt-cache `':initial'`
-                        // suffix, `agent-persistence.ts`) uses to classify the
-                        // workspace's coordinator. Both flags are persisted on
-                        // the raw `AgentSession.metadata` JSON; the strict
-                        // `AgentLite.metadata` projection surfaces
-                        // `isInitialAgent` (presence-detected, `true`-only —
-                        // PROTOCOL §5.5). The caller's metadata object is
-                        // forwarded as-is; like agent.create, only the
-                        // harvested gap fields persist today (P2-12a) —
-                        // `behaviorPrompt` has no session column and the
-                        // behavior derives from the persisted `specialist`.
-                        let mut metadata = match agent.metadata {
-                            Some(serde_json::Value::Object(m)) => m,
-                            _ => serde_json::Map::new(),
-                        };
-                        metadata.insert("isInitialAgent".to_string(), serde_json::json!(true));
-                        metadata.insert(
-                            "isFirstWorkspaceAgent".to_string(),
-                            serde_json::json!(true),
-                        );
-                        // Own the initial-message invariant on the
-                        // `metadata.initialMessage` harvest key: when
-                        // the daemon has a non-empty prompt, stamp it (delegate
-                        // parity — a wake-up can resume from it); otherwise
-                        // drop any caller-supplied `initialMessage` so
-                        // `agent_create_op`'s metadata harvest cannot persist
-                        // a stale prompt for a no-prompt workspace.
-                        if let Some(ref p) = prompt {
-                            metadata.insert(
-                                "initialMessage".to_string(),
-                                serde_json::json!(p.clone()),
-                            );
-                        } else {
-                            metadata.remove("initialMessage");
-                        }
-                        // The effective session-level image blocks, mirroring
-                        // the `agent_create_op` harvest (top-level param wins
-                        // over the `metadata.imageBlocks` fallback). Captured
-                        // here because the created `AgentLite` no longer
-                        // serves `imageBlocks` (list-projection cost contract)
-                        // and the first-turn threading below still needs them.
-                        let image_blocks = agent
-                            .image_blocks
-                            .or_else(|| metadata.get("imageBlocks").cloned())
-                            .filter(|v| !v.is_null());
-                        let extra = intent_core::AgentCreateExtra {
-                            provider: nonempty_owned(agent.provider),
-                            agent_type: nonempty_owned(agent.agent_type),
-                            metadata: Some(serde_json::Value::Object(metadata)),
-                            context_references: agent
-                                .context_references
-                                .filter(|v| !v.is_null()),
-                            image_blocks: image_blocks.clone(),
-                            file_blocks: agent.file_blocks.filter(|v| !v.is_null()),
-                            // The initial agent is the workspace's
-                            // foreground agent (top-level wins over any
-                            // metadata.isBackground copy).
-                            is_background: Some(false),
-                            ..Default::default()
-                        };
+                    if let Some((mut plan, prompt, image_blocks)) = planned_initial_agent {
                         // Harness-owned commits: same derivation as
                         // `agent.create` — the initial agent opts out of the
                         // idle subscriber when the workspace's effective
-                        // auto-commit (just seeded above) is off.
-                        let skip_auto_commit =
+                        // auto-commit (just seeded above) is off. The one
+                        // post-plan input (see `AgentCreatePlan`).
+                        plan.skip_auto_commit =
                             !services.effective_auto_commit(&ws.id).await;
+                        // Persist half: the plan was validated before the
+                        // first side effect, so this can only fail on
+                        // infrastructure (`AgentPersistError` → `-32603`) —
+                        // never on input. The non-failing specialist prompt
+                        // snapshot reads the freshly provisioned worktree at
+                        // `baseRef` (agent.create parity: worktree, else the
+                        // repository path).
+                        let snapshot_wp = crate::git_ops::worktree_path(&ws);
                         let created = services
-                            .agent_create_op(
-                                ws.id.clone(),
-                                nonempty_owned(agent.name),
-                                nonempty_owned(agent.model),
-                                nonempty_owned(agent.specialist),
-                                None,
-                                None,
-                                skip_auto_commit,
-                                extra,
-                            )
+                            .persist_agent_create(plan, ws.id.clone(), snapshot_wp)
                             .await?;
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
@@ -20326,7 +21020,9 @@ impl WorkspaceApi for Services {
                             rev: 0,
                             updated_at: now.clone(),
                         };
-                        if let Err(e) = store.insert_note(&clone).await {
+                        if let Err(e) =
+                            persist_new_note(&store, &clone, &system_version_author()).await
+                        {
                             tracing::warn!(
                                 workspace = %ws.id.as_str(),
                                 error = %e,
@@ -20583,8 +21279,10 @@ impl WorkspaceApi for Services {
             // case; after the mark-all above it is normally a no-op — the
             // settle already cleared and emitted). Review-required attention
             // persists. Merely looking at a workspace is not "activity", so
-            // `updated_at` (which feeds the derived `lastActivity`) stays
-            // untouched (intent-hq/monorepo#1466). Atomic settle-clear
+            // neither the workspace `updated_at` nor any session `updated_at`
+            // (both feed the derived `lastActivity`) moves: the per-agent
+            // marker writes above pass `updated_at: None` to the store
+            // (intent-hq/monorepo#1466). Atomic settle-clear
             // (monorepo#1481 pattern, hardened): one UPDATE guarded on
             // `attention = unread` AND the derivation re-checked inside the
             // write — touching only the attention column, so a concurrent
@@ -21160,10 +21858,9 @@ impl WorkspaceApi for Services {
                         rev: 0,
                         updated_at: now,
                     };
-                    store.insert_note(&note).await?;
                     let author =
                         resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-                    capture_note_version(&store, &note, &author).await?;
+                    persist_new_note(&store, &note, &author).await?;
                     services.schedule_line_attribution_recompute(
                         &note.workspace_id.clone(),
                         &note.id.clone(),
@@ -21223,22 +21920,15 @@ impl WorkspaceApi for Services {
             let content_changed = input.content.is_some();
             let mut reanchor_plan: Option<ReanchorPlan> = None;
             if let Some(content) = input.content {
-                // Route the full-content write through the CRDT merge engine
-                // so concurrent writers converge (§5.2 / A5 parity with
-                // `CRDTNotesService.applyContentUpdate`).
-                let old_content = note.content.clone();
-                let merged = services.crdt_notes.apply_full_content(
-                    &workspace_id,
-                    &note_id,
-                    &old_content,
-                    &content,
-                );
+                // Plain versioned write: a stale `expectedVersion` surfaces
+                // `-32005` from `update_note_versioned` below; only
+                // `note.setContent` merges.
                 // Comment anchor recovery mirrors reference `updateNote`: run
-                // the merged markdown through `recoverAllPartialAnchors` before
+                // the new markdown through `recoverAllPartialAnchors` before
                 // persisting so surviving-partial anchors are repaired and
                 // unrecoverable ones are stripped + flipped to orphaned.
                 let mut plan =
-                    reanchor_note_comments(&store, &workspace_id, &note_id, merged).await?;
+                    reanchor_note_comments(&store, &workspace_id, &note_id, content).await?;
                 note.content = std::mem::take(&mut plan.content);
                 reanchor_plan = Some(plan);
             } else {
@@ -21250,14 +21940,22 @@ impl WorkspaceApi for Services {
                 }
             }
             note.updated_at = now_iso();
-            store.update_note_versioned(&note, expected_version).await?;
+            if content_changed {
+                // FE-only `note.update`: no caller-agent context on this arm
+                // (transport router path), so the version author is the user.
+                persist_note_content(&store, &note, expected_version, &user_version_author())
+                    .await?;
+            } else {
+                // Metadata-scoped: leaves the stored content untouched even
+                // when a content write committed after the fetch above.
+                store
+                    .update_note_metadata_versioned(&note, expected_version)
+                    .await?;
+            }
             if let Some(plan) = reanchor_plan {
                 plan.apply_orphaned(&store, &workspace_id).await?;
             }
             if content_changed {
-                // FE-only `note.update`: no caller-agent context on this arm
-                // (transport router path), so the version author is the user.
-                capture_note_version(&store, &note, &user_version_author()).await?;
                 services.schedule_line_attribution_recompute(
                     &note.workspace_id.clone(),
                     &note.id.clone(),
@@ -21308,26 +22006,36 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             note_ops::reject_numbered_read_presentation(&input.content)?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let old_content = note.content.clone();
-            let (new_content, position) = note_ops::apply_add(
-                &old_content,
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let (incoming, position) = note_ops::apply_add(
+                &note.content,
                 &input.content,
                 input.heading.as_deref(),
                 input.position.as_deref(),
             )?;
-            let mut plan =
-                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
-            let new_content = std::mem::take(&mut plan.content);
-            note.content = new_content.clone();
-            note.updated_at = now_iso();
-            store.update_note(&note).await?;
-            plan.apply_orphaned(&store, &workspace_id).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author).await?;
+            let read_rev = note.rev;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: new_content,
+                ..
+            } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: Some(note),
+                    incoming: &incoming,
+                    expected_version: Some(read_rev),
+                    policy: ContentWritePolicy::Surgical,
+                    author: &author,
+                    op: "note.add",
+                },
+            )
+            .await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
                 .auto_convert_task_blocks_after_write(
                     &note.workspace_id,
@@ -21390,22 +22098,32 @@ impl WorkspaceApi for Services {
                 ));
             }
             note_ops::reject_numbered_read_presentation(&input.new)?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let old_content = note.content.clone();
-            let (new_content, match_position, was_empty) =
-                note_ops::apply_edit(&old_content, &input.old, &input.new)?;
-            let mut plan =
-                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
-            let new_content = std::mem::take(&mut plan.content);
-            note.content = new_content.clone();
-            note.updated_at = now_iso();
-            store.update_note(&note).await?;
-            plan.apply_orphaned(&store, &workspace_id).await?;
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let (incoming, match_position, was_empty) =
+                note_ops::apply_edit(&note.content, &input.old, &input.new)?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author).await?;
+            let read_rev = note.rev;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: new_content,
+                ..
+            } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: Some(note),
+                    incoming: &incoming,
+                    expected_version: Some(read_rev),
+                    policy: ContentWritePolicy::Surgical,
+                    author: &author,
+                    op: "note.edit",
+                },
+            )
+            .await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
                 .auto_convert_task_blocks_after_write(
                     &note.workspace_id,
@@ -21466,23 +22184,33 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             note_ops::reject_numbered_read_presentation(&input.content)?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let old_content = note.content.clone();
-            let new_content =
-                note_ops::apply_edit_lines(&old_content, input.start, input.end, &input.content)?;
-            let total_lines_before = old_content.split('\n').count();
-            let mut plan =
-                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
-            let new_content = std::mem::take(&mut plan.content);
-            note.content = new_content.clone();
-            note.updated_at = now_iso();
-            store.update_note(&note).await?;
-            plan.apply_orphaned(&store, &workspace_id).await?;
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let incoming =
+                note_ops::apply_edit_lines(&note.content, input.start, input.end, &input.content)?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author).await?;
+            let read_rev = note.rev;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: new_content,
+                ..
+            } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: Some(note),
+                    incoming: &incoming,
+                    expected_version: Some(read_rev),
+                    policy: ContentWritePolicy::Surgical,
+                    author: &author,
+                    op: "note.editLines",
+                },
+            )
+            .await?;
+            let total_lines_before = old_content.split('\n').count();
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
                 .auto_convert_task_blocks_after_write(
                     &note.workspace_id,
@@ -21542,55 +22270,33 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
-            // Guard before the CRDT merge so a rejected write never seeds the
-            // yrs doc with content that is not persisted.
+            // Guard before the merge so a rejected write touches neither the
+            // store nor the merge state.
             note_ops::reject_numbered_read_presentation(&content)?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let old_content = note.content.clone();
-            let previous_title = note.title.clone();
-            if !old_content.is_empty() {
-                // Note sizes are far below 2^53 (loss-free in f64); the rounded
-                // percentage is in [0, 100] so the float→int cast is exact.
-                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-                let old_len = old_content.chars().count() as f64;
-                #[allow(clippy::cast_precision_loss)]
-                let new_len = content.chars().count() as f64;
-                let reduction = (old_len - new_len) / old_len * 100.0;
-                if reduction > 50.0 && !confirm_replacement {
-                    // The rounded percentage is in (50, 100]: exact in i64.
-                    #[allow(clippy::cast_possible_truncation)]
-                    let reduction_pct = reduction.round() as i64;
-                    return Err(Error::Internal(format!(
-                        "⚠️ CONTENT REDUCTION DETECTED: Your new content ({} chars) is {}% shorter than the existing content ({} chars).\n\nThis will REPLACE the entire note. If you intended to:\n- ADD content: Use note.add instead\n- EDIT a section: Use note.edit instead\n- PROCEED with replacement: Call note.setContent again with confirmReplacement=true",
-                        content.chars().count(),
-                        reduction_pct,
-                        old_content.chars().count()
-                    )));
-                }
-            }
-            // Route the full-content write through the CRDT merge engine
-            // (`CRDTNotesService.applyContentUpdate`): the yrs `Doc` is seeded
-            // from `old_content` on first touch and subsequent writes diff
-            // against the doc's current text, so concurrent full-content
-            // writes converge instead of last-write-wins. The merged text is
-            // what we then clean + persist through the normal mutation flow,
-            // so the line-attribution recompute still fires downstream.
-            let merged = services.crdt_notes.apply_full_content(
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: clean,
+                now,
+                rev,
+            } = persist_merged_content(
+                &store,
                 &workspace_id,
                 &note_id,
-                &old_content,
-                &content,
-            );
-            let clean = note_ops::clean_set_content(&merged)?;
-            let mut plan = reanchor_note_comments(&store, &workspace_id, &note_id, clean).await?;
-            let clean = std::mem::take(&mut plan.content);
-            note.content = clean.clone();
-            let now = now_iso();
-            note.updated_at = now.clone();
-            store.update_note_versioned(&note, expected_version).await?;
-            plan.apply_orphaned(&store, &workspace_id).await?;
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author).await?;
+                ContentWrite {
+                    seed: None,
+                    incoming: &content,
+                    expected_version,
+                    policy: ContentWritePolicy::SetContent {
+                        confirm_replacement,
+                    },
+                    author: &author,
+                    op: "note.setContent",
+                },
+            )
+            .await?;
+            let previous_title = note.title.clone();
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             let outcome = services
@@ -21601,9 +22307,9 @@ impl WorkspaceApi for Services {
                     caller_agent_id.as_ref(),
                 )
                 .await;
-            let (final_content, final_updated_at) = match outcome.refetched_note {
-                Some(n) => (n.content, n.updated_at),
-                None => (clean, now),
+            let (final_content, final_updated_at, final_rev) = match outcome.refetched_note {
+                Some(n) => (n.content, n.updated_at, n.rev),
+                None => (clean, now, rev),
             };
             publish_event(
                 bus.as_ref(),
@@ -21633,6 +22339,7 @@ impl WorkspaceApi for Services {
                 created_task_note_ids: outcome.created_note_ids,
                 created_tasks: outcome.created_tasks,
                 warnings: outcome.warnings,
+                rev: final_rev,
             })
         })
     }
@@ -21684,7 +22391,9 @@ impl WorkspaceApi for Services {
             }
             let now = now_iso();
             note.updated_at = now.clone();
-            store.update_note_versioned(&note, expected_version).await?;
+            store
+                .update_note_metadata_versioned(&note, expected_version)
+                .await?;
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -21732,7 +22441,6 @@ impl WorkspaceApi for Services {
             store
                 .delete_note_versioned(&workspace_id, &note_id, expected_version)
                 .await?;
-            services.crdt_notes.remove(&workspace_id, &note_id);
             publish_event(
                 bus.as_ref(),
                 note_change_event(&workspace_id, &note_id, &note.title, NOTE_DELETED, "delete"),
@@ -21859,7 +22567,7 @@ impl WorkspaceApi for Services {
             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             // Asset sizes are far below 2^53 (loss-free in f64); the rounded
             // KiB count fits i64, and the float→int cast saturates anyway.
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
             let size_kb = ((data.len() as f64) / 1024.0).round() as i64;
             let mime_type = note_ops::mime_from_extension(&asset_id);
             Ok(ReadAssetResult {
@@ -21965,12 +22673,12 @@ impl WorkspaceApi for Services {
             note.title = version.title;
             note.content = version.content;
             note.updated_at = now_iso();
-            store.update_note(&note).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            let new_v = capture_note_version(&store, &note, &author).await?;
+            let (_, new_v) = store
+                .update_note_with_version(&note, None, &author, &note.updated_at)
+                .await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -22049,21 +22757,21 @@ impl WorkspaceApi for Services {
             let checkbox = note_ops::checkbox_for(&status).ok_or_else(|| {
                 Error::Internal("Status must be 'done', 'todo', or 'in-progress'".to_string())
             })?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let normalized = task_text.trim().to_string();
             let linked = match note_ops::linked_task_for_text(&note.content, &normalized) {
                 Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
                 None => None,
             };
-            if let Some((task_id, current)) = linked {
+            if let Some((task_id, task)) = linked {
                 // The line links a task note: the task's metadata status is
                 // the source of truth and the char is its projection, so the
                 // write goes to the task (events, ready-task recompute) and
                 // the char follows via materialization — which also heals a
                 // line that had drifted from the task's status.
-                // Materialization invalidates the CRDT session and schedules
-                // the attribution recompute of every parent it rewrites.
-                match redirected_task_status(&status, current) {
+                // Materialization schedules the attribution recompute of
+                // every parent it rewrites.
+                match redirected_task_status(&status, task.status) {
                     Some(next) => {
                         services
                             .set_task_note_status(
@@ -22089,10 +22797,22 @@ impl WorkspaceApi for Services {
                 });
             }
             let updated = note_ops::apply_task_status(&note.content, &normalized, checkbox)?;
-            note.content = updated;
-            note.updated_at = now_iso();
-            store.update_note(&note).await?;
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let read_rev = note.rev;
+            let MergedContentWrite { note, .. } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: Some(note),
+                    incoming: &updated,
+                    expected_version: Some(read_rev),
+                    policy: ContentWritePolicy::Surgical,
+                    author: &author,
+                    op: "task.updateStatus",
+                },
+            )
+            .await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
@@ -22136,7 +22856,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         workspace_id: WorkspaceId,
@@ -22168,59 +22887,145 @@ impl WorkspaceApi for Services {
                     ));
                 }
             }
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            // The link is resolved from the POST-edit line: `text` may retarget
-            // it (A → B), and it is the task the line links after this write
-            // whose status the char projects.
-            let post_edit = note_ops::apply_task_line_update(
-                &note.content,
-                line,
-                text.as_deref(),
-                None,
-                expected.as_deref(),
-            )?;
-            let linked = match note_ops::linked_task_at_line(&post_edit.content, line) {
-                Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
-                None => None,
-            };
-            // On a linked line the char is a projection of the task note's
-            // status: the status write is redirected to the task and the line
-            // edit carries the word that status projects to — with no status
-            // word, the task's current one (a text-only retarget renders the
-            // new target's marker).
-            let redirect = linked.map(|(task_id, current)| {
-                let next = status
-                    .as_deref()
-                    .and_then(|word| redirected_task_status(word, current));
-                (task_id, next, current)
-            });
-            let line_status = match &redirect {
-                Some((_, next, current)) => Some(note_ops::status_word_for_task_status(
-                    next.unwrap_or(*current),
-                )),
-                None => status.as_deref(),
-            };
-            let update = note_ops::apply_task_line_update(
-                &note.content,
-                line,
-                text.as_deref(),
-                line_status,
-                expected.as_deref(),
-            )?;
-            // A redirected pure-status write leaves the char to materialization
-            // so the parent's `note:updated` follows the task's own emissions;
-            // a text edit (or a drifted char with nothing to write on the task)
-            // lands in one direct parent write instead.
-            let write_parent = match &redirect {
-                None => true,
-                Some((_, next, _)) => {
-                    text.is_some() || (next.is_none() && update.content != note.content)
+            // Every attempt derives the line from ONE read of the parent and
+            // commits gated on exactly that rev. On a linked line the
+            // projected marker is a function of the task note's status, so
+            // a miss on the gate re-runs the derivation from the fresh
+            // parent (link, guarded target status, marker) instead of
+            // three-way-merging the stale projection onto the current text:
+            // a task completed and materialized (`[x]`) by another caller
+            // between the read and the write would otherwise char-interleave
+            // with the stale marker into `[x ]` — no longer a checkbox, so
+            // nothing could heal it (intent-hq/intentd#1857). Unlinked lines
+            // carry no projection and keep the merging write.
+            let mut attempt = 0;
+            let (note, update, redirect, write_parent) = loop {
+                attempt += 1;
+                let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+                // The link is resolved from the POST-edit line: `text` may retarget
+                // it (A → B), and it is the task the line links after this write
+                // whose status the char projects.
+                let post_edit = note_ops::apply_task_line_update(
+                    &note.content,
+                    line,
+                    text.as_deref(),
+                    None,
+                    expected.as_deref(),
+                )?;
+                let linked = match note_ops::linked_task_at_line(&post_edit.content, line) {
+                    Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
+                    None => None,
+                };
+                // On a linked line the char is a projection of the task note's
+                // status: the status write is redirected to the task and the line
+                // edit carries the word that status projects to — with no status
+                // word, the task's current one (a text-only retarget renders the
+                // new target's marker). A write the terminal guard will refuse
+                // (the task's own linked agent reopening a `complete` /
+                // `cancelled` task) leaves the task where it is, so the line
+                // projects the CURRENT status — the parent is never rewritten
+                // with a marker the task write will not produce.
+                let redirect = match linked {
+                    Some((task_id, task)) => {
+                        let current = task.status;
+                        let next = status
+                            .as_deref()
+                            .and_then(|word| redirected_task_status(word, current));
+                        let projected = match next {
+                            Some(n)
+                                if !services
+                                    .terminal_guard_blocks(
+                                        &task,
+                                        &task_id,
+                                        n,
+                                        caller_agent_id.as_ref(),
+                                    )
+                                    .await =>
+                            {
+                                n
+                            }
+                            _ => current,
+                        };
+                        Some((task_id, next, projected))
+                    }
+                    None => None,
+                };
+                let line_status = match &redirect {
+                    Some((_, _, projected)) => {
+                        Some(note_ops::status_word_for_task_status(*projected))
+                    }
+                    None => status.as_deref(),
+                };
+                let update = note_ops::apply_task_line_update(
+                    &note.content,
+                    line,
+                    text.as_deref(),
+                    line_status,
+                    expected.as_deref(),
+                )?;
+                // A redirected pure-status write leaves the char to materialization
+                // so the parent's `note:updated` follows the task's own emissions;
+                // a text edit (or a drifted char with nothing to write on the task)
+                // lands in one direct parent write instead. A guard-refused
+                // status word writes the parent only when the text edit actually
+                // changed the line.
+                let write_parent = match &redirect {
+                    None => true,
+                    Some((_, next, projected)) => {
+                        let refused = next.is_some_and(|n| n != *projected);
+                        if refused {
+                            text.is_some() && update.content != note.content
+                        } else {
+                            text.is_some() || (next.is_none() && update.content != note.content)
+                        }
+                    }
+                };
+                if !write_parent {
+                    break (note, update, redirect, false);
+                }
+                services.park_task_update_projection(attempt).await;
+                let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+                let read_rev = note.rev;
+                if redirect.is_none() {
+                    let merged = persist_merged_content(
+                        &store,
+                        &workspace_id,
+                        &note_id,
+                        ContentWrite {
+                            seed: Some(note),
+                            incoming: &update.content,
+                            expected_version: Some(read_rev),
+                            policy: ContentWritePolicy::Surgical,
+                            author: &author,
+                            op: "task.update",
+                        },
+                    )
+                    .await?;
+                    break (merged.note, update, redirect, true);
+                }
+                let mut plan =
+                    reanchor_note_comments(&store, &workspace_id, &note_id, update.content.clone())
+                        .await?;
+                note.content = std::mem::take(&mut plan.content);
+                note.updated_at = now_iso();
+                match persist_note_content(&store, &note, Some(read_rev), &author).await {
+                    Ok(_) => {
+                        plan.apply_orphaned(&store, &workspace_id).await?;
+                        break (note, update, redirect, true);
+                    }
+                    Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {
+                        tracing::debug!(
+                            note = %note_id.0,
+                            op = "task.update",
+                            attempt,
+                            read_rev,
+                            "linked line changed under the projection; re-deriving"
+                        );
+                    }
+                    Err(e) => return Err(e),
                 }
             };
             if write_parent {
-                note.content = update.content;
-                note.updated_at = now_iso();
-                store.update_note(&note).await?;
                 publish_event(
                     bus.as_ref(),
                     note_change_event(
@@ -22238,15 +23043,18 @@ impl WorkspaceApi for Services {
                     .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
                     .await;
             }
+            // A guard-refused write still goes through the guarded path so the
+            // refusal and its materialization stay single-sourced; the task is
+            // unchanged and the line already projects it, so nothing is
+            // rewritten.
             if let Some((task_id, Some(next), _)) = redirect {
                 services
                     .set_task_note_status(&note.workspace_id, &task_id, next, None, caller_agent_id)
                     .await?;
             }
-            // A parent materialization rewrites already invalidates and
-            // schedules; only the direct write here needs it.
+            // A parent materialization rewrite already schedules; only the
+            // direct write here needs it.
             if write_parent {
-                services.invalidate_crdt_note(&note.workspace_id, &note.id);
                 services.schedule_line_attribution_recompute(&note.workspace_id, &note.id);
             }
             Ok(TaskUpdateResult {
@@ -22260,7 +23068,7 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::similar_names)] // stats/status are both the natural domain names
+    #[expect(clippy::similar_names)] // stats/status are both the natural domain names
     fn task_list(
         &self,
         workspace_id: WorkspaceId,
@@ -22466,7 +23274,7 @@ impl WorkspaceApi for Services {
                 }
             }
             note.updated_at = now.clone();
-            store.update_note(&note).await?;
+            store.update_note_metadata(&note).await?;
             // A markAsTask that crosses the complete boundary records/removes
             // the caller's flipped-completion pair, exactly like
             // `task.updateNoteStatus` (a same-status re-mark is a no-op here).
@@ -22655,7 +23463,7 @@ impl WorkspaceApi for Services {
             }
             note.metadata.task = Some(task);
             note.updated_at = now_iso();
-            store.update_note(&note).await?;
+            store.update_note_metadata(&note).await?;
             // Metadata changed → subscribers refetch the note (§6.5), same as
             // every other task-metadata write.
             publish_event(
@@ -22846,7 +23654,7 @@ impl WorkspaceApi for Services {
             }
             note.metadata.task = Some(task);
             note.updated_at = now.clone();
-            store.update_note(&note).await?;
+            store.update_note_metadata(&note).await?;
             // TS parity (`assignAgentToTask`): the assignment write routes
             // through `updateNote` (→ `note:updated`) and the not_started →
             // in_progress transition through `updateTaskStatus`
@@ -22931,7 +23739,7 @@ impl WorkspaceApi for Services {
                 task.assigned_agent_ids.retain(|id| id != &agent_id);
                 note.metadata.task = Some(task);
                 note.updated_at = now.clone();
-                store.update_note(&note).await?;
+                store.update_note_metadata(&note).await?;
                 updated_count += 1;
             }
             Ok(TaskRemoveAgentFromAllTasksResult {
@@ -22941,7 +23749,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_add(
         &self,
         workspace_id: WorkspaceId,
@@ -23028,7 +23835,33 @@ impl WorkspaceApi for Services {
                         }
                         None => uuid::Uuid::new_v4().to_string(),
                     };
+                    // The comment's author/type is the only provenance the
+                    // add carries: it stamps the anchor rewrite's snapshot.
+                    let comment_author = author.unwrap_or_else(|| {
+                        match author_type {
+                            AuthorType::User => "User",
+                            AuthorType::Agent => "Agent",
+                        }
+                        .to_string()
+                    });
+                    let version_author = match author_type {
+                        AuthorType::User => user_version_author(),
+                        AuthorType::Agent => NoteVersionAuthor {
+                            id: comment_author.clone(),
+                            name: comment_author.clone(),
+                            author_type: "agent".to_string(),
+                        },
+                    };
+                    // Read-anchor-persist loop: the anchor rewrite is gated
+                    // on the rev it read, so a save that lands in between
+                    // (`Conflict`) is re-read and re-anchored on the next
+                    // attempt instead of overwritten; the last attempt's
+                    // `Conflict` propagates unchanged, like `note.setContent`.
+                    let mut attempt = 0;
+                    let (note, line, anchored_text, note_rev) = loop {
+                    attempt += 1;
                     let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+                    let read_rev = note.rev;
                     // Self-heal phantom debris (Round 15): scrub UUID-format
                     // markers whose id has no live comment row before
                     // matching. The cleaned content persists only as part of
@@ -23081,14 +23914,8 @@ impl WorkspaceApi for Services {
                         thread_id: comment_id.clone(),
                         note_id: Some(note_id.clone()),
                         kind: parse_comment_type(kind.as_deref()),
-                        content: comment,
-                        author: author.unwrap_or_else(|| {
-                            match author_type {
-                                AuthorType::User => "User",
-                                AuthorType::Agent => "Agent",
-                            }
-                            .to_string()
-                        }),
+                        content: comment.clone(),
+                        author: comment_author.clone(),
                         author_type,
                         status: CommentStatus::Open,
                         parent_id: None,
@@ -23116,24 +23943,42 @@ impl WorkspaceApi for Services {
                         created_at: now.clone(),
                         updated_at: now,
                     };
-                    // The anchor-marker note rewrite + comment INSERT commit
+                    // The anchor-marker note rewrite (gated on `read_rev`) +
+                    // its version snapshot + comment INSERT commit
                     // atomically: a failure can never leave markers embedded
-                    // with no comment row (monorepo#638). The returned rev is
-                    // the authoritative post-rewrite value echoed to clients.
+                    // with no comment row (monorepo#638), nor the new rev
+                    // visible without its snapshot. The returned rev is the
+                    // authoritative post-rewrite value echoed to clients.
                     // Duplicate-id detection rides the INSERT's PK constraint
-                    // inside that same transaction (no TOCTOU pre-check), so a
-                    // colliding client-supplied `commentId` is InvalidParams
+                    // inside that same transaction (no TOCTOU pre-check), so
+                    // a colliding client-supplied `commentId` is InvalidParams
                     // even when two adds race.
-                    let note_rev = match store.update_note_with_comment(&note, &new_comment).await {
-                        Ok(rev) => rev,
+                    match store
+                        .update_note_with_comment(
+                            &note,
+                            Some(read_rev),
+                            &new_comment,
+                            &version_author,
+                        )
+                        .await
+                    {
+                        Ok(rev) => break (note, line, anchored_text, rev),
+                        Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {
+                            tracing::debug!(
+                                note = %note_id.0,
+                                attempt,
+                                read_rev,
+                                "comment.add: note changed under the anchor rewrite; re-anchoring"
+                            );
+                        }
                         Err(Error::InvalidInput(_)) if client_supplied_id => {
                             return Err(Error::InvalidParams(format!(
                                 "Invalid 'commentId': {comment_id}. A comment with this id already exists."
                             )))
                         }
                         Err(e) => return Err(e),
+                    }
                     };
-                    services.invalidate_crdt_note(&note.workspace_id, &note.id);
                     services.schedule_line_attribution_recompute(
                         &note.workspace_id.clone(),
                         &note.id.clone(),
@@ -23370,7 +24215,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_respond(
         &self,
         workspace_id: WorkspaceId,
@@ -23970,8 +24814,8 @@ impl WorkspaceApi for Services {
                     .ok()
                     .and_then(std::result::Result::ok)
                     .flatten()
-                    .and_then(|url| Self::parse_github_owner_repo(&url))
-                    .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+                    .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+                    .map_or((None, None), |r| (Some(r.owner), Some(r.name)));
             // Stamp the root's HEAD at registration time (fail-soft:
             // unreadable HEAD ⇒ NULL; the store merge never overwrites an
             // existing value on re-registration).
@@ -24850,7 +25694,9 @@ impl WorkspaceApi for Services {
                 }
             }
             let url = github_url.trim().to_string();
-            let Some((owner, repo)) = clone_ops::parse_owner_repo(&url) else {
+            let Some(RepoRef { owner, name: repo }) =
+                GitRemoteUrl::parse(&url).and_then(|u| u.repo_slug())
+            else {
                 return Err(Error::InvalidParams(format!(
                     "githubUrl carries no owner/repo pair: {url}"
                 )));
@@ -24873,12 +25719,11 @@ impl WorkspaceApi for Services {
                     )));
                 }
             }
-            let cache_root = resolve_workspaces_parent(
+            let cache_root = intent_git::repo_cache::cache_root_for(&resolve_workspaces_parent(
                 workspaces_root,
                 workspaces_root_pinned,
                 &worktrees_location,
-            )?
-            .join(".repo-cache");
+            )?);
             // Global single-flight: claim the slot or reject immediately with
             // the busy error naming the warm already in flight (never queue).
             {
@@ -25001,7 +25846,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         workspace_id: WorkspaceId,
@@ -27067,10 +27911,9 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         Box::pin(async move {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let repo_ref = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc
                 .get_pr(&repo_ref, number)
                 .await
@@ -27130,13 +27973,15 @@ impl WorkspaceApi for Services {
             // Cross-repo override (`{ repo: "owner/name" }`) wins over the
             // workspace repo; either way the resolved repo is echoed in the
             // result so a wrong-repo read is detectable.
-            let (owner, repo) = match repo {
-                Some(slug) => pr_ops::parse_repo_slug(&slug)?,
+            let repo_ref = match repo {
+                Some(slug) => {
+                    let (owner, repo) = pr_ops::parse_repo_slug(&slug)?;
+                    intent_sourcecontrol::RepoRef::new(owner, repo)
+                }
                 None => pr_ops::repo_of(&ws)?,
             };
-            let repo_slug = format!("{owner}/{repo}");
+            let repo_slug = format!("{}/{}", repo_ref.owner, repo_ref.name);
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
                 intent_sourcecontrol::Error::NotFound(_) => {
                     Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
@@ -27285,7 +28130,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_pulls_list(
         &self,
         owner: String,
@@ -27313,6 +28157,7 @@ impl WorkspaceApi for Services {
                         author: None,
                         involvement: None,
                         search: None,
+                        extra_repos: Vec::new(),
                         limit: Some(limit),
                         cursor,
                     },
@@ -27327,7 +28172,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_pulls_search(
         &self,
         owner: String,
@@ -27335,6 +28179,7 @@ impl WorkspaceApi for Services {
         filter: Option<String>,
         state: Option<String>,
         query: Option<String>,
+        repos: Vec<intent_sourcecontrol::RepoRef>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -27343,18 +28188,20 @@ impl WorkspaceApi for Services {
             let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
             let search = github_ops::normalize_search_query(query);
             // Search defaults to open PRs (FE `searchGitHubPullRequests`); a
-            // `filter:"all"` with no free-text `query` carries no constraint
-            // and so degrades to the plain `github.pulls.list` listing the
-            // engine performs, while involvement and/or free text route
-            // through `GET /search/issues`.
+            // `filter:"all"` with no free-text `query` and no `repos` extras
+            // carries no constraint and so degrades to the plain
+            // `github.pulls.list` listing the engine performs, while
+            // involvement, free text, and/or a multi-repo scope route through
+            // `GET /search/issues`.
             let state = match state {
                 Some(s) => github_ops::parse_pr_state(Some(s.as_str()))?,
                 None => Some(intent_sourcecontrol::PrState::Open),
             };
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let extra_repos = github_ops::normalize_extra_repos(&repo_ref, repos)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let page = sc
                 .list_prs(
                     &repo_ref,
@@ -27365,13 +28212,21 @@ impl WorkspaceApi for Services {
                         author: None,
                         involvement,
                         search,
+                        extra_repos: extra_repos.clone(),
                         limit: Some(limit),
                         cursor,
                     },
                 )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
-            let pulls: Vec<_> = page.items.iter().map(github_ops::pull_to_json).collect();
+            let scope: Vec<_> = std::iter::once(repo_ref).chain(extra_repos).collect();
+            let pulls: Vec<_> = page
+                .items
+                .iter()
+                .map(|p| {
+                    github_ops::pull_to_json_with_repo(p, &github_ops::hit_repo(&scope, &p.url))
+                })
+                .collect();
             Ok(serde_json::json!({
                 "pulls": pulls,
                 "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
@@ -27509,7 +28364,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_issues_list(
         &self,
         owner: String,
@@ -27533,6 +28387,7 @@ impl WorkspaceApi for Services {
                         state: Some(state),
                         labels,
                         search: None,
+                        extra_repos: Vec::new(),
                         limit: Some(limit),
                         cursor,
                     },
@@ -27551,7 +28406,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_issues_search(
         &self,
         owner: String,
@@ -27559,6 +28413,7 @@ impl WorkspaceApi for Services {
         filter: Option<String>,
         state: Option<String>,
         query: Option<String>,
+        repos: Vec<intent_sourcecontrol::RepoRef>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -27568,9 +28423,9 @@ impl WorkspaceApi for Services {
             // (no PR-only `review-requested`). The host-agnostic engine
             // cannot express `@me` involvement for issues (v1 limitation —
             // that needs an involvement clause on `IssueQuery`); a free-text
-            // `query` routes through the engine's `GET /search/issues` path,
-            // and without one the search degrades to the repo-issue listing
-            // filtered by state.
+            // `query` and/or `repos` extras route through the engine's
+            // `GET /search/issues` path, and without either the search
+            // degrades to the repo-issue listing filtered by state.
             github_ops::parse_issue_filter(filter.as_deref())?;
             let search = github_ops::normalize_search_query(query);
             let state = match state {
@@ -27579,8 +28434,9 @@ impl WorkspaceApi for Services {
             };
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let extra_repos = github_ops::normalize_extra_repos(&repo_ref, repos)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let page = sc
                 .list_issues(
                     &repo_ref,
@@ -27588,16 +28444,21 @@ impl WorkspaceApi for Services {
                         state: Some(state),
                         labels: None,
                         search,
+                        extra_repos: extra_repos.clone(),
                         limit: Some(limit),
                         cursor,
                     },
                 )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
+            let scope: Vec<_> = std::iter::once(repo_ref).chain(extra_repos).collect();
             let items: Vec<_> = page
                 .items
                 .iter()
-                .map(|i| github_ops::issue_to_json(i, &repo_ref.owner, &repo_ref.name))
+                .map(|i| {
+                    let hit = github_ops::hit_repo(&scope, &i.url);
+                    github_ops::issue_to_json(i, &hit.owner, &hit.name)
+                })
                 .collect();
             Ok(serde_json::json!({
                 "issues": items,
@@ -27791,7 +28652,7 @@ impl WorkspaceApi for Services {
         let registry = self.settings_registry.clone();
         let ls_remote_base = self.branches_ls_remote_base.clone();
         Box::pin(async move {
-            let cache_root = cache_parent.join(".repo-cache");
+            let cache_root = intent_git::repo_cache::cache_root_for(&cache_parent);
             if let Some(cached) =
                 intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await?
             {
@@ -27894,6 +28755,47 @@ impl WorkspaceApi for Services {
                     "exists": false,
                 })),
             }
+        })
+    }
+
+    fn github_related_repos_list(
+        &self,
+        owner: String,
+        repo: String,
+        git_ref: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
+            // Missing `.gitmodules` → { repos: [] }. A mis-shaped contents
+            // payload (directory, non-base64/non-UTF-8 content) folds the
+            // same way — never an error, like `github.repoConfig.get`.
+            // Transport/auth failures still surface like the other
+            // `github.*` methods.
+            let content = match sc
+                .get_file_content(&repo_ref, ".gitmodules", git_ref.as_deref())
+                .await
+            {
+                Ok(c) => c,
+                Err(intent_sourcecontrol::Error::Decode(msg)) => {
+                    tracing::warn!(
+                        "Mis-shaped remote .gitmodules at {}/{}@{}: {}",
+                        owner,
+                        repo,
+                        git_ref.as_deref().unwrap_or("default"),
+                        msg
+                    );
+                    None
+                }
+                Err(e) => return Err(pr_ops::map_sc_err(e)),
+            };
+            let repos = content
+                .map(|text| github_browse_ops::related_repos_from_gitmodules(&text, &repo_ref))
+                .unwrap_or_default();
+            Ok(serde_json::json!({
+                "repos": github_browse_ops::related_repos_to_wire(&repos),
+            }))
         })
     }
 
@@ -29790,7 +30692,7 @@ impl Services {
     /// Run the requested action's step sequence, accumulating per-step status.
     /// A failing step short-circuits with `success:false`; on success the
     /// recomputed metrics + refreshed git-status are emitted.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn ac_run_pipeline(
         &self,
         workspace_id: &WorkspaceId,
@@ -30083,10 +30985,9 @@ impl Services {
         if let Some(number) = ws.pr_number {
             return Ok((number, ws.pr_url.clone().unwrap_or_default()));
         }
-        let (owner, repo) = pr_ops::repo_of(&ws)
+        let repo_ref = pr_ops::repo_of(&ws)
             .map_err(|_| Error::Internal("No remote configured for this repository".to_string()))?;
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         let branch = ws.branch.clone();
         let target_branch = target
@@ -30137,9 +31038,8 @@ impl Services {
         let mut ws = self.store.get_workspace(&workspace_id).await.map_err(|_| {
             Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
         })?;
-        let (owner, repo) = pr_ops::repo_of(&ws)?;
+        let repo_ref = pr_ops::repo_of(&ws)?;
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
         let options = intent_sourcecontrol::MergeOptions {
             commit_title,
             commit_message,
@@ -30591,7 +31491,7 @@ impl Services {
     /// (locally via `update-ref`, or on the remote via a refspec push), rebasing
     /// onto trunk first when the branch is behind. Mirrors the TS local-trunk /
     /// remote-trunk merge flow incl. the squash strategy and auto-rebase.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn ac_merge(
         &self,
         workspace_id: &WorkspaceId,
@@ -30928,7 +31828,7 @@ impl Services {
     /// trunk when it exists, else a local `update-ref` of `refs/heads/<trunk>`.
     /// `token` is the caller-resolved GitHub token (the merge flow resolves it
     /// once via [`Self::ac_git_token`] and threads it through).
-    #[allow(clippy::unused_self)] // instance method for parity with the other ac_* steps
+    #[expect(clippy::unused_self)] // instance method for parity with the other ac_* steps
     fn ac_advance_trunk(
         &self,
         worktree: &Path,

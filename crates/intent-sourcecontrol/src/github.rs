@@ -64,6 +64,94 @@ impl GitHubSourceControl {
     fn repo_path(repo: &RepoRef, suffix: &str) -> String {
         format!("/repos/{}/{}{}", repo.owner, repo.name, suffix)
     }
+
+    /// One `GET /search/issues` page for `q`, newest-updated first; the raw
+    /// `items` array (empty when absent).
+    async fn search_issues_page(
+        &self,
+        q: String,
+        per_page: u64,
+        page_no: u64,
+    ) -> Result<Vec<Value>> {
+        let params: Vec<(&str, String)> = vec![
+            ("q", q),
+            ("sort", "updated".to_string()),
+            ("order", "desc".to_string()),
+            ("per_page", per_page.to_string()),
+            ("page", page_no.to_string()),
+        ];
+        let v: Value = self.client.get("/search/issues", Some(&params)).await?;
+        Ok(serde_json::from_value(
+            v.get("items")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        )?)
+    }
+
+    /// [`Self::search_issues_page`] over a repo `scope`, tolerant of
+    /// unreadable repos in a multi-repo scope: GitHub rejects the whole search
+    /// with 422 ("The listed users and repositories cannot be searched either
+    /// because the resources do not exist or you do not have permission to
+    /// view them" → [`Error::Conflict`]) when any `repo:` qualifier names a
+    /// repo the token cannot read. On THAT rejection — recognized by its
+    /// message via [`is_unsearchable_scope_rejection`]; other 422s (query over
+    /// 256 characters, a page past the 1000-result window) surface unchanged —
+    /// each scoped repo is probed (`GET /repos/{o}/{r}`), the ones answering
+    /// not-found/forbidden are dropped (debug log), and the search is retried
+    /// ONCE over the readable remainder. A single-repo scope never probes, so
+    /// its behavior is unchanged; a scope with nothing droppable surfaces the
+    /// original error.
+    async fn search_issues_scoped(
+        &self,
+        scope: &[RepoRef],
+        build: impl Fn(&[RepoRef]) -> String,
+        per_page: u64,
+        page_no: u64,
+    ) -> Result<Vec<Value>> {
+        let err = match self
+            .search_issues_page(build(scope), per_page, page_no)
+            .await
+        {
+            Ok(items) => return Ok(items),
+            Err(err) => match &err {
+                Error::Conflict(msg) if scope.len() > 1 && is_unsearchable_scope_rejection(msg) => {
+                    err
+                }
+                _ => return Err(err),
+            },
+        };
+        let mut readable: Vec<RepoRef> = Vec::with_capacity(scope.len());
+        for repo in scope {
+            match self
+                .client
+                .get::<Value, _, _>(&Self::repo_path(repo, ""), None::<&()>)
+                .await
+            {
+                Ok(_) => readable.push(repo.clone()),
+                Err(e) => match Error::from(e) {
+                    Error::NotFound(_) | Error::Auth(_) => tracing::debug!(
+                        owner = %repo.owner,
+                        repo = %repo.name,
+                        "dropping unreadable repo from multi-repo search scope"
+                    ),
+                    _ => readable.push(repo.clone()),
+                },
+            }
+        }
+        if readable.is_empty() || readable.len() == scope.len() {
+            return Err(err);
+        }
+        self.search_issues_page(build(&readable), per_page, page_no)
+            .await
+    }
+}
+
+/// Whether a search 422's message is GitHub's whole-search rejection for a
+/// `repo:` qualifier the token cannot read ("The listed users and repositories
+/// cannot be searched either because the resources do not exist or you do not
+/// have permission to view them"), as opposed to any other validation failure.
+fn is_unsearchable_scope_rejection(msg: &str) -> bool {
+    msg.contains("cannot be searched")
 }
 
 /// Capabilities of the GitHub host (everything the trait models is supported).
@@ -330,16 +418,37 @@ fn sanitize_search_text(text: &str) -> String {
         .join(" ")
 }
 
+/// One `repo:{o}/{r}` qualifier per repository, space-joined. GitHub search
+/// implicitly ORs repeated `repo:` qualifiers, so a multi-repo scope is a
+/// single request whose hits GitHub blends and orders natively.
+fn repo_qualifiers(repos: &[RepoRef]) -> String {
+    repos
+        .iter()
+        .map(|r| format!("repo:{}/{}", r.owner, r.name))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The full search scope for a query: the addressed repo first, then the
+/// `extra_repos` in caller order.
+fn search_scope(repo: &RepoRef, extra_repos: &[RepoRef]) -> Vec<RepoRef> {
+    let mut scope = Vec::with_capacity(1 + extra_repos.len());
+    scope.push(repo.clone());
+    scope.extend(extra_repos.iter().cloned());
+    scope
+}
+
 /// Build the `GET /search/issues` query for a PR search: `is:pr repo:{o}/{r}
-/// is:{state}` plus the optional `@me` involvement clause (parity with the FE
-/// `searchGitHubPullRequests`) and the optional free-text term.
+/// [repo:{o2}/{r2} …] is:{state}` plus the optional `@me` involvement clause
+/// (parity with the FE `searchGitHubPullRequests`) and the optional free-text
+/// term. `repos` is the addressed repo followed by any extra repos.
 pub(crate) fn build_pr_search_query(
-    repo: &RepoRef,
+    repos: &[RepoRef],
     state: &str,
     involvement: Option<PrInvolvement>,
     search: Option<&str>,
 ) -> String {
-    let mut q = format!("is:pr repo:{}/{} is:{state}", repo.owner, repo.name);
+    let mut q = format!("is:pr {} is:{state}", repo_qualifiers(repos));
     if let Some(involvement) = involvement {
         let involve = match involvement {
             PrInvolvement::Created => "author:@me",
@@ -361,16 +470,17 @@ pub(crate) fn build_pr_search_query(
 }
 
 /// Build the `GET /search/issues` query for an issue search: `is:issue
-/// repo:{o}/{r}` plus a `state:` clause (`all` adds none), a `label:` clause
-/// per comma-separated label (parity with the `/issues` listing `labels`
-/// param), and the free-text term.
+/// repo:{o}/{r} [repo:{o2}/{r2} …]` plus a `state:` clause (`all` adds none),
+/// a `label:` clause per comma-separated label (parity with the `/issues`
+/// listing `labels` param), and the free-text term. `repos` is the addressed
+/// repo followed by any extra repos.
 pub(crate) fn build_issue_search_query(
-    repo: &RepoRef,
+    repos: &[RepoRef],
     state: &str,
     labels: Option<&str>,
     search: &str,
 ) -> String {
-    let mut q = format!("is:issue repo:{}/{}", repo.owner, repo.name);
+    let mut q = format!("is:issue {}", repo_qualifiers(repos));
     if matches!(state, "open" | "closed") {
         let _ = write!(q, " state:{state}");
     }
@@ -1199,30 +1309,25 @@ impl SourceControl for GitHubSourceControl {
         let per_page = rest_per_page(query.limit.unwrap_or(30));
         let page_no = rest_page(query.cursor.as_deref());
         let search = search_term(query.search.as_deref());
-        if query.involvement.is_some() || search.is_some() {
+        if query.involvement.is_some() || search.is_some() || !query.extra_repos.is_empty() {
             // GitHub's `/pulls` listing cannot express assignee/review-requested/
-            // involves @me or free text, so route involvement/free-text queries
-            // through `/search/issues` (parity with the FE
+            // involves @me, free text, or a multi-repo scope, so route those
+            // queries through `/search/issues` (parity with the FE
             // `searchGitHubPullRequests`).
             let state = match query.state {
                 Some(PrState::Closed) => "closed",
                 Some(PrState::Merged) => "merged",
                 _ => "open",
             };
-            let q = build_pr_search_query(repo, state, query.involvement, search);
-            let params: Vec<(&str, String)> = vec![
-                ("q", q),
-                ("sort", "updated".to_string()),
-                ("order", "desc".to_string()),
-                ("per_page", per_page.to_string()),
-                ("page", page_no.to_string()),
-            ];
-            let v: Value = self.client.get("/search/issues", Some(&params)).await?;
-            let items: Vec<Value> = serde_json::from_value(
-                v.get("items")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new())),
-            )?;
+            let scope = search_scope(repo, &query.extra_repos);
+            let items = self
+                .search_issues_scoped(
+                    &scope,
+                    |repos| build_pr_search_query(repos, state, query.involvement, search),
+                    per_page,
+                    page_no,
+                )
+                .await?;
             let fetched = items.len();
             let prs = items
                 .into_iter()
@@ -1643,25 +1748,23 @@ impl SourceControl for GitHubSourceControl {
     async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Page<Issue>> {
         let per_page = rest_per_page(query.limit.unwrap_or(30));
         let page_no = rest_page(query.cursor.as_deref());
-        if let Some(search) = search_term(query.search.as_deref()) {
-            // The `/issues` listing cannot express free text, so route search
-            // queries through `/search/issues` (mirror of the `list_prs`
-            // involvement branch).
+        let search = search_term(query.search.as_deref());
+        if search.is_some() || !query.extra_repos.is_empty() {
+            // The `/issues` listing cannot express free text or a multi-repo
+            // scope, so route those queries through `/search/issues` (mirror
+            // of the `list_prs` involvement branch).
             let state = query.state.as_deref().unwrap_or("open");
-            let q = build_issue_search_query(repo, state, query.labels.as_deref(), search);
-            let params: Vec<(&str, String)> = vec![
-                ("q", q),
-                ("sort", "updated".to_string()),
-                ("order", "desc".to_string()),
-                ("per_page", per_page.to_string()),
-                ("page", page_no.to_string()),
-            ];
-            let v: Value = self.client.get("/search/issues", Some(&params)).await?;
-            let items: Vec<Value> = serde_json::from_value(
-                v.get("items")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new())),
-            )?;
+            let labels = query.labels.as_deref();
+            let search = search.unwrap_or_default();
+            let scope = search_scope(repo, &query.extra_repos);
+            let items = self
+                .search_issues_scoped(
+                    &scope,
+                    |repos| build_issue_search_query(repos, state, labels, search),
+                    per_page,
+                    page_no,
+                )
+                .await?;
             let fetched = items.len();
             // `is:issue` already excludes PRs server-side; the `pull_request`
             // filter stays as defense-in-depth (paging is measured on the raw
@@ -2468,15 +2571,16 @@ mod tests {
     #[test]
     fn builds_pr_search_query() {
         let repo = RepoRef::new("o", "r");
+        let repo = std::slice::from_ref(&repo);
         // Involvement-only (the pre-existing branch shape).
         assert_eq!(
-            build_pr_search_query(&repo, "open", Some(PrInvolvement::Created), None),
+            build_pr_search_query(repo, "open", Some(PrInvolvement::Created), None),
             "is:pr repo:o/r is:open author:@me"
         );
         // Free text combines with involvement and state.
         assert_eq!(
             build_pr_search_query(
-                &repo,
+                repo,
                 "closed",
                 Some(PrInvolvement::ReviewRequested),
                 Some("panic on save")
@@ -2485,12 +2589,12 @@ mod tests {
         );
         // Free text without involvement still searches; text is trimmed.
         assert_eq!(
-            build_pr_search_query(&repo, "merged", None, Some("  flaky test  ")),
+            build_pr_search_query(repo, "merged", None, Some("  flaky test  ")),
             "is:pr repo:o/r is:merged flaky test"
         );
         // Blank text adds no clause.
         assert_eq!(
-            build_pr_search_query(&repo, "open", Some(PrInvolvement::Involves), Some("   ")),
+            build_pr_search_query(repo, "open", Some(PrInvolvement::Involves), Some("   ")),
             "is:pr repo:o/r is:open involves:@me"
         );
     }
@@ -2498,23 +2602,63 @@ mod tests {
     #[test]
     fn builds_issue_search_query() {
         let repo = RepoRef::new("o", "r");
+        let repo = std::slice::from_ref(&repo);
         assert_eq!(
-            build_issue_search_query(&repo, "open", None, "login bug"),
+            build_issue_search_query(repo, "open", None, "login bug"),
             "is:issue repo:o/r state:open login bug"
         );
         assert_eq!(
-            build_issue_search_query(&repo, "closed", None, "crash"),
+            build_issue_search_query(repo, "closed", None, "crash"),
             "is:issue repo:o/r state:closed crash"
         );
         // `all` carries no state clause; text is trimmed.
         assert_eq!(
-            build_issue_search_query(&repo, "all", None, "  crash  "),
+            build_issue_search_query(repo, "all", None, "  crash  "),
             "is:issue repo:o/r crash"
         );
         // Comma-separated labels become quoted `label:` clauses.
         assert_eq!(
-            build_issue_search_query(&repo, "open", Some("bug, needs triage ,"), "crash"),
+            build_issue_search_query(repo, "open", Some("bug, needs triage ,"), "crash"),
             "is:issue repo:o/r state:open label:\"bug\" label:\"needs triage\" crash"
+        );
+    }
+
+    /// A multi-repo scope is ONE query with a `repo:` qualifier per repo, the
+    /// addressed repo first and the extras in caller order, for 1..=6 repos;
+    /// every other clause keeps its single-repo position. A blank issue
+    /// search over several repos is a bare scope query (the multi-repo
+    /// blank-query path routes through search).
+    #[test]
+    fn builds_multi_repo_search_queries() {
+        let primary = RepoRef::new("o", "r");
+        let extras: Vec<RepoRef> = (1..=5)
+            .map(|i| RepoRef::new(format!("o{i}"), format!("r{i}")))
+            .collect();
+        for n in 0..=extras.len() {
+            let scope = search_scope(&primary, &extras[..n]);
+            assert_eq!(scope.len(), n + 1);
+            let qualifiers = scope
+                .iter()
+                .map(|r| format!("repo:{}/{}", r.owner, r.name))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                build_pr_search_query(&scope, "open", Some(PrInvolvement::Created), Some("x")),
+                format!("is:pr {qualifiers} is:open author:@me x")
+            );
+            assert_eq!(
+                build_issue_search_query(&scope, "closed", Some("bug"), "x"),
+                format!("is:issue {qualifiers} state:closed label:\"bug\" x")
+            );
+            assert_eq!(
+                build_issue_search_query(&scope, "all", None, ""),
+                format!("is:issue {qualifiers}")
+            );
+        }
+        let scope = search_scope(&primary, &extras[..2]);
+        assert_eq!(
+            build_pr_search_query(&scope, "open", None, None),
+            "is:pr repo:o/r repo:o1/r1 repo:o2/r2 is:open"
         );
     }
 
@@ -2543,12 +2687,13 @@ mod tests {
         assert_eq!(sanitize_search_text("\"repo:x/y\" fix"), "\"repo:x/y\" fix");
         // The builders keep the scope prefix intact around sanitized text.
         let repo = RepoRef::new("o", "r");
+        let repo = std::slice::from_ref(&repo);
         assert_eq!(
-            build_issue_search_query(&repo, "open", None, "x repo:evil/evil"),
+            build_issue_search_query(repo, "open", None, "x repo:evil/evil"),
             "is:issue repo:o/r state:open x \"repo:evil/evil\""
         );
         assert_eq!(
-            build_pr_search_query(&repo, "open", None, Some("a OR org:evil")),
+            build_pr_search_query(repo, "open", None, Some("a OR org:evil")),
             "is:pr repo:o/r is:open a \"OR\" \"org:evil\""
         );
     }

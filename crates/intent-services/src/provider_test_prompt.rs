@@ -192,6 +192,7 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
         cmd,
         TEST_PROMPT,
         crate::complete_ops::config_option_model(provider, model),
+        None,
         TEST_PROMPT_TIMEOUT,
     )
     .await;

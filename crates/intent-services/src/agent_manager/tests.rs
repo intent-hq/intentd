@@ -29,6 +29,7 @@ use super::{
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
+use crate::test_support::test_tempdir;
 use crate::Services;
 
 /// `SQLite` db inside an RAII temp dir: the dir sweep (on drop, including on
@@ -42,13 +43,7 @@ struct TempDb {
 
 impl TempDb {
     fn new() -> Self {
-        let mut dir = tempfile::Builder::new()
-            .prefix("intentd-mgr-")
-            .tempdir()
-            .expect("create test tempdir");
-        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
-            dir.disable_cleanup(true);
-        }
+        let dir = test_tempdir("intentd-mgr-");
         let path = dir.path().join("mgr.db");
         Self { path, _dir: dir }
     }
@@ -3434,19 +3429,14 @@ fn pid_alive(pid: u32) -> bool {
 /// A self-cleaning temp git repo with one committed file modified in the workdir.
 struct TempRepo {
     dir: PathBuf,
-}
-
-impl Drop for TempRepo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
+    _guard: tempfile::TempDir,
 }
 
 /// Seed `a.txt`, commit it, then leave an unstaged modification (2 adds / 1 del).
 fn seed_repo() -> TempRepo {
     use git2::{Repository, Signature};
-    let dir = std::env::temp_dir().join(format!("intentd-ft-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let guard = test_tempdir("intentd-ft-");
+    let dir = guard.path().to_path_buf();
     let repo = Repository::init(&dir).unwrap();
     {
         let mut cfg = repo.config().unwrap();
@@ -3465,7 +3455,7 @@ fn seed_repo() -> TempRepo {
             .unwrap();
     }
     std::fs::write(dir.join("a.txt"), "line1\nCHANGED\nline3\nline4\n").unwrap();
-    TempRepo { dir }
+    TempRepo { dir, _guard: guard }
 }
 
 /// An agent `file:changed` runs the BE-internal review pipeline (§17.1): the
@@ -3777,11 +3767,14 @@ fn track_mock_agent_inner(
 /// `session/prompt` with a JSON-RPC ERROR carrying `error_message` (a
 /// transient-shaped `-32603`), while answering the lifecycle methods normally.
 /// Drives the suspend-enrollment turn worker path: a suspend-overlapping
-/// transient disconnect that `run_prompt_turn` enrolls for wake-resume.
+/// transient disconnect that `run_prompt_turn` enrolls for wake-resume. With a
+/// `gate`, the prompt failure is held until the test notifies it, so the worker
+/// provably holds its in-flight slot while the test acts.
 fn spawn_mock_agent_erroring_on_prompt<R, W>(
     read: R,
     write: W,
     error_message: String,
+    gate: Option<Arc<tokio::sync::Notify>>,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -3801,6 +3794,9 @@ where
                 continue;
             };
             if method == "session/prompt" {
+                if let Some(gate) = &gate {
+                    gate.notified().await;
+                }
                 // A pre-failure warning chunk, then the transient error.
                 let note = json!({
                     "jsonrpc": "2.0",
@@ -3851,10 +3847,36 @@ fn track_mock_agent_prompt_rpc_error(
     id: &AgentId,
     error_message: &str,
 ) -> JoinHandle<()> {
+    track_mock_agent_prompt_rpc_error_inner(mgr, id, error_message, "auggie", None)
+}
+
+/// Like [`track_mock_agent_prompt_rpc_error`], but the prompt failure waits on
+/// the returned gate (`notify_one`), holding the worker mid-turn until then.
+/// The handle is stamped as spawned by the `mock` provider (`node`) so a
+/// session pinned to `mock` reuses it instead of taking the provider-changed
+/// respawn branch.
+fn track_mock_agent_prompt_rpc_error_gated(
+    mgr: &AgentManager,
+    id: &AgentId,
+    error_message: &str,
+) -> (JoinHandle<()>, Arc<tokio::sync::Notify>) {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let agent =
+        track_mock_agent_prompt_rpc_error_inner(mgr, id, error_message, "node", Some(gate.clone()));
+    (agent, gate)
+}
+
+fn track_mock_agent_prompt_rpc_error_inner(
+    mgr: &AgentManager,
+    id: &AgentId,
+    error_message: &str,
+    spawned_provider: &str,
+    gate: Option<Arc<tokio::sync::Notify>>,
+) -> JoinHandle<()> {
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
     let agent =
-        spawn_mock_agent_erroring_on_prompt(c2a_agent, a2c_agent, error_message.to_string());
+        spawn_mock_agent_erroring_on_prompt(c2a_agent, a2c_agent, error_message.to_string(), gate);
     let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
     let connection = Arc::new(Connection::new(
         c2a_client,
@@ -3880,7 +3902,7 @@ fn track_mock_agent_prompt_rpc_error(
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
-            spawned_provider: "auggie".to_string(),
+            spawned_provider: spawned_provider.to_string(),
             thought_level: None,
             wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_listener: None,
@@ -4086,6 +4108,164 @@ async fn suspend_enrollment_flushes_deferred_attention() {
     assert!(
         mgr.services.take_deferred_attention(&id).is_empty(),
         "the flush consumed the parked queue"
+    );
+}
+
+/// Regression (intent-hq/intent#4972): the wake-resume continuation is
+/// delivered through `send_message`, and under load it can land while the
+/// suspend-interrupted worker still holds its in-flight slot (the self-heal
+/// debounce is only a timer; the enrollment persist + `kill_child_only` can
+/// outlast it). The send then loses `try_begin` and is parked in the queue.
+/// The suspend arm used to `end_turn` + `break` without a drain pass, and the
+/// session settles `RuntimeIdle` (not `Error`), so the parked-recovery-send
+/// redrive never fired either: the continuation stranded until an unrelated
+/// message arrived, and the e2e waited out its 180 s slow-timeout. The worker
+/// must drain the parked continuation itself, on a fresh child.
+///
+/// Deterministic: the mock's prompt failure is gated, so the second send
+/// provably lands behind the held slot before the failure is released.
+#[tokio::test]
+async fn suspend_enrollment_drains_continuation_parked_behind_held_slot() {
+    let script = mock_agent_script();
+    // Keep the enrollment self-heal from firing: the test IS the continuation
+    // send, timed against the held slot. The mock script serves the fresh
+    // child the drained turn spawns after `kill_child_only`.
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_WAKE_RESUME_SELF_HEAL_MS", "600000"),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+    ]);
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store)
+        .with_event_bus(bus.clone())
+        .with_suspend_tracker(Arc::new(AlwaysSuspended(Duration::from_secs(120))));
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services, sink, 8));
+
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-suspend-parked"));
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "existing-id")
+        .await
+        .unwrap();
+
+    // A live child whose prompt fails transiently (suspend-overlapping) — but
+    // only once the gate opens, so the worker holds the slot until then.
+    let (_agent, gate) =
+        track_mock_agent_prompt_rpc_error_gated(&mgr, &id, "Connection reset by peer");
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "work through the sleep".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message starts the turn worker");
+    assert!(
+        mgr.is_busy(&id),
+        "the worker holds the in-flight slot mid-turn"
+    );
+
+    // The resume continuation lands behind the held slot: parked in the queue
+    // (the shape `resume_interrupted_agent` sends — automatic origin, tagged).
+    let parked = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "You can now continue your work and pick up where you left off.".to_string(),
+            None,
+            super::TurnOptions {
+                message_metadata: Some(json!({
+                    "type": "resume_continuation",
+                    "source": "system",
+                })),
+                origin: MessageOrigin::Automatic,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("continuation send is accepted");
+    assert_eq!(
+        parked["queued"],
+        json!(true),
+        "the continuation lost try_begin to the held slot: {parked}"
+    );
+    assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+
+    // Release the prompt failure: the worker enrolls the turn (system_suspend)
+    // and must drain the parked continuation instead of exiting past it.
+    gate.notify_one();
+
+    // Wait for the worker to exit with the slot released (pre-fix it exits
+    // straight after the enrollment; post-fix after the drained turn).
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the suspend-interrupted worker exits");
+    // The continuation did not strand behind the exited worker: the drain
+    // delivered it on a fresh child.
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "the suspend-interrupted worker drains the continuation parked behind its slot: {:?}",
+        mgr.services.queue_snapshot(&id)
+    );
+
+    // The turn was enrolled (not surfaced terminally) …
+    let row = mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .expect("interrupted_agent row enrolled");
+    assert_eq!(row.reason.as_deref(), Some("system_suspend"));
+    // … with its partial persisted, and the continuation reached the
+    // transcript and produced a completed assistant turn (the mock's default
+    // response) — no stranded message.
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.to_string().contains("partial ")),
+        "suspend-interrupted partial persisted: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == "user"
+                && m.content.to_string().contains("pick up where you left off")),
+        "continuation user row persisted by the drain: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(
+            |m| m.role == "assistant" && m.content.to_string().contains("Mock agent completed")
+        ),
+        "drained continuation completed on the fresh child: {messages:?}"
+    );
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap(),
+        AgentStatus::RuntimeIdle,
+        "no Error status: the suspend path stays non-terminal"
     );
 }
 
@@ -4864,9 +5044,10 @@ async fn build_turn_prompt_appends_image_blocks_after_text() {
     assert_eq!(arr[2]["mimeType"], json!("image/jpeg"));
 }
 
-/// FE-supplied `fileBlocks` become ACP `resource` content blocks with a
-/// `BlobResourceContents` carrying the file name lifted into the resource
-/// `uri` (`file:///<fileName>`), appended after any image blocks.
+/// FE-supplied `fileBlocks` (attachment references, PROTOCOL §5.5 v10.0)
+/// become `text` attachment notices naming the file and its `attachmentId`,
+/// appended after any image blocks, in caller order. No `resource` blob is
+/// ever emitted.
 #[tokio::test]
 async fn build_turn_prompt_appends_file_blocks_after_text_and_images() {
     let (_tmp, mgr) = manager().await;
@@ -4876,26 +5057,32 @@ async fn build_turn_prompt_appends_file_blocks_after_text_and_images() {
     let options = super::TurnOptions {
         image_blocks: Some(json!([{"data": "IMG", "mimeType": "image/png"}])),
         file_blocks: Some(json!([
-            {"data": "Zm9v", "mimeType": "text/plain", "fileName": "notes.txt"},
-            {"data": "YmFy", "mimeType": "application/pdf", "fileName": "spec.pdf"},
+            {"attachmentId": "att-notes", "mimeType": "text/plain", "fileName": "notes.txt"},
+            {"attachmentId": "att-spec", "mimeType": "application/pdf", "fileName": "spec.pdf"},
         ])),
         ..super::TurnOptions::default()
     };
     let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
-    assert_eq!(arr.len(), 4, "text + 1 image + 2 file blocks");
+    assert_eq!(arr.len(), 4, "text + 1 image + 2 file notices");
     assert_eq!(arr[0]["type"], json!("text"));
     assert_eq!(arr[1]["type"], json!("image"));
     // Images come before files, files come in caller order.
-    assert_eq!(arr[2]["type"], json!("resource"));
-    assert_eq!(arr[2]["resource"]["blob"], json!("Zm9v"));
-    assert_eq!(arr[2]["resource"]["mimeType"], json!("text/plain"));
-    assert_eq!(arr[2]["resource"]["uri"], json!("file:///notes.txt"));
-    assert_eq!(arr[3]["type"], json!("resource"));
-    assert_eq!(arr[3]["resource"]["blob"], json!("YmFy"));
-    assert_eq!(arr[3]["resource"]["mimeType"], json!("application/pdf"));
-    assert_eq!(arr[3]["resource"]["uri"], json!("file:///spec.pdf"));
+    assert_eq!(arr[2]["type"], json!("text"));
+    let notes = arr[2]["text"].as_str().unwrap();
+    assert!(notes.contains("notes.txt"), "{notes}");
+    assert!(notes.contains("text/plain"), "{notes}");
+    assert!(notes.contains("att-notes"), "{notes}");
+    assert_eq!(arr[3]["type"], json!("text"));
+    let spec = arr[3]["text"].as_str().unwrap();
+    assert!(spec.contains("spec.pdf"), "{spec}");
+    assert!(spec.contains("application/pdf"), "{spec}");
+    assert!(spec.contains("att-spec"), "{spec}");
+    assert!(
+        arr.iter().all(|b| b["type"] != json!("resource")),
+        "no resource blob is emitted from file blocks: {wire}"
+    );
 }
 
 /// Malformed attachment entries (missing required fields, wrong types) are
@@ -4914,20 +5101,26 @@ async fn build_turn_prompt_skips_malformed_attachments() {
             {"data": "GOOD", "mimeType": "image/png"},
         ])),
         file_blocks: Some(json!([
-            {"mimeType": "text/plain", "fileName": "x.txt"},   // missing data
-            {"data": "d", "fileName": "x.txt"},                 // missing mimeType
-            {"data": "d", "mimeType": "text/plain"},            // missing fileName
-            {"data": "d", "mimeType": "text/plain", "fileName": "keep.txt"},
+            {"mimeType": "text/plain", "fileName": "x.txt"},   // no attachmentId
+            {"attachmentId": "att-1"},                          // missing fileName
+            {"attachmentId": "  ", "fileName": "blank.txt"},    // blank attachmentId
+            // Legacy inline data (v10.0): dropped, never a resource blob.
+            {"data": "d", "mimeType": "text/plain", "fileName": "inline.txt"},
+            {"attachmentId": "att-keep", "mimeType": "text/plain", "fileName": "keep.txt"},
         ])),
         ..super::TurnOptions::default()
     };
     let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
-    // text + 1 well-formed image + 1 well-formed file.
-    assert_eq!(arr.len(), 3);
+    // text + 1 well-formed image + 1 well-formed file reference.
+    assert_eq!(arr.len(), 3, "{wire}");
     assert_eq!(arr[1]["data"], json!("GOOD"));
-    assert_eq!(arr[2]["resource"]["uri"], json!("file:///keep.txt"));
+    assert_eq!(arr[2]["type"], json!("text"));
+    let notice = arr[2]["text"].as_str().unwrap();
+    assert!(notice.contains("keep.txt"), "{notice}");
+    assert!(notice.contains("att-keep"), "{notice}");
+    assert!(!wire.to_string().contains("inline.txt"));
 }
 
 /// Combined interrupt delivery (STAB-114 / monorepo#1014): `prepend_content`
@@ -4944,11 +5137,11 @@ async fn build_turn_prompt_prepends_preempted_content_and_attachments_first() {
         prepend_content: Some("original ask".to_string()),
         prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
         prepend_file_blocks: Some(json!([
-            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+            {"attachmentId": "att-orig", "mimeType": "text/plain", "fileName": "orig.txt"},
         ])),
         image_blocks: Some(json!([{"data": "NEW_IMG", "mimeType": "image/jpeg"}])),
         file_blocks: Some(json!([
-            {"data": "bmV3", "mimeType": "text/plain", "fileName": "new.txt"},
+            {"attachmentId": "att-new", "mimeType": "text/plain", "fileName": "new.txt"},
         ])),
         ..super::TurnOptions::default()
     };
@@ -4974,12 +5167,12 @@ async fn build_turn_prompt_prepends_preempted_content_and_attachments_first() {
     // Preempted attachments precede this turn's own.
     assert_eq!(arr[1]["type"], json!("image"));
     assert_eq!(arr[1]["data"], json!("ORIG_IMG"));
-    assert_eq!(arr[2]["type"], json!("resource"));
-    assert_eq!(arr[2]["resource"]["uri"], json!("file:///orig.txt"));
+    assert_eq!(arr[2]["type"], json!("text"));
+    assert!(arr[2]["text"].as_str().unwrap().contains("orig.txt"));
     assert_eq!(arr[3]["type"], json!("image"));
     assert_eq!(arr[3]["data"], json!("NEW_IMG"));
-    assert_eq!(arr[4]["type"], json!("resource"));
-    assert_eq!(arr[4]["resource"]["uri"], json!("file:///new.txt"));
+    assert_eq!(arr[4]["type"], json!("text"));
+    assert!(arr[4]["text"].as_str().unwrap().contains("new.txt"));
 }
 
 /// Recreated-session interaction (monorepo#1014): when the ACP session was
@@ -6068,10 +6261,10 @@ async fn stop_redelivery_flush_413_retry(
     queued: [(&str, Option<&str>); 2],
 ) -> StopRedeliveryFlush413 {
     let script = mock_agent_script();
-    let prompt_log =
-        std::env::temp_dir().join(format!("itd-413-{tag}-{}.log", uuid::Uuid::new_v4()));
+    let scratch = test_tempdir(&format!("itd-413-{tag}-"));
+    let prompt_log = scratch.path().join("prompts.log");
     let prompt_log_s = prompt_log.to_string_lossy().into_owned();
-    let attempt_file = std::env::temp_dir().join(format!("itd-413-{tag}-{}", uuid::Uuid::new_v4()));
+    let attempt_file = scratch.path().join("attempts");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
     // `advertiseLoadSession` keeps the retry on the RESUME path: a recreated
     // session replays the transcript (stopped row included) as history and
@@ -6199,8 +6392,6 @@ async fn stop_redelivery_flush_413_retry(
         .lines()
         .map(|l| serde_json::from_str(l).expect("prompt log line"))
         .collect();
-    let _ = std::fs::remove_file(&prompt_log);
-    let _ = std::fs::remove_file(&attempt_file);
     assert_eq!(
         prompts.len(),
         2,
@@ -6478,7 +6669,15 @@ async fn terminal_failure_events_carry_turn_id() {
     seed_agent(&mgr, &ws, &id).await;
 
     let mut sub = bus.subscribe(SubscriptionFilter::default());
-    super::publish_terminal_failure_events(&mgr, &id, &ws, "boom", Some("turn-tfe-1")).await;
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        "boom",
+        Some("turn-tfe-1"),
+        super::FailedProviderSource::CommittedTurn,
+    )
+    .await;
 
     let mut events = Vec::new();
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
@@ -6498,7 +6697,15 @@ async fn terminal_failure_events_carry_turn_id() {
 
     // Omit-when-absent: a None turn id leaves both payloads without the key.
     let mut sub = bus.subscribe(SubscriptionFilter::default());
-    super::publish_terminal_failure_events(&mgr, &id, &ws, "boom2", None).await;
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        "boom2",
+        None,
+        super::FailedProviderSource::CommittedTurn,
+    )
+    .await;
     let mut events = Vec::new();
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
@@ -6514,6 +6721,141 @@ async fn terminal_failure_events_carry_turn_id() {
             ev.data
         );
     }
+}
+
+/// Collect the `agent:failed` payload the terminal publisher emits for one
+/// quota-classified failure under the given provider source.
+async fn quota_failed_payload(
+    mgr: &AgentManager,
+    bus: &EventBus,
+    ws: &WorkspaceId,
+    id: &AgentId,
+    source: super::FailedProviderSource,
+) -> Value {
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    super::publish_terminal_failure_events(
+        mgr,
+        id,
+        ws,
+        "session/new failed: rate_limit_error: usage limit reached",
+        None,
+        source,
+    )
+    .await;
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    events
+        .iter()
+        .find(|e| e.event_type == "agent:failed")
+        .expect("agent:failed event")
+        .data
+        .clone()
+}
+
+/// A quota failure's `providerId` comes from the source matching the step
+/// that failed. The seeded state is the one an `agent.setModel` switch
+/// leaves behind until the new child is up: `last_turn_provider` still names
+/// the PREVIOUS provider. A failed TURN (`CommittedTurn`) is correctly
+/// attributed to it; a failed spawn / session setup (`SpawnAttempt`) must name
+/// the provider the attempt resolved instead, consume that record so it can
+/// never label a later unrelated failure, and — when no attempt was recorded
+/// — omit the field rather than fall back to the stale turn identity.
+#[tokio::test]
+async fn quota_failure_provider_follows_failed_step() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-qfp"), AgentId::from("a-qfp"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_agent_session_last_turn_model(&ws, &id, None, "auggie")
+        .await
+        .expect("seed previous provider as last_turn_provider");
+
+    let turn = quota_failed_payload(
+        &mgr,
+        &bus,
+        &ws,
+        &id,
+        super::FailedProviderSource::CommittedTurn,
+    )
+    .await;
+    assert_eq!(turn["errorCode"], json!("quota-exceeded"));
+    assert_eq!(turn["providerId"], json!("auggie"), "{turn}");
+
+    mgr.spawn_attempt_provider
+        .lock()
+        .unwrap()
+        .insert(id.clone(), "mock".to_string());
+    let spawn = quota_failed_payload(
+        &mgr,
+        &bus,
+        &ws,
+        &id,
+        super::FailedProviderSource::SpawnAttempt,
+    )
+    .await;
+    assert_eq!(spawn["errorCode"], json!("quota-exceeded"));
+    assert_eq!(spawn["providerId"], json!("mock"), "{spawn}");
+    assert!(
+        !mgr.spawn_attempt_provider.lock().unwrap().contains_key(&id),
+        "the attempt record is consumed by the publisher"
+    );
+
+    let unrecorded = quota_failed_payload(
+        &mgr,
+        &bus,
+        &ws,
+        &id,
+        super::FailedProviderSource::SpawnAttempt,
+    )
+    .await;
+    assert_eq!(unrecorded["errorCode"], json!("quota-exceeded"));
+    assert!(
+        unrecorded.get("providerId").is_none(),
+        "no attempt record: omit rather than stamp the stale turn provider: {unrecorded}"
+    );
+}
+
+/// No spawn-attempt record outlives its attempt: a spawn failure that is NOT
+/// a quota rejection still consumes it (the publisher runs once per failed
+/// attempt, quota or not), and a teardown that cancels an in-flight attempt
+/// (`stop` / `workspace.delete` → `detach`) drops it — so an agent that is
+/// never retried does not retain a per-agent entry.
+#[tokio::test]
+async fn spawn_attempt_provider_never_outlives_its_attempt() {
+    let (_tmp, mgr, _bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-sap"), AgentId::from("a-sap"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    mgr.spawn_attempt_provider
+        .lock()
+        .unwrap()
+        .insert(id.clone(), "mock".to_string());
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        "session/new failed: internal error",
+        None,
+        super::FailedProviderSource::SpawnAttempt,
+    )
+    .await;
+    assert!(
+        !mgr.spawn_attempt_provider.lock().unwrap().contains_key(&id),
+        "a non-quota spawn failure consumes the attempt record"
+    );
+
+    mgr.spawn_attempt_provider
+        .lock()
+        .unwrap()
+        .insert(id.clone(), "mock".to_string());
+    mgr.stop(&id).await;
+    assert!(
+        !mgr.spawn_attempt_provider.lock().unwrap().contains_key(&id),
+        "teardown drops the record of a cancelled attempt"
+    );
 }
 
 /// Durable-before-observable (monorepo#2009): the terminal-failure handlers
@@ -9527,25 +9869,17 @@ async fn interrupt_send_during_turn_startup_queues_keep_alive() {
 // --- SP-B: spawn `agent_type` derived from the specialist's `agentType` -------
 
 /// Self-cleaning temp directory for hermetic specialist-file fixtures.
-struct TempSpecialistsDir(PathBuf);
+struct TempSpecialistsDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
 impl TempSpecialistsDir {
     fn new() -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("intentd-spb-specialists-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create specialists dir");
-        Self(dir)
+        let guard = test_tempdir("intentd-spb-specialists-");
+        Self(guard.path().to_path_buf(), guard)
     }
 
     /// Write `<id>.md` with the given raw markdown-with-frontmatter content.
     fn write(&self, id: &str, content: &str) {
         std::fs::write(self.0.join(format!("{id}.md")), content).expect("write specialist file");
-    }
-}
-
-impl Drop for TempSpecialistsDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -12871,7 +13205,8 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
 #[tokio::test]
 async fn pre_output_transport_failure_redrives_silently_once() {
     let script = mock_agent_script();
-    let attempt_file = std::env::temp_dir().join(format!("itd-764-once-{}", uuid::Uuid::new_v4()));
+    let scratch = test_tempdir("itd-764-once-");
+    let attempt_file = scratch.path().join("attempts");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
     let behavior = json!({
         "exitDuringPromptAttempts": 1,
@@ -12963,7 +13298,6 @@ async fn pre_output_transport_failure_redrives_silently_once() {
         messages.iter().any(|m| m.role == "assistant"),
         "the redriven turn completed with assistant output: {messages:?}"
     );
-    let _ = std::fs::remove_file(&attempt_file);
 }
 
 /// End-to-end auth-required prompt failure (intent-hq/intent#3941): a real
@@ -13138,7 +13472,8 @@ async fn worker_driven_streaming_failure_records_streak_exactly_once() {
 #[tokio::test]
 async fn second_pre_output_transport_failure_takes_terminal_path() {
     let script = mock_agent_script();
-    let attempt_file = std::env::temp_dir().join(format!("itd-764-twice-{}", uuid::Uuid::new_v4()));
+    let scratch = test_tempdir("itd-764-twice-");
+    let attempt_file = scratch.path().join("attempts");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
     let behavior = json!({
         "exitDuringPromptAttempts": 2,
@@ -13217,7 +13552,6 @@ async fn second_pre_output_transport_failure_takes_terminal_path() {
         stop_reason.contains("transport closed before output"),
         "stop_reason names the transport failure: {stop_reason}"
     );
-    let _ = std::fs::remove_file(&attempt_file);
 }
 
 /// Warn-and-continue: a prompt idle timeout injects a persisted user-role
@@ -13921,8 +14255,8 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.provider = Some("auggie".to_string());
-    let ws_dir = std::env::temp_dir().join(format!("intentd-rs-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&ws_dir).unwrap();
+    let ws_guard = test_tempdir("intentd-rs-");
+    let ws_dir = ws_guard.path().to_path_buf();
     let mut workspace = intent_core::Workspace {
         id: WorkspaceId::from("ws-rs"),
         title: "WS".to_string(),
@@ -13974,7 +14308,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
 
     // Switch to a non-existent path → fall back to temp.
     workspace.path = Some(
-        std::env::temp_dir()
+        std::env::temp_dir() // tmp-hygiene: allow — never created
             .join(format!("intentd-missing-{}", uuid::Uuid::new_v4()))
             .display()
             .to_string(),
@@ -13982,8 +14316,6 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
     let resolved =
         resolve_spawn(&session, Some(&workspace), &settings, None).expect("falls back to temp");
     assert_eq!(resolved.cwd, std::env::temp_dir());
-
-    let _ = std::fs::remove_dir_all(&ws_dir);
 }
 
 /// The chief workspace (no worktree on disk) spawns in the dedicated
@@ -13998,13 +14330,14 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
     let chief = intent_core::chief_workspace();
 
     // Fresh (not-yet-created) chief cwd root → created on demand and used.
-    let data_dir = std::env::temp_dir().join(format!("intentd-chief-{}", uuid::Uuid::new_v4()));
+    let data_guard = test_tempdir("intentd-chief-");
+    let data_dir = data_guard.path().to_path_buf();
     let chief_root = intent_core::chief_cwd_root(&data_dir);
     assert!(!chief_root.exists(), "fresh data dir: root must not exist");
     let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&chief_root))
         .expect("chief resolves");
     assert_eq!(resolved.cwd, chief_root);
-    assert_ne!(resolved.cwd, PathBuf::from("/tmp"), "never /tmp");
+    assert_ne!(resolved.cwd, PathBuf::from("/tmp"), "never /tmp"); // tmp-hygiene: allow (literal)
     assert!(chief_root.is_dir(), "chief cwd created on demand");
     let entries = std::fs::read_dir(&chief_root).unwrap().count();
     assert_eq!(entries, 0, "dedicated chief cwd is empty");
@@ -14027,8 +14360,6 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
     let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&blocked_root))
         .expect("chief resolves despite blocked root");
     assert_eq!(resolved.cwd, std::env::temp_dir());
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// A workspace with only `repository_path` on disk (an `isNewRepo`
@@ -14039,8 +14370,8 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.provider = Some("auggie".to_string());
-    let repo_dir = std::env::temp_dir().join(format!("intentd-rs-repo-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&repo_dir).unwrap();
+    let repo_guard = test_tempdir("intentd-rs-repo-");
+    let repo_dir = repo_guard.path().to_path_buf();
     let mut workspace = intent_core::Workspace {
         id: WorkspaceId::from("ws-repo-fb"),
         title: "WS".to_string(),
@@ -14092,8 +14423,8 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     assert_ne!(resolved.cwd, std::env::temp_dir(), "never the temp dir");
 
     // `worktree_path` still wins over `repository_path` when both exist.
-    let wt_dir = std::env::temp_dir().join(format!("intentd-rs-wt-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&wt_dir).unwrap();
+    let wt_guard = test_tempdir("intentd-rs-wt-");
+    let wt_dir = wt_guard.path().to_path_buf();
     workspace.worktree_path = Some(wt_dir.display().to_string());
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("worktree_path still wins");
@@ -14102,7 +14433,7 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     // A stale (non-directory) `path` must not suppress a live candidate
     // further down the chain — each entry is `is_dir()`-checked individually.
     workspace.path = Some(
-        std::env::temp_dir()
+        std::env::temp_dir() // tmp-hygiene: allow — never created
             .join(format!("intentd-stale-path-{}", uuid::Uuid::new_v4()))
             .display()
             .to_string(),
@@ -14115,7 +14446,7 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     // A missing repository_path directory falls through to the temp dir.
     workspace.worktree_path = None;
     workspace.repository_path = Some(
-        std::env::temp_dir()
+        std::env::temp_dir() // tmp-hygiene: allow — never created
             .join(format!("intentd-missing-{}", uuid::Uuid::new_v4()))
             .display()
             .to_string(),
@@ -14123,9 +14454,6 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     let resolved =
         resolve_spawn(&session, Some(&workspace), &settings, None).expect("falls back to temp");
     assert_eq!(resolved.cwd, std::env::temp_dir());
-
-    let _ = std::fs::remove_dir_all(&repo_dir);
-    let _ = std::fs::remove_dir_all(&wt_dir);
 }
 
 // --- Prompt block shape helpers ----------------------------------------------
@@ -14214,31 +14542,53 @@ fn user_message_blocks_blank_attachment_id_persists_inline_data() {
     assert!(arr[1].get("attachmentId").is_none());
 }
 
-/// `validate_file_blocks` (PROTOCOL §5.5): exactly one of `data` /
-/// `attachmentId` per entry — both or neither is `-32602`; valid arrays,
-/// non-arrays, and non-object entries pass.
+/// `validate_file_blocks` (PROTOCOL §5.5, v10.0): every entry must carry a
+/// non-empty `attachmentId`; inline `data` (alone or beside a reference) and
+/// a missing / blank reference are `-32602` naming the index; valid
+/// reference arrays, non-arrays, and non-object entries pass.
 #[test]
-fn validate_file_blocks_rejects_both_or_neither() {
+fn validate_file_blocks_rejects_inline_data_and_missing_reference() {
     use crate::agent_ops::validate_file_blocks;
-    // Valid: inline-data entry and attachment-reference entry.
+    let invalid_params =
+        |err: &intent_core::Error| matches!(err, intent_core::Error::InvalidParams(_));
+    // Valid: attachment-reference entries only.
     let ok = json!([
-        { "type": "file", "data": "d", "mimeType": "t/p", "fileName": "a.txt" },
         { "type": "file", "attachmentId": "att-1", "fileName": "b.pdf" },
+        { "type": "file", "attachmentId": "att-2", "fileName": "c.txt", "mimeType": "t/p", "size": 3 },
     ]);
     assert!(validate_file_blocks("m", Some(&ok)).is_ok());
-    // Neither.
-    let neither = json!([{ "type": "file", "fileName": "x.txt" }]);
-    let err = validate_file_blocks("agent.sendMessage", Some(&neither)).unwrap_err();
+    // Inline data alone: rejected, naming the index and the removed arm.
+    let inline = json!([
+        { "type": "file", "attachmentId": "att-1", "fileName": "b.pdf" },
+        { "type": "file", "data": "QQ==", "mimeType": "t/p", "fileName": "a.txt" },
+    ]);
+    let err = validate_file_blocks("agent.sendMessage", Some(&inline)).unwrap_err();
+    assert!(invalid_params(&err), "{err:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("agent.sendMessage"), "{msg}");
+    assert!(msg.contains("fileBlocks[1]"), "{msg}");
     assert!(
-        matches!(err, intent_core::Error::InvalidParams(_)),
-        "{err:?}"
+        msg.contains("inline file data is no longer accepted"),
+        "{msg}"
     );
-    // Both.
+    // Inline data beside a reference: still rejected.
     let both = json!([{ "type": "file", "data": "d", "attachmentId": "att-1", "fileName": "x" }]);
-    assert!(validate_file_blocks("m", Some(&both)).is_err());
-    // Blank attachmentId counts as absent → data-only entry still valid.
-    let blank = json!([{ "type": "file", "data": "d", "attachmentId": " ", "fileName": "x" }]);
-    assert!(validate_file_blocks("m", Some(&blank)).is_ok());
+    let err = validate_file_blocks("m", Some(&both)).unwrap_err();
+    assert!(invalid_params(&err), "{err:?}");
+    assert!(err.to_string().contains("fileBlocks[0]"), "{err}");
+    // A non-string `data` value is also inline data.
+    let bad_type = json!([{ "type": "file", "data": 7, "attachmentId": "att-1", "fileName": "x" }]);
+    assert!(validate_file_blocks("m", Some(&bad_type)).is_err());
+    // No reference.
+    let neither = json!([{ "type": "file", "fileName": "x.txt" }]);
+    let err = validate_file_blocks("agent.queueMessage", Some(&neither)).unwrap_err();
+    assert!(invalid_params(&err), "{err:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("agent.queueMessage: fileBlocks[0]"), "{msg}");
+    assert!(msg.contains("attachmentId"), "{msg}");
+    // Blank attachmentId counts as absent.
+    let blank = json!([{ "type": "file", "attachmentId": " ", "fileName": "x" }]);
+    assert!(validate_file_blocks("m", Some(&blank)).is_err());
     // Non-array / absent / non-object entries are tolerated.
     assert!(validate_file_blocks("m", None).is_ok());
     assert!(validate_file_blocks("m", Some(&json!("nope"))).is_ok());
@@ -14546,8 +14896,8 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
 
 /// Prompt rendering (PROTOCOL §5.5): an attachment-reference file block
 /// becomes a `text` attachment notice naming the metadata and directing the
-/// model to `ws.file.getAttachment(attachmentId)`; inline-data file blocks
-/// keep the `resource` blob shape.
+/// model to `ws.file.getAttachment(attachmentId)`; a legacy inline-data file
+/// block (v10.0) is dropped from the prompt — never a `resource` blob.
 #[test]
 fn append_attachment_blocks_renders_attachment_reference_notice() {
     let options = super::TurnOptions {
@@ -14560,7 +14910,7 @@ fn append_attachment_blocks_renders_attachment_reference_notice() {
     };
     let mut blocks = Vec::new();
     super::append_attachment_blocks(&mut blocks, &options);
-    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks.len(), 1, "inline entry dropped: {blocks:?}");
     let notice = serde_json::to_value(&blocks[0]).unwrap();
     assert_eq!(notice["type"], json!("text"));
     let text = notice["text"].as_str().unwrap();
@@ -14568,9 +14918,7 @@ fn append_attachment_blocks_renders_attachment_reference_notice() {
     assert!(text.contains("application/json"), "{text}");
     assert!(text.contains("4096 bytes"), "{text}");
     assert!(text.contains("ws.file.getAttachment(\"att-9\")"), "{text}");
-    let inline = serde_json::to_value(&blocks[1]).unwrap();
-    assert_eq!(inline["type"], json!("resource"));
-    assert_eq!(inline["resource"]["blob"], json!("aGk="));
+    assert!(!text.contains("aGk="), "{text}");
 }
 
 /// STAB-133: the queue-drain `persist_user` path appends the FE-supplied
@@ -14794,7 +15142,8 @@ fn text_prompt_produces_one_acp_text_content_block() {
 /// the workspace path and returns its declared `agentType`.
 #[tokio::test]
 async fn derive_agent_type_uses_workspace_project_specialists_dir() {
-    let ws_dir = std::env::temp_dir().join(format!("intentd-dat-{}", uuid::Uuid::new_v4()));
+    let ws_guard = test_tempdir("intentd-dat-");
+    let ws_dir = ws_guard.path().to_path_buf();
     let specialists_dir = ws_dir.join(".intent/specialists");
     std::fs::create_dir_all(&specialists_dir).unwrap();
     std::fs::write(
@@ -14890,8 +15239,6 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         derive_is_orchestrator(&services, &orch_session, Some(&repo_only)),
         "derive_is_orchestrator must fall back to repositoryPath"
     );
-
-    let _ = std::fs::remove_dir_all(&ws_dir);
 }
 
 // --- Context references → stdinContext builder (Fidelity B) ---------------
@@ -18995,8 +19342,8 @@ mod archived_flush_gates {
     #[tokio::test]
     async fn parked_archive_wake_rides_the_unarchiving_user_turn() {
         let script = mock_agent_script();
-        let prompt_log =
-            std::env::temp_dir().join(format!("itd-ua-flush-{}.log", uuid::Uuid::new_v4()));
+        let scratch = test_tempdir("itd-ua-flush-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -19092,7 +19439,6 @@ mod archived_flush_gates {
         // ONE combined provider turn whose prompt carries the wake, the
         // user message, and the trailing one-shot unarchive notice.
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(prompts.len(), 1, "one combined turn: {prompts:?}");
         let text = &prompts[0];
         let w = text
@@ -19902,8 +20248,8 @@ mod flush_queued_messages_tests {
     #[tokio::test]
     async fn drain_flushes_two_ready_entries_into_one_combined_turn() {
         let script = mock_agent_script();
-        let prompt_log =
-            std::env::temp_dir().join(format!("itd-flush-on-{}.log", uuid::Uuid::new_v4()));
+        let scratch = test_tempdir("itd-flush-on-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -19955,7 +20301,6 @@ mod flush_queued_messages_tests {
 
         // ONE provider turn carrying the combined prompt.
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(prompts.len(), 1, "one combined turn: {prompts:?}");
         let text = &prompts[0];
         assert!(
@@ -20002,8 +20347,8 @@ mod flush_queued_messages_tests {
     #[tokio::test]
     async fn setting_off_keeps_one_turn_per_message() {
         let script = mock_agent_script();
-        let prompt_log =
-            std::env::temp_dir().join(format!("itd-flush-off-{}.log", uuid::Uuid::new_v4()));
+        let scratch = test_tempdir("itd-flush-off-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -20069,7 +20414,6 @@ mod flush_queued_messages_tests {
         .expect("both turns complete");
 
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(
             prompts.len(),
             2,
@@ -20090,8 +20434,8 @@ mod flush_queued_messages_tests {
     #[tokio::test]
     async fn system_only_batches_system_entries_and_leaves_user_entry_for_solo_fifo_drain() {
         let script = mock_agent_script();
-        let prompt_log =
-            std::env::temp_dir().join(format!("itd-flush-systemonly-{}.log", uuid::Uuid::new_v4()));
+        let scratch = test_tempdir("itd-flush-systemonly-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -20170,7 +20514,6 @@ mod flush_queued_messages_tests {
         .expect("both the combined system turn and the solo user turn complete");
 
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(
             prompts.len(),
             2,
@@ -20201,10 +20544,8 @@ mod flush_queued_messages_tests {
     #[tokio::test]
     async fn system_only_single_system_entry_drains_solo() {
         let script = mock_agent_script();
-        let prompt_log = std::env::temp_dir().join(format!(
-            "itd-flush-systemonly-solo-{}.log",
-            uuid::Uuid::new_v4()
-        ));
+        let scratch = test_tempdir("itd-flush-systemonly-solo-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -20262,7 +20603,6 @@ mod flush_queued_messages_tests {
         .expect("solo turn completes");
 
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(prompts.len(), 1, "single solo turn: {prompts:?}");
         assert!(
             !prompts[0].contains("queued messages while you were working"),

@@ -24,8 +24,10 @@ const NEXT_STEPS_OFF: &str = "## Suggested Next Steps\n\n\
 const AUTO_COMMIT_CLAUSE: &str = " Auto-commit is enabled; do not include prompts about \
     committing or reviewing changes before committing.";
 
+/// The v2.3 row stays bundled after the bump so a "2.3"-stamped session
+/// keeps resolving its own doctrine (`v2_4_goldens` pins the current stamp).
 #[test]
-fn v2_3_remains_registered() {
+fn v2_3_stays_registered() {
     assert_eq!(crate::harness::resolve_entry("2.3").version, "2.3");
 }
 

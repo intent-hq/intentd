@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use super::*;
 
 // `credential_pid` recorder is `Option<Option<_>>`: never-called vs called-with-None.
-#[allow(clippy::option_option)]
+#[expect(clippy::option_option)]
 struct FakeControl {
     status: SystemStatus,
     shutdown_called: AtomicBool,

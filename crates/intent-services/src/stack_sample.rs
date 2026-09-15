@@ -42,6 +42,7 @@ pub(crate) fn effective_frequency_hz(frequency_hz: Option<i64>) -> i64 {
 /// a concurrent call is rejected with a typed `Error::Internal` instead of
 /// being queued. The capture (guard install → sleep → report build/render)
 /// runs on the blocking pool so the async runtime is never stalled.
+#[cfg_attr(not(unix), expect(clippy::unused_async))] // only the unix arm awaits
 pub(crate) async fn sample_stacks(
     duration_ms: Option<i64>,
     frequency_hz: Option<i64>,
@@ -52,9 +53,9 @@ pub(crate) async fn sample_stacks(
     #[cfg(not(unix))]
     {
         let _ = (duration_ms, frequency_hz);
-        return Err(Error::Unsupported(
+        Err(Error::Unsupported(
             "debug.sampleStacks is not supported on this platform (Unix-only)".to_string(),
-        ));
+        ))
     }
 
     #[cfg(unix)]

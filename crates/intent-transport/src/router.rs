@@ -9,8 +9,9 @@
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ClientId, ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate,
-    NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode,
-    TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId, WorkspaceUpdate,
+    NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, RepoRef, ScriptCreateParams,
+    ScriptMode, TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId,
+    WorkspaceUpdate,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -2709,6 +2710,15 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "github.relatedRepos.list" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let git_ref = opt_str(params, "ref");
+            let r = api
+                .github_related_repos_list(owner, repo, git_ref)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "github.pulls.get" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
@@ -2765,15 +2775,15 @@ async fn dispatch(
             Ok(r)
         }
         "github.pulls.search" => {
-            let owner = require_str_param(params, "owner")?;
-            let repo = require_str_param(params, "repo")?;
+            let (owner, repo) = require_repo_slug(params)?;
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let query = opt_str(params, "query");
+            let repos = opt_repo_refs(params, "repos")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_pulls_search(owner, repo, filter, state, query, limit, next_token)
+                .github_pulls_search(owner, repo, filter, state, query, repos, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2823,15 +2833,15 @@ async fn dispatch(
             Ok(r)
         }
         "github.issues.search" => {
-            let owner = require_str_param(params, "owner")?;
-            let repo = require_str_param(params, "repo")?;
+            let (owner, repo) = require_repo_slug(params)?;
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let query = opt_str(params, "query");
+            let repos = opt_repo_refs(params, "repos")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_issues_search(owner, repo, filter, state, query, limit, next_token)
+                .github_issues_search(owner, repo, filter, state, query, repos, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3516,15 +3526,35 @@ async fn dispatch(
             let data = opt_str(params, "data");
             let source_path = opt_str(params, "sourcePath");
             let mime_type = opt_str(params, "mimeType");
-            api.file_place_attachment(ws, file_name, data, source_path, mime_type)
+            let idempotency_key = opt_str_strict(params, "idempotencyKey")?;
+            api.file_place_attachment(ws, file_name, data, source_path, mime_type, idempotency_key)
                 .await
                 .map_err(domain_to_rpc)
         }
         "file.getAttachmentInfo" => {
-            let attachment_id = require_str_param(params, "attachmentId")?;
-            api.file_get_attachment_info(attachment_id)
-                .await
-                .map_err(domain_to_rpc)
+            // Exactly one of `attachmentId` | (`workspaceId` + `idempotencyKey`)
+            // (intent-hq/intent#4691). Presence is decided on the raw params
+            // so a key arm never silently degrades to the id arm.
+            let has_id = params.get("attachmentId").is_some_and(|v| !v.is_null());
+            let has_key = params.get("idempotencyKey").is_some_and(|v| !v.is_null());
+            match (has_id, has_key) {
+                (true, false) => {
+                    let attachment_id = require_str_param(params, "attachmentId")?;
+                    api.file_get_attachment_info(attachment_id)
+                        .await
+                        .map_err(domain_to_rpc)
+                }
+                (false, true) => {
+                    let ws = require_ws_note(params)?;
+                    let idempotency_key = require_str_param(params, "idempotencyKey")?;
+                    api.file_get_attachment_info_by_key(ws, idempotency_key)
+                        .await
+                        .map_err(domain_to_rpc)
+                }
+                _ => Err(invalid_params(
+                    "exactly one of attachmentId or idempotencyKey (with workspaceId) is required",
+                )),
+            }
         }
         "file.attachmentUpload.begin" => {
             let ws = require_ws_note(params)?;
@@ -3532,9 +3562,17 @@ async fn dispatch(
             let size_bytes = require_u64(params, "sizeBytes")?;
             let sha256 = require_str_param(params, "sha256")?;
             let mime_type = opt_str(params, "mimeType");
-            api.file_attachment_upload_begin(ws, file_name, size_bytes, sha256, mime_type)
-                .await
-                .map_err(domain_to_rpc)
+            let idempotency_key = opt_str_strict(params, "idempotencyKey")?;
+            api.file_attachment_upload_begin(
+                ws,
+                file_name,
+                size_bytes,
+                sha256,
+                mime_type,
+                idempotency_key,
+            )
+            .await
+            .map_err(domain_to_rpc)
         }
         "file.attachmentUpload.chunk" => {
             let upload_id = require_str_param(params, "uploadId")?;
@@ -4112,6 +4150,84 @@ fn opt_str(params: &Map<String, Value>, name: &str) -> Option<String> {
     params.get(name).and_then(Value::as_str).map(str::to_string)
 }
 
+/// GitHub's own length ceilings for a login (user / org) and a repository
+/// name; anything longer cannot name a real repo and is rejected up front.
+const MAX_GITHUB_OWNER_LEN: usize = 39;
+const MAX_GITHUB_REPO_LEN: usize = 100;
+
+/// Validate one half of a GitHub `owner/repo` slug against GitHub's naming
+/// rules — owner: `[A-Za-z0-9-]`, repo: `[A-Za-z0-9._-]` (never `.` / `..`),
+/// both non-empty and length-capped. The slugs are interpolated verbatim
+/// into search qualifiers (`repo:{owner}/{repo}`) and REST paths, so a value
+/// carrying whitespace, `:` or `/` could smuggle in extra qualifiers or path
+/// segments; `label` names the offending param in the `-32602` message.
+fn validate_repo_slug_part(label: &str, value: &str, is_owner: bool) -> Result<(), RpcErr> {
+    let (what, max_len) = if is_owner {
+        ("GitHub owner", MAX_GITHUB_OWNER_LEN)
+    } else {
+        ("GitHub repository name", MAX_GITHUB_REPO_LEN)
+    };
+    let allowed =
+        |c: char| c.is_ascii_alphanumeric() || c == '-' || (!is_owner && (c == '_' || c == '.'));
+    let valid = !value.is_empty()
+        && value.len() <= max_len
+        && value != "."
+        && value != ".."
+        && value.chars().all(allowed);
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_params(format!(
+            "{label} is not a valid {what}: {value:?}"
+        )))
+    }
+}
+
+/// Require the `(owner, repo)` pair addressing a GitHub repository (§5.27)
+/// and validate both halves via [`validate_repo_slug_part`]; missing/non-string
+/// → the usual "Missing required parameter" `-32602`.
+fn require_repo_slug(params: &Map<String, Value>) -> Result<(String, String), RpcErr> {
+    let owner = require_str_param(params, "owner")?;
+    let repo = require_str_param(params, "repo")?;
+    validate_repo_slug_part("owner", &owner, true)?;
+    validate_repo_slug_part("repo", &repo, false)?;
+    Ok((owner, repo))
+}
+
+/// Optional `[{ owner, repo }]` param (the `github.*.search` `repos` extras,
+/// §5.27): absent/null → empty. Anything else must be an array whose every
+/// entry is an object with string `owner` and `repo` that pass
+/// [`validate_repo_slug_part`] → `-32602` naming the entry index otherwise.
+/// Dedup and the total-repo cap are applied downstream by the services layer.
+fn opt_repo_refs(params: &Map<String, Value>, name: &str) -> Result<Vec<RepoRef>, RpcErr> {
+    let entries = match params.get(name) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err(invalid_params(format!(
+                "{name} must be an array of {{ owner, repo }} objects"
+            )))
+        }
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let field = |key: &str, is_owner: bool| {
+                let label = format!("{name}[{idx}].{key}");
+                let value = entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| invalid_params(format!("{label} must be a non-empty string")))?;
+                validate_repo_slug_part(&label, value, is_owner)?;
+                Ok::<_, RpcErr>(value.to_string())
+            };
+            Ok(RepoRef::new(field("owner", true)?, field("repo", false)?))
+        })
+        .collect()
+}
+
 /// Like [`opt_str`] but treats empty and whitespace-only values as absent, so
 /// downstream code cannot distinguish `Some("")` from `None`. Used at the
 /// router boundary for optional hints where an empty string would be
@@ -4276,6 +4392,18 @@ fn opt_bool_strict(params: &Map<String, Value>, name: &str) -> Result<Option<boo
     }
 }
 
+/// Like [`opt_str`] but strict: absent/null → `None`, a string →
+/// `Some(..)`, anything else → `-32602`. Used where silently dropping a
+/// non-string would change semantics (e.g. an attachment `idempotencyKey`,
+/// whose absence means "not idempotent").
+fn opt_str_strict(params: &Map<String, Value>, name: &str) -> Result<Option<String>, RpcErr> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(invalid_params(format!("{name} must be a string"))),
+    }
+}
+
 /// Optional string→string map param (absent/non-object → `None`); non-string
 /// values are skipped. Used for the `script.create` `env` overrides.
 fn opt_string_map(
@@ -4293,7 +4421,7 @@ fn opt_string_map(
 /// Used by the `event.*` `limit` / `minutesAgo` knobs, whose defaults are
 /// applied in the service layer (`value || default`).
 // Whole-valued floats from JSON clients; float→int casts saturate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn opt_int(params: &Map<String, Value>, name: &str) -> Option<i64> {
     match params.get(name) {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
@@ -4380,7 +4508,7 @@ fn parse_confirm(params: &Map<String, Value>) -> bool {
 /// for parity with the other paginated reads we fall back to top-level `limit`
 /// and `nextToken` when no `page` object is present.
 // Whole-valued floats from JSON clients; float→int casts saturate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn parse_page_params(params: &Map<String, Value>) -> (Option<i64>, Option<String>) {
     if let Some(Value::Object(page)) = params.get("page") {
         let limit = page
@@ -4425,7 +4553,7 @@ fn normalize_acceptance_criteria(params: &Map<String, Value>) -> Vec<String> {
 /// Loosely parse an integer from a JSON number or leading-int string
 /// (`parseInt`-like), returning `None` when no integer is present.
 // Whole-valued floats from JSON clients; float→int casts saturate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn parse_int_loose(value: Option<&Value>) -> Option<i64> {
     match value {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),

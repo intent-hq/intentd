@@ -5,12 +5,19 @@
 use super::*;
 use futures_util::FutureExt;
 
+fn data(bytes: Vec<u8>) -> StreamMsg {
+    let permit = Arc::new(Semaphore::new(bytes.len()))
+        .try_acquire_many_owned(u32::try_from(bytes.len()).unwrap())
+        .unwrap();
+    StreamMsg::Data(bytes, permit)
+}
+
 /// Queue saturation is isolated even when the next frame is a half-close.
 /// Use an unpolled receiver to make saturation deterministic, without relying
 /// on kernel TCP buffer sizes or timing a slow consumer.
 #[tokio::test]
 async fn full_stream_queue_closes_only_that_stream() {
-    for message in [StreamMsg::Data(vec![2]), StreamMsg::Eof] {
+    for message in [data(vec![2]), StreamMsg::Eof] {
         let (server_io, client_io) = tokio::io::duplex(1024);
         let server = WebSocketStream::from_raw_socket(
             server_io,
@@ -26,7 +33,7 @@ async fn full_stream_queue_closes_only_that_stream() {
         .await;
         let (mut sink, _) = server.split();
         let (blocked_tx, _blocked_rx) = mpsc::channel(1);
-        assert!(blocked_tx.try_send(StreamMsg::Data(vec![1])).is_ok());
+        assert!(blocked_tx.try_send(data(vec![1])).is_ok());
         let (healthy_tx, mut healthy_rx) = mpsc::channel(2);
         let blocked = tokio::spawn(std::future::pending::<()>());
         let healthy = tokio::spawn(std::future::pending::<()>());
@@ -37,6 +44,7 @@ async fn full_stream_queue_closes_only_that_stream() {
             (
                 1,
                 StreamHandle {
+                    port: 0,
                     generation: blocked_generation.clone(),
                     msg_tx: blocked_tx,
                     abort: blocked.abort_handle(),
@@ -45,6 +53,7 @@ async fn full_stream_queue_closes_only_that_stream() {
             (
                 2,
                 StreamHandle {
+                    port: 0,
                     generation: healthy_generation,
                     msg_tx: healthy_tx,
                     abort: healthy.abort_handle(),
@@ -94,6 +103,7 @@ async fn full_stream_queue_closes_only_that_stream() {
                 &mut streams,
                 &out_tx,
                 TunnelLimits::default(),
+                &Arc::new(Semaphore::new(INBOUND_BYTES_PER_CONNECTION)),
             )
             .await
         );
@@ -117,10 +127,10 @@ async fn full_stream_queue_closes_only_that_stream() {
                 .get(&1)
                 .is_some_and(|handle| Arc::ptr_eq(&handle.generation, &replacement_generation)));
         }
-        assert!(forward_to_stream(&mut sink, &mut streams, 2, StreamMsg::Data(vec![3])).await);
+        assert!(forward_to_stream(&mut sink, &mut streams, 2, data(vec![3])).await);
         assert!(forward_to_stream(&mut sink, &mut streams, 2, StreamMsg::Eof).await);
         assert!(
-            matches!(healthy_rx.recv().await, Some(StreamMsg::Data(bytes)) if bytes == vec![3])
+            matches!(healthy_rx.recv().await, Some(StreamMsg::Data(bytes, _permit)) if bytes == vec![3])
         );
         assert!(matches!(healthy_rx.recv().await, Some(StreamMsg::Eof)));
         streams
@@ -158,6 +168,7 @@ async fn client_close_drops_stale_output_after_stream_id_reuse() {
     let mut streams = HashMap::from([(
         7,
         StreamHandle {
+            port: 0,
             generation: stale_generation.clone(),
             msg_tx,
             abort: old_relay.abort_handle(),
@@ -180,6 +191,7 @@ async fn client_close_drops_stale_output_after_stream_id_reuse() {
             &mut streams,
             &out_tx,
             TunnelLimits::default(),
+            &Arc::new(Semaphore::new(INBOUND_BYTES_PER_CONNECTION)),
         )
         .await
     );
@@ -205,6 +217,7 @@ async fn client_close_drops_stale_output_after_stream_id_reuse() {
             &mut streams,
             &out_tx,
             TunnelLimits::default(),
+            &Arc::new(Semaphore::new(INBOUND_BYTES_PER_CONNECTION)),
         )
         .await
     );
@@ -258,6 +271,7 @@ async fn natural_terminal_frames_release_only_the_matching_generation() {
     let mut streams = HashMap::from([(
         7,
         StreamHandle {
+            port: 0,
             generation: current_generation.clone(),
             msg_tx,
             abort: relay.abort_handle(),
@@ -317,6 +331,7 @@ async fn natural_terminal_frames_release_only_the_matching_generation() {
     streams.insert(
         7,
         StreamHandle {
+            port: 0,
             generation: failed_generation.clone(),
             msg_tx,
             abort: failed_relay.abort_handle(),
@@ -516,4 +531,77 @@ fn stream_id_accessor_covers_all_variants() {
     for (frame, id) in cases {
         assert_eq!(frame.stream_id(), id);
     }
+}
+
+/// The shared payload budget follows queued data through consumption and is
+/// returned on drop; overload must not abort a different stream's relay.
+#[tokio::test]
+async fn inbound_byte_budget_is_shared_and_released() {
+    let (server_io, client_io) = tokio::io::duplex(1024);
+    let server = WebSocketStream::from_raw_socket(
+        server_io,
+        tokio_tungstenite::tungstenite::protocol::Role::Server,
+        None,
+    )
+    .await;
+    let mut client = WebSocketStream::from_raw_socket(
+        client_io,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+    let (mut sink, _) = server.split();
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let budget = Arc::new(Semaphore::new(1));
+    let mut streams = HashMap::new();
+    let mut receivers = Vec::new();
+    for id in [1, 2] {
+        let (msg_tx, msg_rx) = mpsc::channel(4);
+        receivers.push(msg_rx);
+        let task = tokio::spawn(std::future::pending::<()>());
+        streams.insert(
+            id,
+            StreamHandle {
+                port: u16::try_from(id).unwrap(),
+                generation: Arc::new(()),
+                msg_tx,
+                abort: task.abort_handle(),
+            },
+        );
+    }
+    for id in [1, 2] {
+        assert!(
+            handle_frame(
+                Frame::Data {
+                    stream_id: id,
+                    payload: vec![7]
+                },
+                &mut sink,
+                &mut streams,
+                &out_tx,
+                TunnelLimits::default(),
+                &budget
+            )
+            .await
+        );
+    }
+    let Message::Binary(bytes) = client.next().await.unwrap().unwrap() else {
+        panic!("expected CLOSE");
+    };
+    assert_eq!(
+        Frame::decode(&bytes).unwrap(),
+        Frame::Close { stream_id: 2 }
+    );
+    assert!(streams.contains_key(&1));
+    assert!(!streams.contains_key(&2));
+    assert_eq!(budget.available_permits(), 0);
+    let writing = receivers[0].recv().await.unwrap();
+    assert_eq!(
+        budget.available_permits(),
+        0,
+        "currently writing bytes remain budgeted"
+    );
+    drop(writing);
+    assert_eq!(budget.available_permits(), 1);
+    streams.remove(&1).unwrap().abort.abort();
 }

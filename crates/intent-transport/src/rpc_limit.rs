@@ -202,7 +202,7 @@ mod tests {
     /// parallel hook swaps restore each other's hook. The lock is held across
     /// the `await` on purpose: the quiet hook must stay installed until the
     /// spawned task has unwound.
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     #[tokio::test]
     async fn permit_is_released_when_the_spawned_task_panics() {
         let limiter = RpcLimiter::new(1);

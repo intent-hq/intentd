@@ -39,7 +39,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,28 +55,22 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-cfgopt-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-cfgopt-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -303,7 +297,8 @@ async fn stored_model_applied_via_set_config_option_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok" }).to_string();
@@ -316,10 +311,7 @@ async fn stored_model_applied_via_set_config_option_over_wss() {
         ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -426,7 +418,8 @@ async fn stored_model_applied_via_set_model_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok" }).to_string();
@@ -439,10 +432,7 @@ async fn stored_model_applied_via_set_model_over_wss() {
         ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -549,7 +539,8 @@ async fn stored_model_effort_suffix_stripped_for_config_option_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok" }).to_string();
@@ -563,10 +554,7 @@ async fn stored_model_effort_suffix_stripped_for_config_option_over_wss() {
         ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -657,7 +645,8 @@ async fn assert_effective_codex_model_selection(
     let Some(script) = gate() else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     let behavior = json!({
@@ -678,10 +667,7 @@ async fn assert_effective_codex_model_selection(
         ("MOCK_AGENT_CONFIG_OPTION_MODEL_STRIPS_EFFORT", "1"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let mut daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let mut daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -930,7 +916,8 @@ async fn codex_default_selection_keeps_provider_default() {
 /// including on retry. Cover fresh, loaded, and recreated session setup.
 async fn assert_codex_rejection_and_recovery(advertise_load: bool) {
     let Some(script) = gate() else { return };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_log = data_dir.join("config.jsonl");
     let session_log = data_dir.join("sessions.jsonl");
     let prompt_log = data_dir.join("prompts.jsonl");
@@ -957,10 +944,7 @@ async fn assert_codex_rejection_and_recovery(advertise_load: bool) {
         ("MOCK_AGENT_PROMPT_LOG", prompt_path.as_str()),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1168,7 +1152,8 @@ async fn codex_rejection_invalidates_child_on_recreated_sessions() {
 /// retry path. Only a fresh, successfully configured child may run the prompt.
 async fn assert_codex_config_transport_recovery(advertise_load: bool) {
     let Some(script) = gate() else { return };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_log = data_dir.join("config.jsonl");
     let session_log = data_dir.join("sessions.jsonl");
     let prompt_log = data_dir.join("prompts.jsonl");
@@ -1196,10 +1181,7 @@ async fn assert_codex_config_transport_recovery(advertise_load: bool) {
         ("MOCK_AGENT_ATTEMPT_FILE", attempts.to_str().unwrap()),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1366,7 +1348,8 @@ async fn set_model_failure_does_not_fail_the_turn() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok", "rejectSetModel": true }).to_string();
@@ -1379,10 +1362,7 @@ async fn set_model_failure_does_not_fail_the_turn() {
         ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1468,7 +1448,8 @@ async fn set_config_option_failure_does_not_fail_the_turn() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok", "rejectSetConfigOption": true }).to_string();
@@ -1481,10 +1462,7 @@ async fn set_config_option_failure_does_not_fail_the_turn() {
         ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1573,7 +1551,8 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok" }).to_string();
@@ -1587,10 +1566,7 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
         ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1722,7 +1698,8 @@ async fn effort_levels_persisted_and_served_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let behavior = json!({ "response": "ok" }).to_string();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -1733,10 +1710,7 @@ async fn effort_levels_persisted_and_served_over_wss() {
         ("MOCK_AGENT_THOUGHT_LEVEL", "medium"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -1839,7 +1813,8 @@ async fn reasoning_effort_is_a_no_op_without_a_thought_level_option() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok" }).to_string();
@@ -1853,10 +1828,7 @@ async fn reasoning_effort_is_a_no_op_without_a_thought_level_option() {
         ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

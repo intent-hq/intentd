@@ -15,44 +15,37 @@ use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
 use super::shared_watch::SharedWatchHub;
 use super::watcher::{flush_due, Action, FileWatcher};
-use super::LIVENESS;
+use super::{TestBudget, LIVENESS};
 
-/// Self-cleaning temp directory (db file + watched workspace root).
+/// Self-cleaning temp directory (watched workspace root); see
+/// [`crate::test_support::test_tempdir`].
 struct TempDir {
     path: PathBuf,
+    _guard: tempfile::TempDir,
 }
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let path =
-            std::env::temp_dir().join(format!("intentd-watch-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        Self { path }
+        let guard = crate::test_support::test_tempdir(&format!("intentd-watch-{tag}-"));
+        Self {
+            path: guard.path().to_path_buf(),
+            _guard: guard,
+        }
     }
 }
 
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
+/// `SQLite` db inside an RAII temp dir; the dir sweep on drop also covers the
+/// `-wal`/`-shm` sidecars.
 struct TempDb {
     path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("intentd-watch-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = crate::test_support::test_tempdir("intentd-watch-");
+        let path = dir.path().join("watch.db");
+        Self { path, _dir: dir }
     }
 }
 
@@ -1013,6 +1006,10 @@ async fn runtime_info_exclude_negation_rescues_prefiltered_path() {
 
 #[tokio::test]
 async fn user_negation_overrides_default_pattern() {
+    // Registration recovery and the event wait share ONE liveness budget so
+    // the test always fails with a diagnostic before nextest's 180s kill
+    // (intent-hq/intent#4845).
+    let budget = TestBudget::liveness();
     let db = TempDb::new();
     let store = Store::open(&db.path).await.expect("open store");
     let bus = EventBus::new(store);
@@ -1030,14 +1027,64 @@ async fn user_negation_overrides_default_pattern() {
         WorkspaceId::from("ws-gi"),
         &dir.path.clone(),
     );
-    watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(budget.remaining()).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("dist/bundle.js"), b"js").expect("write negated");
-    let ev = next_for(&mut sub, "dist/bundle.js", None, LIVENESS)
+    let ev = next_for(&mut sub, "dist/bundle.js", None, budget.remaining())
         .await
         .expect("negated default must emit");
     assert_eq!(ev.data["relativePath"], "dist/bundle.js");
+}
+
+/// Setup and event waits drawn from one [`TestBudget`] spend a single
+/// deadline: after delayed setup consumes part of it, a never-arriving event
+/// fails within what is left, not after a fresh full wait. This is what keeps
+/// the watcher tests' worst case below nextest's slow-test kill
+/// (intent-hq/intent#4845 / #4852). Runs on tokio's paused clock so the
+/// timing assertions are virtual-time facts (to the timer's 1ms tick), not
+/// wall-clock bounds that host load could push past.
+#[tokio::test]
+async fn budget_bounds_delayed_setup_plus_missing_event_to_one_deadline() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    tokio::time::pause();
+
+    let total = Duration::from_millis(600);
+    let setup = Duration::from_millis(400);
+    let remainder = total.saturating_sub(setup);
+    let tick = Duration::from_millis(2);
+    let budget = TestBudget::new(total);
+    let started = Instant::now();
+    // Delayed registration: consumes most of the budget before the event wait.
+    tokio::time::sleep(setup).await;
+    assert!(budget.remaining().abs_diff(remainder) <= tick);
+
+    let event_wait = Instant::now();
+    let ev = next_for(&mut sub, "never/arrives.txt", None, budget.remaining()).await;
+    assert!(ev.is_none(), "no event was ever published");
+    assert!(
+        event_wait.elapsed().abs_diff(remainder) <= tick,
+        "the event wait must take only the budget's remainder, not a fresh {total:?}: took {:?}",
+        event_wait.elapsed()
+    );
+    assert!(
+        started.elapsed().abs_diff(total) <= tick,
+        "setup plus event wait must end at the shared deadline: took {:?}",
+        started.elapsed()
+    );
+    assert!(budget.remaining().is_zero(), "budget must be spent");
+    // A wait started after the budget is spent returns without advancing
+    // the clock at all.
+    let late = Instant::now();
+    assert!(
+        next_for(&mut sub, "never/arrives.txt", None, budget.remaining())
+            .await
+            .is_none()
+    );
+    assert_eq!(late.elapsed(), Duration::ZERO);
 }
 
 #[tokio::test]

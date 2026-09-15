@@ -1969,6 +1969,14 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     tokio::spawn(async move {
         services_export_sweep.sweep_stale_export_staging().await;
     });
+    // Sweep expired attachment idempotency-key bindings (7-day retention,
+    // intent-hq/intent#4691); also swept lazily by keyed placements/begins.
+    let services_idempotency_sweep = services.clone();
+    tokio::spawn(async move {
+        services_idempotency_sweep
+            .sweep_expired_attachment_idempotency_keys()
+            .await;
+    });
     // Background PR refresh (§7.6): periodically re-fetch linked PRs (and
     // discover/link PRs for workspaces without one), persist any change, and
     // emit `pr:*` events so clients update without polling.
@@ -2007,11 +2015,6 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
     // without an event bus. Aborted on clean shutdown.
     let agent_locks_loop = services.spawn_agent_locks_loop();
-    // CRDT session sweeper (A5, §5.2 CRDT): every hour, drop cached yrs docs
-    // for `(workspace, note)` pairs whose last access is older than 24h so
-    // long-lived daemons do not accumulate per-note session state. Aborted on
-    // clean shutdown.
-    let crdt_session_sweep = services.spawn_crdt_session_sweep_loop();
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
     // aggregate memory budget is installed (monorepo#2063), drain idle agents
@@ -2077,9 +2080,14 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     };
     // Watch-health handle created BEFORE the backgrounded registry start so
     // DaemonControl can hold it now; it snapshots `None` (fileWatch absent
-    // from system.status) until the registry attaches the shared hub.
+    // from system.status) until the registry attaches the shared hub. The hub
+    // itself is created here too so the config.toml live-reload watcher below
+    // shares its OS stream instead of costing a second inotify instance
+    // (intent-hq/intent#4953).
     let watch_health = intent_services::WatchHealth::default();
+    let watch_hub = intent_services::SharedWatchHub::new();
     let watcher_init_task = spawn_watcher_registry_init(
+        Arc::clone(&watch_hub),
         bus.clone(),
         api.clone(),
         Arc::clone(&git_status_refresher),
@@ -2345,12 +2353,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // (survives editor rename/atomic-save), debounce, and strictly re-parse.
     // Valid external edits update the registry, run the same server runtime
     // hooks as `settings.update`, and emit `settings:changed`; invalid edits
-    // keep last-good values. Registration is a synchronous FSEvents call, so
-    // it too runs in the background (monorepo#1581) with the guard held by the
-    // task for the lifetime of `serve`; aborting the handle at shutdown drops
-    // the guard and tears the watch down with the daemon.
+    // keep last-good values. The watch rides the shared hub (whose registrar
+    // performs the OS call off-thread, monorepo#1581) with the guard held by a
+    // background task for the lifetime of `serve`; aborting the handle at
+    // shutdown drops the guard and tears the watch down with the daemon.
     let config_watcher_task =
-        spawn_config_watcher_init(settings_registry.clone(), services.clone());
+        spawn_config_watcher_init(watch_hub, settings_registry.clone(), services.clone());
 
     // Boot-time secure WSS listener auto-start when the effective
     // server.wsApi.enabled is true (config.toml or persisted runtime toggle).
@@ -2523,7 +2531,6 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     completion_delivery.abort();
     auto_commit_loop.abort();
     agent_locks_loop.abort();
-    crdt_session_sweep.abort();
     if let Some(reap_task) = reap_task {
         reap_task.abort();
     }
@@ -2930,7 +2937,7 @@ mod fd_limit {
     #[cfg(target_os = "macos")]
     pub(crate) const PLATFORM_CAP: Option<u64> = Some(10240);
     #[cfg(not(target_os = "macos"))]
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(not(unix), expect(dead_code))]
     pub(crate) const PLATFORM_CAP: Option<u64> = None;
 
     /// Soft limit in effect after the startup raise (or the untouched value
@@ -2954,7 +2961,7 @@ mod fd_limit {
     /// kernel refuses `RLIM_INFINITY` for `RLIMIT_NOFILE` (EPERM above
     /// `fs.nr_open`), so the hard limit is always finite there. That branch
     /// is macOS-without-cap territory only, and macOS always has a cap.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(all(not(unix), not(test)), expect(dead_code))]
     pub(crate) fn target_soft(soft: u64, hard: Option<u64>, cap: Option<u64>) -> Option<u64> {
         let target = match (hard, cap) {
             (Some(hard), Some(cap)) => hard.min(cap),
@@ -3043,7 +3050,7 @@ mod fd_limit {
 
     /// `rlim_t` is `u64` on the tier-1 Unix targets but not universally.
     #[cfg(unix)]
-    #[allow(clippy::unnecessary_cast)]
+    #[expect(clippy::unnecessary_cast)]
     fn to_u64(v: libc::rlim_t) -> u64 {
         v as u64
     }
@@ -3447,7 +3454,7 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
             0 => CHILD_TREE_WARN_FALLBACK_BYTES,
             // RAM sizes are far below 2^53 (loss-free in f64); the fraction
             // is in (0, 1) and the float→int cast saturates anyway.
-            #[allow(
+            #[expect(
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss
@@ -3850,7 +3857,7 @@ impl intent_core::ServerControl for DaemonControl {
                 // Settings schema bounds the port to u16 range; the
                 // float→int cast saturates anyway.
                 .map(|p| {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let p = p as u16;
                     p
                 });
@@ -4444,6 +4451,7 @@ async fn uds_is_live(socket_path: &Path) -> bool {
 }
 
 #[cfg(windows)]
+#[expect(clippy::unused_async)] // signature parity with the unix UDS probe; pipe open is sync
 async fn uds_is_live(socket_path: &Path) -> bool {
     use tokio::net::windows::named_pipe::ClientOptions;
     const ERROR_PIPE_BUSY: i32 = 231;
@@ -4586,6 +4594,7 @@ fn lock_holder_detail(pid_path: &Path, errno: nix::errno::Errno) -> String {
 /// Non-unix has no `flock`; the lock is a no-op success (the socket/pidfile
 /// guards remain the single-instance enforcement on those platforms).
 #[cfg(not(unix))]
+#[expect(clippy::unnecessary_wraps)] // signature parity with the unix flock impl
 fn acquire_data_dir_lock(_config: &Config) -> anyhow::Result<DataDirLock> {
     Ok(DataDirLock)
 }
@@ -4924,6 +4933,7 @@ fn test_watcher_init_delay(raw: Option<&str>) -> Option<Duration> {
 /// startup so it owns the registry; aborting the returned handle drops it,
 /// tearing down every watcher.
 fn spawn_watcher_registry_init(
+    hub: Arc<intent_services::SharedWatchHub>,
     bus: EventBus,
     api: Arc<dyn WorkspaceApi>,
     refresher: Arc<GitStatusRefresher>,
@@ -4952,7 +4962,7 @@ fn spawn_watcher_registry_init(
                     // exercise worker starvation at all.
                     std::thread::sleep(delay);
                 }
-                WatcherRegistry::start_with_health(bus, api, refresher, &watch_health).await
+                WatcherRegistry::start_with_health(&hub, bus, api, refresher, &watch_health).await
             })
         });
         tracing::info!("watcher registry ready");
@@ -4963,37 +4973,29 @@ fn spawn_watcher_registry_init(
     })
 }
 
-/// Start the `config.toml` live-reload watcher (§9.8) in the background and
-/// hold it for the task's lifetime.
+/// Start the `config.toml` live-reload watcher (§9.8) over the shared `hub`
+/// and hold it for the task's lifetime.
 ///
-/// Spawned rather than started inline for the same reason as
-/// [`spawn_watcher_registry_init`]: `notify`'s `FSEvents` registration is a
-/// synchronous IPC to `fseventsd` that can take seconds on a loaded machine,
-/// which would otherwise delay the UDS bind past the FE sidecar's probe window
-/// (monorepo#1581), and it runs under `block_in_place` for the same reason. The
-/// task parks after startup so it owns the watcher guard; aborting the returned
-/// handle drops it, ending the OS subscription.
+/// The OS registration runs on the hub's registrar thread, so `start` itself
+/// never blocks on `fseventsd` IPC (monorepo#1581). The task parks after
+/// startup so it owns the watcher guard; aborting the returned handle drops
+/// it, ending the subscription.
 fn spawn_config_watcher_init(
+    hub: Arc<intent_services::SharedWatchHub>,
     registry: Arc<intent_services::SettingsRegistry>,
     services: Services,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let watcher_services = services.clone();
-        // `ConfigWatcher::start` is synchronous and its `notify` registration
-        // blocks the calling thread on `fseventsd` IPC, so it runs under
-        // `block_in_place` for the same reason as the watcher registry above.
-        // It stays inside the runtime context, so the watcher's own
-        // `tokio::spawn` of its debounce loop keeps working.
-        let started = tokio::task::block_in_place(|| {
-            intent_services::ConfigWatcher::start(
-                registry,
-                watcher_services.settings_revision_gate(),
-                move |notice| {
-                    let services = watcher_services.clone();
-                    async move { services.apply_external_settings_change(&notice).await }
-                },
-            )
-        });
+        let started = intent_services::ConfigWatcher::start(
+            &hub,
+            registry,
+            watcher_services.settings_revision_gate(),
+            move |notice| {
+                let services = watcher_services.clone();
+                async move { services.apply_external_settings_change(&notice).await }
+            },
+        );
         let watcher = match started {
             Ok(watcher) => watcher,
             Err(e) => {
@@ -5005,7 +5007,20 @@ fn spawn_config_watcher_init(
                 return;
             }
         };
-        tracing::info!("config.toml live-reload watcher ready");
+        // `start` only enqueues the directory registration on the hub's
+        // registrar thread; the readiness marker below is what
+        // `e2e_wss_settings_live_reload` gates its external edits on, so it
+        // must not be logged until that watch is actually live.
+        if watcher.ready().await {
+            tracing::info!("config.toml live-reload watcher ready");
+        } else {
+            // Still park below rather than drop: the watcher re-subscribes
+            // with capped backoff until the directory watch goes live.
+            tracing::warn!(
+                "config.toml live-reload watcher failed to start: the config directory \
+                 watch did not go live; retrying in the background"
+            );
+        }
         // Park forever so the watch stays alive until the handle is aborted.
         std::future::pending::<()>().await;
         drop(watcher);
@@ -5328,7 +5343,7 @@ async fn cmd_settings_list(config: &Config) -> anyhow::Result<()> {
 
 /// Print one setting (`settings.get` output shape) from the already-fetched
 /// `settings.get` result: value, type, default, origin, description.
-#[allow(clippy::unnecessary_wraps)] // keeps the uniform Result shape of the print_setting_* family
+#[expect(clippy::unnecessary_wraps)] // keeps the uniform Result shape of the print_setting_* family
 fn print_setting_get(name: &str, result: &Value) -> anyhow::Result<()> {
     let value = display_setting_value(result.get("value").unwrap_or(&Value::Null));
     println!("{name} = {value}");
@@ -5616,44 +5631,47 @@ async fn cmd_stop() -> ExitCode {
     };
 
     // (2)-(4) Wait, then escalate SIGTERM → SIGKILL with timeouts.
-    let outcome = run_stop_escalation(pid, graceful).await;
-    match outcome {
-        StopOutcome::AlreadyDown => println!("intentd: stopped"),
-        StopOutcome::Graceful => println!("intentd: stopped gracefully"),
-        StopOutcome::Terminated => println!("intentd: stopped (SIGTERM)"),
-        StopOutcome::Killed => println!("intentd: stopped (SIGKILL)"),
-        StopOutcome::Failed => {
-            eprintln!("error: could not confirm intentd shutdown (pid {pid})");
-            return ExitCode::FAILURE;
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-/// Run the escalation with production timeouts, using the real OS signaller on
-/// unix. On non-unix there is no UDS daemon to signal, so report failure.
-async fn run_stop_escalation(pid: u32, graceful: bool) -> StopOutcome {
     #[cfg(unix)]
     {
-        escalate_stop(
-            &NixSignaller,
-            pid,
-            graceful,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_secs(3),
-            Duration::from_millis(100),
-        )
-        .await
+        match run_stop_escalation(pid, graceful).await {
+            StopOutcome::AlreadyDown => println!("intentd: stopped"),
+            StopOutcome::Graceful => println!("intentd: stopped gracefully"),
+            StopOutcome::Terminated => println!("intentd: stopped (SIGTERM)"),
+            StopOutcome::Killed => println!("intentd: stopped (SIGKILL)"),
+            StopOutcome::Failed => {
+                eprintln!("error: could not confirm intentd shutdown (pid {pid})");
+                return ExitCode::FAILURE;
+            }
+        }
+        ExitCode::SUCCESS
     }
+    // On non-unix there is no process signalling to escalate through, so
+    // shutdown cannot be confirmed.
     #[cfg(not(unix))]
     {
-        let _ = (pid, graceful);
-        StopOutcome::Failed
+        let _ = graceful;
+        eprintln!("error: could not confirm intentd shutdown (pid {pid})");
+        ExitCode::FAILURE
     }
+}
+
+/// Run the escalation with production timeouts, using the real OS signaller.
+#[cfg(unix)]
+async fn run_stop_escalation(pid: u32, graceful: bool) -> StopOutcome {
+    escalate_stop(
+        &NixSignaller,
+        pid,
+        graceful,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        Duration::from_secs(3),
+        Duration::from_millis(100),
+    )
+    .await
 }
 
 /// The terminal result of a stop escalation (§5.7).
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum StopOutcome {
     /// The process was already gone before any escalation.
@@ -5670,6 +5688,7 @@ enum StopOutcome {
 
 /// Process-signalling seam so the escalation logic is unit-testable with a fake
 /// (§5.7 verification). The real impl uses `nix` signal-0/SIGTERM/SIGKILL.
+#[cfg(unix)]
 trait Signaller {
     fn is_alive(&self, pid: u32) -> bool;
     fn term(&self, pid: u32);
@@ -5679,6 +5698,7 @@ trait Signaller {
 /// SIGTERM → SIGKILL escalation. The caller has already issued the graceful
 /// control RPC; `graceful_requested` says whether to first wait for a polite
 /// exit. Each phase polls liveness up to its timeout before escalating.
+#[cfg(unix)]
 async fn escalate_stop<S: Signaller>(
     sig: &S,
     pid: u32,
@@ -5706,6 +5726,7 @@ async fn escalate_stop<S: Signaller>(
 }
 
 /// Poll `is_alive` until the process exits or `timeout` elapses; `true` on exit.
+#[cfg(unix)]
 async fn wait_for_exit<S: Signaller>(sig: &S, pid: u32, timeout: Duration, poll: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -6656,6 +6677,35 @@ mod tests {
         assert_eq!(std::fs::read(&link).unwrap(), b"secret");
     }
 
+    /// A stand-in sitter child (see [`spawn_stand_in_sitter`]) that is
+    /// killed and reaped on drop, so a failing assertion mid-test never
+    /// leaks it past the test (nextest `LEAK`, intent-hq/intent#4942).
+    #[cfg(unix)]
+    struct StandInSitter(std::process::Child);
+
+    #[cfg(unix)]
+    impl std::ops::Deref for StandInSitter {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl std::ops::DerefMut for StandInSitter {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for StandInSitter {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// A stand-in "sitter": `sleep` COPIED as `name` — the kernel-visible
     /// process name comes from the executed image itself, so a copy carries
     /// the name on every platform, whereas a symlink resolves to the
@@ -6663,8 +6713,19 @@ mod tests {
     /// for the dev build, `intentd` for the packaged rename. SIGUSR1's
     /// default disposition is terminate, so the child exiting on signal
     /// 10/30 proves delivery.
+    ///
+    /// Returns only once the child is observable under its sitter name:
+    /// `Command::spawn` returns when the child has committed to its exec
+    /// (glibc `posix_spawn` resumes the vfork parent from `exec_mmap`),
+    /// but the kernel installs the new `comm` — the `/proc/<pid>/stat`
+    /// name `pid_is_sitter` reads via sysinfo — later in `begin_new_exec`,
+    /// so a just-spawned copy can still carry this test binary's name
+    /// (intent-hq/intent#4942, ~25% of spawns idle, ~70% under CPU load).
+    /// The fixture therefore polls the production identity check itself
+    /// (`pid_is_sitter` with the pid as its own expected parent, so only
+    /// the name gate is exercised) until it accepts, bounded.
     #[cfg(unix)]
-    fn spawn_stand_in_sitter(dir: &Path, name: &str) -> std::process::Child {
+    fn spawn_stand_in_sitter(dir: &Path, name: &str) -> StandInSitter {
         let sleep = ["/bin/sleep", "/usr/bin/sleep"]
             .iter()
             .find(|p| Path::new(p).exists())
@@ -6677,9 +6738,21 @@ mod tests {
         // "Text file busy".
         for _ in 0..400 {
             match std::process::Command::new(&bin).arg("30").spawn() {
-                Ok(child) => return child,
+                Ok(child) => {
+                    let child = StandInSitter(child);
+                    let pid = child.id();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    while !pid_is_sitter(pid, pid) {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "stand-in sitter {name} (pid {pid}) never became visible under its sitter name"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    return child;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(e) => panic!("spawn stand-in sitter: {e}"),
             }
@@ -7727,6 +7800,7 @@ mod tests {
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn refuses_when_uds_is_live() {
         let config = temp_config();
@@ -7925,11 +7999,13 @@ mod tests {
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
 
+    #[cfg(unix)]
     use std::sync::Mutex;
 
     /// A scriptable [`Signaller`] for the stop-escalation unit tests: it models
     /// process death either after N liveness polls (a "graceful" exit) or in
     /// response to SIGTERM / SIGKILL, and records which signals were sent.
+    #[cfg(unix)]
     #[derive(Default)]
     struct FakeState {
         term_called: bool,
@@ -7937,6 +8013,7 @@ mod tests {
         polls: u32,
     }
 
+    #[cfg(unix)]
     struct FakeSignaller {
         inner: Mutex<FakeState>,
         die_after_polls: Option<u32>,
@@ -7944,6 +8021,7 @@ mod tests {
         die_on_kill: bool,
     }
 
+    #[cfg(unix)]
     impl FakeSignaller {
         fn new(die_after_polls: Option<u32>, die_on_term: bool, die_on_kill: bool) -> Self {
             Self {
@@ -7955,6 +8033,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Signaller for FakeSignaller {
         fn is_alive(&self, _pid: u32) -> bool {
             let mut s = self.inner.lock().unwrap();
@@ -7981,11 +8060,16 @@ mod tests {
     }
 
     // Tiny timeouts keep the escalation tests fast while exercising real waits.
+    #[cfg(unix)]
     const GRACE: Duration = Duration::from_millis(200);
+    #[cfg(unix)]
     const TERM_T: Duration = Duration::from_millis(60);
+    #[cfg(unix)]
     const KILL_T: Duration = Duration::from_millis(60);
+    #[cfg(unix)]
     const POLL: Duration = Duration::from_millis(2);
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_already_down_when_not_alive() {
         // Dead on the very first liveness probe.
@@ -7996,6 +8080,7 @@ mod tests {
         assert!(!sig.inner.lock().unwrap().kill_called);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_graceful_when_exits_before_signal() {
         // Alive for the first couple of polls, then exits during the grace wait.
@@ -8005,6 +8090,7 @@ mod tests {
         assert!(!sig.inner.lock().unwrap().term_called, "no signal needed");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_escalates_to_sigterm() {
         // Never exits on its own; dies on SIGTERM. No graceful wait requested.
@@ -8015,6 +8101,7 @@ mod tests {
         assert!(!sig.inner.lock().unwrap().kill_called);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_escalates_to_sigkill() {
         // Survives SIGTERM, dies on SIGKILL.
@@ -8025,6 +8112,7 @@ mod tests {
         assert!(sig.inner.lock().unwrap().kill_called);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_fails_when_process_never_dies() {
         let sig = FakeSignaller::new(None, false, false);

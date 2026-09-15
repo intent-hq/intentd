@@ -70,6 +70,50 @@ fn context_mentions_are_stripped() {
 }
 
 #[test]
+fn mixed_case_context_mentions_are_stripped() {
+    assert_eq!(
+        strip_context_mentions("@File[x] @CONTEXT[y] fix auth"),
+        "  fix auth"
+    );
+    // Without case-insensitive matching this would extract `billing-add`.
+    assert_eq!(extract_local_slug("@File[add billing]"), None);
+    assert_eq!(
+        extract_local_slug("fix auth @File[src/auth.rs] @CONTEXT[some stuff]").as_deref(),
+        Some("auth-fix")
+    );
+}
+
+/// Regression (intent-hq/intent#4801): an `@` followed by text containing a
+/// multi-byte char within the first `kind.len()` bytes must not panic on a
+/// non-char-boundary slice in the case-insensitive kind comparison.
+#[test]
+fn at_followed_by_multibyte_char_does_not_panic() {
+    // Em dash (3 bytes) at byte offset 4: the 5/6-byte kinds cut inside it.
+    assert_eq!(
+        extract_local_slug("@foo — bar baz").as_deref(),
+        Some("foo-bar")
+    );
+    // 4-byte char as the very first char after `@`: the 3-byte kind cuts inside it.
+    assert_eq!(
+        extract_local_slug("@🎉 launch party").as_deref(),
+        Some("launch-party")
+    );
+    // Short tails shorter than every kind are skipped without slicing.
+    assert_eq!(extract_local_slug("@—"), None);
+    assert_eq!(extract_local_slug("@é"), None);
+    assert_eq!(
+        extract_local_slug("@é fix auth").as_deref(),
+        Some("auth-fix")
+    );
+    // A kind spelled with a non-ASCII char right after it is not a mention
+    // and must not panic on the longer kinds' prefix check either.
+    assert_eq!(
+        extract_local_slug("@fileé[x] fix auth").as_deref(),
+        Some("auth-fix")
+    );
+}
+
+#[test]
 fn numbers_and_long_words_are_filtered() {
     // Words with digits or >15 chars never enter the slug.
     assert_eq!(

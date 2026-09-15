@@ -25,7 +25,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,7 +41,6 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -58,11 +57,8 @@ const CONTINUATION_PREFIX: &str = "You were interrupted for about ";
 const CONTINUATION_SUFFIX: &str = "due to a harness shutdown and restart. You can now continue \
      your work and pick up where you left off.";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-tail-recap-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-tail-recap-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -365,7 +361,8 @@ async fn resume_via_session_load_replays_interrupted_tail() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let prompt_log = data_dir.join("prompts.jsonl");
     let session_log = data_dir.join("sessions.jsonl");
@@ -475,7 +472,7 @@ async fn resume_via_session_load_replays_interrupted_tail() {
         &session_log,
         "daemon2.log",
     );
-    let _daemon2 = common::DaemonGuard::new(child2, data_dir.clone(), true);
+    let _daemon2 = common::DaemonGuard::process_only(child2);
     assert!(await_uds(&socket).await, "daemon2 did not start");
 
     let status = common::await_wss_status(&socket).await;

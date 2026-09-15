@@ -71,10 +71,10 @@ pub struct ResumeEvent {
     /// Detected suspend duration (wall skew) preceding this resume.
     pub suspended_for: Duration,
     /// Monotonic instant of the last sample before the gap.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub before: Instant,
     /// Monotonic instant of the first sample after the gap (the resume tick).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub after: Instant,
 }
 

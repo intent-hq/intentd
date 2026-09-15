@@ -14,7 +14,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -46,13 +45,6 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
@@ -182,7 +174,6 @@ fn sample_issue() -> Issue {
 /// Branch listings record the `(prefix, cursor)` pair the engine saw so the
 /// `github.branches.list` `prefix` threading is assertable end-to-end.
 #[derive(Default)]
-#[allow(clippy::struct_field_names)] // fields mirror the recorded query kinds
 struct RecordingForge {
     pr_queries: Mutex<Vec<PrQuery>>,
     issue_queries: Mutex<Vec<IssueQuery>>,
@@ -260,10 +251,25 @@ impl SourceControl for RecordingForge {
     async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
         unimplemented!()
     }
-    async fn list_prs(&self, _: &RepoRef, query: PrQuery) -> ScResult<Page<PullRequest>> {
+    async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> ScResult<Page<PullRequest>> {
+        let items = if query.extra_repos.is_empty() {
+            vec![sample_pr()]
+        } else {
+            // One updated-desc hit per scoped repo, the URL naming ITS repo.
+            std::iter::once(repo)
+                .chain(query.extra_repos.iter())
+                .enumerate()
+                .map(|(i, r)| PullRequest {
+                    number: 100 + i as u64,
+                    url: format!("https://github.com/{}/{}/pull/{}", r.owner, r.name, 100 + i),
+                    updated_at: format!("2026-03-0{}T00:00:00Z", 9 - i),
+                    ..sample_pr()
+                })
+                .collect()
+        };
         self.pr_queries.lock().unwrap().push(query);
         Ok(Page {
-            items: vec![sample_pr()],
+            items,
             next_cursor: Some("2".into()),
         })
     }
@@ -353,10 +359,29 @@ impl SourceControl for RecordingForge {
             ..sample_issue()
         })
     }
-    async fn list_issues(&self, _: &RepoRef, query: IssueQuery) -> ScResult<Page<Issue>> {
+    async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> ScResult<Page<Issue>> {
+        let items = if query.extra_repos.is_empty() {
+            vec![sample_issue()]
+        } else {
+            std::iter::once(repo)
+                .chain(query.extra_repos.iter())
+                .enumerate()
+                .map(|(i, r)| Issue {
+                    number: 100 + i as u64,
+                    url: format!(
+                        "https://github.com/{}/{}/issues/{}",
+                        r.owner,
+                        r.name,
+                        100 + i
+                    ),
+                    updated_at: format!("2026-03-0{}T00:00:00Z", 9 - i),
+                    ..sample_issue()
+                })
+                .collect()
+        };
         self.issue_queries.lock().unwrap().push(query);
         Ok(Page {
-            items: vec![sample_issue()],
+            items,
             next_cursor: Some("2".into()),
         })
     }
@@ -367,15 +392,14 @@ struct Fixture {
     port: u16,
     cfg: Arc<ClientConfig>,
     forge: Arc<RecordingForge>,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry the recording
 /// stub forge.
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-gh-search-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-gh-search-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -406,7 +430,7 @@ async fn boot() -> Fixture {
         port,
         cfg,
         forge,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -560,6 +584,202 @@ async fn search_without_query_leaves_listing_unchanged() {
     assert_eq!(pr_queries.len(), 1);
     assert_eq!(pr_queries[0].search, None);
     assert_eq!(pr_queries[0].involvement, None);
+    assert!(pr_queries[0].extra_repos.is_empty());
+}
+
+/// `github.pulls.search` / `github.issues.search` with `repos` extras
+/// (§5.27): the wire `[{ owner, repo }]` list reaches the engine as ONE
+/// query carrying `extra_repos` (the addressed repo and repeats dropped,
+/// order kept), every item's `owner` / `repo` names ITS OWN hit's repository
+/// (not an echo of the request params), the blended page keeps the engine's
+/// updated-desc order, and `nextToken` round-trips.
+#[tokio::test]
+async fn search_with_repos_spans_repos_and_attributes_hits() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    let r = wss_rpc(
+        &mut ws,
+        1,
+        "github.pulls.search",
+        json!({
+            "owner": "intent-hq", "repo": "intent", "filter": "involves",
+            "repos": [
+                { "owner": "intent-hq", "repo": "intentd" },
+                { "owner": "Intent-HQ", "repo": "Intent" },
+                { "owner": "intent-hq", "repo": "cloudlands-fe" },
+                { "owner": "INTENT-HQ", "repo": "INTENTD" },
+            ],
+        }),
+    )
+    .await;
+    let pulls = r["pulls"].as_array().unwrap();
+    let attributed: Vec<(&str, &str, u64)> = pulls
+        .iter()
+        .map(|p| {
+            (
+                p["owner"].as_str().unwrap(),
+                p["repo"].as_str().unwrap(),
+                p["number"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        attributed,
+        vec![
+            ("intent-hq", "intent", 100),
+            ("intent-hq", "intentd", 101),
+            ("intent-hq", "cloudlands-fe", 102),
+        ],
+        "{r}"
+    );
+    assert_eq!(
+        pulls[1]["htmlUrl"],
+        "https://github.com/intent-hq/intentd/pull/101"
+    );
+    let updated: Vec<&str> = pulls
+        .iter()
+        .map(|p| p["updatedAt"].as_str().unwrap())
+        .collect();
+    let mut sorted = updated.clone();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(updated, sorted, "blended page is updated-desc");
+    assert_eq!(r["nextToken"], json!(wire_next_token("2")));
+
+    let r2 = wss_rpc(
+        &mut ws,
+        2,
+        "github.issues.search",
+        json!({
+            "owner": "intent-hq", "repo": "intent", "query": "crash",
+            "repos": [{ "owner": "intent-hq", "repo": "intentd" }],
+        }),
+    )
+    .await;
+    let issues = r2["issues"].as_array().unwrap();
+    assert_eq!(issues.len(), 2, "{r2}");
+    assert_eq!(issues[0]["owner"], "intent-hq");
+    assert_eq!(issues[0]["repo"], "intent");
+    assert_eq!(issues[1]["owner"], "intent-hq");
+    assert_eq!(issues[1]["repo"], "intentd");
+    assert_eq!(
+        issues[1]["htmlUrl"],
+        "https://github.com/intent-hq/intentd/issues/101"
+    );
+    assert_eq!(r2["nextToken"], json!(wire_next_token("2")));
+
+    let pr_queries = fx.forge.pr_queries.lock().unwrap();
+    assert_eq!(pr_queries.len(), 1, "ONE engine call, no per-repo fan-out");
+    assert_eq!(
+        pr_queries[0].extra_repos,
+        vec![
+            RepoRef::new("intent-hq", "intentd"),
+            RepoRef::new("intent-hq", "cloudlands-fe"),
+        ]
+    );
+    assert_eq!(pr_queries[0].involvement, Some(PrInvolvement::Involves));
+    let issue_queries = fx.forge.issue_queries.lock().unwrap();
+    assert_eq!(issue_queries.len(), 1);
+    assert_eq!(
+        issue_queries[0].extra_repos,
+        vec![RepoRef::new("intent-hq", "intentd")]
+    );
+    assert_eq!(issue_queries[0].search.as_deref(), Some("crash"));
+}
+
+/// `repos` validation on the wire: a malformed entry is `-32602` naming its
+/// index, and more than 6 distinct repositories in total (addressed + extras)
+/// is `-32602` — in both cases the engine is never called.
+#[tokio::test]
+async fn search_repos_rejects_malformed_and_over_cap() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    let env = wss_rpc_envelope(
+        &mut ws,
+        1,
+        "github.pulls.search",
+        json!({
+            "owner": "o", "repo": "r",
+            "repos": [{ "owner": "a", "repo": "b" }, { "owner": "c" }],
+        }),
+    )
+    .await;
+    assert_eq!(env["error"]["code"], json!(-32602), "{env}");
+    let msg = env["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("repos[1].repo"), "{msg}");
+    assert_eq!(env["error"]["data"], json!({ "code": "invalid-params" }));
+
+    let env = wss_rpc_envelope(
+        &mut ws,
+        2,
+        "github.issues.search",
+        json!({ "owner": "o", "repo": "r", "repos": "intent-hq/intentd" }),
+    )
+    .await;
+    assert_eq!(env["error"]["code"], json!(-32602), "{env}");
+
+    // A slug carrying whitespace / `:` / `/` would smuggle a second `repo:`
+    // qualifier into the search `q` and bypass the cap → `-32602` naming it.
+    for (id, repos, needle) in [
+        (
+            5,
+            json!([{ "owner": "a", "repo": "b repo:other/private" }]),
+            "repos[0].repo",
+        ),
+        (
+            6,
+            json!([{ "owner": "a:x", "repo": "b" }]),
+            "repos[0].owner",
+        ),
+        (
+            7,
+            json!([{ "owner": "a", "repo": "b" }, { "owner": "c/d", "repo": "e" }]),
+            "repos[1].owner",
+        ),
+    ] {
+        let env = wss_rpc_envelope(
+            &mut ws,
+            id,
+            "github.issues.search",
+            json!({ "owner": "o", "repo": "r", "repos": repos }),
+        )
+        .await;
+        assert_eq!(env["error"]["code"], json!(-32602), "{env}");
+        let msg = env["error"]["message"].as_str().unwrap();
+        assert!(msg.contains(needle), "{msg}");
+    }
+
+    let seven: Vec<Value> = (1..=6)
+        .map(|i| json!({ "owner": "o", "repo": format!("r{i}") }))
+        .collect();
+    let env = wss_rpc_envelope(
+        &mut ws,
+        3,
+        "github.pulls.search",
+        json!({ "owner": "o", "repo": "r", "repos": seven }),
+    )
+    .await;
+    assert_eq!(env["error"]["code"], json!(-32602), "{env}");
+    let msg = env["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("at most 6"), "{msg}");
+
+    assert!(fx.forge.pr_queries.lock().unwrap().is_empty());
+    assert!(fx.forge.issue_queries.lock().unwrap().is_empty());
+
+    // Exactly six in total passes.
+    let six: Vec<Value> = (1..=5)
+        .map(|i| json!({ "owner": "o", "repo": format!("r{i}") }))
+        .collect();
+    let r = wss_rpc(
+        &mut ws,
+        4,
+        "github.pulls.search",
+        json!({ "owner": "o", "repo": "r", "repos": six }),
+    )
+    .await;
+    assert_eq!(r["pulls"].as_array().unwrap().len(), 6);
+    assert_eq!(fx.forge.pr_queries.lock().unwrap()[0].extra_repos.len(), 5);
 }
 
 /// `github.issues.get` resolves a single issue by `{owner, repo, number}`:
@@ -601,8 +821,24 @@ async fn issues_get_returns_issue_with_author_and_timestamps() {
     .await;
     assert_eq!(env["error"]["code"], json!(-32602), "envelope: {env}");
 
+    // Mixed-case addressing reaches the engine with its casing intact.
+    let r3 = wss_rpc(
+        &mut ws,
+        3,
+        "github.issues.get",
+        json!({ "owner": "Intent-HQ", "repo": "IntentD", "number": 9 }),
+    )
+    .await;
+    assert_eq!(r3["issue"]["number"], 9);
+
+    // `RepoRef` equality is case-insensitive, so compare the recorded fields
+    // directly to prove the addressing was forwarded verbatim.
     let gets = fx.forge.issue_gets.lock().unwrap();
-    assert_eq!(*gets, vec![(RepoRef::new("o", "r"), 7)]);
+    let recorded: Vec<(&str, &str, u64)> = gets
+        .iter()
+        .map(|(repo, number)| (repo.owner.as_str(), repo.name.as_str(), *number))
+        .collect();
+    assert_eq!(recorded, vec![("o", "r", 7), ("Intent-HQ", "IntentD", 9)]);
 }
 
 /// `github.issues.search` rejects the PR-only `review-requested` filter with

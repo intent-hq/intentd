@@ -13,7 +13,7 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,7 +31,6 @@ use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
@@ -41,22 +40,17 @@ const ACCESS_TOKEN: &str = "gho_e2e_device_flow_token";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-ghdf-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-ghdf-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -355,7 +349,8 @@ async fn serve_conn(mut stream: TcpStream, authorize: Arc<AtomicBool>) -> std::i
 async fn github_device_flow_full_lifecycle_over_wss() {
     let mock = spawn_mock_github().await;
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_s = secrets_file.to_string_lossy().to_string();
     let env: [(&str, &str); 4] = [
@@ -365,10 +360,7 @@ async fn github_device_flow_full_lifecycle_over_wss() {
         ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -474,7 +466,8 @@ async fn github_device_flow_full_lifecycle_over_wss() {
 async fn github_cancel_auth_stops_the_background_poll_over_wss() {
     let mock = spawn_mock_github().await;
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_s = secrets_file.to_string_lossy().to_string();
     let env: [(&str, &str); 4] = [
@@ -484,10 +477,7 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
         ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

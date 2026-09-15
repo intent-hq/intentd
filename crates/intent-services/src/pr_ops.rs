@@ -59,16 +59,11 @@ pub(crate) async fn resolve_source_control(
     }
 }
 
-/// The `(owner, repo)` pair for the workspace's active provider, or
-/// [`NO_ACTIVE_PR`] when either is unset (§7.6).
-pub(crate) fn repo_of(ws: &Workspace) -> Result<(String, String)> {
-    match (
-        ws.repository_owner.as_deref().filter(|s| !s.is_empty()),
-        ws.repository_name.as_deref().filter(|s| !s.is_empty()),
-    ) {
-        (Some(owner), Some(name)) => Ok((owner.to_string(), name.to_string())),
-        _ => Err(Error::Internal(NO_ACTIVE_PR.to_string())),
-    }
+/// The workspace's forge repository ([`Workspace::repo`]) for its active
+/// provider, or [`NO_ACTIVE_PR`] when either slug half is unset (§7.6).
+pub(crate) fn repo_of(ws: &Workspace) -> Result<RepoRef> {
+    ws.repo()
+        .ok_or_else(|| Error::Internal(NO_ACTIVE_PR.to_string()))
 }
 
 /// Parse the `ws.pr.snapshot` cross-repo override: an `"owner/name"` slug
@@ -796,7 +791,7 @@ pub struct MergeRequirementsThreads {
 /// rollups.
 // The bool fields mirror the wire checklist shape; grouping them would
 // change the serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeRequirements {

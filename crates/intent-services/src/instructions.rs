@@ -157,9 +157,9 @@ pub(crate) static V2_2: InstructionSet = InstructionSet {
     ..V2
 };
 
-/// Harness v2.4 adds self-contained plain-language communication guidance.
-pub(crate) static V2_4: InstructionSet = InstructionSet {
-    common: instr!("v2.4", "common"),
+/// Harness v2.5 adds self-contained plain-language communication guidance.
+pub(crate) static V2_5: InstructionSet = InstructionSet {
+    common: instr!("v2.5", "common"),
     ..V2_2
 };
 
@@ -469,8 +469,8 @@ mod tests {
         defaults()
     }
 
-    /// The latest common body includes v2.4 plain-language guidance.
-    const COMMON_LATEST: &str = V2_4.common;
+    /// The latest common body includes v2.5 plain-language guidance.
+    const COMMON_LATEST: &str = V2_5.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;
@@ -754,7 +754,7 @@ mod tests {
         assert!(!out.contains("ws.hook."));
         // Neighboring sections survive intact, with clean separation.
         assert!(out.contains("## Raising Attention"));
-        assert!(out.contains("progressing work.\n\n## Response Organization"));
+        assert!(out.contains("with no `advisory`).\n\n## Response Organization"));
         assert!(out.contains("## Rich Chat Rendering"));
     }
 
@@ -840,7 +840,7 @@ mod tests {
         assert!(!common.contains("ws.pr.monitor"));
         // Neighboring sections survive intact, with clean separation.
         assert!(common.contains("## Raising Attention"));
-        assert!(common.contains("progressing work.\n\n## Response Organization"));
+        assert!(common.contains("with no `advisory`).\n\n## Response Organization"));
         assert!(common.contains("## Rich Chat Rendering"));
     }
 

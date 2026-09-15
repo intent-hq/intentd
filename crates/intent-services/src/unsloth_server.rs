@@ -1672,7 +1672,7 @@ fn pid_is_alive(pid: u32) -> bool {
 /// call, never on a hot path. Best-effort throughout: pids that have since
 /// exited are silently skipped, never an error.
 async fn sample_process_tree(root: u32) -> (f32, u64) {
-    #[allow(unused_mut)]
+    #[cfg_attr(not(unix), expect(unused_mut))]
     let mut pids: Vec<u32> = vec![root];
     #[cfg(unix)]
     pids.extend(
@@ -2149,6 +2149,78 @@ mod tests {
             path
         }
 
+        /// `run_behavior` for a stub child that stays alive until the test
+        /// calls [`release_stub_child`] — a crash at a moment the TEST picks
+        /// (after startup completed) instead of a fixed wall-clock lifetime,
+        /// which scheduling delays under suite load could consume before
+        /// `ensure_endpoint` even finished probing (intent-hq/intent#4885).
+        /// A release is one-shot: the child consumes the flag on its way
+        /// out, so a respawned child from the same stub waits for its own.
+        fn run_until_released(dir: &Path) -> String {
+            let flag = release_flag(dir);
+            format!(
+                "while [ ! -e '{flag}' ]; do sleep 0.02; done; rm -f '{flag}'",
+                flag = flag.display()
+            )
+        }
+
+        fn release_flag(dir: &Path) -> PathBuf {
+            dir.join("release-stub-child")
+        }
+
+        /// Let a [`run_until_released`] stub child exit. The caller still has
+        /// to synchronize on the exit itself (e.g. [`wait_for_child_exit`] or
+        /// a blocking `waitpid`).
+        fn release_stub_child(dir: &Path) {
+            std::fs::write(release_flag(dir), b"").expect("release stub child");
+        }
+
+        /// Block until the manager's owned child has exited, as observed
+        /// through the same `try_wait` probe `ensure_endpoint` uses to
+        /// notice a dead child.
+        async fn wait_for_child_exit(mgr: &UnslothServerManager) {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let alive = mgr
+                        .state
+                        .lock()
+                        .await
+                        .as_mut()
+                        .is_some_and(ManagedServer::is_alive);
+                    if !alive {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("stub child exits after release");
+        }
+
+        /// Reap `pid` directly (the test process is its true OS parent) once
+        /// it exits — bounded `WNOHANG` polling, so a broken release
+        /// handshake fails with a diagnosable message instead of hanging
+        /// until nextest kills the test.
+        async fn reap_stub_child(pid: u32) {
+            use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+            let pid = nix::unistd::Pid::from_raw(pid.cast_signed());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => return,
+                    Ok(WaitStatus::StillAlive) => {}
+                    Ok(other) => panic!("unexpected stub child wait status: {other:?}"),
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(e) => panic!("waitpid on stub child failed: {e}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "stub child did not exit within 30s of release"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
         /// Stub Hugging Face API on an ephemeral loopback port: answers every
         /// request with 200 + `body` and counts hits (for cache assertions).
         async fn spawn_stub_hf(body: &'static str) -> (u16, Arc<AtomicUsize>) {
@@ -2502,9 +2574,14 @@ mod tests {
         async fn dead_child_respawn_does_not_warn_even_with_live_agents() {
             let dir = tempfile::tempdir().expect("tempdir");
             let port = spawn_stub_http("sk-unsloth-test-key").await;
-            // `run` exits shortly after startup completes, standing in for a
-            // server that crashed while agents were attached.
-            let binary = write_stub_binary(dir.path(), dir.path(), port, Some("sleep 0.3"));
+            // `run` exits once released after startup completes, standing in
+            // for a server that crashed while agents were attached.
+            let binary = write_stub_binary(
+                dir.path(),
+                dir.path(),
+                port,
+                Some(&run_until_released(dir.path())),
+            );
             let mgr = UnslothServerManager::with_config(test_config(
                 binary,
                 dir.path().to_path_buf(),
@@ -2514,8 +2591,8 @@ mod tests {
             mgr.ensure_endpoint(REPO, None, 1, &|_, _| {})
                 .await
                 .expect("cold start");
-            // Wait for the stubbed server child to exit.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            release_stub_child(dir.path());
+            wait_for_child_exit(&mgr).await;
 
             let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
@@ -2753,14 +2830,38 @@ mod tests {
             assert!(err.to_string().contains("shutting down"), "got: {err}");
         }
 
+        /// Block until an in-flight `ensure_endpoint` has registered its
+        /// starting server (identity mirror set). Reads only the short-held
+        /// `identity` mirror mutex, never the startup-serializing `state`
+        /// lock — the startup holds that for its whole window. The deadline
+        /// is a hang guard for a startup that never registers, sized to
+        /// expire before nextest's kill window, not a latency bound.
+        async fn wait_for_identity_registered(mgr: &UnslothServerManager) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while lock_ignore_poison(&mgr.identity).is_none() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "startup never registered a starting server"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
         #[tokio::test]
         async fn status_snapshot_stays_responsive_during_in_flight_startup() {
             // Regression: `status_snapshot` must never contend with the
-            // startup-serializing `state` lock — it reads the lock-free
-            // `identity`/`phase` mirrors instead. `run` sleeps but never
-            // opens the HTTP socket, so the startup sits in its phase-1 probe
-            // loop for the whole (long) window; `status_snapshot` must return
-            // promptly throughout, not block behind `ensure_endpoint`.
+            // startup-serializing `state` lock — it reads the short-held
+            // `identity`/`phase` mirror mutexes instead. `run` sleeps but
+            // never opens the HTTP socket, so the startup sits in its phase-1
+            // probe loop holding `state` for the whole (long) window — the
+            // stub child's 300s lifetime, under the 600s `server_up_timeout`;
+            // a snapshot that contended for the lock could not return before
+            // that window elapsed. The contract is asserted as ORDERING — the
+            // snapshot returns while the startup is still in flight and
+            // still holds `state` — not as an elapsed-time bound: under CPU
+            // starvation the snapshot's own process-tree sampling takes
+            // seconds, which a tight budget misreads as lock contention
+            // (intent-hq/intent#4925).
             let dir = tempfile::tempdir().expect("tempdir");
             let binary = write_stub_binary(dir.path(), dir.path(), 1, None);
             let mut config = test_config(binary, dir.path().to_path_buf(), 1);
@@ -2770,18 +2871,27 @@ mod tests {
             let m2 = mgr.clone();
             let startup =
                 tokio::spawn(async move { m2.ensure_endpoint(REPO, None, 0, &|_, _| {}).await });
-            // Give the startup time to spawn the child and enter the probe
-            // loop (holding `state` for the remainder of the long timeout).
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Handshake rather than a fixed sleep: once the starting server
+            // is registered, the startup holds `state` until its window
+            // elapses or it is aborted.
+            wait_for_identity_registered(&mgr).await;
 
-            let start = tokio::time::Instant::now();
-            let status = tokio::time::timeout(Duration::from_secs(5), mgr.status_snapshot())
+            // Hang guard only: it must expire before nextest's 180s kill so
+            // a regression names the stalled step (a contending snapshot
+            // would otherwise sit behind the long startup window), but it
+            // is far too loose to measure latency — the ordering assertions
+            // below carry the contract.
+            let status = tokio::time::timeout(Duration::from_secs(60), mgr.status_snapshot())
                 .await
                 .expect("status_snapshot must not block behind the startup's state lock")
                 .expect("server tracked as running mid-startup");
             assert!(
-                start.elapsed() < Duration::from_secs(1),
-                "status_snapshot must return promptly, not wait out the startup timeout"
+                !startup.is_finished(),
+                "startup must still be in flight when the snapshot returns"
+            );
+            assert!(
+                mgr.state.try_lock().is_err(),
+                "the in-flight startup must still hold `state`: the snapshot returned without contending for it"
             );
             assert_eq!(status.repo_id, REPO);
             assert_eq!(status.phase, "starting");
@@ -2861,9 +2971,15 @@ mod tests {
             // relying on a race with the kernel's own reaping.)
             let dir = tempfile::tempdir().expect("tempdir");
             let port = spawn_stub_http("sk-unsloth-test-key").await;
-            // `run` exits shortly after startup completes, standing in for a
-            // server that crashes post-ready without the daemon noticing yet.
-            let binary = write_stub_binary(dir.path(), dir.path(), port, Some("sleep 0.3"));
+            // `run` exits once released after startup completes, standing in
+            // for a server that crashes post-ready without the daemon
+            // noticing yet.
+            let binary = write_stub_binary(
+                dir.path(),
+                dir.path(),
+                port,
+                Some(&run_until_released(dir.path())),
+            );
             let mgr = UnslothServerManager::with_config(test_config(
                 binary,
                 dir.path().to_path_buf(),
@@ -2878,10 +2994,12 @@ mod tests {
                 .and_then(|s| s.pid)
                 .expect("pid while running");
 
-            // Reap the child directly (this test process is its true OS
-            // parent), forcing the terminal "exited and reaped" state that a
-            // signal-0 probe can actually observe.
-            let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid.cast_signed()), None);
+            // Let the child exit, then reap it directly (this test process is
+            // its true OS parent; the reap is the exit synchronization),
+            // forcing the terminal "exited and reaped" state that a signal-0
+            // probe can actually observe.
+            release_stub_child(dir.path());
+            reap_stub_child(pid).await;
 
             assert!(
                 mgr.status_snapshot().await.is_none(),
@@ -2923,6 +3041,11 @@ mod tests {
         /// isn't drained concurrently the child blocks on `write()` once the
         /// pipe fills, `try_wait()` never observes an exit, and a live
         /// process is misreported as timed out.
+        ///
+        /// No wall-clock bound around the call: a regression surfaces as the
+        /// config's own `mint_timeout` firing (a named mint-timeout error,
+        /// within nextest's kill window), not as a tight elapsed budget that
+        /// CPU starvation alone can exceed (intent-hq/intent#4925).
         #[tokio::test]
         async fn mint_with_large_stdout_output_does_not_hang() {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -2947,13 +3070,10 @@ mod tests {
             let config = test_config(binary_path, dir.path().to_path_buf(), port);
             let mgr = UnslothServerManager::with_config(config);
 
-            let endpoint = tokio::time::timeout(
-                Duration::from_secs(5),
-                mgr.ensure_endpoint(REPO, None, 0, &|_, _| {}),
-            )
-            .await
-            .expect("mint must complete well within mint_timeout, not hang on a full pipe")
-            .expect("mint succeeds despite large stdout output");
+            let endpoint = mgr
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
+                .await
+                .expect("mint succeeds despite large stdout output (must not hang on a full pipe)");
             assert_eq!(endpoint.base_url, format!("http://127.0.0.1:{port}/v1"));
 
             mgr.shutdown().await;

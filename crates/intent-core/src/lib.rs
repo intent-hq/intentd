@@ -24,10 +24,12 @@ pub mod config;
 pub mod discovery_cache;
 pub mod error;
 pub mod events;
+pub mod git_remote_url;
 pub mod ids;
 pub mod model;
 pub mod path_utils;
 pub mod replay_preview;
+pub mod repo_ref;
 pub mod secrets;
 pub mod server_control;
 pub mod settings_file;
@@ -50,6 +52,7 @@ pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
 pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
+pub use git_remote_url::GitRemoteUrl;
 pub use ids::{
     AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
     CHIEF_WORKSPACE_ID,
@@ -110,6 +113,7 @@ pub use model::{
     BrowserTabVisibility,
 };
 pub use path_utils::prewarm_login_shell_path;
+pub use repo_ref::RepoRef;
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
 pub use server_control::ServerControl;
 pub use settings_file::{
