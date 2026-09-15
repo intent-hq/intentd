@@ -3343,6 +3343,17 @@ impl Services {
         };
         let mut page: Vec<AgentMessage> =
             raw_page.into_iter().map(project_served_message).collect();
+        // Serve-time author projection (multiplayer w2): every user row gets
+        // `author` resolved from its `fromPrincipalId` stamp, else the
+        // workspace's legacy author, else its owner — the one projection
+        // `chat.subscribe` snapshots share. Bounded by the distinct authors
+        // on the page (RPC cost contract), never stored. Attached on the
+        // typed page BEFORE the slim byte budget below, so the profile
+        // strings count toward `SLIM_PAGE_BUDGET_BYTES` instead of landing on
+        // top of an already-at-budget page.
+        crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
+            .attach_typed(&mut page)
+            .await;
         if projection == Some(ConversationProjection::Slim) {
             // One bounded thumbnails read sized by the page (RPC cost
             // contract: O(rows returned); the common all-text page selects
@@ -3393,16 +3404,6 @@ impl Services {
             }
         }
         let mut messages = serde_json::to_value(&page).expect("messages serialize");
-        // Serve-time author projection (multiplayer w2): every user row gets
-        // `author` resolved from its `fromPrincipalId` stamp, else the
-        // workspace's legacy author, else its owner — the one projection
-        // `chat.subscribe` snapshots share. Bounded by the distinct authors
-        // on the page (RPC cost contract), never stored.
-        if let Some(arr) = messages.as_array_mut() {
-            crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
-                .attach(arr)
-                .await;
-        }
         // In-progress tail (monorepo#3647): append the in-flight turn's
         // partial assistant message when the caller opted in and this page
         // ends at the live tail, so a mid-turn read shows the tool calls and
@@ -6230,16 +6231,26 @@ impl Services {
                 .position(|m| m.id == message_id)
                 .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
             let was = queue[position].editing;
-            queue[position].content = content;
             let human_authored = queue[position].user_origin
                 || crate::principal_ops::carries_principal_stamp(
                     queue[position].message_metadata.as_ref(),
                 );
-            if restamp && human_authored {
-                queue[position].message_metadata =
-                    crate::principal_ops::stamp_principal_attribution(
-                        queue[position].message_metadata.take(),
-                    )?;
+            // The restamp is the one fallible step (a durable pre-attribution
+            // entry may carry scalar metadata, which the stamp rejects), so
+            // it is computed on a copy BEFORE anything on the entry moves: a
+            // rejected edit leaves content and metadata exactly as they were
+            // instead of a mutated entry that never published and that a
+            // later queue write would persist.
+            let restamped = if restamp && human_authored {
+                Some(crate::principal_ops::stamp_principal_attribution(
+                    queue[position].message_metadata.clone(),
+                )?)
+            } else {
+                None
+            };
+            queue[position].content = content;
+            if let Some(metadata) = restamped {
+                queue[position].message_metadata = metadata;
             }
             if let Some(flag) = editing {
                 queue[position].editing = flag;

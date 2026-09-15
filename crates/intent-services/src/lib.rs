@@ -19743,10 +19743,20 @@ impl WorkspaceApi for Services {
                             || created_file_blocks.is_some();
                         if has_content {
                             let prompt_text = prompt.unwrap_or_default();
+                            // Principal stamp (multiplayer w2): the initial
+                            // prompt is the creating human's first message,
+                            // stamped with the bound wire caller exactly like
+                            // `agent.sendMessage` (an agent / daemon caller
+                            // stamps nothing). Stamping an absent payload
+                            // cannot fail, so this never strands the row
+                            // persisted above.
+                            let message_metadata =
+                                crate::principal_ops::stamp_principal_attribution(None)?;
                             let options = crate::agent_manager::TurnOptions {
                                 image_blocks: created_image_blocks.clone(),
                                 file_blocks: created_file_blocks.clone(),
                                 context_references: created_context_refs,
+                                message_metadata: message_metadata.clone(),
                                 ..crate::agent_manager::TurnOptions::default()
                             };
                             let send = match services.agent_manager() {
@@ -19763,7 +19773,7 @@ impl WorkspaceApi for Services {
                                             None,
                                             created_image_blocks,
                                             created_file_blocks,
-                                            None,
+                                            message_metadata,
                                         )
                                         .await
                                 }
