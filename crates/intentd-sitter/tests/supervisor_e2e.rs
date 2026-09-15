@@ -160,6 +160,45 @@ fn serve_stallable(routes: Routes) -> (String, Arc<std::sync::atomic::AtomicBool
     (url, stalled)
 }
 
+/// [`serve`] with a hold switch: while the returned flag is set, each
+/// accepted socket is parked (and counted in the returned counter) until
+/// the flag clears, then served normally — an update check a test can keep
+/// in flight for as long as it needs and then release.
+fn serve_holdable(
+    routes: Routes,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let parked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_hold = Arc::clone(&hold);
+    let server_parked = Arc::clone(&parked);
+    thread::spawn(move || {
+        let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let routes = Arc::clone(&routes);
+            let log = Arc::clone(&log);
+            let hold = Arc::clone(&server_hold);
+            let parked = Arc::clone(&server_parked);
+            thread::spawn(move || {
+                if hold.load(std::sync::atomic::Ordering::SeqCst) {
+                    parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    while hold.load(std::sync::atomic::Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                handle(stream, &routes, &log);
+            });
+        }
+    });
+    (url, hold, parked)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -2098,6 +2137,106 @@ fn sigusr2_when_already_current_signals_nothing_to_the_daemon() {
     send_signal(&sitter, "TERM");
     let status = wait_exit(&mut sitter, Duration::from_secs(10));
     assert_eq!(status.code(), Some(0));
+}
+
+/// SIGUSR1 ("update now") keeps its semantics when it lands while a
+/// SIGUSR2 idle-mode check is still in flight: the running check is
+/// escalated, so when it installs the new version the daemon is stopped
+/// (SIGTERM) and the new version respawned at once — not handed a SIGUSR2
+/// and left to restart when idle.
+#[test]
+fn sigusr1_during_an_idle_mode_check_escalates_it_to_restart_now() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &idle_restart_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, hold, parked) = serve_holdable(Arc::clone(&routes));
+
+    // Hour-long check interval: only the signals may check.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(UPDATE_RESTART_ENV)
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    // Publish 0.2.0 but hold the endpoint so the SIGUSR2 check stays in
+    // flight; once its manifest request is parked, send SIGUSR1.
+    let archive = make_tar_xz(idle_restart_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    hold.store(true, std::sync::atomic::Ordering::SeqCst);
+    send_signal(&sitter, "USR2");
+    wait_until(
+        "the SIGUSR2 check to be parked at the endpoint",
+        Duration::from_secs(15),
+        || parked.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+    );
+    let stderr = stderr_path(dir.path());
+    send_signal(&sitter, "USR1");
+    wait_until(
+        "the in-flight check to be escalated",
+        Duration::from_secs(15),
+        || {
+            read_or_empty(&stderr).contains(
+                "SIGUSR1 received; an update check is already running, escalating it to restart now",
+            )
+        },
+    );
+    hold.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must survive the escalated restart"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset idle_restart=1".to_string(),
+            "term 0.1.0".to_string(),
+            "start 0.2.0 update_restart=1 idle_restart=1".to_string(),
+            "term 0.2.0".to_string(),
+        ],
+        "SIGUSR1 mid-check must SIGTERM 0.1.0 and respawn 0.2.0 — no SIGUSR2 hand-off"
+    );
+    let stderr = read_or_empty(&stderr);
+    assert!(
+        stderr.contains("installed intentd 0.2.0 (was 0.1.0); restarting daemon"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("asking daemon to restart when idle"),
+        "the escalated check must not promise an idle restart: {stderr}"
+    );
 }
 
 /// A staged version the daemon never restarted into (`state.json` names an

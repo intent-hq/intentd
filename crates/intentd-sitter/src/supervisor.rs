@@ -88,7 +88,10 @@
 //!     differs) — the SIGHUP path without the stop. Serve mode advertises
 //!     the handshake by setting [`IDLE_RESTART_ENV`]`=1` on the child; the
 //!     daemon only sends SIGUSR2 to a sitter that did. A daemon that never
-//!     gets idle is caught by item 4 at the next periodic check
+//!     gets idle is caught by item 4 at the next periodic check. A SIGUSR1
+//!     arriving while the idle-mode check is in flight escalates it to
+//!     item 9's immediate restart; a SIGUSR2 never downgrades a SIGUSR1
+//!     check
 //!
 //! When the startup channel came from `config.toml` or the stable default
 //! (not the `--sitter-channel` flag or `INTENTD_CHANNEL` env), every update
@@ -606,7 +609,9 @@ impl Supervisor {
                                 CheckNowOutcome::RestartRequested => {
                                     self.refresh_version_from_state(&mut current_version);
                                 }
-                                CheckNowOutcome::Respawn(version) => current_version = version,
+                                CheckNowOutcome::Respawn { version, .. } => {
+                                    current_version = version;
+                                }
                                 CheckNowOutcome::Unchanged => {}
                             }
                             backoff = self.config.backoff_initial;
@@ -719,7 +724,7 @@ impl Supervisor {
                                     CheckNowOutcome::RestartRequested => {
                                         self.refresh_version_from_state(&mut current_version);
                                     }
-                                    CheckNowOutcome::Respawn(version) => current_version = version,
+                                    CheckNowOutcome::Respawn { version, .. } => current_version = version,
                                     CheckNowOutcome::Unchanged => {}
                                 }
                                 backoff = self.config.backoff_initial;
@@ -811,7 +816,7 @@ impl Supervisor {
                                     .check_now(&current_version, RestartStyle::Now, &mut signals, &mut next_check_at)
                                     .await
                                 {
-                                    CheckNowOutcome::Respawn(version) => {
+                                    CheckNowOutcome::Respawn { version, .. } => {
                                         self.graceful_stop(&mut child).await;
                                         current_version = version;
                                         backoff = self.config.backoff_initial;
@@ -837,7 +842,9 @@ impl Supervisor {
                             // daemon as SIGUSR2 instead of a SIGTERM; it
                             // exits with RESTART_FOR_UPDATE_EXIT_CODE once
                             // idle and the wait arm respawns it. The child
-                            // keeps running here whatever the check found.
+                            // keeps running here whatever the check found —
+                            // unless a SIGUSR1 arrived mid-check and
+                            // escalated the restart to "now".
                             #[cfg(unix)]
                             SignalEvent::CheckNowIdle => {
                                 if !supervised {
@@ -849,9 +856,16 @@ impl Supervisor {
                                     .check_now(&current_version, RestartStyle::WhenIdle, &mut signals, &mut next_check_at)
                                     .await
                                 {
-                                    CheckNowOutcome::Respawn(_) => {
+                                    CheckNowOutcome::Respawn { style: RestartStyle::WhenIdle, .. } => {
                                         forward_signal(&child, nix::sys::signal::Signal::SIGUSR2 as i32);
                                         continue; // keep supervising until it exits
+                                    }
+                                    CheckNowOutcome::Respawn { version, style: RestartStyle::Now } => {
+                                        self.graceful_stop(&mut child).await;
+                                        current_version = version;
+                                        backoff = self.config.backoff_initial;
+                                        failures = 0;
+                                        break; // respawn the new version
                                     }
                                     CheckNowOutcome::Unchanged => continue, // daemon untouched
                                     CheckNowOutcome::RestartRequested => {
@@ -1019,8 +1033,11 @@ impl Supervisor {
     /// The SIGUSR1 ("update now") / SIGUSR2 ("update when idle") check: one
     /// immediate on-demand check on top of the periodic schedule (which it
     /// re-arms, persisting `state.json` exactly like a periodic check).
-    /// `style` only changes what the log promises for a found version; the
-    /// caller performs the stop or the SIGUSR2 hand-off. Selects on
+    /// `style` is how a found version is to be taken: the caller performs
+    /// the stop or the SIGUSR2 hand-off per the style the outcome carries.
+    /// A SIGUSR1 arriving while an idle-mode check is in flight escalates
+    /// it to [`RestartStyle::Now`] (SIGUSR1's "update now" always wins); a
+    /// SIGUSR2 never downgrades an immediate check. Selects on
     /// `signals.recv()` while the check runs (like
     /// [`Supervisor::check_after_failed_start`]) so a stalled update
     /// endpoint — the updater's download timeout is minutes long — can never
@@ -1031,7 +1048,7 @@ impl Supervisor {
     async fn check_now(
         &self,
         current_version: &str,
-        style: RestartStyle,
+        mut style: RestartStyle,
         signals: &mut Signals,
         next_check_at: &mut Instant,
     ) -> CheckNowOutcome {
@@ -1049,12 +1066,26 @@ impl Supervisor {
                         return CheckNowOutcome::RestartRequested;
                     }
                     // A check is already in flight, which is exactly what
-                    // SIGUSR1/SIGUSR2 ask for: let it finish (with the
-                    // restart style of the check that started first).
-                    SignalEvent::CheckNow | SignalEvent::CheckNowIdle => {
+                    // SIGUSR1 asks for: let it finish, but restart at once
+                    // when it finds something, even if the check started
+                    // as an idle-mode one.
+                    SignalEvent::CheckNow => {
+                        if matches!(style, RestartStyle::WhenIdle) {
+                            eprintln!(
+                                "intentd-sitter: SIGUSR1 received; an update check is already \
+                                 running, escalating it to restart now"
+                            );
+                            style = RestartStyle::Now;
+                        } else {
+                            eprintln!(
+                                "intentd-sitter: SIGUSR1 received; an update check is already running"
+                            );
+                        }
+                    }
+                    // Never downgrades an immediate check to idle mode.
+                    SignalEvent::CheckNowIdle => {
                         eprintln!(
-                            "intentd-sitter: {} received; an update check is already running",
-                            event.name()
+                            "intentd-sitter: SIGUSR2 received; an update check is already running"
                         );
                     }
                 },
@@ -1068,7 +1099,7 @@ impl Supervisor {
                     previous.as_deref().unwrap_or("none"),
                     style.describe()
                 );
-                CheckNowOutcome::Respawn(version)
+                CheckNowOutcome::Respawn { version, style }
             }
             Ok(UpdateOutcome::AlreadyCurrent { version })
                 if version != current_version && self.paths.daemon_binary(&version).exists() =>
@@ -1078,7 +1109,7 @@ impl Supervisor {
                      (was {current_version}); {}",
                     style.describe()
                 );
-                CheckNowOutcome::Respawn(version)
+                CheckNowOutcome::Respawn { version, style }
             }
             Ok(UpdateOutcome::AlreadyCurrent { version }) => {
                 eprintln!("intentd-sitter: intentd {version} is already current");
@@ -1204,10 +1235,12 @@ enum FailedStartCheck {
     Shutdown(i32),
 }
 
-/// What an on-demand check ([`Supervisor::check_now`]) promises to do with
-/// a found version — only the log wording; the caller acts on it.
+/// How an on-demand check ([`Supervisor::check_now`]) takes a found
+/// version. The style a check starts with can only escalate (a SIGUSR1
+/// mid-check turns `WhenIdle` into `Now`); the outcome carries the
+/// effective one and the caller acts on it.
 #[cfg(unix)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RestartStyle {
     /// SIGUSR1: stop the child and respawn the new version at once.
     Now,
@@ -1229,10 +1262,14 @@ impl RestartStyle {
 #[cfg(unix)]
 enum CheckNowOutcome {
     /// The check installed (or found concurrently installed) a different
-    /// version; the caller restarts onto it per its [`RestartStyle`] —
-    /// respawn now with the backoff and failure counter reset, or hand the
-    /// child SIGUSR2 and let the restart-for-update exit drive the respawn.
-    Respawn(String),
+    /// version; the caller restarts onto it per the effective
+    /// [`RestartStyle`] — respawn now with the backoff and failure counter
+    /// reset, or hand the child SIGUSR2 and let the restart-for-update exit
+    /// drive the respawn.
+    Respawn {
+        version: String,
+        style: RestartStyle,
+    },
     /// Already current or the check failed; both non-fatal — the caller
     /// leaves the daemon alone.
     Unchanged,
