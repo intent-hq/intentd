@@ -608,6 +608,51 @@ impl Store {
         .map_err(|e| intent_core::Error::Internal(format!("update pr monitor poll failed: {e}")))?;
         Ok(res.rows_affected() > 0)
     }
+
+    /// Re-parent an ACTIVE monitor from `from_agent_id` to `to_agent_id` and
+    /// re-arm it in the same statement (the [`Store::update_pr_monitor_poll`]
+    /// write-back), so a reader never observes the new owner with the old
+    /// owner's pending changes. Backs orphaned-monitor adoption
+    /// (intent-hq/intent#5079).
+    ///
+    /// Guarded like the poll write-back — the row must still be `active`
+    /// with the caller's `expected_updated_at` — AND still owned by
+    /// `from_agent_id`, so two siblings adopting concurrently cannot both
+    /// win. Returns `false` when the guard fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn adopt_pr_monitor(
+        &self,
+        monitor_id: &PrMonitorId,
+        from_agent_id: &AgentId,
+        to_agent_id: &AgentId,
+        update: PrMonitorPollUpdate<'_>,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE pr_monitor SET agent_id = ?, last_snapshot = ?, baseline_snapshot = ?, \
+             pending_changes = ?, pending_since = ?, last_change_at = ?, last_polled_at = ?, \
+             last_error = ?, updated_at = ? \
+             WHERE monitor_id = ? AND agent_id = ? AND state = 'active' AND updated_at = ?",
+        )
+        .bind(&to_agent_id.0)
+        .bind(update.last_snapshot)
+        .bind(update.baseline_snapshot)
+        .bind(pending_to_db(update.pending_changes))
+        .bind(update.pending_since)
+        .bind(update.last_change_at)
+        .bind(update.last_polled_at)
+        .bind(update.last_error)
+        .bind(update.updated_at)
+        .bind(&monitor_id.0)
+        .bind(&from_agent_id.0)
+        .bind(update.expected_updated_at)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| intent_core::Error::Internal(format!("adopt pr monitor failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 #[cfg(test)]
@@ -1015,6 +1060,97 @@ mod tests {
             "emit baseline written independently"
         );
         assert_eq!(read.pending_changes, vec!["mergeable: true → false"]);
+    }
+
+    /// `adopt_pr_monitor` re-parents and re-arms in one guarded write: the
+    /// new owner lands together with the refreshed baseline and cleared
+    /// pending state; a stale `expected_updated_at` or a wrong `from` owner
+    /// leaves the row untouched (intent-hq/intent#5079).
+    #[tokio::test]
+    async fn adopt_pr_monitor_reparents_and_rearms_under_guard() {
+        let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
+        let ts = now_iso();
+        let mut m = test_monitor(&ws_id, &agent_id, &ts);
+        m.pending_changes = vec!["checks: 1 failing".to_string()];
+        m.pending_since = Some(ts.clone());
+        assert!(store.insert_pr_monitor(&m).await.expect("insert"));
+        let adopter = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&test_session(&adopter, &ws_id, &ts))
+            .await
+            .expect("adopter session");
+        let stranger = AgentId(format!("agent-{}", Uuid::new_v4()));
+
+        let now = now_iso();
+        let stale = PrMonitorPollUpdate {
+            updated_at: &now,
+            expected_updated_at: "1970-01-01T00:00:00Z",
+            ..Default::default()
+        };
+        assert!(
+            !store
+                .adopt_pr_monitor(&m.monitor_id, &agent_id, &adopter, stale)
+                .await
+                .expect("stale adopt"),
+            "stale expected_updated_at must not adopt"
+        );
+        let wrong_from = PrMonitorPollUpdate {
+            updated_at: &now,
+            expected_updated_at: &m.updated_at,
+            ..Default::default()
+        };
+        assert!(
+            !store
+                .adopt_pr_monitor(&m.monitor_id, &stranger, &adopter, wrong_from)
+                .await
+                .expect("wrong-from adopt"),
+            "a from-owner mismatch must not adopt"
+        );
+        let untouched = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+        assert_eq!(untouched.agent_id, agent_id);
+        assert_eq!(untouched.pending_changes, vec!["checks: 1 failing"]);
+
+        assert!(store
+            .adopt_pr_monitor(
+                &m.monitor_id,
+                &agent_id,
+                &adopter,
+                PrMonitorPollUpdate {
+                    last_snapshot: Some(r#"{"v":2}"#),
+                    baseline_snapshot: Some(r#"{"v":2}"#),
+                    pending_changes: &[],
+                    last_polled_at: Some(&now),
+                    updated_at: &now,
+                    expected_updated_at: &m.updated_at,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("adopt"));
+        let read = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+        assert_eq!(read.agent_id, adopter, "re-parented");
+        assert_eq!(read.state, PrMonitorState::Active);
+        assert_eq!(read.baseline_snapshot.as_deref(), Some(r#"{"v":2}"#));
+        assert_eq!(read.last_snapshot.as_deref(), Some(r#"{"v":2}"#));
+        assert!(read.pending_changes.is_empty(), "pending cleared");
+        assert!(read.pending_since.is_none());
+        assert_eq!(read.updated_at, now);
+        assert!(
+            store
+                .find_active_pr_monitor(&agent_id, "o", "r", 42)
+                .await
+                .expect("old owner lookup")
+                .is_none(),
+            "the old owner no longer holds it"
+        );
+        assert_eq!(
+            store
+                .find_active_pr_monitor(&adopter, "o", "r", 42)
+                .await
+                .expect("new owner lookup")
+                .map(|m| m.monitor_id),
+            Some(m.monitor_id.clone())
+        );
     }
 
     /// The 0089 migration backfills `baseline_snapshot` from `last_snapshot`

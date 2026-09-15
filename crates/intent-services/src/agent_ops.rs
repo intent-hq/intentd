@@ -96,8 +96,9 @@ fn is_running_turn(status: AgentStatus) -> bool {
 }
 
 /// Terminal statuses the retire cascade never touches (the same set
-/// `count_child_agents` treats as terminal).
-fn is_terminal_status(status: AgentStatus) -> bool {
+/// `count_child_agents` treats as terminal). Also the "owner can no longer
+/// receive wakes" test behind PR-monitor adoption (intent-hq/intent#5079).
+pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
     matches!(
         status,
         AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted

@@ -439,17 +439,31 @@ pub(crate) fn monitor_label(m: &PrMonitor) -> String {
 }
 
 /// Outcome of [`Services::pr_monitor_try_register`]: the monitor was
-/// registered (or re-armed), or the call was refused because another agent
-/// in the workspace already holds the PR's active monitor.
+/// registered (re-armed, or adopted from a dead owner), or the call was
+/// refused because another LIVE agent in the workspace already holds the
+/// PR's active monitor.
 #[derive(Debug, Clone)]
 pub enum PrMonitorRegistration {
     /// The caller now owns an active monitor on the PR.
     Registered {
         monitor: Box<PrMonitor>,
         requirements: MergeRequirements,
+        /// `Some(previous owner)` when the row was ADOPTED from an agent
+        /// that can no longer receive wakes (intent-hq/intent#5079);
+        /// `None` for a fresh registration or the owner's own re-arm.
+        adopted_from: Option<AgentId>,
     },
     /// Refused: one monitor per PR per workspace, and another agent holds it.
     Refused(PrMonitorRefusal),
+}
+
+/// Who holds the workspace's ACTIVE monitor on a PR when it is not the
+/// caller: a live agent (the call is refused), or an agent that can no
+/// longer receive wakes — terminal status, soft-retired, or its session row
+/// gone — whose monitor is orphaned and adoptable (intent-hq/intent#5079).
+enum PrMonitorHolder {
+    Live(PrMonitorRefusal),
+    Orphaned(PrMonitor),
 }
 
 /// A refused `pr.monitor` registration — the ACTIVE monitor another agent in
@@ -880,14 +894,15 @@ impl Services {
     /// next wake reports only what moves from here.
     ///
     /// The direct-service convenience over [`Services::pr_monitor_try_register`]:
-    /// a workspace-level refusal (another agent already holds the PR's active
-    /// monitor) surfaces as `Error::InvalidParams` naming the owner. The MCP
-    /// op ([`Services::pr_monitor_start_op`]) uses the structured outcome
-    /// instead so the model can act on it.
+    /// a workspace-level refusal (another live agent already holds the PR's
+    /// active monitor) surfaces as `Error::InvalidParams` naming the owner.
+    /// The MCP op ([`Services::pr_monitor_start_op`]) uses the structured
+    /// outcome instead so the model can act on it. An adoption from a dead
+    /// owner is an ordinary success here.
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap or another agent in the workspace already monitors the PR, and propagates store or forge failures (e.g. when the PR cannot be fetched).
+    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap or another live agent in the workspace already monitors the PR, and propagates store or forge failures (e.g. when the PR cannot be fetched).
     pub async fn pr_monitor_register(
         &self,
         workspace_id: &WorkspaceId,
@@ -903,6 +918,7 @@ impl Services {
             PrMonitorRegistration::Registered {
                 monitor,
                 requirements,
+                ..
             } => Ok((*monitor, requirements)),
             PrMonitorRegistration::Refused(refusal) => Err(Error::InvalidParams(format!(
                 "pr.monitor: {} is already monitored by agent {} in this workspace",
@@ -913,11 +929,21 @@ impl Services {
     }
 
     /// Register (or idempotently re-arm) a monitor, or REFUSE when another
-    /// agent in `workspace_id` already holds the ACTIVE monitor on the PR —
-    /// one monitor per PR per workspace (`idx_pr_monitor_workspace_identity`).
-    /// The refusal is decided before the forge fetch, so a refused call costs
-    /// no forge request and persists nothing; the caller's OWN re-register is
-    /// never refused (it re-arms).
+    /// LIVE agent in `workspace_id` already holds the ACTIVE monitor on the
+    /// PR — one monitor per PR per workspace
+    /// (`idx_pr_monitor_workspace_identity`). The refusal is decided before
+    /// the forge fetch, so a refused call costs no forge request and
+    /// persists nothing; the caller's OWN re-register is never refused (it
+    /// re-arms).
+    ///
+    /// When the holder can no longer receive wakes — terminal status
+    /// (`error` / `deleted` / `completed`), soft-retired, or its session row
+    /// gone — the monitor is ORPHANED and the caller ADOPTS it instead
+    /// (intent-hq/intent#5079): the same row is re-parented and re-armed
+    /// under the caller (no second row, so the workspace-identity index
+    /// holds), the outcome carries `adopted_from`, and the
+    /// `prMonitor:registered` event marks the adoption. Adoption counts
+    /// against the adopter's own cap exactly like a fresh registration.
     ///
     /// The initial fetch is load-bearing — a forge that cannot read the PR
     /// (unsupported host, missing PR, no token) fails registration rather
@@ -938,12 +964,17 @@ impl Services {
             .store
             .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number.cast_signed())
             .await?;
+        let mut orphan = None;
         if existing.is_none() {
-            if let Some(refusal) = self
-                .pr_monitor_refusal(workspace_id, agent_id, repo_owner, repo_name, pr_number)
+            match self
+                .pr_monitor_holder(workspace_id, agent_id, repo_owner, repo_name, pr_number)
                 .await?
             {
-                return Ok(PrMonitorRegistration::Refused(refusal));
+                Some(PrMonitorHolder::Live(refusal)) => {
+                    return Ok(PrMonitorRegistration::Refused(refusal));
+                }
+                Some(PrMonitorHolder::Orphaned(m)) => orphan = Some(m),
+                None => {}
             }
             let cap = self.pr_monitors_max_per_agent as usize;
             let active = self
@@ -966,10 +997,20 @@ impl Services {
         let baseline = serde_json::to_string(&snapshot).ok();
         let now = now_iso();
 
+        let mut adopted_from = None;
         let mut monitor = match existing {
             Some(m) => self.rearm_pr_monitor(m, baseline.clone(), &now).await?,
             None => None,
         };
+        if monitor.is_none() {
+            if let Some(o) = orphan.take() {
+                let from = o.agent_id.clone();
+                monitor = self
+                    .adopt_pr_monitor(o, agent_id, baseline.clone(), &now)
+                    .await?;
+                adopted_from = monitor.is_some().then_some(from);
+            }
+        }
         if monitor.is_none() {
             let m = PrMonitor {
                 monitor_id: PrMonitorId::new(),
@@ -1000,13 +1041,27 @@ impl Services {
                 // same triple: re-arm the winner's row instead of surfacing
                 // the unique-index violation (the call stays idempotent).
                 monitor = self.rearm_pr_monitor(winner, baseline, &now).await?;
-            } else if let Some(refusal) = self
-                .pr_monitor_refusal(workspace_id, agent_id, repo_owner, repo_name, pr_number)
-                .await?
-            {
-                // Lost the insert race to ANOTHER agent's registration in
-                // this workspace: the same refusal as the pre-fetch check.
-                return Ok(PrMonitorRegistration::Refused(refusal));
+            } else {
+                match self
+                    .pr_monitor_holder(workspace_id, agent_id, repo_owner, repo_name, pr_number)
+                    .await?
+                {
+                    // Lost the insert race to ANOTHER live agent's
+                    // registration in this workspace: the same refusal as
+                    // the pre-fetch check.
+                    Some(PrMonitorHolder::Live(refusal)) => {
+                        return Ok(PrMonitorRegistration::Refused(refusal));
+                    }
+                    // The orphan's row moved under us (a poll tick landed
+                    // between the read and the adoption CAS): adopt the
+                    // fresh image once more before giving up.
+                    Some(PrMonitorHolder::Orphaned(o)) => {
+                        let from = o.agent_id.clone();
+                        monitor = self.adopt_pr_monitor(o, agent_id, baseline, &now).await?;
+                        adopted_from = monitor.is_some().then_some(from);
+                    }
+                    None => {}
+                }
             }
         }
         let monitor = monitor.ok_or_else(|| {
@@ -1014,7 +1069,10 @@ impl Services {
                 "pr.monitor: registration raced a concurrent monitor mutation; retry".to_string(),
             )
         })?;
-        self.emit_pr_monitor_event(PR_MONITOR_REGISTERED, &monitor, None)
+        let extra = adopted_from
+            .as_ref()
+            .map(|from| json!({ "adoptedFrom": from }));
+        self.emit_pr_monitor_event(PR_MONITOR_REGISTERED, &monitor, extra)
             .await;
         // A newly persisted active monitor on an open PR can move the
         // derived displayStatus to `pr_open`/`pr_ready` (§6.5) and raise
@@ -1024,22 +1082,28 @@ impl Services {
         Ok(PrMonitorRegistration::Registered {
             monitor: Box::new(monitor),
             requirements: snapshot.requirements,
+            adopted_from,
         })
     }
 
     /// The workspace-level duplicate check behind [`Services::pr_monitor_try_register`]:
-    /// `Some(refusal)` when an agent OTHER than `agent_id` holds the ACTIVE
-    /// monitor on `(repo, pr_number)` in `workspace_id`, naming that owner
-    /// (session name included when it has one). `None` when the PR is
-    /// unmonitored in the workspace or the holder is the caller itself.
-    async fn pr_monitor_refusal(
+    /// `Some(holder)` when an agent OTHER than `agent_id` holds the ACTIVE
+    /// monitor on `(repo, pr_number)` in `workspace_id` — [`PrMonitorHolder::Live`]
+    /// (a refusal naming that owner, session name included when it has one)
+    /// while the owner can still receive wakes, [`PrMonitorHolder::Orphaned`]
+    /// once it cannot (terminal status, soft-retired, or session row gone;
+    /// intent-hq/intent#5079). `None` when the PR is unmonitored in the
+    /// workspace or the holder is the caller itself. Any other session
+    /// lookup error fails closed (propagated) rather than adopting a monitor
+    /// whose owner might be live.
+    async fn pr_monitor_holder(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         repo_owner: &str,
         repo_name: &str,
         pr_number: u64,
-    ) -> Result<Option<PrMonitorRefusal>> {
+    ) -> Result<Option<PrMonitorHolder>> {
         let Some(owner) = self
             .store
             .find_active_pr_monitor_in_workspace(
@@ -1056,14 +1120,74 @@ impl Services {
             return Ok(None);
         }
         let owner_agent_name = match self.store.get_agent_session_summary(&owner.agent_id).await {
+            Ok(session)
+                if session.retired_at.is_some()
+                    || crate::agent_ops::is_terminal_status(session.status) =>
+            {
+                return Ok(Some(PrMonitorHolder::Orphaned(owner)));
+            }
             Ok(session) => Some(session.name).filter(|n| !n.trim().is_empty()),
-            Err(Error::NotFound(_)) => None,
+            Err(Error::NotFound(_)) => return Ok(Some(PrMonitorHolder::Orphaned(owner))),
             Err(e) => return Err(e),
         };
-        Ok(Some(PrMonitorRefusal {
+        Ok(Some(PrMonitorHolder::Live(PrMonitorRefusal {
             owner,
             owner_agent_name,
-        }))
+        })))
+    }
+
+    /// Adopt an ORPHANED monitor for `agent_id` (intent-hq/intent#5079): the
+    /// row is re-parented and re-armed in one guarded write (baseline
+    /// refreshed, pending state cleared, debounce anchors reset — the
+    /// [`Services::rearm_pr_monitor`] semantics), so the adopter's first wake
+    /// reports only what moves from here rather than the dead owner's
+    /// backlog. Returns `None` when the guarded write loses — the row was
+    /// cancelled/completed/polled/adopted concurrently — so the caller can
+    /// re-read instead of clobbering.
+    async fn adopt_pr_monitor(
+        &self,
+        mut m: PrMonitor,
+        agent_id: &AgentId,
+        baseline: Option<String>,
+        now: &str,
+    ) -> Result<Option<PrMonitor>> {
+        let updated = self
+            .store
+            .adopt_pr_monitor(
+                &m.monitor_id,
+                &m.agent_id,
+                agent_id,
+                PrMonitorPollUpdate {
+                    last_snapshot: baseline.as_deref(),
+                    baseline_snapshot: baseline.as_deref(),
+                    pending_changes: &[],
+                    last_polled_at: Some(now),
+                    updated_at: now,
+                    expected_updated_at: &m.updated_at,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if !updated {
+            return Ok(None);
+        }
+        tracing::info!(
+            monitor = %m.monitor_id,
+            from = %m.agent_id.0,
+            to = %agent_id.0,
+            label = %monitor_label(&m),
+            "pr monitor: orphaned monitor adopted"
+        );
+        m.agent_id = agent_id.clone();
+        m.last_snapshot = baseline.clone();
+        m.baseline_snapshot = baseline;
+        m.pending_changes = Vec::new();
+        m.pending_since = None;
+        m.last_change_at = None;
+        m.last_polled_at = Some(now.to_string());
+        m.last_error = None;
+        m.updated_at = now.to_string();
+        Ok(Some(m))
     }
 
     /// Re-arm an existing ACTIVE monitor row for an idempotent re-register:
@@ -2239,11 +2363,18 @@ impl Services {
             PrMonitorRegistration::Registered {
                 monitor,
                 requirements,
-            } => Ok(json!({
-                "ok": true,
-                "monitor": pr_monitor_wire(&monitor),
-                "requirements": requirements,
-            })),
+                adopted_from,
+            } => {
+                let mut payload = json!({
+                    "ok": true,
+                    "monitor": pr_monitor_wire(&monitor),
+                    "requirements": requirements,
+                });
+                if let Some(from) = adopted_from {
+                    payload["adoptedFrom"] = json!(from);
+                }
+                Ok(payload)
+            }
             PrMonitorRegistration::Refused(refusal) => Ok(refusal.to_wire()),
         }
     }
@@ -3954,6 +4085,183 @@ mod tests {
                 .contains("by agent agent-unnamed;"),
             "{refused}"
         );
+    }
+
+    /// How the fixture owner "dies" in the orphaned-monitor tests
+    /// (intent-hq/intent#5079): a terminal session status, or soft-retire.
+    #[derive(Clone, Copy, Debug)]
+    enum OwnerDeath {
+        Error,
+        Deleted,
+        Retired,
+    }
+
+    async fn kill_owner(svc: &Services, ws: &WorkspaceId, owner: &AgentId, how: OwnerDeath) {
+        let now = now_iso();
+        match how {
+            OwnerDeath::Error | OwnerDeath::Deleted => {
+                let status = match how {
+                    OwnerDeath::Error => AgentStatus::Error,
+                    _ => AgentStatus::Deleted,
+                };
+                svc.store()
+                    .set_agent_session_status(ws, owner, status, false, &now, None)
+                    .await
+                    .expect("owner status");
+            }
+            OwnerDeath::Retired => {
+                assert!(svc
+                    .store()
+                    .set_agent_session_retired_at(ws, owner, Some(&now), &now)
+                    .await
+                    .expect("owner retired"));
+            }
+        }
+    }
+
+    /// The `prMonitor:registered` event payloads in the workspace, newest first.
+    async fn registered_event_data(svc: &Services, ws: &WorkspaceId) -> Vec<Value> {
+        svc.store()
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![PR_MONITOR_REGISTERED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.data)
+            .collect()
+    }
+
+    /// A monitor whose owner can no longer receive wakes is ORPHANED: a
+    /// live sibling's `ws.pr.monitor` adopts it (intent-hq/intent#5079) —
+    /// the same row is re-armed under the caller (baseline refreshed,
+    /// pending changes cleared), the result is a success payload carrying
+    /// `adoptedFrom`, and `prMonitor:registered` marks the adoption. While
+    /// the owner is still live, the same call is refused exactly as before.
+    async fn assert_orphan_adopted_after(how: OwnerDeath) {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let first = register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        forge.edit(|s| s.conversation_comments = 2);
+        svc.poll_pr_monitors().await;
+        let before = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert!(
+            !before.pending_changes.is_empty(),
+            "a change is pending: {before:?}"
+        );
+
+        let refused = svc
+            .pr_monitor_start_op(&ws, &sibling, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(refused["refused"], json!(true), "live owner: {refused}");
+
+        kill_owner(&svc, &ws, &owner, how).await;
+        let registered_before = registered_event_data(&svc, &ws).await.len();
+
+        let adopted = svc
+            .pr_monitor_start_op(&ws, &sibling, 42, None)
+            .await
+            .expect("adoption is a success payload");
+        assert_eq!(adopted["ok"], json!(true), "{how:?}: {adopted}");
+        assert!(adopted.get("refused").is_none(), "{how:?}: {adopted}");
+        assert_eq!(
+            adopted["adoptedFrom"],
+            json!(owner.to_string()),
+            "{how:?}: {adopted}"
+        );
+        assert_eq!(
+            adopted["monitor"]["monitorId"],
+            json!(first.monitor_id),
+            "same row"
+        );
+        assert_eq!(adopted["monitor"]["agentId"], json!(sibling.to_string()));
+        assert_eq!(adopted["monitor"]["state"], json!("active"));
+        assert_eq!(adopted["requirements"]["state"], json!("open"), "{adopted}");
+
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(row.agent_id, sibling, "{how:?}: owner re-parented");
+        assert_eq!(row.state, PrMonitorState::Active);
+        assert!(row.pending_changes.is_empty(), "pending cleared: {row:?}");
+        assert_eq!(
+            row.baseline_snapshot, row.last_snapshot,
+            "baseline refreshed"
+        );
+        assert_ne!(
+            row.baseline_snapshot, first.baseline_snapshot,
+            "baseline moved"
+        );
+
+        let events = registered_event_data(&svc, &ws).await;
+        assert_eq!(events.len(), registered_before + 1, "one registered event");
+        let newest = events.first().unwrap();
+        assert_eq!(newest["agentId"], json!(sibling.to_string()), "{newest}");
+        assert_eq!(newest["adoptedFrom"], json!(owner.to_string()), "{newest}");
+        assert_eq!(newest["monitorId"], json!(first.monitor_id), "{newest}");
+
+        assert!(svc.pr_monitors_for_agent(&owner).await.unwrap().is_empty());
+        assert_eq!(svc.pr_monitors_for_agent(&sibling).await.unwrap().len(), 1);
+        let ws_view = svc.pr_monitor_list_op(&ws, None).await.expect("ws list");
+        let rows = ws_view["monitors"].as_array().expect("array");
+        assert_eq!(rows.len(), 1, "no second row: {ws_view}");
+        assert_eq!(rows[0]["agentId"], json!(sibling.to_string()));
+
+        // The new owner's own re-register is the ordinary idempotent re-arm.
+        let rearmed = svc
+            .pr_monitor_start_op(&ws, &sibling, 42, None)
+            .await
+            .expect("re-register");
+        assert_eq!(rearmed["ok"], json!(true), "{rearmed}");
+        assert!(rearmed.get("adoptedFrom").is_none(), "{rearmed}");
+        assert_eq!(rearmed["monitor"]["monitorId"], json!(first.monitor_id));
+        assert_eq!(svc.pr_monitors_for_agent(&sibling).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_monitor_owned_by_a_failed_agent_is_adopted() {
+        assert_orphan_adopted_after(OwnerDeath::Error).await;
+    }
+
+    #[tokio::test]
+    async fn a_monitor_owned_by_a_deleted_agent_is_adopted() {
+        assert_orphan_adopted_after(OwnerDeath::Deleted).await;
+    }
+
+    #[tokio::test]
+    async fn a_monitor_owned_by_a_retired_agent_is_adopted() {
+        assert_orphan_adopted_after(OwnerDeath::Retired).await;
+    }
+
+    /// Adoption counts against the adopter's own cap, and the direct-service
+    /// path adopts too (no `InvalidParams` for a dead owner).
+    #[tokio::test]
+    async fn adoption_honors_the_adopter_cap_and_the_service_path() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitors_max_per_agent(1);
+        let first = register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        svc.pr_monitor_register(&ws, &sibling, "o", "r", 7)
+            .await
+            .expect("sibling's own monitor");
+        kill_owner(&svc, &ws, &owner, OwnerDeath::Error).await;
+
+        let err = svc
+            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .await
+            .expect_err("at cap");
+        assert!(err.to_string().contains("max 1"), "{err}");
+        let still = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(still.agent_id, owner, "not adopted while at cap");
+
+        let third = second_agent(&svc, &ws, "agent-third").await;
+        let (adopted, _) = svc
+            .pr_monitor_register(&ws, &third, "o", "r", 42)
+            .await
+            .expect("service path adopts");
+        assert_eq!(adopted.monitor_id, first.monitor_id);
+        assert_eq!(adopted.agent_id, third);
     }
 
     /// Only ACTIVE monitors block: once the owner cancels (or the monitor
