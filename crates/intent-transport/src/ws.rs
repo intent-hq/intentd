@@ -2,9 +2,10 @@
 //!
 //! Ports `src/main/websocket-api-server.ts`: a TLS listener on
 //! `<bindAddress>:<port>` (default `127.0.0.1:5181`) serving a WebSocket endpoint
-//! at `/ws` and a plain `GET /health` → `{ "status":"ok", "clients":<n> }`.
-//! Bearer auth + the origin allow-list are enforced during the HTTP upgrade
-//! (401 bad token / 403 disabled or bad origin, socket destroyed). The accepted
+//! at `/ws` and a plain `GET /health` → `{ "status":"ok", "clients":<n>,
+//! "guestConnections":<n> }`. Bearer auth + the origin allow-list are
+//! enforced during the HTTP upgrade (401 bad token / 403 disabled or bad
+//! origin / 503 guest caps spent, socket destroyed). The accepted
 //! WebSocket reuses the SAME JSON-RPC router + event bus as the UDS listener
 //! (via [`crate::conn`]), so the wire result is transport-identical. Lifecycle
 //! hardening (single-flight start/stop, fail-fast bind, graceful shutdown)
@@ -78,6 +79,113 @@ pub(crate) const MAX_INVITE_MESSAGE_BYTES: usize = 16 * 1024;
 /// responses (its own `principal.revokeSelf` result) before the policy close.
 const REVOKE_FLUSH_GRACE: Duration = Duration::from_secs(5);
 
+/// Caps on WSS connections held by guests — connections admitted on a
+/// per-principal credential (`sharing.maxGuestConnections` /
+/// `sharing.maxConnectionsPerGuest`; `0` = unlimited). The primary
+/// credential (the legacy bearer token) is never counted. Sized at listener
+/// construction, so a settings change applies on daemon restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestConnectionLimits {
+    /// Listener-wide cap on concurrent guest connections.
+    pub max_guest_connections: u32,
+    /// Cap on concurrent connections one guest principal may hold.
+    pub max_connections_per_guest: u32,
+}
+
+impl Default for GuestConnectionLimits {
+    fn default() -> Self {
+        Self {
+            max_guest_connections: intent_core::config::DEFAULT_SHARING_MAX_GUEST_CONNECTIONS,
+            max_connections_per_guest:
+                intent_core::config::DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST,
+        }
+    }
+}
+
+/// Live guest-connection bookkeeping behind [`GuestConnectionLimits`]: the
+/// listener-wide total and the per-principal counts, checked and bumped
+/// under ONE lock so two racing upgrades cannot both take the last seat.
+#[derive(Debug, Default)]
+struct GuestCounts {
+    total: usize,
+    per_principal: HashMap<intent_core::PrincipalId, usize>,
+}
+
+/// Admission control for guest connections (see [`GuestConnectionLimits`]).
+/// [`admit`](Self::admit) is called at the upgrade gate before the `101`;
+/// the returned [`GuestAdmission`] rides with the connection task and gives
+/// both seats back on drop — on a clean exit, a remote close, a panic
+/// unwind, and when the heartbeat reaper aborts the task.
+#[derive(Debug)]
+pub(crate) struct GuestRegistry {
+    limits: GuestConnectionLimits,
+    counts: Mutex<GuestCounts>,
+}
+
+impl GuestRegistry {
+    pub(crate) fn new(limits: GuestConnectionLimits) -> Arc<Self> {
+        Arc::new(Self {
+            limits,
+            counts: Mutex::new(GuestCounts::default()),
+        })
+    }
+
+    /// Take a listener-wide seat and a per-principal seat for `principal`,
+    /// or `None` when either cap is spent (`0` = unlimited for that cap).
+    pub(crate) fn admit(
+        self: &Arc<Self>,
+        principal: &intent_core::PrincipalId,
+    ) -> Option<GuestAdmission> {
+        let mut counts = self.counts.lock().expect("guest counts poisoned");
+        let listener_cap = usize::try_from(self.limits.max_guest_connections).unwrap_or(usize::MAX);
+        let per_guest_cap =
+            usize::try_from(self.limits.max_connections_per_guest).unwrap_or(usize::MAX);
+        if listener_cap != 0 && counts.total >= listener_cap {
+            return None;
+        }
+        let held = counts.per_principal.get(principal).copied().unwrap_or(0);
+        if per_guest_cap != 0 && held >= per_guest_cap {
+            return None;
+        }
+        counts.total += 1;
+        counts.per_principal.insert(principal.clone(), held + 1);
+        Some(GuestAdmission {
+            registry: self.clone(),
+            principal: principal.clone(),
+        })
+    }
+
+    /// Guest connections currently admitted (the `/health` count).
+    pub(crate) fn connections(&self) -> usize {
+        self.counts.lock().expect("guest counts poisoned").total
+    }
+
+    fn release(&self, principal: &intent_core::PrincipalId) {
+        let mut counts = self.counts.lock().expect("guest counts poisoned");
+        counts.total = counts.total.saturating_sub(1);
+        if let Some(held) = counts.per_principal.get_mut(principal) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                counts.per_principal.remove(principal);
+            }
+        }
+    }
+}
+
+/// One admitted guest connection's seats; returned to the
+/// [`GuestRegistry`] on drop.
+#[derive(Debug)]
+pub(crate) struct GuestAdmission {
+    registry: Arc<GuestRegistry>,
+    principal: intent_core::PrincipalId,
+}
+
+impl Drop for GuestAdmission {
+    fn drop(&mut self) {
+        self.registry.release(&self.principal);
+    }
+}
+
 /// Tuning for a [`WsApiServer`]. [`Default`] mirrors the production posture:
 /// bind `127.0.0.1:5181` (loopback; `server.bindAddress` widens it
 /// deliberately), WS API enabled, bearer auth on (TCP), 30s/60s heartbeat.
@@ -109,6 +217,9 @@ pub struct WsOptions {
     /// `/tunnel` caps and timeouts; defaults are production values, tests
     /// shrink them to exercise idle/connect/forward timeout behavior.
     pub tunnel_limits: crate::tunnel::TunnelLimits,
+    /// Guest (per-principal credential) connection caps
+    /// (`sharing.maxGuestConnections` / `sharing.maxConnectionsPerGuest`).
+    pub guest_limits: GuestConnectionLimits,
     /// Test-only seam: when set, a closing connection's loop parks after it
     /// has left the reverse registry and before the rest of its cleanup runs,
     /// until the watched value becomes `true`. Lets a test hold that window
@@ -135,6 +246,7 @@ impl Default for WsOptions {
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
             rpc_limiter: RpcLimiter::unlimited(),
             tunnel_limits: crate::tunnel::TunnelLimits::default(),
+            guest_limits: GuestConnectionLimits::default(),
             cleanup_gate: None,
             heartbeat_gate: None,
         }
@@ -220,6 +332,9 @@ pub(crate) struct WsInner {
     /// ([`crate::invite::RedeemThrottle`]); shared by every `/invite`
     /// connection so a reconnect never resets it.
     pub redeem_throttle: crate::invite::SharedRedeemThrottle,
+    /// Guest connection admission ([`GuestConnectionLimits`]): seats are
+    /// taken before the `101` and travel with the connection task.
+    pub guests: Arc<GuestRegistry>,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -274,6 +389,7 @@ impl WsApiServer {
             heartbeat_gate: options.heartbeat_gate,
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             redeem_throttle: crate::invite::new_redeem_throttle(),
+            guests: GuestRegistry::new(options.guest_limits),
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -316,6 +432,7 @@ impl WsApiServer {
             heartbeat_gate: options.heartbeat_gate,
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             redeem_throttle: crate::invite::new_redeem_throttle(),
+            guests: GuestRegistry::new(options.guest_limits),
         };
         Self {
             inner: Arc::new(inner),
@@ -640,6 +757,21 @@ impl WsInner {
         if path == "/tunnel" && matches!(credential, ResolvedCredential::Principal(_)) {
             return reject(&mut stream, 403, "Forbidden").await;
         }
+        // Guest connection caps: a per-principal credential takes a
+        // listener-wide seat (`sharing.maxGuestConnections`) and one of its
+        // own (`sharing.maxConnectionsPerGuest`) here, before the `101`;
+        // both are refused with 503. The seats ride with the connection task
+        // so an aborted (heartbeat-reaped) task returns them like a clean
+        // exit does. The legacy token — the primary — is never counted.
+        let guest = match &credential {
+            ResolvedCredential::Principal(principal_id) => {
+                let Some(admission) = self.guests.admit(principal_id) else {
+                    return reject(&mut stream, 503, "Service Unavailable").await;
+                };
+                Some(admission)
+            }
+            ResolvedCredential::Legacy => None,
+        };
         let caller = credential.into_caller(self.api.as_ref()).await;
         let Some(key) = ws_key else {
             return reject(&mut stream, 400, "Bad Request").await;
@@ -691,7 +823,7 @@ impl WsInner {
         if path == "/tunnel" {
             self.spawn_tunnel_connection(ws);
         } else {
-            self.spawn_connection(ws, caller);
+            self.spawn_connection(ws, caller, guest);
         }
         Ok(())
     }
@@ -702,7 +834,9 @@ impl WsInner {
         W: AsyncWrite + Unpin,
     {
         let count = self.clients.lock().expect("ws clients poisoned").len();
-        let body = format!("{{\"status\":\"ok\",\"clients\":{count}}}");
+        let guests = self.guests.connections();
+        let body =
+            format!("{{\"status\":\"ok\",\"clients\":{count},\"guestConnections\":{guests}}}");
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -715,19 +849,29 @@ impl WsInner {
 
     /// Register a new client and spawn its connection loop. `caller` is the
     /// principal binding resolved at the upgrade gate, fixed for the life of
-    /// the connection.
-    fn spawn_connection<S>(self: &Arc<Self>, ws: WebSocketStream<S>, caller: Option<Caller>)
-    where
+    /// the connection; `guest` is the guest-cap admission a per-principal
+    /// credential took there, owned by the task's future so it is released
+    /// when the loop returns *and* when the reaper aborts the task.
+    fn spawn_connection<S>(
+        self: &Arc<Self>,
+        ws: WebSocketStream<S>,
+        caller: Option<Caller>,
+        guest: Option<GuestAdmission>,
+    ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
         let last_pong = Arc::new(AtomicI64::new(mono_ms()));
-        let handle =
-            tokio::spawn(
-                self.clone()
-                    .connection_loop(id, ws, cmd_rx, last_pong.clone(), caller),
-            );
+        let handle = tokio::spawn({
+            let this = self.clone();
+            let last_pong = last_pong.clone();
+            async move {
+                let _guest = guest;
+                this.connection_loop(id, ws, cmd_rx, last_pong, caller)
+                    .await;
+            }
+        });
         let abort = handle.abort_handle();
         self.clients.lock().expect("ws clients poisoned").insert(
             id,
@@ -1261,7 +1405,63 @@ pub(crate) fn mono_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{mono_ms, negotiate_extensions};
+    use super::{mono_ms, negotiate_extensions, GuestConnectionLimits, GuestRegistry};
+    use intent_core::PrincipalId;
+
+    fn limits(listener: u32, per_guest: u32) -> GuestConnectionLimits {
+        GuestConnectionLimits {
+            max_guest_connections: listener,
+            max_connections_per_guest: per_guest,
+        }
+    }
+
+    /// The listener-wide cap refuses any guest once spent, whoever holds the
+    /// seats, and a dropped admission gives its seat back.
+    #[test]
+    fn guest_registry_enforces_the_listener_wide_cap_and_releases_on_drop() {
+        let registry = GuestRegistry::new(limits(2, 0));
+        let (a, b) = (PrincipalId::new(), PrincipalId::new());
+        let first = registry.admit(&a).expect("first seat");
+        let second = registry.admit(&a).expect("second seat");
+        assert_eq!(registry.connections(), 2);
+        assert!(
+            registry.admit(&b).is_none(),
+            "listener full for a new guest"
+        );
+        drop(first);
+        assert_eq!(registry.connections(), 1);
+        let third = registry.admit(&b).expect("released seat admits again");
+        assert!(registry.admit(&a).is_none());
+        drop((second, third));
+        assert_eq!(registry.connections(), 0);
+    }
+
+    /// The per-guest cap is independent of the listener-wide one: one guest
+    /// at its own cap is refused while another guest is still admitted.
+    #[test]
+    fn guest_registry_enforces_the_per_guest_cap_independently() {
+        let registry = GuestRegistry::new(limits(0, 1));
+        let (a, b) = (PrincipalId::new(), PrincipalId::new());
+        let a1 = registry.admit(&a).expect("a's seat");
+        assert!(registry.admit(&a).is_none(), "a is at its cap");
+        let _b1 = registry.admit(&b).expect("b is unaffected");
+        drop(a1);
+        let _a2 = registry.admit(&a).expect("a's released seat admits again");
+        assert_eq!(registry.connections(), 2);
+    }
+
+    /// `0` means unlimited for either cap.
+    #[test]
+    fn guest_registry_zero_is_unlimited() {
+        let registry = GuestRegistry::new(limits(0, 0));
+        let a = PrincipalId::new();
+        let seats: Vec<_> = (0..100)
+            .map(|_| registry.admit(&a).expect("seat"))
+            .collect();
+        assert_eq!(registry.connections(), 100);
+        drop(seats);
+        assert_eq!(registry.connections(), 0);
+    }
 
     /// Tripwire for intent-hq/intent#3712: heartbeat bookkeeping must stay on
     /// the monotonic clock. A wall-clock regression would make `mono_ms()`

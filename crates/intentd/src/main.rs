@@ -2246,6 +2246,13 @@ async fn cmd_serve(
         );
     }
     ws_options.rpc_limiter = rpc_limiter.clone();
+    // Guest connection caps (`sharing.maxGuestConnections` /
+    // `sharing.maxConnectionsPerGuest`, 0 = unlimited): sized once here and
+    // carried by every listener the runtime toggle builds later.
+    ws_options.guest_limits = intent_transport::GuestConnectionLimits {
+        max_guest_connections: boot_settings.effective.sharing.max_guest_connections,
+        max_connections_per_guest: boot_settings.effective.sharing.max_connections_per_guest,
+    };
 
     // TLS + bearer auth: provision the cert (lazy; cert stays on disk) + build
     // the token store for auth layers (§5.2/§5.3). Always provision for runtime

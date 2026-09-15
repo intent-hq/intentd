@@ -1285,6 +1285,33 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(100_000.0),
             256.0,
         ),
+        number(
+            "sharing.maxGuestsPerWorkspace",
+            "Max guests per workspace",
+            "Guests one workspace admits besides its owner: open invites count at mint time, collaborators at join time; over-limit invites are refused with guest-limit and over-limit joins with workspace-full (0 closes every workspace to guests)",
+            "sharing",
+            Some(0.0),
+            Some(100.0),
+            10.0,
+        ),
+        number(
+            "sharing.maxGuestConnections",
+            "Max guest connections",
+            "Listener-wide cap on concurrent WSS connections held by guests; the owner's credential is never counted and over-limit upgrades are refused with 503 (0 = unlimited; changes apply on daemon restart)",
+            "sharing",
+            Some(0.0),
+            Some(100_000.0),
+            40.0,
+        ),
+        number(
+            "sharing.maxConnectionsPerGuest",
+            "Max connections per guest",
+            "Concurrent WSS connections one guest may hold; over-limit upgrades are refused with 503 (0 = unlimited; changes apply on daemon restart)",
+            "sharing",
+            Some(0.0),
+            Some(1_000.0),
+            4.0,
+        ),
         // --- Group B: source control ----------------------------------------
         enumerated(
             "sourceControl.activeProvider",

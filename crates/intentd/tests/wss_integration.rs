@@ -8970,6 +8970,122 @@ async fn health_reports_ok_and_client_count() {
     srv.ws.stop().await;
 }
 
+/// Guest connection caps at the `/ws` upgrade: with
+/// `maxConnectionsPerGuest = 1` a guest's second connection is `503` while
+/// another guest still connects; with `maxGuestConnections = 2` the third
+/// guest is `503` while the owner (legacy token, never counted) still
+/// connects; `/health` carries `guestConnections`; and a guest that
+/// disconnects gives its seat back so the refused guest is admitted.
+#[intent_test_macros::daemon_test]
+async fn wss_guest_connection_caps_refuse_503_and_release_on_disconnect() {
+    use intent_core::{Principal, PrincipalId};
+    use intent_transport::GuestConnectionLimits;
+
+    let srv = start(WsOptions {
+        guest_limits: GuestConnectionLimits {
+            max_guest_connections: 2,
+            max_connections_per_guest: 1,
+        },
+        ..WsOptions::default()
+    })
+    .await;
+
+    let tokens = [
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+    ];
+    for (n, token) in tokens.iter().enumerate() {
+        let guest = Principal {
+            id: PrincipalId::new(),
+            github_user_id: None,
+            login: Some(format!("guest-{n}")),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        srv.store.upsert_principal(&guest).await.expect("guest");
+        srv.store
+            .insert_principal_credential(&guest.id, &sha256_hex(token.as_bytes()))
+            .await
+            .expect("guest credential");
+    }
+
+    let (port, cfg) = (srv.port, srv.cfg.clone());
+    let health = || {
+        let cfg = cfg.clone();
+        async move {
+            https_request(
+                port,
+                cfg,
+                "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .await
+        }
+    };
+    let guest_upgrade = |token: &'static str| {
+        let cfg = cfg.clone();
+        async move {
+            let resp = https_request(port, cfg, &upgrade_req("/ws", None, Some(token))).await;
+            status_code(&resp)
+        }
+    };
+    let guest_connect = |token: &'static str| {
+        let cfg = cfg.clone();
+        async move {
+            let url = format!("wss://localhost:{port}/ws?token={token}");
+            common::wss_connect_with_retry(port, cfg, &url).await
+        }
+    };
+    let await_guest_connections = |want: &'static str| {
+        let health = &health;
+        async move {
+            for _ in 0..100 {
+                let resp = health().await;
+                if resp.contains(want) {
+                    return resp;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("guestConnections never reached {want}")
+        }
+    };
+
+    assert!(
+        health().await.contains("\"guestConnections\":0"),
+        "fresh listener"
+    );
+
+    // Guest A takes its one seat; its second upgrade is refused at the
+    // per-guest cap while guest B is still admitted.
+    let a = guest_connect(tokens[0]).await;
+    await_guest_connections("\"guestConnections\":1").await;
+    assert_eq!(guest_upgrade(tokens[0]).await, 503, "guest A over its cap");
+    let _b = guest_connect(tokens[1]).await;
+    await_guest_connections("\"guestConnections\":2").await;
+
+    // The listener-wide cap is spent: guest C is refused, the owner is not.
+    assert_eq!(guest_upgrade(tokens[2]).await, 503, "listener full");
+    let _owner = connect_ws(srv.port, srv.cfg.clone()).await;
+    let resp = health().await;
+    assert!(resp.contains("\"clients\":3"), "health body: {resp}");
+    assert!(
+        resp.contains("\"guestConnections\":2"),
+        "health body: {resp}"
+    );
+
+    // Guest A leaves; its seat admits guest C.
+    drop(a);
+    await_guest_connections("\"guestConnections\":1").await;
+    let _c = guest_connect(tokens[2]).await;
+    await_guest_connections("\"guestConnections\":2").await;
+    assert_eq!(guest_upgrade(tokens[0]).await, 503, "listener full again");
+
+    srv.ws.stop().await;
+}
+
 /// Open a pinned TLS stream to `addr:port` (the fixed-target variant of
 /// [`tls_connect`] for multi-bind tests).
 async fn tls_connect_to(
