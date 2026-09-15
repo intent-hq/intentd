@@ -210,11 +210,14 @@ struct ChatLifecycle {
 
 /// Per-connection record for one active subscription: the forwarder task (its
 /// `Drop` aborts delivery and releases the bus subscription), the optional
-/// `replaceGroup` it belongs to, and (chat only) its lifecycle identity.
+/// `replaceGroup` it belongs to, (chat only) its lifecycle identity, and
+/// whether it holds a `note.presence` viewer lease (released with the service
+/// layer by [`ConnSubs::remove`] before the removal is acknowledged).
 struct ConnSub {
     handle: JoinHandle<()>,
     replace_group: Option<String>,
     lifecycle: Option<ChatLifecycle>,
+    note_lease: bool,
 }
 
 impl Drop for ConnSub {
@@ -253,13 +256,47 @@ impl ConnSubs {
                 handle,
                 replace_group,
                 lifecycle,
+                note_lease: false,
+            },
+        );
+    }
+
+    /// Register a `note.presence` channel subscription whose forwarder holds
+    /// the viewer lease `id`.
+    fn insert_note_lease(
+        &mut self,
+        id: String,
+        handle: JoinHandle<()>,
+        replace_group: Option<String>,
+    ) {
+        self.subs.insert(
+            id,
+            ConnSub {
+                handle,
+                replace_group,
+                lifecycle: None,
+                note_lease: true,
             },
         );
     }
 
     /// Remove one subscription; `true` if it existed (TS `handleUnsubscribe`).
-    fn remove(&mut self, id: &str) -> bool {
-        self.subs.remove(id).is_some()
+    /// A `note.presence` lease is released with the service layer *before*
+    /// returning, so the connection's next frame (a pipelined
+    /// `note.presence.update`) can no longer find it: the forwarder's own
+    /// [`presence::NoteLease`] drop only schedules the same idempotent leave
+    /// and would otherwise race the unsubscribe acknowledgement.
+    async fn remove(&mut self, api: &Arc<dyn WorkspaceApi>, id: &str) -> bool {
+        let Some(sub) = self.subs.remove(id) else {
+            return false;
+        };
+        let note_lease = sub.note_lease;
+        drop(sub);
+        if note_lease {
+            api.note_presence_leave(self.presence.id().to_string(), id.to_string())
+                .await;
+        }
+        true
     }
 
     /// Whether a registered forwarder has exited on its own (`None` for an
@@ -269,8 +306,9 @@ impl ConnSubs {
         self.subs.get(id).map(|s| s.handle.is_finished())
     }
 
-    /// Drop every subscription sharing `group` (`replaceGroup` semantics).
-    fn remove_group(&mut self, group: &str) {
+    /// Drop every subscription sharing `group` (`replaceGroup` semantics),
+    /// releasing their `note.presence` leases like [`Self::remove`].
+    async fn remove_group(&mut self, api: &Arc<dyn WorkspaceApi>, group: &str) {
         let ids: Vec<String> = self
             .subs
             .iter()
@@ -278,7 +316,7 @@ impl ConnSubs {
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
-            self.subs.remove(&id);
+            self.remove(api, &id).await;
         }
     }
 }
@@ -863,7 +901,7 @@ pub(crate) async fn handle_fast_path(
                     replace_group,
                 } = p;
                 if let Some(group) = replace_group.as_deref() {
-                    subs.remove_group(group);
+                    subs.remove_group(api, group).await;
                 }
                 // Canonical WS bridge: each accepted event is delivered
                 // individually (no server-side coalescing, §6.6). A
@@ -926,7 +964,7 @@ pub(crate) async fn handle_fast_path(
         },
         FastPath::Unsubscribe { id, params } => match events::parse_unsubscribe_id(&params) {
             Ok(subscription_id) => {
-                let success = subs.remove(&subscription_id);
+                let success = subs.remove(api, &subscription_id).await;
                 if id.present {
                     let frame = events::success_frame(&id.echo, &json!({ "success": success }));
                     return out_tx.send_priority(frame).await.is_ok();
@@ -1099,7 +1137,7 @@ pub(crate) async fn handle_sub_fast_path(
                 // in the measured interval.
                 let timer = subscriptions::SnapshotTimer::start(Channel::Note, &workspace_id);
                 if let Some(group) = replace_group.as_deref() {
-                    subs.remove_group(group);
+                    subs.remove_group(api, group).await;
                 }
                 // Subscribe before the snapshot so a mutation racing the read is
                 // captured and re-emitted as a delta (idempotent over-delivery,
@@ -1166,7 +1204,7 @@ pub(crate) async fn handle_sub_fast_path(
                 let timer =
                     subscriptions::SnapshotTimer::start(Channel::NotePresence, &workspace_id);
                 if let Some(group) = replace_group.as_deref() {
-                    subs.remove_group(group);
+                    subs.remove_group(api, group).await;
                 }
                 // Subscribe before the join so the join's own `joined` (and
                 // any racing viewer) is delivered as a delta after the
@@ -1219,7 +1257,7 @@ pub(crate) async fn handle_sub_fast_path(
                     timer,
                     lease,
                 ));
-                subs.insert(subscription_id, handle, replace_group, None);
+                subs.insert_note_lease(subscription_id, handle, replace_group);
                 true
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -1249,7 +1287,7 @@ pub(crate) async fn handle_sub_fast_path(
                 // scan is included in the measured interval.
                 let timer = subscriptions::SnapshotTimer::start(Channel::Chat, &agent_id);
                 if let Some(group) = replace_group.as_deref() {
-                    subs.remove_group(group);
+                    subs.remove_group(api, group).await;
                 }
                 // The chat channel is per-agent, not workspace-scoped, so the
                 // bus filter carries no `workspaceId`; the forwarder narrows the
@@ -1342,7 +1380,7 @@ pub(crate) async fn handle_sub_fast_path(
                         workspace_id.as_deref().unwrap_or("global"),
                     );
                     if let Some(group) = replace_group.as_deref() {
-                        subs.remove_group(group);
+                        subs.remove_group(api, group).await;
                     }
                     let filter_ws = if subscriptions::channel_is_global(channel) {
                         None
@@ -1392,7 +1430,7 @@ pub(crate) async fn handle_sub_fast_path(
         }
         SubFastPath::Unsubscribe { id, params } => match events::parse_unsubscribe_id(&params) {
             Ok(subscription_id) => {
-                let success = subs.remove(&subscription_id);
+                let success = subs.remove(api, &subscription_id).await;
                 if id.present {
                     let frame = events::success_frame(&id.echo, &json!({ "success": success }));
                     return out_tx.send_priority(frame).await.is_ok();
