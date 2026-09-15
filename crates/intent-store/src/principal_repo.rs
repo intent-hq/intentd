@@ -251,7 +251,8 @@ impl Store {
     /// Add a principal to a workspace with `role`. Idempotent: an existing
     /// membership is left untouched (use
     /// [`Store::set_workspace_member_role`] to change its role). Returns
-    /// whether a row was inserted.
+    /// whether a row was inserted. `workspace.owner_principal_id` is
+    /// re-derived from the owner membership in the same transaction.
     ///
     /// # Errors
     ///
@@ -263,22 +264,36 @@ impl Store {
         principal_id: &PrincipalId,
         role: WorkspaceRole,
     ) -> Result<bool> {
-        let sql = format!(
-            "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
-             ON CONFLICT(workspace_id, principal_id) DO NOTHING"
-        );
-        let res = sqlx::query(&sql)
-            .bind(&workspace_id.0)
-            .bind(&principal_id.0)
-            .bind(role.as_str())
-            .bind(now_iso())
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("add workspace member failed: {e}")))?;
-        Ok(res.rows_affected() > 0)
+        let pool = self.write_pool();
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| Error::Internal(format!("add workspace member begin failed: {e}")))?;
+            let sql = format!(
+                "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
+                 ON CONFLICT(workspace_id, principal_id) DO NOTHING"
+            );
+            let res = sqlx::query(&sql)
+                .bind(&workspace_id.0)
+                .bind(&principal_id.0)
+                .bind(role.as_str())
+                .bind(now_iso())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("add workspace member failed: {e}")))?;
+            sync_workspace_owner(&mut tx, workspace_id).await?;
+            tx.commit()
+                .await
+                .map_err(|e| Error::Internal(format!("add workspace member commit failed: {e}")))?;
+            Ok(res.rows_affected() > 0)
+        })
+        .await
     }
 
-    /// Change an existing member's role.
+    /// Change an existing member's role. `workspace.owner_principal_id` is
+    /// re-derived from the owner membership in the same transaction, so
+    /// demoting the owner clears it and promoting a member sets it.
     ///
     /// # Errors
     ///
@@ -290,25 +305,37 @@ impl Store {
         principal_id: &PrincipalId,
         role: WorkspaceRole,
     ) -> Result<()> {
-        let res = sqlx::query(
-            "UPDATE workspace_member SET role = ? WHERE workspace_id = ? AND principal_id = ?",
-        )
-        .bind(role.as_str())
-        .bind(&workspace_id.0)
-        .bind(&principal_id.0)
-        .execute(self.write_pool())
+        let pool = self.write_pool();
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool.begin().await.map_err(|e| {
+                Error::Internal(format!("set workspace member role begin failed: {e}"))
+            })?;
+            let res = sqlx::query(
+                "UPDATE workspace_member SET role = ? WHERE workspace_id = ? AND principal_id = ?",
+            )
+            .bind(role.as_str())
+            .bind(&workspace_id.0)
+            .bind(&principal_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("set workspace member role failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!(
+                    "principal {principal_id} is not a member of workspace {workspace_id}"
+                )));
+            }
+            sync_workspace_owner(&mut tx, workspace_id).await?;
+            tx.commit().await.map_err(|e| {
+                Error::Internal(format!("set workspace member role commit failed: {e}"))
+            })?;
+            Ok(())
+        })
         .await
-        .map_err(|e| Error::Internal(format!("set workspace member role failed: {e}")))?;
-        if res.rows_affected() == 0 {
-            return Err(Error::NotFound(format!(
-                "principal {principal_id} is not a member of workspace {workspace_id}"
-            )));
-        }
-        Ok(())
     }
 
     /// Remove a principal from a workspace. Returns whether a row was
-    /// removed; removing a non-member is not an error.
+    /// removed; removing a non-member is not an error. Removing the owner
+    /// clears `workspace.owner_principal_id` in the same transaction.
     ///
     /// # Errors
     ///
@@ -318,14 +345,26 @@ impl Store {
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) -> Result<bool> {
-        let res =
-            sqlx::query("DELETE FROM workspace_member WHERE workspace_id = ? AND principal_id = ?")
-                .bind(&workspace_id.0)
-                .bind(&principal_id.0)
-                .execute(self.write_pool())
-                .await
-                .map_err(|e| Error::Internal(format!("remove workspace member failed: {e}")))?;
-        Ok(res.rows_affected() > 0)
+        let pool = self.write_pool();
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool.begin().await.map_err(|e| {
+                Error::Internal(format!("remove workspace member begin failed: {e}"))
+            })?;
+            let res = sqlx::query(
+                "DELETE FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
+            )
+            .bind(&workspace_id.0)
+            .bind(&principal_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("remove workspace member failed: {e}")))?;
+            sync_workspace_owner(&mut tx, workspace_id).await?;
+            tx.commit().await.map_err(|e| {
+                Error::Internal(format!("remove workspace member commit failed: {e}"))
+            })?;
+            Ok(res.rows_affected() > 0)
+        })
+        .await
     }
 
     /// Record a bearer credential for a principal, keyed by `token_hash`
@@ -466,6 +505,28 @@ impl Store {
         .map_err(|e| Error::Internal(format!("revoke principal credential failed: {e}")))?;
         Ok(res.rows_affected() > 0)
     }
+}
+
+/// Re-derive `workspace.owner_principal_id` from the `owner` membership row
+/// (the earliest-added one when several exist; `NULL` when there is none) so
+/// the column stays a faithful mirror of the membership table after every
+/// membership write. Runs inside the caller's write transaction.
+async fn sync_workspace_owner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workspace_id: &WorkspaceId,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE workspace SET owner_principal_id = (\
+            SELECT m.principal_id FROM workspace_member m \
+            WHERE m.workspace_id = workspace.id AND m.role = 'owner' \
+            ORDER BY m.added_at, m.principal_id LIMIT 1) \
+         WHERE id = ?",
+    )
+    .bind(&workspace_id.0)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| Error::Internal(format!("sync workspace owner failed: {e}")))?;
+    Ok(())
 }
 
 fn map_principal_row(r: &SqliteRow) -> Principal {
