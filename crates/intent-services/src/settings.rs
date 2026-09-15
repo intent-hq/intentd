@@ -1731,7 +1731,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         boolean(
             "updates.checkOnIdle",
             "Check for updates when idle",
-            "Request an update check from the desktop client once the daemon has been continuously idle",
+            "Ask the sitter (via SIGUSR2) to check for updates once the daemon has been continuously idle",
             "updates",
             true,
         ),

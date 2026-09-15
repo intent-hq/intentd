@@ -1041,8 +1041,8 @@ impl Default for PrMonitorSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct UpdatesSettings {
-    /// `updates.checkOnIdle` — request an update check from the desktop
-    /// client once the daemon has been continuously idle.
+    /// `updates.checkOnIdle` — ask the sitter (via `SIGUSR2`) to check for
+    /// updates once the daemon has been continuously idle.
     pub check_on_idle: bool,
     /// `updates.idleCheckIntervalMinutes` — minimum spacing (minutes) between
     /// two idle-triggered checks, also applied from process start.
@@ -1832,8 +1832,8 @@ pollSeconds = 30
 hourlyRequestBudget = 1500
 
 [updates]
-# Check for updates when idle -- request an update check from the desktop
-# client once the daemon has been continuously idle.
+# Check for updates when idle -- ask the sitter (via SIGUSR2) to check for
+# updates once the daemon has been continuously idle.
 checkOnIdle = true
 # Idle check interval minutes -- minimum spacing (in minutes) between two
 # idle-triggered update checks, also applied from process start (minimum 5).

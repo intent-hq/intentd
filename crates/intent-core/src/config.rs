@@ -170,9 +170,9 @@ pub const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;
 /// are clamped up at read time.
 pub const MIN_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 10;
 
-/// Default for `updates.checkOnIdle` — whether the daemon requests an update
-/// check from the desktop client once it has been continuously idle; on by
-/// default.
+/// Default for `updates.checkOnIdle` — whether the daemon asks the sitter
+/// (via `SIGUSR2`) to check for updates once it has been continuously idle;
+/// on by default.
 pub const DEFAULT_UPDATES_CHECK_ON_IDLE: bool = true;
 
 /// Default for `updates.idleCheckIntervalMinutes` — minimum spacing (in
@@ -181,7 +181,7 @@ pub const DEFAULT_UPDATES_CHECK_ON_IDLE: bool = true;
 pub const DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES: u32 = 60;
 
 /// Floor for `updates.idleCheckIntervalMinutes` — a tighter interval would
-/// re-request checks the client already answered. Sub-minimum values
+/// re-request checks the sitter already answered. Sub-minimum values
 /// (notably `0`) are clamped up at read time.
 pub const MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES: u32 = 5;
 
