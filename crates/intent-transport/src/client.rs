@@ -6,6 +6,11 @@
 //! `host.status` probe (§5.14). So, like the `system.*`/`host.status`/`forward.*`
 //! fast-paths, every listener intercepts it before the JSON-RPC dispatcher and
 //! threads the resolved id through the per-connection `client_id` binding.
+//!
+//! The presented `clientId` is a self-assigned handle, never an identity: on a
+//! non-administrator connection it is namespaced by the bound principal
+//! ([`scope_to_caller`]) so one member can never act as another member's
+//! client (multiplayer w3).
 
 use intent_core::{ClientHostInfo, ClientId, WorkspaceApi};
 use serde_json::{json, Value};
@@ -119,14 +124,42 @@ pub(crate) struct HelloOutcome {
     pub bound: Option<ReverseClientIdentity>,
 }
 
-/// Handle a classified `client.hello`: resolve (or mint) the `clientId`, persist
-/// the logical `client` row, set the connection's `client_id` binding, and reply
-/// with `{ clientId, protocolVersion, server }`. The top-level `protocolVersion`
-/// is an explicit copy of `server.protocolVersion` so clients can version-check
-/// without digging into the `server` block. A non-string `clientId` is `-32602`;
-/// a persistence failure is `-32603`. Idempotent: re-sending updates name /
-/// capabilities / host identification and re-returns the same `server` block
-/// (PROTOCOL §5.17).
+/// Namespace a `clientId` by the caller's principal when the request is bound
+/// to a non-administrator principal (multiplayer w3): `{principalId}:{raw}`.
+///
+/// A collaborator can only ever act as a client id inside its own namespace,
+/// so re-presenting an id learned from another member's `draft:changed` event
+/// never reaches that member's draft or presence. Idempotent: an id already
+/// carrying the caller's prefix is kept as is, so a client that persists the
+/// id returned by `client.hello` re-hellos to the same identity. The
+/// administrator, agents, the daemon, and unbound requests keep the raw id.
+pub(crate) fn scope_to_caller(raw: ClientId) -> ClientId {
+    let Some(caller) = crate::context::current_caller() else {
+        return raw;
+    };
+    if caller.is_administrator() {
+        return raw;
+    }
+    let Some(principal) = caller.principal_id() else {
+        return raw;
+    };
+    let prefix = format!("{}:", principal.as_str());
+    if raw.as_str().starts_with(&prefix) {
+        return raw;
+    }
+    ClientId::from_string(format!("{prefix}{}", raw.as_str()))
+}
+
+/// Handle a classified `client.hello`: resolve (or mint) the `clientId`, scope
+/// it to the caller ([`scope_to_caller`]), persist the logical `client` row,
+/// set the connection's `client_id` binding, and reply with
+/// `{ clientId, protocolVersion, server }` — `clientId` being the scoped id the
+/// client should persist. The top-level `protocolVersion` is an explicit copy
+/// of `server.protocolVersion` so clients can version-check without digging
+/// into the `server` block. A non-string `clientId` is `-32602`; a persistence
+/// failure is `-32603`. Idempotent: re-sending updates name / capabilities /
+/// host identification and re-returns the same `server` block (PROTOCOL
+/// §5.17).
 pub(crate) async fn handle(
     req: ClientRequest,
     api: &dyn WorkspaceApi,
@@ -143,7 +176,7 @@ pub(crate) async fn handle(
             bound: None,
         };
     }
-    let resolved = req.client_id.map(ClientId::from_string).unwrap_or_default();
+    let resolved = scope_to_caller(req.client_id.map(ClientId::from_string).unwrap_or_default());
     if let Err(e) = api
         .upsert_client(
             resolved.clone(),
