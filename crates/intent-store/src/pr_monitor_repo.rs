@@ -567,6 +567,38 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Terminalize an ACTIVE monitor: `completed` plus the cleared pending
+    /// state in ONE statement, guarded like [`Store::update_pr_monitor_poll`]
+    /// on `expected_updated_at`. A single write means no window in which a
+    /// concurrent re-parent (adoption, intent-hq/intent#5079) can land
+    /// between the poll write-back and the state flip and have its row
+    /// completed under it while the final wake goes to the previous owner.
+    /// Returns `false` when the guard fails (the row moved or is already
+    /// terminal) so the caller skips the wake.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn complete_pr_monitor(
+        &self,
+        monitor_id: &PrMonitorId,
+        updated_at: &str,
+        expected_updated_at: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE pr_monitor SET state = 'completed', pending_changes = NULL, \
+             pending_since = NULL, last_change_at = NULL, updated_at = ? \
+             WHERE monitor_id = ? AND state = 'active' AND updated_at = ?",
+        )
+        .bind(updated_at)
+        .bind(&monitor_id.0)
+        .bind(expected_updated_at)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| intent_core::Error::Internal(format!("complete pr monitor failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// Write back everything one poll can change: the last-poll snapshot, the
     /// emit-baseline snapshot, the pending changes and their debounce anchors,
     /// the poll timestamp, and the last forge error. One statement so a reader
@@ -1150,6 +1182,52 @@ mod tests {
                 .expect("new owner lookup")
                 .map(|m| m.monitor_id),
             Some(m.monitor_id.clone())
+        );
+    }
+
+    /// `complete_pr_monitor` flips `completed` and clears the pending state
+    /// in one guarded write: a stale `expected_updated_at` (the row moved —
+    /// e.g. an adoption re-parented it) leaves the row active and untouched,
+    /// and the successful write is not repeatable.
+    #[tokio::test]
+    async fn complete_pr_monitor_is_one_guarded_write() {
+        let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
+        let ts = now_iso();
+        let mut m = test_monitor(&ws_id, &agent_id, &ts);
+        m.pending_changes = vec!["checks: 1 failing".to_string()];
+        m.pending_since = Some(ts.clone());
+        m.last_change_at = Some(ts.clone());
+        assert!(store.insert_pr_monitor(&m).await.expect("insert"));
+
+        let now = now_iso();
+        assert!(
+            !store
+                .complete_pr_monitor(&m.monitor_id, &now, "1970-01-01T00:00:00Z")
+                .await
+                .expect("stale complete"),
+            "a stale expected_updated_at must not complete"
+        );
+        let untouched = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+        assert_eq!(untouched.state, PrMonitorState::Active);
+        assert_eq!(untouched.pending_changes, vec!["checks: 1 failing"]);
+
+        assert!(store
+            .complete_pr_monitor(&m.monitor_id, &now, &m.updated_at)
+            .await
+            .expect("complete"));
+        let read = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+        assert_eq!(read.state, PrMonitorState::Completed);
+        assert!(read.pending_changes.is_empty());
+        assert!(read.pending_since.is_none());
+        assert!(read.last_change_at.is_none());
+        assert_eq!(read.updated_at, now);
+        assert_eq!(read.last_snapshot, m.last_snapshot, "snapshots untouched");
+        assert!(
+            !store
+                .complete_pr_monitor(&m.monitor_id, &now_iso(), &now)
+                .await
+                .expect("repeat complete"),
+            "a terminal row is never completed twice"
         );
     }
 

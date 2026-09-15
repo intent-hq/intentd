@@ -1171,6 +1171,11 @@ impl Services {
         if !updated {
             return Ok(None);
         }
+        // A restart catch-up marker ([`Services::rehydrate_pr_monitors`])
+        // belongs to the dead owner's pre-restart backlog, which the fresh
+        // baseline just discarded; consume it so the adopter's first change
+        // is debounced like any other, not fired immediately.
+        self.consume_pr_monitor_catch_up(&m.monitor_id);
         tracing::info!(
             monitor = %m.monitor_id,
             from = %m.agent_id.0,
@@ -2066,8 +2071,9 @@ impl Services {
     /// last report" section coalesces the same way as a change wake —
     /// `diff(baseline, final)` — so the journey to terminal never replays
     /// intermediate transitions. Returns whether the final wake was
-    /// delivered — `false` when a lost guarded write (a concurrent
-    /// flush/cancel/re-register moved the row) skipped it.
+    /// delivered — `false` when the lost guarded write (a concurrent
+    /// flush/cancel/re-register/adoption moved the row, or a cancel already
+    /// terminalized it and delivered its own notice) skipped it.
     async fn complete_pr_monitor(
         &self,
         monitor: &PrMonitor,
@@ -2083,32 +2089,20 @@ impl Services {
             );
         let message = render_terminal_wake(monitor, &changes, snapshot);
         let now = now_iso();
+        // ONE guarded write for the state flip and the pending clear: the
+        // final wake below goes to `monitor.agent_id`, so the image it was
+        // rendered from must still be the row's owner when `completed`
+        // lands — a two-statement terminalization left a window in which
+        // an adoption (intent-hq/intent#5079) could re-parent the row
+        // between them and have its only completion wake delivered to the
+        // dead previous owner.
         if !self
             .store
-            .update_pr_monitor_poll(
-                &monitor.monitor_id,
-                PrMonitorPollUpdate {
-                    last_snapshot: monitor.last_snapshot.as_deref(),
-                    baseline_snapshot: monitor.baseline_snapshot.as_deref(),
-                    pending_changes: &[],
-                    last_polled_at: monitor.last_polled_at.as_deref(),
-                    updated_at: &now,
-                    expected_updated_at: &monitor.updated_at,
-                    ..Default::default()
-                },
-            )
+            .complete_pr_monitor(&monitor.monitor_id, &now, &monitor.updated_at)
             .await?
         {
-            // The row moved under us (concurrent flush/cancel/re-register);
-            // skip the wake — the next tick re-detects the terminal state.
-            return Ok(false);
-        }
-        if !self
-            .store
-            .update_pr_monitor_state(&monitor.monitor_id, PrMonitorState::Completed, &now)
-            .await?
-        {
-            // A concurrent cancel won; it already delivered its own notice.
+            // The row moved under us; skip the wake — the next tick
+            // re-detects the terminal state under the row's current owner.
             return Ok(false);
         }
         let mut completed = monitor.clone();
@@ -4262,6 +4256,127 @@ mod tests {
             .expect("service path adopts");
         assert_eq!(adopted.monitor_id, first.monitor_id);
         assert_eq!(adopted.agent_id, third);
+    }
+
+    /// Terminalization is ONE guarded write (`Store::complete_pr_monitor`,
+    /// whose guard has its own store test): a sweep holding the dead
+    /// owner's pre-adoption image cannot complete the row an adoption
+    /// re-parented (its final wake would go to the dead owner). The stale
+    /// image's completion is a no-op — row still active under the adopter,
+    /// no `prMonitor:completed`, nobody woken — and the next real poll
+    /// completes the monitor under the adopter, waking the adopter.
+    #[tokio::test]
+    async fn a_stale_sweep_image_cannot_complete_an_adopted_monitor() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let first = register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        // The sweep's image: the row as the poll loop read it.
+        let stale = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+
+        kill_owner(&svc, &ws, &owner, OwnerDeath::Error).await;
+        let (adopted, _) = svc
+            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .await
+            .expect("adopt");
+        assert_eq!(adopted.agent_id, sibling);
+        assert_ne!(adopted.updated_at, stale.updated_at, "the row moved");
+
+        let merged = snapshot(|s| s.requirements.state = "merged".into());
+        assert!(
+            !svc.complete_pr_monitor(&stale, &merged)
+                .await
+                .expect("stale complete"),
+            "the stale image loses the guarded write"
+        );
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(row.state, PrMonitorState::Active, "not completed: {row:?}");
+        assert_eq!(row.agent_id, sibling, "still the adopter's");
+        assert!(
+            !owner_messages(&svc, &owner)
+                .await
+                .contains("[PR monitor o/r#42]"),
+            "the dead owner is never woken"
+        );
+        assert!(
+            !owner_messages(&svc, &sibling)
+                .await
+                .contains("[PR monitor o/r#42]"),
+            "no wake without a completion"
+        );
+        let completed_events = svc
+            .store()
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![PR_MONITOR_COMPLETED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(completed_events.is_empty(), "{completed_events:?}");
+
+        // The next real sweep completes it under the adopter.
+        forge.edit(|s| s.pr_state = PrState::Merged);
+        svc.poll_pr_monitors().await;
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(row.state, PrMonitorState::Completed);
+        assert_eq!(row.agent_id, sibling);
+        assert!(
+            owner_messages(&svc, &sibling)
+                .await
+                .contains("[PR monitor o/r#42]"),
+            "the adopter gets the final wake"
+        );
+        assert!(!owner_messages(&svc, &owner)
+            .await
+            .contains("[PR monitor o/r#42]"));
+    }
+
+    /// Adoption consumes the boot-rehydration catch-up marker: the marker
+    /// belongs to the dead owner's pre-restart backlog, which the adoption's
+    /// fresh baseline discards, so the adopter's first change is debounced
+    /// like any other instead of firing on the next poll.
+    #[tokio::test]
+    async fn adoption_consumes_the_restart_catch_up_marker() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let first = register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        kill_owner(&svc, &ws, &owner, OwnerDeath::Error).await;
+
+        // A restart: the failed owner's monitor is rehydrated (not swept —
+        // only deleted/retired/gone owners are) and marked for catch-up.
+        assert_eq!(svc.rehydrate_pr_monitors().await.expect("rehydrate"), 1);
+        assert!(
+            svc.pr_monitor_catch_up
+                .lock()
+                .unwrap()
+                .contains_key(&first.monitor_id),
+            "marked for catch-up"
+        );
+
+        let (adopted, _) = svc
+            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .await
+            .expect("adopt");
+        assert_eq!(adopted.agent_id, sibling);
+        assert!(
+            !svc.pr_monitor_catch_up
+                .lock()
+                .unwrap()
+                .contains_key(&first.monitor_id),
+            "adoption consumed the marker"
+        );
+
+        // The adopter's first change holds for the debounce window.
+        forge.edit(|s| s.conversation_comments = 2);
+        svc.poll_pr_monitors().await;
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert!(!row.pending_changes.is_empty(), "pending: {row:?}");
+        assert!(
+            !owner_messages(&svc, &sibling)
+                .await
+                .contains("[PR monitor o/r#42]"),
+            "debounced, not fired as catch-up"
+        );
     }
 
     /// Only ACTIVE monitors block: once the owner cancels (or the monitor
