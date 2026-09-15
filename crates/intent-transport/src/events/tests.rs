@@ -580,7 +580,10 @@ mod collaborator_fan_out {
 /// Test code is excluded by construction: files named `tests.rs`, modules
 /// declared as `#[cfg(test)] mod name;` (their file / directory), and every
 /// `#[cfg(test)]` item (attribute through the `;` or the `}` closing its
-/// body). Comments and char literals never count.
+/// body). Comments and char literals never count, and a literal is judged
+/// by its runtime value: escape sequences (`\x6e`, `\u{..}`, `\n`, a `\`
+/// line continuation) are decoded before the shape check, so an obfuscated
+/// spelling cannot slip past as "not an event".
 mod emit_path_taxonomy {
     use std::collections::HashSet;
     use std::fs;
@@ -740,11 +743,53 @@ mod emit_path_taxonomy {
                 let mut text = String::new();
                 while i < len && chars[i] != '"' {
                     if chars[i] == '\\' {
-                        text.push(chars[i]);
                         i += 1;
-                        if i >= len {
+                        let Some(&esc) = chars.get(i) else {
                             break;
+                        };
+                        i += 1;
+                        match esc {
+                            'n' => text.push('\n'),
+                            'r' => text.push('\r'),
+                            't' => text.push('\t'),
+                            '0' => text.push('\0'),
+                            '\\' | '"' | '\'' => text.push(esc),
+                            'x' => {
+                                let hex: String = chars[i..len.min(i + 2)].iter().collect();
+                                i += hex.len();
+                                text.extend(
+                                    u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32),
+                                );
+                            }
+                            'u' if chars.get(i) == Some(&'{') => {
+                                let mut hex = String::new();
+                                i += 1;
+                                while i < len && chars[i] != '}' {
+                                    if chars[i] != '_' {
+                                        hex.push(chars[i]);
+                                    }
+                                    i += 1;
+                                }
+                                i += 1;
+                                text.extend(
+                                    u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32),
+                                );
+                            }
+                            '\n' => {
+                                line += 1;
+                                while i < len && chars[i].is_whitespace() {
+                                    if chars[i] == '\n' {
+                                        line += 1;
+                                    }
+                                    i += 1;
+                                }
+                            }
+                            other => {
+                                text.push('\\');
+                                text.push(other);
+                            }
                         }
+                        continue;
                     }
                     if chars[i] == '\n' {
                         line += 1;
@@ -973,19 +1018,39 @@ mod emit_path_taxonomy {
         }
     }
 
+    /// `Some(rest)` when `line` declares a `const` at any visibility
+    /// (`const`, `pub const`, `pub(crate) const`, `pub(in path) const`),
+    /// with `rest` starting at the constant's name.
+    fn const_decl(line: &str) -> Option<&str> {
+        let line = line.trim_start();
+        let after_vis = match line.strip_prefix("pub") {
+            Some(rest) => {
+                let rest = rest.trim_start();
+                match rest.strip_prefix('(') {
+                    Some(scoped) => scoped.split_once(')')?.1,
+                    None => rest,
+                }
+            }
+            None => line,
+        };
+        after_vis.trim_start().strip_prefix("const ")
+    }
+
     /// Most emit paths name their type through an `intent_core::events`
     /// constant rather than a literal, so the constant table is the other
-    /// half of the emit surface: every event-shaped `pub const … : &str`
-    /// in `intent-core/src/events.rs` must be a taxonomy member too (the
-    /// `*_PREFIX` constants end in `:` and are not event-shaped).
+    /// half of the emit surface: every event-shaped `const … : &str` in
+    /// `intent-core/src/events.rs` — at any visibility, `pub(crate)`
+    /// included — must be a taxonomy member too (the `*_PREFIX` constants
+    /// end in `:` and are not event-shaped).
     #[test]
     fn every_event_constant_is_in_the_taxonomy() {
         let path = crate_src("intent-core").join("events.rs");
         let src =
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let mut constants = Vec::new();
+        let mut crate_visible = 0;
         for (idx, line) in src.lines().enumerate() {
-            let Some(rest) = line.trim_start().strip_prefix("pub const ") else {
+            let Some(rest) = const_decl(line) else {
                 continue;
             };
             let Some((_, value)) = rest.split_once(": &str = \"") else {
@@ -995,6 +1060,9 @@ mod emit_path_taxonomy {
                 continue;
             };
             if emit_shaped(lit) {
+                if line.trim_start().starts_with("pub(") {
+                    crate_visible += 1;
+                }
                 constants.push((idx + 1, lit.to_string()));
             }
         }
@@ -1002,6 +1070,24 @@ mod emit_path_taxonomy {
             constants.len() > 50,
             "expected the constant table, got {constants:?}"
         );
+        assert!(
+            crate_visible > 0,
+            "the scan no longer reaches the `pub(crate)` constants: {constants:?}"
+        );
+        assert_eq!(
+            const_decl("pub(crate) const X: &str = \"a:b\";"),
+            Some("X: &str = \"a:b\";")
+        );
+        assert_eq!(
+            const_decl("pub(in crate::x) const X: &str = \"a:b\";"),
+            Some("X: &str = \"a:b\";")
+        );
+        assert_eq!(
+            const_decl("    const X: &str = \"a:b\";"),
+            Some("X: &str = \"a:b\";")
+        );
+        assert_eq!(const_decl("pub static X: &str = \"a:b\";"), None);
+        assert_eq!(const_decl("// pub const X: &str = \"a:b\";"), None);
         let missing: Vec<String> = constants
             .iter()
             .filter(|(_, lit)| !is_known_event_type(lit))
@@ -1033,10 +1119,15 @@ mod emit_path_taxonomy {
                 bus.publish(Event { event_type: "note:new_event".to_string() });
                 bus.publish("Note:Updated");
                 bus.publish("AGENT:IDLE");
+                bus.publish("\x6eote:updated");
+                bus.publish("agent:\u{69}dle-escaped");
+                bus.publish("task:\
+                             continued");
                 let _ = (
                     '"', "not an event", "a:", ":b", "x:{y}", "note:",
                     "HEAD:.gitmodules", "127.0.0.1:0", "_ns:name", "note:-x",
-                    "note:up dated", "http://x", "a::b",
+                    "note:up dated", "http://x", "a::b", "note:\"quoted",
+                    "note:tab\there", "\\note:escaped-backslash",
                 );
             }
             #[cfg(test)]
@@ -1065,6 +1156,9 @@ mod emit_path_taxonomy {
                 "note:new_event",
                 "Note:Updated",
                 "AGENT:IDLE",
+                "note:updated",
+                "agent:idle-escaped",
+                "task:continued",
                 "agent:idle"
             ]
         );
@@ -1075,9 +1169,26 @@ mod emit_path_taxonomy {
                 "brandnew:emitted",
                 "note:new_event",
                 "Note:Updated",
-                "AGENT:IDLE"
+                "AGENT:IDLE",
+                "agent:idle-escaped",
+                "task:continued"
             ]
         );
+        // Escapes are decoded to the runtime value, never left as source
+        // text (which would hide `\x6eote:…` behind the shape check).
+        assert!(
+            scanned
+                .literals
+                .iter()
+                .all(|(_, l)| !l.contains("\\x") && !l.contains("\\u{")),
+            "{:?}",
+            scanned.literals
+        );
+        assert!(scanned.literals.iter().any(|(_, l)| l == "note:\"quoted"));
+        assert!(scanned
+            .literals
+            .iter()
+            .any(|(_, l)| l == "\\note:escaped-backslash"));
         assert_eq!(scanned.test_only_mods, vec!["tests".to_string()]);
         assert!(unclassified(["note:updated", "agent:idle"]).is_empty());
 

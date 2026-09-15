@@ -4049,7 +4049,9 @@ impl Guest {
     }
 
     /// One JSON-RPC round-trip on the guest connection (pushes and pings
-    /// interleaved on the same socket are skipped).
+    /// interleaved on the same socket are skipped). The reply is checked
+    /// against the JSON-RPC 2.0 response envelope before it is returned:
+    /// `jsonrpc: "2.0"`, exactly one of `result` / `error`, no `method`.
     async fn call(&mut self, method: &str, params: Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
@@ -4065,6 +4067,12 @@ impl Guest {
                     Some(Ok(Message::Text(text))) => {
                         let v: Value = serde_json::from_str(&text).expect("json");
                         if v["id"] == id {
+                            assert_eq!(v["jsonrpc"], "2.0", "{method} envelope: {v}");
+                            assert!(v.get("method").is_none(), "{method} envelope: {v}");
+                            assert!(
+                                v.get("result").is_some() != v.get("error").is_some(),
+                                "{method} envelope: exactly one of result/error: {v}"
+                            );
                             return v;
                         }
                     }
@@ -4209,18 +4217,24 @@ async fn wss_collaborator_git_push_succeeds_against_bare_remote() {
 }
 
 /// Multiplayer w3 (decided: an agent steered by a collaborator acts with the
-/// owner's capabilities). Over WSS the collaborator's `host.exec` is refused
-/// before dispatch (`-32003`), yet its `agent.sendMessage` steer of the
-/// workspace's agent succeeds and is stamped with the collaborator; the same
-/// agent's `ws.host.exec` binding — the intent-acp `workspace_api` front
-/// door bound to the agent as caller, against the same services the WSS
-/// listener serves — then runs a real process in the workspace checkout and
-/// returns its stdout. The bridge is driven inside the collaborator's own
-/// `Caller::Wire` scope, so the pass is owed to the binding rebinding
-/// `Caller::Agent` (a bridge with no caller agent inherits the scope and is
-/// refused), not to the gate's unbound-caller permit. The service seam
-/// agrees: `Caller::Agent` passes `host_exec`, a collaborator wire caller is
-/// `Forbidden`.
+/// owner's capabilities) — the binding seam. Over WSS the collaborator's
+/// `host.exec` is refused before dispatch (`-32003`), yet its
+/// `agent.sendMessage` steer of the workspace's agent succeeds and is
+/// stamped with the collaborator; the same agent's `ws.host.exec` binding —
+/// the intent-acp `workspace_api` front door bound to the agent as caller,
+/// against the same services the WSS listener serves — then runs a real
+/// process in the workspace checkout and returns its stdout. The bridge is
+/// driven inside the collaborator's own `Caller::Wire` scope, so the pass
+/// is owed to the binding rebinding `Caller::Agent` (a bridge with no
+/// caller agent inherits the scope and is refused), not to the gate's
+/// unbound-caller permit. The service seam agrees: `Caller::Agent` passes
+/// `host_exec`, a collaborator wire caller is `Forbidden`.
+///
+/// This harness has no `AgentManager`, so the bridge is constructed here;
+/// the same steer driven through the real runtime — the daemon binding the
+/// bridge to the agent and executing the collaborator's turn — is
+/// `collaborator_steer_runs_host_exec_through_bound_bridge_over_wss` in
+/// `e2e_wss_agent_lifecycle.rs`.
 #[tokio::test]
 async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities() {
     use intent_acp::WorkspaceMcpServer;
@@ -4410,7 +4424,7 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
 #[tokio::test]
 async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     use intent_core::events::AGENT_QUEUE_UPDATED;
-    use intent_core::{lift_from_principal_id, AgentId, WorkspaceRole};
+    use intent_core::{lift_from_principal_id, AgentId, PrincipalId, WorkspaceRole};
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
@@ -4624,12 +4638,25 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
         .iter()
         .find(|q| q["content"] == "from staying")
         .expect("staying entry");
-    assert_eq!(staying_entry["author"]["login"], "guest", "{after}");
+    // Both guests share the `guest` login, so the resolved author is pinned
+    // by principal id: the staying member's, not the removed one's.
+    assert_eq!(
+        staying_entry["author"],
+        json!({
+            "principalId": staying.principal.id.0,
+            "login": "guest",
+            "displayName": "Guest User",
+            "avatarUrl": null,
+        }),
+        "{after}"
+    );
 
     // Durable side: the persisted snapshot (what a later drain or a restart
-    // redrives) carries no entry stamped with the removed member.
+    // redrives) mirrors the surviving queue entry for entry — same ids,
+    // same order, same content and stamp — and carries nothing stamped with
+    // the removed member.
     let agent_typed = AgentId::from_string(agent_id.clone());
-    let persisted: Vec<_> = srv
+    let mut persisted: Vec<_> = srv
         .store
         .load_all_agent_queues()
         .await
@@ -4637,12 +4664,36 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
         .into_iter()
         .filter(|row| row.agent_id == agent_typed)
         .collect();
-    assert_eq!(persisted.len(), 2, "{persisted:?}");
+    persisted.sort_by_key(|row| row.position);
+    let persisted_view: Vec<(String, Value, Option<PrincipalId>)> = persisted
+        .iter()
+        .map(|row| {
+            assert_eq!(row.payload["id"], row.id, "{row:?}");
+            (
+                row.id.clone(),
+                row.payload["content"].clone(),
+                lift_from_principal_id(row.payload.get("messageMetadata")),
+            )
+        })
+        .collect();
+    let live_view: Vec<(String, Value, Option<PrincipalId>)> = queue
+        .iter()
+        .map(|q| {
+            (
+                q["id"].as_str().expect("entry id").to_string(),
+                q["content"].clone(),
+                lift_from_principal_id(q.get("messageMetadata")),
+            )
+        })
+        .collect();
+    assert_eq!(
+        persisted_view, live_view,
+        "persisted snapshot must mirror the surviving queue: {persisted:?}"
+    );
     assert!(
-        persisted.iter().all(|row| {
-            lift_from_principal_id(row.payload.get("messageMetadata")).as_ref()
-                != Some(&leaving.principal.id)
-        }),
+        persisted_view
+            .iter()
+            .all(|(_, _, stamp)| stamp.as_ref() != Some(&leaving.principal.id)),
         "persisted snapshot must not redrive the removed member's entry: {persisted:?}"
     );
 
