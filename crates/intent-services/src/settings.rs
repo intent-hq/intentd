@@ -1297,7 +1297,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "sharing.maxGuestConnections",
             "Max guest connections",
-            "Listener-wide cap on concurrent WSS connections held by guests; the owner's credential is never counted and over-limit upgrades are refused with 503 (0 = unlimited; changes apply on daemon restart)",
+            "Listener-wide cap on concurrent WSS connections held by guests; the owner's credential is never counted and over-limit upgrades are refused with 503 (0 = unlimited; applies live to new connections, never disconnects admitted guests)",
             "sharing",
             Some(0.0),
             Some(100_000.0),
@@ -1306,7 +1306,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "sharing.maxConnectionsPerGuest",
             "Max connections per guest",
-            "Concurrent WSS connections one guest may hold; over-limit upgrades are refused with 503 (0 = unlimited; changes apply on daemon restart)",
+            "Concurrent WSS connections one guest may hold; over-limit upgrades are refused with 503 (0 = unlimited; applies live to new connections, never disconnects admitted guests)",
             "sharing",
             Some(0.0),
             Some(1_000.0),
