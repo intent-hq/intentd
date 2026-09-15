@@ -190,6 +190,11 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "per-daemon bearer credentials; credentials never leave the source machine",
     ),
     (
+        "workspace_invite",
+        "invite links FK onto daemon-local `principal` ids and hash secrets minted \
+         against THIS daemon; an open invite is meaningless on the target",
+    ),
+    (
         "agent_message_fts",
         "derived FTS5 index over `agent_message`; the target's insert triggers \
          rebuild it from the imported rows",

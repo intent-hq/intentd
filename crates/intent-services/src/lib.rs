@@ -100,6 +100,7 @@ mod agent_list_cache;
 mod harness;
 mod history_xml;
 mod hook_manager;
+mod invite_ops;
 mod line_attribution;
 mod linear_ops;
 mod model_catalog;
@@ -945,6 +946,24 @@ pub struct Services {
     /// `GET /user` on a `principal.me` read (multiplayer w1); shared across
     /// clones so the rate limit spans every RPC handle.
     principal_identity_refreshed_at: principal_ops::IdentityRefreshState,
+    /// Serialises the primary identity's lock check + write against invite
+    /// minting (multiplayer w4): see
+    /// [`principal_ops::IdentityTransitionLock`]. Shared across clones.
+    identity_transition: principal_ops::IdentityTransitionLock,
+    /// In-flight identity-only device flows started by `invite.redeem`
+    /// (multiplayer w4), keyed by flow id; shared across clones.
+    invite_flows: invite_ops::InviteFlowState,
+    /// Admission permits for those flows (`MAX_INFLIGHT_INVITE_FLOWS`),
+    /// taken before the upstream device-code request.
+    invite_flow_permits: invite_ops::InviteFlowPermits,
+    /// Live feed of principals whose credentials were just revoked
+    /// (`principal.revokeSelf`), consumed by the transport to close their
+    /// connections (multiplayer w4).
+    principal_revocations: invite_ops::PrincipalRevocations,
+    /// Test-only override for the GitHub API base the identity-only flow's
+    /// `GET /user` talks to (`None` → `$INTENTD_GITHUB_API_BASE_URI` →
+    /// api.github.com).
+    github_api_base_uri: Option<String>,
     /// Shared cache + offload gates for git-derived aggregates that are still
     /// computed on demand (`diffSummary` for explicit callers, `CoW` support
     /// probes on list/get). Diff rollups are **not** attached to the high-
@@ -1290,6 +1309,14 @@ impl Services {
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
+            identity_transition: Arc::new(tokio::sync::Mutex::new(())),
+            invite_flows: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            invite_flow_permits: invite_ops::new_flow_permits(),
+            principal_revocations: tokio::sync::broadcast::channel(
+                invite_ops::REVOCATION_CHANNEL_CAPACITY,
+            )
+            .0,
+            github_api_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
             disk_usage: Arc::new(disk_usage::DiskUsageCache::new()),
             agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
@@ -1460,6 +1487,15 @@ impl Services {
     #[must_use]
     pub fn with_github_login_base_uri(mut self, base_uri: impl Into<String>) -> Self {
         self.github_login_base_uri = Some(base_uri.into());
+        self
+    }
+
+    /// Override the GitHub API base the identity-only invite flow's
+    /// `GET /user` talks to (multiplayer w4 test seam). Production wiring
+    /// keeps `None` (env override → api.github.com).
+    #[must_use]
+    pub fn with_github_api_base_uri(mut self, base_uri: impl Into<String>) -> Self {
+        self.github_api_base_uri = Some(base_uri.into());
         self
     }
 
@@ -24125,6 +24161,9 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            // A collaborator's comment is attributed by the daemon, not the
+            // client (multiplayer w4).
+            let (author, author_type) = self.attribute_comment_author(author, author_type).await?;
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
             let warn_note_id = note_id.clone();
@@ -24593,6 +24632,9 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            // A collaborator's reply is attributed by the daemon, not the
+            // client (multiplayer w4).
+            let (author, author_type) = self.attribute_comment_author(author, author_type).await?;
             if thread_id.is_none() && comment_id.is_none() {
                 return Err(Error::InvalidParams(
                     "Either threadId or commentId must be provided".to_string(),
@@ -29479,6 +29521,11 @@ impl WorkspaceApi for Services {
             .oauth_client_id;
         let base_uri =
             github_auth_ops::resolve_login_base_uri(self.github_login_base_uri.as_deref());
+        // Reconnect guard (multiplayer w4): the granted account is verified
+        // against the primary identity BEFORE the token replaces the stored
+        // one; see `Services::connect_identity_guard`.
+        let api_base = invite_ops::resolve_api_base_uri(self.github_api_base_uri.as_deref());
+        let identity_guard = self.connect_identity_guard();
         Box::pin(async move {
             Self::require_administrator("github.connect")?;
             // Short critical section: reuse a live flow / clear a terminal
@@ -29504,6 +29551,7 @@ impl WorkspaceApi for Services {
             )
             .await
             .map_err(pr_ops::map_sc_err)?;
+            let flow = flow.with_identity_guard(api_base.as_deref(), identity_guard);
             let mut slot = state.lock().await;
             // A concurrent connect raced us while the lock was released: keep
             // the resident live flow (single-flow invariant) and drop ours —
@@ -29654,6 +29702,67 @@ impl WorkspaceApi for Services {
             self.workspace_members_remove_op(&workspace_id, &principal_id)
                 .await
         })
+    }
+
+    // Invites + identity-only join (multiplayer w4) — see `invite_ops`.
+
+    fn workspace_members_leave(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_members_leave_op(&workspace_id).await })
+    }
+
+    fn principal_revoke_self(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.principal_revoke_self_op().await })
+    }
+
+    fn subscribe_principal_revocations(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>> {
+        Some(self.principal_revocations.subscribe())
+    }
+
+    fn workspace_invite_create(
+        &self,
+        workspace_id: WorkspaceId,
+        pin_login: Option<String>,
+        expires_in_secs: Option<u64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_invite_create_op(&workspace_id, pin_login, expires_in_secs)
+                .await
+        })
+    }
+
+    fn workspace_invite_list(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_invite_list_op(&workspace_id).await })
+    }
+
+    fn workspace_invite_revoke(
+        &self,
+        workspace_id: WorkspaceId,
+        invite_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_invite_revoke_op(&workspace_id, &invite_id)
+                .await
+        })
+    }
+
+    fn invite_redeem_start(
+        &self,
+        invite_id: String,
+        secret: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.invite_redeem_start_op(&invite_id, &secret).await })
+    }
+
+    fn invite_redeem_wait(&self, flow_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.invite_redeem_wait_op(&flow_id).await })
     }
 
     fn primary_principal_id(&self) -> BoxFuture<'_, Result<intent_core::PrincipalId>> {

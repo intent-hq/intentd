@@ -104,6 +104,14 @@ impl OutboundSender {
         self.priority.is_closed()
     }
 
+    /// Whether the priority lane holds neither a queued frame nor a reserved
+    /// slot. A slow-path RPC reserves its slot on the read loop before it is
+    /// spawned (see [`finish_slow_path_rpc`]), so `true` means no RPC response
+    /// is queued or still in flight for this connection.
+    pub(crate) fn priority_idle(&self) -> bool {
+        self.priority.capacity() == self.priority.max_capacity()
+    }
+
     /// The priority-lane sender for collaborators that only ever send
     /// latency-critical frames (the reverse-RPC channel).
     pub(crate) fn priority_sender(&self) -> mpsc::Sender<String> {
@@ -411,6 +419,26 @@ pub(crate) async fn process_frame(
                     &method,
                     rpc_id.clone(),
                     crate::pairing::handle(req, server_info, is_local),
+                )
+                .await;
+                return match frame {
+                    Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                    None => true,
+                };
+            }
+        }
+        // `workspace.invite.create` (multiplayer w4): wraps the minted invite
+        // into the `intent://invite` link with this listener's own pairing
+        // envelope (hosts / port / fingerprint, never the bearer token), so it
+        // runs here where the pairing provider is in reach. Not local-only:
+        // a remote owner mints links too. `invite.redeem` is NOT served on
+        // authenticated connections — only on the `/invite` endpoint.
+        if let Some(req) = crate::invite::classify(value) {
+            if req.method == crate::invite::InviteMethod::Create {
+                let frame = panic_guard::guard_frame(
+                    &method,
+                    rpc_id.clone(),
+                    crate::invite::handle_create(req, api, server_pairing_info),
                 )
                 .await;
                 return match frame {
