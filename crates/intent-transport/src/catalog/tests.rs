@@ -149,12 +149,15 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// `note.presence.update`) and +1 router method (`presence.snapshot`); the
 /// `note.presence.subscribe` / `note.presence.unsubscribe` channel pair is
 /// counted with the other subscription channels, not here.
-const EXPECTED_TOTAL_METHODS: usize = 378;
+///
+/// Also within 10.2: +1 router method (`github.users.search`, the
+/// collaborator picker's login-prefix user search).
+const EXPECTED_TOTAL_METHODS: usize = 379;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 323;
+const EXPECTED_ROUTER_METHODS: usize = 324;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 53;
@@ -617,6 +620,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "github.resolveThread",
     "github.revoke",
     "github.unresolveThread",
+    "github.users.search",
     "hook.cancel",
     "hook.list",
     "hook.runNow",
@@ -1152,6 +1156,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "github.resolveThread",
     "github.revoke",
     "github.unresolveThread",
+    "github.users.search",
     "hook.cancel",
     "hook.runNow",
     "host.checkAuggie",
@@ -1740,6 +1745,7 @@ mod unbound_owner_only_methods {
             ("github.resolveThread", json!({ "threadId": "t" })),
             ("github.revoke", json!({})),
             ("github.unresolveThread", json!({ "threadId": "t" })),
+            ("github.users.search", json!({ "query": "q" })),
             ("hook.cancel", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("hook.runNow", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("linear.authStatus", json!({})),

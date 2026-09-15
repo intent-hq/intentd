@@ -4339,6 +4339,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.users.search`: login-prefix user search (`GET /search/users`)
+    /// → `{ users: [{ id, login, avatarUrl, htmlUrl }] }`. `limit` defaults to
+    /// 8 and is clamped into `[1, 10]`; a blank `query` answers `{ users: [] }`
+    /// without touching the forge.
+    fn github_users_search(
+        &self,
+        query: String,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (query, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_users_search not implemented".to_string(),
+            ))
+        })
+    }
+
     // ========================================================================
     // principal.* (multiplayer w1)
     // ========================================================================
