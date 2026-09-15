@@ -1515,8 +1515,11 @@ mod unbound_owner_only_methods {
         AgentId,
         /// The gated calls (`update_workspace` for `finalStatusMessage`,
         /// `archive_workspace` for `archiveSource`) run only once the
-        /// `exportId` resolves to a Ready session; an unknown id returns at
-        /// the lookup.
+        /// `exportId` resolves to a Ready session **and** the option is
+        /// given; an unknown id returns at the lookup, and a Ready session
+        /// finalized with neither option runs no gated call at all — it
+        /// only retires the session. That live unarmed mode is pinned `ok`
+        /// by the armed test, not left implicit.
         ReadyExport,
     }
 
@@ -1540,7 +1543,9 @@ mod unbound_owner_only_methods {
         ("git.agentCommit", "-32603", Arming::AgentId),
         ("rules.list", "ok", Arming::WorkspaceId),
         // Unknown `exportId`: NotFound at the registry lookup (`-32602`,
-        // `not-found`), ahead of both gated mutations.
+        // `not-found`), ahead of both gated mutations. The other unarmed
+        // mode — a Ready session with neither option, which retires the
+        // session ungated — is asserted `ok` by the armed test.
         ("workspace.export.finalize", "-32602", Arming::ReadyExport),
     ];
 
@@ -2060,7 +2065,11 @@ mod unbound_owner_only_methods {
     ///   with `finalStatusMessage` reaches the gated `update_workspace`, and
     ///   with `archiveSource: true` the gated `archive_workspace`. Both
     ///   mutations run before the session is retired, so the one session
-    ///   serves both cells and stays Ready after each refusal.
+    ///   serves both cells and stays Ready after each refusal. The same
+    ///   session then pins the row's live unarmed mode: finalize with
+    ///   neither option runs no gated call, so unbound it is `ok` and
+    ///   retires the session (the next read is `-32602`). Gating that
+    ///   mode is a capability-rule change, out of this table's remit.
     ///
     /// `git.agentCommit` is the one row whose router arm cannot arm the gate:
     /// it passes `agent_id = None` unconditionally (the wire shape has no
@@ -2100,6 +2109,25 @@ mod unbound_owner_only_methods {
                     assert!(
                         still_ready.get("error").is_none(),
                         "a refused finalize must leave the export intact: {still_ready}"
+                    );
+                    let bare = json!({ "exportId": export_id });
+                    let outcome = dispatch_unbound(&f.services, method, &bare).await;
+                    assert_eq!(
+                        outcome, "ok",
+                        "{method} on a Ready export with neither option runs no gated \
+                         call today; if this is now -32003 the gate stopped being \
+                         conditional — move the row into the sweep"
+                    );
+                    let retired = dispatch_as_daemon(
+                        &f.services,
+                        "workspace.export.read",
+                        &json!({ "exportId": export_id, "seq": 0 }),
+                    )
+                    .await;
+                    assert_eq!(
+                        retired["error"]["data"]["code"],
+                        json!("not-found"),
+                        "the bare finalize must have retired the session: {retired}"
                     );
                     continue;
                 }
