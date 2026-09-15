@@ -170,6 +170,30 @@ pub const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;
 /// are clamped up at read time.
 pub const MIN_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 10;
 
+/// Default for `updates.checkOnIdle` — whether the daemon requests an update
+/// check from the desktop client once it has been continuously idle; on by
+/// default.
+pub const DEFAULT_UPDATES_CHECK_ON_IDLE: bool = true;
+
+/// Default for `updates.idleCheckIntervalMinutes` — minimum spacing (in
+/// minutes) between two idle-triggered update checks, also applied from
+/// process start since the sitter checks at startup.
+pub const DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES: u32 = 60;
+
+/// Floor for `updates.idleCheckIntervalMinutes` — a tighter interval would
+/// re-request checks the client already answered. Sub-minimum values
+/// (notably `0`) are clamped up at read time.
+pub const MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES: u32 = 5;
+
+/// Default for `updates.idleGraceSeconds` — how long (in seconds) the daemon
+/// must be continuously idle before it requests an update check.
+pub const DEFAULT_UPDATES_IDLE_GRACE_SECONDS: u32 = 120;
+
+/// Floor for `updates.idleGraceSeconds` — below this a momentary lull between
+/// agent turns would count as idle. Sub-minimum values (notably `0`) are
+/// clamped up at read time.
+pub const MIN_UPDATES_IDLE_GRACE_SECONDS: u32 = 10;
+
 /// Resolved filesystem locations for the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {

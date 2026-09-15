@@ -41,11 +41,13 @@ use crate::config::{
     DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
     DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
     DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
-    DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, DEFAULT_WAKE_RESUME_ENABLED,
-    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
-    DEFAULT_WORKSPACE_API_TOON_OUTPUT, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
-    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN, MAX_CONCURRENT_ADAPTERS_LIMIT,
-    TOOL_PAYLOAD_RETENTION_DAYS_MAX,
+    DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, DEFAULT_UPDATES_CHECK_ON_IDLE,
+    DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, DEFAULT_UPDATES_IDLE_GRACE_SECONDS,
+    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
+    MAX_CONCURRENT_ADAPTERS_LIMIT, MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+    MIN_UPDATES_IDLE_GRACE_SECONDS, TOOL_PAYLOAD_RETENTION_DAYS_MAX,
 };
 use crate::error::{Error, Result};
 
@@ -77,6 +79,7 @@ pub struct SettingsFile {
     pub agent_features: AgentFeaturesSettings,
     pub wake_resume: WakeResumeSettings,
     pub pr_monitor: PrMonitorSettings,
+    pub updates: UpdatesSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -1031,6 +1034,50 @@ impl Default for PrMonitorSettings {
     }
 }
 
+/// `[updates]` — idle-triggered update-check knobs (`updates.*`). The raw
+/// values are kept as parsed; consumers read them through the `effective_*`
+/// accessors, which clamp sub-floor values up to their floors (mirroring the
+/// `prMonitor.*` read-time clamp).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct UpdatesSettings {
+    /// `updates.checkOnIdle` — request an update check from the desktop
+    /// client once the daemon has been continuously idle.
+    pub check_on_idle: bool,
+    /// `updates.idleCheckIntervalMinutes` — minimum spacing (minutes) between
+    /// two idle-triggered checks, also applied from process start.
+    pub idle_check_interval_minutes: u32,
+    /// `updates.idleGraceSeconds` — how long (seconds) the daemon must be
+    /// continuously idle before requesting a check.
+    pub idle_grace_seconds: u32,
+}
+
+impl UpdatesSettings {
+    /// `idleCheckIntervalMinutes` clamped up to
+    /// [`MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES`].
+    #[must_use]
+    pub fn effective_idle_check_interval_minutes(&self) -> u32 {
+        self.idle_check_interval_minutes
+            .max(MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES)
+    }
+
+    /// `idleGraceSeconds` clamped up to [`MIN_UPDATES_IDLE_GRACE_SECONDS`].
+    #[must_use]
+    pub fn effective_idle_grace_seconds(&self) -> u32 {
+        self.idle_grace_seconds.max(MIN_UPDATES_IDLE_GRACE_SECONDS)
+    }
+}
+
+impl Default for UpdatesSettings {
+    fn default() -> Self {
+        Self {
+            check_on_idle: DEFAULT_UPDATES_CHECK_ON_IDLE,
+            idle_check_interval_minutes: DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+            idle_grace_seconds: DEFAULT_UPDATES_IDLE_GRACE_SECONDS,
+        }
+    }
+}
+
 /// Accept both TOML integers and floats for `f64` fields, so `volume = 1`
 /// parses the same as `volume = 1.0` (users hand-edit this file).
 fn de_lenient_f64<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
@@ -1783,6 +1830,17 @@ pollSeconds = 30
 # exceeds it; requests are not counted or blocked against it (minimum 60,
 # maximum 5000).
 hourlyRequestBudget = 1500
+
+[updates]
+# Check for updates when idle -- request an update check from the desktop
+# client once the daemon has been continuously idle.
+checkOnIdle = true
+# Idle check interval minutes -- minimum spacing (in minutes) between two
+# idle-triggered update checks, also applied from process start (minimum 5).
+idleCheckIntervalMinutes = 60
+# Idle grace seconds -- how long (in seconds) the daemon must be continuously
+# idle before it requests an update check (minimum 10).
+idleGraceSeconds = 120
 "#;
 
 #[cfg(test)]
@@ -2947,6 +3005,84 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("prMonitor"), "names the table: {msg}");
         assert!(msg.contains("debounceSecs"), "names the bad key: {msg}");
+    }
+
+    #[test]
+    fn updates_defaults_and_template_round_trip() {
+        // A file with no [updates] section resolves to the shipped defaults.
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(parsed.updates.check_on_idle, DEFAULT_UPDATES_CHECK_ON_IDLE);
+        assert!(parsed.updates.check_on_idle);
+        assert_eq!(
+            parsed.updates.idle_check_interval_minutes,
+            DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES
+        );
+        assert_eq!(parsed.updates.idle_check_interval_minutes, 60);
+        assert_eq!(
+            parsed.updates.idle_grace_seconds,
+            DEFAULT_UPDATES_IDLE_GRACE_SECONDS
+        );
+        assert_eq!(parsed.updates.idle_grace_seconds, 120);
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[updates]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(templated.updates, parsed.updates);
+    }
+
+    #[test]
+    fn updates_explicit_override_parses() {
+        let parsed = SettingsFile::parse_str(
+            "[updates]\ncheckOnIdle = false\nidleCheckIntervalMinutes = 15\nidleGraceSeconds = 30\n",
+        )
+        .expect("override parses");
+        assert!(!parsed.updates.check_on_idle);
+        assert_eq!(parsed.updates.idle_check_interval_minutes, 15);
+        assert_eq!(parsed.updates.idle_grace_seconds, 30);
+        assert_eq!(parsed.updates.effective_idle_check_interval_minutes(), 15);
+        assert_eq!(parsed.updates.effective_idle_grace_seconds(), 30);
+    }
+
+    #[test]
+    fn updates_sub_floor_values_clamp_at_read_time() {
+        let parsed = SettingsFile::parse_str(
+            "[updates]\nidleCheckIntervalMinutes = 0\nidleGraceSeconds = 3\n",
+        )
+        .expect("sub-floor values parse");
+        // Raw values are preserved…
+        assert_eq!(parsed.updates.idle_check_interval_minutes, 0);
+        assert_eq!(parsed.updates.idle_grace_seconds, 3);
+        // …and the effective accessors clamp up to the floors.
+        assert_eq!(
+            parsed.updates.effective_idle_check_interval_minutes(),
+            MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES
+        );
+        assert_eq!(parsed.updates.effective_idle_check_interval_minutes(), 5);
+        assert_eq!(
+            parsed.updates.effective_idle_grace_seconds(),
+            MIN_UPDATES_IDLE_GRACE_SECONDS
+        );
+        assert_eq!(parsed.updates.effective_idle_grace_seconds(), 10);
+    }
+
+    #[test]
+    fn updates_unknown_key_is_rejected() {
+        let err = SettingsFile::parse_str("[updates]\ncheckOnIdel = true\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("updates"), "names the table: {msg}");
+        assert!(msg.contains("checkOnIdel"), "names the bad key: {msg}");
+    }
+
+    #[test]
+    fn updates_wrong_type_is_rejected() {
+        let err = SettingsFile::parse_str("[updates]\nidleGraceSeconds = \"soon\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("updates.idleGraceSeconds"),
+            "names the key: {err}"
+        );
+        let err = SettingsFile::parse_str("[updates]\nidleGraceSeconds = -1\n").unwrap_err();
+        assert!(
+            err.to_string().contains("updates.idleGraceSeconds"),
+            "negative value names the key: {err}"
+        );
     }
 
     #[test]

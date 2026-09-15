@@ -1728,6 +1728,31 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(5_000.0),
             1_500.0,
         ),
+        boolean(
+            "updates.checkOnIdle",
+            "Check for updates when idle",
+            "Request an update check from the desktop client once the daemon has been continuously idle",
+            "updates",
+            true,
+        ),
+        number(
+            "updates.idleCheckIntervalMinutes",
+            "Idle check interval minutes",
+            "Minimum spacing (in minutes) between two idle-triggered update checks, also applied from process start (minimum 5)",
+            "updates",
+            Some(5.0),
+            Some(10_080.0),
+            60.0,
+        ),
+        number(
+            "updates.idleGraceSeconds",
+            "Idle grace seconds",
+            "How long (in seconds) the daemon must be continuously idle before it requests an update check (minimum 10)",
+            "updates",
+            Some(10.0),
+            Some(86_400.0),
+            120.0,
+        ),
     ]
 }
 
@@ -4195,6 +4220,143 @@ mod tests {
             let got = svc.get(path).await.expect("get");
             assert_eq!(got["origin"], json!("default"), "{path} origin after reset");
         }
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `[updates]` exposes one TOML-backed boolean (`checkOnIdle`, default
+    /// on) and two numbers: `idleCheckIntervalMinutes` (default 60, floor 5)
+    /// and `idleGraceSeconds` (default 120, floor 10). All round-trip through
+    /// the registry-wired service, the numbers reject sub-floor values, and
+    /// the catalog floors agree with the read-time clamp constants.
+    #[tokio::test]
+    async fn updates_settings_round_trip_via_registry() {
+        let check = find_definition("updates.checkOnIdle").expect("updates.checkOnIdle missing");
+        assert!(!check.sensitive);
+        assert!(!check.read_only);
+        assert_eq!(check.category, "updates");
+        assert!(matches!(check.ty, SettingType::Boolean));
+        assert_eq!(check.default_value, Some(json!(true)));
+        assert!(KNOWN_PATHS.contains(&"updates.checkOnIdle"));
+
+        for (path, default, floor) in [
+            ("updates.idleCheckIntervalMinutes", 60.0, 5.0),
+            ("updates.idleGraceSeconds", 120.0, 10.0),
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.sensitive, "{path} must be non-secret");
+            assert!(!def.read_only, "{path} must not be read-only");
+            assert_eq!(def.category, "updates");
+            let SettingType::Number { min, .. } = def.ty else {
+                panic!("{path} must be a number setting");
+            };
+            assert!(
+                min.is_some_and(|m| (m - floor).abs() < f64::EPSILON),
+                "{path} floor must be {floor}, got {min:?}"
+            );
+            assert_eq!(def.default_value, Some(json!(default)), "{path} default");
+            assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
+        }
+        // The catalog floors/defaults and the read-time clamp constants agree.
+        assert_eq!(
+            check.default_value,
+            Some(json!(intent_core::config::DEFAULT_UPDATES_CHECK_ON_IDLE))
+        );
+        assert_eq!(
+            intent_core::config::DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+            60
+        );
+        assert_eq!(
+            intent_core::config::MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+            5
+        );
+        assert_eq!(intent_core::config::DEFAULT_UPDATES_IDLE_GRACE_SECONDS, 120);
+        assert_eq!(intent_core::config::MIN_UPDATES_IDLE_GRACE_SECONDS, 10);
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-updates-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-updates-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Boolean: default on, flips to off through the registry, never SQLite.
+        let got = svc.get("updates.checkOnIdle").await.expect("get");
+        assert_eq!(got["value"], json!(true));
+        assert_eq!(got["origin"], json!("default"));
+        svc.update(&json!([{ "path": "updates.checkOnIdle", "value": false }]))
+            .await
+            .expect("update");
+        let got = svc.get("updates.checkOnIdle").await.expect("get");
+        assert_eq!(got["value"], json!(false));
+        assert_eq!(got["origin"], json!("file"));
+        assert!(!registry.snapshot().effective.updates.check_on_idle);
+        assert_eq!(
+            store
+                .get_setting("updates.checkOnIdle")
+                .await
+                .expect("read settings table"),
+            None,
+            "TOML-backed updates.checkOnIdle must never write a SQLite settings row"
+        );
+        let err = svc
+            .update(&json!([{ "path": "updates.checkOnIdle", "value": "off" }]))
+            .await
+            .expect_err("mistyped boolean must reject");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        let reset = svc.reset("updates.checkOnIdle").await.expect("reset");
+        assert_eq!(reset["value"], json!(true));
+
+        for (path, default) in [
+            ("updates.idleCheckIntervalMinutes", 60.0),
+            ("updates.idleGraceSeconds", 120.0),
+        ] {
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["value"], json!(default), "{path} default");
+            assert_eq!(got["origin"], json!("default"), "{path} origin");
+
+            svc.update(&json!([{ "path": path, "value": 45 }]))
+                .await
+                .expect("update");
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["value"], json!(45.0), "{path} updated");
+            assert_eq!(got["origin"], json!("file"), "{path} origin");
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed {path} must never write a SQLite settings row"
+            );
+
+            // Sub-floor values reject before anything is written.
+            let err = svc
+                .update(&json!([{ "path": path, "value": 1 }]))
+                .await
+                .expect_err("sub-floor value must reject");
+            assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(
+                got["value"],
+                json!(45.0),
+                "{path} unchanged after rejection"
+            );
+
+            let reset = svc.reset(path).await.expect("reset");
+            assert_eq!(reset["value"], json!(default), "{path} reset");
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["origin"], json!("default"), "{path} origin after reset");
+        }
+        let effective = registry.snapshot().effective.clone();
+        assert_eq!(effective.updates.idle_check_interval_minutes, 60);
+        assert_eq!(effective.updates.idle_grace_seconds, 120);
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {

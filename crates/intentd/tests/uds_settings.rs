@@ -589,6 +589,26 @@ async fn settings_round_trip_redaction_validation_and_event() {
         assert_eq!(e["max"], json!(max), "{path}");
         assert!(e.get("sensitive").is_none(), "{path}");
     }
+
+    // `[updates]` — the idle-triggered update-check knobs: one non-secret
+    // TOML-backed boolean (default on) and two numbers (floors 5 and 10).
+    let e = entry(&list, "updates.checkOnIdle");
+    assert_eq!(e["type"], "boolean");
+    assert_eq!(e["value"], json!(true));
+    assert_eq!(e["category"], "updates");
+    assert!(e.get("sensitive").is_none());
+    for (path, default, min, max) in [
+        ("updates.idleCheckIntervalMinutes", 60.0, 5.0, 10_080.0),
+        ("updates.idleGraceSeconds", 120.0, 10.0, 86_400.0),
+    ] {
+        let e = entry(&list, path);
+        assert_eq!(e["type"], "number", "{path}");
+        assert_eq!(e["value"], json!(default), "{path}");
+        assert_eq!(e["category"], "updates", "{path}");
+        assert_eq!(e["min"], json!(min), "{path}");
+        assert_eq!(e["max"], json!(max), "{path}");
+        assert!(e.get("sensitive").is_none(), "{path}");
+    }
     let resp = call(
         &mut w,
         &mut r,
