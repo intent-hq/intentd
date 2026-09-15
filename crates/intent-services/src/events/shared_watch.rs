@@ -1111,6 +1111,7 @@ impl PrunedWatches {
     /// One `watch()` of `root` in `mode`: on Linux a recursive root becomes
     /// one non-recursive descriptor per directory of the pruned walk;
     /// everything else is the backend's own watch.
+    #[cfg_attr(not(target_os = "linux"), expect(clippy::unused_self))]
     fn watch(
         &mut self,
         watcher: &mut dyn Watcher,
@@ -1129,6 +1130,7 @@ impl PrunedWatches {
     /// ref-counting, exactly like `notify`'s recursive inotify unwatch the hub
     /// already re-registers survivors for (`SubHandle::drop`). Any other root
     /// releases its single descriptor.
+    #[cfg_attr(not(target_os = "linux"), expect(clippy::unused_self))]
     fn unwatch(&mut self, watcher: &mut dyn Watcher, root: &Path) -> notify::Result<()> {
         #[cfg(target_os = "linux")]
         if self.roots.remove(root) {
