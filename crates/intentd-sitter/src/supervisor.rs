@@ -13,12 +13,14 @@
 //!    on failure fall back to `state.current_version`; nothing installed AND
 //!    check failed → exit non-zero with a clear message
 //! 2. spawn `versions/<current>/intentd` with all forwarded args verbatim,
-//!    inheriting stdio and environment. The sitter's one injection:
-//!    respawning a version different from the one that just ran in this
-//!    sitter's lifetime sets [`UPDATE_RESTART_ENV`]`=1` on the child, so
-//!    the daemon can tell an update-triggered restart apart from a first
-//!    spawn, a crash respawn, or a same-version SIGHUP restart (none of
-//!    which set it)
+//!    inheriting stdio and environment. The sitter injects two env
+//!    variables: respawning a version different from the one that just ran
+//!    in this sitter's lifetime sets [`UPDATE_RESTART_ENV`]`=1` on the
+//!    child, so the daemon can tell an update-triggered restart apart from
+//!    a first spawn, a crash respawn, or a same-version SIGHUP restart (none
+//!    of which set it); and serve mode on unix sets [`IDLE_RESTART_ENV`]`=1`
+//!    to advertise the idle-restart handshake (item 10), clearing it on
+//!    one-shot spawns and elsewhere
 //! 3. after every check, pick the next check uniformly at random in
 //!    [`SupervisorConfig::check_min`], [`SupervisorConfig::check_max`]) and
 //!    persist it to `state.json`
