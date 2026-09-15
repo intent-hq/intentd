@@ -8837,3 +8837,224 @@ async fn workspace_invite_secret_round_trips_and_legacy_rows_read_none() {
     assert_eq!(open[0].secret.as_deref(), Some("b".repeat(64).as_str()));
     assert_eq!(open[1].secret, None);
 }
+
+fn guest_invite(id: &str, ws: &WorkspaceId, by: &PrincipalId) -> WorkspaceInvite {
+    WorkspaceInvite {
+        id: id.to_string(),
+        workspace_id: ws.clone(),
+        secret_hash: format!("{id:0>64}"),
+        secret: None,
+        created_by_principal_id: by.clone(),
+        pin_github_user_id: None,
+        pin_login: None,
+        created_at: now_iso(),
+        expires_at: "2999-01-01T00:00:00.000Z".to_string(),
+        redeemed_at: None,
+        redeemed_by_principal_id: None,
+        revoked_at: None,
+    }
+}
+
+fn guest_identity(github_user_id: i64) -> Principal {
+    Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(github_user_id),
+        login: Some(format!("guest-{github_user_id}")),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    }
+}
+
+/// `count_workspace_guests` counts collaborators (never the owner) and open
+/// invites (never redeemed / revoked / expired ones), per workspace.
+#[tokio::test]
+async fn count_workspace_guests_counts_collaborators_and_open_invites() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let other = WorkspaceId::new();
+    for id in [&ws, &other] {
+        store
+            .insert_workspace(&sample_workspace(id, "Guests", false))
+            .await
+            .expect("insert ws");
+    }
+    let primary = store.get_primary_principal().await.expect("primary").id;
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.expect("count"),
+        crate::WorkspaceGuestCount::default(),
+        "the owner is not a guest"
+    );
+
+    let guest = guest_identity(77);
+    store.upsert_principal(&guest).await.expect("principal");
+    store
+        .add_workspace_member(&ws, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("member");
+    for id in ["open-1", "open-2", "revoked", "redeemed", "expired"] {
+        store
+            .insert_workspace_invite(&guest_invite(id, &ws, &primary))
+            .await
+            .expect("insert invite");
+    }
+    store
+        .insert_workspace_invite(&guest_invite("elsewhere", &other, &primary))
+        .await
+        .expect("insert invite");
+    assert!(store
+        .revoke_workspace_invite("revoked")
+        .await
+        .expect("revoke"));
+    assert!(store
+        .redeem_workspace_invite("redeemed", &guest.id)
+        .await
+        .expect("redeem"));
+    sqlx::query("UPDATE workspace_invite SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+        .bind("expired")
+        .execute(store.write_pool())
+        .await
+        .expect("expire");
+
+    let counted = store.count_workspace_guests(&ws).await.expect("count");
+    assert_eq!(
+        counted,
+        crate::WorkspaceGuestCount {
+            collaborators: 1,
+            open_invites: 2,
+        }
+    );
+    assert_eq!(counted.committed(), 3);
+    assert_eq!(
+        store.count_workspace_guests(&other).await.expect("count"),
+        crate::WorkspaceGuestCount {
+            collaborators: 0,
+            open_invites: 1,
+        }
+    );
+}
+
+/// The join transaction refuses a new collaborator once the workspace holds
+/// `max_guests` of them, writes nothing (the invite stays open, no principal
+/// or credential row lands), still admits an account that is already a
+/// member (a re-join takes no seat), and — under `BEGIN IMMEDIATE` — never
+/// lets two concurrent joins for the last seat both commit.
+#[tokio::test]
+async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Capped", false))
+        .await
+        .expect("insert ws");
+    let primary = store.get_primary_principal().await.expect("primary").id;
+    let join = |store: Store, invite: &str, ws: WorkspaceId, github_user_id: i64, cap: u32| {
+        let invite = invite.to_string();
+        async move {
+            store
+                .join_workspace_by_invite(
+                    &invite,
+                    &ws,
+                    &guest_identity(github_user_id),
+                    &format!("cred-{invite}-{github_user_id}"),
+                    cap,
+                )
+                .await
+                .expect("join")
+        }
+    };
+
+    // Cap 0: nothing joins, the invite stays open, no rows land.
+    store
+        .insert_workspace_invite(&guest_invite("closed-door", &ws, &primary))
+        .await
+        .expect("insert invite");
+    let before = store.count_principals().await.expect("count");
+    assert_eq!(
+        join(store.clone(), "closed-door", ws.clone(), 1, 0).await,
+        crate::InviteJoinOutcome::WorkspaceFull
+    );
+    assert_eq!(store.count_principals().await.expect("count"), before);
+    assert!(
+        store
+            .get_workspace_invite("closed-door")
+            .await
+            .expect("get")
+            .expect("row")
+            .redeemed_at
+            .is_none(),
+        "a refused join leaves the invite open"
+    );
+    assert_eq!(
+        store
+            .lookup_principal_credential("cred-closed-door-1")
+            .await
+            .expect("lookup"),
+        None
+    );
+
+    // Cap 1: the first seat is taken, the second refused, a re-join of the
+    // seated account (fresh credential) is not a new guest.
+    let first = join(store.clone(), "closed-door", ws.clone(), 1, 1).await;
+    let crate::InviteJoinOutcome::Joined(seated) = first else {
+        panic!("expected a join, got {first:?}");
+    };
+    store
+        .insert_workspace_invite(&guest_invite("second", &ws, &primary))
+        .await
+        .expect("insert invite");
+    assert_eq!(
+        join(store.clone(), "second", ws.clone(), 2, 1).await,
+        crate::InviteJoinOutcome::WorkspaceFull
+    );
+    assert_eq!(
+        join(store.clone(), "second", ws.clone(), 1, 1).await,
+        crate::InviteJoinOutcome::Joined(store.get_principal(&seated.id).await.expect("principal")),
+        "an already-seated account re-joins without a new seat"
+    );
+    assert_eq!(
+        join(store.clone(), "second", ws.clone(), 1, 1).await,
+        crate::InviteJoinOutcome::Closed,
+        "the re-join consumed the invite"
+    );
+
+    // Race for the last seat: cap 2 with one seated collaborator and many
+    // concurrent joins on distinct invites — exactly one more commits.
+    let mut handles = Vec::new();
+    for n in 0..8 {
+        let id = format!("race-{n}");
+        store
+            .insert_workspace_invite(&guest_invite(&id, &ws, &primary))
+            .await
+            .expect("insert invite");
+        handles.push(tokio::spawn(join(
+            store.clone(),
+            &id,
+            ws.clone(),
+            100 + n,
+            2,
+        )));
+    }
+    let mut joined = 0;
+    let mut full = 0;
+    for h in handles {
+        match h.await.expect("task") {
+            crate::InviteJoinOutcome::Joined(_) => joined += 1,
+            crate::InviteJoinOutcome::WorkspaceFull => full += 1,
+            crate::InviteJoinOutcome::Closed => panic!("an open invite was reported closed"),
+        }
+    }
+    assert_eq!((joined, full), (1, 7));
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.expect("count"),
+        crate::WorkspaceGuestCount {
+            collaborators: 2,
+            open_invites: 7,
+        },
+        "refused joins leave their invites open"
+    );
+}

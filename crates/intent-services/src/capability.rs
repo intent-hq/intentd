@@ -382,6 +382,7 @@ impl Services {
         self.require_member(workspace_id).await?;
         self.store.get_workspace(workspace_id).await?;
         let members = self.store.list_workspace_members(workspace_id).await?;
+        let guests = self.store.count_workspace_guests(workspace_id).await?;
         let principals: HashMap<PrincipalId, intent_core::Principal> = self
             .store
             .list_principals()
@@ -403,7 +404,11 @@ impl Services {
                 })
             })
             .collect();
-        Ok(json!({ "members": rows }))
+        Ok(json!({
+            "members": rows,
+            "guestCount": guests.committed(),
+            "guestLimit": self.max_guests_per_workspace(),
+        }))
     }
 
     /// `workspace.members.remove`: see
