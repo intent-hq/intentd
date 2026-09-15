@@ -19,6 +19,7 @@ pub use control::{FileWatchStatus, IdleUpdateCheckStatus, SystemControl, SystemS
 pub use host_env::{
     detect_has_display, detect_host_environment, local_hostname, pretty_hostname, HostEnvironment,
 };
+pub use invite::InviteLinkResolver;
 #[cfg(windows)]
 pub use listener::pipe_name_for_socket_path;
 pub use listener::{serve_uds, serve_uds_with_reverse};
