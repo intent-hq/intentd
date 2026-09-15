@@ -262,15 +262,18 @@ impl Services {
             .map_or(0, |m| m.member_count))
     }
 
-    /// The listener's link envelope for stamping invites with `url`, once
-    /// per call: `None` (never an error) when no builder is attached or no
-    /// link can be built right now — the invite rows are still answered.
+    /// The listener's link envelope for stamping listed invites with `url`,
+    /// once per call: `None` (never an error) when no builder is attached or
+    /// no link can be built right now — the invite rows are still answered.
     async fn invite_link_envelope(&self) -> Option<Box<dyn InviteLinkEnvelope>> {
         self.invite_links.get()?.invite_link_envelope().await
     }
 
     /// `workspace.invite.create`: see
-    /// [`intent_core::WorkspaceApi::workspace_invite_create`].
+    /// [`intent_core::WorkspaceApi::workspace_invite_create`]. The returned
+    /// `invite` carries no `url`: the transport resolves the link envelope
+    /// exactly once per create and stamps the same link as both the top-level
+    /// `url` and `invite.url`, so this path never resolves it a second time.
     pub(crate) async fn workspace_invite_create_op(
         &self,
         workspace_id: &WorkspaceId,
@@ -355,9 +358,8 @@ impl Services {
             crate::workspace_updated_event(workspace_id, &json!({ "invites": true })),
         )
         .await;
-        let envelope = self.invite_link_envelope().await;
         Ok(json!({
-            "invite": invite_to_wire(&invite, envelope.as_deref()),
+            "invite": invite_to_wire(&invite, None),
             "secret": secret,
         }))
     }
