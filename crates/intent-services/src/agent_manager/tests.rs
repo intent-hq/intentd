@@ -12922,13 +12922,16 @@ fn mock_agent_script() -> String {
         .to_string()
 }
 
-/// Which `AgentManager` front door a cross-workspace `ws.agent.send` takes:
-/// `priority: "queue"` lands on `send_message`; the default (omitted /
-/// `interrupt`) lands on `interrupt_send_message`.
+/// Which `AgentManager` front door a cross-workspace activation takes:
+/// `ws.agent.send({ priority: "queue" })` lands on `send_message`; the
+/// default (omitted / `interrupt`) lands on `interrupt_send_message`; a
+/// caller-scoped `agent.sendQueuedMessageNow` lands on
+/// `send_queued_message_now`.
 #[derive(Clone, Copy, Debug)]
 enum SendRoute {
     Queue,
     Interrupt,
+    QueuedNow,
 }
 
 /// Captures the `agent_manager` tracing events (fields rendered as
@@ -13095,6 +13098,21 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute
             )
             .await
         }
+        SendRoute::QueuedNow => {
+            // The entry is queued on the cold target; the "send now" arrives
+            // keyed on the CALLER's router workspace.
+            let queued = mgr
+                .services
+                .agent_queue_message_op(target.clone(), "wake up".to_string(), None, None, None)
+                .await
+                .expect("queue the entry");
+            let message_id = queued["queuedMessage"]["id"]
+                .as_str()
+                .expect("queued entry id")
+                .to_string();
+            mgr.send_queued_message_now(target.clone(), sender_ws.clone(), message_id)
+                .await
+        }
     }
     .expect("cross-workspace send is accepted");
     assert_eq!(
@@ -13214,6 +13232,17 @@ async fn cross_workspace_send_binds_woken_agent_to_its_session_workspace() {
 #[tokio::test]
 async fn cross_workspace_interrupt_send_binds_woken_agent_to_its_session_workspace() {
     assert_cross_workspace_send_binds_to_session_workspace(SendRoute::Interrupt).await;
+}
+
+/// Regression (intent-hq/intent#5017), send-now route: `agent.sendQueuedMessageNow`
+/// forwards the CALLER's router `workspaceId` unchanged into
+/// `send_queued_message_now`, which reads the target session and then
+/// claims the slot, emits the queue / message events, and spawns the worker.
+/// A cold target activated from another workspace must still bind to its
+/// OWN session workspace, same as the two `ws.agent.send` routes.
+#[tokio::test]
+async fn cross_workspace_send_queued_now_binds_woken_agent_to_its_session_workspace() {
+    assert_cross_workspace_send_binds_to_session_workspace(SendRoute::QueuedNow).await;
 }
 
 /// Regression (intent-hq/intent#5017 × intent-hq/monorepo#2732): the

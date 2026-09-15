@@ -11,6 +11,20 @@
 //! `agent-process-registry` (acquire/register/markActive/markIdle/deregister +
 //! a global concurrency cap with LRU idle eviction); full timer/memory-pressure
 //! reaping is M5, exposed here as the [`AgentManager::reap_idle`] hook.
+//!
+//! Session-workspace invariant (intent-hq/intent#5017): an agent is always
+//! activated in ITS OWN session workspace — the `AgentSession.workspace_id`
+//! it was created in — never in the workspace the activating caller happens
+//! to be scoped to. Every delivery front door that can start a turn
+//! (`send_message`, `interrupt_send_message`, `send_queued_message_now`)
+//! rebinds the caller-supplied workspace to the session's via
+//! [`AgentManager::session_workspace`] BEFORE any scope-sensitive step (the
+//! archived gate, the `try_begin` claim, event echoes, and the spawn:
+//! `ensure_started` → `resolve_spawn` cwd + `create_agent` workspace-MCP
+//! scope). A cross-workspace `ws.agent.send` / `ws.agent.sendToTask` arrives
+//! keyed on the SENDER's bridge workspace; without the rebind the woken
+//! child would run in the sender's checkout with a `workspace_api` bridge
+//! scoped to the sender's workspace.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -6650,6 +6664,12 @@ impl AgentManager {
         // monorepo#564: fail closed on a nonexistent target BEFORE touching
         // the queue.
         let session = self.services.require_agent_session(&agent_id).await?;
+        // Bind the activation to the target's OWN session workspace
+        // (intent-hq/intent#5017): the router forwards the CALLER's
+        // `workspaceId` unchanged, and the `try_begin` claim, the queue /
+        // status events, and the spawn below must key on the workspace the
+        // target lives in (see the module-header invariant).
+        let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
         // Quarantine gate (monorepo#840): a provably-poisoned session must
         // not be redriven by delivery — every replay deterministically
         // fails. The entry STAYS in the queue (no side effects); the absent
