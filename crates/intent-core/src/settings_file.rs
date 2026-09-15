@@ -405,8 +405,9 @@ impl Default for ServerSettings {
 }
 
 /// `[sharing]` — guest (collaborator) caps (`sharing.*`). The membership cap
-/// is read live by the invite flow; the connection caps size the WSS
-/// listener's guest permits and apply on daemon restart.
+/// is read live by the invite flow; the connection caps are read live by the
+/// WSS listener's guest admission gate, so a change applies to the next guest
+/// upgrade (never evicting an admitted connection) without a restart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SharingSettings {
@@ -1679,10 +1680,11 @@ enabled = true
 maxGuestsPerWorkspace = 10
 # Max guest connections -- listener-wide cap on concurrent WSS connections
 # held by guests (the owner's credential is never counted; 0 = unlimited;
-# changes apply on daemon restart).
+# applies live to new connections, never disconnects admitted guests).
 maxGuestConnections = 40
 # Max connections per guest -- concurrent WSS connections one guest may hold
-# (0 = unlimited; changes apply on daemon restart).
+# (0 = unlimited; applies live to new connections, never disconnects
+# admitted guests).
 maxConnectionsPerGuest = 4
 
 [sourceControl]
