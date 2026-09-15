@@ -12931,12 +12931,108 @@ enum SendRoute {
     Interrupt,
 }
 
+/// Captures the `agent_manager` tracing events (fields rendered as
+/// `name=value`) so a test can assert on the session-workspace rebind log.
+#[derive(Clone, Default)]
+struct AgentManagerLogCapture(Arc<Mutex<Vec<String>>>);
+
+impl AgentManagerLogCapture {
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn set_as_default(&self) -> tracing::subscriber::DefaultGuard {
+        crate::test_tracing::set_capture_default(self.clone())
+    }
+}
+
+impl tracing::Subscriber for AgentManagerLogCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata
+            .target()
+            .starts_with("intent_services::agent_manager")
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{}={value:?} ", field.name());
+            }
+        }
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Dial the live agent's per-agent MCP bridge (the `workspace_api` server the
+/// spawned child reaches) over its loopback address and run `code` through
+/// `workspace_api`, returning the text body of the tool result. Probes the
+/// bridge's ACTUAL workspace scope, not a proxy for it.
+#[expect(clippy::used_underscore_binding)] // reads the RAII `_mcp_bridge` field; underscore documents production intent
+async fn probe_bridge_workspace_api(mgr: &AgentManager, id: &AgentId, code: &str) -> String {
+    let addr = mgr
+        .handles
+        .lock()
+        .unwrap()
+        .get(id)
+        .expect("the woken agent keeps a live handle")
+        ._mcp_bridge
+        .as_ref()
+        .expect("the live handle serves a workspace_api bridge")
+        .addr();
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to the agent's mcp bridge");
+    let (read, mut write) = stream.into_split();
+    let request = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "workspace_api", "arguments": { "code": code, "summary": "probe" } },
+    });
+    write
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("write tools/call");
+    let mut line = String::new();
+    timeout(
+        Duration::from_secs(30),
+        BufReader::new(read).read_line(&mut line),
+    )
+    .await
+    .expect("bridge answers within the budget")
+    .expect("read tools/call response");
+    let response: Value = serde_json::from_str(&line).expect("bridge response is JSON");
+    assert_eq!(
+        response["result"]["isError"],
+        json!(false),
+        "workspace_api probe succeeds: {response}"
+    );
+    response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("text tool result: {response}"))
+        .to_string()
+}
+
 /// Shared driver for the intent-hq/intent#5017 regressions: seeds a cold
 /// target in `ws-5017-home` (checkout `home_dir`) and a sender in
 /// `ws-5017-sender` (checkout `sender_dir`), delivers to the target keyed
-/// on the SENDER's workspace via `route`, and asserts the woken child's
-/// actual cwd is the home checkout and the `agent:message` user-row echo is
-/// scoped to the home workspace.
+/// on the SENDER's workspace via `route`, and asserts (a) the woken child's
+/// actual cwd is the home checkout, (b) the `agent:message` user-row echo is
+/// scoped to the home workspace, (c) the woken child's live `workspace_api`
+/// bridge answers `ws.workspace.info()` with the home workspace + checkout,
+/// and (d) the rebind logged the caller-side scope mismatch.
 async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute) {
     let script = mock_agent_script();
     let behavior = json!({ "response": "done", "echoCwd": true }).to_string();
@@ -12970,6 +13066,8 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute
     }
 
     let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let logs = AgentManagerLogCapture::default();
+    let _log_guard = logs.set_as_default();
     // The shape `ws.agent.send` produces: the delivery is keyed on the
     // CALLER's bridge workspace, not the target's home.
     let options = super::TurnOptions {
@@ -13059,6 +13157,37 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(route: SendRoute
     assert_eq!(
         echo.workspace_id, home_ws,
         "via {route:?}: the delivery's agent:message echo is scoped to the target's session workspace"
+    );
+
+    // The woken child's live `workspace_api` bridge is scoped to the target's
+    // session workspace: `ws.workspace.info()` answers the home id + checkout.
+    let info = probe_bridge_workspace_api(
+        &mgr,
+        &target,
+        "const i = await ws.workspace.info(); return i.id + '|' + i.path",
+    )
+    .await;
+    let home_path = home_dir.path().display().to_string();
+    assert!(
+        info.contains(&format!("{}|{home_path}", home_ws.as_str())),
+        "via {route:?}: the woken agent's workspace_api bridge is scoped to ITS session workspace (got {info})"
+    );
+    assert!(
+        !info.contains(sender_ws.as_str()),
+        "via {route:?}: the bridge must not be scoped to the sender's workspace (got {info})"
+    );
+
+    // The rebind logged the caller-side scope mismatch it corrected.
+    let lines = logs.lines();
+    let rebind = lines
+        .iter()
+        .find(|l| l.contains("intent-hq/intent#5017"))
+        .unwrap_or_else(|| {
+            panic!("via {route:?}: the session-workspace rebind is logged (got {lines:#?})")
+        });
+    assert!(
+        rebind.contains(sender_ws.as_str()) && rebind.contains(home_ws.as_str()),
+        "via {route:?}: the rebind log names the requested and session workspaces (got {rebind})"
     );
 }
 
