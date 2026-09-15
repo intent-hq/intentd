@@ -97,13 +97,27 @@
 //! recursion flag, the backend no longer auto-watches directories created
 //! later; the group's event callback feeds `Create(Folder)` / rename-to
 //! events back to the registrar, which walks the new directory the same way.
-//! Nothing is pruned beneath a [`PRUNE_EXEMPT_DIRS`] component — `.git`,
-//! `.intent`, `.augment`, `.agents`, `.claude` are trees a subscriber reads
-//! through the workspace-root watch and filters itself, and a nested name
-//! colliding with the noise list (`.git/refs/heads/build`,
-//! `.intent/skills/build/`) must stay watched. The residual is a root that
-//! itself lives under such a component: it is walked unpruned. macOS
-//! (`FSEvents`) is untouched — its streams cost no per-directory resource.
+//! Nothing is pruned beneath a [`PRUNE_EXEMPT_DIRS`] component — `.intent`,
+//! `.augment`, `.agents`, `.claude` are trees a subscriber reads through the
+//! workspace-root watch and filters itself, and a nested name colliding with
+//! the noise list (`.intent/skills/build/`) must stay watched. The residual is
+//! a root that itself lives under such a component: it is walked unpruned.
+//!
+//! A `.git` directory is neither noise nor exempt: what its subscribers
+//! consume is known exactly (intent-hq/intent#5044). The git metadata watcher
+//! reads `HEAD`, `index` and `packed-refs` as direct children plus anything
+//! under `refs/`, and the file watcher reads `info/exclude` — all through the
+//! recursive workspace-root watch, or through a subscription on the resolved
+//! git dir itself for a linked worktree (`<main>/.git/worktrees/<name>` and
+//! the common dir `<main>/.git`). So the walk keeps the git dir itself and
+//! its [`GIT_DIR_KEPT_DIRS`] children (`refs/` recursively, so
+//! `refs/heads/build` survives the noise list; `info/`) and prunes every
+//! other child — `objects/`, `logs/`, `modules/`, `worktrees/`, `hooks/` —
+//! which after intent-hq/intentd#1904 were about half of a workspace's
+//! remaining descriptors. A root that lies under a `.git` component IS a git
+//! dir (that is the only way one is subscribed) and gets the same rule from
+//! its own top. macOS (`FSEvents`) is untouched — its streams cost no
+//! per-directory resource.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -120,7 +134,19 @@ use super::root_watch::{canonical_root, find_existing_ancestor};
 /// Directory names beneath which the pruned walk never prunes (see the module
 /// header): subscriber-owned trees whose contents are filtered downstream.
 #[cfg(target_os = "linux")]
-const PRUNE_EXEMPT_DIRS: &[&str] = &[".git", ".intent", ".augment", ".agents", ".claude"];
+const PRUNE_EXEMPT_DIRS: &[&str] = &[".intent", ".augment", ".agents", ".claude"];
+
+/// The only children of a git dir the pruned walk descends into (module
+/// header, intent-hq/intent#5044): `refs/` for the git metadata watcher and
+/// `info/` for the file watcher's `info/exclude` invalidation. Nothing is
+/// pruned beneath them; every other child of a git dir is.
+#[cfg(target_os = "linux")]
+const GIT_DIR_KEPT_DIRS: &[&str] = &["refs", "info"];
+
+/// The `.git` directory name, the marker the pruned walk keys the git-dir
+/// rule on.
+#[cfg(target_os = "linux")]
+const GIT_DIR_NAME: &str = ".git";
 
 /// Event callback a group's watcher invokes with each raw result; boxed so the
 /// watcher factory below can be swapped out.
@@ -1248,33 +1274,59 @@ impl PrunedWatches {
     }
 }
 
+/// The name of a normal path component, `None` for any other kind.
+#[cfg(target_os = "linux")]
+fn component_name(component: std::path::Component<'_>) -> Option<&str> {
+    match component {
+        std::path::Component::Normal(name) => name.to_str(),
+        _ => None,
+    }
+}
+
 /// Whether the pruned walk of `root` skips `dir`: the first noise component
 /// on the path from `root` down to `dir` prunes it, unless a
 /// [`PRUNE_EXEMPT_DIRS`] component comes first — or `root` itself lies under
-/// one, in which case the whole root is walked unpruned (module header).
+/// one, in which case the whole root is walked unpruned (module header). A
+/// `.git` component met first (on the way down, or in `root` itself) hands
+/// the rest of the path to [`git_dir_prunes`].
 #[cfg(target_os = "linux")]
 fn prunes(root: &Path, dir: &Path) -> bool {
-    let is_exempt = |c: std::path::Component<'_>| matches!(c, std::path::Component::Normal(n) if n.to_str().is_some_and(|n| PRUNE_EXEMPT_DIRS.contains(&n)));
-    if root.components().any(is_exempt) {
-        return false;
-    }
+    let is_exempt = |c| component_name(c).is_some_and(|n| PRUNE_EXEMPT_DIRS.contains(&n));
+    let is_git_dir = |c| component_name(c) == Some(GIT_DIR_NAME);
     let Ok(rel) = dir.strip_prefix(root) else {
         return false;
     };
-    for component in rel.components() {
+    for component in root.components() {
         if is_exempt(component) {
             return false;
         }
-        if let std::path::Component::Normal(name) = component {
-            if name
-                .to_str()
-                .is_some_and(|n| super::watcher::NOISE_DIRS.contains(&n))
-            {
-                return true;
-            }
+        if is_git_dir(component) {
+            return git_dir_prunes(rel.components());
+        }
+    }
+    let mut components = rel.components();
+    while let Some(component) = components.next() {
+        if is_exempt(component) {
+            return false;
+        }
+        if is_git_dir(component) {
+            return git_dir_prunes(components);
+        }
+        if component_name(component).is_some_and(|n| super::watcher::NOISE_DIRS.contains(&n)) {
+            return true;
         }
     }
     false
+}
+
+/// The git-dir rule (module header): given the path components below a git
+/// dir, the git dir itself and anything at or under a [`GIT_DIR_KEPT_DIRS`]
+/// child survive; every other child is pruned.
+#[cfg(target_os = "linux")]
+fn git_dir_prunes(mut below_git_dir: std::path::Components<'_>) -> bool {
+    below_git_dir
+        .next()
+        .is_some_and(|child| !component_name(child).is_some_and(|n| GIT_DIR_KEPT_DIRS.contains(&n)))
 }
 
 /// The directories of `start`'s subtree (itself included) that survive
@@ -2110,9 +2162,10 @@ mod tests {
     /// at any depth — those subtrees cost `max_user_watches` for events every
     /// consumer drops — while everything else, including directories created
     /// AFTER registration, stays covered and delivers. Subscriber-owned trees
-    /// (`.git`, `.intent`) are exempt from pruning even where a nested name
-    /// collides with the noise list (`.git/refs/heads/build`), and retiring
-    /// the root releases every descriptor the pruned walk registered.
+    /// (`.intent`, and the kept `refs/` of a git dir) are exempt from pruning
+    /// even where a nested name collides with the noise list
+    /// (`.git/refs/heads/build`), and retiring the root releases every
+    /// descriptor the pruned walk registered.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[expect(clippy::await_holding_lock)]
@@ -2312,6 +2365,283 @@ mod tests {
             sub_ws.registration.live(),
             "the outer root is untouched by the nested root's retirement"
         );
+    }
+
+    /// A regular repository's `.git` tree as the pruned walk sees it: the
+    /// metadata the git metadata watcher and the file watcher consume, plus
+    /// the subtrees neither reads (intent-hq/intent#5044).
+    #[cfg(target_os = "linux")]
+    const GIT_DIR_KEPT: &[&str] = &[
+        ".git",
+        ".git/refs",
+        ".git/refs/heads",
+        ".git/refs/tags",
+        ".git/info",
+    ];
+    #[cfg(target_os = "linux")]
+    const GIT_DIR_PRUNED: &[&str] = &[
+        ".git/objects",
+        ".git/objects/ab",
+        ".git/objects/pack",
+        ".git/logs",
+        ".git/logs/refs/heads",
+        ".git/modules",
+        ".git/modules/sub",
+        ".git/modules/sub/objects/cd",
+        ".git/modules/sub/refs/heads",
+        ".git/worktrees",
+        ".git/worktrees/wt/logs",
+        ".git/hooks",
+    ];
+
+    /// The intent-hq/intent#5044 invariant for a regular repository: the
+    /// recursive workspace-root watch holds descriptors for `.git` itself,
+    /// `.git/refs/**` and `.git/info` — exactly what the git metadata watcher
+    /// (`HEAD`, `index`, `packed-refs`, `refs/**`) and the file watcher
+    /// (`info/exclude`) consume through it — and none for `objects/`,
+    /// `logs/`, `modules/` (submodule git dirs, which the metadata watcher
+    /// does not read), `worktrees/` or `hooks/`, which after
+    /// intent-hq/intentd#1904 were about half of a workspace's remaining
+    /// descriptors. Metadata edits, including in a ref directory created
+    /// after registration, still deliver; an object fanout directory created
+    /// later stays unwatched.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_recursive_root_watches_only_git_metadata_dirs() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("prune-git");
+        let ws = base.path.join("ws");
+        for rel in GIT_DIR_KEPT.iter().chain(GIT_DIR_PRUNED.iter()) {
+            std::fs::create_dir_all(ws.join(rel)).expect("mk tree");
+        }
+        std::fs::create_dir_all(ws.join("src")).expect("mk src");
+        for rel in [
+            ".git/HEAD",
+            ".git/index",
+            ".git/packed-refs",
+            ".git/refs/heads/main",
+        ] {
+            std::fs::write(ws.join(rel), b"seed").expect("seed metadata");
+        }
+
+        let hub = SharedWatchHub::new();
+        let (sub, mut rx, root) = hub.subscribe(&ws);
+        sub.probe().wait_live(LIVENESS).await;
+
+        let inodes = inotify_watched_inodes();
+        for rel in GIT_DIR_KEPT.iter().chain(["src"].iter()) {
+            assert!(
+                inodes.contains(&inode_of(&root.join(rel))),
+                "{rel} must hold an inotify descriptor"
+            );
+        }
+        for rel in GIT_DIR_PRUNED {
+            assert!(
+                !inodes.contains(&inode_of(&root.join(rel))),
+                "{rel} must NOT hold an inotify descriptor"
+            );
+        }
+
+        // Every metadata path the git metadata watcher filters for still
+        // delivers through the narrowed watch.
+        for rel in [
+            ".git/HEAD",
+            ".git/index",
+            ".git/packed-refs",
+            ".git/refs/heads/main",
+            ".git/info/exclude",
+        ] {
+            assert!(
+                touch_until_seen(&mut rx, &root, rel).await,
+                "{rel} must deliver through the narrowed .git watch"
+            );
+        }
+        // A ref namespace created after registration (`git checkout -b
+        // feature/x`) is walked and delivers; an object fanout directory
+        // created after registration stays pruned.
+        std::fs::create_dir_all(root.join(".git/refs/heads/feature")).expect("mk feature");
+        assert!(
+            touch_until_seen(&mut rx, &root, ".git/refs/heads/feature/x").await,
+            "a ref directory created after registration must deliver"
+        );
+        std::fs::create_dir_all(root.join(".git/objects/ef")).expect("mk objects/ef");
+        assert!(
+            wait_watched(&root.join(".git/refs/heads/feature"), true).await,
+            ".git/refs/heads/feature must be watched"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !inotify_watched_inodes().contains(&inode_of(&root.join(".git/objects/ef"))),
+            ".git/objects/ef created after registration must NOT be watched"
+        );
+
+        drop(sub);
+        for rel in [
+            ".git",
+            ".git/refs/heads",
+            ".git/refs/heads/feature",
+            ".git/info",
+        ] {
+            assert!(
+                wait_watched(&root.join(rel), false).await,
+                "unwatch must release the descriptor for {rel:?}"
+            );
+        }
+    }
+
+    /// The intent-hq/intent#5044 invariant for a linked worktree, whose git
+    /// metadata watcher subscribes the resolved git dirs directly: the common
+    /// dir (`<main>/.git`, read for `refs/**` and `packed-refs`) and the
+    /// per-worktree gitdir (`<main>/.git/worktrees/<name>`, read for `HEAD`,
+    /// `index` and its own `refs/**`). A root that lies under `.git` is a git
+    /// dir and gets the same rule from its own top: the common-dir root skips
+    /// `objects/`, `logs/` and `worktrees/` (the gitdir is its own root, not
+    /// covered by the common dir), the gitdir root skips its `logs/`, and
+    /// both still deliver their metadata edits.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_git_dir_root_watches_only_its_metadata_dirs() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("prune-gitdir");
+        let main = base.path.join("main");
+        for rel in GIT_DIR_KEPT.iter().chain(GIT_DIR_PRUNED.iter()) {
+            std::fs::create_dir_all(main.join(rel)).expect("mk tree");
+        }
+        std::fs::create_dir_all(main.join(".git/worktrees/wt/refs/bisect")).expect("mk wt refs");
+        for rel in [
+            ".git/packed-refs",
+            ".git/refs/heads/main",
+            ".git/worktrees/wt/HEAD",
+            ".git/worktrees/wt/index",
+        ] {
+            std::fs::write(main.join(rel), b"seed").expect("seed metadata");
+        }
+
+        let hub = SharedWatchHub::new();
+        let (sub_common, mut rx_common, common) = hub.subscribe(&main.join(".git"));
+        sub_common.probe().wait_live(LIVENESS).await;
+        let inodes = inotify_watched_inodes();
+        for rel in ["", "refs", "refs/heads", "info"] {
+            assert!(
+                inodes.contains(&inode_of(&common.join(rel))),
+                "common dir {rel:?} must hold an inotify descriptor"
+            );
+        }
+        for rel in [
+            "objects",
+            "objects/ab",
+            "logs",
+            "modules/sub",
+            "worktrees",
+            "worktrees/wt",
+            "worktrees/wt/refs",
+            "hooks",
+        ] {
+            assert!(
+                !inodes.contains(&inode_of(&common.join(rel))),
+                "common dir {rel:?} must NOT hold an inotify descriptor"
+            );
+        }
+
+        let (sub_wt, mut rx_wt, gitdir) = hub.subscribe(&common.join("worktrees/wt"));
+        sub_wt.probe().wait_live(LIVENESS).await;
+        let inodes = inotify_watched_inodes();
+        for rel in ["", "refs", "refs/bisect"] {
+            assert!(
+                inodes.contains(&inode_of(&gitdir.join(rel))),
+                "gitdir {rel:?} must hold an inotify descriptor"
+            );
+        }
+        assert!(
+            !inodes.contains(&inode_of(&gitdir.join("logs"))),
+            "gitdir logs/ must NOT hold an inotify descriptor"
+        );
+        assert!(
+            !inodes.contains(&inode_of(&common.join("worktrees"))),
+            "subscribing the gitdir must not pull in the common dir's worktrees/"
+        );
+
+        for rel in ["packed-refs", "refs/heads/main"] {
+            assert!(
+                touch_until_seen(&mut rx_common, &common, rel).await,
+                "common dir {rel} must deliver through the narrowed watch"
+            );
+        }
+        for rel in ["HEAD", "index", "refs/bisect/bad"] {
+            assert!(
+                touch_until_seen(&mut rx_wt, &gitdir, rel).await,
+                "gitdir {rel} must deliver through the narrowed watch"
+            );
+        }
+
+        // The gitdir is its own root (pruned under the common dir, so not
+        // covered by it): retiring its subscriber releases its descriptors
+        // while the common dir's stay.
+        drop(sub_wt);
+        for rel in ["", "refs/bisect"] {
+            assert!(
+                wait_watched(&gitdir.join(rel), false).await,
+                "dropping the gitdir subscriber must release {rel:?}"
+            );
+        }
+        assert!(
+            inotify_watched_inodes().contains(&inode_of(&common.join("refs/heads"))),
+            "the common dir's descriptors survive the gitdir's retirement"
+        );
+        drop(sub_common);
+    }
+
+    /// The prune rule's `.git` cases as a pure function, one per module-header
+    /// clause (intent-hq/intent#5044).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_dir_prune_rules() {
+        let ws = Path::new("/ws");
+        // The git dir itself and its kept children survive, recursively.
+        for rel in [
+            ".git",
+            ".git/refs",
+            ".git/refs/heads/build",
+            ".git/info",
+            "sub/nested/.git/refs/tags",
+        ] {
+            assert!(!prunes(ws, &ws.join(rel)), "{rel} must survive");
+        }
+        // Every other child of a git dir is pruned, wherever the git dir is.
+        for rel in [
+            ".git/objects",
+            ".git/objects/ab",
+            ".git/logs",
+            ".git/modules",
+            ".git/modules/sub/refs",
+            ".git/worktrees/wt",
+            ".git/hooks",
+            "sub/nested/.git/objects",
+        ] {
+            assert!(prunes(ws, &ws.join(rel)), "{rel} must be pruned");
+        }
+        // Noise and exempt components met before `.git` keep their own rule.
+        assert!(prunes(ws, &ws.join("node_modules/pkg/.git/refs")));
+        assert!(!prunes(ws, &ws.join(".intent/x/.git/objects")));
+        // A root under `.git` is a git dir: the rule applies from its top.
+        let common = Path::new("/main/.git");
+        assert!(!prunes(common, common));
+        assert!(!prunes(common, &common.join("refs/heads")));
+        assert!(!prunes(common, &common.join("info")));
+        assert!(prunes(common, &common.join("objects/ab")));
+        assert!(prunes(common, &common.join("logs")));
+        assert!(prunes(common, &common.join("worktrees/wt")));
+        assert!(prunes(common, &common.join("modules/sub")));
+        let gitdir = Path::new("/main/.git/worktrees/wt");
+        assert!(!prunes(gitdir, gitdir));
+        assert!(!prunes(gitdir, &gitdir.join("refs/bisect")));
+        assert!(prunes(gitdir, &gitdir.join("logs/refs")));
     }
 
     /// macOS keeps parent-directory grouping: the `FSEvents` stream rebuild on

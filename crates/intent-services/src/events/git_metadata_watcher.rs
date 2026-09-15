@@ -33,6 +33,13 @@
 //! Path-based filtering (rather than watching the `HEAD`/`index` files
 //! directly) is what keeps detection alive across git's atomic
 //! write-lock-then-rename updates.
+//!
+//! On Linux the hub's pruned walk registers descriptors for exactly what
+//! these filters consume — a git dir itself and its `refs/` subtree (plus
+//! `info/` for the file watcher) — and skips `objects/`, `logs/`,
+//! `modules/`, `worktrees/` (intent-hq/intent#5044). Widening any filter here
+//! to another `.git` subtree requires widening `GIT_DIR_KEPT_DIRS` in
+//! [`super::shared_watch`] alongside it, or the events never reach the hub.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
