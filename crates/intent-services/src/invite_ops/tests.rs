@@ -714,10 +714,12 @@ fn assert_secret_hidden(wire: &Value, secret: &str) {
     assert!(!text.contains(&hash_secret(secret)), "hash leaked: {text}");
 }
 
-/// The mint stores the secret and, with a link builder attached, both the
-/// `create` echo and every `list` row carry `url` rebuilt from it — the
-/// envelope resolved once per list, not per row; a row minted before the
-/// secret was stored gets no `url`; the secret itself never serialises.
+/// The mint stores the secret and, with a link builder attached, every
+/// `list` row carries `url` rebuilt from it — the envelope resolved once per
+/// list, not per row, and never by `create` (the transport resolves the
+/// create envelope itself and stamps both `url`s from it); a row minted
+/// before the secret was stored gets no `url`; the secret itself never
+/// serialises.
 #[tokio::test]
 async fn invite_list_rebuilds_the_link_from_the_stored_secret() {
     let tmp = TempDb::new();
@@ -732,7 +734,15 @@ async fn invite_list_rebuilds_the_link_from_the_stored_secret() {
     let id = id_of(&created);
     let secret = created["secret"].as_str().expect("secret").to_string();
     let expected_url = format!("stub://{id}/{secret}");
-    assert_eq!(created["invite"]["url"], json!(expected_url));
+    assert_eq!(
+        links.resolves.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "create never resolves the envelope through the builder"
+    );
+    assert!(
+        created["invite"].get("url").is_none(),
+        "create leaves url to the transport: {created}"
+    );
     assert_secret_hidden(&created["invite"], &secret);
     let stored = f
         .store

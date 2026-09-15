@@ -940,7 +940,7 @@ pub struct Services {
     /// Arc is built (composition-root wiring, §5.12). Shared across clones.
     server_control: Arc<OnceLock<Arc<dyn intent_core::ServerControl>>>,
     /// Rebuilds an open invite's `intent://invite?…` link for
-    /// `workspace.invite.create` / `.list` (multiplayer w4). Attached after
+    /// `workspace.invite.list` (multiplayer w4). Attached after
     /// the `api` Arc like `server_control` (the transport owns the pairing
     /// envelope); unset means no `url` is stamped. Shared across clones.
     invite_links: Arc<OnceLock<Arc<dyn intent_core::InviteLinkBuilder>>>,
@@ -4254,8 +4254,9 @@ impl Services {
     }
 
     /// Attach the [`InviteLinkBuilder`](intent_core::InviteLinkBuilder) so
-    /// `workspace.invite.create` / `.list` can stamp each open invite with
-    /// its `url` (multiplayer w4). Idempotent like
+    /// `workspace.invite.list` can stamp each open invite with its `url`
+    /// (multiplayer w4; `.create` is stamped by the transport, which resolves
+    /// the envelope itself). Idempotent like
     /// [`attach_server_control`](Self::attach_server_control).
     pub fn attach_invite_link_builder(&self, builder: Arc<dyn intent_core::InviteLinkBuilder>) {
         let _ = self.invite_links.set(builder);
