@@ -585,10 +585,14 @@ mod tests {
     /// recursive. Promotion then subscribes the root and, on storing it,
     /// releases the parent watch — whose recursive unwatch strips the root's
     /// descriptors, so the hub re-registers the root behind the loop's
-    /// completed `wait_live`. With that second registration failing, the loop
-    /// must not stay parked on a dead watch: it re-registers (third call) and
-    /// the recovered watch reports later changes. Linux only, like the hub
-    /// behaviour it exercises.
+    /// completed `wait_live`. With that registration failing, the loop must
+    /// not stay parked on a dead watch: it re-registers and the recovered
+    /// watch reports later changes. Linux only, like the hub behaviour it
+    /// exercises. The `watch()` calls the fault seam counts on `specialists`:
+    /// the recursive parent's descriptor-tracking adds the directory the
+    /// moment it is created (1st), promotion registers it (2nd), the
+    /// parent's retirement re-registers it (3rd, injected failure), and the
+    /// loop recovers (4th).
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[expect(clippy::await_holding_lock)]
@@ -602,7 +606,7 @@ mod tests {
         let root = dir.path.join("specialists");
         let hits = Arc::new(AtomicUsize::new(0));
         let h = Arc::clone(&hits);
-        let fault = WatchFault::nth("specialists", 2);
+        let fault = WatchFault::nth("specialists", 3);
         let hub = SharedWatchHub::with_watch_fault(&fault);
         let watch = watch_root(&hub, root.clone(), md_only, move || {
             h.fetch_add(1, Ordering::SeqCst);
@@ -623,11 +627,12 @@ mod tests {
         drop(sub_wide);
 
         std::fs::create_dir_all(&root).expect("create root");
-        // Promotion registers the root (1st call, live), stores it — releasing
-        // the ancestor watch, whose retirement re-registers the root (2nd
-        // call, injected failure) — and the loop recovers (3rd call).
+        // The parent's descriptor-tracking watches the new directory (1st
+        // call); promotion registers the root (2nd, live), stores it —
+        // releasing the ancestor watch, whose retirement re-registers the
+        // root (3rd, injected failure) — and the loop recovers (4th).
         assert!(
-            wait_for(|| fault.attempts() >= 3, LIVENESS).await,
+            wait_for(|| fault.attempts() >= 4, LIVENESS).await,
             "the lost promoted watch must be re-registered, saw {} watch() calls",
             fault.attempts()
         );
@@ -650,7 +655,7 @@ mod tests {
         );
         assert_eq!(
             fault.attempts(),
-            3,
+            4,
             "exactly one recovery registration must follow the injected failure"
         );
     }
