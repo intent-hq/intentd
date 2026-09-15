@@ -1889,6 +1889,15 @@ mod tests {
         let known = merge_requirements(&p, None, &[], &agg(0, 0), Some(2));
         let wire = serde_json::to_value(&known).unwrap();
         assert_eq!(wire["threads"]["unresolved"], 2);
+        let present: MergeRequirementsThreads = serde_json::from_value(serde_json::json!({
+            "unresolved": 2,
+            "resolutionRequired": true
+        }))
+        .unwrap();
+        assert_eq!(present.unresolved, Some(2));
+        assert_eq!(present.resolution_required, Some(true));
+        let back: MergeRequirements = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.threads.unresolved, Some(2));
         let legacy: MergeRequirementsThreads =
             serde_json::from_value(serde_json::json!({ "resolutionRequired": true })).unwrap();
         assert_eq!(legacy.unresolved, None);
