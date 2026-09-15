@@ -330,6 +330,7 @@ fn golden_supervisor_history_wrapper() {
         content: json!([{ "type": "text", "text": text }]),
         metadata: None,
         app_message_id: None,
+        author: None,
         created_at: "2026-01-02T03:04:05Z".to_string(),
     };
     // The default per-block cap (4000) keeps the golden byte-identical.
@@ -1501,6 +1502,7 @@ fn golden_supervisor_history_truncation_markers() {
         content: blocks,
         metadata: None,
         app_message_id: None,
+        author: None,
         created_at: "2026-01-02T03:04:05Z".to_string(),
     };
     // Two exchanges with a budget that only fits the newest: the omission

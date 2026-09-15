@@ -2852,6 +2852,325 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     srv.ws.stop().await;
 }
 
+/// Multiplayer w2: every human-authored chat entry is stamped with the wire
+/// caller's principal — `agent.sendMessage` (direct persist),
+/// `agent.appendMessage` (`user` role) and `agent.queueMessage` (queue entry
+/// `messageMetadata`) — overwriting whatever `fromPrincipalId` the client
+/// supplied, and `agent.getConversation` / the `agent:message` echo serve a
+/// resolved `author` per user row: the stamp, else the workspace's legacy
+/// author, else its owner (pre-multiplayer rows). Assistant rows carry no
+/// author; a non-user role never gets a stamp.
+#[tokio::test]
+async fn wss_user_messages_stamp_principal_and_serve_author() {
+    use intent_core::{Principal, PrincipalId};
+
+    async fn next_event(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        event_type: &str,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == event_type
+                        {
+                            return v["params"]["event"].clone();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
+    }
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let primary = srv
+        .store
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+
+    // A collaborator with its own credential.
+    let guest_token = "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: Some("Guest User".to_string()),
+        avatar_url: Some("https://example.test/guest.png".to_string()),
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    srv.store.upsert_principal(&guest).await.expect("guest");
+    srv.store
+        .insert_principal_credential(&guest.id, &sha256_hex(guest_token.as_bytes()))
+        .await
+        .expect("guest credential");
+    let guest_ws_call = |frame: String| {
+        let port = srv.port;
+        let cfg = srv.cfg.clone();
+        async move {
+            let url = format!("wss://localhost:{port}/ws?token={guest_token}");
+            let mut ws = common::wss_connect_with_retry(port, cfg, &url).await;
+            ws.send(Message::Text(frame.into())).await.expect("send");
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        return serde_json::from_str::<Value>(&text).expect("json")
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        }
+    };
+
+    // Workspace created by the primary user (owner by trigger); one agent.
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Principal Stamp"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Stamped"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = intent_core::AgentId::from_string(agent_id.clone());
+
+    // A pre-multiplayer row: persisted straight into the store with no
+    // stamp, before any wire write.
+    let legacy_row = srv
+        .store
+        .append_agent_message(
+            &agent,
+            "user",
+            &serde_json::json!([{ "type": "text", "text": "from before sharing" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("legacy row");
+
+    // Subscribe for the live echo before the wire writes.
+    let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub_ws
+        .send(Message::Text(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"events.subscribe","params":{{"eventTypes":["agent:message"],"workspaceId":"{ws_id}"}}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .expect("subscribe");
+    loop {
+        match sub_ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json");
+                if v.get("id") == Some(&serde_json::json!(3)) {
+                    assert!(v["result"]["subscriptionId"].is_string(), "subscribe: {v}");
+                    break;
+                }
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+
+    // Guest sends with a spoofed stamp: the daemon overwrites it.
+    let sent = guest_ws_call(format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.sendMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","content":"hello from guest","messageMetadata":{{"fromPrincipalId":"spoof","kind":"reply"}}}}}}"#
+    ))
+    .await;
+    assert_eq!(sent["result"]["success"], true, "guest send: {sent}");
+    assert_eq!(sent["result"]["queued"], false, "guest send: {sent}");
+    let sent_id = sent["result"]["messageId"]
+        .as_str()
+        .expect("sent message id")
+        .to_string();
+
+    // The live echo carries the resolved author.
+    let echo = next_event(&mut sub_ws, "agent:message").await;
+    assert_eq!(echo["data"]["messageId"], sent_id.as_str());
+    assert_eq!(echo["data"]["role"], "user");
+    assert_eq!(
+        echo["data"]["author"],
+        serde_json::json!({
+            "principalId": guest.id.0,
+            "login": "guest",
+            "displayName": "Guest User",
+            "avatarUrl": "https://example.test/guest.png",
+        }),
+        "agent:message echo carries the resolved author: {echo}"
+    );
+
+    // Primary appends a user row (no client metadata) and an assistant row
+    // with a spoofed stamp (stripped: not human-authored).
+    let appended = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"user","contentBlocks":[{{"type":"text","text":"owner reply"}}]}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(appended["result"]["success"], true, "append: {appended}");
+    let appended_id = appended["result"]["message"]["id"]
+        .as_str()
+        .expect("appended id")
+        .to_string();
+    assert_eq!(
+        appended["result"]["message"]["metadata"]["fromPrincipalId"], primary.id.0,
+        "appendMessage(user) is stamped with the caller: {appended}"
+    );
+    let assistant = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"assistant","contentBlocks":[{{"type":"text","text":"ack"}}],"metadata":{{"fromPrincipalId":"{}"}}}}}}"#,
+            guest.id.0
+        ),
+    )
+    .await;
+    assert_eq!(assistant["result"]["success"], true, "append: {assistant}");
+    assert!(
+        assistant["result"]["message"]
+            .get("metadata")
+            .and_then(|m| m.get("fromPrincipalId"))
+            .is_none(),
+        "a non-user row never carries a stamp: {assistant}"
+    );
+
+    // Read back: every user row resolves an author, assistant rows none.
+    let conv = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let messages = conv["result"]["messages"].as_array().expect("messages");
+    let find = |id: &str| {
+        messages
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap_or_else(|| panic!("message {id} in conversation: {conv}"))
+    };
+    let legacy = find(&legacy_row.id);
+    assert!(
+        legacy.get("metadata").is_none(),
+        "the legacy row stays unstamped: {legacy}"
+    );
+    assert_eq!(
+        legacy["author"]["principalId"], primary.id.0,
+        "an unstamped row resolves to the owner: {legacy}"
+    );
+    let guest_row = find(&sent_id);
+    assert_eq!(
+        guest_row["metadata"]["fromPrincipalId"], guest.id.0,
+        "the persisted row carries the caller's stamp, not the spoofed one: {guest_row}"
+    );
+    assert_eq!(guest_row["metadata"]["kind"], "reply");
+    assert_eq!(guest_row["author"]["principalId"], guest.id.0);
+    assert_eq!(guest_row["author"]["login"], "guest");
+    assert_eq!(guest_row["author"]["displayName"], "Guest User");
+    let owner_row = find(&appended_id);
+    assert_eq!(owner_row["author"]["principalId"], primary.id.0);
+    assert!(
+        messages
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .all(|m| m.get("author").is_none()),
+        "assistant rows carry no author: {conv}"
+    );
+
+    // A legacy author beats the owner for unstamped rows.
+    srv.store
+        .set_workspace_legacy_author_principal_id(
+            &WorkspaceId::from_string(ws_id.clone()),
+            Some(&guest.id),
+        )
+        .await
+        .expect("set legacy author");
+    let conv2 = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let legacy2 = conv2["result"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["id"] == legacy_row.id.as_str())
+        .expect("legacy row");
+    assert_eq!(
+        legacy2["author"]["principalId"], guest.id.0,
+        "legacy_author_principal_id wins over the owner: {legacy2}"
+    );
+    let owner_row2 = conv2["result"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["id"] == appended_id.as_str())
+        .expect("owner row");
+    assert_eq!(
+        owner_row2["author"]["principalId"], primary.id.0,
+        "a stamped row is unaffected by the legacy author: {owner_row2}"
+    );
+
+    // A queued entry captures the stamp on `messageMetadata`.
+    let queued = guest_ws_call(format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"agent.queueMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","content":"queued by guest","messageMetadata":{{"fromPrincipalId":"spoof"}}}}}}"#
+    ))
+    .await;
+    assert_eq!(queued["result"]["success"], true, "queue: {queued}");
+    let queue = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"agent.getQueue","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let entry = queue["result"]["queue"]
+        .as_array()
+        .expect("queue array")
+        .iter()
+        .find(|q| q["content"] == "queued by guest")
+        .unwrap_or_else(|| panic!("queued entry: {queue}"));
+    assert_eq!(
+        entry["messageMetadata"]["fromPrincipalId"], guest.id.0,
+        "queue entry carries the caller's stamp: {entry}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// monorepo#564: `agent.sendMessage` to a nonexistent agent id (e.g. a
 /// truncated id) fails closed with `-32602` naming the unknown id — it must
 /// NOT auto-queue a phantom message (`queued: true`) the sender then waits on
