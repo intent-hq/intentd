@@ -305,6 +305,135 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
     );
 }
 
+/// The "Someone (you)" regression: a principal first seen with an empty
+/// profile whose GitHub identity is persisted later (the lazy `principal.me`
+/// refresh landing after the first `presence.update`) must be renamed in
+/// place — the next `presence:changed` roster, a `note:presence` delta on
+/// every viewed note and `presence.snapshot` all carry the login without the
+/// principal leaving and rejoining. Persisting the same identity again emits
+/// nothing. The row carries the account id already so the refresh passes the
+/// same-account guard of a locked identity (the fixture has two principals).
+#[tokio::test]
+async fn profile_persisted_after_first_sight_refreshes_rosters_without_a_reconnect() {
+    use crate::events::SubscriptionFilter;
+    use intent_core::events::{NOTE_PRESENCE, PRESENCE_CHANGED};
+    use intent_core::{with_caller, NoteId};
+    let tmp = crate::tests::TempDb::new();
+    let root = crate::tests::WorkspacesRoot::new();
+    let (store, services, ws, caller) = member_services(&tmp, &root).await;
+    let principal = caller.principal_id().cloned().expect("wire caller");
+    let mut row = store.get_principal(&principal).await.expect("principal");
+    row.github_user_id = Some(583_231);
+    row.login = None;
+    store.upsert_principal(&row).await.expect("empty profile");
+    let note = NoteId::from("spec");
+    let mut sub = services
+        .event_bus
+        .as_ref()
+        .expect("bus")
+        .subscribe(SubscriptionFilter {
+            event_types: vec![PRESENCE_CHANGED.to_string(), NOTE_PRESENCE.to_string()],
+            workspace_id: Some(ws.to_string()),
+            ..Default::default()
+        });
+    let next = |batch: Option<Vec<intent_core::Event>>| -> Vec<(String, Value)> {
+        batch
+            .expect("bus open")
+            .into_iter()
+            .map(|e| (e.event_type, e.data))
+            .collect()
+    };
+    let roster_login = |data: &Value| -> Value {
+        let members = data["members"].as_array().expect("members");
+        assert_eq!(members.len(), 1, "{data}");
+        members[0]["login"].clone()
+    };
+
+    with_caller(caller.clone(), async {
+        services
+            .presence_connect_op("conn-1".into())
+            .await
+            .expect("hello");
+        services
+            .note_presence_join_op("conn-1".into(), "lease-1".into(), ws.clone(), note.clone())
+            .await
+            .expect("subscribe");
+    })
+    .await;
+    let seen = next(sub.recv().await);
+    assert_eq!(seen[0].0, PRESENCE_CHANGED);
+    assert_eq!(
+        roster_login(&seen[0].1),
+        Value::Null,
+        "seen before identity"
+    );
+    let joined = next(sub.recv().await);
+    assert_eq!(joined[0].0, NOTE_PRESENCE);
+    assert_eq!(joined[0].1["kind"], "joined");
+    assert_eq!(joined[0].1["login"], Value::Null);
+
+    let identity = intent_sourcecontrol::UserIdentity {
+        login: "octocat".to_string(),
+        id: Some(583_231),
+        name: Some("The Octocat".to_string()),
+        avatar_url: Some("https://avatars.example/octocat".to_string()),
+        html_url: None,
+    };
+    let applied = services
+        .apply_primary_identity(row.clone(), &identity)
+        .await
+        .expect("identity applied");
+    assert_eq!(applied.login.as_deref(), Some("octocat"));
+
+    let renamed = next(sub.recv().await);
+    assert_eq!(renamed[0].0, NOTE_PRESENCE);
+    assert_eq!(renamed[0].1["kind"], "updated");
+    assert_eq!(renamed[0].1["login"], "octocat");
+    assert_eq!(renamed[0].1["displayName"], "The Octocat");
+    assert_eq!(renamed[0].1["noteId"], "spec");
+    assert_eq!(renamed[0].1["cursor"], Value::Null);
+    let renamed = next(sub.recv().await);
+    assert_eq!(renamed[0].0, PRESENCE_CHANGED);
+    assert_eq!(roster_login(&renamed[0].1), "octocat", "{:?}", renamed[0].1);
+    assert_eq!(
+        renamed[0].1["members"][0]["avatarUrl"],
+        "https://avatars.example/octocat"
+    );
+
+    let snapshot = with_caller(caller.clone(), services.presence_snapshot_op(ws.clone()))
+        .await
+        .expect("snapshot");
+    assert_eq!(roster_login(&snapshot), "octocat");
+    assert_eq!(
+        services.presence.lock().conns.len(),
+        1,
+        "the connection never left"
+    );
+
+    services
+        .apply_primary_identity(applied, &identity)
+        .await
+        .expect("idempotent");
+    let quiet = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
+    assert!(
+        quiet.is_err(),
+        "an unchanged profile re-emits nothing: {quiet:?}"
+    );
+}
+
+/// A principal presence has never seen leaves no cache entry behind: the
+/// refresh is a no-op rather than an unbounded insert.
+#[tokio::test]
+async fn profile_refresh_skips_a_principal_presence_never_saw() {
+    let tmp = crate::tests::TempDb::new();
+    let root = crate::tests::WorkspacesRoot::new();
+    let (store, services, _ws, caller) = member_services(&tmp, &root).await;
+    let principal = caller.principal_id().cloned().expect("wire caller");
+    let row = store.get_principal(&principal).await.expect("principal");
+    services.presence_profile_changed(&row).await;
+    assert!(services.presence.lock().profiles.is_empty());
+}
+
 #[test]
 fn parse_update_accepts_focus_set_and_optional_typing() {
     let (focus, typing) = parse_update(&json!({
