@@ -249,6 +249,13 @@ fn main() -> ExitCode {
         std::sync::atomic::Ordering::Relaxed,
     );
     std::env::remove_var(UPDATE_RESTART_ENV);
+    // Same capture-and-scrub for the sitter's idle-restart handshake marker:
+    // a leaked marker would make a nested daemon signal a non-sitter parent.
+    SITTER_IDLE_RESTART.store(
+        env_flag(SITTER_IDLE_RESTART_ENV),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    std::env::remove_var(SITTER_IDLE_RESTART_ENV);
     // Parse the CLI here too — before the tokio runtime — so `serve
     // --specialists-dir` can fold into INTENTD_SPECIALISTS_DIR while
     // `env::set_var` is still sound (the flag wins over an inherited env
@@ -298,7 +305,13 @@ async fn async_main(cli: Cli) -> ExitCode {
             resume_all,
             // Folded into INTENTD_SPECIALISTS_DIR in `main()`, pre-runtime.
             specialists_dir: _,
-        } => to_exit(cmd_serve(mode.as_deref(), insecure, resume_all).await),
+        } => match cmd_serve(mode.as_deref(), insecure, resume_all).await {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
@@ -1387,6 +1400,36 @@ const UPDATE_RESTART_ENV: &str = "INTENTD_UPDATE_RESTART";
 /// scrubbed. Read by `cmd_serve` for the startup resume decision.
 static UPDATE_RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Env var the sitter sets on a supervised `serve` child to advertise the
+/// idle-mode restart handshake (see
+/// `intentd_sitter::supervisor::IDLE_RESTART_ENV`): the daemon may send the
+/// sitter SIGUSR2 to stage an update, and receives SIGUSR2 back once a newer
+/// version is staged. Captured into [`SITTER_IDLE_RESTART`] and scrubbed in
+/// `main()` like [`UPDATE_RESTART_ENV`].
+const SITTER_IDLE_RESTART_ENV: &str = "INTENTD_SITTER_IDLE_RESTART";
+
+/// Whether the supervising sitter advertised the idle-mode restart handshake:
+/// the value of [`SITTER_IDLE_RESTART_ENV`] captured in `main()`. Gates the
+/// idle update requester and the SIGUSR2 exit-when-idle path — an older
+/// sitter has no SIGUSR2 handler, and the default disposition would kill it.
+static SITTER_IDLE_RESTART: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Exit code by which a supervised daemon asks the sitter to respawn it on
+/// the staged version once idle (its answer to SIGUSR2). Mirrors
+/// `intentd_sitter::supervisor::RESTART_FOR_UPDATE_EXIT_CODE`; keep both in
+/// sync.
+#[cfg(unix)]
+const RESTART_FOR_UPDATE_EXIT_CODE: u8 = 75;
+
+/// Cadence of the idle update requester tick.
+#[cfg(unix)]
+const IDLE_UPDATE_TICK: Duration = Duration::from_secs(30);
+
+/// Cadence at which a pending staged restart re-checks for an idle daemon.
+#[cfg(unix)]
+const STAGED_RESTART_POLL: Duration = Duration::from_secs(1);
+
 /// Exit status mirroring a default-disposition SIGPIPE death (128 + 13), the
 /// code shells report for standard Unix tools whose output pipe closes early.
 const SIGPIPE_EXIT_CODE: i32 = 141;
@@ -1456,7 +1499,15 @@ fn banner_build_commit(build_commit: Option<&str>) -> &str {
     build_commit.unwrap_or("unknown")
 }
 
-async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyhow::Result<()> {
+/// Runs the daemon to completion. `Ok` carries the process exit code:
+/// success after a plain graceful shutdown, [`RESTART_FOR_UPDATE_EXIT_CODE`]
+/// when the shutdown was the sitter's staged-update handshake firing once
+/// idle.
+async fn cmd_serve(
+    mode: Option<&str>,
+    insecure: bool,
+    resume_all: bool,
+) -> anyhow::Result<ExitCode> {
     // Build-identity banner as the first serve log line so every log file
     // opens with which build produced it (monorepo#3649). Same identity
     // values `system.info` and the hello handshake expose.
@@ -2280,6 +2331,30 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         "control OnceLock should only be set once"
     );
 
+    // Sitter idle-update handshake (unix only): the requester asks the sitter
+    // for an idle-mode update check (SIGUSR2) while no turn is in flight, and
+    // the staged-restart watcher answers the sitter's SIGUSR2 ("a newer
+    // version is staged") by exiting with RESTART_FOR_UPDATE_EXIT_CODE the
+    // moment `list_busy()` drains. Both are gated on the sitter having
+    // advertised the handshake via INTENTD_SITTER_IDLE_RESTART.
+    #[cfg(unix)]
+    let idle_update_state = Arc::new(IdleUpdateState::new(
+        SITTER_IDLE_RESTART.load(std::sync::atomic::Ordering::Relaxed),
+    ));
+    #[cfg(unix)]
+    let staged_restart_watcher = spawn_staged_restart_watcher(
+        manager.clone(),
+        idle_update_state.clone(),
+        shutdown_notify.clone(),
+    );
+    #[cfg(unix)]
+    let idle_update_requester = spawn_idle_update_requester(
+        manager.clone(),
+        settings_registry.clone(),
+        control.sitter_pid_path.clone(),
+        idle_update_state.clone(),
+    );
+
     // Auto-resume interrupted agents at startup. `--resume-all` forces the
     // sweep, as does an update-triggered restart (the sitter sets
     // `INTENTD_UPDATE_RESTART=1` when it respawns a different version than
@@ -2537,6 +2612,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     retention_task.abort();
     idempotency_reap_task.abort();
     merge_retry_task.abort();
+    #[cfg(unix)]
+    {
+        idle_update_requester.abort();
+        staged_restart_watcher.abort();
+    }
     // Drop the watcher registry (and every filesystem/skills/specialists watch
     // it owns) plus the config.toml live-reload watch by aborting the tasks
     // that hold them.
@@ -2593,7 +2673,15 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // is visible to the next daemon instance.
     shutdown_store.close().await;
 
-    Ok(())
+    #[cfg(unix)]
+    if idle_update_state.restart_exit_fired() {
+        tracing::info!(
+            exit_code = RESTART_FOR_UPDATE_EXIT_CODE,
+            "exiting for staged update restart"
+        );
+        return Ok(ExitCode::from(RESTART_FOR_UPDATE_EXIT_CODE));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Live daemon control surface backing `system.status`, `system.shutdown`, and
@@ -4441,6 +4529,328 @@ fn sitter_update_supported(pid_path: &Path) -> bool {
 #[cfg(not(unix))]
 fn sitter_update_supported(_pid_path: &Path) -> bool {
     false
+}
+
+/// Idle-mode counterpart of [`signal_sitter_update_with_parent`]: the same
+/// supervision check, but SIGUSR2 — the sitter's "check for updates and only
+/// STAGE what you find" signal (it answers with SIGUSR2 to the daemon once a
+/// newer version is staged; see `spawn_staged_restart_watcher`). Callers must
+/// hold the [`SITTER_IDLE_RESTART`] gate: an older sitter has no SIGUSR2
+/// handler and the default disposition would terminate it.
+#[cfg(unix)]
+fn signal_sitter_idle_update_with_parent(
+    pid_path: &Path,
+    expected_parent: u32,
+) -> Result<(), String> {
+    let pid = supervising_sitter_pid(pid_path, expected_parent).ok_or_else(|| {
+        format!(
+            "daemon is not supervised by intentd-sitter (pid in {} is not the daemon's parent)",
+            pid_path.display()
+        )
+    })?;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid.cast_signed()),
+        nix::sys::signal::Signal::SIGUSR2,
+    )
+    .map_err(|e| format!("failed to signal intentd-sitter (pid {pid}): {e}"))?;
+    tracing::info!(
+        sitter_pid = pid,
+        "sent SIGUSR2 to intentd-sitter (idle update check)"
+    );
+    Ok(())
+}
+
+/// Shared state of the sitter idle-update handshake: written by the idle
+/// update requester (`timing`) and the SIGUSR2 staged-restart watcher
+/// (`restart_pending`, `restart_exit`), read by the serve loop's exit-code
+/// decision and available to `system.status` reporters.
+#[cfg(unix)]
+struct IdleUpdateState {
+    /// The sitter advertised the handshake at boot ([`SITTER_IDLE_RESTART`]).
+    advertised: bool,
+    /// Process start; the first idle request interval counts from here.
+    boot_at: std::time::Instant,
+    /// The sitter announced a staged version: the daemon exits with
+    /// [`RESTART_FOR_UPDATE_EXIT_CODE`] as soon as it is idle. Suppresses
+    /// further idle update requests meanwhile.
+    restart_pending: std::sync::atomic::AtomicBool,
+    /// The exit-when-idle actually fired the shutdown, so the exit code must
+    /// be the restart code — distinct from `restart_pending` so an unrelated
+    /// SIGTERM arriving while a restart is pending still exits cleanly.
+    restart_exit: std::sync::atomic::AtomicBool,
+    /// Requester bookkeeping, refreshed on every tick.
+    timing: std::sync::Mutex<IdleUpdateTiming>,
+}
+
+/// Idle update requester bookkeeping (see [`IdleUpdateState::timing`]).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct IdleUpdateTiming {
+    /// Start of the current continuous-idle stretch; `None` while a turn is
+    /// in flight.
+    idle_since: Option<std::time::Instant>,
+    /// When SIGUSR2 was last sent (or last failed to send).
+    last_request_at: Option<std::time::Instant>,
+    /// Earliest instant the interval rule allows another request (the later
+    /// of boot and the last request, plus the interval); `None` while the
+    /// requester is disabled (handshake not advertised or `checkOnIdle` off).
+    next_eligible_at: Option<std::time::Instant>,
+}
+
+#[cfg(unix)]
+impl IdleUpdateState {
+    fn new(advertised: bool) -> Self {
+        Self {
+            advertised,
+            boot_at: std::time::Instant::now(),
+            restart_pending: std::sync::atomic::AtomicBool::new(false),
+            restart_exit: std::sync::atomic::AtomicBool::new(false),
+            timing: std::sync::Mutex::new(IdleUpdateTiming::default()),
+        }
+    }
+
+    fn is_restart_pending(&self) -> bool {
+        self.restart_pending
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn restart_exit_fired(&self) -> bool {
+        self.restart_exit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn timing(&self) -> IdleUpdateTiming {
+        *self
+            .timing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_timing(&self, timing: IdleUpdateTiming) {
+        *self
+            .timing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = timing;
+    }
+}
+
+/// Inputs to the idle update requester decision (see
+/// [`should_request_idle_update`]); the `updates.*` fields are re-read from
+/// the live settings on every tick.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IdleUpdatePolicy {
+    /// The sitter advertised the handshake at boot ([`SITTER_IDLE_RESTART`]).
+    advertised: bool,
+    /// `updates.checkOnIdle`.
+    check_on_idle: bool,
+    /// `updates.idleCheckIntervalMinutes` (clamped), as a duration.
+    interval: Duration,
+    /// `updates.idleGraceSeconds` (clamped), as a duration.
+    grace: Duration,
+}
+
+#[cfg(unix)]
+impl IdleUpdatePolicy {
+    fn from_settings(
+        advertised: bool,
+        updates: &intent_core::settings_file::UpdatesSettings,
+    ) -> Self {
+        Self {
+            advertised,
+            check_on_idle: updates.check_on_idle,
+            interval: Duration::from_secs(
+                u64::from(updates.effective_idle_check_interval_minutes()) * 60,
+            ),
+            grace: Duration::from_secs(u64::from(updates.effective_idle_grace_seconds())),
+        }
+    }
+}
+
+/// Pure decision for one idle update requester tick: send SIGUSR2 to the
+/// sitter now exactly when the handshake is advertised, `checkOnIdle` is on,
+/// no staged restart is pending, the daemon has been continuously idle
+/// (`idle_since`, `None` while a turn is in flight) for at least the grace,
+/// and at least the interval has elapsed since the later of process start
+/// and the last request (sent or failed).
+#[cfg(unix)]
+fn should_request_idle_update(
+    now: std::time::Instant,
+    boot_at: std::time::Instant,
+    idle_since: Option<std::time::Instant>,
+    last_request_at: Option<std::time::Instant>,
+    restart_pending: bool,
+    policy: &IdleUpdatePolicy,
+) -> bool {
+    if !policy.advertised || !policy.check_on_idle || restart_pending {
+        return false;
+    }
+    let Some(idle_since) = idle_since else {
+        return false;
+    };
+    if now.saturating_duration_since(idle_since) < policy.grace {
+        return false;
+    }
+    let interval_from = last_request_at.map_or(boot_at, |last| last.max(boot_at));
+    now.saturating_duration_since(interval_from) >= policy.interval
+}
+
+/// [`IdleUpdateTiming::next_eligible_at`] for one tick: the later of boot and
+/// the last request plus the interval, or `None` while the requester is
+/// disabled by the policy.
+#[cfg(unix)]
+fn next_eligible_at(
+    boot_at: std::time::Instant,
+    last_request_at: Option<std::time::Instant>,
+    policy: &IdleUpdatePolicy,
+) -> Option<std::time::Instant> {
+    if !policy.advertised || !policy.check_on_idle {
+        return None;
+    }
+    let interval_from = last_request_at.map_or(boot_at, |last| last.max(boot_at));
+    interval_from.checked_add(policy.interval)
+}
+
+/// Spawn the idle update requester: every [`IDLE_UPDATE_TICK`] it tracks
+/// whether any turn is in flight (`AgentManager::list_busy` — hooks, PR
+/// monitors, subscriptions, queued messages and idle agents never count),
+/// and when [`should_request_idle_update`] holds and the daemon is
+/// sitter-supervised, sends the sitter SIGUSR2. A failed signal is logged and
+/// still counts for the interval; an unsupervised tick does not. Idleness is
+/// sampled per tick, so a turn that starts and ends between two ticks does
+/// not reset the grace. Each tick publishes its bookkeeping to
+/// [`IdleUpdateState::timing`].
+#[cfg(unix)]
+fn spawn_idle_update_requester(
+    manager: Arc<AgentManager>,
+    settings_registry: Arc<intent_services::SettingsRegistry>,
+    sitter_pid_path: PathBuf,
+    state: Arc<IdleUpdateState>,
+) -> tokio::task::JoinHandle<()> {
+    if !state.advertised {
+        tracing::debug!(
+            "sitter did not advertise the idle-restart handshake; idle update requests disabled"
+        );
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(IDLE_UPDATE_TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let now = std::time::Instant::now();
+            let mut timing = state.timing();
+            let busy = manager.list_busy().len();
+            if busy > 0 {
+                timing.idle_since = None;
+            } else if timing.idle_since.is_none() {
+                timing.idle_since = Some(now);
+            }
+            let policy = IdleUpdatePolicy::from_settings(
+                state.advertised,
+                &settings_registry.snapshot().effective.updates,
+            );
+            let restart_pending = state.is_restart_pending();
+            let request = should_request_idle_update(
+                now,
+                state.boot_at,
+                timing.idle_since,
+                timing.last_request_at,
+                restart_pending,
+                &policy,
+            );
+            let parent = std::os::unix::process::parent_id();
+            let supervised = request && supervising_sitter_pid(&sitter_pid_path, parent).is_some();
+            if supervised {
+                timing.last_request_at = Some(now);
+            }
+            timing.next_eligible_at =
+                next_eligible_at(state.boot_at, timing.last_request_at, &policy);
+            state.set_timing(timing);
+            if !request {
+                tracing::debug!(
+                    busy,
+                    idle_secs = timing
+                        .idle_since
+                        .map(|t| now.saturating_duration_since(t).as_secs()),
+                    restart_pending,
+                    check_on_idle = policy.check_on_idle,
+                    "idle update requester: tick skipped"
+                );
+                continue;
+            }
+            if !supervised {
+                tracing::debug!("idle update requester: daemon is not sitter-supervised; skipped");
+                continue;
+            }
+            if let Err(e) = signal_sitter_idle_update_with_parent(&sitter_pid_path, parent) {
+                tracing::warn!(error = %e, "idle update requester: failed to signal intentd-sitter");
+            }
+        }
+    })
+}
+
+/// Spawn the staged-restart watcher: installs the SIGUSR2 handler (the
+/// sitter's "a newer version is staged; exit when idle"), and on receipt
+/// marks the restart pending and triggers the graceful shutdown as soon as
+/// `list_busy()` is empty — immediately if already idle, otherwise polled
+/// every [`STAGED_RESTART_POLL`] with no cap (the sitter's periodic check is
+/// the forced fallback). The serve loop then exits with
+/// [`RESTART_FOR_UPDATE_EXIT_CODE`]. Installed even when the handshake was
+/// not advertised so a stray SIGUSR2 cannot kill the daemon via the default
+/// disposition; it is then logged and ignored.
+#[cfg(unix)]
+fn spawn_staged_restart_watcher(
+    manager: Arc<AgentManager>,
+    state: Arc<IdleUpdateState>,
+    shutdown: Arc<tokio::sync::Notify>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut usr2 = match signal(SignalKind::user_defined2()) {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install the SIGUSR2 handler; staged update restarts disabled");
+                return;
+            }
+        };
+        loop {
+            if usr2.recv().await.is_none() {
+                return;
+            }
+            if !state.advertised {
+                tracing::warn!(
+                    "SIGUSR2 received but the supervisor did not advertise the idle-restart handshake; ignored"
+                );
+                continue;
+            }
+            if state.is_restart_pending() {
+                tracing::debug!(
+                    "SIGUSR2 received while a staged update restart is already pending"
+                );
+                continue;
+            }
+            state
+                .restart_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("staged update restart accepted; exiting once no turn is in flight");
+            loop {
+                let busy = manager.list_busy().len();
+                if busy == 0 {
+                    break;
+                }
+                tracing::debug!(busy, "staged update restart waiting for in-flight turns");
+                tokio::time::sleep(STAGED_RESTART_POLL).await;
+            }
+            state
+                .restart_exit
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                exit_code = RESTART_FOR_UPDATE_EXIT_CODE,
+                "daemon idle; exiting for staged update restart"
+            );
+            shutdown.notify_one();
+            return;
+        }
+    })
 }
 
 /// Local-transport liveness probe: a successful connect means a daemon is
@@ -6921,6 +7331,185 @@ mod tests {
             child.kill().unwrap();
             child.wait().unwrap();
         }
+    }
+
+    /// The idle-mode signal shares the supervision gate with
+    /// `signal_sitter_update` (non-parent pids rejected) and sends SIGUSR2,
+    /// never SIGUSR1: the stand-in (default disposition for both) must die by
+    /// SIGUSR2.
+    #[cfg(unix)]
+    #[test]
+    fn signal_sitter_idle_update_sends_sigusr2_to_the_parent_sitter() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let mut child = spawn_stand_in_sitter(dir.path(), "intentd-sitter");
+        std::fs::write(&path, format!("{}\n", child.id())).unwrap();
+
+        let err = signal_sitter_idle_update_with_parent(&path, std::os::unix::process::parent_id())
+            .unwrap_err();
+        assert!(err.contains("not supervised"), "{err}");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "rejected pid must not be signaled"
+        );
+
+        signal_sitter_idle_update_with_parent(&path, child.id()).unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(nix::sys::signal::Signal::SIGUSR2 as i32),
+            "sitter must be terminated by SIGUSR2"
+        );
+    }
+
+    /// `IdleUpdatePolicy` applies the settings clamps (the sitter contract's
+    /// floors) and converts minutes/seconds to durations.
+    #[cfg(unix)]
+    #[test]
+    fn idle_update_policy_applies_settings_clamps() {
+        use intent_core::config::{
+            MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, MIN_UPDATES_IDLE_GRACE_SECONDS,
+        };
+        use intent_core::settings_file::UpdatesSettings;
+        let below = UpdatesSettings {
+            check_on_idle: true,
+            idle_check_interval_minutes: 0,
+            idle_grace_seconds: 0,
+        };
+        let policy = IdleUpdatePolicy::from_settings(true, &below);
+        assert_eq!(
+            policy,
+            IdleUpdatePolicy {
+                advertised: true,
+                check_on_idle: true,
+                interval: Duration::from_secs(
+                    u64::from(MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES) * 60
+                ),
+                grace: Duration::from_secs(u64::from(MIN_UPDATES_IDLE_GRACE_SECONDS)),
+            }
+        );
+
+        let above = UpdatesSettings {
+            check_on_idle: false,
+            idle_check_interval_minutes: 90,
+            idle_grace_seconds: 600,
+        };
+        let policy = IdleUpdatePolicy::from_settings(false, &above);
+        assert_eq!(
+            policy,
+            IdleUpdatePolicy {
+                advertised: false,
+                check_on_idle: false,
+                interval: Duration::from_secs(90 * 60),
+                grace: Duration::from_secs(600),
+            }
+        );
+    }
+
+    /// The requester decision: fires only when advertised + `checkOnIdle` +
+    /// no pending restart + continuously idle ≥ grace + interval elapsed since
+    /// the later of boot and the last request; busy (`idle_since == None`)
+    /// never fires.
+    #[cfg(unix)]
+    #[test]
+    fn should_request_idle_update_gates() {
+        use std::time::Instant;
+        let policy = IdleUpdatePolicy {
+            advertised: true,
+            check_on_idle: true,
+            interval: Duration::from_secs(600),
+            grace: Duration::from_secs(60),
+        };
+        let boot = Instant::now();
+        let at = |secs: u64| boot + Duration::from_secs(secs);
+        let decide = |now, idle_since, last, pending, policy: &IdleUpdatePolicy| {
+            should_request_idle_update(now, boot, idle_since, last, pending, policy)
+        };
+
+        // Idle since boot, grace met, interval met ⇒ fire.
+        assert!(decide(at(600), Some(boot), None, false, &policy));
+        // Interval counts from boot: idle long enough but too soon after start.
+        assert!(!decide(at(599), Some(boot), None, false, &policy));
+        // Grace not met: became idle recently.
+        assert!(!decide(at(700), Some(at(650)), None, false, &policy));
+        assert!(decide(at(710), Some(at(650)), None, false, &policy));
+        // A turn in flight never fires.
+        assert!(!decide(at(700), None, None, false, &policy));
+        // Interval from the last request (later than boot).
+        assert!(!decide(at(1199), Some(boot), Some(at(600)), false, &policy));
+        assert!(decide(at(1200), Some(boot), Some(at(600)), false, &policy));
+        // Pending staged restart suppresses further requests.
+        assert!(!decide(at(1200), Some(boot), None, true, &policy));
+        // checkOnIdle off / handshake not advertised ⇒ never.
+        let off = IdleUpdatePolicy {
+            check_on_idle: false,
+            ..policy
+        };
+        assert!(!decide(at(1200), Some(boot), None, false, &off));
+        let not_advertised = IdleUpdatePolicy {
+            advertised: false,
+            ..policy
+        };
+        assert!(!decide(at(1200), Some(boot), None, false, &not_advertised));
+    }
+
+    /// The exit-code decision is keyed on `restart_exit` (the exit-when-idle
+    /// actually fired), not `restart_pending`: an unrelated shutdown while a
+    /// restart is pending must still exit cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn staged_restart_exit_is_distinct_from_pending() {
+        let state = IdleUpdateState::new(true);
+        assert!(state.advertised);
+        assert!(!state.is_restart_pending());
+        assert!(!state.restart_exit_fired());
+        assert_eq!(state.timing(), IdleUpdateTiming::default());
+        state
+            .restart_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(state.is_restart_pending());
+        assert!(!state.restart_exit_fired());
+        state
+            .restart_exit
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(state.restart_exit_fired());
+    }
+
+    /// `next_eligible_at` (published for `system.status`) is the later of
+    /// boot and the last request plus the interval, and `None` while the
+    /// requester is disabled.
+    #[cfg(unix)]
+    #[test]
+    fn next_eligible_at_tracks_boot_then_last_request() {
+        use std::time::Instant;
+        let policy = IdleUpdatePolicy {
+            advertised: true,
+            check_on_idle: true,
+            interval: Duration::from_secs(600),
+            grace: Duration::from_secs(60),
+        };
+        let boot = Instant::now();
+        assert_eq!(
+            next_eligible_at(boot, None, &policy),
+            Some(boot + Duration::from_secs(600))
+        );
+        let last = boot + Duration::from_secs(900);
+        assert_eq!(
+            next_eligible_at(boot, Some(last), &policy),
+            Some(last + Duration::from_secs(600))
+        );
+        let off = IdleUpdatePolicy {
+            check_on_idle: false,
+            ..policy
+        };
+        assert_eq!(next_eligible_at(boot, Some(last), &off), None);
+        let not_advertised = IdleUpdatePolicy {
+            advertised: false,
+            ..policy
+        };
+        assert_eq!(next_eligible_at(boot, Some(last), &not_advertised), None);
     }
 
     #[test]

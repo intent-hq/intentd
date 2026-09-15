@@ -5130,7 +5130,9 @@ impl AgentManager {
 
     /// Snapshot every agent with a turn currently in flight together with its
     /// owning workspace. This is the daemon-global source for
-    /// `agent.listActive`; it never scans persisted workspaces or sessions.
+    /// `agent.listActive` and the composition root's idle gate for the
+    /// sitter update handshake; it never scans persisted workspaces or
+    /// sessions.
     ///
     /// Lock-order invariant: `busy` is always acquired before `agent_ws`
     /// (here and in every `busy/agent_ws` mutator — `try_begin`,
@@ -5138,7 +5140,11 @@ impl AgentManager {
     /// while holding the `busy` lock. That makes a claim/release visible
     /// atomically from this snapshot's perspective: a busy agent always has
     /// its `agent_ws` entry.
-    pub(crate) fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
         let busy = self.busy.lock().unwrap();
         let agent_ws = self.agent_ws.lock().unwrap();
         let mut active = busy
