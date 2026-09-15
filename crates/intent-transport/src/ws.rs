@@ -568,6 +568,13 @@ impl WsInner {
         } else {
             ResolvedCredential::Legacy
         };
+        // Port forwarding is owner-only (multiplayer w3): the `/tunnel` mux
+        // reaches host loopback, so a per-principal (collaborator) credential
+        // is refused at the upgrade — the fe renders "Only the workspace
+        // owner can open forwarded ports" instead of a connection failure.
+        if path == "/tunnel" && matches!(credential, ResolvedCredential::Principal(_)) {
+            return reject(&mut stream, 403, "Forbidden").await;
+        }
         let caller = credential.into_caller(self.api.as_ref()).await;
         let Some(key) = ws_key else {
             return reject(&mut stream, 400, "Bad Request").await;
@@ -726,7 +733,12 @@ impl WsInner {
         let (app_tx, mut app_rx) = conn::outbound_channel();
         let mut subs = ConnSubs::default();
         let mut forwards = ForwardRegistry::default();
-        let reverse = ReverseChannel::new(app_tx.priority_sender());
+        // A connection bound to a non-administrator principal never serves
+        // reverse RPCs and is never an eligible reverse target (multiplayer
+        // w3); an unbound legacy-token connection keeps the administrator
+        // default (see `context::is_non_administrator_caller`).
+        let reverse = ReverseChannel::new(app_tx.priority_sender())
+            .with_administrator(caller.as_ref().is_none_or(Caller::is_administrator));
         // REV-2: register this connection's reverse channel with the shared
         // target registry; it becomes an eligible `browser.exec` target once
         // `client.hello` binds an identity advertising `browserExec`. The

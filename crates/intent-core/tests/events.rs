@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use intent_core::events::{
-    is_known_event_type, DiscriminatorKind, EventDiscriminator, ALL_EVENT_TYPES,
-    EVENT_DISCRIMINATORS,
+    is_collaborator_event_type, is_known_event_type, DiscriminatorKind, EventDiscriminator,
+    ALL_EVENT_TYPES, COLLABORATOR_EVENT_TYPES, EVENT_DISCRIMINATORS,
 };
 use intent_core::is_known_event_type as re_exported_is_known_event_type;
 use serde_json::{json, Value};
@@ -200,6 +200,159 @@ fn discriminator_table_is_well_formed() {
     }
     assert!(seen.contains("task:ready-tasks-changed"));
     assert!(seen.contains("workspace:updated"));
+}
+
+/// Multiplayer w3 golden: the event types a non-administrator principal never
+/// receives — the refused remainder of [`ALL_EVENT_TYPES`] after
+/// [`COLLABORATOR_EVENT_TYPES`]. Sorted; every taxonomy entry must appear in
+/// exactly one of the two lists, so adding an event type forces an explicit
+/// classification (a new owner-only type is added here, a guest-visible one
+/// gets a vetting note in `COLLABORATOR_EVENT_TYPES`).
+const COLLABORATOR_REFUSED_EVENT_TYPES: &[&str] = &[
+    "agent:delivery-confirmed",
+    "agent:event-delivery-failed",
+    "agent:event-delivery-timeout",
+    "agent:message:delivery-failed",
+    "agent:message:received",
+    "agent:message:sent",
+    "agent:permission:request",
+    "agent:permission:resolved",
+    "agent:subscribed",
+    "agent:subscriptions-restored",
+    "agent:unsubscribed",
+    "agent:woken-by-subscription",
+    "app:ui-highlight",
+    "app:ui-navigate",
+    "app:workspace-open",
+    "browser:tab-closed",
+    "browser:tab-opened",
+    "browser:tab-updated",
+    "build:completed",
+    "build:started",
+    "client:connected",
+    "client:disconnected",
+    "git:clone:done",
+    "git:clone:progress",
+    "gitRoot:registered",
+    "gitRoot:unregistered",
+    "gitRoot:updated",
+    "github:auth-changed",
+    "hook:run-completed",
+    "hook:run-started",
+    "host:exec:exit",
+    "host:exec:stderr",
+    "host:exec:stdout",
+    "mcp.servers:status-changed",
+    "mcp:notification",
+    "script:changed",
+    "script:output",
+    "script:state",
+    "settings:changed",
+    "terminal:command",
+    "terminal:cwd",
+    "terminal:data",
+    "terminal:exit",
+    "terminal:title",
+    "test:completed",
+    "test:started",
+    "workspace:transfer:failed",
+    "workspace:transfer:progress",
+    "workspace:transfer:ready",
+];
+
+#[test]
+fn collaborator_event_types_are_sorted_unique_vetted_and_canonical() {
+    let types: Vec<&str> = COLLABORATOR_EVENT_TYPES.iter().map(|(t, _)| *t).collect();
+    let mut sorted = types.clone();
+    sorted.sort_unstable();
+    assert_eq!(types, sorted, "COLLABORATOR_EVENT_TYPES must be sorted");
+    let unique: BTreeSet<&str> = types.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        types.len(),
+        "COLLABORATOR_EVENT_TYPES must contain no duplicates"
+    );
+    for (ty, note) in COLLABORATOR_EVENT_TYPES {
+        assert!(
+            !note.trim().is_empty(),
+            "collaborator event type `{ty}` needs a vetting note"
+        );
+        assert!(
+            is_known_event_type(ty),
+            "collaborator event type `{ty}` is not in ALL_EVENT_TYPES"
+        );
+        assert!(is_collaborator_event_type(ty));
+    }
+}
+
+#[test]
+fn every_canonical_type_is_classified_for_collaborators_exactly_once() {
+    let allowed: BTreeSet<&str> = COLLABORATOR_EVENT_TYPES.iter().map(|(t, _)| *t).collect();
+    let refused: BTreeSet<&str> = COLLABORATOR_REFUSED_EVENT_TYPES.iter().copied().collect();
+
+    let mut sorted_refused = COLLABORATOR_REFUSED_EVENT_TYPES.to_vec();
+    sorted_refused.sort_unstable();
+    assert_eq!(
+        COLLABORATOR_REFUSED_EVENT_TYPES,
+        sorted_refused.as_slice(),
+        "COLLABORATOR_REFUSED_EVENT_TYPES must be sorted"
+    );
+    assert_eq!(
+        refused.len(),
+        COLLABORATOR_REFUSED_EVENT_TYPES.len(),
+        "COLLABORATOR_REFUSED_EVENT_TYPES must contain no duplicates"
+    );
+
+    let both: Vec<&&str> = allowed.intersection(&refused).collect();
+    assert!(
+        both.is_empty(),
+        "classified as both allowed and refused: {both:?}"
+    );
+
+    let unclassified: Vec<&&str> = ALL_EVENT_TYPES
+        .iter()
+        .filter(|t| !allowed.contains(*t) && !refused.contains(*t))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "event types in ALL_EVENT_TYPES classified neither allowed nor refused for collaborators: {unclassified:?}"
+    );
+
+    let all: BTreeSet<&str> = ALL_EVENT_TYPES.iter().copied().collect();
+    let stale: Vec<&&str> = refused.iter().filter(|t| !all.contains(*t)).collect();
+    assert!(
+        stale.is_empty(),
+        "refused golden names types missing from ALL_EVENT_TYPES: {stale:?}"
+    );
+
+    for ty in &refused {
+        assert!(
+            !is_collaborator_event_type(ty),
+            "`{ty}` is refused for collaborators but the predicate allowed it"
+        );
+    }
+}
+
+#[test]
+fn collaborator_predicate_is_default_deny() {
+    // Owner-only families and unknown / non-canonical spellings never pass:
+    // the predicate is membership in the vetted list, not a prefix rule.
+    for bogus in [
+        "",
+        "*",
+        "note:*",
+        "terminal:data",
+        "host:exec:stdout",
+        "client:connected",
+        "sandbox:cow:created",
+        "NOTE:UPDATED",
+    ] {
+        assert!(
+            !is_collaborator_event_type(bogus),
+            "`{bogus}` must not pass the collaborator allowlist"
+        );
+    }
+    assert!(is_collaborator_event_type("note:updated"));
 }
 
 #[test]

@@ -10,6 +10,10 @@
 //!   CLIs, dev tooling) and connections without the capability (FE auxiliary
 //!   `JsonRpcClient`s) are never candidates — this is what fixes the REV-1
 //!   misrouting where the first arrival won regardless of what it could do.
+//!   A connection bound to a non-administrator principal is never a
+//!   candidate either (multiplayer w3; [`super::ReverseChannel::is_administrator`]):
+//!   its `client.hello` is not bound onto the entry, so it is also absent from
+//!   the presence projections and the `client:*` transitions.
 //! - [`ReverseTarget::Default`] → the **first-connected** eligible connection
 //!   (unchanged single-desktop behaviour); none → `NoClient`.
 //! - [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`] → the **newest**
@@ -47,13 +51,11 @@ use tokio::sync::mpsc;
 
 use super::{request_timeout, ReverseChannel};
 
-/// Global event (empty `workspaceId`, like `settings:changed`) published when
-/// a logical client gains its first live hello'd connection (REV-2, §6).
-pub const CLIENT_CONNECTED: &str = "client:connected";
-
-/// Global event published when a logical client loses its last live hello'd
-/// connection (REV-2, §6).
-pub const CLIENT_DISCONNECTED: &str = "client:disconnected";
+/// Global events (empty `workspaceId`, like `settings:changed`) published
+/// when a logical client gains its first / loses its last live hello'd
+/// connection (REV-2, §6). Defined in the canonical taxonomy so the
+/// collaborator allowlist golden classifies them (owner-only, multiplayer w3).
+pub use intent_core::events::{CLIENT_CONNECTED, CLIENT_DISCONNECTED};
 
 /// Which listener accepted a registered connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -308,10 +310,16 @@ struct Entry {
 }
 
 impl Entry {
+    /// An eligible reverse target advertised `browserExec` **and** is the
+    /// administrator's connection (multiplayer w3): a connection bound to a
+    /// non-administrator principal never hosts tabs or serves reverse RPCs,
+    /// whatever its hello claims.
     fn is_eligible(&self) -> bool {
-        self.identity
-            .as_ref()
-            .is_some_and(ReverseClientIdentity::browser_exec)
+        self.channel.is_administrator()
+            && self
+                .identity
+                .as_ref()
+                .is_some_and(ReverseClientIdentity::browser_exec)
     }
 
     fn has_client(&self, client_id: &ClientId) -> bool {
@@ -687,6 +695,12 @@ impl PrimaryReverseGuard {
     /// connection was the last of, then a `Connected` for a new `clientId`
     /// with no other live connection) under the registry lock.
     ///
+    /// A non-administrator connection's hello is not bound at all (multiplayer
+    /// w3): the entry keeps no identity, so it never appears in
+    /// [`PrimaryReverseRegistry::live_clients`] / `host_presence`, never
+    /// reports as a tab host, and never queues a `client:*` transition —
+    /// whatever `clientId` or `browserExec` it advertised.
+    ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
@@ -698,6 +712,9 @@ impl PrimaryReverseGuard {
         let Some(pos) = state.entries.iter().position(|e| e.id == self.id) else {
             return;
         };
+        if !state.entries[pos].channel.is_administrator() {
+            return;
+        }
         state.entries[pos].hello_seq = inner.next_hello_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let previous = state.entries[pos].identity.replace(identity.clone());
         state.bound.insert(self.id, identity.client_id.clone());

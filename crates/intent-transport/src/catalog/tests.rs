@@ -9,8 +9,11 @@
 //! checks only (extracting reverse `.request("...")` call sites would be
 //! fragile); renames are a lower-risk edge case caught during code review.
 
-use super::{FASTPATH_METHODS, METHOD_ALIASES, NOTIFICATIONS, REVERSE_METHODS, ROUTER_METHODS};
-use std::collections::HashSet;
+use super::{
+    canonical_method, collaborator_may_call, COLLABORATOR_METHODS, FASTPATH_METHODS,
+    METHOD_ALIASES, NOTIFICATIONS, REVERSE_METHODS, ROUTER_METHODS,
+};
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 
 /// Extract router methods from the actual source code at test runtime.
@@ -132,12 +135,12 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// 355 → 366: `extract_router_methods` rejected `-` in method names, so the 11
 /// already-shipped `accept-changes.*` / `file-tracking.*` router arms were never
 /// frozen here. No protocol bump — the wire surface did not change.
-const EXPECTED_TOTAL_METHODS: usize = 367;
+const EXPECTED_TOTAL_METHODS: usize = 369;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 316;
+const EXPECTED_ROUTER_METHODS: usize = 318;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 49;
@@ -797,6 +800,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.list",
     "workspace.localChanges",
     "workspace.markSeen",
+    "workspace.members.list",
+    "workspace.members.remove",
     "workspace.restore",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
@@ -989,4 +994,458 @@ fn content_only_new_method_is_reported_unclassified() {
         .collect();
     let (_, _, stale) = chat_write_classification(&shrunk);
     assert_eq!(stale, vec!["agent.appendMessage".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// Collaborator allowlist goldens (multiplayer w3)
+// ---------------------------------------------------------------------------
+
+/// Subscription-channel fast paths (`subscriptions.rs`): the `*.subscribe` /
+/// `*.unsubscribe` arms the connection task intercepts before the router.
+/// They are not part of `ROUTER_METHODS` / `FASTPATH_METHODS` (that extractor
+/// walks one namespace per file), so the allowlist universe adds them here,
+/// extracted from source like the other two so a new channel cannot slip in
+/// unclassified. `agent.subscribe` / `agent.unsubscribe` also have router
+/// arms and are already cataloged there.
+fn extract_subscription_channel_methods() -> HashSet<String> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let path = std::path::Path::new(manifest_dir).join("src/subscriptions.rs");
+    let source =
+        std::fs::read_to_string(&path).expect("Failed to read subscriptions.rs at test time");
+    let mut methods = HashSet::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        let mut rest = trimmed;
+        while let Some(start) = rest.find('"') {
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('"') else { break };
+            let candidate = &after[..end];
+            if (candidate.ends_with(".subscribe") || candidate.ends_with(".unsubscribe"))
+                && candidate
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '.' || c == '_')
+            {
+                methods.insert(candidate.to_string());
+            }
+            rest = &after[end + 1..];
+        }
+    }
+    assert!(
+        methods.contains("chat.subscribe") && methods.contains("workspace.unsubscribe"),
+        "subscription-channel extraction broke: {methods:?}"
+    );
+    methods
+}
+
+/// Every method a client can put on the wire: router arms, fast paths, and
+/// the subscription channels.
+fn client_callable_universe() -> BTreeSet<String> {
+    ROUTER_METHODS
+        .iter()
+        .chain(FASTPATH_METHODS.iter())
+        .map(std::string::ToString::to_string)
+        .chain(extract_subscription_channel_methods())
+        .collect()
+}
+
+/// Golden: every client-callable method a non-administrator may **not** call.
+/// `client_callable_universe() \ COLLABORATOR_METHODS` must equal this list
+/// exactly, so adding a method to the wire surface fails CI until it is
+/// classified — either allowed with a vetting note in `COLLABORATOR_METHODS`
+/// or named here. The failure message prints the recomputed golden.
+///
+/// Owner-only families: `host.*` but the two display probes, `browser.*`,
+/// `forward.*`, `terminal.*`, `script.*`, `github.*`, `linear.*`, `sentry.*`,
+/// `voice.*`, `settings.*`, `repo.*` / `repoConfig.*`, `mcp.*`, `server.*`,
+/// `pairing.*`, `providers.setup.*`, `system.*` (but `system.capabilities`),
+/// `rules.*`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
+/// export / import / setup / browser-client pinning, `git.clone`,
+/// `git.agentCommit` (agent-only), agent deletion / proposals / one-shot
+/// completions, `agent.replaceMessages` (persists client-supplied user rows
+/// verbatim, so a non-owner could forge `fromPrincipalId`), hook run/cancel,
+/// PR-monitor cancel/flush, daemon-wide metrics, and the `accept-changes.*` /
+/// `file-tracking.*` publishing flow (stages, commits, pushes and merges as
+/// the primary user; refused as a family pending a per-method decision).
+const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
+    "accept-changes.addRemote",
+    "accept-changes.execute",
+    "accept-changes.getStatus",
+    "accept-changes.mergePR",
+    "accept-changes.prepare",
+    "agent.cancelDelete",
+    "agent.completeOnce",
+    "agent.delete",
+    "agent.diagnostics",
+    "agent.enhancePrompt",
+    "agent.replaceMessages",
+    "agent.reportToParent",
+    "agent.resolveProposal",
+    "browser.closeTab",
+    "browser.exec",
+    "browser.listTabs",
+    "browser.navigateTab",
+    "browser.removeTab",
+    "browser.syncTabs",
+    "browser.upsertTab",
+    "client.list",
+    "debug.sampleStacks",
+    "file-tracking.getAgentLocks",
+    "file-tracking.getChanges",
+    "file-tracking.getLineStats",
+    "file-tracking.loadCommits",
+    "file-tracking.stage",
+    "file-tracking.unstage",
+    "forward.close",
+    "forward.create",
+    "forward.list",
+    "git.agentCommit",
+    "git.clone",
+    "github.authStatus",
+    "github.branches.list",
+    "github.branches.listCached",
+    "github.cancelAuth",
+    "github.connect",
+    "github.getReviewThreads",
+    "github.getUser",
+    "github.issues.get",
+    "github.issues.list",
+    "github.issues.search",
+    "github.listReviewComments",
+    "github.pulls.create",
+    "github.pulls.get",
+    "github.pulls.list",
+    "github.pulls.merge",
+    "github.pulls.search",
+    "github.pulls.updateBranch",
+    "github.relatedRepos.list",
+    "github.replyReviewComment",
+    "github.repoConfig.get",
+    "github.repos.get",
+    "github.repos.list",
+    "github.repos.search",
+    "github.resolveThread",
+    "github.revoke",
+    "github.unresolveThread",
+    "hook.cancel",
+    "hook.runNow",
+    "host.checkAuggie",
+    "host.checkGh",
+    "host.checkGit",
+    "host.checkNode",
+    "host.createDirectory",
+    "host.directoryStatus",
+    "host.env",
+    "host.exec",
+    "host.execStream",
+    "host.execStream.cancel",
+    "host.execStream.write",
+    "host.findApp",
+    "host.findBinary",
+    "host.listDirectory",
+    "host.listInstalledEditors",
+    "host.openInEditor",
+    "host.providerAuthStatus",
+    "host.providerDiscovery",
+    "host.providerTestPrompt",
+    "linear.authStatus",
+    "linear.createIssue",
+    "linear.getIssue",
+    "linear.listIssues",
+    "linear.listLabels",
+    "linear.listProjects",
+    "linear.listTeams",
+    "linear.listWorkflowStates",
+    "linear.searchIssues",
+    "linear.updateIssue",
+    "linear.viewer",
+    "mcp.oauth.delete",
+    "mcp.oauth.get",
+    "mcp.oauth.list",
+    "mcp.oauth.set",
+    "mcp.servers.create",
+    "mcp.servers.delete",
+    "mcp.servers.getStatus",
+    "mcp.servers.list",
+    "mcp.servers.restart",
+    "mcp.servers.toggle",
+    "mcp.servers.update",
+    "mcp.testConnection",
+    "metrics.clearAgentStats",
+    "metrics.getAllWorkspaceStats",
+    "pairing.getInfo",
+    "prMonitor.cancel",
+    "prMonitor.flush",
+    "providers.setup.cancel",
+    "providers.setup.login",
+    "providers.setup.start",
+    "providers.setup.status",
+    "repo.list",
+    "repo.remove",
+    "repo.warmCache",
+    "repoConfig.ensureDir",
+    "repoConfig.get",
+    "repoConfig.has",
+    "repoConfig.save",
+    "rules.get",
+    "rules.list",
+    "rules.update",
+    "sandbox.cow.discard",
+    "sandbox.cow.merge",
+    "script.create",
+    "script.list",
+    "script.output",
+    "script.remove",
+    "script.restart",
+    "script.run",
+    "script.start",
+    "script.status",
+    "script.stop",
+    "sentry.assignIssue",
+    "sentry.authStatus",
+    "sentry.getIssue",
+    "sentry.ignoreIssue",
+    "sentry.listIssues",
+    "sentry.listProjects",
+    "sentry.resolveIssue",
+    "sentry.searchIssues",
+    "server.pairingInfo",
+    "server.rotateToken",
+    "settings.get",
+    "settings.list",
+    "settings.reset",
+    "settings.update",
+    "specialist.create",
+    "specialist.delete",
+    "specialist.edit",
+    "system.gitCredential",
+    "system.importLegacy",
+    "system.requestUpdate",
+    "system.shutdown",
+    "system.status",
+    "terminal.create",
+    "terminal.getBuffer",
+    "terminal.kill",
+    "terminal.list",
+    "terminal.readOutput",
+    "terminal.resize",
+    "terminal.write",
+    "unsloth.status",
+    "unsloth.stop",
+    "voice.getWorkspaceVocabulary",
+    "voice.transcribe",
+    "workspace.archive",
+    "workspace.cancelDelete",
+    "workspace.cleanup",
+    "workspace.create",
+    "workspace.delete",
+    "workspace.detectProjectType",
+    "workspace.diskUsage",
+    "workspace.duplicate",
+    "workspace.export.abort",
+    "workspace.export.finalize",
+    "workspace.export.read",
+    "workspace.export.start",
+    "workspace.findRepositories",
+    "workspace.generateSetupScript",
+    "workspace.getBrowserClient",
+    "workspace.getSetupScript",
+    "workspace.import.abort",
+    "workspace.import.begin",
+    "workspace.import.chunk",
+    "workspace.import.commit",
+    "workspace.initializeRepository",
+    "workspace.members.remove",
+    "workspace.restore",
+    "workspace.saveSetupScript",
+    "workspace.setAutoCommit",
+    "workspace.setBrowserClient",
+    "workspace.transfer.plan",
+    "workspace.unarchive",
+];
+
+#[test]
+fn collaborator_methods_are_sorted_unique_and_vetted() {
+    let mut sorted: Vec<&str> = COLLABORATOR_METHODS.iter().map(|(m, _)| *m).collect();
+    let listed = sorted.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        listed, sorted,
+        "COLLABORATOR_METHODS must be sorted alphabetically by method"
+    );
+    let mut seen = HashSet::new();
+    for (method, note) in COLLABORATOR_METHODS {
+        assert!(
+            seen.insert(method),
+            "Duplicate collaborator method: {method}"
+        );
+        assert!(
+            !note.trim().is_empty(),
+            "Collaborator method {method} has no vetting note — every allowed entry must say what it reads or mutates, why a guest needs it, and why it cannot reach the host or another workspace"
+        );
+    }
+}
+
+#[test]
+fn collaborator_methods_are_canonical_and_cataloged() {
+    let universe = client_callable_universe();
+    let aliases: HashSet<&str> = METHOD_ALIASES.iter().map(|(alias, _)| *alias).collect();
+    for (method, _) in COLLABORATOR_METHODS {
+        assert!(
+            !aliases.contains(method),
+            "COLLABORATOR_METHODS lists alias {method}; list the canonical method ({}) instead — aliases are canonicalised before the lookup",
+            canonical_method(method)
+        );
+        assert!(
+            universe.contains(*method),
+            "COLLABORATOR_METHODS lists {method}, which is not in ROUTER_METHODS, FASTPATH_METHODS, or the subscription channels"
+        );
+    }
+}
+
+#[test]
+fn collaborator_refused_remainder_is_classified() {
+    let allowed: HashSet<&str> = COLLABORATOR_METHODS.iter().map(|(m, _)| *m).collect();
+    let refused: Vec<String> = client_callable_universe()
+        .into_iter()
+        .filter(|m| !allowed.contains(m.as_str()))
+        .collect();
+    let golden: Vec<String> = COLLABORATOR_REFUSED_METHODS
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    if refused != golden {
+        let mut msg = String::from(
+            "Collaborator allowlist drift: a client-callable method is neither in COLLABORATOR_METHODS nor in COLLABORATOR_REFUSED_METHODS (or a refused entry is stale).\n\
+             Classify it: allow it in catalog.rs COLLABORATOR_METHODS with a vetting note, or name it in the refused golden below and mirror the change in docs/protocol/.\n",
+        );
+        let refused_set: BTreeSet<&str> = refused.iter().map(String::as_str).collect();
+        let golden_set: BTreeSet<&str> = golden.iter().map(String::as_str).collect();
+        let unclassified: Vec<_> = refused_set.difference(&golden_set).collect();
+        let stale: Vec<_> = golden_set.difference(&refused_set).collect();
+        if !unclassified.is_empty() {
+            let _ = writeln!(
+                msg,
+                "\nUnclassified (refused by default, not in the golden):"
+            );
+            for m in unclassified {
+                let _ = writeln!(msg, "  - {m}");
+            }
+        }
+        if !stale.is_empty() {
+            let _ = writeln!(
+                msg,
+                "\nStale golden entries (no longer client-callable or now allowed):"
+            );
+            for m in stale {
+                let _ = writeln!(msg, "  - {m}");
+            }
+        }
+        let _ = writeln!(msg, "\nRecomputed COLLABORATOR_REFUSED_METHODS golden:");
+        for m in &refused {
+            let _ = writeln!(msg, "    \"{m}\",");
+        }
+        panic!("{msg}");
+    }
+}
+
+#[test]
+fn collaborator_refused_golden_is_sorted_unique_and_disjoint() {
+    let mut sorted = COLLABORATOR_REFUSED_METHODS.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(
+        COLLABORATOR_REFUSED_METHODS,
+        &sorted[..],
+        "COLLABORATOR_REFUSED_METHODS must be sorted alphabetically"
+    );
+    let allowed: HashSet<&str> = COLLABORATOR_METHODS.iter().map(|(m, _)| *m).collect();
+    let mut seen = HashSet::new();
+    for method in COLLABORATOR_REFUSED_METHODS {
+        assert!(seen.insert(method), "Duplicate refused method: {method}");
+        assert!(
+            !allowed.contains(method),
+            "{method} is both allowed and refused"
+        );
+    }
+}
+
+#[test]
+fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
+    for (alias, canonical) in METHOD_ALIASES {
+        assert_eq!(canonical_method(alias), *canonical);
+        assert_eq!(
+            collaborator_may_call(alias),
+            collaborator_may_call(canonical),
+            "alias {alias} must classify exactly like {canonical}"
+        );
+    }
+    assert_eq!(canonical_method("note.get"), "note.get");
+    assert!(
+        collaborator_may_call("git.diff"),
+        "git.diff is treated as git.diffs"
+    );
+    assert!(
+        collaborator_may_call("git.log"),
+        "git.log is treated as git.commits"
+    );
+    for allowed in [
+        "client.hello",
+        "events.subscribe",
+        "chat.subscribe",
+        "workspace.subscribe",
+        "system.capabilities",
+        "host.status",
+        "principal.me",
+        "pr.status",
+        "pr.refresh",
+        "prMonitor.list",
+        "agent.create",
+        "agent.stop",
+        "agent.sendMessage",
+        "agent.setModel",
+        "hook.list",
+        "git.commit",
+        "git.push",
+    ] {
+        assert!(collaborator_may_call(allowed), "{allowed} must be allowed");
+    }
+    for refused in [
+        "host.exec",
+        "host.openInEditor",
+        "browser.exec",
+        "browser.listTabs",
+        "forward.create",
+        "github.authStatus",
+        "github.pulls.create",
+        "github.pulls.get",
+        "mcp.servers.list",
+        "prMonitor.cancel",
+        "settings.get",
+        "repo.list",
+        "voice.transcribe",
+        "workspace.create",
+        "git.clone",
+        "agent.delete",
+        "agent.replaceMessages",
+        "terminal.list",
+        "script.list",
+        "debug.sampleStacks",
+    ] {
+        assert!(!collaborator_may_call(refused), "{refused} must be refused");
+    }
+    // Default-deny: anything not cataloged is refused too.
+    assert!(!collaborator_may_call("totally.unknown"));
+    assert!(!collaborator_may_call(""));
+}
+
+#[test]
+fn reverse_methods_are_never_on_the_collaborator_allowlist() {
+    for method in REVERSE_METHODS {
+        assert!(
+            !collaborator_may_call(method),
+            "reverse RPC {method} must not be callable by a non-administrator"
+        );
+    }
 }

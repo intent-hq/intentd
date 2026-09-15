@@ -163,6 +163,15 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
         e @ (Error::InvalidParams(_) | Error::InvalidInput(_)) => invalid_params(e.to_string()),
+        // Capability refusal (multiplayer w3): the same `-32003 "Forbidden"`
+        // envelope the connection-level allowlist emits, with the reason in
+        // `data.detail` so a client cannot tell the two refusals apart by
+        // code or message.
+        Error::Forbidden(detail) => RpcErr {
+            code: crate::catalog::FORBIDDEN_ERROR_CODE,
+            message: crate::catalog::FORBIDDEN_ERROR_MESSAGE.to_string(),
+            data: Some(json!({ "code": "forbidden", "detail": detail })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -589,6 +598,26 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let ws = api.mark_seen(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
+        }
+        // `workspace.members.*` (multiplayer w3): membership roster of one
+        // workspace. Member+ may list; removal is Owner-only in the service
+        // layer (`-32003` for a collaborator, `-32602` for a non-member).
+        "workspace.members.list" => {
+            let id = require_workspace_id(params)?;
+            let r = api
+                .workspace_members_list(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        "workspace.members.remove" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let r = api
+                .workspace_members_remove(id, intent_core::PrincipalId::from(principal_id))
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
         }
         "workspace.getTokenUsage" => {
             let id = require_workspace_id(params)?;

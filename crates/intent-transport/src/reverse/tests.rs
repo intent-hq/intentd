@@ -111,6 +111,30 @@ async fn client_error_response_propagates() {
     assert_eq!(err.message, "no handler");
 }
 
+/// Multiplayer w3: a channel bound to a non-administrator principal refuses
+/// every reverse RPC up front (`-32003`) and puts nothing on the wire.
+#[tokio::test]
+async fn non_administrator_channel_refuses_reverse_requests_without_sending() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let reverse = ReverseChannel::new(out_tx).with_administrator(false);
+    assert!(!reverse.is_administrator());
+    assert!(ReverseChannel::new(mpsc::channel::<String>(1).0).is_administrator());
+
+    let err = reverse
+        .request(
+            "host.openExternal",
+            json!({ "url": "x" }),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("non-administrator channels never serve reverse RPCs");
+    assert_eq!(err.code, -32003);
+    assert!(
+        out_rx.try_recv().is_err(),
+        "nothing may be sent to a non-administrator connection"
+    );
+}
+
 #[test]
 fn route_response_ignores_non_replies() {
     let (out_tx, _out_rx) = mpsc::channel::<String>(8);
