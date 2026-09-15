@@ -413,6 +413,19 @@ impl Services {
             }
             Some(WorkspaceRole::Collaborator) => {}
         }
+        let removed = self.detach_collaborator(workspace_id, principal_id).await?;
+        Ok(json!({ "removed": removed }))
+    }
+
+    /// Shared teardown of a collaborator membership (`members.remove`,
+    /// `members.leave`, `principal.revokeSelf`): delete the row, drop the
+    /// member's queued messages and publish the `removedPrincipalId`
+    /// `workspace:updated`. Returns whether a row was deleted.
+    pub(crate) async fn detach_collaborator(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+    ) -> Result<bool> {
         let removed = self
             .store
             .remove_workspace_member(workspace_id, principal_id)
@@ -420,16 +433,21 @@ impl Services {
         if removed {
             self.drop_queued_messages_from(workspace_id, principal_id)
                 .await;
+            let member_count = self.member_count(workspace_id).await?;
             crate::publish_event(
                 self.event_bus.as_ref(),
                 crate::workspace_updated_event(
                     workspace_id,
-                    &json!({ "members": true, "removedPrincipalId": principal_id }),
+                    &json!({
+                        "members": true,
+                        "removedPrincipalId": principal_id,
+                        "memberCount": member_count,
+                    }),
                 ),
             )
             .await;
         }
-        Ok(json!({ "removed": removed }))
+        Ok(removed)
     }
 
     /// Drop every queued entry stamped with `principal_id` on the agents of

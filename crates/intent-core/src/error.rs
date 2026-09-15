@@ -134,6 +134,127 @@ pub enum Error {
     /// not disclosed.
     #[error("forbidden: {0}")]
     Forbidden(String),
+
+    /// A workspace-invite operation was refused for a reason the client must
+    /// key off machine-readably (multiplayer w4): the invite is unknown /
+    /// expired / revoked / already redeemed, the pinned GitHub login does not
+    /// match the authorizing account, the owner has no GitHub identity to
+    /// invite from, or the identity-only device flow was denied / expired /
+    /// is not known. Surfaces as `-32602` (`-32603` for the daemon-side
+    /// conditions) with `error.data = { code: kind.as_str() }`.
+    #[error("{}", .0.message())]
+    Invite(InviteErrorKind),
+}
+
+/// Machine-readable reason an invite / join operation was refused, surfaced
+/// on the wire as `error.data.code` (multiplayer w4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteErrorKind {
+    /// No invite has this id, or the secret does not match it.
+    NotFound,
+    /// The invite's `expiresAt` has passed.
+    Expired,
+    /// The owner revoked the invite.
+    Revoked,
+    /// The invite was already redeemed (single use).
+    Redeemed,
+    /// The invite is pinned to another GitHub login.
+    PinMismatch,
+    /// The pinned login does not name a GitHub account.
+    PinUnknown,
+    /// Minting an invite requires the owner's linked GitHub identity
+    /// (`github.authStatus.isConfigured`).
+    GithubIdentityRequired,
+    /// The primary user's GitHub identity cannot change while other
+    /// principals or open invites exist (reconnect guard).
+    IdentityLocked,
+    /// The invitee denied the identity-only device flow.
+    FlowDenied,
+    /// The identity-only device flow's codes expired before authorization.
+    FlowExpired,
+    /// Polling the identity-only device flow failed repeatedly.
+    FlowError,
+    /// No identity-only device flow has this id (or its result was already
+    /// collected).
+    FlowNotFound,
+    /// Too many identity-only device flows are in flight; retry later.
+    FlowBusy,
+}
+
+impl InviteErrorKind {
+    /// Stable wire identifier for this kind (`error.data.code`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InviteErrorKind::NotFound => "invite-not-found",
+            InviteErrorKind::Expired => "invite-expired",
+            InviteErrorKind::Revoked => "invite-revoked",
+            InviteErrorKind::Redeemed => "invite-redeemed",
+            InviteErrorKind::PinMismatch => "invite-pin-mismatch",
+            InviteErrorKind::PinUnknown => "invite-pin-unknown",
+            InviteErrorKind::GithubIdentityRequired => "github-identity-required",
+            InviteErrorKind::IdentityLocked => "primary-identity-locked",
+            InviteErrorKind::FlowDenied => "invite-flow-denied",
+            InviteErrorKind::FlowExpired => "invite-flow-expired",
+            InviteErrorKind::FlowError => "invite-flow-error",
+            InviteErrorKind::FlowNotFound => "invite-flow-not-found",
+            InviteErrorKind::FlowBusy => "invite-flow-busy",
+        }
+    }
+
+    /// Human-readable message for this kind.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            InviteErrorKind::NotFound => "invalid params: invite not found",
+            InviteErrorKind::Expired => "invalid params: invite has expired",
+            InviteErrorKind::Revoked => "invalid params: invite was revoked",
+            InviteErrorKind::Redeemed => "invalid params: invite was already redeemed",
+            InviteErrorKind::PinMismatch => {
+                "invalid params: this invite is pinned to a different GitHub account"
+            }
+            InviteErrorKind::PinUnknown => {
+                "invalid params: pinLogin does not name a GitHub account"
+            }
+            InviteErrorKind::GithubIdentityRequired => {
+                "unsupported: inviting requires a linked GitHub identity — connect GitHub \
+                 (github.connect) before creating an invite"
+            }
+            InviteErrorKind::IdentityLocked => {
+                "unsupported: the primary GitHub identity cannot change while other \
+                 principals or open invites exist"
+            }
+            InviteErrorKind::FlowDenied => "invalid params: the GitHub authorization was denied",
+            InviteErrorKind::FlowExpired => {
+                "invalid params: the GitHub device code expired before authorization"
+            }
+            InviteErrorKind::FlowError => "internal error: polling the GitHub device flow failed",
+            InviteErrorKind::FlowNotFound => "invalid params: unknown invite flow",
+            InviteErrorKind::FlowBusy => {
+                "internal error: too many invite redemptions in flight; retry shortly"
+            }
+        }
+    }
+
+    /// JSON-RPC 2.0 numeric error code for this kind.
+    #[must_use]
+    pub fn code(self) -> i32 {
+        match self {
+            InviteErrorKind::NotFound
+            | InviteErrorKind::Expired
+            | InviteErrorKind::Revoked
+            | InviteErrorKind::Redeemed
+            | InviteErrorKind::PinMismatch
+            | InviteErrorKind::PinUnknown
+            | InviteErrorKind::FlowDenied
+            | InviteErrorKind::FlowExpired
+            | InviteErrorKind::FlowNotFound => -32602,
+            InviteErrorKind::GithubIdentityRequired
+            | InviteErrorKind::IdentityLocked
+            | InviteErrorKind::FlowError
+            | InviteErrorKind::FlowBusy => -32603,
+        }
+    }
 }
 
 /// Machine-readable category for a failed clone/provisioning step, surfaced
@@ -213,6 +334,7 @@ impl Error {
             | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,
             Error::Forbidden(_) => -32003,
+            Error::Invite(kind) => kind.code(),
         }
     }
 }

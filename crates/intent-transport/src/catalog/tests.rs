@@ -78,6 +78,8 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("pairing.rs", "pairing."),
         ("server.rs", "server."),
         ("provider_setup.rs", "providers.setup."),
+        ("invite.rs", "invite."),
+        ("invite.rs", "workspace.invite."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
             .unwrap_or_else(|_| panic!("Failed to read {filename} at test time"));
@@ -135,15 +137,15 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// 355 → 366: `extract_router_methods` rejected `-` in method names, so the 11
 /// already-shipped `accept-changes.*` / `file-tracking.*` router arms were never
 /// frozen here. No protocol bump — the wire surface did not change.
-const EXPECTED_TOTAL_METHODS: usize = 369;
+const EXPECTED_TOTAL_METHODS: usize = 375;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 318;
+const EXPECTED_ROUTER_METHODS: usize = 322;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 49;
+const EXPECTED_FASTPATH_METHODS: usize = 51;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;
@@ -627,6 +629,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.providerTestPrompt",
     "host.status",
     "host.toolAvailability",
+    "invite.redeem",
     "linear.authStatus",
     "linear.createIssue",
     "linear.getIssue",
@@ -684,6 +687,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "primitive.addPatch",
     "primitive.addReference",
     "principal.me",
+    "principal.revokeSelf",
     "providers.catalog",
     "providers.setup.cancel",
     "providers.setup.login",
@@ -797,9 +801,13 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.import.chunk",
     "workspace.import.commit",
     "workspace.initializeRepository",
+    "workspace.invite.create",
+    "workspace.invite.list",
+    "workspace.invite.revoke",
     "workspace.list",
     "workspace.localChanges",
     "workspace.markSeen",
+    "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
     "workspace.restore",
@@ -1150,6 +1158,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
+    "invite.redeem",
     "linear.authStatus",
     "linear.createIssue",
     "linear.getIssue",
@@ -1257,6 +1266,9 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "workspace.import.chunk",
     "workspace.import.commit",
     "workspace.initializeRepository",
+    "workspace.invite.create",
+    "workspace.invite.list",
+    "workspace.invite.revoke",
     "workspace.members.remove",
     "workspace.restore",
     "workspace.saveSetupScript",
