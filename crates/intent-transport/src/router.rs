@@ -2983,6 +2983,15 @@ async fn dispatch(
             let r = api.github_get_user().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "github.users.search" => {
+            let query = require_str_param(params, "query")?;
+            let limit = opt_int(params, "limit");
+            let r = api
+                .github_users_search(query, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         // `principal.me` (multiplayer w1): the principal this connection was
         // bound to at admission; no params. Fails when no caller is bound.
         "principal.me" => {
