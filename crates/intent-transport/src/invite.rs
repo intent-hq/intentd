@@ -16,6 +16,8 @@
 //!   collaborator credential exactly once.
 
 use std::fmt::Write as _;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,7 +26,10 @@ use serde_json::{json, Value};
 use crate::events::{error_frame, error_frame_with_data, success_frame};
 use crate::pairing::encode_query_value;
 use crate::server::{pairing_hosts, ServerPairingInfo};
-use intent_core::{Error, InviteErrorKind, Result, WorkspaceApi, WorkspaceId};
+use intent_core::{
+    Error, InviteErrorKind, InviteLinkBuilder, InviteLinkEnvelope, ResolvedInviteLinkEnvelope,
+    Result, WorkspaceApi, WorkspaceId,
+};
 
 /// Version of the `intent://invite` payload format (`v` query parameter and
 /// the `version` field of the `workspace.invite.create` result).
@@ -255,15 +260,38 @@ fn opt_u64_param(params: &Value, key: &str) -> Result<Option<u64>> {
     }
 }
 
-/// The link envelope of this listener: `(hosts, port, fingerprint, tc)`.
-/// Resolved BEFORE the invite is minted so a daemon nobody can dial never
+/// The link envelope of this listener: hosts, port, fingerprint and the
+/// optional tunnel address every `intent://invite?…` link of the daemon
+/// shares. [`link_envelope`] resolves it; [`InviteLinkEnvelope::invite_url`]
+/// formats one invite's link from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkEnvelope {
+    pub hosts: Vec<String>,
+    pub port: u16,
+    pub fingerprint: String,
+    pub tc_address: Option<String>,
+}
+
+impl InviteLinkEnvelope for LinkEnvelope {
+    fn invite_url(&self, invite_id: &str, secret: &str) -> String {
+        build_invite_uri(
+            &self.hosts,
+            self.port,
+            &self.fingerprint,
+            invite_id,
+            secret,
+            self.tc_address.as_deref(),
+        )
+    }
+}
+
+/// Resolve the listener's [`LinkEnvelope`]. On `workspace.invite.create`
+/// this runs BEFORE the invite is minted so a daemon nobody can dial never
 /// stores an invite that cannot be redeemed: no TCP listener is
 /// [`Error::ListenerDown`] (`error.data.code = "listener-down"`, like
 /// `pairing.getInfo`), and no dialable route at all (loopback-only bind and
 /// no tunnel) is `Unsupported`.
-async fn link_envelope(
-    provider: Option<&Arc<dyn ServerPairingInfo>>,
-) -> Result<(Vec<String>, u16, String, Option<String>)> {
+async fn link_envelope(provider: Option<&Arc<dyn ServerPairingInfo>>) -> Result<LinkEnvelope> {
     let provider = provider.ok_or_else(|| {
         Error::Unsupported("invite links are unavailable on this listener".to_string())
     })?;
@@ -278,7 +306,41 @@ async fn link_envelope(
                 .to_string(),
         ));
     }
-    Ok((hosts, port, cert.fingerprint256, snapshot.tc_address))
+    Ok(LinkEnvelope {
+        hosts,
+        port,
+        fingerprint: cert.fingerprint256,
+        tc_address: snapshot.tc_address,
+    })
+}
+
+/// The services layer's [`InviteLinkBuilder`] over a listener's pairing
+/// provider: the same [`link_envelope`] `workspace.invite.create` resolves,
+/// so a link rebuilt for `workspace.invite.list` is byte-identical to the
+/// one minted. Resolution failures (listener down, no dialable route) are
+/// `None` here — a read never fails for them.
+pub struct InviteLinkResolver {
+    provider: Arc<dyn ServerPairingInfo>,
+}
+
+impl InviteLinkResolver {
+    #[must_use]
+    pub fn new(provider: Arc<dyn ServerPairingInfo>) -> Self {
+        Self { provider }
+    }
+}
+
+impl InviteLinkBuilder for InviteLinkResolver {
+    fn invite_link_envelope(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = ResolvedInviteLinkEnvelope> + Send + '_>> {
+        Box::pin(async move {
+            link_envelope(Some(&self.provider))
+                .await
+                .ok()
+                .map(|env| Box::new(env) as Box<dyn InviteLinkEnvelope>)
+        })
+    }
 }
 
 /// Handle a classified `workspace.invite.create`: params
@@ -303,7 +365,7 @@ async fn create_json(
     let workspace_id = WorkspaceId::from(str_param(params, "workspaceId")?.as_str());
     let pin_login = opt_str_param(params, "pinLogin")?;
     let expires_in_secs = opt_u64_param(params, "expiresInSecs")?;
-    let (hosts, port, fingerprint, tc_address) = link_envelope(provider).await?;
+    let envelope = link_envelope(provider).await?;
     let mut result = api
         .workspace_invite_create(workspace_id, pin_login, expires_in_secs)
         .await?;
@@ -317,23 +379,16 @@ async fn create_json(
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Internal("invite result carries no secret".to_string()))?
         .to_string();
-    let url = build_invite_uri(
-        &hosts,
-        port,
-        &fingerprint,
-        &invite_id,
-        &secret,
-        tc_address.as_deref(),
-    );
+    let url = envelope.invite_url(&invite_id, &secret);
     let obj = result
         .as_object_mut()
         .ok_or_else(|| Error::Internal("invite result is not an object".to_string()))?;
     obj.insert("url".into(), url.into());
-    obj.insert("hosts".into(), json!(hosts));
-    obj.insert("port".into(), port.into());
-    obj.insert("fingerprint".into(), fingerprint.into());
+    obj.insert("hosts".into(), json!(envelope.hosts));
+    obj.insert("port".into(), envelope.port.into());
+    obj.insert("fingerprint".into(), envelope.fingerprint.into());
     obj.insert("version".into(), INVITE_PAYLOAD_VERSION.into());
-    if let Some(tc) = tc_address {
+    if let Some(tc) = envelope.tc_address {
         obj.insert("tcAddress".into(), tc.into());
     }
     Ok(result)

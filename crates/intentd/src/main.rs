@@ -2427,6 +2427,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         } else {
             None
         };
+    // Let `workspace.invite.create` / `.list` stamp each open invite with its
+    // `url` (multiplayer w4): the same envelope the create fast path resolves.
+    if let Some(provider) = pairing_info.clone() {
+        services.attach_invite_link_builder(Arc::new(intent_transport::InviteLinkResolver::new(
+            provider,
+        )));
+    }
 
     let shutdown = {
         let notify = shutdown_notify.clone();

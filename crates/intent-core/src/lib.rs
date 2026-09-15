@@ -122,7 +122,9 @@ pub use model::{
 pub use path_utils::prewarm_login_shell_path;
 pub use repo_ref::RepoRef;
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
-pub use server_control::ServerControl;
+pub use server_control::{
+    InviteLinkBuilder, InviteLinkEnvelope, ResolvedInviteLinkEnvelope, ServerControl,
+};
 pub use settings_file::{
     FlushQueuedMessagesMode, LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE,
     LEGACY_SETTINGS_PATHS,
