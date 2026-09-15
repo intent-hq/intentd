@@ -508,8 +508,14 @@
 //! alphanumerics and `-`), so search qualifiers / booleans typed after it
 //! never reach GitHub's search parser and a query with no such prefix
 //! answers `{ users: [] }`; `limit` defaults to 8 and is clamped into
-//! `[1, 10]`. The catalog contains 324 router methods, 53 fast-path
-//! methods, and two aliases: 379 client-callable names.
+//! `[1, 10]`. Also within 10.3,
+//! `workspace.invite.list` rows (and the `invite` of `workspace.invite.create`)
+//! carry the additive `url` — the open invite's `intent://invite?…` link
+//! rebuilt from the stored secret — omitted when the row predates the
+//! stored secret or no link can be built right now (listener down, no
+//! dialable route); the secret itself never appears as a field. The catalog
+//! contains 324 router methods, 53 fast-path methods, and two aliases: 379
+//! client-callable names.
 
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
 //! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release

@@ -939,6 +939,11 @@ pub struct Services {
     /// Held as `Arc<OnceLock>` so the control can be attached after the `api`
     /// Arc is built (composition-root wiring, §5.12). Shared across clones.
     server_control: Arc<OnceLock<Arc<dyn intent_core::ServerControl>>>,
+    /// Rebuilds an open invite's `intent://invite?…` link for
+    /// `workspace.invite.create` / `.list` (multiplayer w4). Attached after
+    /// the `api` Arc like `server_control` (the transport owns the pairing
+    /// envelope); unset means no `url` is stamped. Shared across clones.
+    invite_links: Arc<OnceLock<Arc<dyn intent_core::InviteLinkBuilder>>>,
     /// In-memory watermark cache for incremental token-usage scanning (finding F2).
     /// Maps `workspace_id` → `agent_message` count. When the watermark is unchanged
     /// since the last scan, the workspace is skipped. A restart rescans once.
@@ -1338,6 +1343,7 @@ impl Services {
             last_waiting_statuses: Arc::new(workspace_status::WaitingStatusCache::default()),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
+            invite_links: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
@@ -4245,6 +4251,14 @@ impl Services {
     /// Idempotent: a second call is a no-op (the `OnceLock` keeps the first).
     pub fn attach_server_control(&self, control: Arc<dyn intent_core::ServerControl>) {
         let _ = self.server_control.set(control);
+    }
+
+    /// Attach the [`InviteLinkBuilder`](intent_core::InviteLinkBuilder) so
+    /// `workspace.invite.create` / `.list` can stamp each open invite with
+    /// its `url` (multiplayer w4). Idempotent like
+    /// [`attach_server_control`](Self::attach_server_control).
+    pub fn attach_invite_link_builder(&self, builder: Arc<dyn intent_core::InviteLinkBuilder>) {
+        let _ = self.invite_links.set(builder);
     }
 
     /// Borrow the shared [`McpHub`] (composition root: spawn the health monitor
