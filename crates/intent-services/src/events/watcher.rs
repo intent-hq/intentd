@@ -466,8 +466,20 @@ impl GitignoreMatcher {
                     }
                 }
             }
-            if let Ok(canon) = std::fs::canonicalize(&exclude_path) {
-                if canon != exclude_path {
+            // Also the canonical spelling via the parent directory: the file
+            // itself may not exist yet (a worktree's `../..`-relative path
+            // has nothing to resolve against until it is created), while the
+            // `info/` directory the out-of-root watch reports under does.
+            let via_parent = exclude_path
+                .parent()
+                .and_then(|dir| std::fs::canonicalize(dir).ok())
+                .map(|dir| dir.join("exclude"));
+            for canon in std::fs::canonicalize(&exclude_path)
+                .ok()
+                .into_iter()
+                .chain(via_parent)
+            {
+                if canon != exclude_path && !self.exclude_paths.contains(&canon) {
                     self.exclude_paths.push(canon);
                 }
             }
@@ -631,8 +643,9 @@ impl FileWatcher {
 ///
 /// `exclude_rx` is the out-of-root `info/` stream of a linked worktree (see
 /// [`external_exclude_dir`]); its events only ever mark the matcher dirty,
-/// since nothing under it is a workspace path.
-async fn debounce_loop(
+/// since nothing under it is a workspace path. `pub(super)` so tests can
+/// drive both channels deterministically with hand-built events.
+pub(super) async fn debounce_loop(
     bus: EventBus,
     workspace_id: WorkspaceId,
     root: PathBuf,
@@ -647,8 +660,9 @@ async fn debounce_loop(
         tokio::select! {
             maybe = raw_rx.recv() => {
                 if let Some(event) = maybe {
+                    drain_exclude(&root, &mut matcher, &mut exclude_rx, &mut pending);
                     ingest(&root, &mut matcher, &event, &mut pending);
-                    drain_ready(&root, &mut matcher, &mut raw_rx, &mut pending);
+                    drain_ready(&root, &mut matcher, &mut raw_rx, &mut exclude_rx, &mut pending);
                 } else {
                     // Watcher dropped: flush whatever is pending, then stop.
                     flush_all(&bus, &workspace_id, &mut pending).await;
@@ -669,8 +683,39 @@ async fn debounce_loop(
                 // Ingest everything already delivered before deciding what is
                 // due, so the burst decision sees the full backlog even when
                 // publishes are slow (STAB-121).
-                drain_ready(&root, &mut matcher, &mut raw_rx, &mut pending);
+                drain_ready(&root, &mut matcher, &mut raw_rx, &mut exclude_rx, &mut pending);
                 flush_due(&bus, &workspace_id, &mut pending, &mut burst_until).await;
+            }
+        }
+    }
+}
+
+/// Apply every out-of-root `info/` event already delivered, without awaiting.
+/// The two channels are filled in OS order by one demux pass, but `select!`
+/// picks between them arbitrarily, so a workspace write that followed an
+/// `info/exclude` edit could otherwise be evaluated against the stale matcher
+/// — and nothing re-evaluates `pending` once it is queued. Draining this
+/// channel before each workspace ingest restores the edit-before-write order.
+/// A disconnected channel is dropped so the loop stops polling it. Events go
+/// through [`ingest`] like the `select!` branch: out-of-root paths only reach
+/// `note_raw_change`, and non-mutation kinds (git reading the file) are
+/// skipped rather than dirtying the matcher.
+fn drain_exclude(
+    root: &Path,
+    matcher: &mut GitignoreMatcher,
+    exclude_rx: &mut Option<mpsc::UnboundedReceiver<notify::Event>>,
+    pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
+) {
+    let Some(rx) = exclude_rx else {
+        return;
+    };
+    loop {
+        match rx.try_recv() {
+            Ok(event) => ingest(root, matcher, &event, pending),
+            Err(mpsc::error::TryRecvError::Empty) => return,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                *exclude_rx = None;
+                return;
             }
         }
     }
@@ -681,16 +726,21 @@ async fn debounce_loop(
 /// would otherwise starve ingestion: each raw event would be ingested one
 /// publish-latency apart, spreading per-path deadlines so far that no single
 /// flush ever sees the whole churn and the burst collapse never engages
-/// (STAB-121).
+/// (STAB-121). Out-of-root `info/` events are applied ahead of each workspace
+/// event ([`drain_exclude`]).
 fn drain_ready(
     root: &Path,
     matcher: &mut GitignoreMatcher,
     raw_rx: &mut mpsc::UnboundedReceiver<notify::Event>,
+    exclude_rx: &mut Option<mpsc::UnboundedReceiver<notify::Event>>,
     pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
 ) {
     for _ in 0..DRAIN_MAX_PER_CALL {
         match raw_rx.try_recv() {
-            Ok(event) => ingest(root, matcher, &event, pending),
+            Ok(event) => {
+                drain_exclude(root, matcher, exclude_rx, pending);
+                ingest(root, matcher, &event, pending);
+            }
             Err(_) => break,
         }
     }
