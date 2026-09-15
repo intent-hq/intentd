@@ -5009,16 +5009,13 @@ impl Services {
         reason: Option<&str>,
     ) -> Result<Option<String>> {
         let now = now_iso();
-        // Derived unread observed BEFORE the retire write: a retired session
-        // drops out of the unread derivation, so this is the `was_unread`
-        // input the post-retire settle below needs (a probe failure reads as
-        // unread, which only makes the settle more conservative).
-        let was_unread = !session.workspace_id.is_chief()
-            && self
-                .store
-                .workspace_has_unread_top_level_session(&session.workspace_id)
-                .await
-                .unwrap_or(true);
+        // Unread state observed BEFORE the retire write (derived + stored
+        // flag): a retired session drops out of the unread derivation, so
+        // this is the snapshot the post-retire settle below needs. Both
+        // reads fail closed on emission (derived `false`, stored `unread`),
+        // so a transient probe failure can never publish a spurious
+        // `{ none }` through the settle's fallback.
+        let before = self.snapshot_workspace_unread(&session.workspace_id).await;
         // CAS write: only the request that actually flips NULL → set emits
         // the event.
         let transitioned = self
@@ -5087,9 +5084,12 @@ impl Services {
         // (`review_required` untouched; a still-unread workspace stays
         // silent). Runs after the displayStatus recompute so the attention
         // rungs settle before the blue dot; the cascade retires children
-        // through this same path, and the guarded UPDATE inside the settle
-        // ensures the clear emits at most once per actual transition.
-        self.settle_workspace_unread_after_seen(&session.workspace_id, was_unread)
+        // through this same path. Exact-once under concurrency: the guarded
+        // UPDATE inside the settle affects a row for only one of several
+        // concurrent retires (or seen-marker advances) racing on the same
+        // stored `unread`, and the pre-write snapshot keeps the losers out
+        // of the stored-flag-already-clear fallback.
+        self.settle_workspace_unread_after_seen(&session.workspace_id, before)
             .await;
         // The watch/group sweep above may have removed the workspace's last
         // waiting reason (watches feed
@@ -7422,16 +7422,13 @@ impl Services {
                 "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
             )));
         }
-        // Pre-write unread derivation (§5.1): whether the workspace read as
-        // unread BEFORE this marker advance, so the settle below only emits
-        // the workspace-level clear on an actual unread→none transition. A
-        // probe failure reads `false` — fail closed on emission (no spurious
-        // clear), the marker write is unaffected.
-        let was_unread = self
-            .store
-            .workspace_has_unread_top_level_session(&workspace_id)
-            .await
-            .unwrap_or(false);
+        // Pre-write unread snapshot (§5.1): whether the workspace read as
+        // unread (derived + stored flag) BEFORE this marker advance, so the
+        // settle below only emits the workspace-level clear on an actual
+        // unread→none transition — and exactly once when several advances
+        // race on the same stored `unread`. Probe failures fail closed on
+        // emission (no spurious clear); the marker write is unaffected.
+        let before = self.snapshot_workspace_unread(&workspace_id).await;
         for _ in 0..MARK_SEEN_CAS_ATTEMPTS {
             // Metadata-only lookup (no transcript hydration); workspace
             // mismatch surfaces as NotFound (defense-in-depth against
@@ -7512,8 +7509,9 @@ impl Services {
             // clear the stored legacy flag + emit ONE
             // `workspace:attention-changed { none }`. A workspace with other
             // unread sessions — or one that was not unread to begin with —
-            // stays silent.
-            self.settle_workspace_unread_after_seen(&workspace_id, was_unread)
+            // stays silent; a concurrent advance that loses the guarded
+            // clear stays silent too.
+            self.settle_workspace_unread_after_seen(&workspace_id, before)
                 .await;
             return Ok(json!({
                 "success": true,

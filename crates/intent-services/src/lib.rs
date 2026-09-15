@@ -3492,28 +3492,74 @@ impl Services {
         }
     }
 
-    /// Post-seen-marker settlement of the workspace-level `unread` state
-    /// (§5.1): when advancing a per-agent seen marker (`agent.markSeen`, or
-    /// the `workspace.markSeen` mark-all loop) leaves the workspace with no
-    /// unread top-level session, clear the stored legacy flag and emit ONE
-    /// self-sufficient `workspace:attention-changed { none }` — clients
-    /// clear the blue dot together whether they track the derived or the
-    /// stored flag. The clear is ATOMIC
-    /// ([`intent_store::Store::clear_workspace_unread_if_all_seen`]): the
-    /// guarded UPDATE re-checks the derivation inside the write itself
+    /// Take the [`UnreadSnapshot`] for `workspace_id`: the derivation probe
+    /// plus one primary-key read of the stored flag. Both reads fail CLOSED
+    /// on emission — a probe failure records `derived = false` and a
+    /// stored-flag read failure records `stored_unread = true`, each of
+    /// which keeps the settle's fallback emit off (recording `derived =
+    /// true` on error would be the opposite: a transient probe failure
+    /// followed by a successful post-write fallback would publish a
+    /// spurious `{ none }`). Chief has no attention state and snapshots as
+    /// not-unread.
+    pub(crate) async fn snapshot_workspace_unread(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> UnreadSnapshot {
+        if workspace_id.is_chief() {
+            return UnreadSnapshot {
+                derived: false,
+                stored_unread: true,
+            };
+        }
+        let derived = self
+            .store
+            .workspace_has_unread_top_level_session(workspace_id)
+            .await
+            .unwrap_or(false);
+        let stored_unread = match self.store.get_workspace(workspace_id).await {
+            Ok(ws) => ws.attention == WorkspaceAttention::Unread,
+            Err(_) => true,
+        };
+        UnreadSnapshot {
+            derived,
+            stored_unread,
+        }
+    }
+
+    /// Post-write settlement of the workspace-level `unread` state (§5.1):
+    /// when a write that drops a session out of the unread derivation (a
+    /// per-agent seen-marker advance via `agent.markSeen`, or a retire via
+    /// `agent.retire`) leaves the workspace with no unread top-level
+    /// session, clear the stored legacy flag and emit ONE self-sufficient
+    /// `workspace:attention-changed { none }` — clients clear the blue dot
+    /// together whether they track the derived or the stored flag. The clear
+    /// is ATOMIC ([`intent_store::Store::clear_workspace_unread_if_all_seen`]):
+    /// the guarded UPDATE re-checks the derivation inside the write itself
     /// (`attention = unread AND NOT EXISTS <unread session>`), so an
     /// assistant message landing between the probe below and the write can
     /// never have a freshly-raised unread retired — the write declines and
     /// stays silent (`review_required` is likewise never touched).
-    /// `was_unread` is the derivation observed before the marker write; a
-    /// still-unread workspace (other sessions pending) is a silent no-op, so
-    /// partial reads never emit. Best-effort: a probe failure fails closed
+    ///
+    /// `before` is the [`UnreadSnapshot`] taken before the caller's write.
+    /// A still-unread workspace (other sessions pending) is a silent no-op,
+    /// so partial reads never emit. Exact-once: when the stored flag WAS
+    /// `unread` at snapshot time, only the settle whose guarded clear
+    /// affects the row emits — a concurrent settle (two sessions retired or
+    /// read at once) finds the clear declined and stays silent, since the
+    /// winner already emitted (or a fresh raise re-armed the flag and
+    /// reads serve `unread` again). The fallback emit below exists for the
+    /// other case only — the derivation read unread while the stored flag
+    /// was ALREADY clear (a skipped turn-end raise, a dropped store write),
+    /// so no clear can ever affect a row and clients tracking the derived
+    /// value would never get their `{ none }`; two concurrent settles of
+    /// such an unflagged workspace can both take it (the emit is
+    /// idempotent for clients). Best-effort: a probe failure fails closed
     /// (no emit we cannot confirm) and a write failure skips the settle —
-    /// the marker write is the contract; reads re-derive.
+    /// the caller's write is the contract; reads re-derive.
     pub(crate) async fn settle_workspace_unread_after_seen(
         &self,
         workspace_id: &WorkspaceId,
-        was_unread: bool,
+        before: UnreadSnapshot,
     ) {
         if workspace_id.is_chief() {
             return;
@@ -3543,7 +3589,7 @@ impl Services {
             .await;
             return;
         }
-        if was_unread {
+        if before.derived && !before.stored_unread {
             // The derivation transitioned while the stored flag was already
             // clear (e.g. a turn-end raise was skipped, or a store error
             // dropped it): the read paths were serving derived `unread`, so
@@ -3551,7 +3597,11 @@ impl Services {
             // the dot (it wins on reads; emitting `none` would wrongly
             // retire it), or the derivation flipped back to unread in the
             // park gap (a new assistant message landed; emitting `none`
-            // would contradict what reads now serve).
+            // would contradict what reads now serve). A stored `unread` at
+            // snapshot time never takes this branch: the declined clear
+            // means a concurrent settle already cleared-and-emitted (or a
+            // fresh raise re-armed the flag) — emitting again would
+            // duplicate the `{ none }`.
             let derived_unread = self
                 .store
                 .workspace_has_unread_top_level_session(workspace_id)
@@ -12175,6 +12225,21 @@ fn activity_changed_event(workspace_id: &WorkspaceId, activity: WorkspaceActivit
             "activity": activity,
         }),
     }
+}
+
+/// Pre-write observation of a workspace's unread state, taken by the settle
+/// callers ([`Services::settle_workspace_unread_after_seen`]) BEFORE the
+/// write that drops a session out of the unread derivation (a seen-marker
+/// advance or a retire), via [`Services::snapshot_workspace_unread`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnreadSnapshot {
+    /// The derivation read unread (an unread top-level session existed). A
+    /// probe failure records `false`: the fallback emit stays off.
+    pub(crate) derived: bool,
+    /// The stored legacy `attention` flag read `unread`. A read failure
+    /// records `true`: the settle then only ever emits through the atomic
+    /// clear, never the fallback (conservative — silent).
+    pub(crate) stored_unread: bool,
 }
 
 /// Build a `workspace:attention-changed` change event with the self-sufficient

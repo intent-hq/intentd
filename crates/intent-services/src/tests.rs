@@ -43014,6 +43014,146 @@ mod derived_workspace_unread {
         assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
     }
 
+    /// Regression (intentd#1901 review): two unread top-level sessions
+    /// retired CONCURRENTLY settle the stored `unread` exactly once. Both
+    /// retires snapshot the pre-write state (derived unread, stored
+    /// `unread`) before either clears, then both park immediately before
+    /// their atomic clear; on release the first clear wins and emits, the
+    /// second declines — and must stay silent instead of falling through
+    /// to the "stored flag was already clear" fallback and emitting a
+    /// duplicate `{ none }`.
+    #[tokio::test]
+    async fn agent_retire_concurrent_unread_sessions_settle_exactly_once() {
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let h = harness_with_park(Some(park.clone())).await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        seed_session(&h, "agent-b", &["user", "assistant"]).await;
+        // Stored flag raised as the turn-end gate would have left it (seeded
+        // via the store — the armed park would hold the service-path raise).
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.attention = WorkspaceAttention::Unread;
+        h.store.update_workspace(&ws).await.expect("seed flag");
+
+        let mut sub = subscribe_attention(&h);
+        let mut tasks = Vec::new();
+        for id in ["agent-a", "agent-b"] {
+            let services = h.services.clone();
+            let ws_id = h.ws.clone();
+            tasks.push(tokio::spawn(async move {
+                services
+                    .agent_retire_op(AgentId::from(id), Some(ws_id), None)
+                    .await
+            }));
+        }
+        // Both retires have written `retired_at` and reached the settle's
+        // attention-write window: neither has cleared yet.
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+                .await
+                .expect("settle reaches the attention write window");
+        }
+        park.release.notify_one();
+        park.release.notify_one();
+        for task in tasks {
+            let res = task.await.expect("join").expect("retire");
+            assert_eq!(res["success"], true);
+        }
+
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+    }
+
+    /// The retire settle clears the derived state even when the stored flag
+    /// was never raised (e.g. the turn-end raise was skipped): the guarded
+    /// clear has nothing to write, so the fallback emits the one `{ none }`
+    /// clients tracking the derived value still need.
+    #[tokio::test]
+    async fn agent_retire_emits_clear_without_stored_flag() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+        let stored = h.store.get_workspace(&h.ws).await.expect("load");
+        assert_eq!(stored.attention, WorkspaceAttention::None);
+
+        let mut sub = subscribe_attention(&h);
+        h.services
+            .agent_retire_op(AgentId::from("agent-a"), Some(h.ws.clone()), None)
+            .await
+            .expect("retire");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_silent(&mut sub).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+    }
+
+    /// Regression (intentd#1901 review): the retire pre-probe fails CLOSED.
+    /// When the derivation probe errors (here: its `INDEXED BY` index is
+    /// gone, so only the probe fails — the retire write itself succeeds),
+    /// the snapshot must record `derived = false` rather than `true`: a
+    /// TRANSIENT probe failure followed by a successful post-retire
+    /// fallback would otherwise publish a spurious `{ none }` on a
+    /// workspace that was never unread. The snapshot assertion is the
+    /// discriminating one — the fault here is persistent, so the settle's
+    /// own re-probes fail too and it stays silent either way; the retire
+    /// assertions confirm the write still lands and the stored flag is
+    /// untouched.
+    #[tokio::test]
+    async fn agent_retire_probe_failure_fails_closed() {
+        let h = harness().await;
+        let last = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        // Read the session so the workspace is genuinely not unread, with
+        // the stored flag already `none` — the shape the fallback branch
+        // would emit for if the failed probe were recorded as `unread`.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last)
+            .await
+            .expect("mark seen");
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+
+        sqlx::query("DROP INDEX idx_agent_session_unread_top_level")
+            .execute(h.store.write_pool())
+            .await
+            .expect("drop unread probe index");
+        assert!(
+            h.store
+                .workspace_has_unread_top_level_session(&h.ws)
+                .await
+                .is_err(),
+            "probe must fail once its index is gone"
+        );
+
+        let before = h.services.snapshot_workspace_unread(&h.ws).await;
+        assert!(!before.derived, "probe failure must snapshot as not-unread");
+        assert!(!before.stored_unread);
+
+        let mut sub = subscribe_attention(&h);
+        h.services
+            .agent_retire_op(AgentId::from("agent-a"), Some(h.ws.clone()), None)
+            .await
+            .expect("retire lands despite the failed probe");
+        assert_silent(&mut sub).await;
+        let stored = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(stored.attention, WorkspaceAttention::None);
+        let session = h
+            .store
+            .get_agent_session(&AgentId::from("agent-a"))
+            .await
+            .expect("reload session");
+        assert!(session.retired_at.is_some(), "retire must still land");
+    }
+
     /// A stored `review_required` is never touched by retire or restore:
     /// no attention event, stored and served value unchanged.
     #[tokio::test]
