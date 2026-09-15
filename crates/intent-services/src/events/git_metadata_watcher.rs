@@ -37,9 +37,14 @@
 //! On Linux the hub's pruned walk registers descriptors for exactly what
 //! these filters consume — a git dir itself and its `refs/` subtree (plus
 //! `info/` for the file watcher) — and skips `objects/`, `logs/`,
-//! `modules/`, `worktrees/` (intent-hq/intent#5044). Widening any filter here
-//! to another `.git` subtree requires widening `GIT_DIR_KEPT_DIRS` in
-//! [`super::shared_watch`] alongside it, or the events never reach the hub.
+//! `modules/`, `worktrees/` (intent-hq/intent#5044). The regular repository
+//! gets that through the workspace-root watch's `.git` child; the resolved
+//! gitdir and common dir are subscribed AS git dirs
+//! ([`SharedWatchHub::subscribe_git_dir`]) because their pathnames need not
+//! contain `.git` at all (`git init --separate-git-dir`, a bare `repo.git`).
+//! Widening any filter here to another git-dir subtree requires widening
+//! `GIT_DIR_KEPT_DIRS` in [`super::shared_watch`] alongside it, or the
+//! events never reach the hub.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -134,7 +139,7 @@ impl GitMetadataWatcher {
                 return None;
             }
         };
-        let (sub, mut rx, gitdir) = hub.subscribe(&gitdir);
+        let (sub, mut rx, gitdir) = hub.subscribe_git_dir(&gitdir);
         let ws_id = workspace_id.clone();
         let gitdir_refresher = Arc::clone(&refresher);
         let task = tokio::spawn(async move {
@@ -264,7 +269,7 @@ impl GitCommonDirWatches {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let mut state = lock(&self.state);
         let entry = state.entry(key.clone()).or_insert_with(|| {
-            let (sub, mut rx, common_dir) = hub.subscribe(&key);
+            let (sub, mut rx, common_dir) = hub.subscribe_git_dir(&key);
             let workspaces: Arc<Mutex<HashMap<WorkspaceId, Registration>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let fan_out = Arc::clone(&workspaces);
@@ -869,6 +874,126 @@ mod tests {
             file_ev.is_none(),
             "`.git` metadata churn must not emit file:* events, got {file_ev:?}"
         );
+    }
+
+    /// The intent-hq/intent#5044 descriptor regression for a checkout whose
+    /// resolved git dir carries no `.git` path component at all
+    /// (`git init --separate-git-dir <metadata> <checkout>`: `checkout/.git`
+    /// is a gitfile, the metadata lives at `<metadata>/`). The watcher must
+    /// subscribe that root AS a git dir so the hub's pruned walk keeps only
+    /// the root, `refs/**` and `info/` and skips `objects/` and `logs/`; a
+    /// pathname-keyed rule would walk the whole tree here. The narrowed watch
+    /// must still deliver an external HEAD change as `changes:git-status`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn separate_git_dir_checkout_watches_only_its_metadata_dirs() {
+        use crate::events::{inode_of, inotify_watched_inodes};
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, mut status_sub, _file_sub) = bus_and_subs().await;
+        let base = TempDir::new("sep-gitdir");
+        let metadata = base.path.join("metadata");
+        let checkout = base.path.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let repo = {
+            use git2::{Repository, RepositoryInitOptions, Signature};
+            let mut opts = RepositoryInitOptions::new();
+            opts.no_dotgit_dir(true).workdir_path(&checkout);
+            let repo = Repository::init_opts(&metadata, &opts).unwrap();
+            {
+                let mut cfg = repo.config().unwrap();
+                cfg.set_str("user.name", "Test").unwrap();
+                cfg.set_str("user.email", "test@example.com").unwrap();
+            }
+            repo.set_head("refs/heads/main").unwrap();
+            std::fs::write(checkout.join("seed.txt"), "seed\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("seed.txt")).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            {
+                let tree = repo.find_tree(tree_oid).unwrap();
+                let sig = Signature::now("Test", "test@example.com").unwrap();
+                repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+                    .unwrap();
+            }
+            repo
+        };
+        assert!(
+            checkout.join(".git").is_file(),
+            "the checkout must carry a gitfile pointing at the separate git dir"
+        );
+        let metadata = std::fs::canonicalize(&metadata).unwrap();
+        let resolved =
+            std::fs::canonicalize(git2::Repository::open(&checkout).unwrap().path()).unwrap();
+        assert_eq!(
+            resolved, metadata,
+            "the gitfile must resolve to the separate git dir itself"
+        );
+        assert!(
+            !metadata.iter().any(|c| c == ".git"),
+            "the resolved git dir must carry no .git component: {}",
+            metadata.display()
+        );
+        for rel in ["objects/ab", "logs/refs/heads", "refs/heads"] {
+            std::fs::create_dir_all(metadata.join(rel)).unwrap();
+        }
+
+        let ws = test_workspace("ws-sep-gitdir", &checkout);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus.clone(),
+            api,
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
+        let hub = SharedWatchHub::new();
+        let watcher = GitMetadataWatcher::start(
+            &hub,
+            &GitCommonDirWatches::new(),
+            refresher,
+            ws.id.clone(),
+            &checkout.clone(),
+        )
+        .expect("separate-git-dir checkout must gain a metadata watch");
+        watcher.wait_established(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let inodes = inotify_watched_inodes();
+        for rel in ["", "refs", "refs/heads"] {
+            assert!(
+                inodes.contains(&inode_of(&metadata.join(rel))),
+                "resolved git dir {rel:?} must hold an inotify descriptor (root {})",
+                hub.root_registration_state(&metadata)
+            );
+        }
+        for rel in ["objects", "objects/ab", "logs", "logs/refs/heads"] {
+            assert!(
+                !inodes.contains(&inode_of(&metadata.join(rel))),
+                "resolved git dir {rel:?} must NOT hold an inotify descriptor"
+            );
+        }
+
+        let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("alt", &head_commit, false).unwrap();
+        let mut ev = None;
+        for i in 0..20 {
+            let target = if i % 2 == 0 {
+                "refs/heads/alt"
+            } else {
+                "refs/heads/main"
+            };
+            repo.set_head(target).unwrap();
+            ev = next_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
+            if ev.is_some() {
+                break;
+            }
+        }
+        let ev =
+            ev.expect("external HEAD change in the separate git dir must yield changes:git-status");
+        assert_eq!(ev.event_type, CHANGES_GIT_STATUS);
+        assert_eq!(ev.data["workspaceId"], ws.id.as_str());
     }
 
     /// Two worktrees of one repo share ONE common-dir watch, a ref change in

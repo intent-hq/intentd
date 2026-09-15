@@ -84,6 +84,44 @@ impl TestBudget {
     }
 }
 
+/// Inodes currently held by an inotify watch descriptor anywhere in this
+/// process, parsed from the `inotify wd:N ino:HEX ...` lines of
+/// `/proc/self/fdinfo/*` (the counting method of intent-hq/intent#3708).
+/// Shared by the descriptor-count regressions in `shared_watch` and
+/// `git_metadata_watcher`.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn inotify_watched_inodes() -> std::collections::HashSet<u64> {
+    let mut inodes = std::collections::HashSet::new();
+    let Ok(fds) = std::fs::read_dir("/proc/self/fd") else {
+        return inodes;
+    };
+    for fd in fds.flatten() {
+        let fdinfo = std::path::Path::new("/proc/self/fdinfo").join(fd.file_name());
+        let Ok(text) = std::fs::read_to_string(fdinfo) else {
+            continue;
+        };
+        for line in text.lines().filter(|l| l.starts_with("inotify wd:")) {
+            let Some(ino) = line
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("ino:"))
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            else {
+                continue;
+            };
+            inodes.insert(ino);
+        }
+    }
+    inodes
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn inode_of(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+        .ino()
+}
+
 #[cfg(test)]
 mod bus_tests;
 
