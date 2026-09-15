@@ -1027,6 +1027,16 @@ pub struct Services {
     /// race can be decided by moving the deadline instead of racing wall
     /// clock.
     hook_clock_skew: Option<Arc<std::sync::atomic::AtomicI64>>,
+    /// Base backoff between retries of a failed hook-run persistence step
+    /// (1 s in production, doubling per attempt — see
+    /// [`hook_manager::HOOK_STORE_RETRY_ATTEMPTS`]). Tests compress it via
+    /// the `#[cfg(test)]`-only `with_hook_store_retry_base`.
+    hook_store_retry_base: std::time::Duration,
+    /// Test-only fault injector consulted before every hook-run persistence
+    /// step (intent-hq/intent#5035): `Some(err)` fails that attempt without
+    /// touching the store. `None` in production wiring.
+    #[cfg(test)]
+    hook_store_fault: Option<hook_manager::HookStoreFault>,
     /// Host suspend-overlap query used by [`Services::run_prompt_turn`] to
     /// recognize a sleep-induced turn failure and enroll it as interrupted for
     /// wake-triggered resume (Task C). Wired by the composition root from the
@@ -1284,6 +1294,9 @@ impl Services {
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
             hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
+            hook_store_retry_base: hook_manager::HOOK_STORE_RETRY_BASE,
+            #[cfg(test)]
+            hook_store_fault: None,
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
             pr_monitor_poll_seconds: None,
@@ -1393,6 +1406,23 @@ impl Services {
         skew_ms: Arc<std::sync::atomic::AtomicI64>,
     ) -> Self {
         self.hook_clock_skew = Some(skew_ms);
+        self
+    }
+
+    /// Test-only: compress the backoff between hook persistence retries so
+    /// store-failure coverage completes in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_hook_store_retry_base(mut self, base: std::time::Duration) -> Self {
+        self.hook_store_retry_base = base;
+        self
+    }
+
+    /// Test-only: inject a fault into hook-run persistence steps. The
+    /// injector is called with the step name before every attempt and fails
+    /// the attempt when it returns `Some(err)`.
+    #[cfg(test)]
+    pub(crate) fn with_hook_store_fault(mut self, fault: hook_manager::HookStoreFault) -> Self {
+        self.hook_store_fault = Some(fault);
         self
     }
 
