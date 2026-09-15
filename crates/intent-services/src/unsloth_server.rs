@@ -1146,10 +1146,16 @@ impl UnslothServerManager {
         let output_tail = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let mut drain_tasks = Vec::new();
         if let Some(stdout) = child.stdout.take() {
-            drain_tasks.push(tokio::spawn(drain_into_tail(stdout, output_tail.clone())));
+            drain_tasks.push(intent_core::spawn_daemon(drain_into_tail(
+                stdout,
+                output_tail.clone(),
+            )));
         }
         if let Some(stderr) = child.stderr.take() {
-            drain_tasks.push(tokio::spawn(drain_into_tail(stderr, output_tail.clone())));
+            drain_tasks.push(intent_core::spawn_daemon(drain_into_tail(
+                stderr,
+                output_tail.clone(),
+            )));
         }
 
         tracing::info!(repo = %repo_id, quant = %quant, port, "spawned managed unsloth server");
@@ -1417,14 +1423,14 @@ impl UnslothServerManager {
         // does not, so the drain has to be made explicit.
         let stdout_pipe = mint_child.stdout.take();
         let stderr_pipe = mint_child.stderr.take();
-        let stdout_task = tokio::spawn(async move {
+        let stdout_task = intent_core::spawn_daemon(async move {
             let mut buf = Vec::new();
             if let Some(mut out) = stdout_pipe {
                 let _ = out.read_to_end(&mut buf).await;
             }
             buf
         });
-        let stderr_task = tokio::spawn(async move {
+        let stderr_task = intent_core::spawn_daemon(async move {
             let mut buf = Vec::new();
             if let Some(mut err) = stderr_pipe {
                 let _ = err.read_to_end(&mut buf).await;

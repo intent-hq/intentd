@@ -122,7 +122,7 @@ fn entry<'a>(list: &'a Value, path: &str) -> &'a Value {
 
 const SECRET: &str = "ghp_super_secret_token_value_0123456789";
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn settings_round_trip_redaction_validation_and_event() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -142,7 +142,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {

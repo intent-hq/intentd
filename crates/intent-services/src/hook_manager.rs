@@ -1561,7 +1561,7 @@ impl Services {
         let (control_tx, mut control_rx) = mpsc::channel::<HookControl>(4);
         let services = self.clone();
         let hook_id = hook.hook_id.clone();
-        let join = tokio::spawn(async move {
+        let join = intent_core::spawn_daemon(async move {
             let mut hook = hook;
             let mut delay = initial_delay
                 .unwrap_or_else(|| Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()));
@@ -3568,7 +3568,7 @@ mod tests {
     /// the existing cancel semantics — state persisted to `cancelled`, task
     /// aborted, `hook:cancelled` emitted, owner told why — while terminal
     /// hooks are untouched.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn archive_cancels_active_hooks_and_leaves_terminal_hooks_untouched() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
         // A terminal hook first: an immediate dispatch short-circuits the
@@ -3893,7 +3893,7 @@ mod tests {
     /// `workspace.delete` aborts the workspace's live hook scheduler tasks
     /// EAGERLY — the task is gone the moment delete returns, not lazily at
     /// its next tick — and the store cascade drops the row.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delete_aborts_live_hook_tasks_eagerly() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
         let out = svc

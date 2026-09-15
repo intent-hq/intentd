@@ -217,7 +217,7 @@ fn contention_budget(floor: Duration, baseline: Duration) -> Duration {
 /// co-tenancy-calibrated `contention_budget`. Proves the single-writer/read
 /// pool split prevents pool exhaustion and `database is locked` errors under
 /// heavy concurrent write load.
-#[tokio::test(flavor = "multi_thread")]
+#[intent_test_macros::daemon_test(flavor = "multi_thread")]
 async fn concurrent_writes_do_not_starve_reads() {
     let srv = start().await;
 
@@ -275,7 +275,7 @@ async fn concurrent_writes_do_not_starve_reads() {
         let cfg = srv.cfg.clone();
         let ws_id = ws_id.clone();
         let note_id = note_id.clone();
-        let handle = tokio::spawn(async move {
+        let handle = intent_core::spawn_daemon(async move {
             let frame = format!(
                 r#"{{"jsonrpc":"2.0","id":{},"method":"note.setContent","params":{{"workspaceId":"{}","noteId":"{}","content":"edit {i}","confirmReplacement":true}}}}"#,
                 100 + i,
@@ -334,7 +334,7 @@ async fn concurrent_writes_do_not_starve_reads() {
 /// projections, each `agent.list` hydrated + decoded every transcript
 /// (~6 MB of content JSON here), saturating the read pool; the issue's live
 /// evidence was note refreshes pool-timing-out behind `agent.list`.
-#[tokio::test(flavor = "multi_thread")]
+#[intent_test_macros::daemon_test(flavor = "multi_thread")]
 async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
     use intent_core::{AgentSession, AgentStatus, WorkspaceId};
     use intent_store::ReplaceMessage;
@@ -448,7 +448,7 @@ async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
         let port = srv.port;
         let cfg = srv.cfg.clone();
         let ws = ws_id.clone();
-        list_tasks.push(tokio::spawn(async move {
+        list_tasks.push(intent_core::spawn_daemon(async move {
             let start = Instant::now();
             let frame = format!(
                 r#"{{"jsonrpc":"2.0","id":{},"method":"agent.list","params":{{"workspaceId":"{}"}}}}"#,

@@ -82,7 +82,7 @@ fn slug_workspace(id: &WorkspaceId) -> Workspace {
     }
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(

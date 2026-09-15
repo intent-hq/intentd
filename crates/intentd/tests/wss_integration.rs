@@ -445,7 +445,7 @@ async fn wss_session(port: u16, cfg: Arc<ClientConfig>, frames: Vec<String>) -> 
     out
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_client_hello_and_drafts_round_trip() {
     let srv = start(WsOptions::default()).await;
     // Create a workspace first (drafts FK to `workspace`); a fresh connection is
@@ -538,7 +538,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
 /// that the getter reads back and emits a self-sufficient `workspace:updated`
 /// event carrying the `autoCommitEnabled` delta (§6.5); a missing or
 /// wrong-typed `enabled` and an unknown workspace all surface `-32602`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_workspace_auto_commit_round_trip() {
     async fn send_and_wait(
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
@@ -700,7 +700,7 @@ async fn wss_workspace_auto_commit_round_trip() {
 /// `workspace.list` rows in the documented camelCase + lowercase-kind wire
 /// shape; a workspace created without the param omits the field; a malformed
 /// list rejects `-32602` before any state change.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_workspace_create_context_links_round_trip_and_validation() {
     let srv = start(WsOptions::default()).await;
     let links = serde_json::json!([
@@ -839,7 +839,7 @@ async fn wss_workspace_create_context_links_round_trip_and_validation() {
 /// under `__new-workspace__` / `__initializer__` before any workspace row
 /// exists, so `drafts.set` → `drafts.get` → `drafts.clear` must round-trip
 /// without a workspace.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_drafts_sentinel_keys_round_trip_without_workspace() {
     let srv = start(WsOptions::default()).await;
     let sess = wss_session(
@@ -876,7 +876,7 @@ async fn wss_drafts_sentinel_keys_round_trip_without_workspace() {
 /// "invalid-params"` on the wire, mirroring the dispatcher. `browser.exec`
 /// validation short-circuits before the FE reverse RPC, so no frontend is
 /// needed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_fast_path_invalid_params_carry_data_code() {
     let srv = start(WsOptions::default()).await;
     let sess = wss_session(
@@ -918,7 +918,7 @@ async fn wss_fast_path_invalid_params_carry_data_code() {
 /// (Message Too Big) close frame; a large-but-legit single-frame message
 /// above tungstenite's 16 MiB default frame size still round-trips, as does
 /// a normal request on a fresh connection.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_oversized_message_terminates_connection() {
     use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
     use tokio_tungstenite::tungstenite::protocol::frame::Frame;
@@ -1009,7 +1009,7 @@ async fn wss_oversized_message_terminates_connection() {
 /// The created/resolved `AgentLite` payloads also carry the harness stamp
 /// (`harnessVersion` = current constant, `harnessFeatures` = the captured
 /// agentFeatures snapshot) over the real wire (intent-hq/monorepo#2459).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_create_rejects_client_supplied_agent_id() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
@@ -1137,7 +1137,7 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
 /// `agent.list` rows OMIT it (absent, never `null`) — it was the last
 /// unbounded per-row field on real workspaces and no client reads it off
 /// agent rows.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_lite_omits_initial_message() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
@@ -1219,7 +1219,7 @@ async fn wss_agent_lite_omits_initial_message() {
 /// — and the wire `agent.restore` method returns it to service. Both
 /// transitions emit their events (`agent:retired` / `agent:restored`) to an
 /// `events.subscribe` subscriber.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_soft_retire_and_restore_round_trip() {
     async fn send_and_wait(
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
@@ -1482,7 +1482,7 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
 /// cancelled hook nor the consumed watch. PR-monitor cancellation is
 /// asserted at the unit level (`agent_ops` tests); this e2e covers the
 /// hook + watch sweeps.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     /// Next `events.event` frame of any type, bounded by `deadline`.
     async fn next_event_any(
@@ -1828,7 +1828,7 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
 /// `digest`, `lastToolUse`, `metadata.completionReport` — to the render-sized
 /// per-field budget, while `agent.get` keeps serving the full values for the
 /// same session. Asserts the wire shape over the real WSS transport.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_list_caps_previews_get_serves_full() {
     const BUDGET: usize = intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES;
     let srv = start(WsOptions::default()).await;
@@ -1989,7 +1989,7 @@ async fn wss_agent_list_caps_previews_get_serves_full() {
 /// both fields for detail reads, archived included. The active row's
 /// `agentSummary.agents[]` also carries the additive `isBackground` flag
 /// (monorepo#3789): `true` for a background session, omitted for foreground.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     use std::collections::BTreeMap;
 
@@ -2386,7 +2386,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
 /// membership summary relative to the caller: the primary user is `owner` of
 /// a workspace it created, an added collaborator sees `collaborator`, and a
 /// non-member sees no `myRole` at all. An unknown token is still refused.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_principal_me_and_workspace_membership_by_caller() {
     use intent_core::{Principal, PrincipalId, WorkspaceRole};
 
@@ -2546,7 +2546,7 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
 /// `workspace.members.remove` over the wire drops the collaborator: its
 /// open workspace channel receives a `removedIds` delta and its next read is
 /// `NotFound` again; removing the owner row is rejected.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_collaborator_capability_matrix_in_service_layer() {
     use intent_core::{Principal, PrincipalId, WorkspaceRole};
     use serde_json::json;
@@ -3188,7 +3188,7 @@ async fn wss_collaborator_client_ids_are_principal_scoped() {
 /// (allowed, so it reaches the router and fails on params, not on -32003);
 /// a `/tunnel` upgrade with the collaborator credential is refused (403). The
 /// legacy token keeps the administrator's unrestricted surface.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
     use intent_core::{Principal, PrincipalId};
     use serde_json::json;
@@ -3349,7 +3349,7 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
 /// owner's identical subscription still sees every one. `event.query` from
 /// the collaborator returns no excluded rows (an explicit `terminal:*` filter
 /// yields `[]`) while the administrator's query returns them all.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_collaborator_event_fan_out_and_query_are_allowlisted() {
     use intent_core::events::{HOST_EXEC_STDOUT, NOTE_UPDATED, TERMINAL_DATA, TERMINAL_EXIT};
     use intent_core::{ActorType, EventActor, Principal, PrincipalId, WorkspaceRole};
@@ -3585,7 +3585,7 @@ async fn wss_collaborator_event_fan_out_and_query_are_allowlisted() {
 /// resolved `author` per user row: the stamp, else the workspace's legacy
 /// author, else its owner (pre-multiplayer rows). Assistant rows carry no
 /// author; a non-user role never gets a stamp.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_user_messages_stamp_principal_and_serve_author() {
     use intent_core::{Principal, PrincipalId, WorkspaceRole};
 
@@ -3908,7 +3908,7 @@ async fn wss_user_messages_stamp_principal_and_serve_author() {
 /// truncated id) fails closed with `-32602` naming the unknown id — it must
 /// NOT auto-queue a phantom message (`queued: true`) the sender then waits on
 /// forever. A send to a real agent on the same connection still succeeds.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_send_message_rejects_unknown_agent() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
@@ -3984,7 +3984,7 @@ async fn wss_agent_send_message_rejects_unknown_agent() {
 /// with `-32602` naming the unknown id — it must NOT create a queue entry
 /// that never drains. A queue to a real agent on the same connection still
 /// succeeds.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_queue_message_rejects_unknown_agent() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
@@ -4055,13 +4055,12 @@ async fn wss_agent_queue_message_rejects_unknown_agent() {
     srv.ws.stop().await;
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `agent.diagnostics` reports real pending-message queue snapshots over the
 /// WSS wire: after `agent.queueMessage`, `diagnostics.queues` carries the
 /// target's queue (drain-order entries with `queuedAt`, content truncated to
 /// 200 chars) and `summary.queuedAgents` counts it; after
 /// `agent.removeQueuedMessage` the snapshot is empty again.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_diagnostics_reports_queue_snapshots() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
@@ -4155,7 +4154,7 @@ async fn wss_agent_diagnostics_reports_queue_snapshots() {
 /// it, and the `text` rendering mentions it. The stale entry is seeded via
 /// the durable queue snapshot + rehydration path (the same path a daemon
 /// restart uses), so the wire read reflects the live in-memory queue.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_diagnostics_flags_stale_queue_entry() {
     let dir = test_tempdir("intentd-wss-stalequeue-");
     let store = Store::open(&dir.path().join("intentd.db"))
@@ -4290,7 +4289,7 @@ async fn wss_agent_diagnostics_flags_stale_queue_entry() {
 /// conversation past the 4 MiB threshold raises a `large-conversation`
 /// stuck-risk naming the agent and sizes so coordinators can rotate to a
 /// fresh agent before turns start silently truncating.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
     let dir = test_tempdir("intentd-wss-largeconv-");
     let store = Store::open(&dir.path().join("intentd.db"))
@@ -4396,7 +4395,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
 /// model prefix, and `agent.setModel` with an unknown compound prefix, are all
 /// rejected with `-32602` naming the unknown id — no session row is persisted
 /// and no default-provider fallback occurs.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_create_and_set_model_reject_unknown_provider() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
@@ -4527,7 +4526,7 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
 /// bare model and the prefix-won provider; no wire payload ever carries a
 /// colon-compound model id. An effort-lookalike bare id (`opus[1m]`) passes
 /// through untouched.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_reads_serialize_legacy_compound_rows_split() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
@@ -4653,7 +4652,7 @@ async fn wss_agent_reads_serialize_legacy_compound_rows_split() {
 /// mismatched `provider`) and `agent.setModel` (session's effective
 /// provider), no session row / model mutation persists, and a bare id
 /// unknown to every cached catalog still passes.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
     let dir = test_tempdir("intentd-wss-bare-mismatch-");
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
@@ -4799,7 +4798,7 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
 /// router boundary, and a compound `modelId` conflicting with `providerId`
 /// is -32602 with the session untouched. Every response is checked for the
 /// JSON-RPC envelope (`jsonrpc: "2.0"` + request-id correlation).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_set_model_provider_id_param() {
     /// Assert the JSON-RPC response envelope: version and id correlation.
     fn assert_envelope(resp: &Value, id: i64) {
@@ -5016,7 +5015,7 @@ async fn wss_agent_set_model_provider_id_param() {
 /// bare `model: "fable-5"` — is rejected -32602 naming auggie, and no
 /// session row persists. The same id passes when grok has no cached catalog
 /// entry (absence of evidence is not a mismatch).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
     let dir = test_tempdir("intentd-wss-bare-cache-");
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
@@ -5123,7 +5122,7 @@ async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
 /// the full `AgentLite` projection instead of the pre-widening `{id, name}`
 /// snippet. All new params are additive — omitted params still succeed and
 /// still round-trip through `agent.get` (PROTOCOL §5.5).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_create_widened_params_round_trip() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
@@ -5228,7 +5227,7 @@ async fn wss_agent_create_widened_params_round_trip() {
 /// `agent:updated { agentId, lastSeenMessageId }`, serves the marker on the
 /// `agent.get` metadata projection, applies the monotonic no-op when naming
 /// an older message, and rejects missing params with `-32602`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_mark_seen_round_trip() {
     async fn send_and_wait(
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
@@ -5414,7 +5413,7 @@ async fn wss_agent_mark_seen_round_trip() {
 /// the same preview from the persisted 0098 column. A follow-up tool-less
 /// assistant persist emits a companion WITHOUT `lastToolUse` (the cleared
 /// state) and `agent.get` drops the field.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
     async fn send_and_wait(
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
@@ -5604,7 +5603,7 @@ async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
 /// updates round-tripping through `agent.getSession`, append-then-swap
 /// transcript mutations under freshly-minted `seq: 0..n`, and the `-32602`
 /// error codes for unknown agents / unknown fields.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_session_shape_rpcs_round_trip() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
@@ -5773,7 +5772,7 @@ async fn wss_agent_session_shape_rpcs_round_trip() {
 /// nullable via `agent.update`, and served on `agent.getSession` /
 /// `agent.get` — over the real WSS transport. The daemon stores the level
 /// as-is (no vocabulary validation), so an arbitrary string passes.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_reasoning_effort_round_trip() {
     let srv = start(WsOptions::default()).await;
     let created_ws = wss_call(
@@ -5879,7 +5878,7 @@ async fn wss_agent_reasoning_effort_round_trip() {
 /// `effortLevels` evidence and an arbitrary level passes through unvalidated —
 /// the "absence of evidence is not a mismatch" rule; the rejection arm is
 /// covered by the service-layer unit test that seeds the catalog cache.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_delegate_persists_reasoning_effort() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
@@ -5943,7 +5942,7 @@ async fn wss_agent_delegate_persists_reasoning_effort() {
 /// unsupported level is rejected naming the valid values and persists no
 /// session row, a supported level matches case-insensitively, and a model with
 /// no `effortLevels` evidence passes through unvalidated.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_levels() {
     let dir = test_tempdir("intentd-wss-create-effort-");
     let cache = serde_json::json!({
@@ -6042,7 +6041,7 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
 /// level the resolved model's cached `effortLevels` does not list is dropped
 /// with a warn rather than rejected — settings-chain leniency, so the create
 /// still succeeds with the effort omitted from the `AgentLite` payload.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_create_applies_settings_default_reasoning_effort() {
     let dir = test_tempdir("intentd-wss-settings-effort-");
     let cache = serde_json::json!({
@@ -6156,7 +6155,7 @@ async fn wss_agent_create_applies_settings_default_reasoning_effort() {
 /// `AgentLite` payload); a configured settings default still outranks it; and
 /// the settings default reasoning effort does NOT companion a
 /// catalog-default-resolved model.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_create_pins_the_catalog_default_model() {
     let dir = test_tempdir("intentd-wss-catalog-default-");
     let cache = serde_json::json!({
@@ -6242,7 +6241,7 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
 /// workspaces root, so the probe always runs and the field is present as a
 /// boolean (true on `CoW` filesystems like APFS, false on e.g. ext4); when the
 /// probe cannot run the field is omitted, never null.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_system_capabilities_reports_cow_supported() {
     let srv = start(WsOptions::default()).await;
     let resp = wss_call(
@@ -6269,7 +6268,7 @@ async fn wss_system_capabilities_reports_cow_supported() {
 /// the `-32602` caller error for a non-numeric param. Unix-only capture —
 /// these test hosts are Unix, so the success path is exercised directly.
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_debug_sample_stacks_returns_report() {
     let srv = start(WsOptions::default()).await;
 
@@ -6315,7 +6314,7 @@ async fn wss_debug_sample_stacks_returns_report() {
 /// (env-var gates: mock, plus cortex/droid hidden by default behind
 /// `INTENTD_ENABLE_CORTEX` / `INTENTD_ENABLE_DROID`), and no default
 /// designation or tier metadata anywhere in the payload.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_providers_catalog_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -6427,7 +6426,7 @@ async fn wss_providers_catalog_round_trip() {
 /// and is out of scope for CI; `intent-services`' `unsloth_server` unit tests
 /// cover the running-server shapes (status fields, resource sampling, stop
 /// terminating the process tree) against a stubbed process.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_unsloth_status_and_stop_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -6462,7 +6461,7 @@ async fn wss_unsloth_status_and_stop_round_trip() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn health_reports_ok_and_client_count() {
     let srv = start(WsOptions::default()).await;
     let resp = https_request(
@@ -6516,7 +6515,7 @@ fn ipv6_loopback_available() -> bool {
 
 /// monorepo#3314: a `server.bindAddress` list binds one listener per address
 /// on the same port — both addresses accept and serve the same instance.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn multi_bind_serves_every_configured_address() {
     if !ipv6_loopback_available() {
         eprintln!("skipping: IPv6 loopback unavailable");
@@ -6618,7 +6617,7 @@ fn reserve_dual_stack_port_with_v4_blocker() -> (StdTcpListener, tokio::net::Tcp
 /// monorepo#3314: partial bind failure is a hard error — when any address in
 /// the set cannot bind, `start()` fails and the addresses that DID bind are
 /// released (never silently serve fewer interfaces than configured).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn multi_bind_partial_failure_is_all_or_nothing() {
     if !ipv6_loopback_available() {
         eprintln!("skipping: IPv6 loopback unavailable");
@@ -6665,7 +6664,7 @@ async fn multi_bind_partial_failure_is_all_or_nothing() {
 /// `WsOptions` is public, so an empty bind set must be a hard `start()`
 /// error in release builds too — never a "successful" start with a
 /// heartbeat and reported port but no TCP listener behind it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn empty_bind_set_is_a_start_error() {
     let (api, bus, _store, _registry, dir) = make_services(None, None).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
@@ -6688,7 +6687,7 @@ async fn empty_bind_set_is_a_start_error() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn upgrade_rejected_without_or_with_bad_token() {
     let srv = start(WsOptions::default()).await;
     let no_token = https_request(srv.port, srv.cfg.clone(), &upgrade_req("/ws", None, None)).await;
@@ -6703,7 +6702,7 @@ async fn upgrade_rejected_without_or_with_bad_token() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn upgrade_rejected_when_disabled() {
     let srv = start(WsOptions {
         enabled: false,
@@ -6720,7 +6719,7 @@ async fn upgrade_rejected_when_disabled() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn upgrade_rejected_bad_origin() {
     let srv = start(WsOptions::default()).await;
     let resp = https_request(
@@ -6738,7 +6737,7 @@ async fn upgrade_rejected_bad_origin() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_jsonrpc_roundtrip_matches_uds() {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixStream;
@@ -6751,7 +6750,7 @@ async fn wss_jsonrpc_roundtrip_matches_uds() {
     let socket = srv.dir.path().join("intentd-wss.sock");
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let (api, bus, sock) = (srv.api.clone(), srv.bus.clone(), socket.clone());
-    let uds = tokio::spawn(async move {
+    let uds = intent_core::spawn_daemon(async move {
         serve_uds(api, bus, &sock, None, async move {
             let _ = rx.await;
         })
@@ -6794,7 +6793,7 @@ async fn wss_jsonrpc_roundtrip_matches_uds() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_models_list_returns_catalog_with_source() {
     // models.list (§5.30): the rich FE model catalog — `{ models, source }`
     // where `source` is "auggie" (live CLI) or "static" (empty fallback —
@@ -6816,7 +6815,7 @@ async fn wss_models_list_returns_catalog_with_source() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_models_list_preserves_legacy_metadata_through_cache() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -6877,7 +6876,7 @@ JSON
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_models_list_provider_auggie_failure_includes_warning() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -6906,7 +6905,7 @@ async fn wss_models_list_provider_auggie_failure_includes_warning() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     // The current hour bucket is inside both the current month and the
     // trailing-24h window; a bucket 48h back is outside the 24h window.
@@ -7064,7 +7063,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
     use chrono::{Duration as ChronoDuration, Utc};
     // stats.getRateHistory (§5.39): the global per-minute token-rate history
@@ -7202,7 +7201,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_models_list_with_provider_id_and_force_refresh() {
     // models.list { providerId, forceRefresh } (§5.30): per-provider catalog
     // through the generic cache. Unknown providers degrade to the empty
@@ -7346,7 +7345,7 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_models_list_negative_cache_suppresses_reprobe_force_refresh_bypasses() {
     // models.list legacy path probe guards (§5.30) over the real WSS
     // transport: a failed auggie probe is negatively cached for 60s — a
@@ -7405,7 +7404,7 @@ async fn wss_models_list_negative_cache_suppresses_reprobe_force_refresh_bypasse
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_models_list_legacy_fresh_entry_served_and_forced_failure_stale() {
     // models.list legacy path contract (§5.30) over the real WSS transport:
     // a NON-forced read whose persisted entry is fresh (younger than the 24h
@@ -7506,7 +7505,7 @@ async fn wss_models_list_legacy_fresh_entry_served_and_forced_failure_stale() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
     // models.list legacy path staleness contract (§5.30) over the real WSS
     // transport: a NON-forced read whose persisted entry is past the 24h
@@ -7647,7 +7646,7 @@ fn fake_auggie_script(tag: &str, body: &str) -> (tempfile::TempDir, std::path::P
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_enhance_prompt_round_trip() {
     // agent.enhancePrompt (§5.31): `mode: "enhance"` (the default) extracts the
     // `<augment-enhanced-prompt>` payload; `mode: "layout"` returns the full
@@ -7692,7 +7691,7 @@ async fn wss_agent_enhance_prompt_round_trip() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
     // Provider-neutrality gate: with a non-auggie active provider,
     // agent.enhancePrompt returns a typed `{ available: false, reason }`
@@ -7722,7 +7721,7 @@ async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_enhance_prompt_unavailable_when_settings_unset() {
     // Gate closed on unset settings: with `model.defaultProvider` not
     // configured, the derived default is undecidable and
@@ -7754,7 +7753,7 @@ async fn wss_agent_enhance_prompt_unavailable_when_settings_unset() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_enhance_prompt_gate_follows_model_default_provider() {
     // Gate precedence: the effective provider derives from
     // `model.defaultProvider` alone — `model.default` is a bare model id and
@@ -7819,7 +7818,7 @@ async fn wss_agent_enhance_prompt_gate_follows_model_default_provider() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_enhance_prompt_parse_failure_is_internal_error() {
     // A reply without the `<augment-enhanced-prompt>` tags in enhance mode is
     // the documented -32603 parse failure (§5.31).
@@ -7841,7 +7840,7 @@ async fn wss_agent_enhance_prompt_parse_failure_is_internal_error() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_enhance_prompt_cli_missing_is_internal_error() {
     // A missing/unspawnable auggie binary is a hard -32603 (§5.31) — there is
     // no static fallback for enhancement.
@@ -7862,7 +7861,7 @@ async fn wss_agent_enhance_prompt_cli_missing_is_internal_error() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_enhance_prompt_validates_params() {
     // Router-side -32602s (§5.31): missing prompt, unknown mode — rejected
     // before any CLI spawn, so no auggie override is needed.
@@ -7894,7 +7893,7 @@ async fn wss_agent_enhance_prompt_validates_params() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_round_trip() {
     // agent.completeOnce (§5.32) — stateless one-shot prompt→completion.
     // `{ prompt }` returns `{ text }` with the cleaned CLI reply verbatim,
@@ -7942,7 +7941,7 @@ fn fake_acp_adapter_script(tag: &str, behavior: &str) -> (tempfile::TempDir, std
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() {
     // Provider-neutral routing (§5.32): with codex as the effective default
     // provider the daemon runs an EPHEMERAL ACP session (initialize →
@@ -7979,7 +7978,7 @@ async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() 
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
     // intent-hq/intent#4587: over the real WSS transport, a claude-code
     // `agent.completeOnce` opens the ephemeral session with a slimming
@@ -8059,7 +8058,7 @@ async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
     // A RESOLVED adapter that dies before completing the turn is a hard
     // -32603 (§5.32), not `{ available: false }` — the unavailable result is
@@ -8091,7 +8090,7 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
     // host.providerTestPrompt (§5.14) over the real wire, both terminal
     // shapes against the mock ACP fixture. A provider whose adapter answers
@@ -8212,7 +8211,7 @@ fn fake_acp_adapter_script_with_session_log(
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_acp_node_max_old_space_mb_setting_reaches_provider_test_prompt_child() {
     // `agents.acpNodeMaxOldSpaceMb` (§5.12, intent-hq/intent#4330) over the
     // real wire: the unset key reads back as `null` with the catalog default
@@ -8340,7 +8339,7 @@ async fn wss_acp_node_max_old_space_mb_setting_reaches_provider_test_prompt_chil
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete() {
     // Adapters that hold their slot for ~10s before answering the turn, so the
     // bound is saturated for a wide, non-racy window. The wrapper records one
@@ -8404,7 +8403,7 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
     let parked: Vec<_> = (0..limit)
         .map(|i| {
             let (port, cfg) = (srv.port, srv.cfg.clone());
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 wss_call(
                     port,
                     cfg,
@@ -8496,7 +8495,7 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_unavailable_when_adapter_unresolvable() {
     // The resolution tier of the gate: a one-shot-capable provider whose
     // adapter resolves to nothing (no binary, no npx for the pinned fallback
@@ -8529,7 +8528,7 @@ async fn wss_agent_complete_once_unavailable_when_adapter_unresolvable() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_unavailable_when_provider_has_no_one_shot() {
     // Routing gate: claude-code / codex / pi run the ephemeral ACP route, but
     // a provider with no one-shot support returns a typed
@@ -8556,7 +8555,7 @@ async fn wss_agent_complete_once_unavailable_when_provider_has_no_one_shot() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_unavailable_when_settings_unset() {
     // Gate closed on unset settings — mirror of the enhance-prompt test.
     let (_auggie_dir, bin) = fake_auggie_script("unset-complete", "printf '🤖\\nnever-runs\\n'");
@@ -8580,7 +8579,7 @@ async fn wss_agent_complete_once_unavailable_when_settings_unset() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_gate_follows_model_default_provider() {
     // Gate precedence mirror of the enhance-prompt test: the effective
     // provider derives from `model.defaultProvider` alone — `model.default`
@@ -8627,7 +8626,7 @@ async fn wss_agent_complete_once_gate_follows_model_default_provider() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_resolves_quick_action_settings() {
     // monorepo#1734: over the wire, a `agent.completeOnce` call with no
     // explicit `model` picks up the user's quick-action settings —
@@ -8684,7 +8683,7 @@ async fn wss_agent_complete_once_resolves_quick_action_settings() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_provider() {
     // A user-authored `quickActions.defaultModel = "codex:gpt-5"` (legacy
     // compound; the wire rejects compounds but user files are never
@@ -8723,7 +8722,7 @@ async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_prov
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_cli_missing_is_internal_error() {
     // A missing/unspawnable auggie binary surfaces as -32603 rather than
     // hanging — the daemon reaps and returns a JSON-RPC error (§5.32).
@@ -8745,7 +8744,7 @@ async fn wss_agent_complete_once_cli_missing_is_internal_error() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_timeout_reaps_and_errors() {
     // A hung CLI is reaped when the client-provided timeout elapses; the
     // response is a -32603 whose `data` carries the timeout message. Proves
@@ -8770,7 +8769,7 @@ async fn wss_agent_complete_once_timeout_reaps_and_errors() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_validates_params() {
     // Router-side -32602s (§5.32): missing prompt, blank prompt, non-positive
     // timeoutMs — all rejected before any CLI spawn.
@@ -8810,7 +8809,7 @@ async fn wss_agent_complete_once_validates_params() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_host_status_reports_remote_locality() {
     // host.status is answered on the WSS transport (§5.14) and reports `remote`
     // by default, with the host capability fields a client gates UI on.
@@ -8834,7 +8833,7 @@ async fn wss_host_status_reports_remote_locality() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_host_status_override_forces_local() {
     // `--mode local` / `server.locality=local` forces local even over WSS.
     let srv = start(WsOptions {
@@ -8851,7 +8850,7 @@ async fn wss_host_status_override_forces_local() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_host_check_node_and_check_gh_answered_on_wss() {
     // host.checkNode / host.checkGh (§5.14, protocol 6.4) ride the same
     // cross-transport host.* fast-path as host.checkGit: always answered on
@@ -8879,7 +8878,7 @@ async fn wss_host_check_node_and_check_gh_answered_on_wss() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn bind_fails_fast_on_occupied_port() {
     // Fixed-port fail-fast (§5.6): a busy configured port must surface the OS
     // bind error immediately — no port walking, no retry. Occupy the port for
@@ -8916,7 +8915,7 @@ async fn bind_fails_fast_on_occupied_port() {
     ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn insecure_mode_serves_plain_ws_without_token() {
     // Insecure dev mode: no TLS acceptor, no bearer-token enforcement. A plain
     // TCP client must be able to open `ws://.../ws` with NO `Authorization`
@@ -8961,7 +8960,7 @@ async fn insecure_mode_serves_plain_ws_without_token() {
     ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn graceful_shutdown_allows_immediate_restart() {
     const MAX_ATTEMPTS: u32 = 10;
     // Verifies fixed-port restart semantics: a graceful `stop()` fully releases
@@ -9023,7 +9022,7 @@ async fn graceful_shutdown_allows_immediate_restart() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn heartbeat_terminates_silent_client() {
     let srv = start(WsOptions {
         heartbeat_interval: Duration::from_millis(100),
@@ -9059,7 +9058,7 @@ async fn heartbeat_terminates_silent_client() {
 /// e.g. storing wall-clock ms on pong receipt while the reaper compares
 /// against monotonic ms (or vice versa) — which makes even responsive clients
 /// look stale and get reaped within one timeout window.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn heartbeat_keeps_responsive_client_alive() {
     let srv = start(WsOptions {
         heartbeat_interval: Duration::from_millis(100),
@@ -9069,7 +9068,8 @@ async fn heartbeat_keeps_responsive_client_alive() {
     .await;
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     // Keep the stream polled so tungstenite answers each Ping with a Pong.
-    let poller = tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} });
+    let poller =
+        intent_core::spawn_daemon(async move { while let Some(Ok(_)) = ws.next().await {} });
     for _ in 0..50 {
         if srv.ws.client_count() == 1 {
             break;
@@ -9172,7 +9172,7 @@ fn fixture_note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
 /// `review_required`. The optional `status` filter narrows `tasks` only —
 /// `stats` stays the unfiltered rollup so the FE renders the progress bar
 /// verbatim regardless of the active filter (PROTOCOL §5.4).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_task_list_emits_stats_aggregate() {
     let srv = start(WsOptions::default()).await;
 
@@ -9319,7 +9319,7 @@ async fn wss_task_list_emits_stats_aggregate() {
 /// A workspace with no task notes still emits a well-formed `stats` aggregate
 /// (zeroed counts) so the FE never sees a missing `stats` field. Covers the
 /// "fresh workspace" branch the FE renderer hits on the first load.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_task_list_empty_workspace_emits_zero_stats() {
     let srv = start(WsOptions::default()).await;
     let created = wss_call(
@@ -9352,7 +9352,7 @@ async fn wss_task_list_empty_workspace_emits_zero_stats() {
 /// `workspace:updated` event whose `changes` delta carries the new value;
 /// a wire `null` clears the stored id (and the cleared field is omitted from
 /// the returned `Workspace` payload per `skip_serializing_if`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_workspace_update_status_image_asset_id_round_trip() {
     async fn send_and_wait(
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
@@ -9528,7 +9528,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
 /// through the shared store so subsequent `note.get` reads see the stripped
 /// arrays. Non-target agents and non-task notes are left untouched. Replay is
 /// idempotent — a second call with the same agent id updates zero notes.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_task_remove_agent_from_all_tasks_round_trip() {
     use intent_core::AgentId;
 
@@ -9637,7 +9637,7 @@ async fn wss_task_remove_agent_from_all_tasks_round_trip() {
 /// `git.commitDetails` + `git.diffs` (with `commitHash`) round-trip over WSS:
 /// proves the daemon's per-commit reads reach a pinned-TLS WebSocket client
 /// with the documented PROTOCOL §5.6 wire shape.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_git_commit_details_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -9753,7 +9753,7 @@ async fn wss_git_commit_details_round_trip() {
 /// workspace worktree) appears in `gitRoot.list` with its live-read branch,
 /// `git.status`/`git.changes` scoped by `gitRootId` target the nested repo
 /// instead of the workspace worktree, and an unknown `gitRootId` is `-32602`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_git_root_list_and_scoped_reads_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -9982,7 +9982,7 @@ async fn wss_git_root_list_and_scoped_reads_round_trip() {
 /// secondary root, answers `{ roots, hasUnpushedCommits, hasUncommittedChanges }`
 /// with the primary row first and the secondary row carrying its `gitRootId`;
 /// a missing `workspaceId` and an unknown workspace are both `-32602`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_workspace_local_changes_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -10106,7 +10106,7 @@ async fn wss_workspace_local_changes_round_trip() {
 /// untouched), the response carries the §5.6 `{ ok, hash, files, fileCount }`
 /// envelope, and an unknown `gitRootId` is `-32602` with the same message as
 /// the root-scoped reads.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_git_agent_commit_in_registered_root_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -10349,7 +10349,7 @@ async fn wss_git_agent_commit_in_registered_root_round_trip() {
 /// the legacy single `path` unions with `paths`, an absolute path under the
 /// worktree is normalized to its relative form (same narrowed result), and an
 /// absent/empty `paths` keeps the full-tree behavior.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_git_diffs_paths_narrowing_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -10499,7 +10499,7 @@ async fn wss_git_diffs_paths_narrowing_round_trip() {
 /// §5.18 — `localCommits` entries are metadata-only (`hash`, `message`,
 /// `author`, `date`, `isPushed`) and omit `files`/`filesChanged`, which
 /// clients fetch on demand via `git.commitDetails`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     let srv = start(WsOptions::default()).await;
 
@@ -10574,11 +10574,10 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     srv.ws.stop().await;
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `file-tracking.loadCommits` with workspace boundary over WSS: proves the
 /// daemon returns `boundarySha` and bounds commits to `boundary..HEAD`, and
 /// the `includeOlder` parameter fetches pre-boundary commits.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_file_tracking_load_commits_bounded() {
     let srv = start(WsOptions::default()).await;
 
@@ -10778,7 +10777,7 @@ async fn wss_file_tracking_load_commits_bounded() {
 /// with the UDS coverage), the missing-branchName -32602, the
 /// nonexistent-path -32602, and the unregistered-repo branch listing used by
 /// the workspace-create flow.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_git_branch_status_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -10952,13 +10951,12 @@ async fn wss_git_branch_status_round_trip() {
     srv.ws.stop().await;
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `git.pull` over WSS — the workspace-create auto-pull seam (§5.6).
 /// Path-based like `git.getBranches`: the repo is never registered as a
 /// workspace. Drives the checked-out fast-forward pull (`{ ok: true }`), the
 /// structured `{ ok: false, error }` failure for a repo without a remote, and
 /// the nonexistent-path -32602.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_git_pull_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -11064,7 +11062,7 @@ async fn wss_git_pull_round_trip() {
 /// summaries (no content blob), `note.getVersion` returns one snapshot with
 /// content, and `note.restoreVersion` resets the note to an old snapshot while
 /// appending a new version that captures the restored state.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_note_version_history_round_trip() {
     let srv = start(WsOptions::default()).await;
     let created = wss_call(
@@ -11177,7 +11175,7 @@ async fn wss_note_version_history_round_trip() {
 /// replaced by `contentPreview` (500 chars) + `contentLength` — so the slim
 /// frame stays far under the threshold, while the default (absent
 /// projection) still round-trips the complete content for existing clients.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_note_list_slim_projection_bounds_large_frames() {
     let srv = start(WsOptions::default()).await;
     let created = wss_call(
@@ -11257,7 +11255,7 @@ async fn wss_note_list_slim_projection_bounds_large_frames() {
 /// write and dropped the WSS connection. The sequence — setContent with
 /// emoji/CJK, an edited setContent, a surgical `note.add`, and another
 /// setContent after the add — must all succeed with the expected content.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_note_set_content_non_ascii_merge_round_trip() {
     let srv = start(WsOptions::default()).await;
     let created = wss_call(
@@ -11396,7 +11394,7 @@ async fn wss_note_set_content_non_ascii_merge_round_trip() {
 /// line-numbered `note.read` display presentation (`   N | line`) back via
 /// `note.setContent` must be rejected with -32602 and leave the note
 /// untouched, while the same Markdown without the prefixes still persists.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_note_set_content_rejects_numbered_read_presentation() {
     let srv = start(WsOptions::default()).await;
     let created = wss_call(
@@ -11488,7 +11486,7 @@ async fn wss_note_set_content_rejects_numbered_read_presentation() {
 /// materializes note content outside the `note.*` surface, so its `content`
 /// must hit the same numbered-`note.read` guard — -32602, no child note
 /// created — while raw Markdown still creates the prerequisite.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_task_create_prerequisite_rejects_numbered_read_presentation() {
     let srv = start(WsOptions::default()).await;
     let created = wss_call(
@@ -11574,7 +11572,7 @@ async fn wss_task_create_prerequisite_rejects_numbered_read_presentation() {
 /// `git.showFile` over WSS (PROTOCOL §5.6 extensions): file content at a
 /// revision (`HEAD` / `HEAD^`), the empty-content fallback for a path missing
 /// at the ref, and -32603 for an unresolvable ref.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_git_show_file_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -11698,7 +11696,7 @@ async fn wss_git_show_file_round_trip() {
 /// only, `git.changes` mirrors the same list, and `git.diffs` emits the
 /// synthesized one-line `Subproject commit <sha>` pseudo-hunk for the staged
 /// pin change.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_git_gitlink_status_and_diffs_wire_shape() {
     let srv = start(WsOptions::default()).await;
 
@@ -11831,7 +11829,7 @@ async fn wss_git_gitlink_status_and_diffs_wire_shape() {
 /// `note.saveAsset` over WSS (PROTOCOL §5.2 — additive asset write): the write
 /// returns `{ assetId, path, url }` and the asset round-trips back through
 /// `note.readAsset`; a missing `data` param is -32602.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[expect(clippy::case_sensitive_file_extension_comparisons)] // extensions generated by our own code with fixed case
 async fn wss_note_save_asset_round_trip() {
     let srv = start(WsOptions::default()).await;
@@ -11880,7 +11878,7 @@ async fn wss_note_save_asset_round_trip() {
 
 /// An authenticated, fingerprint-pinned WSS client can serve the selected
 /// screenshot reverse request and return its result over the same connection.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_browser_screenshot_reverse_round_trip() {
     let srv = start(WsOptions::default()).await;
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
@@ -11970,7 +11968,7 @@ async fn hello_with(
     .expect("client.hello reply");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_disconnect_wakes_accepted_screenshot_request() {
     let srv = start(WsOptions::default()).await;
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
@@ -11978,7 +11976,7 @@ async fn wss_disconnect_wakes_accepted_screenshot_request() {
     assert!(srv.reverse_registry.is_connected());
 
     let reverse_registry = srv.reverse_registry.clone();
-    let request = tokio::spawn(async move {
+    let request = intent_core::spawn_daemon(async move {
         reverse_registry
             .dispatch(
                 "browser.exec",
@@ -12018,7 +12016,7 @@ async fn wss_disconnect_wakes_accepted_screenshot_request() {
     srv.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_heartbeat_abort_wakes_accepted_screenshot_request() {
     let srv = start(WsOptions {
         heartbeat_interval: Duration::from_millis(100),
@@ -12031,7 +12029,7 @@ async fn wss_heartbeat_abort_wakes_accepted_screenshot_request() {
     assert!(srv.reverse_registry.is_connected());
 
     let reverse_registry = srv.reverse_registry.clone();
-    let request = tokio::spawn(async move {
+    let request = intent_core::spawn_daemon(async move {
         reverse_registry
             .dispatch(
                 "browser.exec",
@@ -12107,7 +12105,7 @@ async fn await_client_event(
 /// is, and its arrival and its departure (here via the heartbeat reaper's
 /// task abort) reach an `events.subscribe` subscriber on another
 /// authenticated connection.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     let srv = start(WsOptions {
         heartbeat_interval: Duration::from_millis(100),
@@ -12200,7 +12198,7 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
 /// the connected client as the FE-served reverse RPC (`id: "rev-<n>"`) and
 /// echoes `{ ok: true }` back on the original request; missing params are
 /// -32602.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_host_open_in_editor_reverse_round_trip() {
     let srv = start(WsOptions::default()).await;
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
@@ -12256,7 +12254,7 @@ async fn wss_host_open_in_editor_reverse_round_trip() {
 /// `repo.remove` over WSS (PROTOCOL §5.11): removing a registered path deletes
 /// it from the known-repo registry (`removed: true`, gone from `repo.list`);
 /// removing an unknown path is `removed: false`; missing `path` is -32602.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_repo_remove_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -12326,7 +12324,7 @@ async fn wss_repo_remove_round_trip() {
 /// and `workspace.initializeRepository`. Every method is driven over the
 /// real pinned-TLS WebSocket transport and its response envelope is asserted
 /// against the documented shape.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_workspace_lifecycle_helpers_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -12487,7 +12485,6 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
     srv.ws.stop().await;
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#958 — the bounded agent read paths over the real WSS transport:
 /// `agent.list` / `agent.get` (metadata + last-rows projection), a full
 /// `agent.getConversation` multi-page `nextToken` walk plus the
@@ -12501,7 +12498,7 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
 /// non-JSON (which errors any path that decodes it — `agent.getSession`
 /// demonstrates), the bounded reads still answer correctly, proving they
 /// never fetch/decode beyond their page.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     use intent_core::AgentId;
     use serde_json::json;
@@ -13146,7 +13143,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
 /// (`dataTruncated`/`dataIsThumbnail`/`dataBytes`); the seq-0 snapshot of a
 /// slim subscription serves the same bounded blocks; an absent param serves
 /// the same slim blocks (the v8.0 wire default); a bad value is `-32602`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_conversation_slim_projection_bounds_blocks() {
     use base64::Engine as _;
     use intent_core::{AgentId, SLIM_PROJECTION_BUDGET_BYTES};
@@ -13364,7 +13361,7 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
 /// duplicates, and the `chat.subscribe` seq-0 snapshot (which reuses the
 /// read) stays under the bound too. Slim is the wire default since v8.0,
 /// so absent-projection reads get the same budget.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_slim_conversation_pages_are_byte_budgeted() {
     use intent_core::{AgentId, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES};
     use serde_json::json;
@@ -13495,7 +13492,7 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
 /// unknown message/block ids are `-32602` naming the id; a workspace
 /// mismatch and an unknown agent are not-found; missing required params are
 /// `-32602`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_get_message_block_serves_full_block() {
     use intent_core::{AgentId, SLIM_PROJECTION_BUDGET_BYTES};
     use serde_json::json;
@@ -13661,7 +13658,7 @@ async fn wss_agent_get_message_block_serves_full_block() {
 /// slimming the full body at serve time (shared transform — byte parity),
 /// and `agent.getMessageBlock` hydrates the FULL body back from the side
 /// table, byte-identical to what was appended.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_extracted_payload_round_trip_slim_and_full() {
     use intent_core::{AgentId, SLIM_PROJECTION_BUDGET_BYTES};
     use serde_json::json;
@@ -13816,7 +13813,7 @@ async fn wss_extracted_payload_round_trip_slim_and_full() {
 /// lenient `opt_int` parsing: non-numeric → absent, floats truncate);
 /// `metadata` passes through verbatim when present; a workspace mismatch
 /// and an unknown agent are not-found; a missing `agentId` is `-32602`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_list_user_messages_serves_bounded_index() {
     use intent_core::AgentId;
     use serde_json::json;
@@ -14051,7 +14048,7 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
 /// archived), the enriched match shape
 /// (`workspaceId`/`agentName`/`role`/`timestamp`/`score`), and that raw FTS5
 /// operator syntax in the query never surfaces as an error.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
     use intent_core::{AgentId, AgentSession, AgentStatus};
 
@@ -14276,7 +14273,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
 /// `"not-found"` for lookups of nonexistent entities (`agent.get`, `note.get`)
 /// and `"invalid-params"` for missing required params — while the rest of the
 /// envelope (`jsonrpc`, `id`, numeric `code`, `message`) is unchanged.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_error_data_code_discriminates_not_found_from_invalid_params() {
     let srv = start(WsOptions::default()).await;
     let created = wss_call(
@@ -14353,7 +14350,7 @@ async fn wss_error_data_code_discriminates_not_found_from_invalid_params() {
 /// `nested-repos-skipped` warning naming the dir (and no spurious
 /// `uncommitted-changes`); unknown workspace ids map to
 /// `-32602 Workspace not found`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_workspace_transfer_plan_round_trip() {
     let srv = start(WsOptions::default()).await;
     let created = wss_call(
@@ -14498,7 +14495,7 @@ async fn wss_workspace_transfer_plan_round_trip() {
 /// `{ name, path, commitSha, branch, carried: true, published: false }`.
 /// After the commit is
 /// pushed to the submodule's origin the warning and the entry are gone.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_workspace_transfer_plan_reports_unpublished_submodule_commits() {
     let srv = start(WsOptions::default()).await;
     let root_dir = test_tempdir("intentd-wss-transfer-submodule-");
@@ -14669,7 +14666,7 @@ async fn wss_workspace_transfer_plan_reports_unpublished_submodule_commits() {
 /// answers a collision-suffixed name; the `.intent/.gitignore` exclusion file
 /// is ensured; and the exactly-one-of `data`/`sourcePath` violation is the
 /// documented `-32602`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_file_place_attachment_round_trip() {
     use base64::Engine as _;
 
@@ -14840,7 +14837,7 @@ async fn wss_file_place_attachment_round_trip() {
 /// `file.attachmentUpload.begin` replays a live session's `uploadId`, then
 /// after `commit` rejects a re-begin shape-stably ("already committed") while
 /// the key resolves to the committed attachment.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_file_attachment_idempotency_key_round_trip() {
     use base64::Engine as _;
 
@@ -15043,7 +15040,7 @@ async fn wss_file_attachment_idempotency_key_round_trip() {
 /// reassemble byte-identically; a window past EOF is an empty chunk; a
 /// directory and an over-cap `length` are the documented `-32602`; and a
 /// traversal path is rejected by the containment guard (`-32603`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_file_read_chunk_round_trip() {
     use base64::Engine as _;
 
@@ -15161,7 +15158,7 @@ async fn wss_file_read_chunk_round_trip() {
 /// unique temp target both fail closed, and the write target is never
 /// created on disk; the same requests against a real rooted workspace still
 /// succeed, proving the guard rejects only the empty-root case.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_file_ops_unknown_workspace_fail_closed() {
     let srv = start(WsOptions::default()).await;
 
@@ -15230,7 +15227,7 @@ async fn wss_file_ops_unknown_workspace_fail_closed() {
 /// `.intent/attachments/`. An unknown uploadId is the documented -32602, the
 /// 5th concurrent per-workspace begin is the documented -32602 naming the
 /// cap (monorepo#2275), and `abort` retires a pending session idempotently.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_file_attachment_upload_round_trip() {
     use base64::Engine as _;
 
@@ -15410,7 +15407,6 @@ async fn wss_file_attachment_upload_round_trip() {
     srv.ws.stop().await;
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `workspace.import.begin` / `.chunk` / `.commit` / `.abort` (§5.1): the
 /// staged, atomic import lifecycle over the real WSS transport. A fixture
 /// zip archive (manifest + rows) is uploaded in two chunks and committed;
@@ -15419,7 +15415,7 @@ async fn wss_file_attachment_upload_round_trip() {
 /// event reaches an `events.subscribe` subscriber. A version-mismatched
 /// manifest is rejected by `begin` naming both versions, and `abort` retires
 /// a pending session idempotently.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_workspace_import_lifecycle() {
     use base64::Engine as _;
     use std::io::Write as _;
@@ -15714,7 +15710,6 @@ async fn wss_workspace_import_lifecycle() {
     srv.ws.stop().await;
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `workspace.export.start` / `.read` / `.finalize` / `.abort` (§5.1): the
 /// source-side export lifecycle over the real WSS transport. A subscriber
 /// receives the `workspace:transfer:progress` and `:ready` events (§6.5)
@@ -15723,7 +15718,7 @@ async fn wss_workspace_import_lifecycle() {
 /// relay into `workspace.import.begin`); finalize applies the final status
 /// message + archives the source; a second export session is then started
 /// and aborted idempotently.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_workspace_export_lifecycle() {
     use base64::Engine as _;
 
@@ -16009,7 +16004,7 @@ async fn wss_workspace_export_lifecycle() {
 /// direct) — WITHOUT registering the workspace-owned checkout in
 /// `known_repo` (intent-hq/monorepo#2227). Skips when `git` is unavailable
 /// on PATH (the bundler shells out to it).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_workspace_import_commit_materializes_git() {
     use base64::Engine as _;
     use std::io::Write as _;
@@ -16195,7 +16190,7 @@ async fn wss_workspace_import_commit_materializes_git() {
 /// the superproject's dirty gitlink lands exactly as on the source.
 /// Finalizing the export without archiving restores the source. Skips when
 /// `git` is unavailable on PATH.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_transfer_round_trip_hydrates_unpublished_submodule() {
     use base64::Engine as _;
 
@@ -16493,7 +16488,7 @@ async fn wss_transfer_round_trip_hydrates_unpublished_submodule() {
 /// Regression for intent-hq/intent#4438: real WSS export/import preserves
 /// publication knowledge offline, without hiding local commits or dirty files.
 /// Only the clean, published imported fixture is archived; source WIP is unwound.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_transfer_preserves_remote_state() {
     use base64::Engine as _;
     use std::io::{Read as _, Write as _};
@@ -17160,7 +17155,7 @@ where
 /// the wire than the same payload over a non-offering control connection,
 /// which itself sees no `Sec-WebSocket-Extensions` header and identical
 /// payload semantics (today's behavior).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_deflate_negotiation_compresses_on_the_wire() {
     let srv = start(WsOptions::default()).await;
     // ~128 KiB of highly compressible text, well past any handshake noise.
@@ -17220,7 +17215,7 @@ async fn wss_deflate_negotiation_compresses_on_the_wire() {
 /// in the 101 response — and gets a clean uncompressed connection with a
 /// working JSON-RPC round-trip, byte-identical behavior to a client that
 /// never offered.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_unacceptable_extension_offer_declines_to_plain_connection() {
     let srv = start(WsOptions::default()).await;
 
@@ -17364,7 +17359,7 @@ impl SystemControl for WatchHealthControl {
 /// production clients use. The degraded (watcher-creation-failure) shape is
 /// covered end-to-end over UDS in `uds_control.rs`; both transports share one
 /// render path (`status_json`), so this presence/shape proof carries over.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn system_status_surfaces_file_watch_coverage_over_wss() {
     let dir = test_tempdir("intentd-wss-fw-");
     let store = Store::open(&dir.path().join("intentd.db"))
@@ -17467,7 +17462,7 @@ async fn system_status_surfaces_file_watch_coverage_over_wss() {
 /// neither read out nor modified. A control read through an IN-workspace
 /// symlink still succeeds, proving the gate rejects only escaping links.
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_file_ops_symlink_escape_rejected() {
     let srv = start(WsOptions::default()).await;
 
@@ -17539,7 +17534,7 @@ async fn wss_file_ops_symlink_escape_rejected() {
 
 /// Moving `file.list` / `file.tree` to the blocking pool must not alter their
 /// legacy bare-array payloads, field order, or JSON-RPC envelope bytes.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_file_list_and_tree_preserve_serialized_shape() {
     let srv = start(WsOptions::default()).await;
     let dir = test_tempdir("intentd-wss-file-enumeration-");
@@ -17588,7 +17583,7 @@ async fn wss_file_list_and_tree_preserve_serialized_shape() {
 
 /// Disconnecting during a blocking-pool traversal detaches that work without
 /// pinning an async worker or retaining the dead WSS connection.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
     let control: Arc<dyn SystemControl> = Arc::new(WatchHealthControl {
         health: WatchHealth::default(),
@@ -17688,7 +17683,7 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
 /// returns exactly the same-identity sibling with the documented fields,
 /// `readNote` succeeds against it, and the same `readNote` against the
 /// different-identity workspace is denied with the -32603 access error.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_cross_workspace_siblings_resolve_by_github_identity() {
     let srv = start(WsOptions::default()).await;
 

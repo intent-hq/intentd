@@ -117,7 +117,7 @@ async fn send(socket: &Path, frame: &str) -> Value {
     serde_json::from_str(line.trim()).expect("valid json")
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_git_write_ops_round_trip() {
     let base_guard = common::test_tempdir_in("/tmp", "intentd-git-");
     let base = base_guard.path().to_path_buf();
@@ -148,7 +148,7 @@ async fn uds_git_write_ops_round_trip() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -411,7 +411,7 @@ async fn uds_git_write_ops_round_trip() {
 /// Wave B remediation: hunk stage/unstage, branch create/checkout/rename,
 /// and the index.lock removal helper. `git.push`/`git.fetch` are covered by
 /// their own crate-level tests (they need a bare-remote fixture).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_git_write_ops_wave_b_round_trip() {
     let base_guard = common::test_tempdir_in("/tmp", "intentd-gitwb-");
     let base = base_guard.path().to_path_buf();
@@ -442,7 +442,7 @@ async fn uds_git_write_ops_wave_b_round_trip() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -593,7 +593,7 @@ async fn uds_git_write_ops_wave_b_round_trip() {
 
 /// Over-the-wire git read slice: `git.changes`, `git.diffs` (+ `git.diff`
 /// alias), and `git.commits` (+ `git.log` alias) populate the FE panels.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_git_read_ops_round_trip() {
     let base_guard = common::test_tempdir_in("/tmp", "intentd-gitr-");
     let base = base_guard.path().to_path_buf();
@@ -624,7 +624,7 @@ async fn uds_git_read_ops_round_trip() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -757,7 +757,7 @@ fn add_submodule(parent: &Path, child: &Path, sub_rel: &str) {
 /// `git.agentCommit`'s explicit `files` list refuses a path strictly inside a
 /// registered submodule with a clear error naming the offending path and its
 /// containing submodule, and no commit lands.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_git_agent_commit_rejects_submodule_internal_file() {
     let base_guard = common::test_tempdir_in("/tmp", "intentd-gitsub-");
     let base = base_guard.path().to_path_buf();
@@ -791,7 +791,7 @@ async fn uds_git_agent_commit_rejects_submodule_internal_file() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -858,7 +858,7 @@ async fn uds_git_agent_commit_rejects_submodule_internal_file() {
 /// `git.discard` refuses a path strictly inside a registered submodule instead
 /// of classifying it as untracked in the superproject and unlinking it — the
 /// submodule's uncommitted edit survives and the gitlink stays a `160000` entry.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_git_discard_rejects_submodule_internal_path() {
     let base_guard = common::test_tempdir_in("/tmp", "intentd-gitsubd-");
     let base = base_guard.path().to_path_buf();
@@ -892,7 +892,7 @@ async fn uds_git_discard_rejects_submodule_internal_path() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -949,7 +949,7 @@ async fn uds_git_discard_rejects_submodule_internal_path() {
 /// Over-the-wire per-commit read slice: `git.commitDetails` returns metadata +
 /// `fileDetails`, and `git.diffs` with `commitHash` returns the commit's own
 /// per-file hunks.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_git_commit_details_round_trip() {
     let base_guard = common::test_tempdir_in("/tmp", "intentd-gitc-");
     let base = base_guard.path().to_path_buf();
@@ -996,7 +996,7 @@ async fn uds_git_commit_details_round_trip() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -1093,7 +1093,7 @@ async fn uds_git_commit_details_round_trip() {
 
 /// Over-the-wire `git.branchStatus` slice: path-based ahead/behind + dirty-tree
 /// flag for the workspace-initializer `BranchSelector` seam (PROTOCOL §5.6).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_git_branch_status_round_trip() {
     let base_guard = common::test_tempdir_in("/tmp", "intentd-gitbs-");
     let base = base_guard.path().to_path_buf();
@@ -1124,7 +1124,7 @@ async fn uds_git_branch_status_round_trip() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -1250,7 +1250,7 @@ async fn uds_git_branch_status_round_trip() {
 /// need to be a registered workspace — the create flow lists branches before
 /// the workspace exists — but nonexistent paths and non-git directories are
 /// rejected with distinct -32602 errors.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_git_get_branches_round_trip() {
     let base_guard = common::test_tempdir_in("/tmp", "intentd-gitgb-");
     let base = base_guard.path().to_path_buf();
@@ -1288,7 +1288,7 @@ async fn uds_git_get_branches_round_trip() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -1380,13 +1380,12 @@ async fn uds_git_get_branches_round_trip() {
     let _ = server.await;
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Over-the-wire `git.pull` slice: the workspace-create auto-pull (PROTOCOL
 /// §5.6). Path-based like `git.getBranches` — the repo does NOT need to be a
 /// registered workspace. Covers the checked-out fast-forward pull (with a
 /// dirty worktree exercising the auto-stash bookends), the structured
 /// `{ ok: false, error }` failure, and the -32602 param rejections.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_git_pull_round_trip() {
     let base_guard = common::test_tempdir_in("/tmp", "intentd-gitpl-");
     let base = base_guard.path().to_path_buf();
@@ -1434,7 +1433,7 @@ async fn uds_git_pull_round_trip() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -1526,7 +1525,7 @@ async fn uds_git_pull_round_trip() {
 /// the deferred `#126` cleanup: `git.numstat`, `git.branchDiff`, and
 /// `git.getRemoteUrl`. Uses a small on-disk repo (no bare-remote fixture,
 /// so `origin` is a configured URL only, not a reachable remote).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_git_read_ops_extensions_round_trip() {
     let base_guard = common::test_tempdir_in("/tmp", "intentd-gitreads-");
     let base = base_guard.path().to_path_buf();
@@ -1562,7 +1561,7 @@ async fn uds_git_read_ops_extensions_round_trip() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })

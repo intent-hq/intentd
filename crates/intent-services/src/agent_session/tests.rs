@@ -4049,7 +4049,7 @@ async fn post_output_transport_death_keeps_terminal_events() {
 /// A real clean `end_turn` at the truncation-redrive cap must fall through to
 /// terminal stream:end + idle, with the bounded diagnostic naming cap
 /// exhaustion rather than another redrive.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn truncation_cap_exhaustion_logs_terminal_outcome_and_idles() {
     let _env = EnvGuard::set_all(&[("INTENTD_SILENT_TAIL_SUSPECT_MS", "0")]);
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
@@ -5166,7 +5166,7 @@ async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
 /// resumed by the wake-triggered sweep. The enrolled row is tagged
 /// `system_suspend`, the sweep resumes exactly it, and its atomic claim leaves
 /// the row resolved (no longer pending).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_resume_resumes_turn_enrolled_by_suspend_classifier() {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(

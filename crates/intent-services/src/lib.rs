@@ -2391,7 +2391,7 @@ impl Services {
             .unwrap_or(LAST_ACTIVITY_DEBOUNCE_MS);
 
         // Spawn a task that sleeps for the debounce window, then derives + emits.
-        let handle = tokio::spawn(async move {
+        let handle = intent_core::spawn_daemon(async move {
             tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
 
             // Inner block so the gen-guarded self-removal below runs on every
@@ -3048,7 +3048,7 @@ impl Services {
         }
 
         let services = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             for candidate in candidates {
                 if let Err(e) = services.backfill_one_workspace(candidate.clone()).await {
                     tracing::debug!(
@@ -3439,7 +3439,7 @@ impl Services {
             .unwrap_or(WORKSPACE_IDLE_DEBOUNCE_MS);
 
         // Spawn a task that sleeps for the debounce window, then emits idle.
-        let handle = tokio::spawn(async move {
+        let handle = intent_core::spawn_daemon(async move {
             tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
 
             // Guard emission: verify debouncer still current AND count still zero.
@@ -5011,7 +5011,7 @@ impl Services {
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Consume the immediate first tick so the loop waits one interval.
@@ -5215,7 +5215,7 @@ impl Services {
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Consume the immediate first tick so the loop waits one interval.
@@ -5239,10 +5239,10 @@ impl Services {
     pub fn spawn_completion_delivery_loop(&self) -> tokio::task::JoinHandle<()> {
         let Some(bus) = self.event_bus.clone() else {
             tracing::info!("completion delivery loop disabled: no event bus");
-            return tokio::spawn(async {});
+            return intent_core::spawn_daemon(async {});
         };
         let services = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             // Span every workspace (workspace_id = None) and deliver each matched
             // event immediately (batch_window = None) so wakes are never coalesced.
             let filter = SubscriptionFilter {
@@ -6297,7 +6297,7 @@ impl Services {
         }
 
         let services = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             // 500ms initial (monorepo#4183): the old 100ms start burst three
             // attempts inside the first second on every transient failure;
             // wakes are not latency-critical enough to justify that.
@@ -6354,7 +6354,7 @@ impl Services {
         }
 
         let services = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             // 500ms initial backoff, aligned with the per-child retry task
             // (monorepo#4183): wakes are not latency-critical enough to
             // justify bursting attempts inside the first second.
@@ -9426,7 +9426,7 @@ impl Services {
         let key = (workspace_id.clone(), note_id.clone());
         let services = self.clone();
         let key_for_task = key.clone();
-        let handle = tokio::spawn(async move {
+        let handle = intent_core::spawn_daemon(async move {
             tokio::time::sleep(LINE_ATTRIBUTION_DEBOUNCE).await;
             let (ws, nid) = key_for_task;
             if let Err(err) = services
@@ -14549,7 +14549,7 @@ impl Services {
             return serde_json::json!({ "requestId": request_id, "matches": matches });
         };
         let stream_request_id = request_id.to_string();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let mut emitted = 0usize;
             let mut cancelled = false;
             for chunk in matches.chunks(search_ops::STREAM_BATCH_SIZE) {
@@ -16043,7 +16043,7 @@ impl WorkspaceApi for Services {
             };
             // Validate opts (incl. regex) before registering, so a bad regex is
             // surfaced as InvalidParams without leaving a stale cancel token.
-            let token = registry.register_as(&request_id, capability::search_owner());
+            let token = registry.register_as(&request_id, capability::search_owner()?);
             let outcome = {
                 let token = token.clone();
                 tokio::task::spawn_blocking(move || {
@@ -16082,7 +16082,7 @@ impl WorkspaceApi for Services {
                     "truncated": false,
                 }));
             };
-            let token = registry.register_as(&request_id, capability::search_owner());
+            let token = registry.register_as(&request_id, capability::search_owner()?);
             let outcome = {
                 let token = token.clone();
                 tokio::task::spawn_blocking(move || {
@@ -16108,7 +16108,7 @@ impl WorkspaceApi for Services {
             // A collaborator cancels only searches it started (the id is
             // visible to every workspace subscriber via `search:*` events);
             // the mismatch is the same silent no-op, so nothing is disclosed.
-            let owner = capability::search_owner();
+            let owner = capability::search_owner()?;
             let _ = registry.cancel_as(&request_id, owner.as_deref());
             Ok(serde_json::json!({ "ok": true }))
         })
@@ -16143,7 +16143,7 @@ impl WorkspaceApi for Services {
                     _ => vec![workspace_id.clone()],
                 };
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let token = registry.register_as(&request_id, capability::search_owner());
+            let token = registry.register_as(&request_id, capability::search_owner()?);
             // User-typed queries are never handed to the FTS5 parser verbatim
             // (as-you-type input would surface `fts5: syntax error`); a query
             // with no searchable tokens yields empty matches, not an error.
@@ -16195,7 +16195,7 @@ impl WorkspaceApi for Services {
                 self.require_member(ws).await?;
             }
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let token = registry.register_as(&request_id, capability::search_owner());
+            let token = registry.register_as(&request_id, capability::search_owner()?);
             let limit = limit.and_then(|n| usize::try_from(n).ok());
             let mut q = EventQuery {
                 workspace_id: workspace_id.clone(),
@@ -16230,7 +16230,7 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let token = registry.register_as(&request_id, capability::search_owner());
+            let token = registry.register_as(&request_id, capability::search_owner()?);
             let mut notes = store.list_all_notes().await?;
             // Multiplayer w3: a collaborator matches only its member
             // workspaces' notes (filtered before matching — unbounded list).
@@ -16260,7 +16260,7 @@ impl WorkspaceApi for Services {
             let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
                 return Ok(serde_json::json!({ "requestId": request_id, "matches": [] }));
             };
-            let token = registry.register_as(&request_id, capability::search_owner());
+            let token = registry.register_as(&request_id, capability::search_owner()?);
 
             // Prefer the context engine when it is available, mapping its hits
             // to `CodebaseMatch` (§5.15 parity). When the engine is `Unavailable`
@@ -19371,7 +19371,7 @@ impl WorkspaceApi for Services {
                             .unwrap_or_default();
                         let legacy_script = ws.setup_script.clone();
                         let worktree_for_read = worktree_path_buf.clone();
-                        tokio::spawn(async move {
+                        intent_core::spawn_daemon(async move {
                             // Resolve the effective setup script: the explicit param wins
                             // for this create; an omitted param falls back to the
                             // worktree-first repo-config read, then the legacy DB row.
@@ -20184,7 +20184,7 @@ impl WorkspaceApi for Services {
             let store_bg = store.clone();
             let worktree_locks_bg = worktree_locks.clone();
             let branch_auto_generated_bg = branch_auto_generated;
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 // Re-check that the workspace is actually deleted. If it
                 // exists now (same-slug recreate landed before this task ran),
                 // skip the worktree cleanup entirely — the new workspace owns
@@ -20451,7 +20451,7 @@ impl WorkspaceApi for Services {
                 key,
                 delete_at.clone(),
                 move |generation| {
-                    tokio::spawn(async move {
+                    intent_core::spawn_daemon(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         // Claim-or-abstain: only the timer that still owns the
                         // entry commits. A cancel or an immediate delete that
@@ -20543,7 +20543,7 @@ impl WorkspaceApi for Services {
             // stops running for good — the hook is `cancelled` by the sweep
             // like any other hook in the workspace.
             let id_for_log = id.clone();
-            let tail = tokio::spawn(async move {
+            let tail = intent_core::spawn_daemon(async move {
                 let mut ws = ws;
                 // Gracefully interrupt every in-flight turn in the workspace —
                 // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
@@ -25953,7 +25953,7 @@ impl WorkspaceApi for Services {
             // `gh` lookups can take a few seconds.
             let spawn_request_id = request_id.clone();
             let spawn_target = target.clone();
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 let token = github_git_token_for_url(registry.as_deref(), &url).await;
                 clone_ops::spawn_clone(clone_ops::CloneJob {
                     request_id: spawn_request_id,
@@ -25998,7 +25998,7 @@ impl WorkspaceApi for Services {
                 .is_ok()
             {
                 let store = store.clone();
-                tokio::spawn(async move {
+                intent_core::spawn_daemon(async move {
                     // Same root set as the teardown sweeps: the boot root plus
                     // the currently configured `workspace.worktreesLocation`
                     // (workspaces provisioned there live there).
@@ -26106,7 +26106,7 @@ impl WorkspaceApi for Services {
             // serializes behind this ensure on the per-repo cache lock.
             let task_owner = owner.clone();
             let task_repo = repo.clone();
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 let _clear_on_drop = clear_on_drop;
                 let token = github_git_token_for_url(registry.as_deref(), &url).await;
                 let result = intent_git::repo_cache::ensure_cached_repo(
@@ -27778,17 +27778,20 @@ impl WorkspaceApi for Services {
                         .to_string(),
                 )
             })?;
+            // Multiplayer w3: the prompt is answered on behalf of the owner
+            // (the agent runs with the owner's capabilities), so a collaborator
+            // must own the prompting agent's workspace. The caller gate runs
+            // before the manager lookup so an unbound context is `Forbidden`
+            // on the no-manager path too, never a successful early return.
+            let constrained = capability::collaborator_caller()?.is_some();
             // Without a runtime manager there is no registry to answer against, so
             // every request id is unresolved.
             let Some(manager) = self.agent_manager() else {
                 return Ok(serde_json::json!({ "resolved": false }));
             };
-            // Multiplayer w3: the prompt is answered on behalf of the owner
-            // (the agent runs with the owner's capabilities), so a collaborator
-            // must own the prompting agent's workspace. The request id is
-            // resolved back to its agent through the pending snapshot; an
-            // unknown id stays `resolved: false` for everyone.
-            if capability::collaborator_caller().is_some() {
+            // The request id is resolved back to its agent through the pending
+            // snapshot; an unknown id stays `resolved: false` for everyone.
+            if constrained {
                 let Some(session_id) = manager
                     .pending_permissions()
                     .into_iter()
@@ -29462,7 +29465,7 @@ impl WorkspaceApi for Services {
             // gh CLI sync only makes sense against the production login host
             // (see `github_auth_ops::is_production_login_host`).
             let sync_gh = github_auth_ops::is_production_login_host(&base_uri);
-            tokio::spawn(github_auth_ops::run_poll_loop(
+            intent_core::spawn_daemon(github_auth_ops::run_poll_loop(
                 state.clone(),
                 bus,
                 secrets,
@@ -29553,7 +29556,7 @@ impl WorkspaceApi for Services {
             if logout_gh {
                 // Detached + fail-soft (same pattern as the login sync): a
                 // logout failure can never fail or delay the revoke.
-                tokio::spawn(intent_sourcecontrol::gh_sync::logout_gh_after_revoke(
+                intent_core::spawn_daemon(intent_sourcecontrol::gh_sync::logout_gh_after_revoke(
                     revoked_token,
                 ));
             }

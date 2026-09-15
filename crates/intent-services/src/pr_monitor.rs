@@ -1466,7 +1466,7 @@ impl Services {
     #[must_use]
     pub fn spawn_pr_monitor_loop(&self) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             loop {
                 tokio::time::sleep(services.pr_monitor_poll_interval()).await;
                 services.poll_due_pr_monitors().await;
@@ -6824,7 +6824,7 @@ mod tests {
     /// `cancelled`, `prMonitor:cancelled` emitted, owner told why — while
     /// terminal monitors are untouched, so an archived workspace never
     /// reads `waiting` off a stale monitor signal indefinitely.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn archive_cancels_active_pr_monitors_and_drops_waiting() {
         use intent_core::WorkspaceApi;
         let (_db, _root, svc, forge, ws, owner) = setup().await;

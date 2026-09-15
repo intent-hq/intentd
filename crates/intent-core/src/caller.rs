@@ -87,6 +87,20 @@ where
     CALLER.scope(caller, f)
 }
 
+/// `tokio::spawn` for daemon-internal background work: the spawned task runs
+/// with [`Caller::Daemon`] bound, so the capability gates it reaches (event
+/// fan-out, refreshers, timers, finalisers) see the daemon rather than an
+/// unbound — and therefore refused — request. Work spawned *on behalf of* a
+/// request keeps that request's caller instead: capture [`current_caller`]
+/// and re-establish it with [`with_caller`].
+pub fn spawn_daemon<F>(f: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(with_caller(Caller::Daemon, f))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +142,13 @@ mod tests {
         })
         .await;
         assert_eq!(seen, None);
+    }
+
+    #[tokio::test]
+    async fn spawn_daemon_binds_the_daemon_caller() {
+        let seen = spawn_daemon(async { current_caller() }).await.unwrap();
+        assert_eq!(seen, Some(Caller::Daemon));
+        assert_eq!(current_caller(), None);
     }
 
     #[test]

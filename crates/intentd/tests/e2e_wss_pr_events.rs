@@ -495,7 +495,7 @@ async fn next_event(ws: &mut TlsWs, event_type: &str) -> Value {
 /// and an open successor (#300) exists on the same branch → the refresh emits
 /// `pr:linked` whose payload carries prNumber 300 plus the full `pullRequests`
 /// list (merged #42 retained, open #300 added), matching PROTOCOL §6.5.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_linked_event_carries_pull_requests_list_over_wss() {
     let fx = boot(StubForge {
         open_pr_number: Some(300),
@@ -541,7 +541,7 @@ async fn pr_linked_event_carries_pull_requests_list_over_wss() {
 /// unlinked review workspace on its own branch (`review-ws`) whose `baseRef`
 /// equals an open PR's head ref (`feature`) links that PR — the refresh
 /// emits `pr:linked` with the discovered PR in the payload.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_linked_via_baseref_discovery_over_wss() {
     let fx = boot_seeded(
         StubForge {
@@ -585,7 +585,7 @@ async fn pr_linked_via_baseref_discovery_over_wss() {
 /// Merged-without-successor over the wire: the linked PR (#42) is fetched as
 /// merged and no open successor exists → the refresh emits `pr:updated` whose
 /// payload carries the status delta plus the seeded `pullRequests` list.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_updated_event_carries_pull_requests_list_over_wss() {
     let fx = boot(StubForge::default()).await;
 
@@ -625,7 +625,7 @@ async fn pr_updated_event_carries_pull_requests_list_over_wss() {
 /// linkage state; the `pr:linked` event flows through the existing refresh
 /// path (no duplicate emission). A separate subscriber connection observes the
 /// event so the RPC response and notification framing stay independent.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_refresh_rpc_reports_post_refresh_state_over_wss() {
     let fx = boot(StubForge {
         open_pr_number: Some(300),
@@ -700,7 +700,7 @@ async fn wss_rpc_raw(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Va
 /// fall through the router match to the normal unknown-method path — `-32601
 /// Method not found` over the wire — while `pr.status` / `pr.refresh` stay
 /// recognized (asserted by the other tests in this file).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn removed_pr_methods_return_method_not_found_over_wss() {
     let fx = boot(StubForge::default()).await;
 
@@ -759,7 +759,7 @@ fn run_git(args: &[&str], cwd: &Path) {
 /// the remote-only ref with its commits), `baseRef` is the PR base (`main`),
 /// `prNumber`/`prUrl` are seeded, and `baseCommitSha` records the base
 /// boundary (the merge-base), not the checked-out PR head tip.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_with_pr_context_link_over_wss() {
     let git_ok = matches!(
         Command::new("git")

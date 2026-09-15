@@ -3376,7 +3376,7 @@ impl Services {
                 .lock()
                 .ok()
                 .and_then(|mut chain| chain.remove(agent_id));
-            let handle = tokio::spawn(async move {
+            let handle = intent_core::spawn_daemon(async move {
                 if let Some(prev) = prev {
                     let _ = prev.await;
                 }
@@ -3898,7 +3898,7 @@ impl Services {
                 // against a racing wake sweep / `resolveInterrupted`.
                 let services = self.clone();
                 let debounce = wake_resume_self_heal_debounce();
-                tokio::spawn(async move {
+                intent_core::spawn_daemon(async move {
                     tokio::time::sleep(debounce).await;
                     services.resume_suspend_interrupted_agents().await;
                 });

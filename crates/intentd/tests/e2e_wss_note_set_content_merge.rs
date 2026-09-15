@@ -238,7 +238,7 @@ async fn drain_note_updated(evt: &mut TlsWs, note_id: &str, settle: Duration) ->
 /// `note.setContent` that read rev 0 and edits a different line succeeds,
 /// keeps both edits, returns `rev` equal to `note.get`, and each write emits
 /// exactly one `note:updated`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_set_content_stale_expected_version_merges_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
@@ -391,7 +391,7 @@ fn assert_conflict_envelope(v: &Value, id: i64, content: &str, rev: i64) {
 /// bounded retries. Both return the identical `-32005` envelope carrying the
 /// untouched entity, persist nothing, and leave the daemon able to accept the
 /// next write on the same connection.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_set_content_future_rev_and_retry_exhaustion_conflict_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
