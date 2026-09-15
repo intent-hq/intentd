@@ -12922,6 +12922,123 @@ fn mock_agent_script() -> String {
         .to_string()
 }
 
+/// Regression (intent-hq/intent#5017): a cross-workspace `ws.agent.send`
+/// reaches `send_message` with the SENDER's workspace id — the caller's
+/// bridge scope — not the target's. A cold target woken by that send must
+/// still bind to its OWN session workspace: the child spawns in the
+/// session workspace's checkout and the turn's `agent:message` echo is
+/// scoped to that workspace. Pre-fix the sender's id flowed straight into
+/// `try_begin` / `spawn_worker` / `ensure_started` / `create_agent`, so the
+/// woken agent's child ran in the SENDER's checkout with a `workspace_api`
+/// bridge scoped to the sender's workspace.
+#[tokio::test]
+async fn cross_workspace_send_binds_woken_agent_to_its_session_workspace() {
+    let script = mock_agent_script();
+    let behavior = json!({ "response": "done", "echoCwd": true }).to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+    ]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let home_dir = test_tempdir("intentd-5017-home-");
+    let sender_dir = test_tempdir("intentd-5017-sender-");
+    let (home_ws, sender_ws) = (
+        WorkspaceId::from("ws-5017-home"),
+        WorkspaceId::from("ws-5017-sender"),
+    );
+    let (target, sender) = (
+        AgentId::from("a-5017-target"),
+        AgentId::from("a-5017-sender"),
+    );
+    seed_agent(&mgr, &home_ws, &target).await;
+    seed_agent(&mgr, &sender_ws, &sender).await;
+    set_session_provider(&mgr, &home_ws, &target, "mock").await;
+    for (ws, dir) in [(&home_ws, &home_dir), (&sender_ws, &sender_dir)] {
+        let mut row = mgr.services.store.get_workspace(ws).await.unwrap();
+        row.path = Some(dir.path().display().to_string());
+        mgr.services
+            .store
+            .update_workspace(&row)
+            .await
+            .expect("set workspace path");
+    }
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    // The shape `ws.agent.send` produces: the delivery is keyed on the
+    // CALLER's bridge workspace, not the target's home.
+    let result = mgr
+        .send_message(
+            target.clone(),
+            sender_ws.clone(),
+            "wake up".to_string(),
+            None,
+            super::TurnOptions {
+                origin: MessageOrigin::Automatic,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("cross-workspace send is accepted");
+    assert_eq!(result["queued"], json!(false), "direct turn: {result}");
+
+    // The turn completes on a fresh child that stamps `cwd=<process.cwd()>`.
+    let echoed = timeout(Duration::from_secs(30), async {
+        loop {
+            let messages = mgr
+                .services
+                .store
+                .get_agent_messages(&target, None)
+                .await
+                .unwrap();
+            let stamped = messages.iter().find_map(|m| {
+                (m.role == "assistant")
+                    .then(|| m.content.to_string())?
+                    .split("cwd=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['"', ' ']).next())
+                    .map(str::to_string)
+            });
+            if let Some(cwd) = stamped {
+                break cwd;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the woken agent's turn completes with an echoed cwd");
+    let expected = std::fs::canonicalize(home_dir.path()).expect("home checkout");
+    let actual = std::fs::canonicalize(&echoed).unwrap_or_else(|_| PathBuf::from(&echoed));
+    assert_eq!(
+        actual, expected,
+        "the woken agent spawns in ITS session workspace's checkout, not the sender's ({echoed})"
+    );
+    assert_ne!(
+        actual,
+        std::fs::canonicalize(sender_dir.path()).expect("sender checkout"),
+        "the woken agent must not spawn in the sender's checkout"
+    );
+
+    // The user-row echo for the delivered message is scoped to the target's
+    // home workspace, never the sender's.
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let echo = events
+        .iter()
+        .find(|e| {
+            e.event_type == intent_core::events::AGENT_MESSAGE
+                && e.data["role"] == json!("user")
+                && e.data["agentId"] == json!(target.0)
+        })
+        .expect("user-row agent:message echo for the delivered message");
+    assert_eq!(
+        echo.workspace_id, home_ws,
+        "the delivery's agent:message echo is scoped to the target's session workspace"
+    );
+}
+
 /// #547 regression (fail-closed drain): when the pre-turn `persist_user`
 /// append fails for ALL bounded retry attempts, the drain must NOT start the
 /// turn — even with a healthy provider that would succeed. The agent parks in
