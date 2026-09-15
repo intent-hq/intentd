@@ -6112,6 +6112,229 @@ async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() 
     );
 }
 
+/// Multiplayer w3 (decided: an agent steered by a collaborator acts with the
+/// owner's capabilities), end to end through the real agent runtime. The
+/// collaborator's own `host.exec` over WSS is refused before dispatch
+/// (`-32003`); its `agent.sendMessage` steer succeeds, is stamped with the
+/// collaborator, and drives a real mock-ACP turn in which the agent calls
+/// `ws.host.exec` through the production `workspace_api` bridge the daemon
+/// bound to it. The turn's persisted `tool_result` carries the process
+/// output, run in the workspace checkout. Nothing here is constructed by the
+/// test: if the runtime never binds the bridge or never executes the
+/// collaborator's turn, no `tool_result` lands and the test fails.
+#[intent_test_macros::daemon_test]
+async fn collaborator_steer_runs_host_exec_through_bound_bridge_over_wss() {
+    use intent_core::{now_iso, Principal, PrincipalId, WorkspaceId, WorkspaceRole};
+    use intent_store::Store;
+
+    let Some(script) = gate("WSS collaborator steer host.exec E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    // The workspace checkout lives under the daemon's hermetic workspaces
+    // dir; `ws.host.exec` runs there.
+    let checkout = data_dir.join("workspaces").join("collab-steer");
+    std::fs::create_dir_all(&checkout).expect("mkdir checkout");
+    let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: Some("Guest User".to_string()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    let ws = WorkspaceId::new();
+    {
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("open store");
+        let mut seed = workspace_seed(&ws);
+        seed.path = Some(checkout.to_string_lossy().into_owned());
+        seed.worktree_path = Some(checkout.to_string_lossy().into_owned());
+        store.insert_workspace(&seed).await.expect("insert ws");
+        store
+            .upsert_principal(&guest)
+            .await
+            .expect("guest principal");
+        let token_hash =
+            Sha256::digest(guest_token.as_bytes())
+                .iter()
+                .fold(String::new(), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
+        store
+            .insert_principal_credential(&guest.id, &token_hash)
+            .await
+            .expect("guest credential");
+        store
+            .add_workspace_member(&ws, &guest.id, WorkspaceRole::Collaborator)
+            .await
+            .expect("guest membership");
+    }
+    let ws_id = ws.0.clone();
+
+    // Only the collaborator's steer drives the tool call; the mock agent
+    // reaches the bridge through whatever the daemon delivered for it.
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": "run echo steered",
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": {
+                    "code": "return JSON.stringify(await ws.host.exec({ command: 'sh', args: ['-c', 'echo steered && pwd && touch steered.txt'] }));",
+                    "summary": "collaborator-steered host.exec"
+                }
+            },
+            "response": "ran host.exec",
+            "emitToolBlocks": true,
+        }],
+        "response": "idle",
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // Owner: subscribe before the turn, then create the workspace's agent.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string(), "{sub_resp}");
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Steered", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Collaborator: direct `host.exec` is refused before dispatch …
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
+    let refused = wss_rpc_envelope(
+        &mut guest_rpc,
+        20,
+        "host.exec",
+        json!({ "workspaceId": ws_id, "command": "echo", "args": ["steered"] }),
+    )
+    .await;
+    assert_eq!(refused["jsonrpc"], "2.0", "{refused}");
+    assert_eq!(refused["error"]["code"], -32003, "{refused}");
+    assert_eq!(refused["error"]["message"], "Forbidden", "{refused}");
+    assert!(refused.get("result").is_none(), "{refused}");
+
+    // … while its steer of the owner's agent runs a real turn.
+    let steered = wss_rpc(
+        &mut guest_rpc,
+        21,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "run echo steered" }),
+    )
+    .await;
+    assert_eq!(steered["success"], true, "steer: {steered}");
+    let message_id = steered["messageId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("messageId: {steered}"))
+        .to_string();
+
+    timeout(Duration::from_secs(60), async {
+        loop {
+            let frame = wss_event(&mut sub, 60).await;
+            let ev = &frame["params"]["event"];
+            if ev["type"] == "agent:stream:end" && ev["data"]["agentId"] == agent_id.as_str() {
+                return;
+            }
+            assert_ne!(
+                ev["type"], "agent:failed",
+                "the steered turn must not fail: {frame}"
+            );
+        }
+    })
+    .await
+    .expect("steered turn reached stream:end");
+
+    // The transcript: the steer row stamped with the collaborator, followed
+    // in the same turn by the bridge's `tool_result` carrying the process
+    // output from the workspace checkout.
+    let conv = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages");
+    let steer_at = messages
+        .iter()
+        .position(|m| m["id"] == message_id.as_str())
+        .unwrap_or_else(|| panic!("steer row: {conv}"));
+    assert_eq!(
+        messages[steer_at]["metadata"]["fromPrincipalId"], guest.id.0,
+        "{conv}"
+    );
+    let tool_result = messages[steer_at..]
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_result")
+        .unwrap_or_else(|| panic!("tool_result after the steer row: {conv}"));
+    assert_eq!(tool_result["is_error"], false, "{tool_result}");
+    let text = tool_result["output"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool text: {tool_result}"));
+    let mut body: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}"));
+    if let Some(inner) = body.as_str() {
+        body = serde_json::from_str(inner).unwrap_or_else(|e| panic!("{e}: {inner}"));
+    }
+    assert_eq!(body["exitCode"], 0, "{body}");
+    let stdout = body["stdout"].as_str().expect("stdout");
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("steered"), "{body}");
+    let printed = lines.next().expect("pwd line");
+    let canonical = std::fs::canonicalize(&checkout).unwrap_or_else(|_| checkout.clone());
+    assert!(
+        Path::new(printed) == checkout || Path::new(printed) == canonical,
+        "host.exec must run in the workspace checkout ({}), got {printed}",
+        checkout.display()
+    );
+    assert!(
+        checkout.join("steered.txt").is_file(),
+        "the steered process ran in the checkout"
+    );
+}
+
 /// Pre-seed the daemon's `SQLite` store with a workspace + target note for the
 /// MCP tool call (the daemon opens the same data dir on launch).
 async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
