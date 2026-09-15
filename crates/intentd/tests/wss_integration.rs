@@ -3375,7 +3375,9 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
 /// connection reads the workspace with `myRole`, lists the roster, edits the
 /// note, steers the agent, and reaches `git.push` past the guard; Owner-only
 /// `agent.delete`, `workspace.export.start`, `hook.cancel` and
-/// `workspace.members.remove` stay refused with `-32003`. The owner's
+/// `workspace.members.remove` stay refused with `-32003`, as is an
+/// `agent.update` touching anything beyond display metadata; pairing this
+/// workspace's agent with another member workspace's id is `NotFound`. The owner's
 /// `workspace.members.remove` over the wire drops the collaborator: its
 /// open workspace channel receives a `removedIds` delta and its next read is
 /// `NotFound` again; removing the owner row is rejected.
@@ -3617,6 +3619,78 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
         assert_eq!(v["error"]["code"], -32003, "collaborator {method}: {v}");
         assert_eq!(v["error"]["message"], "Forbidden", "{v}");
         assert!(v.get("result").is_none(), "{v}");
+    }
+
+    // `agent.update`: display metadata is a member edit; anything else
+    // (lifecycle, session, prompt, task, attachments) is owner-only.
+    let (id, frame) = call(
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "name": "Renamed by guest" } }),
+    );
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let v = reply(&mut ws, id).await;
+    assert!(
+        v.get("error").is_none(),
+        "collaborator agent.update name: {v}"
+    );
+    for changes in [
+        json!({ "status": "completed" }),
+        json!({ "systemPrompt": "you are owned" }),
+        json!({ "name": "ok", "sessionId": "forged" }),
+    ] {
+        let (id, frame) = call(
+            "agent.update",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": changes }),
+        );
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_eq!(
+            v["error"]["code"], -32003,
+            "protected agent.update {changes}: {v}"
+        );
+        assert!(v.get("result").is_none(), "{v}");
+    }
+
+    // The agent must belong to the supplied workspace: a collaborator of two
+    // workspaces cannot pair A's agent with B's id (turn side effects, seen
+    // markers and question dismissals all key on the workspace). The
+    // mismatch is `NotFound` on the agent, not `Forbidden`.
+    let other = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"workspace.create","params":{"title":"W3 Other"}}"#,
+    )
+    .await;
+    let other_ws_id = other["result"]["workspace"]["id"]
+        .as_str()
+        .expect("other workspace id")
+        .to_string();
+    srv.store
+        .add_workspace_member(
+            &WorkspaceId::from(other_ws_id.as_str()),
+            &guest.id,
+            WorkspaceRole::Collaborator,
+        )
+        .await
+        .expect("add collaborator to other");
+    for (method, params) in [
+        (
+            "agent.sendMessage",
+            json!({ "workspaceId": other_ws_id, "agentId": agent_id, "content": "cross" }),
+        ),
+        (
+            "agent.markSeen",
+            json!({ "workspaceId": other_ws_id, "agentId": agent_id, "messageId": "m-none" }),
+        ),
+        (
+            "agent.dismissQuestions",
+            json!({ "workspaceId": other_ws_id, "agentId": agent_id, "messageId": "m-none" }),
+        ),
+    ] {
+        let (id, frame) = call(method, params);
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_not_found(&v, &format!("cross-workspace {method}"));
     }
 
     // The collaborator's workspace channel: the member row is in the
