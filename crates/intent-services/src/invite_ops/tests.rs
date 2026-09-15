@@ -422,6 +422,7 @@ async fn identity_switch_rechecks_the_lock_after_a_concurrent_mint() {
         id: uuid::Uuid::new_v4().to_string(),
         workspace_id: ws.clone(),
         secret_hash: hash_secret("s"),
+        secret: None,
         created_by_principal_id: primary.id.clone(),
         pin_github_user_id: None,
         pin_login: None,
@@ -669,6 +670,165 @@ async fn revoke_leaves_an_expired_invite_expired() {
         closed_kind(&stored, &now_iso()),
         Some(InviteErrorKind::Expired)
     );
+}
+
+/// Stand-in for the transport's link builder: `Some` formats
+/// `stub://<inviteId>/<secret>`, `None` models a listener nobody can dial.
+struct StubLinks {
+    envelope: bool,
+    resolves: std::sync::atomic::AtomicUsize,
+}
+
+struct StubEnvelope;
+
+impl intent_core::InviteLinkEnvelope for StubEnvelope {
+    fn invite_url(&self, invite_id: &str, secret: &str) -> String {
+        format!("stub://{invite_id}/{secret}")
+    }
+}
+
+impl intent_core::InviteLinkBuilder for StubLinks {
+    fn invite_link_envelope(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = intent_core::ResolvedInviteLinkEnvelope> + Send + '_>,
+    > {
+        self.resolves
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let envelope = self.envelope;
+        Box::pin(async move {
+            envelope.then(|| Box::new(StubEnvelope) as Box<dyn intent_core::InviteLinkEnvelope>)
+        })
+    }
+}
+
+/// Every wire form of an invite: no `secret` / `secretHash` key, and the raw
+/// secret nowhere but inside `url` (when present).
+fn assert_secret_hidden(wire: &Value, secret: &str) {
+    assert!(wire.get("secret").is_none(), "{wire}");
+    assert!(wire.get("secretHash").is_none(), "{wire}");
+    let mut without_url = wire.clone();
+    without_url.as_object_mut().expect("object").remove("url");
+    let text = serde_json::to_string(&without_url).expect("json");
+    assert!(!text.contains(secret), "raw secret leaked: {text}");
+    assert!(!text.contains(&hash_secret(secret)), "hash leaked: {text}");
+}
+
+/// The mint stores the secret and, with a link builder attached, both the
+/// `create` echo and every `list` row carry `url` rebuilt from it — the
+/// envelope resolved once per list, not per row; a row minted before the
+/// secret was stored gets no `url`; the secret itself never serialises.
+#[tokio::test]
+async fn invite_list_rebuilds_the_link_from_the_stored_secret() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let links = Arc::new(StubLinks {
+        envelope: true,
+        resolves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    f.services.attach_invite_link_builder(links.clone());
+
+    let created = f.create_invite(Some(3600)).await;
+    let id = id_of(&created);
+    let secret = created["secret"].as_str().expect("secret").to_string();
+    let expected_url = format!("stub://{id}/{secret}");
+    assert_eq!(created["invite"]["url"], json!(expected_url));
+    assert_secret_hidden(&created["invite"], &secret);
+    let stored = f
+        .store
+        .get_workspace_invite(&id)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(stored.secret.as_deref(), Some(secret.as_str()));
+    assert_eq!(stored.secret_hash, hash_secret(&secret));
+
+    // A second open invite plus a pre-0128 row (no stored secret).
+    let created_2 = f.create_invite(Some(3600)).await;
+    let id_2 = id_of(&created_2);
+    let secret_2 = created_2["secret"].as_str().expect("secret").to_string();
+    let legacy_secret = "f".repeat(64);
+    let legacy = WorkspaceInvite {
+        id: "inv-legacy".to_string(),
+        workspace_id: f.ws.clone(),
+        secret_hash: hash_secret(&legacy_secret),
+        secret: None,
+        created_by_principal_id: f.owner.clone(),
+        pin_github_user_id: None,
+        pin_login: None,
+        created_at: now_iso(),
+        expires_at: iso_after(60),
+        redeemed_at: None,
+        redeemed_by_principal_id: None,
+        revoked_at: None,
+    };
+    f.store
+        .insert_workspace_invite(&legacy)
+        .await
+        .expect("insert legacy");
+
+    let before = links.resolves.load(std::sync::atomic::Ordering::SeqCst);
+    let listed = with_caller(wire(&f.owner), f.services.workspace_invite_list_op(&f.ws))
+        .await
+        .expect("list");
+    assert_eq!(
+        links.resolves.load(std::sync::atomic::Ordering::SeqCst),
+        before + 1,
+        "one envelope resolve per list call"
+    );
+    let rows = listed["invites"].as_array().expect("invites");
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let row_id = row["id"].as_str().expect("id");
+        match row_id {
+            _ if row_id == id => {
+                assert_eq!(row["url"], json!(expected_url));
+                assert_secret_hidden(row, &secret);
+            }
+            _ if row_id == id_2 => {
+                assert_eq!(row["url"], json!(format!("stub://{id_2}/{secret_2}")));
+                assert_secret_hidden(row, &secret_2);
+            }
+            "inv-legacy" => {
+                assert!(row.get("url").is_none(), "no secret, no url: {row}");
+                assert_secret_hidden(row, &legacy_secret);
+            }
+            other => panic!("unexpected invite {other}"),
+        }
+    }
+    let text = serde_json::to_string(&listed).expect("json");
+    assert!(!text.contains("\"secret\""), "{text}");
+}
+
+/// Without a builder, or with one that cannot build a link right now
+/// (listener down, no dialable route), `create` and `list` still answer —
+/// their rows simply carry no `url`.
+#[tokio::test]
+async fn invite_list_omits_the_url_when_no_link_can_be_built() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(Some(3600)).await;
+    assert!(created["invite"].get("url").is_none(), "{created}");
+    let listed = with_caller(wire(&f.owner), f.services.workspace_invite_list_op(&f.ws))
+        .await
+        .expect("list without builder");
+    assert_eq!(listed["invites"].as_array().map(Vec::len), Some(1));
+    assert!(listed["invites"][0].get("url").is_none(), "{listed}");
+
+    f.services.attach_invite_link_builder(Arc::new(StubLinks {
+        envelope: false,
+        resolves: std::sync::atomic::AtomicUsize::new(0),
+    }));
+    let created = f.create_invite(Some(3600)).await;
+    assert!(created["invite"].get("url").is_none(), "{created}");
+    let secret = created["secret"].as_str().expect("secret");
+    assert_secret_hidden(&created["invite"], secret);
+    let listed = with_caller(wire(&f.owner), f.services.workspace_invite_list_op(&f.ws))
+        .await
+        .expect("list with an unresolvable envelope");
+    let rows = listed["invites"].as_array().expect("invites");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.get("url").is_none()), "{listed}");
 }
 
 /// A waiter whose budget runs out while the poll task is committing the

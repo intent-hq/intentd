@@ -5216,7 +5216,10 @@ impl PrincipalCredential {
 
 /// One `workspace_invite` row (multiplayer w4): a single-use, expiring link
 /// an owner minted so one person can join a workspace as a collaborator.
-/// The link secret is persisted only as `secret_hash` (hex SHA-256); an
+/// Redemption matches the link secret against `secret_hash` (hex SHA-256);
+/// the plaintext `secret` is kept alongside (migration `0128`, `None` on
+/// older rows) only so the owner can copy the link again — it never
+/// serialises, reaching the wire solely inside a rebuilt `url`. An
 /// optional pin restricts redemption to one GitHub account, entered as a
 /// login but stored and compared as the stable `pin_github_user_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5226,6 +5229,8 @@ pub struct WorkspaceInvite {
     pub workspace_id: WorkspaceId,
     #[serde(skip_serializing)]
     pub secret_hash: String,
+    #[serde(default, skip_serializing)]
+    pub secret: Option<String>,
     pub created_by_principal_id: PrincipalId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_github_user_id: Option<i64>,

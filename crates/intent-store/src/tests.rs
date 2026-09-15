@@ -9,7 +9,8 @@ use intent_core::{
     ClientId, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType,
     Error, EventActor, Hook, HookId, HookListRow, HookState, Note, NoteId, NoteMetadata,
     NoteVersionAuthor, NoteVisibility, Principal, PrincipalId, TaskMetadata, TaskStatus, Workspace,
-    WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceRole, WorkspaceStatus,
+    WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceInvite, WorkspaceRole,
+    WorkspaceStatus,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -8758,4 +8759,81 @@ async fn resolve_active_principal_credential_touches_active_and_rejects_revoked(
         after.last_used_at, touched.last_used_at,
         "a rejected resolve does not touch the row"
     );
+}
+
+/// Migration 0128 keeps the invite link secret next to its hash: a minted
+/// row round-trips `secret` through insert / get / list, while a row shaped
+/// like one minted before the column existed (no `secret`, as the `ALTER
+/// TABLE … ADD COLUMN` leaves every pre-existing row) reads back `None` and
+/// still lists as open — the plaintext is never required for the row to be
+/// valid.
+#[tokio::test]
+async fn workspace_invite_secret_round_trips_and_legacy_rows_read_none() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Invites", false))
+        .await
+        .expect("insert ws");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let far = "2999-01-01T00:00:00.000Z".to_string();
+
+    let minted = WorkspaceInvite {
+        id: "inv-minted".to_string(),
+        workspace_id: ws.clone(),
+        secret_hash: "a".repeat(64),
+        secret: Some("b".repeat(64)),
+        created_by_principal_id: primary.id.clone(),
+        pin_github_user_id: None,
+        pin_login: None,
+        created_at: "2020-01-01T00:00:00.000Z".to_string(),
+        expires_at: far.clone(),
+        redeemed_at: None,
+        redeemed_by_principal_id: None,
+        revoked_at: None,
+    };
+    store
+        .insert_workspace_invite(&minted)
+        .await
+        .expect("insert minted");
+    let read = store
+        .get_workspace_invite(&minted.id)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(read, minted, "secret round-trips through the store");
+
+    // A pre-0128 row: inserted without the `secret` column, exactly the shape
+    // every row minted before the migration has afterwards.
+    sqlx::query(
+        "INSERT INTO workspace_invite (id, workspace_id, secret_hash, \
+         created_by_principal_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("inv-legacy")
+    .bind(&ws.0)
+    .bind("c".repeat(64))
+    .bind(&primary.id.0)
+    .bind("2020-01-02T00:00:00.000Z")
+    .bind(&far)
+    .execute(store.write_pool())
+    .await
+    .expect("insert legacy-shaped row");
+    let legacy = store
+        .get_workspace_invite("inv-legacy")
+        .await
+        .expect("get legacy")
+        .expect("present");
+    assert_eq!(legacy.secret, None, "a pre-0128 row has no stored secret");
+    assert_eq!(legacy.secret_hash, "c".repeat(64));
+
+    let open = store.list_open_workspace_invites(&ws).await.expect("list");
+    let ids: Vec<&str> = open.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["inv-minted", "inv-legacy"],
+        "both rows list as open"
+    );
+    assert_eq!(open[0].secret.as_deref(), Some("b".repeat(64).as_str()));
+    assert_eq!(open[1].secret, None);
 }
