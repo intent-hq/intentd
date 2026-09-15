@@ -87,11 +87,17 @@
 //!     immediately (setting [`UPDATE_RESTART_ENV`] when the version
 //!     differs) — the SIGHUP path without the stop. Serve mode advertises
 //!     the handshake by setting [`IDLE_RESTART_ENV`]`=1` on the child; the
-//!     daemon only sends SIGUSR2 to a sitter that did. A daemon that never
-//!     gets idle is caught by item 4 at the next periodic check. A SIGUSR1
-//!     arriving while the idle-mode check is in flight escalates it to
-//!     item 9's immediate restart; a SIGUSR2 never downgrades a SIGUSR1
-//!     check
+//!     daemon only sends SIGUSR2 to a sitter that did. The daemon sends one
+//!     once no agent turn has been in flight for `updates.idleGraceSeconds`
+//!     (default 120 s), at most every `updates.idleCheckIntervalMinutes`
+//!     (default 60), so an idle daemon picks up a publish within about that
+//!     interval instead of waiting for item 3's 12–24 h schedule — which
+//!     stays the forced fallback: a daemon that never gets idle is caught by
+//!     item 4 at the next periodic check, busy or not. Setting
+//!     `updates.checkOnIdle=false` on the daemon stops the requests (live,
+//!     no restart) and leaves only the periodic path. A SIGUSR1 arriving
+//!     while the idle-mode check is in flight escalates it to item 9's
+//!     immediate restart; a SIGUSR2 never downgrades a SIGUSR1 check
 //!
 //! When the startup channel came from `config.toml` or the stable default
 //! (not the `--sitter-channel` flag or `INTENTD_CHANNEL` env), every update

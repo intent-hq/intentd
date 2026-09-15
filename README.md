@@ -333,6 +333,14 @@ literally (`intentd -- restart` sends `restart` to the daemon).
 - Automatic checks are strictly **newer-only** — they never downgrade. The only
   downgrade path is an explicit `intentd sitter channel <channel> --redownload`
   (see [Channels](#channels)).
+- Idle daemons update sooner than that cadence: once no agent has had a turn in
+  flight for `updates.idleGraceSeconds` (default 120 s), the daemon asks its sitter to
+  check right away (via `SIGUSR2`, at most every `updates.idleCheckIntervalMinutes`,
+  default 60), the sitter stages any newer version, and the daemon restarts into it
+  the next moment no turn is in flight — so an idle daemon picks up a publish within
+  about an hour, while a continuously busy daemon still gets the forced 12–24 h
+  restart. `updates.checkOnIdle=false` (a live setting, no restart) disables the
+  idle-triggered path and leaves only the periodic one.
 - `intentd update` forces a check right away — no waiting on the 12–24 h cadence and
   no restart required; `intentd update --check` reports what would happen without
   installing (see [Channels](#channels)).
