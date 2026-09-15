@@ -12812,6 +12812,66 @@ async fn wake_delivery_to_vanished_session_fails_closed() {
     assert!(!mgr.is_busy(&id), "slot released after the rejected wake");
 }
 
+/// intent-hq/intent#5046 regression, lookup-failure arm: when the session
+/// read that binds a wake to the target's home workspace fails for any
+/// reason other than `NotFound`, the wake must fail CLOSED — never fall back
+/// to the CALLER's workspace, which is exactly the scope leak the rebind
+/// exists to prevent. Nothing is claimed, queued or published, and the
+/// queue survives (only a confirmed-vanished session drops it). The failure
+/// is injected by corrupting the row's `metadata` JSON so the summary read
+/// decodes into `Error::Internal`.
+#[tokio::test]
+async fn wake_delivery_fails_closed_when_session_lookup_fails() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let (home_ws, caller_ws) = (
+        WorkspaceId::from("ws-5046-home"),
+        WorkspaceId::from("ws-5046-caller"),
+    );
+    let id = AgentId::from("a-5046-lookup");
+    seed_agent(&mgr, &home_ws, &id).await;
+    // A parked entry the failing wake must leave alone.
+    mgr.services.enqueue_message(
+        &id,
+        "parked before the failing wake".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    sqlx::query("UPDATE agent_session SET metadata = 'not json' WHERE id = ?")
+        .bind(&id.0)
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("corrupt the session row");
+    let mut events = bus.subscribe(SubscriptionFilter::default());
+
+    let err = mgr
+        .services
+        .deliver_wake_message(&caller_ws, &id, "[Agent Completed] cross-ws wake", None)
+        .await
+        .expect_err("a wake whose session lookup fails is rejected, not rebound to the caller");
+    assert!(
+        matches!(&err, Error::Internal(msg) if msg.contains("decode agent session metadata")),
+        "the lookup error propagates unchanged: {err:?}"
+    );
+    assert!(!mgr.is_busy(&id), "no slot claimed under either workspace");
+    assert_eq!(
+        mgr.services.queue_snapshot(&id).len(),
+        1,
+        "the pre-existing queue entry survives (only NotFound drops the queue)"
+    );
+    assert!(
+        timeout(Duration::from_millis(200), events.recv())
+            .await
+            .is_err(),
+        "nothing is published under the caller's (or any) workspace"
+    );
+}
+
 /// intent-hq/monorepo#2762 regression, wake enqueue-only route: a wake for a
 /// BUSY agent whose session vanished never touches `agent_message` (the
 /// busy-agent branch returns queued success without any append), so the

@@ -12788,9 +12788,15 @@ impl Services {
         // `try_begin` claim, the event echo, the drain kicks, and the spawn
         // (`ensure_started` → `resolve_spawn` cwd + `create_agent`
         // workspace-MCP scope) — must key on the workspace the target lives
-        // in. Fail open on a non-NotFound lookup error: the requested
-        // workspace stands, matching the archived/retired gates below.
-        let workspace_id = match self.store.get_agent_session(agent_id).await {
+        // in. Any other lookup error fails CLOSED like the send routes'
+        // `require_agent_session`: unlike the archived/retired gates below
+        // (which fail open because their fallback is the normal path), a
+        // failed read here means the destination identity is unknown, and
+        // binding to the caller's workspace would be exactly the scope leak
+        // this guard exists to prevent. Nothing has been claimed, queued or
+        // published yet, so the caller may simply retry; the queue is left
+        // intact (only a confirmed-vanished session drops it).
+        let workspace_id = match self.store.get_agent_session_summary(agent_id).await {
             Ok(session) => crate::agent_manager::AgentManager::session_workspace(
                 agent_id,
                 workspace_id,
@@ -12808,9 +12814,9 @@ impl Services {
                     agent = %agent_id.0,
                     workspace = %workspace_id.as_str(),
                     error = %e,
-                    "wake delivery: session lookup failed; binding to the requested workspace"
+                    "wake delivery: session lookup failed; refusing to bind the delivery to the requested workspace"
                 );
-                workspace_id.clone()
+                return Err(e);
             }
         };
         let workspace_id = &workspace_id;
