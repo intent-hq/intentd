@@ -4345,7 +4345,9 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `workspace.members.list` (multiplayer w3): the members of a workspace
     /// → `{ members: [{ principalId, login?, displayName?, avatarUrl?, role,
-    /// addedAt }] }`, owners first. Member-visible; a non-member gets
+    /// addedAt }], guestCount, guestLimit }`, owners first. `guestCount` is
+    /// the collaborators plus open invites spent against `guestLimit`
+    /// (`sharing.maxGuestsPerWorkspace`). Member-visible; a non-member gets
     /// `NotFound`.
     fn workspace_members_list(
         &self,
