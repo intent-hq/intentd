@@ -8138,7 +8138,7 @@ async fn workspace_membership_add_set_role_remove() {
             .await
             .expect("owner"),
         Some(primary.id.clone()),
-        "the earliest-added owner stays the mirrored owner"
+        "the current owner stays mirrored while it still holds the owner role"
     );
     store
         .set_workspace_member_role(&ws_id, &primary.id, WorkspaceRole::Collaborator)
@@ -8254,6 +8254,78 @@ async fn workspace_membership_add_set_role_remove() {
             .expect("owner"),
         Some(outsider.id.clone()),
         "adding an owner member sets the mirrored column"
+    );
+}
+
+/// Promoting a second member to `owner` never flips the mirrored
+/// `workspace.owner_principal_id` away from the current owner, even when the
+/// newcomer's `added_at` sorts before the current owner's. `added_at` mixes
+/// the migration trigger's millisecond stamps with `now_iso()`'s nanosecond
+/// ones, so two rows written in the same millisecond order arbitrarily; the
+/// mirror must therefore prefer the current owner and only fall back to the
+/// earliest-added row once the current owner loses the role
+/// (intent-hq/intentd#1868).
+#[tokio::test]
+async fn workspace_owner_mirror_keeps_current_owner_on_promotion() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let ws_id = WorkspaceId::from("ws-owner-tie");
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "T", false))
+        .await
+        .expect("insert ws");
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(9),
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store.upsert_principal(&guest).await.expect("insert guest");
+    assert!(store
+        .add_workspace_member(&ws_id, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("add"));
+    // Force the tie the wrong way: the guest's row now sorts before the
+    // primary's regardless of how the two timestamps were formatted.
+    sqlx::query(
+        "UPDATE workspace_member SET added_at = '2000-01-01T00:00:00Z' \
+         WHERE workspace_id = ? AND principal_id = ?",
+    )
+    .bind(&ws_id.0)
+    .bind(&guest.id.0)
+    .execute(store.write_pool())
+    .await
+    .expect("backdate guest");
+
+    store
+        .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Owner)
+        .await
+        .expect("promote guest");
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(primary.id.clone()),
+        "promoting a second owner keeps the current owner mirrored"
+    );
+
+    store
+        .set_workspace_member_role(&ws_id, &primary.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("demote primary");
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(guest.id.clone()),
+        "once the current owner loses the role the remaining owner is mirrored"
     );
 }
 
