@@ -421,6 +421,84 @@ async fn profile_persisted_after_first_sight_refreshes_rosters_without_a_reconne
     );
 }
 
+/// The first-sight read racing the identity write: `ensure_profile` has the
+/// empty row in hand when `apply_primary_identity` persists the login and
+/// finds nothing cached to refresh. The stale row must not be installed —
+/// the read is retried and the `presence:changed` the connect emits, the
+/// cache and `presence.snapshot` all carry the login. Driven through the
+/// `profile_fetch_pause` seam, so the interleaving is exact.
+#[tokio::test]
+async fn first_sight_read_racing_the_identity_write_installs_the_fresh_profile() {
+    use crate::events::SubscriptionFilter;
+    use crate::presence::ProfileFetchPause;
+    use intent_core::events::PRESENCE_CHANGED;
+    use intent_core::with_caller;
+    use std::sync::Arc;
+    let tmp = crate::tests::TempDb::new();
+    let root = crate::tests::WorkspacesRoot::new();
+    let (store, services, ws, caller) = member_services(&tmp, &root).await;
+    let principal = caller.principal_id().cloned().expect("wire caller");
+    let mut row = store.get_principal(&principal).await.expect("principal");
+    row.github_user_id = Some(583_231);
+    row.login = None;
+    store.upsert_principal(&row).await.expect("empty profile");
+    let mut sub = services
+        .event_bus
+        .as_ref()
+        .expect("bus")
+        .subscribe(SubscriptionFilter {
+            event_types: vec![PRESENCE_CHANGED.to_string()],
+            workspace_id: Some(ws.to_string()),
+            ..Default::default()
+        });
+    let pause = Arc::new(ProfileFetchPause::default());
+    *services.presence.profile_fetch_pause.lock().unwrap() = Some(pause.clone());
+    let identity = intent_sourcecontrol::UserIdentity {
+        login: "octocat".to_string(),
+        id: Some(583_231),
+        name: None,
+        avatar_url: None,
+        html_url: None,
+    };
+
+    let connect = with_caller(
+        caller.clone(),
+        services.presence_connect_op("conn-1".into()),
+    );
+    let interleave = async {
+        pause.fetched.notified().await;
+        assert!(
+            services.presence.lock().profiles.is_empty(),
+            "the stale row is fetched but not yet installed"
+        );
+        services
+            .apply_primary_identity(row.clone(), &identity)
+            .await
+            .expect("identity applied mid-read");
+        pause.resume.notify_one();
+    };
+    let (connected, ()) = tokio::join!(connect, interleave);
+    connected.expect("hello");
+
+    assert_eq!(
+        services.presence.lock().profiles[&principal]
+            .login
+            .as_deref(),
+        Some("octocat"),
+        "the re-read row is installed, not the stale one"
+    );
+    let batch = sub.recv().await.expect("bus open");
+    let members = batch[0].data["members"].as_array().expect("members");
+    assert_eq!(members.len(), 1, "{:?}", batch[0].data);
+    assert_eq!(members[0]["login"], "octocat", "{:?}", batch[0].data);
+    let snapshot = with_caller(caller.clone(), services.presence_snapshot_op(ws.clone()))
+        .await
+        .expect("snapshot");
+    assert_eq!(snapshot["members"][0]["login"], "octocat");
+    let quiet = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
+    assert!(quiet.is_err(), "one roster, from the connect: {quiet:?}");
+}
+
 /// A principal presence has never seen leaves no cache entry behind: the
 /// refresh is a no-op rather than an unbounded insert.
 #[tokio::test]
