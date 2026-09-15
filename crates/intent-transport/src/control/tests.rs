@@ -60,6 +60,14 @@ impl FakeControl {
                 fd_count: Some(312),
                 fd_limit: Some(10240),
                 update_supported: true,
+                busy_agents: 1,
+                idle_update_check: IdleUpdateCheckStatus {
+                    enabled: true,
+                    supported: true,
+                    last_requested_at: Some("2026-09-15T14:00:00Z".to_string()),
+                    next_eligible_at: Some("2026-09-15T15:00:00Z".to_string()),
+                    restart_pending: true,
+                },
             },
             shutdown_called: AtomicBool::new(false),
             import_force: std::sync::Mutex::new(None),
@@ -185,6 +193,19 @@ fn status_json_local_vs_remote_locality() {
     // present, so a client can gate its update affordance without probing
     // system.requestUpdate.
     assert_eq!(local["updateSupported"], true);
+    // Idle-update handshake visibility: busy-turn count plus the requester /
+    // staged-restart state, RFC 3339 timestamps as plain strings.
+    assert_eq!(local["busyAgents"], 1);
+    assert_eq!(
+        local["idleUpdateCheck"],
+        json!({
+            "enabled": true,
+            "supported": true,
+            "lastRequestedAt": "2026-09-15T14:00:00Z",
+            "nextEligibleAt": "2026-09-15T15:00:00Z",
+            "restartPending": true,
+        })
+    );
 
     let remote = status_json(&status, false);
     assert_eq!(remote["host"]["locality"], "remote");
@@ -234,6 +255,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         fd_count: None,
         fd_limit: None,
         update_supported: false,
+        busy_agents: 0,
+        idle_update_check: IdleUpdateCheckStatus::default(),
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));
@@ -271,6 +294,19 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     // Unsupervised daemon ⇒ updateSupported is PRESENT and false — a plain
     // boolean, never absent or null.
     assert_eq!(v["updateSupported"], false);
+    // Idle-update handshake off ⇒ the object is still PRESENT with the
+    // booleans false and the timestamps explicitly null — never absent.
+    assert_eq!(v["busyAgents"], 0);
+    assert_eq!(
+        v["idleUpdateCheck"],
+        json!({
+            "enabled": false,
+            "supported": false,
+            "lastRequestedAt": Value::Null,
+            "nextEligibleAt": Value::Null,
+            "restartPending": false,
+        })
+    );
     assert!(v["host"].get("deviceKind").is_none());
     assert!(v["host"].get("hardwareModel").is_none());
 }

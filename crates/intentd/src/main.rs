@@ -2304,6 +2304,14 @@ async fn cmd_serve(
         &config.data_dir.join("tunnel"),
     ));
 
+    // Sitter idle-update handshake state (unix only), created ahead of the
+    // control surface so `system.status` can report it; the requester and
+    // staged-restart watcher below share it.
+    #[cfg(unix)]
+    let idle_update_state = Arc::new(IdleUpdateState::new(
+        SITTER_IDLE_RESTART.load(std::sync::atomic::Ordering::Relaxed),
+    ));
+
     let control = Arc::new(DaemonControl {
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
@@ -2321,6 +2329,8 @@ async fn cmd_serve(
         settings_registry: settings_registry.clone(),
         sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
         tunnel: tunnel_supervisor.clone(),
+        #[cfg(unix)]
+        idle_update_state: idle_update_state.clone(),
     });
 
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
@@ -2337,10 +2347,6 @@ async fn cmd_serve(
     // version is staged") by exiting with RESTART_FOR_UPDATE_EXIT_CODE the
     // moment `list_busy()` drains. Both are gated on the sitter having
     // advertised the handshake via INTENTD_SITTER_IDLE_RESTART.
-    #[cfg(unix)]
-    let idle_update_state = Arc::new(IdleUpdateState::new(
-        SITTER_IDLE_RESTART.load(std::sync::atomic::Ordering::Relaxed),
-    ));
     #[cfg(unix)]
     let staged_restart_watcher = spawn_staged_restart_watcher(
         manager.clone(),
@@ -2733,6 +2739,10 @@ struct DaemonControl {
     /// Tailcat tunnel sidecar supervisor (`server.tunnel.*`). Always present
     /// so the runtime toggle works whether or not the tunnel was boot-started.
     tunnel: Arc<tunnel::TunnelSupervisor>,
+    /// Sitter idle-update handshake state, reported as `system.status` →
+    /// `idleUpdateCheck`; shared with the requester and staged-restart watcher.
+    #[cfg(unix)]
+    idle_update_state: Arc<IdleUpdateState>,
 }
 
 /// Latest own-process resource sample for `system.status`, written by the
@@ -3759,6 +3769,10 @@ impl SystemControl for DaemonControl {
         // (absent on the wire) until the first sample lands or when no
         // mounted volume matches the root.
         let workspaces_disk = self.workspaces_disk.load();
+        // One supervision probe serves both `updateSupported` and
+        // `idleUpdateCheck.supported`.
+        let update_supported = sitter_update_supported(&self.sitter_pid_path);
+        let idle_update_check = self.idle_update_check(update_supported);
         SystemStatus {
             listen_mode: if tcp { "both" } else { "uds" }.to_string(),
             uds: true,
@@ -3809,7 +3823,10 @@ impl SystemControl for DaemonControl {
             // Signal-free supervision probe (intent-hq/intent#3875): one
             // pidfile read + one single-process sysinfo refresh, never a
             // signal, so status stays cheap and side-effect free.
-            update_supported: sitter_update_supported(&self.sitter_pid_path),
+            update_supported,
+            // In-flight turns: one lock read of the manager's busy set.
+            busy_agents: self.manager.list_busy().len(),
+            idle_update_check,
         }
     }
 
@@ -4630,6 +4647,80 @@ impl IdleUpdateState {
             .timing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = timing;
+    }
+
+    /// The `system.status` → `idleUpdateCheck` projection. `supervised` is the
+    /// caller's already-evaluated supervision probe (`updateSupported`), so
+    /// `supported` reads "idle checks will actually be sent": handshake
+    /// advertised AND a live supervising sitter right now.
+    fn status(&self, enabled: bool, supervised: bool) -> intent_transport::IdleUpdateCheckStatus {
+        let timing = self.timing();
+        let now = std::time::Instant::now();
+        let now_sys = std::time::SystemTime::now();
+        intent_transport::IdleUpdateCheckStatus {
+            enabled,
+            supported: self.advertised && supervised,
+            last_requested_at: timing
+                .last_request_at
+                .map(|at| instant_to_iso(at, now, now_sys)),
+            next_eligible_at: timing
+                .next_eligible_at
+                .map(|at| instant_to_iso(at, now, now_sys)),
+            restart_pending: self.is_restart_pending(),
+        }
+    }
+}
+
+/// Project a monotonic `Instant` onto the wall clock as an RFC 3339 UTC
+/// string, given one shared `(now, now_sys)` reading. Works for instants on
+/// either side of `now`: `Instant::elapsed` saturates at zero for a future
+/// instant (`next_eligible_at`), so the offset is taken in whichever
+/// direction is non-zero.
+#[cfg(unix)]
+fn instant_to_iso(
+    at: std::time::Instant,
+    now: std::time::Instant,
+    now_sys: std::time::SystemTime,
+) -> String {
+    let wall = if at >= now {
+        now_sys.checked_add(at.saturating_duration_since(now))
+    } else {
+        now_sys.checked_sub(now.saturating_duration_since(at))
+    };
+    let secs = wall
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or_default();
+    intent_core::iso_from_unix_secs(secs)
+}
+
+impl DaemonControl {
+    /// `system.status` → `idleUpdateCheck`: `enabled` follows the live
+    /// `updates.checkOnIdle` setting; the rest comes from the shared
+    /// handshake state (unix) or reads as the all-off default where sitter
+    /// supervision cannot exist.
+    #[cfg(unix)]
+    fn idle_update_check(&self, supervised: bool) -> intent_transport::IdleUpdateCheckStatus {
+        let enabled = self
+            .settings_registry
+            .snapshot()
+            .effective
+            .updates
+            .check_on_idle;
+        self.idle_update_state.status(enabled, supervised)
+    }
+
+    #[cfg(not(unix))]
+    fn idle_update_check(&self, _supervised: bool) -> intent_transport::IdleUpdateCheckStatus {
+        intent_transport::IdleUpdateCheckStatus {
+            enabled: self
+                .settings_registry
+                .snapshot()
+                .effective
+                .updates
+                .check_on_idle,
+            ..intent_transport::IdleUpdateCheckStatus::default()
+        }
     }
 }
 
@@ -5987,6 +6078,22 @@ fn print_status(config: &Config, r: &Value) {
     println!(
         "  updateSupported: {}",
         r["updateSupported"].as_bool().unwrap_or(false)
+    );
+    println!("  busyAgents: {}", r["busyAgents"].as_u64().unwrap_or(0));
+    let idle = &r["idleUpdateCheck"];
+    println!(
+        "  idleUpdateCheck: enabled={} supported={} restartPending={}",
+        idle["enabled"].as_bool().unwrap_or(false),
+        idle["supported"].as_bool().unwrap_or(false),
+        idle["restartPending"].as_bool().unwrap_or(false),
+    );
+    println!(
+        "    lastRequestedAt: {}",
+        idle["lastRequestedAt"].as_str().unwrap_or("(never)")
+    );
+    println!(
+        "    nextEligibleAt: {}",
+        idle["nextEligibleAt"].as_str().unwrap_or("(disabled)")
     );
     match r["fingerprint"].as_str() {
         Some(fp) => println!("  fingerprint: {fp}"),
@@ -7476,6 +7583,67 @@ mod tests {
             .restart_exit
             .store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(state.restart_exit_fired());
+    }
+
+    /// `instant_to_iso` projects instants on BOTH sides of `now` onto the
+    /// wall clock: a future `next_eligible_at` must not collapse to `now`
+    /// (which `Instant::elapsed` would do by saturating at zero).
+    #[cfg(unix)]
+    #[test]
+    fn instant_to_iso_handles_past_and_future_instants() {
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        // Build the past instant first so `now` is derived by addition only.
+        let past = Instant::now();
+        let now = past + Duration::from_secs(90);
+        let now_sys = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert_eq!(instant_to_iso(now, now, now_sys), "2027-01-15T08:00:00Z");
+        assert_eq!(
+            instant_to_iso(now + Duration::from_secs(3600), now, now_sys),
+            "2027-01-15T09:00:00Z"
+        );
+        assert_eq!(instant_to_iso(past, now, now_sys), "2027-01-15T07:58:30Z");
+        // A real wall clock still yields a well-formed RFC 3339 string.
+        let live = instant_to_iso(now, now, SystemTime::now());
+        assert!(live.ends_with('Z') && live.len() >= 20, "{live}");
+    }
+
+    /// The `idleUpdateCheck` projection: `supported` needs BOTH the boot-time
+    /// handshake advertisement and a live supervising sitter; unset timing
+    /// reads as null timestamps; `restartPending` mirrors the watcher flag.
+    #[cfg(unix)]
+    #[test]
+    fn idle_update_check_status_projection() {
+        use std::time::Instant;
+        let state = IdleUpdateState::new(true);
+        let status = state.status(true, false);
+        assert!(status.enabled);
+        assert!(!status.supported, "advertised but not supervised");
+        assert_eq!(status.last_requested_at, None);
+        assert_eq!(status.next_eligible_at, None);
+        assert!(!status.restart_pending);
+
+        let last_request = Instant::now();
+        state.set_timing(IdleUpdateTiming {
+            idle_since: Some(last_request + Duration::from_secs(60)),
+            last_request_at: Some(last_request),
+            next_eligible_at: Some(last_request + Duration::from_secs(3600)),
+        });
+        state
+            .restart_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let status = state.status(false, true);
+        assert!(!status.enabled);
+        assert!(status.supported, "advertised and supervised");
+        let last = status.last_requested_at.expect("lastRequestedAt set");
+        let next = status.next_eligible_at.expect("nextEligibleAt set");
+        assert!(last < next, "future eligibility is after the last request");
+        assert!(status.restart_pending);
+
+        let not_advertised = IdleUpdateState::new(false);
+        assert!(
+            !not_advertised.status(true, true).supported,
+            "supervised by an older sitter without the handshake"
+        );
     }
 
     /// `next_eligible_at` (published for `system.status`) is the later of

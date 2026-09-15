@@ -10,7 +10,7 @@ pub use intent_services::Services;
 
 pub use auth::{generate_token, get_or_create_token, AsyncTokenStore, FileTokenStore, TokenStore};
 pub use context::{is_tcp_connection, with_connection_context};
-pub use control::{FileWatchStatus, SystemControl, SystemStatus};
+pub use control::{FileWatchStatus, IdleUpdateCheckStatus, SystemControl, SystemStatus};
 pub use host_env::{
     detect_has_display, detect_host_environment, local_hostname, pretty_hostname, HostEnvironment,
 };

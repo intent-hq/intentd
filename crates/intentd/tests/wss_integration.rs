@@ -16114,6 +16114,8 @@ impl SystemControl for WatchHealthControl {
             fd_count: None,
             fd_limit: None,
             update_supported: false,
+            busy_agents: 0,
+            idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
         }
     }
     fn host_environment(&self) -> intent_transport::HostEnvironment {

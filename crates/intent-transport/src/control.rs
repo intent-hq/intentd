@@ -155,6 +155,35 @@ pub struct SystemStatus {
     /// `false` on platforms without unix signals, where
     /// `system.requestUpdate` is unsupported.
     pub update_supported: bool,
+    /// Agents with a turn in flight right now (`AgentManager::list_busy`),
+    /// the count the idle-update handshake gates on — distinct from
+    /// [`Self::agents`], which counts every live agent process.
+    pub busy_agents: usize,
+    /// Idle-triggered update check state (the daemon→sitter SIGUSR2
+    /// handshake). Always present on the wire.
+    pub idle_update_check: IdleUpdateCheckStatus,
+}
+
+/// The idle-triggered update check state for `system.status`: the daemon
+/// asks its supervising sitter for an idle-mode update check (SIGUSR2) while
+/// no turn is in flight, and exits for a staged update only once idle.
+/// Timestamps are RFC 3339 UTC strings, `None` (null on the wire) when unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdleUpdateCheckStatus {
+    /// `updates.checkOnIdle` is on.
+    pub enabled: bool,
+    /// Idle checks can actually be sent: the sitter advertised the handshake
+    /// at boot AND the daemon is currently sitter-supervised. Always `false`
+    /// on platforms without unix signals.
+    pub supported: bool,
+    /// When SIGUSR2 was last sent (or last failed to send).
+    pub last_requested_at: Option<String>,
+    /// Earliest time the interval rule allows another request; `None` while
+    /// the requester is disabled.
+    pub next_eligible_at: Option<String>,
+    /// The sitter staged a newer version: the daemon exits for the restart
+    /// at the next moment no turn is in flight.
+    pub restart_pending: bool,
 }
 
 /// Live file-watch coverage for `system.status` (intent-hq/intent#3708):
@@ -332,6 +361,14 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "prettyHostname": status.pretty_hostname,
         "protocolVersion": PROTOCOL_VERSION,
         "updateSupported": status.update_supported,
+        "busyAgents": status.busy_agents,
+        "idleUpdateCheck": {
+            "enabled": status.idle_update_check.enabled,
+            "supported": status.idle_update_check.supported,
+            "lastRequestedAt": status.idle_update_check.last_requested_at,
+            "nextEligibleAt": status.idle_update_check.next_eligible_at,
+            "restartPending": status.idle_update_check.restart_pending,
+        },
         "host": {
             "os": status.os,
             "arch": status.arch,
