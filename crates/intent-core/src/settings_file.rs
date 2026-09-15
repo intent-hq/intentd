@@ -41,12 +41,14 @@ use crate::config::{
     DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
     DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
     DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
-    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
-    DEFAULT_UPDATES_CHECK_ON_IDLE, DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
-    DEFAULT_UPDATES_IDLE_GRACE_SECONDS, DEFAULT_WAKE_RESUME_ENABLED,
-    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
-    DEFAULT_WORKSPACE_API_TOON_OUTPUT, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
-    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN, MAX_CONCURRENT_ADAPTERS_LIMIT,
+    DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST, DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE,
+    DEFAULT_SHARING_MAX_GUEST_CONNECTIONS, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, DEFAULT_UPDATES_CHECK_ON_IDLE,
+    DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, DEFAULT_UPDATES_IDLE_GRACE_SECONDS,
+    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
+    MAX_CONCURRENT_ADAPTERS_LIMIT, MAX_SHARING_MAX_GUESTS_PER_WORKSPACE,
     MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, MIN_UPDATES_IDLE_GRACE_SECONDS,
     TOOL_PAYLOAD_RETENTION_DAYS_MAX,
 };
@@ -66,6 +68,7 @@ pub struct SettingsFile {
     pub notifications: NotificationsSettings,
     pub rtk: RtkSettings,
     pub server: ServerSettings,
+    pub sharing: SharingSettings,
     pub source_control: SourceControlSettings,
     pub accounts: AccountsSettings,
     pub voice: VoiceSettings,
@@ -397,6 +400,34 @@ impl Default for ServerSettings {
             tunnel: TunnelSettings::default(),
             tls: TlsSettings::default(),
             auth: AuthSettings::default(),
+        }
+    }
+}
+
+/// `[sharing]` — guest (collaborator) caps (`sharing.*`). The membership cap
+/// is read live by the invite flow; the connection caps size the WSS
+/// listener's guest permits and apply on daemon restart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct SharingSettings {
+    /// `sharing.maxGuestsPerWorkspace` — guests one workspace admits besides
+    /// its owner: open invites count against it at mint time, collaborators
+    /// at join time (0–100; `0` closes every workspace to guests).
+    pub max_guests_per_workspace: u32,
+    /// `sharing.maxGuestConnections` — listener-wide cap on concurrent WSS
+    /// connections held by non-primary principals; `0` means unlimited.
+    pub max_guest_connections: u32,
+    /// `sharing.maxConnectionsPerGuest` — concurrent WSS connections one
+    /// guest principal may hold; `0` means unlimited.
+    pub max_connections_per_guest: u32,
+}
+
+impl Default for SharingSettings {
+    fn default() -> Self {
+        Self {
+            max_guests_per_workspace: DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE,
+            max_guest_connections: DEFAULT_SHARING_MAX_GUEST_CONNECTIONS,
+            max_connections_per_guest: DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST,
         }
     }
 }
@@ -1419,6 +1450,32 @@ impl SettingsFile {
                 &format!("must be between 0 and 100, got {terms}"),
             ));
         }
+        // Mirror the catalog bounds so a hand-edited config.toml cannot admit
+        // more guests (or size larger permit pools) than the `settings.update`
+        // RPC would allow (`0` = closed / unlimited respectively).
+        let guests = self.sharing.max_guests_per_workspace;
+        if guests > MAX_SHARING_MAX_GUESTS_PER_WORKSPACE {
+            return Err(bad(
+                "sharing.maxGuestsPerWorkspace",
+                &format!(
+                    "must be between 0 and {MAX_SHARING_MAX_GUESTS_PER_WORKSPACE}, got {guests}"
+                ),
+            ));
+        }
+        let guest_conns = self.sharing.max_guest_connections;
+        if guest_conns > 100_000 {
+            return Err(bad(
+                "sharing.maxGuestConnections",
+                &format!("must be 0 (unlimited) or between 1 and 100000, got {guest_conns}"),
+            ));
+        }
+        let per_guest = self.sharing.max_connections_per_guest;
+        if per_guest > 1_000 {
+            return Err(bad(
+                "sharing.maxConnectionsPerGuest",
+                &format!("must be 0 (unlimited) or between 1 and 1000, got {per_guest}"),
+            ));
+        }
         Ok(())
     }
 
@@ -1614,6 +1671,19 @@ enabled = false
 # Auth enabled -- require a bearer token on TCP. The bearer token itself is a
 # secret and lives in .secrets.json.
 enabled = true
+
+[sharing]
+# Max guests per workspace -- guests one workspace admits besides its owner;
+# open invites count at mint time, collaborators at join time (0-100, 0
+# closes every workspace to guests).
+maxGuestsPerWorkspace = 10
+# Max guest connections -- listener-wide cap on concurrent WSS connections
+# held by guests (the owner's credential is never counted; 0 = unlimited;
+# changes apply on daemon restart).
+maxGuestConnections = 40
+# Max connections per guest -- concurrent WSS connections one guest may hold
+# (0 = unlimited; changes apply on daemon restart).
+maxConnectionsPerGuest = 4
 
 [sourceControl]
 # Source-control provider -- active forge implementation: "github".
@@ -2792,6 +2862,62 @@ mod tests {
             SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 100000\n").is_ok(),
             "the upper bound itself is legal"
         );
+    }
+
+    #[test]
+    fn sharing_defaults_and_template_round_trip() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(parsed.sharing.max_guests_per_workspace, 10);
+        assert_eq!(parsed.sharing.max_guest_connections, 40);
+        assert_eq!(parsed.sharing.max_connections_per_guest, 4);
+        assert_eq!(parsed.sharing, SharingSettings::default());
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[sharing]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(templated.sharing, parsed.sharing);
+    }
+
+    #[test]
+    fn sharing_explicit_override_parses() {
+        let parsed = SettingsFile::parse_str(
+            "[sharing]\nmaxGuestsPerWorkspace = 0\nmaxGuestConnections = 0\nmaxConnectionsPerGuest = 1\n",
+        )
+        .expect("override parses");
+        assert_eq!(parsed.sharing.max_guests_per_workspace, 0);
+        assert_eq!(parsed.sharing.max_guest_connections, 0);
+        assert_eq!(parsed.sharing.max_connections_per_guest, 1);
+    }
+
+    /// The file path enforces the catalog bounds: `0..=100` on the membership
+    /// cap, `0..=100000` / `0..=1000` on the connection caps.
+    #[test]
+    fn sharing_out_of_range_is_rejected() {
+        let err = SettingsFile::parse_str("[sharing]\nmaxGuestsPerWorkspace = 101\n")
+            .expect_err("out-of-range value must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sharing.maxGuestsPerWorkspace") && msg.contains("101"),
+            "error names the offending key and value: {msg}"
+        );
+        assert!(
+            SettingsFile::parse_str("[sharing]\nmaxGuestsPerWorkspace = 100\n").is_ok(),
+            "the upper bound itself is legal"
+        );
+        assert!(SettingsFile::parse_str("[sharing]\nmaxGuestConnections = 100000\n").is_ok());
+        let err = SettingsFile::parse_str("[sharing]\nmaxGuestConnections = 100001\n")
+            .expect_err("over-ceiling listener cap is rejected");
+        assert!(err.to_string().contains("sharing.maxGuestConnections"));
+        assert!(SettingsFile::parse_str("[sharing]\nmaxConnectionsPerGuest = 1000\n").is_ok());
+        let err = SettingsFile::parse_str("[sharing]\nmaxConnectionsPerGuest = 1001\n")
+            .expect_err("over-ceiling per-guest cap is rejected");
+        assert!(err.to_string().contains("sharing.maxConnectionsPerGuest"));
+    }
+
+    #[test]
+    fn sharing_unknown_key_is_rejected() {
+        let err = SettingsFile::parse_str("[sharing]\nmaxGuests = 3\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("sharing"), "names the table: {msg}");
+        assert!(msg.contains("maxGuests"), "names the bad key: {msg}");
     }
 
     /// The `agents.memoryBudgetMb` parse matrix (monorepo#2063): an absent
