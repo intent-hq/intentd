@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.61] - 2026-09-16
+
+### 🚀 Features
+
+- Opportunistic idle-triggered intentd update restarts ([#1920](https://github.com/intent-hq/intentd/pull/1920))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump croner from 3.0.1 to 4.0.0 ([#1782](https://github.com/intent-hq/intentd/pull/1782))
+
+
 ## [0.9.60] - 2026-09-16
 
 ### 🐛 Bug Fixes
