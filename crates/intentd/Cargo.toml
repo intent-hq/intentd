@@ -87,6 +87,11 @@ nix = { workspace = true, features = ["signal", "process", "fs"] }
 # (termios); already in the workspace dependency tree via intent-core.
 libc = { workspace = true }
 
+[target."cfg(unix)".dev-dependencies]
+# Shared process-group child guard + release-file barrier for the e2e suites
+# that spawn the real daemon; never a runtime dependency.
+intentd-test-support = { path = "../intentd-test-support" }
+
 # Static musl release targets have no system OpenSSL; macOS has no system OpenSSL
 # headers/dylibs we can rely on either (Homebrew paths break on machines without it).
 # Build OpenSSL from source and link it statically so the libgit2/libssh2 chain

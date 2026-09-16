@@ -13,11 +13,11 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
+use intentd_test_support::{Barrier, GuardedChild};
+use nix::sys::signal::Signal;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedReadHalf;
@@ -31,7 +31,8 @@ const RESTART_FOR_UPDATE_EXIT_CODE: i32 = 75;
 const SITTER_IDLE_RESTART_ENV: &str = "INTENTD_SITTER_IDLE_RESTART";
 
 /// Env var (inherited by the daemon, hence by the fake tailcat it spawns)
-/// naming the per-test release file the held fake `genkey` blocks on.
+/// naming the per-test release file ([`Barrier::path`]) the held fake
+/// `genkey` blocks on.
 const FAKE_TAILCAT_RELEASE_ENV: &str = "FAKE_TAILCAT_RELEASE";
 
 /// Fixed WSS bearer token (test-only `INTENTD_AUTH_TOKEN` seam) for the
@@ -39,24 +40,16 @@ const FAKE_TAILCAT_RELEASE_ENV: &str = "FAKE_TAILCAT_RELEASE";
 /// be enabled at runtime.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
+/// The daemon under test; `child` kills the whole process group (daemon plus
+/// any parked fake sidecar) on drop, including on a mid-test panic.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     log_path: PathBuf,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = signal::killpg(
-            Pid::from_raw(self.child.id().cast_signed()),
-            Signal::SIGKILL,
-        );
-        let _ = self.child.wait();
-    }
 }
 
 impl Daemon {
     fn signal(&self, sig: Signal) {
-        signal::kill(Pid::from_raw(self.child.id().cast_signed()), sig).expect("signal daemon");
+        self.child.signal(sig).expect("signal daemon");
     }
 
     fn log(&self) -> String {
@@ -120,7 +113,6 @@ async fn launch_daemon_with(
     advertised: bool,
     extra_env: &[(&str, &str)],
 ) -> (Daemon, PathBuf) {
-    use std::os::unix::process::CommandExt;
     let log_path = data_dir.join("daemon.log");
     let log = std::fs::File::create(&log_path).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
@@ -143,8 +135,7 @@ async fn launch_daemon_with(
     for (k, v) in extra_env {
         command.env(k, v);
     }
-    command.process_group(0);
-    let child = command.spawn().expect("spawn intentd serve");
+    let child = GuardedChild::spawn(&mut command).expect("spawn intentd serve");
     let mut daemon = Daemon { child, log_path };
     let socket = data_dir.join("intentd.sock");
     common::await_daemon_listening(&mut daemon.child, &socket, &daemon.log_path).await;
@@ -153,9 +144,11 @@ async fn launch_daemon_with(
 
 /// Write the HELD fake tailcat into `dir`: `genkey` touches
 /// `<release>.entered` (proof the daemon's tunnel mutex is now held across
-/// the blocked `ensure_key`), blocks until the release file named by
-/// [`FAKE_TAILCAT_RELEASE_ENV`] exists, then writes the key; `serve` behaves
-/// like the other fake tailcats (prints the JSON address, sleeps).
+/// the blocked `ensure_key`; see [`Barrier::entered`]), blocks until the
+/// release file named by [`FAKE_TAILCAT_RELEASE_ENV`] exists (the same wait
+/// loop as [`Barrier::sh_wait`], reading the path from the environment), then
+/// writes the key; `serve` behaves like the other fake tailcats (prints the
+/// JSON address, sleeps).
 fn write_held_fake_tailcat(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("fake-tailcat-held.sh");
@@ -187,31 +180,15 @@ esac
     path
 }
 
-/// Releases the held fake `genkey` barrier on drop (including on panic /
-/// early return) so no daemon is left parked in teardown behind it.
-struct ReleaseOnDrop(PathBuf);
-
-impl ReleaseOnDrop {
-    fn release(&self) {
-        std::fs::write(&self.0, b"").expect("touch fake tailcat release file");
-    }
-}
-
-impl Drop for ReleaseOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::write(&self.0, b"");
-    }
-}
-
-/// Poll for `path` to exist within `budget`; panics (with the daemon log)
-/// if it never appears.
-async fn wait_for_file(path: &Path, budget: Duration, daemon: &Daemon) {
+/// Poll for the fake `genkey` to reach `barrier` within `budget`; panics
+/// (with the daemon log) if it never does.
+async fn wait_for_entered(barrier: &Barrier, budget: Duration, daemon: &Daemon) {
     let deadline = tokio::time::Instant::now() + budget;
-    while !path.exists() {
+    while !barrier.entered() {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "{} never appeared\n--- daemon log ---\n{}",
-            path.display(),
+            "fake tailcat genkey never reached {}\n--- daemon log ---\n{}",
+            barrier.path().display(),
             daemon.log()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -239,12 +216,13 @@ async fn sigusr2_during_held_teardown(trigger: StopTrigger) {
     let data_dir_guard = common::test_tempdir("itd-sr-");
     let data_dir = data_dir_guard.path();
     let tailcat = write_held_fake_tailcat(data_dir);
-    let release_path = data_dir.join("genkey.release");
-    let entered_path = data_dir.join("genkey.release.entered");
-    let release = ReleaseOnDrop(release_path.clone());
+    // Declared before `daemon` so the daemon (and the fake `genkey` parked in
+    // its process group) is torn down first on drop; nothing is left waiting
+    // on the barrier after a panic.
+    let barrier = Barrier::new(data_dir, "genkey");
     common::enable_ws_api(data_dir);
     let tailcat_s = tailcat.to_string_lossy().to_string();
-    let release_s = release_path.to_string_lossy().to_string();
+    let release_s = barrier.path().to_string_lossy().to_string();
     // `common::serve_command` binds an OS-assigned port, overriding the fixed
     // port `enable_ws_api` reserved and released, so a concurrent test cannot
     // claim it first. Nothing here needs the actual port number.
@@ -269,7 +247,7 @@ async fn sigusr2_during_held_teardown(trigger: StopTrigger) {
             json!({ "changes": [{ "path": "server.tunnel.enabled", "value": true }] }),
         )
         .await;
-    wait_for_file(&entered_path, exit_budget(), &daemon).await;
+    wait_for_entered(&barrier, exit_budget(), &daemon).await;
 
     match trigger {
         StopTrigger::Sigterm => daemon.signal(Signal::SIGTERM),
@@ -302,7 +280,7 @@ async fn sigusr2_during_held_teardown(trigger: StopTrigger) {
     let log = daemon.log();
     assert!(!log.contains("staged update restart accepted"), "{log}");
 
-    release.release();
+    barrier.release();
     let status = daemon.wait_exit(exit_budget()).await.unwrap_or_else(|| {
         panic!(
             "daemon did not exit after the barrier was released\n--- daemon log ---\n{}",
