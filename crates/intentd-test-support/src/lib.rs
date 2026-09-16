@@ -5,8 +5,10 @@
 //! sitter, or fake sidecar used to hand-roll privately:
 //!
 //! - [`GuardedChild`] (unix only): a [`std::process::Child`] spawned as the
-//!   leader of its own process group and torn down — the whole group, with
-//!   `SIGKILL` — if it is dropped while still running. A test that panics
+//!   leader of its own process group and torn down — the whole group and
+//!   then the child pid itself, with `SIGKILL` — if it is dropped while
+//!   still running (the pid kill covers a child that moved to another group,
+//!   whose empty group `killpg` can no longer reach). A test that panics
 //!   halfway through would otherwise drop a plain `Child` (no kill on drop)
 //!   and leave the process, plus anything it spawned, behind forever. Use it
 //!   for every long-lived process a test owns; call [`GuardedChild::disarm`]

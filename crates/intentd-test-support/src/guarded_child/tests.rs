@@ -1,4 +1,5 @@
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -6,8 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
-use nix::sys::signal::kill;
-use nix::unistd::Pid;
+use nix::sys::signal::{kill, killpg};
+use nix::unistd::{getpgid, getpgrp, setpgid, Pid};
 
 use super::GuardedChild;
 use crate::Barrier;
@@ -107,6 +108,42 @@ fn disarm_leaves_child_running() {
     child.kill().unwrap();
     child.wait().unwrap();
     wait_until("manually killed child to be gone", || !alive(pid));
+}
+
+#[test]
+fn drop_kills_child_that_left_its_group() {
+    // The child joins the test's own group after `spawn` made it a leader
+    // (`process_group(0)` runs before `pre_exec`), so its original group is
+    // empty and `killpg(pid, SIGKILL)` fails with ESRCH — the reviewer's
+    // repro for intentd#1928, where Drop then blocked in `wait()`.
+    let target = getpgrp();
+    let mut cmd = detached("sleep");
+    cmd.arg("60");
+    // SAFETY: `setpgid` is async-signal-safe and touches no locks or heap
+    // state, so it is safe to call between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || setpgid(Pid::from_raw(0), target).map_err(io::Error::from));
+    }
+    let guard = GuardedChild::spawn(&mut cmd).unwrap();
+    let pid = guard.id();
+    let nix_pid = Pid::from_raw(pid.cast_signed());
+    assert_eq!(
+        getpgid(Some(nix_pid)).unwrap(),
+        target,
+        "child must have joined our group"
+    );
+    assert_eq!(
+        killpg(nix_pid, None),
+        Err(Errno::ESRCH),
+        "the child's original group must be empty"
+    );
+
+    let dropping = thread::spawn(move || drop(guard));
+    wait_until("drop to return after the group kill failed", || {
+        dropping.is_finished()
+    });
+    dropping.join().unwrap();
+    assert!(!alive(pid), "child must be dead once drop returned");
 }
 
 #[test]

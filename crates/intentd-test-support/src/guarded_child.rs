@@ -17,7 +17,9 @@ use nix::unistd::Pid;
 /// helpers (`id()`, `try_wait()`, `kill()`, the stdio handles, ...).
 ///
 /// Drop signals only while `try_wait()` still reports the child as running;
-/// see the crate docs for the reaped-pid caveat.
+/// see the crate docs for the reaped-pid caveat. It kills the group and then
+/// the child pid itself, so a child that left its group (`setpgid`) still
+/// dies instead of parking `Drop` in `wait()` behind a failed `killpg`.
 pub struct GuardedChild {
     /// `None` only once [`GuardedChild::disarm`] has moved the child out,
     /// which leaves `Drop` nothing to tear down; every other path sees `Some`.
@@ -117,8 +119,13 @@ impl Drop for GuardedChild {
         // group (and cannot have been reused); a reaped child is the test's
         // own business.
         if matches!(child.try_wait(), Ok(None)) {
-            let pgid = Pid::from_raw(child.id().cast_signed());
-            let _ = killpg(pgid, Signal::SIGKILL);
+            let pid = Pid::from_raw(child.id().cast_signed());
+            // A leader may have joined another group (`setpgid`), leaving its
+            // own group empty: `killpg` then fails (ESRCH) and `wait()` would
+            // block on a live child. The unreaped pid is still ours to signal,
+            // so kill it directly as well; the errors carry nothing to act on.
+            let _ = killpg(pid, Signal::SIGKILL);
+            let _ = kill(pid, Signal::SIGKILL);
             let _ = child.wait();
         }
     }
