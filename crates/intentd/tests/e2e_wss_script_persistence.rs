@@ -40,13 +40,11 @@ fn spawn_serve(data_dir: &Path) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .spawn()

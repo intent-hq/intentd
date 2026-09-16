@@ -8,7 +8,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,9 +52,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -234,9 +233,8 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     // default resolves (the frontmatter model no longer carries a provider).
     common::seed_default_provider(&data_dir);
 
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
     ];
     let daemon = Daemon {
@@ -312,9 +310,8 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
     };
 
     // Hermetic empty user tier: HOME=data_dir with no specialists written.
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
     ];
     let daemon = Daemon {
@@ -431,9 +428,8 @@ async fn specialist_hidden_round_trips_over_wss() {
     )
     .expect("write visible specialist");
 
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
     ];
     let daemon = Daemon {
@@ -491,9 +487,8 @@ async fn embedded_bundled_catalog_over_wss() {
     let socket = data_dir.join("intentd.sock");
 
     // Hermetic empty user tier: HOME=data_dir with no specialists written.
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
     ];
     let daemon = Daemon {
@@ -604,9 +599,8 @@ async fn specialists_replacement_dir_over_wss() {
         .to_str()
         .expect("replacement dir to str")
         .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
         ("INTENTD_SPECIALISTS_DIR", &replacement_dir_str),
     ];
@@ -716,9 +710,8 @@ async fn specialist_config_scalars_inherit_over_wss() {
         .to_str()
         .expect("bundled dir to str")
         .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
         ("INTENTD_BUNDLED_SPECIALISTS_DIR", &bundled_dir_str),
     ];
@@ -868,9 +861,8 @@ async fn specialist_model_options_round_trip_over_wss() {
         .to_str()
         .expect("bundled dir to str")
         .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
         ("INTENTD_BUNDLED_SPECIALISTS_DIR", &bundled_dir_str),
     ];
@@ -1010,9 +1002,8 @@ async fn specialist_picker_metadata_round_trips_over_wss() {
         .to_str()
         .expect("bundled dir to str")
         .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", data_dir.to_str().expect("data_dir to str")),
         ("INTENTD_BUNDLED_SPECIALISTS_DIR", &bundled_dir_str),
     ];

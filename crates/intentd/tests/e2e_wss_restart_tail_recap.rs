@@ -26,7 +26,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -230,12 +230,10 @@ fn spawn_daemon(
     // the explicit `agent.resolveInterrupted` call (the `auto` default resumes
     // on headless hosts, which would race the assertions below).
     common::disable_resume_on_start(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("MOCK_AGENT_SCRIPT_PATH", script)
         .env("MOCK_AGENT_BEHAVIOR", behavior.to_string())
         .env("MOCK_AGENT_PROMPT_LOG", prompt_log)

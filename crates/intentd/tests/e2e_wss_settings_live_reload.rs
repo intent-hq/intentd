@@ -25,7 +25,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,7 +78,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    let mut cmd = common::serve_command();
     // Guarantee the config-watcher readiness marker (INFO, target `intentd`)
     // reaches daemon.log even when the caller's RUST_LOG is stricter (e.g.
     // `warn`): append a crate-scoped directive, which EnvFilter resolves in
@@ -88,8 +88,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         Ok(v) if !v.is_empty() => format!("{v},intentd=info"),
         _ => "info".to_string(),
     };
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("RUST_LOG", rust_log)
@@ -358,7 +357,7 @@ async fn config_watcher_readiness_marker_waits_for_a_live_watch() {
 /// `system.status` over UDS, and return (daemon, rpc conn, subscriber conn)
 /// with the subscriber already subscribed to `settings:changed`.
 async fn boot_with_wss(data_dir: &Path) -> (Daemon, Wss, Wss) {
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(data_dir, "both", &env);
     let daemon = Daemon {
         child,

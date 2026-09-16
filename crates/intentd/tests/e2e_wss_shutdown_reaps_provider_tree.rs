@@ -295,12 +295,10 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
     let pid_file = data_dir.join("tree-pids.json");
     let behavior = json!({ "blockUntilCancel": true }).to_string();
     common::enable_ws_api(&data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("MOCK_AGENT_SCRIPT_PATH", &script)
         .env("MOCK_AGENT_BEHAVIOR", &behavior)
         .env("MOCK_AGENT_TREE_PID_FILE", &pid_file)

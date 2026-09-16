@@ -13,7 +13,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,9 +49,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -181,7 +180,7 @@ async fn connect_ws(
 async fn boot(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, u16, Arc<ClientConfig>, PathBuf) {
     let data_dir_guard = common::test_tempdir_in("/tmp", &format!("{prefix}-"));
     let data_dir = data_dir_guard.path().to_path_buf();
-    let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN)];
     env.extend_from_slice(envs);
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {

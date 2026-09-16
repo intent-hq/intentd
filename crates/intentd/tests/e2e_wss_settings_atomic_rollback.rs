@@ -21,7 +21,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,9 +67,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -227,7 +226,7 @@ where
 async fn mixed_batch_rollback_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     // Start daemon with both UDS and TCP (server.wsApi.enabled=true in config.toml)
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -343,7 +342,7 @@ async fn mixed_batch_rollback_over_wss() {
 async fn retired_workspace_overrides_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -434,7 +433,7 @@ async fn retired_workspace_overrides_over_wss() {
 async fn agent_features_token_impact_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -578,7 +577,7 @@ async fn provider_switch_reresolves_default_model_over_wss() {
         .expect("serialize seeded cache"),
     )
     .expect("seed models-cache.json");
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -716,7 +715,7 @@ async fn provider_switch_reresolves_default_model_over_wss() {
 async fn workspace_api_settings_round_trip_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -882,7 +881,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
 async fn model_default_reasoning_effort_round_trips_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -986,7 +985,7 @@ async fn model_default_reasoning_effort_round_trips_over_wss() {
 async fn agents_resume_interrupted_on_start_round_trips_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -1098,7 +1097,7 @@ async fn agent_memory_knobs_over_wss() {
     const PARSE_BOUND_MB: f64 = 1_024_000.0;
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -1250,9 +1249,8 @@ async fn redaction_placeholder_round_trip_keeps_secret_over_wss() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_file_str = secrets_file.to_string_lossy().into_owned();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_SECRETS_FILE", &secrets_file_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -1399,9 +1397,8 @@ async fn redaction_placeholder_without_secret_rejects_batch_over_wss() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_file_str = secrets_file.to_string_lossy().into_owned();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_SECRETS_FILE", &secrets_file_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);

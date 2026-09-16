@@ -26,7 +26,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,9 +70,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -377,9 +376,8 @@ async fn first_turn_prepend_delivers_system_prompt_over_wss() {
     let prompt_log = data_dir.join("prompt-log.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok" }).to_string();
-    let env: [(&str, &str); 6] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
@@ -544,9 +542,8 @@ async fn specialist_prompt_frozen_across_file_edit_over_wss() {
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok" }).to_string();
     let home = data_dir.to_string_lossy().into_owned();
-    let env: [(&str, &str); 6] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
