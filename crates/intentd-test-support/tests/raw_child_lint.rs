@@ -17,8 +17,12 @@
 //! - A hit is the whole identifier token `Child` — optionally written as the
 //!   path `process::Child` or `std::process::Child` — in a type position:
 //!   immediately after `->` (return type), after a single `:` (field, binding,
-//!   or parameter type), or as a generic argument (after `<`, or after a `,`
-//!   whose enclosing bracket is `<`: `Option<Child>`, `Result<E, Child>`).
+//!   or parameter type), as a generic argument (after `<`, or after a `,`
+//!   whose enclosing bracket is `<`: `Option<Child>`, `Result<E, Child>`), or
+//!   as a tuple element (after `(`, or after a `,` whose enclosing bracket is
+//!   `(`: `-> (Child, u16)`, `struct LiveProcess(Child)`, `Vec<(u16, Child)>`).
+//!   `std::process::Child` has no public constructor, so it never appears as a
+//!   value inside a call's parentheses — a bare `Child` there is always a type.
 //!   `GuardedChild` and other identifiers merely ending in `Child` are not
 //!   hits, nor is any other path such as `Kind::Child` or `portable_pty::Child`.
 //!   Borrows (`&Child`, `&mut Child`) are not hits: the token is preceded by
@@ -47,6 +51,8 @@ use std::path::{Component, Path, PathBuf};
 /// `intentd_test_support::GuardedChild`, then delete its entry here; the
 /// lint fails while an entry has no hits, so the list can only shrink.
 const BASELINE: &[&str] = &[
+    "crates/intentd-sitter/tests/install_ps1_owner.rs",
+    "crates/intentd-sitter/tests/install_sh_startup.rs",
     "crates/intentd-sitter/tests/sitter_update_e2e.rs",
     "crates/intentd/tests/common/mod.rs",
     "crates/intentd/tests/e2e_agent_features_gating.rs",
@@ -458,8 +464,8 @@ fn is_type_position(chars: &[char], start: usize) -> bool {
     match chars[k] {
         '>' => k > 0 && chars[k - 1] == '-',
         ':' => k == 0 || chars[k - 1] != ':',
-        '<' => true,
-        ',' => enclosing_open_bracket(chars, k) == Some('<'),
+        '<' | '(' => true,
+        ',' => matches!(enclosing_open_bracket(chars, k), Some('<' | '(')),
         _ => false,
     }
 }
@@ -648,10 +654,19 @@ mod heuristic {
 
     #[test]
     fn generic_arguments_hit() {
-        let src = "struct S { a: Option<Child>, b: Mutex<Option<Child>>, c: Result<E, Child> }\n\
-                   fn f() -> (Child, u16) { todo!() }\n\
-                   fn g() -> Vec<(u16, Child)> { todo!() }\n";
+        let src = "struct S { a: Option<Child>, b: Mutex<Option<Child>>, c: Result<E, Child> }\n";
         assert_eq!(hit_lines(src), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn tuple_positions_hit() {
+        let src = "fn f() -> (Child, u16) { todo!() }\n\
+                   fn g() -> Vec<(u16, Child)> { todo!() }\n\
+                   struct LiveProcess(Child);\n\
+                   fn h() -> (u16, std::process::Child, Arc<C>) { todo!() }\n\
+                   let x: (Child, u16) = todo!();\n\
+                   fn k() -> (u16, &Child) { todo!() }\n";
+        assert_eq!(hit_lines(src), vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
