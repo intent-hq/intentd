@@ -1,0 +1,22 @@
+[package]
+name = "intentd-test-support"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Workspace-internal test support for the intentd e2e suites (process-group child guard + release-file barrier); never published"
+# Reachable only as a dev-dependency of the e2e suites; never a runtime dep
+# and never on crates.io.
+publish = false
+
+[dependencies]
+
+[target."cfg(unix)".dependencies]
+nix = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
