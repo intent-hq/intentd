@@ -5022,11 +5022,11 @@ impl SystemControl for BusyDaemonControl {
 /// reporting activity a guest is not a member of (connected clients, live and
 /// busy agents, process / disk / watcher telemetry — [`BusyDaemonControl`]),
 /// the collaborator's result over WSS carries exactly the boot / routing /
-/// host-identity fields (`running`, `listenMode`, `transports`, `port`,
-/// `version`, `buildCommit`, `protocolVersion`, `fingerprint`, `localIps`,
-/// `tcAddress`, `hostname`, `prettyHostname`, `host.{os, arch, locality,
-/// deviceKind, hardwareModel}`) with the administrator's values, and none of
-/// the counts or telemetry; the administrator's own `system.status` on the
+/// host-identity fields (`running`, `listenMode`, `port`, `version`,
+/// `buildCommit`, `protocolVersion`, `fingerprint`, `localIps`, `tcAddress`,
+/// `hostname`, `prettyHostname`, `host.{os, arch, locality, deviceKind,
+/// hardwareModel}`) with the administrator's values, and none of the counts,
+/// telemetry or `transports`; the administrator's own `system.status` on the
 /// same daemon still returns them all. `system.shutdown` and
 /// `system.requestUpdate` stay refused (-32003) for the collaborator even
 /// though the control surface would serve them.
@@ -5118,7 +5118,6 @@ async fn wss_collaborator_system_status_is_projected_to_guest_safe_fields() {
             "protocolVersion",
             "running",
             "tcAddress",
-            "transports",
             "version",
         ],
         "collaborator system.status keys: {guest_status}"
@@ -5141,7 +5140,6 @@ async fn wss_collaborator_system_status_is_projected_to_guest_safe_fields() {
     for key in [
         "running",
         "listenMode",
-        "transports",
         "port",
         "version",
         "buildCommit",
@@ -5154,6 +5152,10 @@ async fn wss_collaborator_system_status_is_projected_to_guest_safe_fields() {
     ] {
         assert_eq!(projected[key], full[key], "{key}: {guest_status}");
     }
+    assert!(
+        full.get("transports").is_some(),
+        "administrator snapshot carries transports: {full}"
+    );
     assert_eq!(
         projected["host"],
         json!({
