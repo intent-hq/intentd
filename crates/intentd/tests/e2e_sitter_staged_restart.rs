@@ -246,8 +246,12 @@ async fn sigusr2_during_held_teardown(trigger: StopTrigger) {
     common::enable_ws_api(data_dir);
     let tailcat_s = tailcat.to_string_lossy().to_string();
     let release_s = release_path.to_string_lossy().to_string();
-    let env: [(&str, &str); 3] = [
+    // `INTENTD_TCP_PORT=0` binds an OS-assigned port, overriding the fixed
+    // port `enable_ws_api` reserved and released, so a concurrent test cannot
+    // claim it first. Nothing here needs the actual port number.
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_TAILCAT_BIN", &tailcat_s),
         (FAKE_TAILCAT_RELEASE_ENV, &release_s),
     ];
