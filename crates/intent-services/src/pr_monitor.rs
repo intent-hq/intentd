@@ -739,14 +739,17 @@ impl PrMonitorRefusal {
             format!(
                 "{label} is already monitored in this workspace by your sub-agent \
                  {owner_display}, which is still working; one monitor per PR per \
-                 workspace. That agent receives the PR's wakes. Instead of registering \
-                 a second monitor, use ws.agent.send to ask it either to relay the \
-                 events you care about to you, or to relinquish the monitor via \
-                 ws.pr.unmonitor so you can register your own; for a one-shot read of \
-                 the PR's current state use ws.pr.snapshot. Once the sub-agent settles \
-                 — its task is complete or cancelled, or it is idle with nothing \
-                 pending but this monitor — your ws.pr.monitor call adopts the monitor \
-                 instead of being refused (the sub-agent is notified of the transfer)."
+                 workspace. A working sub-agent keeps its monitor and receives the \
+                 PR's wakes; do not register a second one. Retry ws.pr.monitor once \
+                 the sub-agent settles — its task is complete or cancelled, or it is \
+                 idle with nothing pending but this monitor (a ws.agent.watch on it \
+                 delivers that as its monitoring-idle advisory): the retry adopts the \
+                 monitor instead of being refused and the sub-agent is notified of the \
+                 transfer. For a one-shot read of the PR's current state use \
+                 ws.pr.snapshot. Only if you need the monitor now, use ws.agent.send \
+                 to ask the sub-agent to relay the events you care about or, as a last \
+                 resort, to relinquish the monitor via ws.pr.unmonitor so you can \
+                 register your own."
             )
         } else {
             format!(
@@ -1340,7 +1343,32 @@ impl Services {
             None => None,
         };
         if monitor.is_none() {
-            if let Some(o) = orphan.take() {
+            let mut adoptable = orphan.take();
+            if transferred_from.is_some() {
+                // The settled-child verdict predates the forge fetch, and
+                // a child that picked up work meanwhile (a queued message,
+                // a new turn, a fresh hook) never touches the monitor row,
+                // so the adoption CAS below cannot see it: re-evaluate the
+                // holder at the write. Only the CAS itself remains as a
+                // window between this check and the re-parenting.
+                adoptable = None;
+                transferred_from = None;
+                match self
+                    .pr_monitor_holder(workspace_id, agent_id, repo_owner, repo_name, pr_number)
+                    .await?
+                {
+                    Some(PrMonitorHolder::Live(refusal)) => {
+                        return Ok(PrMonitorRegistration::Refused(refusal));
+                    }
+                    Some(PrMonitorHolder::Orphaned(o)) => adoptable = Some(o),
+                    Some(PrMonitorHolder::SettledChild(o)) => {
+                        transferred_from = Some(o.clone());
+                        adoptable = Some(o);
+                    }
+                    None => {}
+                }
+            }
+            if let Some(o) = adoptable {
                 let from = o.agent_id.clone();
                 monitor = self
                     .adopt_pr_monitor(o, agent_id, baseline.clone(), &now)
@@ -1505,7 +1533,11 @@ impl Services {
     /// so uncertainty must never adopt — including the pending-question
     /// read, which the shared helper's convenience API collapses to "none
     /// pending" and is therefore probed here first in its propagating form
-    /// ([`Services::try_pending_question_count`]).
+    /// ([`Services::try_pending_question_count`]). Registration evaluates
+    /// it twice: at the pre-fetch precheck (so a still-working child's
+    /// refusal costs no forge request) and again immediately before the
+    /// adoption write, since none of those waiting reasons touch the
+    /// monitor row the CAS guards; the window left is the CAS itself.
     async fn pr_monitor_child_settled(&self, child: &intent_core::AgentSession) -> bool {
         if let Some(task_note_id) = child.task_note_id.as_ref() {
             match self.store.get_note(&child.workspace_id, task_note_id).await {
@@ -5005,7 +5037,23 @@ mod tests {
             instruction.contains("its task is complete or cancelled, or it is idle with nothing pending but this monitor"),
             "{instruction}"
         );
-        assert!(instruction.contains("ws.pr.unmonitor"), "{instruction}");
+        // Contract first (keep + retry), relinquish only as the explicit
+        // "need it now" fallback.
+        assert!(
+            instruction.contains("A working sub-agent keeps its monitor"),
+            "{instruction}"
+        );
+        let retry_at = instruction.find("Retry ws.pr.monitor").expect("retry");
+        let fallback_at = instruction
+            .find("Only if you need the monitor now")
+            .expect("fallback");
+        let relinquish_at = instruction
+            .find("relinquish the monitor via ws.pr.unmonitor")
+            .expect("relinquish");
+        assert!(
+            retry_at < fallback_at && fallback_at < relinquish_at,
+            "{instruction}"
+        );
         let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
         assert_eq!(row.agent_id, child, "not re-parented");
         assert!(
@@ -5090,6 +5138,61 @@ mod tests {
                 .contains("sub-agent"),
             "{refused}"
         );
+    }
+
+    /// The settled-child verdict is re-evaluated at the adoption write, not
+    /// only at the pre-fetch precheck: a child that goes busy DURING the
+    /// parent's forge fetch (a new turn, which never touches the monitor
+    /// row the adoption CAS guards) is refused after the fetch, keeps its
+    /// monitor, and receives no transfer notice.
+    #[tokio::test]
+    async fn a_child_that_resumes_work_during_the_parents_fetch_keeps_its_monitor() {
+        let (_db, _root, svc, forge, ws, parent) = setup().await;
+        let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::RuntimeIdle).await;
+        let first = register(&svc, &ws, &child).await;
+        let fetches_before = forge.fetches();
+
+        // Settled at precheck; the child starts a turn while `get_pr` runs.
+        let svc_in_fetch = svc.clone();
+        let child_in_fetch = child.clone();
+        forge.set_on_get_pr(Some(Box::new(move |_| {
+            svc_in_fetch.set_test_busy(&child_in_fetch, true);
+        })));
+        let refused = svc
+            .pr_monitor_start_op(&ws, &parent, 42, None)
+            .await
+            .expect("a refusal is a payload, not an error");
+        forge.set_on_get_pr(None);
+        assert_eq!(
+            forge.fetches(),
+            fetches_before + 1,
+            "the precheck saw a settled child, so the fetch ran"
+        );
+        assert_eq!(refused["ok"], json!(false), "{refused}");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(refused["reason"], json!("already-monitored"), "{refused}");
+        assert_eq!(refused["ownerAgentId"], json!(child.to_string()));
+        assert_eq!(refused["monitorId"], json!(first.monitor_id));
+        assert!(
+            refused["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("still working"),
+            "{refused}"
+        );
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(row.agent_id, child, "not re-parented");
+        assert_eq!(row.state, PrMonitorState::Active);
+        assert!(
+            !owner_messages(&svc, &child)
+                .await
+                .contains("pr_monitor_wake"),
+            "no transfer notice without a transfer"
+        );
+
+        // Once the child is idle again the same call adopts.
+        svc.set_test_busy(&child, false);
+        assert_parent_takeover(&svc, &ws, &parent, &child, &first).await;
     }
 
     /// Store probes on the takeover path fail CLOSED: an idle child whose
