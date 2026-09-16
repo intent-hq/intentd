@@ -47,7 +47,10 @@
 //! mergeability — is unchanged since the last full fetch, bounded by
 //! [`PR_MONITOR_MAX_CHEAP_POLLS`] and [`PR_MONITOR_MAX_CHEAP_AGE`] so
 //! signals the fingerprint does not cover (check runs, merge-queue events)
-//! are still re-read regularly ([`PrMonitorFetchCache`]).
+//! are still re-read regularly ([`PrMonitorFetchCache`]). A forge that
+//! reports no `updatedAt` gets no cheap polls at all: without it the
+//! fingerprint is blind to the comment / review / thread movement the
+//! monitor exists to report.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -410,6 +413,15 @@ impl PrFingerprint {
             mergeable_state: pr.mergeable_state.clone(),
         }
     }
+
+    /// Whether this fingerprint can stand in for the sub-reads at all. The
+    /// head SHA, lifecycle flags and mergeability verdict do not move on a
+    /// comment, review or thread — only `updatedAt` does — so a forge that
+    /// does not report `updatedAt` leaves the fingerprint blind to exactly
+    /// the movement the monitor reports on, and no poll may be cheap for it.
+    fn detects_changes(&self) -> bool {
+        !self.updated_at.is_empty()
+    }
 }
 
 /// Consecutive fingerprint-unchanged polls that may reuse one full fetch
@@ -435,10 +447,12 @@ pub(crate) struct PrMonitorFetchCacheEntry {
 
 impl PrMonitorFetchCacheEntry {
     /// Whether a poll that just read `fingerprint` at `now` may reuse this
-    /// entry's sub-fetches: same fingerprint, a complete snapshot, and both
-    /// the poll-count and age bounds still open.
+    /// entry's sub-fetches: a fingerprint that can detect changes at all
+    /// ([`PrFingerprint::detects_changes`]) and is unchanged, a complete
+    /// snapshot, and both the poll-count and age bounds still open.
     fn reusable(&self, fingerprint: &PrFingerprint, now: Instant) -> bool {
-        self.fingerprint == *fingerprint
+        fingerprint.detects_changes()
+            && self.fingerprint == *fingerprint
             && self.snapshot.is_complete()
             && self.cheap_polls < PR_MONITOR_MAX_CHEAP_POLLS
             && now.saturating_duration_since(self.fetched_at) < PR_MONITOR_MAX_CHEAP_AGE
@@ -541,7 +555,7 @@ pub(crate) async fn fetch_shared_snapshot_cached(
         return Ok(snapshot);
     }
     let snapshot = fetch_shared_snapshot_for(sc, repo_ref, number, pr).await?;
-    {
+    if fingerprint.detects_changes() {
         let mut cache = cache.lock().unwrap();
         let slot = cache.entry(key.clone()).or_default();
         if slot.generation == generation {
@@ -5830,6 +5844,44 @@ mod tests {
             forge.sub_fetches("list_comments") - before,
             1,
             "the degraded comment read is retried, not carried forward"
+        );
+    }
+
+    /// A forge that reports no `updatedAt` never gets a cheap poll: the
+    /// remaining fingerprint fields do not move on a comment, so reusing the
+    /// sub-reads would hide it. Every poll re-issues the sub-reads and a
+    /// quiet comment bump surfaces on the very next one (regression:
+    /// intent-hq/intentd#1923 merge-queue ejection — the WSS e2e forge
+    /// serves an empty `updated_at`).
+    #[tokio::test]
+    async fn a_forge_without_updated_at_never_gets_a_cheap_poll() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        forge.edit(|s| s.updated_at = Some(String::new()));
+        let monitor = register(&svc, &ws, &owner).await;
+        svc.poll_pr_monitors().await;
+
+        let subs_before = sub_fetch_totals(&forge);
+        svc.poll_pr_monitors().await;
+        for ((method, before), (_, after)) in subs_before.iter().zip(sub_fetch_totals(&forge)) {
+            assert_eq!(
+                after - before,
+                1,
+                "{method}: re-fetched although the fingerprint is unchanged"
+            );
+        }
+
+        forge.edit_quiet(|s| s.conversation_comments = 1);
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.pending_changes,
+            vec!["+1 conversation comment (1 total)".to_string()],
+            "the quiet comment surfaced on the next poll"
         );
     }
 
