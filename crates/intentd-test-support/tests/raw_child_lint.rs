@@ -15,14 +15,19 @@
 //! - Comments and string / char literals are blanked first, so a `Child` in a
 //!   doc comment or a fixture string never counts.
 //! - A hit is the whole identifier token `Child` — optionally written as the
-//!   path `process::Child` or `std::process::Child` — in a type position:
-//!   immediately after `->` (return type), after a single `:` (field, binding,
-//!   or parameter type), as a generic argument (after `<`, or after a `,`
-//!   whose enclosing bracket is `<`: `Option<Child>`, `Result<E, Child>`), or
-//!   as a tuple element (after `(`, or after a `,` whose enclosing bracket is
-//!   `(`: `-> (Child, u16)`, `struct LiveProcess(Child)`, `Vec<(u16, Child)>`).
-//!   `std::process::Child` has no public constructor, so it never appears as a
-//!   value inside a call's parentheses — a bare `Child` there is always a type.
+//!   path `process::Child`, `std::process::Child`, or `::std::process::Child`
+//!   — in a type position: immediately after `->` (return type), after a
+//!   single `:` (field, binding, or parameter type), as a generic argument
+//!   (after `<`, or after a `,` whose enclosing bracket is `<`:
+//!   `Option<Child>`, `Result<E, Child>`), or as a tuple element (after `(`,
+//!   or after a `,` whose enclosing bracket is `(`: `-> (Child, u16)`,
+//!   `struct LiveProcess(Child)`, `Vec<(u16, Child)>`). A visibility
+//!   qualifier between the marker and the type — `pub`, `pub(crate)`,
+//!   `pub(super)`, `pub(self)`, `pub(in path)` — is skipped, so tuple-struct
+//!   fields such as `struct P(pub Child)` and `(u16, pub(crate) Child)` are
+//!   hits too. `std::process::Child` has no public constructor, so it never
+//!   appears as a value inside a call's parentheses — a bare `Child` there is
+//!   always a type.
 //!   `GuardedChild` and other identifiers merely ending in `Child` are not
 //!   hits, nor is any other path such as `Kind::Child` or `portable_pty::Child`.
 //!   Borrows (`&Child`, `&mut Child`) are not hits: the token is preceded by
@@ -159,6 +164,9 @@ const OPT_OUT_MARKER: &str = "// raw-child: allow";
 const CHILD: &str = "Child";
 /// Path prefixes (outermost first) under which the `Child` token counts.
 const ALLOWED_PATHS: &[&[&str]] = &[&[], &["process"], &["std", "process"]];
+/// The only prefix that may also be written with a leading `::`.
+const ABSOLUTE_PATH: &[&str] = &["std", "process"];
+const PUB: &str = "pub";
 const EXEMPT_CRATE: &[&str] = &["crates", "intentd-test-support"];
 const EXCERPT_CHARS: usize = 120;
 
@@ -433,32 +441,78 @@ fn enclosing_open_bracket(chars: &[char], k: usize) -> Option<char> {
     None
 }
 
+/// Start of the identifier ending at the last non-whitespace char before
+/// `end`, if that char is an identifier char.
+fn ident_before(chars: &[char], end: usize) -> Option<(usize, usize)> {
+    let seg_end = last_non_ws_before(chars, end)?;
+    let seg_start = ident_start_before(chars, seg_end + 1)?;
+    Some((seg_start, seg_end))
+}
+
+/// Index of the `(` matching the `)` at `close`, if any.
+fn matching_open_paren(chars: &[char], close: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for idx in (0..close).rev() {
+        match chars[idx] {
+            ')' => depth += 1,
+            '(' if depth == 0 => return Some(idx),
+            '(' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Start of a visibility qualifier — `pub` or `pub(...)` — ending just
+/// before `end`, if there is one.
+fn visibility_start_before(chars: &[char], end: usize) -> Option<usize> {
+    let k = last_non_ws_before(chars, end)?;
+    let ident_end = if chars[k] == ')' {
+        matching_open_paren(chars, k)?
+    } else {
+        end
+    };
+    let (seg_start, seg_end) = ident_before(chars, ident_end)?;
+    let word: String = chars[seg_start..=seg_end].iter().collect();
+    (word == PUB).then_some(seg_start)
+}
+
 /// Whether the `Child` token starting at `start` sits in a type position
-/// (see the module doc), once any `process::` / `std::process::` path prefix
-/// has been walked back over. A path under any other prefix is never a hit.
+/// (see the module doc), once any `process::` / `std::process::` /
+/// `::std::process::` path prefix and any visibility qualifier have been
+/// walked back over. A path under any other prefix is never a hit.
 fn is_type_position(chars: &[char], start: usize) -> bool {
     let mut path_start = start;
+    let mut absolute = false;
     let mut segments: Vec<String> = Vec::new();
     while let Some(colon) = last_non_ws_before(chars, path_start) {
         if chars[colon] != ':' || colon == 0 || chars[colon - 1] != ':' {
             break;
         }
-        let Some(seg_end) = last_non_ws_before(chars, colon - 1) else {
-            return false;
+        // A segment sits flush against its `::`; a `::` with nothing (or
+        // whitespace, as in `pub ::std::…`) before it is the crate root, and
+        // only `::std::process` counts there.
+        let Some(seg_start) = ident_start_before(chars, colon - 1) else {
+            absolute = true;
+            path_start = colon - 1;
+            break;
         };
-        let Some(seg_start) = ident_start_before(chars, seg_end + 1) else {
-            return false;
-        };
-        segments.push(chars[seg_start..=seg_end].iter().collect());
+        segments.push(chars[seg_start..colon - 1].iter().collect());
         path_start = seg_start;
     }
     segments.reverse();
-    if !ALLOWED_PATHS.iter().any(|allowed| {
+    let allowed: &[&[&str]] = if absolute {
+        &[ABSOLUTE_PATH]
+    } else {
+        ALLOWED_PATHS
+    };
+    if !allowed.iter().any(|allowed| {
         allowed.len() == segments.len() && allowed.iter().zip(&segments).all(|(a, s)| *a == s)
     }) {
         return false;
     }
-    let Some(k) = last_non_ws_before(chars, path_start) else {
+    let type_start = visibility_start_before(chars, path_start).unwrap_or(path_start);
+    let Some(k) = last_non_ws_before(chars, type_start) else {
         return false;
     };
     match chars[k] {
@@ -667,6 +721,32 @@ mod heuristic {
                    let x: (Child, u16) = todo!();\n\
                    fn k() -> (u16, &Child) { todo!() }\n";
         assert_eq!(hit_lines(src), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn visibility_qualified_tuple_fields_hit() {
+        let src = "struct P(pub Child);\n\
+                   struct Q(pub(crate) Child);\n\
+                   struct R(pub(super) Child, u16);\n\
+                   struct S(u16, pub(self) Child);\n\
+                   struct T(pub(in crate::a) u16, pub Child);\n\
+                   struct U(pub std::process::Child);\n\
+                   struct V(pub(crate) Option<Child>);\n\
+                   struct W(pub &Child);\n\
+                   struct X(pub GuardedChild);\n";
+        assert_eq!(hit_lines(src), vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn absolute_std_path_hits() {
+        let src = "fn a() -> ::std::process::Child { todo!() }\n\
+                   struct S { child: ::std::process::Child }\n\
+                   struct T(pub ::std::process::Child);\n\
+                   fn b() -> Option<::std::process::Child> { todo!() }\n\
+                   fn c() -> ::process::Child { todo!() }\n\
+                   fn d() -> ::tokio::process::Child { todo!() }\n\
+                   use ::std::process::Child;\n";
+        assert_eq!(hit_lines(src), vec![1, 2, 3, 4]);
     }
 
     #[test]
