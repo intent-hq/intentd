@@ -2492,6 +2492,7 @@ version = "0.1.15"
 dependencies = [
  "directories",
  "flate2",
+ "intentd-test-support",
  "liblzma",
  "nix 0.31.3",
  "reqwest",

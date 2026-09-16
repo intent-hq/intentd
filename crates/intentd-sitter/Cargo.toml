@@ -41,6 +41,9 @@ sha2 = "0.11.0"
 tar = "0.4.46"
 tempfile = "3"
 
+[target."cfg(unix)".dev-dependencies]
+intentd-test-support = { path = "../intentd-test-support" }
+
 [target."cfg(windows)".dependencies]
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 

@@ -15,12 +15,16 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 use sha2::{Digest, Sha256};
 
 use intentd_sitter::cli::{Channel, CHANNEL_ENV};
@@ -32,6 +36,7 @@ use intentd_sitter::supervisor::{
     GIVE_UP_AFTER_ENV, IDLE_RESTART_ENV, KILL_TIMEOUT_ENV, MANIFEST_BASE_URL_ENV,
     RESTART_FOR_UPDATE_EXIT_CODE, UPDATE_RESTART_ENV,
 };
+use intentd_test_support::{Barrier, GuardedChild};
 
 const SITTER_BIN: &str = env!("CARGO_BIN_EXE_intentd-sitter");
 
@@ -324,52 +329,6 @@ fn crash_env_script(code: i32) -> String {
     )
 }
 
-/// A release-file barrier between a test and its fake daemon: the daemon's
-/// shell script blocks at [`Barrier::sh_wait`] until the test calls
-/// [`Barrier::release`], so a held state stays stable for as long as the
-/// test's assertions take instead of racing a fixed `sleep`. A script can
-/// also [`Barrier::sh_arrive`] just before waiting so the test can prove,
-/// via [`Barrier::entered`], that the daemon actually reached the hold.
-struct Barrier {
-    path: std::path::PathBuf,
-}
-
-impl Barrier {
-    fn new(data_dir: &Path, name: &str) -> Self {
-        Self {
-            path: data_dir.join(format!("barrier-{name}")),
-        }
-    }
-
-    /// Let every script blocked in [`Barrier::sh_wait`] proceed.
-    fn release(&self) {
-        fs::write(&self.path, b"").unwrap();
-    }
-
-    /// Shell snippet that blocks until the barrier is released.
-    fn sh_wait(&self) -> String {
-        let path = self.path.display();
-        // timing-guard: poll interval
-        format!("while [ ! -e \"{path}\" ]; do sleep 0.05; done")
-    }
-
-    /// Shell snippet that marks the barrier as reached (see [`Barrier::entered`]).
-    fn sh_arrive(&self) -> String {
-        format!(": > \"{}\"", self.entered_path().display())
-    }
-
-    /// Whether a script has run [`Barrier::sh_arrive`].
-    fn entered(&self) -> bool {
-        self.entered_path().exists()
-    }
-
-    fn entered_path(&self) -> std::path::PathBuf {
-        let mut path = self.path.clone().into_os_string();
-        path.push(".entered");
-        path.into()
-    }
-}
-
 /// Fake daemon speaking the idle-restart handshake: the start line records
 /// the update-restart and idle-restart markers; SIGTERM/SIGINT log a `term`
 /// line and exit 0; SIGUSR2 logs a `usr2` line, then holds at `release` —
@@ -430,6 +389,20 @@ fn restart_once_script(version: &str, release: &Barrier) -> String {
     )
 }
 
+/// Fake daemon: log its own pid, arrive at `release`, and hold there for
+/// as long as the test lets it (the injected-panic test never releases it).
+fn parked_pid_script(release: &Barrier) -> String {
+    format!(
+        "#!/bin/sh\n\
+         echo \"pid $$\" >> \"${FAKE_DAEMON_LOG}\"\n\
+         {arrive}\n\
+         {wait}\n\
+         exit 0\n",
+        arrive = release.sh_arrive(),
+        wait = release.sh_wait(),
+    )
+}
+
 /// Fake daemon: log one line, stay up `secs`, then crash with `code` — a
 /// daemon that serves for a while and dies, not one that can never start.
 fn long_lived_crash_script(secs: &str, code: i32) -> String {
@@ -457,43 +430,20 @@ fn sitter_command(data_dir: &Path, base_url: &str) -> Command {
     cmd
 }
 
-/// A sitter `Child` spawned as the leader of its own process group and torn
-/// down with that whole group if dropped while still running. A test that
-/// parks its fake daemon on a [`Barrier`] and panics before releasing it
-/// would otherwise drop a plain `Child` (no kill on drop) and the `TempDir`
-/// holding the release file, leaving the sitter and its parked daemon
-/// behind forever. Derefs to `Child` for the existing helpers.
-struct GuardedSitter(Child);
-
-/// Spawn `cmd` as a [`GuardedSitter`].
-fn spawn_guarded(cmd: &mut Command) -> GuardedSitter {
-    use std::os::unix::process::CommandExt;
-    GuardedSitter(cmd.process_group(0).spawn().unwrap())
+/// Spawn the sitter as a [`GuardedChild`]: the leader of its own process
+/// group, torn down with that whole group (the sitter and its fake daemon)
+/// if dropped while still running — e.g. by a test that parks its daemon on
+/// a [`Barrier`] and panics before releasing it.
+fn spawn_guarded(cmd: &mut Command) -> GuardedChild {
+    GuardedChild::spawn(cmd).unwrap()
 }
 
-impl std::ops::Deref for GuardedSitter {
-    type Target = Child;
-    fn deref(&self) -> &Child {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for GuardedSitter {
-    fn deref_mut(&mut self) -> &mut Child {
-        &mut self.0
-    }
-}
-
-impl Drop for GuardedSitter {
-    fn drop(&mut self) {
-        // Only while the sitter is still alive does its pid still name the
-        // group (and cannot have been reused); a reaped child is the test's
-        // own business.
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let pgid = nix::unistd::Pid::from_raw(self.0.id().cast_signed());
-            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-            let _ = self.0.wait();
-        }
+/// Whether `pid` still names a process (signal 0 probe), zombies included.
+fn alive(pid: u32) -> bool {
+    match kill(Pid::from_raw(pid.cast_signed()), None) {
+        Ok(()) => true,
+        Err(Errno::ESRCH) => false,
+        Err(e) => panic!("kill({pid}, 0): {e}"),
     }
 }
 
@@ -2507,6 +2457,66 @@ fn restart_for_update_exit_with_unchanged_state_respawns_same_version_unmarked()
     assert!(
         !stderr.contains("exited unexpectedly") && !stderr.contains("respawning intentd in"),
         "the restart exit is neither a crash nor backed off: {stderr}"
+    );
+}
+
+/// Regression for the #1924 review ask: a test that panics while its sitter
+/// is parked on a [`Barrier`] must not leave the sitter or its fake daemon
+/// behind. The panic unwinds through the [`GuardedChild`] guard, which
+/// `SIGKILL`s the sitter's whole process group (the daemon inherits it), so
+/// both pids are gone within the bound even though the barrier is never
+/// released.
+#[test]
+fn panic_mid_test_leaves_no_sitter_or_daemon_behind() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Declared before the guard so the release file outlives the unwind:
+    // nothing but the kill may unpark the daemon.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    let release = Barrier::new(dir.path(), "release");
+    preinstall(&paths, "0.1.0", &parked_pid_script(&release));
+    let log_path = daemon_log_path(dir.path());
+
+    let pids = Mutex::new(None);
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let sitter = spawn_guarded(
+            sitter_command(dir.path(), &dead_url())
+                .env(CHECK_MIN_ENV, "3600000")
+                .env(CHECK_MAX_ENV, "3600001")
+                .arg("serve"),
+        );
+        wait_until(
+            "daemon 0.1.0 to reach the hold",
+            Duration::from_secs(15),
+            || release.entered(),
+        );
+        let daemon_pid: u32 = read_or_empty(&log_path)
+            .lines()
+            .find_map(|line| line.strip_prefix("pid "))
+            .expect("fake daemon logs its pid before arriving")
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(alive(sitter.id()) && alive(daemon_pid));
+        *pids.lock().unwrap() = Some((sitter.id(), daemon_pid));
+        panic!("injected mid-test panic while the sitter is parked on the barrier");
+    }));
+    assert!(outcome.is_err(), "the injected panic must unwind");
+    let (sitter_pid, daemon_pid) = pids
+        .into_inner()
+        .unwrap()
+        .expect("spawned and recorded pids before panicking");
+
+    wait_until(
+        "sitter and fake daemon to be gone after unwinding",
+        Duration::from_secs(5),
+        || !alive(sitter_pid) && !alive(daemon_pid),
+    );
+    assert!(
+        !release.path().exists(),
+        "the barrier must never have been released: only the guard's kill unparks the daemon"
     );
 }
 
