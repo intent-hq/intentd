@@ -296,7 +296,8 @@ pub(crate) struct PrMonitorSnapshot {
     /// The freshness anchor for superseding the snapshot with a workspace
     /// copy ([`superseded_by_terminal_copy`]): the row's `last_polled_at`
     /// also advances on failed polls, which do not re-observe the PR.
-    /// Absent on snapshots persisted before the field existed; never
+    /// Absent on snapshots persisted before the field existed (unknown
+    /// freshness: such a snapshot never holds a terminal copy off); never
     /// participates in the change diff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
@@ -820,7 +821,7 @@ pub(crate) fn fold_monitor_pr_signals(
                 else {
                     continue;
                 };
-                if superseded_by_terminal_copy(m, &snapshot, terminal_prs) {
+                if superseded_by_terminal_copy(&snapshot, terminal_prs) {
                     continue;
                 }
                 let req = &snapshot.requirements;
@@ -862,7 +863,6 @@ pub(crate) fn fold_monitor_pr_signals(
 /// timestamp is then the fresher observation. An unparseable copy timestamp
 /// never supersedes.
 fn superseded_by_terminal_copy(
-    m: &PrMonitor,
     snapshot: &PrMonitorSnapshot,
     terminal_prs: &[&PullRequestInfo],
 ) -> bool {
@@ -871,7 +871,7 @@ fn superseded_by_terminal_copy(
             && match pr.status {
                 PullRequestStatus::Merged => true,
                 PullRequestStatus::Closed => parse_iso(&pr.updated_at).is_some_and(|updated| {
-                    snapshot_observed_at(m, snapshot).is_none_or(|observed| updated > observed)
+                    snapshot_observed_at(snapshot).is_none_or(|observed| updated > observed)
                 }),
                 PullRequestStatus::Open | PullRequestStatus::Draft => false,
             }
@@ -879,25 +879,15 @@ fn superseded_by_terminal_copy(
 }
 
 /// When the monitor's persisted snapshot was actually read off the forge:
-/// the snapshot's own `observed_at`, or — for a snapshot persisted before
-/// that field existed — the row's `last_polled_at` only while the last poll
-/// SUCCEEDED. A failed poll ([`Services::record_pr_monitor_error`]) advances
-/// `last_polled_at` but keeps the previous snapshot, so under a recorded
-/// error the poll time says nothing about the snapshot's age.
-fn snapshot_observed_at(
-    m: &PrMonitor,
-    snapshot: &PrMonitorSnapshot,
-) -> Option<time::OffsetDateTime> {
-    snapshot
-        .observed_at
-        .as_deref()
-        .and_then(parse_iso)
-        .or_else(|| {
-            if m.last_error.is_some() {
-                return None;
-            }
-            m.last_polled_at.as_deref().and_then(parse_iso)
-        })
+/// the snapshot's own `observed_at`, and nothing else. The row's
+/// `last_polled_at` is NOT a stand-in for a snapshot persisted before the
+/// field existed: a failed poll ([`Services::record_pr_monitor_error`])
+/// advances it while keeping the previous snapshot, and the flush
+/// ([`Services::emit_pending_changes`]) then clears `last_error` without
+/// touching either, so neither column can vouch for the snapshot's age.
+/// A legacy snapshot has unknown freshness and yields to any terminal copy.
+fn snapshot_observed_at(snapshot: &PrMonitorSnapshot) -> Option<time::OffsetDateTime> {
+    snapshot.observed_at.as_deref().and_then(parse_iso)
 }
 
 /// Light metadata for one ACTIVE PR monitor — the idle-visibility
@@ -6897,6 +6887,107 @@ mod tests {
         assert!(!recovered.pending_changes.is_empty());
     }
 
+    /// Regression (intentd#1923 re-review, round 2): a snapshot persisted
+    /// before `observedAt` existed has UNKNOWN freshness, so it must never
+    /// hold a workspace-owned Closed copy off. `last_error == None` is not a
+    /// stand-in for "the last poll succeeded": the flush
+    /// (`emit_pending_changes`) clears the error while keeping both the
+    /// stale snapshot and the failed attempt's `last_polled_at`.
+    #[tokio::test]
+    async fn a_flushed_legacy_row_never_blocks_a_newer_closed_copy() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        // Forge the pre-upgrade row: open snapshot without `observedAt`, a
+        // pending set awaiting its debounced wake, last successful poll T1.
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let strip = |col: &Option<String>| -> Option<String> {
+            let mut v: Value = serde_json::from_str(col.as_deref()?).ok()?;
+            v.as_object_mut()?.remove("observedAt");
+            serde_json::to_string(&v).ok()
+        };
+        let (last, baseline) = (strip(&row.last_snapshot), strip(&row.baseline_snapshot));
+        assert!(!last.as_deref().unwrap().contains("observedAt"));
+        let pending = vec!["conversation comments: 0 → 1".to_string()];
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                &monitor.monitor_id,
+                PrMonitorPollUpdate {
+                    last_snapshot: last.as_deref(),
+                    baseline_snapshot: baseline.as_deref(),
+                    pending_changes: &pending,
+                    pending_since: Some("2026-01-03T00:00:00Z"),
+                    last_change_at: Some("2026-01-03T00:00:00Z"),
+                    last_polled_at: Some("2026-01-03T00:00:00Z"),
+                    last_error: None,
+                    updated_at: &now_iso(),
+                    expected_updated_at: &row.updated_at,
+                },
+            )
+            .await
+            .unwrap());
+
+        // The PR closes at T2; the hover fold writes the workspace copy.
+        let closed_copy = PullRequestInfo {
+            id: "42".into(),
+            number: 42,
+            url: "https://github.com/o/r/pull/42".into(),
+            title: "Add thing".into(),
+            status: PullRequestStatus::Closed,
+            created_at: String::new(),
+            updated_at: "2026-01-04T00:00:00Z".into(),
+            base_ref: None,
+            head_ref: None,
+            head_sha: None,
+            author: None,
+            mergeable: None,
+            mergeable_state: None,
+            is_draft: None,
+        };
+
+        // T3: a failed poll advances `last_polled_at` past T2 with an error.
+        forge.edit(|s| s.fail_get_pr = true);
+        svc.poll_pr_monitors().await;
+        let errored = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(errored.last_error.is_some());
+        assert_eq!(
+            fold_monitor_pr_signals(std::slice::from_ref(&errored), &[&closed_copy]),
+            MonitorPrSignals::default(),
+            "under a recorded error the legacy row yields to the copy"
+        );
+
+        // The flush delivers the pending set and clears `last_error` while
+        // keeping the stale snapshot and the failed attempt's poll time.
+        assert!(svc
+            .pr_monitor_flush(&ws, &monitor.monitor_id)
+            .await
+            .unwrap());
+        let flushed = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(flushed.last_error.is_none());
+        assert!(flushed.pending_changes.is_empty());
+        assert_eq!(flushed.last_polled_at, errored.last_polled_at);
+        assert_eq!(flushed.last_snapshot, errored.last_snapshot);
+        assert_eq!(
+            fold_monitor_pr_signals(std::slice::from_ref(&flushed), &[&closed_copy]),
+            MonitorPrSignals::default(),
+            "a flushed legacy row still yields to the newer closed copy"
+        );
+    }
+
     #[tokio::test]
     async fn rehydration_resumes_active_monitors_and_delivers_downtime_changes_immediately() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
@@ -7906,10 +7997,16 @@ mod tests {
             mergeable_state: None,
             is_draft: None,
         };
-        let mut polled = ready.clone();
+        let mut polled = mk(
+            PrMonitorState::Active,
+            snap(|s| {
+                ready_requirements(&mut s.requirements);
+                s.observed_at = Some("2026-01-05T00:00:00Z".into());
+            }),
+        );
         polled.last_polled_at = Some("2026-01-05T00:00:00Z".into());
-        // Merged is irreversible: it supersedes whatever the poll timing, and
-        // the URL match folds ASCII case.
+        // Merged is irreversible: it supersedes whatever the observation
+        // timing, and the URL match folds ASCII case.
         let merged_copy = copy(
             PullRequestStatus::Merged,
             "https://github.com/O/R/pull/42",
@@ -7920,8 +8017,9 @@ mod tests {
             MonitorPrSignals::default(),
             "a merged workspace copy silences the stale open monitor"
         );
-        // Closed can be reopened: only a copy fresher than the last poll
-        // supersedes; an older one (or an unparseable timestamp) does not.
+        // Closed can be reopened: only a copy fresher than the snapshot's
+        // observation supersedes; an older one (or an unparseable timestamp)
+        // does not.
         let fresh_closed = copy(
             PullRequestStatus::Closed,
             "https://github.com/o/r/pull/42",
@@ -7950,7 +8048,7 @@ mod tests {
                     ready: true,
                     merged: false
                 },
-                "an older closed copy yields to the fresher open poll"
+                "an older closed copy yields to the fresher open observation"
             );
         }
         // Regression (intentd#1923 re-review): freshness is the snapshot's
@@ -7990,20 +8088,25 @@ mod tests {
             open_signal,
             "the reopened-state protection survives a later failed poll"
         );
-        // Legacy snapshot without `observedAt`: `last_polled_at` stands in
-        // only while the last poll succeeded; under a recorded error the
-        // snapshot's age is unknown and the copy wins.
-        let mut legacy_errored = polled.clone();
+        // Legacy snapshot without `observedAt`: unknown freshness. Neither a
+        // clean `last_polled_at` nor a recorded error stands in for it — the
+        // flush clears `last_error` while keeping the failed attempt's poll
+        // time — so the copy wins regardless of the row's poll columns.
+        let mut legacy = ready.clone();
+        legacy.last_polled_at = Some("2026-01-05T00:00:00Z".into());
+        let mut legacy_errored = legacy.clone();
         legacy_errored.last_error = Some("rate limited".into());
+        for (row, case) in [(&legacy, "clean poll"), (&legacy_errored, "failed poll")] {
+            assert_eq!(
+                fold_monitor_pr_signals(std::slice::from_ref(row), &[&stale_closed]),
+                MonitorPrSignals::default(),
+                "legacy row, {case}: unknown freshness yields to the copy"
+            );
+        }
         assert_eq!(
-            fold_monitor_pr_signals(std::slice::from_ref(&polled), &[&stale_closed]),
+            fold_monitor_pr_signals(std::slice::from_ref(&legacy), &[&undated_closed]),
             open_signal,
-            "legacy row, clean poll: the poll time anchors freshness"
-        );
-        assert_eq!(
-            fold_monitor_pr_signals(std::slice::from_ref(&legacy_errored), &[&stale_closed]),
-            MonitorPrSignals::default(),
-            "legacy row, failed poll: unknown freshness yields to the copy"
+            "an unparseable copy timestamp never supersedes, legacy or not"
         );
         // A terminal copy of ANOTHER PR leaves the monitor's signal alone.
         let other = copy(
