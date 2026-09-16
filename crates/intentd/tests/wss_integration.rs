@@ -4745,9 +4745,12 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
 /// call only the vetted `COLLABORATOR_METHODS`; everything else is refused
 /// before dispatch with the forbidden error (`-32003`, docs/protocol §9).
 /// The happy-path client boot trace (`client.hello`, `system.capabilities`,
-/// `host.status`, `principal.me`, `workspace.list`, `events.subscribe`,
-/// `workspace.subscribe`) succeeds; `host.exec`, `browser.exec`,
-/// `forward.create`, `github.authStatus`, `mcp.servers.list` are refused;
+/// `system.status`, `host.status`, `principal.me`, `workspace.list`,
+/// `events.subscribe`, `workspace.subscribe`) succeeds — `system.status`
+/// answers the daemon snapshot (`running`, `hostname`, `prettyHostname`,
+/// `host.locality == "remote"`) so the guest's status panel and route
+/// refresh work; `host.exec`, `browser.exec`, `forward.create`,
+/// `github.authStatus`, `mcp.servers.list`, `system.shutdown` are refused;
 /// the alias `git.diff` is canonicalised to `git.diffs` before the lookup
 /// (allowed, so it reaches the router and fails on params, not on -32003);
 /// a `/tunnel` upgrade with the collaborator credential is refused (403). The
@@ -4779,7 +4782,12 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
         .expect("reply within 10s")
     }
 
-    let srv = start(WsOptions::default()).await;
+    // Wire the control surface so `system.status` is answered from the
+    // connection-task fast path, exactly as the composition root does.
+    let control: Arc<dyn SystemControl> = Arc::new(WatchHealthControl {
+        health: WatchHealth::default(),
+    });
+    let srv = start_with_control(WsOptions::default(), None, None, Some(control)).await;
 
     let guest_token = "dcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc";
     let guest = Principal {
@@ -4817,6 +4825,7 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
             json!({ "clientId": "w3-guest", "name": "guest fe", "capabilities": {} }),
         ),
         ("system.capabilities", json!({})),
+        ("system.status", json!({})),
         ("host.status", json!({})),
         ("principal.me", json!({})),
         ("workspace.list", json!({})),
@@ -4834,11 +4843,31 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
             v.get("error").is_none(),
             "{method} must succeed for a collaborator: {v}"
         );
+        if method == "system.status" {
+            // The guest's daemon-status panel reads the same snapshot the
+            // administrator gets: running flag, hostnames and the serving
+            // transport's locality (WSS ⇒ `remote`).
+            let result = &v["result"];
+            assert_eq!(result["running"], true, "system.status: {v}");
+            assert!(
+                result["hostname"].is_string(),
+                "system.status hostname: {v}"
+            );
+            assert!(
+                result["prettyHostname"].is_string(),
+                "system.status prettyHostname: {v}"
+            );
+            assert_eq!(
+                result["host"]["locality"], "remote",
+                "system.status host.locality: {v}"
+            );
+        }
     }
 
     // Owner-only methods are refused before dispatch with -32003.
     for (method, params) in [
         ("host.exec", json!({ "command": "true" })),
+        ("system.shutdown", json!({})),
         (
             "browser.exec",
             json!({ "actions": [{ "action": "listTabs" }] }),
