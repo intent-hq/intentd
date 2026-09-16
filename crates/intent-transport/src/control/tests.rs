@@ -442,7 +442,6 @@ fn collaborator_status_json_projects_to_guest_safe_fields() {
             "protocolVersion",
             "running",
             "tcAddress",
-            "transports",
             "version",
         ]
     );
@@ -470,6 +469,7 @@ fn collaborator_status_json_projects_to_guest_safe_fields() {
     // The fields the guest must not see are present on the full snapshot
     // (so the projection is what removed them) and absent here.
     for key in [
+        "transports",
         "clients",
         "agents",
         "busyAgents",
