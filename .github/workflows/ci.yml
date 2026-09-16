@@ -396,6 +396,14 @@ jobs:
       # so a positive-path wait cannot quietly regress into a fixed delay.
       - name: Fixed-sleep lint
         run: cargo test -p intent-core --test fixed_sleep_lint
+      # Raw-Child lint: fails naming file:line wherever a test file under
+      # crates/*/tests names `std::process::Child` as a type (return, field,
+      # binding, or generic argument) instead of holding it in
+      # `intentd_test_support::GuardedChild` — a bare `Child` leaks the
+      # process, and everything it spawned, when the test panics before its
+      # teardown. Unmigrated suites sit in the lint's shrink-only BASELINE.
+      - name: Raw-Child lint
+        run: cargo test -p intentd-test-support --test raw_child_lint
       # Per-slot HOME for install-action — see the coverage-e2e job's comment
       # for the full rationale (shared ~/.install-action tmp/bin race across
       # the 8 tinybox slots; monorepo#1239).

@@ -251,6 +251,18 @@ ratchets down: when a file's unannotated count drops, the lint fails printing th
 replacement line to paste; raising an entry, or adding one for a new file, needs a
 justification in the PR.
 
+The same job runs the raw-`Child` lint,
+`cargo test -p intentd-test-support --test raw_child_lint` (`make lint-raw-child`): it
+fails naming `file:line` wherever a file under `crates/*/tests/**/*.rs` names
+`std::process::Child` as a type — return type, field, binding, parameter, or generic
+argument — instead of holding it in `intentd_test_support::GuardedChild` (a bare `Child`
+leaks the process, and everything it spawned, when the test panics before its
+teardown). Borrows (`&Child`, `&mut Child`) and `use` paths are not hits. Suites not yet
+migrated are listed in the lint's `BASELINE`, which only shrinks: once a file has no
+hits left, the lint fails until its entry is deleted. A site that genuinely must own a
+bare `Child` opts out with `// raw-child: allow — <reason>` on the line immediately
+above it; the reason is required.
+
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.
 
