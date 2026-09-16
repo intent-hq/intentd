@@ -25,7 +25,12 @@ mod tests {
         let previous = super::super::resolve_entry("2.5");
         let current = super::super::latest_entry();
         assert_eq!(current.version, "2.6");
-        assert!(std::ptr::eq(current.harness, previous.harness));
+        for auto_commit in [true, false] {
+            assert_eq!(
+                current.harness.suggested_next_steps_block(auto_commit),
+                previous.harness.suggested_next_steps_block(auto_commit)
+            );
+        }
         assert_eq!(current.doctrine.specialists, previous.doctrine.specialists);
         let common = current.doctrine.instructions.common;
         let guidance = common
