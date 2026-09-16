@@ -1473,6 +1473,315 @@ async fn a_monitor_owned_by_a_dead_agent_is_adopted_over_wss() {
     );
 }
 
+/// Seed a live sub-agent of the fixture agent in `status`, so the fixture
+/// agent is its parent for the takeover tests.
+async fn seed_child_agent(fx: &Fixture, id: &str, status: AgentStatus) -> AgentId {
+    let mut child = agent_session(&fx.ws_id, id);
+    child.name = "Child".into();
+    child.parent_agent_id = Some(fx.agent_id.clone());
+    child.status = status;
+    fx.services
+        .store()
+        .insert_agent_session(&child)
+        .await
+        .expect("seed child agent");
+    AgentId::from(id)
+}
+
+/// Create a task note over the wire in `status` and link it to `agent_id` as
+/// its task note (the linkage delegation would set). Returns the note id.
+async fn link_task_note_over_wss(
+    fx: &Fixture,
+    rpc: &mut TlsWs,
+    agent_id: &AgentId,
+    status: &str,
+) -> String {
+    let created = wss_rpc(
+        rpc,
+        100,
+        "note.create",
+        json!({ "workspaceId": fx.ws_id.as_str(), "title": "Task", "content": "body" }),
+    )
+    .await;
+    let note_id = created["note"]["id"].as_str().expect("note id").to_string();
+    let marked = wss_rpc(
+        rpc,
+        101,
+        "task.markAsTask",
+        json!({ "workspaceId": fx.ws_id.as_str(), "noteId": note_id, "status": status }),
+    )
+    .await;
+    assert_eq!(marked["ok"], json!(true), "{marked}");
+    assert_eq!(marked["status"], json!(status), "{marked}");
+    let store = fx.services.store();
+    let mut session = store.get_agent_session(agent_id).await.unwrap();
+    session.task_note_id = Some(intent_core::NoteId::from(note_id.clone()));
+    store
+        .update_agent_session(&fx.ws_id, &session)
+        .await
+        .expect("link task note");
+    note_id
+}
+
+/// The child's transcript rows over the wire whose metadata is a
+/// `pr_monitor_wake`.
+async fn pr_monitor_wakes_over_wss(
+    fx: &Fixture,
+    rpc: &mut TlsWs,
+    agent_id: &AgentId,
+) -> Vec<Value> {
+    let convo = wss_rpc(
+        rpc,
+        102,
+        "agent.getConversation",
+        json!({ "workspaceId": fx.ws_id.as_str(), "agentId": agent_id.as_str() }),
+    )
+    .await;
+    convo["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|m| m["metadata"]["type"] == json!("pr_monitor_wake"))
+        .cloned()
+        .collect()
+}
+
+/// Parent takeover (PROTOCOL §5.42): a monitor held by the caller's DIRECT
+/// sub-agent whose linked task has moved to `complete` (over the wire, via
+/// `task.updateNoteStatus`) is no longer refused to the parent — it is
+/// ADOPTED with the orphan-adoption semantics (same `monitorId` re-parented,
+/// pending cleared, `adoptedFrom` in the payload and in
+/// `prMonitor:registered`, `prMonitor.list` stays single) and, unlike an
+/// orphan's dead owner, the child is told once: its transcript over
+/// `agent.getConversation` carries one `pr_monitor_wake` row with
+/// `reason: "transferred"` and `adoptedBy` naming the parent. The parent
+/// itself is not woken by its own takeover.
+#[tokio::test]
+async fn a_settled_childs_monitor_is_adopted_by_its_parent_over_wss() {
+    let fx = boot().await;
+    let child_id = seed_child_agent(&fx, "agent-prmon-child", AgentStatus::Active).await;
+    let api: Arc<dyn WorkspaceApi> = fx.services.clone();
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:registered"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let note_id = link_task_note_over_wss(&fx, &mut rpc, &child_id, "in_progress").await;
+
+    // The child registers and accrues a pending change under its ownership.
+    let started = api
+        .pr_monitor_start(fx.ws_id.clone(), child_id.clone(), 42, None)
+        .await
+        .expect("child registers");
+    assert_eq!(started["ok"], json!(true), "{started}");
+    let monitor_id = started["monitor"]["monitorId"]
+        .as_str()
+        .expect("child monitorId")
+        .to_string();
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], monitor_id);
+    assert!(evt["data"].get("adoptedFrom").is_none(), "{evt}");
+    fx.forge.edit(|s| s.conversation_comments = 1);
+    fx.services.poll_pr_monitors().await;
+
+    // While the child's task is in progress and it is busy, the parent is
+    // refused like any other live holder.
+    let refused = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("a refusal is a payload");
+    assert_eq!(refused["refused"], json!(true), "{refused}");
+    assert_eq!(refused["ownerAgentId"], child_id.as_str(), "{refused}");
+    assert_no_event(&mut sub, "prMonitor:registered").await;
+
+    // The child's task moves to `complete` over the wire: settled.
+    let updated = wss_rpc(
+        &mut rpc,
+        2,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": fx.ws_id.as_str(), "noteId": note_id, "status": "complete" }),
+    )
+    .await;
+    assert_eq!(updated["ok"], json!(true), "{updated}");
+    assert_eq!(updated["status"], json!("complete"), "{updated}");
+
+    let adopted = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("takeover is a success payload");
+    assert_eq!(adopted["ok"], json!(true), "{adopted}");
+    assert!(adopted.get("refused").is_none(), "{adopted}");
+    assert_eq!(adopted["adoptedFrom"], child_id.as_str(), "{adopted}");
+    assert_eq!(adopted["monitor"]["monitorId"], monitor_id, "same row");
+    assert_eq!(adopted["monitor"]["agentId"], fx.agent_id.as_str());
+    assert_eq!(adopted["monitor"]["state"], "active");
+    assert_eq!(adopted["monitor"]["hasPendingChanges"], false, "{adopted}");
+    assert_eq!(adopted["requirements"]["state"], "open");
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], monitor_id, "{evt}");
+    assert_eq!(evt["data"]["agentId"], fx.agent_id.as_str(), "{evt}");
+    assert_eq!(evt["data"]["adoptedFrom"], child_id.as_str(), "{evt}");
+
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let rows = listed["monitors"].as_array().expect("monitors array");
+    assert_eq!(rows.len(), 1, "one monitor: {listed}");
+    assert_eq!(rows[0]["monitorId"], monitor_id);
+    assert_eq!(rows[0]["agentId"], fx.agent_id.as_str());
+    assert_eq!(rows[0]["state"], "active");
+
+    // The child is told exactly once, through the client-visible transcript.
+    let wakes = pr_monitor_wakes_over_wss(&fx, &mut rpc, &child_id).await;
+    assert_eq!(wakes.len(), 1, "one transfer notice: {wakes:?}");
+    let metadata = &wakes[0]["metadata"];
+    assert_eq!(metadata["reason"], "transferred", "{metadata}");
+    assert_eq!(metadata["adoptedBy"], fx.agent_id.as_str(), "{metadata}");
+    assert_eq!(metadata["monitorId"], monitor_id, "{metadata}");
+    assert_eq!(metadata["repo"], "o/r", "{metadata}");
+    assert_eq!(metadata["prNumber"], 42, "{metadata}");
+    assert_eq!(
+        metadata["url"], "https://github.com/o/r/pull/42",
+        "{metadata}"
+    );
+    let text = wakes[0].to_string();
+    assert!(text.contains("[PR monitor o/r#42]"), "{text}");
+    assert!(text.contains("took over this monitor"), "{text}");
+    assert!(
+        pr_monitor_wakes_over_wss(&fx, &mut rpc, &fx.agent_id)
+            .await
+            .is_empty(),
+        "the adopter is not woken by its own takeover"
+    );
+}
+
+/// The refusal half of parent takeover (PROTOCOL §5.42): a DIRECT sub-agent
+/// whose task is still `in_progress` and which has not settled — here idle
+/// but holding an active hook, a waiting reason other than the monitor —
+/// keeps its monitor: the parent gets the ordinary `already-monitored`
+/// refusal naming the child, no `prMonitor:registered` fires, the list stays
+/// single under the child, and no transfer notice is written. Once the hook
+/// is gone the child is idle with nothing pending but the monitor, and the
+/// same call adopts even though the task still reads `in_progress`.
+#[tokio::test]
+async fn a_parent_is_refused_while_its_child_is_still_working_over_wss() {
+    let fx = boot().await;
+    let child_id = seed_child_agent(&fx, "agent-prmon-child", AgentStatus::RuntimeIdle).await;
+    let api: Arc<dyn WorkspaceApi> = fx.services.clone();
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:registered"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    link_task_note_over_wss(&fx, &mut rpc, &child_id, "in_progress").await;
+
+    let started = api
+        .pr_monitor_start(fx.ws_id.clone(), child_id.clone(), 42, None)
+        .await
+        .expect("child registers");
+    assert_eq!(started["ok"], json!(true), "{started}");
+    let monitor_id = started["monitor"]["monitorId"]
+        .as_str()
+        .expect("child monitorId")
+        .to_string();
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], monitor_id);
+
+    // An active hook is a waiting reason: the idle child has not settled.
+    let scheduled = api
+        .hook_schedule(
+            fx.ws_id.clone(),
+            child_id.clone(),
+            json!({ "name": "watcher", "code": "return { dispatch: false };", "delayMs": 10_000 }),
+        )
+        .await
+        .expect("child schedules a hook");
+    let hook_id = scheduled["hook"]["hookId"]
+        .as_str()
+        .expect("hookId")
+        .to_string();
+
+    let fetches_before = fx.forge.fetches();
+    let refused = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("a refusal is a payload, not an error");
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(refused["refused"], json!(true), "{refused}");
+    assert_eq!(refused["reason"], json!("already-monitored"), "{refused}");
+    assert_eq!(refused["ownerAgentId"], child_id.as_str(), "{refused}");
+    assert_eq!(refused["ownerAgentName"], json!("Child"), "{refused}");
+    assert_eq!(refused["monitorId"], monitor_id, "{refused}");
+    let instruction = refused["instruction"].as_str().expect("instruction");
+    assert!(instruction.contains("sub-agent"), "{instruction}");
+    assert!(instruction.contains("still working"), "{instruction}");
+    assert!(refused.get("monitor").is_none(), "{refused}");
+    assert!(refused.get("adoptedFrom").is_none(), "{refused}");
+    assert_eq!(
+        fx.forge.fetches(),
+        fetches_before,
+        "the refusal is decided before the forge fetch"
+    );
+    assert_no_event(&mut sub, "prMonitor:registered").await;
+
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let rows = listed["monitors"].as_array().expect("monitors array");
+    assert_eq!(rows.len(), 1, "one monitor: {listed}");
+    assert_eq!(rows[0]["monitorId"], monitor_id);
+    assert_eq!(rows[0]["agentId"], child_id.as_str(), "not re-parented");
+    assert!(
+        pr_monitor_wakes_over_wss(&fx, &mut rpc, &child_id)
+            .await
+            .is_empty(),
+        "no transfer notice without a transfer"
+    );
+
+    // The child's own cancel clears its last waiting reason; the task still
+    // reads `in_progress`, but idle-with-nothing-pending is enough.
+    api.hook_cancel(
+        fx.ws_id.clone(),
+        intent_core::HookId::from(hook_id.as_str()),
+        Some(child_id.clone()),
+    )
+    .await
+    .expect("child cancels its hook");
+    let adopted = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("takeover is a success payload");
+    assert_eq!(adopted["ok"], json!(true), "{adopted}");
+    assert_eq!(adopted["adoptedFrom"], child_id.as_str(), "{adopted}");
+    assert_eq!(adopted["monitor"]["monitorId"], monitor_id, "same row");
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["adoptedFrom"], child_id.as_str(), "{evt}");
+    let wakes = pr_monitor_wakes_over_wss(&fx, &mut rpc, &child_id).await;
+    assert_eq!(wakes.len(), 1, "one transfer notice: {wakes:?}");
+    assert_eq!(wakes[0]["metadata"]["reason"], "transferred");
+    assert_eq!(wakes[0]["metadata"]["adoptedBy"], fx.agent_id.as_str());
+}
+
 /// A merged PR terminalizes the monitor: `prMonitor:completed` fires, the
 /// owner is woken immediately, and the `completed` row STAYS visible in
 /// `prMonitor.list` so merged PRs remain in the UI's list. The wake's
