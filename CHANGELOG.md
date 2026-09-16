@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.63] - 2026-09-16
+
+### 🐛 Bug Fixes
+
+- Keep workspace PR status fresh (hover fold + cheap monitor polls) ([#1923](https://github.com/intent-hq/intentd/pull/1923))
+
+### 🧪 Testing
+
+- *(core)* Repo-wide fixed-sleep annotation lint with ratcheting baseline ([#1926](https://github.com/intent-hq/intentd/pull/1926))
+- *(e2e)* Centralize intentd serve spawns in common::serve_command and add serve_spawn_guard ([#1927](https://github.com/intent-hq/intentd/pull/1927))
+
+
 ## [0.9.62] - 2026-09-16
 
 ### 🧪 Testing
