@@ -69,9 +69,8 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -259,7 +258,6 @@ async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
         &data_dir,
         &[
             ("INTENTD_AUTH_TOKEN", TOKEN),
-            ("INTENTD_TCP_PORT", "0"),
             ("INTENTD_WORKSPACES_DIR", &root_s),
             (
                 "INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH",

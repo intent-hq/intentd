@@ -19,7 +19,7 @@
 mod common;
 
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use intent_core::{
@@ -140,8 +140,7 @@ async fn launch_daemon(data_dir: &PathBuf, script: &str, behavior: &str) -> (Dae
     let log = std::fs::File::create(&log_path).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let child = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    let child = common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -252,8 +251,7 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
     let log = std::fs::File::create(&log_path).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let child = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    let child = common::serve_command()
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")

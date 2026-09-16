@@ -48,8 +48,7 @@ fn spawn_serve(data_dir: &Path) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
@@ -210,8 +209,7 @@ fn spawn_serve_with_stored_token(data_dir: &Path) -> Child {
         "[sourceControl.github]\ntokenSource = \"explicit\"\n",
     )
     .expect("write config.toml");
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))

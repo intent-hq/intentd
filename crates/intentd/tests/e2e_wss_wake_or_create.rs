@@ -29,7 +29,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,9 +68,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         common::enable_ws_api(data_dir);
     }
     common::seed_default_provider(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -332,7 +331,7 @@ async fn boot_daemon_with_task_env(
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_task(&data_dir, title).await;
-    let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN)];
     env.extend_from_slice(extra_env);
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {

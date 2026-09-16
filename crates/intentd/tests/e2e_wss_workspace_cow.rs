@@ -80,9 +80,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     common::enable_ws_api(data_dir);
     common::seed_default_provider(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -350,7 +349,6 @@ async fn boot(
     let root_s = workspaces_root.to_string_lossy().to_string();
     let mut env: Vec<(&str, &str)> = vec![
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_WORKSPACES_DIR", &root_s),
     ];
     env.extend_from_slice(extra_env);

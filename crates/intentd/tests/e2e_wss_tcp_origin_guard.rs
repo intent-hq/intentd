@@ -21,7 +21,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,11 +61,9 @@ fn spawn_serve(data_dir: &Path) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_TCP_PORT", "0")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("MOCK_ACP_HOST", "localhost:0")
@@ -357,13 +355,11 @@ async fn tcp_client_refused_settings_disable_wss_when_mode_local() {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(&data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .arg("--mode")
+    let mut cmd = common::serve_command();
+    cmd.arg("--mode")
         .arg("local")
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_TCP_PORT", "0")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("MOCK_ACP_HOST", "localhost:0")

@@ -58,9 +58,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         common::enable_ws_api(data_dir);
     }
     common::seed_default_provider(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -243,9 +242,8 @@ async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = data_dir_guard.path().to_path_buf();
     let scratch = scratch_dir("scratch");
     let root_s = workspaces_root.to_string_lossy().to_string();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_WORKSPACES_DIR", &root_s),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
