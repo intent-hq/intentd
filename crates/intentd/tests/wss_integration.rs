@@ -4844,8 +4844,9 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
             "{method} must succeed for a collaborator: {v}"
         );
         if method == "system.status" {
-            // The guest's daemon-status panel reads the same snapshot the
-            // administrator gets: running flag, hostnames and the serving
+            // The guest's daemon-status panel reads the guest-safe projection
+            // (`wss_collaborator_system_status_is_projected_to_guest_safe_fields`
+            // pins its exact shape): running flag, hostnames and the serving
             // transport's locality (WSS ⇒ `remote`).
             let result = &v["result"];
             assert_eq!(result["running"], true, "system.status: {v}");
@@ -4930,6 +4931,253 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
         admin["error"]["code"], -32003,
         "administrator must not be allowlisted: {admin}"
     );
+
+    srv.ws.stop().await;
+}
+
+/// [`SystemControl`] whose snapshot reports daemon-wide activity — connected
+/// clients, live and busy agents, process / disk / file-watch / fd telemetry,
+/// the agent-memory budget and the idle-update handshake — standing in for
+/// the manager-backed counters the composition root wires. None of it is
+/// scoped to a workspace, so for a collaborator all of it is activity outside
+/// its member workspaces.
+struct BusyDaemonControl;
+
+impl SystemControl for BusyDaemonControl {
+    fn status(&self) -> SystemStatus {
+        SystemStatus {
+            listen_mode: "both".to_string(),
+            uds: true,
+            tcp: true,
+            port: Some(5180),
+            clients: 4,
+            agents: 3,
+            fingerprint: Some("AB:CD".to_string()),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            has_display: true,
+            max_agents: 20,
+            version: "0.0.0-test".to_string(),
+            build_commit: Some("0123456789abcdef".to_string()),
+            uptime_seconds: 4242,
+            local_ips: vec!["192.168.1.10".to_string()],
+            tc_address: Some("tc7f2a91.tailcat.net".to_string()),
+            hostname: "studio.local".to_string(),
+            pretty_hostname: "Owner's Studio".to_string(),
+            device_kind: Some("macStudio".to_string()),
+            hardware_model: Some("Mac Studio".to_string()),
+            cpu_percent: 42.0,
+            memory_bytes: 104_857_600,
+            child_processes: Some(9),
+            child_memory_bytes: Some(2_684_354_560),
+            child_memory_peak_bytes: Some(5_368_709_120),
+            agent_memory_budget_bytes: Some(21_474_836_480),
+            agent_memory_charged_bytes: Some(3_221_225_472),
+            queued_spawns: Some(1),
+            workspaces_disk_available_bytes: Some(250_000_000_000),
+            workspaces_disk_total_bytes: Some(1_000_000_000_000),
+            file_watch: Some(FileWatchStatus {
+                active_streams: 6,
+                total_roots: 7,
+                failed_roots: 1,
+            }),
+            fd_count: Some(312),
+            fd_limit: Some(10240),
+            update_supported: true,
+            busy_agents: 2,
+            idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
+        }
+    }
+    fn host_environment(&self) -> intent_transport::HostEnvironment {
+        intent_transport::HostEnvironment {
+            hostname: "studio.local".to_string(),
+            pretty_hostname: "Owner's Studio".to_string(),
+            device_kind: Some("macStudio".to_string()),
+            hardware_model: Some("Mac Studio".to_string()),
+        }
+    }
+    fn request_shutdown(&self) {}
+    fn request_update(&self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    fn import_legacy(
+        &self,
+        _force: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
+    > {
+        Box::pin(async { Err("not supported in this test".to_string()) })
+    }
+    fn git_credential(
+        &self,
+        _client_pid: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send + '_>>
+    {
+        Box::pin(async { None })
+    }
+}
+
+/// Multiplayer w3, least privilege: a collaborator's `system.status` is the
+/// guest-safe projection, not the administrator's snapshot. With the daemon
+/// reporting activity a guest is not a member of (connected clients, live and
+/// busy agents, process / disk / watcher telemetry — [`BusyDaemonControl`]),
+/// the collaborator's result over WSS carries exactly the boot / routing /
+/// host-identity fields (`running`, `listenMode`, `transports`, `port`,
+/// `version`, `buildCommit`, `protocolVersion`, `fingerprint`, `localIps`,
+/// `tcAddress`, `hostname`, `prettyHostname`, `host.{os, arch, locality,
+/// deviceKind, hardwareModel}`) with the administrator's values, and none of
+/// the counts or telemetry; the administrator's own `system.status` on the
+/// same daemon still returns them all. `system.shutdown` and
+/// `system.requestUpdate` stay refused (-32003) for the collaborator even
+/// though the control surface would serve them.
+#[intent_test_macros::daemon_test]
+async fn wss_collaborator_system_status_is_projected_to_guest_safe_fields() {
+    use intent_core::{Principal, PrincipalId};
+    use serde_json::json;
+
+    let control: Arc<dyn SystemControl> = Arc::new(BusyDaemonControl);
+    let srv = start_with_control(WsOptions::default(), None, None, Some(control)).await;
+
+    let guest_token = "dedededededededededededededededededededededededededededededededede";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    srv.store.upsert_principal(&guest).await.expect("guest");
+    srv.store
+        .insert_principal_credential(&guest.id, &sha256_hex(guest_token.as_bytes()))
+        .await
+        .expect("guest credential");
+
+    // Administrator (legacy token): the full snapshot, activity included.
+    let admin = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"system.status","params":{}}"#,
+    )
+    .await;
+    assert!(admin.get("error").is_none(), "administrator: {admin}");
+    let full = &admin["result"];
+    assert_eq!(full["clients"], 4, "{admin}");
+    assert_eq!(full["agents"], 3, "{admin}");
+    assert_eq!(full["busyAgents"], 2, "{admin}");
+    assert_eq!(full["maxAgents"], 20, "{admin}");
+    assert_eq!(full["uptimeSeconds"], 4242, "{admin}");
+    assert_eq!(full["childProcesses"], 9, "{admin}");
+    assert_eq!(full["fileWatch"]["activeStreams"], 6, "{admin}");
+    assert_eq!(full["fdCount"], 312, "{admin}");
+    assert_eq!(full["updateSupported"], true, "{admin}");
+    assert!(full["idleUpdateCheck"].is_object(), "{admin}");
+    assert_eq!(full["host"]["hasDisplay"], true, "{admin}");
+
+    // Collaborator: the projection.
+    let url = format!("wss://localhost:{}/ws?token={guest_token}", srv.port);
+    let mut ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+    let resp = drive_frames(
+        &mut ws,
+        vec![
+            r#"{"jsonrpc":"2.0","id":1,"method":"system.status","params":{}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"system.shutdown","params":{}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"system.requestUpdate","params":{}}"#.to_string(),
+        ],
+    )
+    .await;
+    let guest_status = &resp[0];
+    assert_eq!(guest_status["jsonrpc"], "2.0");
+    assert_eq!(guest_status["id"], 1);
+    assert!(
+        guest_status.get("error").is_none(),
+        "collaborator system.status: {guest_status}"
+    );
+    let projected = &guest_status["result"];
+
+    let mut keys: Vec<&str> = projected
+        .as_object()
+        .expect("result object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "buildCommit",
+            "fingerprint",
+            "host",
+            "hostname",
+            "listenMode",
+            "localIps",
+            "port",
+            "prettyHostname",
+            "protocolVersion",
+            "running",
+            "tcAddress",
+            "transports",
+            "version",
+        ],
+        "collaborator system.status keys: {guest_status}"
+    );
+    let mut host_keys: Vec<&str> = projected["host"]
+        .as_object()
+        .expect("host object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    host_keys.sort_unstable();
+    assert_eq!(
+        host_keys,
+        ["arch", "deviceKind", "hardwareModel", "locality", "os"],
+        "collaborator system.status host keys: {guest_status}"
+    );
+
+    // Retained fields carry the administrator's values (both connections are
+    // WSS, so `host.locality` is `remote` for both).
+    for key in [
+        "running",
+        "listenMode",
+        "transports",
+        "port",
+        "version",
+        "buildCommit",
+        "protocolVersion",
+        "fingerprint",
+        "localIps",
+        "tcAddress",
+        "hostname",
+        "prettyHostname",
+    ] {
+        assert_eq!(projected[key], full[key], "{key}: {guest_status}");
+    }
+    assert_eq!(
+        projected["host"],
+        json!({
+            "os": full["host"]["os"],
+            "arch": full["host"]["arch"],
+            "locality": "remote",
+            "deviceKind": "macStudio",
+            "hardwareModel": "Mac Studio",
+        })
+    );
+    assert_eq!(projected["tcAddress"], "tc7f2a91.tailcat.net");
+    assert_eq!(projected["localIps"], json!(["192.168.1.10"]));
+
+    // The other `system.*` methods are refused before the control surface.
+    for (i, method) in [(1usize, "system.shutdown"), (2, "system.requestUpdate")] {
+        let v = &resp[i];
+        assert_eq!(v["id"], i + 1);
+        assert_eq!(
+            v["error"]["code"], -32003,
+            "{method} must be refused for a collaborator: {v}"
+        );
+        assert!(v.get("result").is_none(), "{v}");
+    }
+    let _ = ws.close(None).await;
 
     srv.ws.stop().await;
 }

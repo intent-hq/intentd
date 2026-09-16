@@ -457,6 +457,53 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     v
 }
 
+/// Top-level `system.status` fields a non-administrator (collaborator)
+/// connection receives — the client boot / routing / host-identity subset the
+/// guest FE reads, every one of which the invite envelope and
+/// `server.pairingInfo` already disclosed. Default-deny: a field added to
+/// [`status_json`] stays administrator-only until it is listed here.
+const COLLABORATOR_STATUS_FIELDS: &[&str] = &[
+    "running",
+    "listenMode",
+    "transports",
+    "port",
+    "version",
+    "buildCommit",
+    "protocolVersion",
+    "fingerprint",
+    "localIps",
+    "tcAddress",
+    "hostname",
+    "prettyHostname",
+    "host",
+];
+
+/// `host` sub-object fields served to a collaborator: OS / arch / locality
+/// and the device identity `host.status` also serves. `hasDisplay` stays
+/// administrator-only (the guest has no host-shell reach to gate on it).
+const COLLABORATOR_STATUS_HOST_FIELDS: &[&str] =
+    &["os", "arch", "locality", "deviceKind", "hardwareModel"];
+
+/// Render the collaborator projection of `system.status` (multiplayer w3,
+/// least privilege). Same values as [`status_json`] restricted to
+/// [`COLLABORATOR_STATUS_FIELDS`] / [`COLLABORATOR_STATUS_HOST_FIELDS`]:
+/// daemon-global counts (`clients`, `agents`, `busyAgents`, `maxAgents`),
+/// process / disk / file-watch / fd telemetry, the agent-memory budget and
+/// the update handshake (`updateSupported`, `idleUpdateCheck`) are omitted —
+/// they aggregate activity outside the caller's member workspaces
+/// (`agent.listActive` membership-filters the very set `busyAgents` counts),
+/// and `system.requestUpdate` is refused for collaborators anyway. The
+/// administrator's snapshot is unchanged.
+pub(crate) fn collaborator_status_json(status: &SystemStatus, is_local: bool) -> Value {
+    let mut v = status_json(status, is_local);
+    let obj = v.as_object_mut().expect("status_json literal is an object");
+    obj.retain(|key, _| COLLABORATOR_STATUS_FIELDS.contains(&key.as_str()));
+    if let Some(host) = obj.get_mut("host").and_then(Value::as_object_mut) {
+        host.retain(|key, _| COLLABORATOR_STATUS_HOST_FIELDS.contains(&key.as_str()));
+    }
+    v
+}
+
 /// The daemon-side scope gate for `system.gitCredential` (monorepo#884): only
 /// `protocol=https` + `host=github.com` (case-insensitive, exact host) may
 /// receive the credential. Mirrors the helper's own client-side gate.
@@ -476,14 +523,23 @@ pub(crate) fn git_credential_scope_ok(protocol: Option<&str>, host: Option<&str>
 /// the wire. `system.requestUpdate` is served on BOTH transports (a remote
 /// client is exactly who needs to trigger an update): success returns
 /// `{ ok: true }`, and a daemon that is not sitter-supervised gets `-32603`
-/// with the reason.
+/// with the reason. `system.status` answers the full snapshot to an
+/// administrator and the [`collaborator_status_json`] projection otherwise
+/// (`is_administrator` is the negation of
+/// `context::is_non_administrator_caller()`, resolved by the caller); the
+/// other `system.*` methods never reach here for a collaborator — the
+/// `COLLABORATOR_METHODS` gate in `conn.rs` refuses them first.
 pub(crate) async fn handle(
     req: SystemRequest,
     control: &dyn SystemControl,
     is_local: bool,
     is_uds: bool,
+    is_administrator: bool,
 ) -> Option<String> {
     let result: Result<Value, (i32, String)> = match req.method {
+        SystemMethod::Status if !is_administrator => {
+            Ok(collaborator_status_json(&control.status(), is_local))
+        }
         SystemMethod::Status => {
             let mut status = status_json(&control.status(), is_local);
             status["exactUpdateSupported"] = json!(control.exact_update_supported());
