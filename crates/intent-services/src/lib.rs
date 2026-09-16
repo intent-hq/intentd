@@ -748,6 +748,14 @@ pub struct Services {
     /// interleave a concurrent row mutation. `None` in production wiring;
     /// tests inject via the `#[cfg(test)]`-only `with_attention_write_park`.
     attention_write_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seam (intent-hq/intent#5137) at the ENTRY of
+    /// `settle_workspace_unread_after_seen` — after the caller's write, before
+    /// the settle's unread probe — so two concurrent settles can be held
+    /// until both writes have landed, and neither early-returns on a probe
+    /// that still sees the other's session unread. `None` in production
+    /// wiring; tests inject via the `#[cfg(test)]`-only
+    /// `with_unread_settle_entry_park`.
+    unread_settle_entry_park: Option<Arc<script_ops::SupervisePark>>,
     /// Test park seam (intent-hq/monorepo#2739) for the
     /// `deliver_wake_message` archived-gate read → enqueue window: parks the
     /// wake delivery after the gate observed the workspace archived and
@@ -1261,6 +1269,7 @@ impl Services {
             completion_claim_park: None,
             completion_flip_take_park: None,
             attention_write_park: None,
+            unread_settle_entry_park: None,
             wake_archived_park: None,
             task_update_projection_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
@@ -2005,6 +2014,19 @@ impl Services {
         self
     }
 
+    /// Test seam (intent-hq/intent#5137): park
+    /// `settle_workspace_unread_after_seen` at its entry — after the caller's
+    /// write, before the unread probe — so concurrent settles hold until every
+    /// racing write has landed. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_unread_settle_entry_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.unread_settle_entry_park = Some(park);
+        self
+    }
+
     /// Test seam (intent-hq/monorepo#2739): park `deliver_wake_message` in
     /// its archived-gate read → enqueue window so a concurrent
     /// `workspace.unarchive` inside that window is deterministic. Production
@@ -2067,6 +2089,15 @@ impl Services {
     /// is armed (no-op in production wiring).
     async fn park_attention_write(&self) {
         if let Some(park) = &self.attention_write_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+    }
+
+    /// Park at the entry of the unread settle when the test seam is armed
+    /// (no-op in production wiring).
+    async fn park_unread_settle_entry(&self) {
+        if let Some(park) = &self.unread_settle_entry_park {
             park.entered.notify_one();
             park.release.notified().await;
         }
@@ -3605,6 +3636,7 @@ impl Services {
         if workspace_id.is_chief() {
             return;
         }
+        self.park_unread_settle_entry().await;
         let still_unread = self
             .store
             .workspace_has_unread_top_level_session(workspace_id)

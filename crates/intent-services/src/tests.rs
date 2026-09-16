@@ -42817,6 +42817,16 @@ mod derived_workspace_unread {
     async fn harness_with_park(
         park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
     ) -> Harness {
+        harness_with_parks(park, None).await
+    }
+
+    /// Harness variant that can also arm the intent-hq/intent#5137 settle
+    /// ENTRY park, which holds a settle after the caller's write and before
+    /// its unread probe (see `Services::with_unread_settle_entry_park`).
+    async fn harness_with_parks(
+        attention_write_park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+        settle_entry_park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+    ) -> Harness {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
@@ -42826,8 +42836,11 @@ mod derived_workspace_unread {
         let mut services = Services::new(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
-        if let Some(park) = park {
+        if let Some(park) = attention_write_park {
             services = services.with_attention_write_park(park);
+        }
+        if let Some(park) = settle_entry_park {
+            services = services.with_unread_settle_entry_park(park);
         }
         Harness {
             _tmp: tmp,
@@ -43530,11 +43543,21 @@ mod derived_workspace_unread {
     /// second declines — and must stay silent instead of falling through
     /// to the "stored flag was already clear" fallback and emitting a
     /// duplicate `{ none }`.
+    ///
+    /// Two parks (intent-hq/intent#5137): the settle ENTRY park first holds
+    /// both retires after their `retired_at` writes and before either
+    /// probes, because the ops interleave freely and a settle whose probe
+    /// runs before the other retire's write still sees that session unread
+    /// and (correctly) returns early without ever reaching the write
+    /// window — under load that starved the second window wait about
+    /// 1 in 8 runs. Only once both writes have landed are the settles
+    /// released into the attention-write park.
     #[tokio::test]
     async fn agent_retire_concurrent_unread_sessions_settle_exactly_once() {
         use std::sync::Arc;
+        let entry = Arc::new(crate::script_ops::SupervisePark::default());
         let park = Arc::new(crate::script_ops::SupervisePark::default());
-        let h = harness_with_park(Some(park.clone())).await;
+        let h = harness_with_parks(Some(park.clone()), Some(entry.clone())).await;
         seed_session(&h, "agent-a", &["user", "assistant"]).await;
         seed_session(&h, "agent-b", &["user", "assistant"]).await;
         // Stored flag raised as the turn-end gate would have left it (seeded
@@ -43554,10 +43577,20 @@ mod derived_workspace_unread {
                     .await
             }));
         }
-        // Both retires have written `retired_at` and reached the settle's
-        // attention-write window: neither has cleared yet.
+        // Both retires have written `retired_at` and sit at the settle's
+        // entry: neither has probed yet, so neither can early-return on the
+        // other's still-pending write.
         for _ in 0..2 {
-            tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            tokio::time::timeout(Duration::from_secs(10), entry.entered.notified())
+                .await
+                .expect("retire reaches the settle entry");
+        }
+        entry.release.notify_one();
+        entry.release.notify_one();
+        // Both probes now see every session retired, so both settles reach
+        // the attention-write window: neither has cleared yet.
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(10), park.entered.notified())
                 .await
                 .expect("settle reaches the attention write window");
         }
