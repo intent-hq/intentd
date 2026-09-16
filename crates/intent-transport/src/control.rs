@@ -460,12 +460,13 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
 /// Top-level `system.status` fields a non-administrator (collaborator)
 /// connection receives — the client boot / routing / host-identity subset the
 /// guest FE reads, every one of which the invite envelope and
-/// `server.pairingInfo` already disclosed. Default-deny: a field added to
-/// [`status_json`] stays administrator-only until it is listed here.
+/// `server.pairingInfo` already disclosed (`transports` has no guest
+/// consumer and is derivable from `listenMode`, so it is not served).
+/// Default-deny: a field added to [`status_json`] stays administrator-only
+/// until it is listed here.
 const COLLABORATOR_STATUS_FIELDS: &[&str] = &[
     "running",
     "listenMode",
-    "transports",
     "port",
     "version",
     "buildCommit",
