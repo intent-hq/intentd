@@ -16,7 +16,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,9 +61,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -334,9 +333,8 @@ async fn agent_retry_redrive_preserves_original_turn_id_over_wss() {
         "response": "turn-correlation-recovered-1022",
     })
     .to_string();
-    let env: [(&str, &str); 7] = [
+    let env: [(&str, &str); 6] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),

@@ -40,7 +40,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,9 +81,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -302,9 +301,8 @@ async fn stored_model_applied_via_set_config_option_over_wss() {
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok" }).to_string();
-    let env: [(&str, &str); 6] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
@@ -423,9 +421,8 @@ async fn stored_model_applied_via_set_model_over_wss() {
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok" }).to_string();
-    let env: [(&str, &str); 6] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_SET_MODEL", "1"),
@@ -544,9 +541,8 @@ async fn stored_model_effort_suffix_stripped_for_config_option_over_wss() {
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok" }).to_string();
-    let env: [(&str, &str); 7] = [
+    let env: [(&str, &str); 6] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
@@ -659,7 +655,6 @@ async fn assert_effective_codex_model_selection(
     .to_string();
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
         ("MOCK_AGENT_PROMPT_LOG", prompt_log_str.as_str()),
@@ -934,7 +929,6 @@ async fn assert_codex_rejection_and_recovery(advertise_load: bool) {
     .to_string();
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
         ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
@@ -1169,7 +1163,6 @@ async fn assert_codex_config_transport_recovery(advertise_load: bool) {
     .to_string();
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "1,1"),
         ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
@@ -1353,9 +1346,8 @@ async fn set_model_failure_does_not_fail_the_turn() {
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok", "rejectSetModel": true }).to_string();
-    let env: [(&str, &str); 6] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_SET_MODEL", "1"),
@@ -1453,9 +1445,8 @@ async fn set_config_option_failure_does_not_fail_the_turn() {
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok", "rejectSetConfigOption": true }).to_string();
-    let env: [(&str, &str); 6] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
@@ -1556,9 +1547,8 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
     let config_log = data_dir.join("config-log.jsonl");
     let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok" }).to_string();
-    let env: [(&str, &str); 6] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         // The provider opens on "medium" and offers low/medium/high.
@@ -1701,9 +1691,8 @@ async fn effort_levels_persisted_and_served_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let behavior = json!({ "response": "ok" }).to_string();
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         // The provider advertises a thought_level select (low/medium/high).
@@ -1820,9 +1809,8 @@ async fn reasoning_effort_is_a_no_op_without_a_thought_level_option() {
     let behavior = json!({ "response": "ok" }).to_string();
     // No MOCK_AGENT_THOUGHT_LEVEL and no config-option model: the mock's
     // session results carry no `configOptions` at all.
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_CONFIG_LOG", &config_log_str),

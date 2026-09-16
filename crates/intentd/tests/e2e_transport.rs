@@ -73,9 +73,8 @@ fn spawn_serve(data_dir: &PathBuf, listen: &str, env: &[(&str, &str)]) -> Child 
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -297,7 +296,7 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
 async fn e2e_transport_full() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
     };

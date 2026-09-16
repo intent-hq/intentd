@@ -5,7 +5,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -121,15 +121,13 @@ fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir workspaces dir");
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("daemon log");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    let mut command = common::serve_command();
     command
-        .arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("MOCK_AGENT_SCRIPT_PATH", script)
         .env("MOCK_AGENT_BEHAVIOR", behavior)
         .stdout(Stdio::null())

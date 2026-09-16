@@ -13,7 +13,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,9 +59,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -322,9 +321,8 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
     })
     .to_string();
     // Fast retry: 500ms timeouts + 100ms,200ms backoff for fast e2e
-    let env: [(&str, &str); 8] = [
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -445,9 +443,8 @@ async fn agent_spawn_retry_stdout_closed_over_wss() {
         "response": "retry succeeded after exit",
     })
     .to_string();
-    let env: [(&str, &str); 8] = [
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -561,9 +558,8 @@ async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
         "ignoreSessionNewAttempts": 999,
     })
     .to_string();
-    let env: [(&str, &str); 8] = [
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -688,9 +684,8 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
         "response": "retry recovery succeeded",
     })
     .to_string();
-    let env: [(&str, &str); 8] = [
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -926,9 +921,8 @@ async fn pi_spawn_fails_fast_on_old_cli_over_wss() {
     }
     let fake_pi_str = fake_pi.to_string_lossy().into_owned();
 
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("PI_ACP_PI_COMMAND", &fake_pi_str),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
     ];
@@ -1082,9 +1076,8 @@ async fn agent_spawn_slow_initialize_succeeds_over_wss() {
     .to_string();
     // No INTENTD_ACP_INITIALIZE_TIMEOUT_MS: exercise the 30s default, which
     // must tolerate the 6s initialize delay without a handshake timeout.
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),

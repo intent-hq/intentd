@@ -18,7 +18,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,9 +63,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -413,9 +412,8 @@ async fn idle_timeout_warns_and_continues_on_same_child_over_wss() {
         "response": "recovered after idle warning",
     })
     .to_string();
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "1500"),
@@ -624,9 +622,8 @@ async fn idle_timeout_tail_does_not_bleed_into_warning_turn_over_wss() {
         "response": "recovered after idle warning",
     })
     .to_string();
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "1500"),
@@ -794,9 +791,8 @@ async fn idle_timeout_unresolved_cancel_tears_down_child_over_wss() {
         "response": "recovered after teardown",
     })
     .to_string();
-    let env: [(&str, &str); 6] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
@@ -1011,9 +1007,8 @@ async fn delegated_child_idle_timeout_does_not_wake_parent_over_wss() {
     // child parks with ZERO activity, so its timeout fires deterministically
     // regardless of the window size — the wait below keys off the child's
     // warning row, not a fixed sleep, so the wider window costs nothing.
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "8000"),
@@ -1229,9 +1224,8 @@ async fn idle_timeout_cap_fails_terminally_over_wss() {
         "response": "never reached",
     })
     .to_string();
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "1500"),

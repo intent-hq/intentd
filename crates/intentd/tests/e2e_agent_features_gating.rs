@@ -21,7 +21,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,9 +86,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -394,10 +393,7 @@ async fn agent_features_settings_round_trip() {
     let socket = data_dir.join("intentd.sock");
 
     let mut _daemon = Daemon {
-        child: spawn_serve(
-            &data_dir,
-            &[("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")],
-        ),
+        child: spawn_serve(&data_dir, &[("INTENTD_AUTH_TOKEN", TOKEN)]),
         data_dir: data_dir.clone(),
     };
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -474,7 +470,6 @@ async fn agent_features_gate_new_sessions_only() {
             &data_dir,
             &[
                 ("INTENTD_AUTH_TOKEN", TOKEN),
-                ("INTENTD_TCP_PORT", "0"),
                 ("MOCK_AGENT_SCRIPT_PATH", &script),
                 ("MOCK_AGENT_BEHAVIOR", &behavior),
             ],
@@ -960,7 +955,6 @@ async fn specialist_model_options_surface_in_bridge_description() {
             &data_dir,
             &[
                 ("INTENTD_AUTH_TOKEN", TOKEN),
-                ("INTENTD_TCP_PORT", "0"),
                 ("MOCK_AGENT_SCRIPT_PATH", &script),
                 ("MOCK_AGENT_BEHAVIOR", &behavior),
                 ("HOME", &home),
@@ -1070,7 +1064,6 @@ async fn create_top_level_creates_independent_agent_over_wss() {
             &data_dir,
             &[
                 ("INTENTD_AUTH_TOKEN", TOKEN),
-                ("INTENTD_TCP_PORT", "0"),
                 ("MOCK_AGENT_SCRIPT_PATH", &script),
                 ("MOCK_AGENT_BEHAVIOR", &behavior),
             ],

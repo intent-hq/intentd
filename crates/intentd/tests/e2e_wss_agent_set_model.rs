@@ -11,7 +11,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,9 +52,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -236,7 +235,7 @@ async fn antigravity_catalog_override_change_and_restart_use_current_executable_
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
         wrappers.push(wrapper);
     }
-    let env = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
     };
@@ -355,7 +354,6 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
             "both",
             &[
                 ("INTENTD_AUTH_TOKEN", TOKEN),
-                ("INTENTD_TCP_PORT", "0"),
                 ("MOCK_AGENT_BEHAVIOR", &behavior),
                 ("MOCK_AGENT_SESSION_RESULT", &catalog),
                 ("MOCK_AGENT_RPC_LOG", log.to_str().unwrap()),
@@ -583,9 +581,8 @@ async fn agent_set_model_triggers_respawn_over_wss() {
         "response": "mock response",
     })
     .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
