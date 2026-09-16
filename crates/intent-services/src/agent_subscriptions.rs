@@ -953,10 +953,12 @@ impl Services {
             event_summaries: Vec::new(),
             raw_events: Vec::new(),
         };
-        guard.delegation_groups.push(group.clone());
-        // Write-through persist (best-effort), enqueued under the lock so the
-        // lane order matches the registry order.
-        self.persist_delegation_group(group);
+        // Do not persist an empty recovery record. If it lands before the
+        // first enrollment snapshot and the daemon stops between the writes,
+        // rehydration seals a group with no expected children and loses the
+        // eventual parent wake. Enrollment persists the first meaningful
+        // snapshot through the same ordered lane.
+        guard.delegation_groups.push(group);
         drop(guard);
         group_id
     }
