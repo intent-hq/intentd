@@ -1261,6 +1261,14 @@ impl Services {
     /// `prMonitor:registered` event marks the adoption. Adoption counts
     /// against the adopter's own cap exactly like a fresh registration.
     ///
+    /// A LIVE holder that is the caller's DIRECT sub-agent and has SETTLED
+    /// ([`Services::pr_monitor_child_settled`]: task `complete`/`cancelled`,
+    /// or `RuntimeIdle` with no waiting reason other than PR monitors) is
+    /// adopted the same way — parent takeover — and, unlike a dead owner,
+    /// the child is woken once with a `transferred` notice naming the
+    /// adopter. A grandparent, sibling, or the child itself (once the parent
+    /// holds the row) is refused as before.
+    ///
     /// The initial fetch is load-bearing — a forge that cannot read the PR
     /// (unsupported host, missing PR, no token) fails registration rather
     /// than persisting a monitor that could never poll.
@@ -4747,6 +4755,10 @@ mod tests {
         let rows = ws_view["monitors"].as_array().expect("array");
         assert_eq!(rows.len(), 1, "no second row: {ws_view}");
         assert_eq!(rows[0]["agentId"], json!(sibling.to_string()));
+        assert!(
+            !owner_messages(&svc, &owner).await.contains("transferred"),
+            "{how:?}: a dead owner gets no transfer notice"
+        );
 
         // The new owner's own re-register is the ordinary idempotent re-arm.
         let rearmed = svc
@@ -4998,12 +5010,6 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut session = svc.store().get_agent_session(&child).await.unwrap();
-        session.task_note_id = None;
-        svc.store()
-            .update_agent_session(&ws, &session)
-            .await
-            .unwrap();
         svc.set_test_busy(&child, true);
         let refused = svc
             .pr_monitor_start_op(&ws, &parent, 42, None)
@@ -5011,12 +5017,95 @@ mod tests {
             .expect("payload");
         assert_eq!(refused["refused"], json!(true), "busy child: {refused}");
         svc.set_test_busy(&child, false);
+
+        // Idle holding an active hook: the hook is a waiting reason too.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &child,
+                &json!({
+                    "name": "watcher",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook_id = intent_core::HookId::from(out["hook"]["hookId"].as_str().expect("hookId"));
+        let refused = svc
+            .pr_monitor_start_op(&ws, &parent, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(
+            refused["refused"],
+            json!(true),
+            "hook-holding child: {refused}"
+        );
+        svc.hook_cancel_op(&ws, &hook_id, Some(&child))
+            .await
+            .expect("cancel hook");
+
+        // Task still `in_progress`, but idle with nothing pending: the
+        // predicates are OR'd, so the takeover proceeds.
         let adopted = svc
             .pr_monitor_start_op(&ws, &parent, 42, None)
             .await
             .expect("payload");
         assert_eq!(adopted["ok"], json!(true), "settled child: {adopted}");
         assert_eq!(adopted["adoptedFrom"], json!(child.to_string()));
+
+        // The child's own re-register after the takeover is the ordinary
+        // refusal — the parent is a live holder, not the child's child.
+        let refused = svc
+            .pr_monitor_start_op(&ws, &child, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(
+            refused["refused"],
+            json!(true),
+            "child after takeover: {refused}"
+        );
+        assert_eq!(refused["ownerAgentId"], json!(parent.to_string()));
+        assert!(
+            !refused["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("sub-agent"),
+            "{refused}"
+        );
+    }
+
+    /// Only the DIRECT parent may take over: the parent's own parent is
+    /// refused even though the holder has settled.
+    #[tokio::test]
+    async fn a_grandparent_is_refused_a_settled_grandchilds_monitor() {
+        let (_db, _root, svc, _forge, ws, grandparent) = setup().await;
+        let parent = child_agent(
+            &svc,
+            &ws,
+            "agent-parent",
+            &grandparent,
+            AgentStatus::RuntimeIdle,
+        )
+        .await;
+        let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::RuntimeIdle).await;
+        let first = register(&svc, &ws, &child).await;
+
+        let refused = svc
+            .pr_monitor_start_op(&ws, &grandparent, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(refused["ownerAgentId"], json!(child.to_string()));
+        assert!(
+            !refused["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("sub-agent"),
+            "{refused}"
+        );
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(row.agent_id, child, "not re-parented");
     }
 
     /// Settlement only opens the monitor to the DIRECT parent: a sibling
