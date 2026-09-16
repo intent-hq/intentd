@@ -454,6 +454,46 @@ fn sitter_command(data_dir: &Path, base_url: &str) -> Command {
     cmd
 }
 
+/// A sitter `Child` spawned as the leader of its own process group and torn
+/// down with that whole group if dropped while still running. A test that
+/// parks its fake daemon on a [`Barrier`] and panics before releasing it
+/// would otherwise drop a plain `Child` (no kill on drop) and the `TempDir`
+/// holding the release file, leaving the sitter and its parked daemon
+/// behind forever. Derefs to `Child` for the existing helpers.
+struct GuardedSitter(Child);
+
+/// Spawn `cmd` as a [`GuardedSitter`].
+fn spawn_guarded(cmd: &mut Command) -> GuardedSitter {
+    use std::os::unix::process::CommandExt;
+    GuardedSitter(cmd.process_group(0).spawn().unwrap())
+}
+
+impl std::ops::Deref for GuardedSitter {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for GuardedSitter {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for GuardedSitter {
+    fn drop(&mut self) {
+        // Only while the sitter is still alive does its pid still name the
+        // group (and cannot have been reused); a reaped child is the test's
+        // own business.
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let pgid = nix::unistd::Pid::from_raw(self.0.id().cast_signed());
+            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            let _ = self.0.wait();
+        }
+    }
+}
+
 fn daemon_log_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("fake-daemon.log")
 }
@@ -2048,17 +2088,17 @@ fn sigusr2_stages_update_and_respawns_when_daemon_exits_for_restart() {
     // Hour-long check interval: only the SIGUSR2 may check. A 30s backoff
     // (never elapsing within the test) proves the restart-for-update exit
     // respawns without one.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env_remove(UPDATE_RESTART_ENV)
-        .env_remove(IDLE_RESTART_ENV)
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(BACKOFF_INITIAL_ENV, "30000")
-        .env(BACKOFF_CAP_ENV, "30000")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env_remove(IDLE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(BACKOFF_INITIAL_ENV, "30000")
+            .env(BACKOFF_CAP_ENV, "30000")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -2170,13 +2210,13 @@ fn sigusr2_when_already_current_signals_nothing_to_the_daemon() {
     let (base_url, requests) = serve_recording(routes);
 
     // Hour-long check interval: only the SIGUSR2 may trigger a check.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -2233,14 +2273,14 @@ fn sigusr1_during_an_idle_mode_check_escalates_it_to_restart_now() {
     let (base_url, hold, parked) = serve_holdable(Arc::clone(&routes));
 
     // Hour-long check interval: only the signals may check.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env_remove(UPDATE_RESTART_ENV)
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -2401,16 +2441,16 @@ fn restart_for_update_exit_with_unchanged_state_respawns_same_version_unmarked()
 
     // Hour-long check interval and a 30s backoff: the respawn below can
     // only happen promptly if the exit is neither checked nor backed off.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env_remove(UPDATE_RESTART_ENV)
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(BACKOFF_INITIAL_ENV, "30000")
-        .env(BACKOFF_CAP_ENV, "30000")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(BACKOFF_INITIAL_ENV, "30000")
+            .env(BACKOFF_CAP_ENV, "30000")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -2845,34 +2885,88 @@ fn sitter_initiated_stop_does_not_respawn() {
     assert_eq!(starts, 1, "sitter-initiated stop must not respawn");
 }
 
-/// Self-lint: every fixed sleep in this file — a Rust `thread::sleep(` or a
-/// shell `sleep <n>` inside a fake-daemon script — must carry a
-/// `// timing-guard: <reason>` marker on its own line or the one above, so
-/// a positive-path wait cannot quietly regress into a fixed delay (use a
-/// [`Barrier`] or [`wait_until`] instead). The `sleep 60 &` + `wait $!`
-/// stay-alive idiom of the long-running scripts is exempt.
-#[test]
-fn fixed_sleeps_are_annotated() {
-    const MARKER: &str = "timing-guard:";
-    // Split so this lint's own source does not match itself.
-    let rust_sleep = concat!("thread::", "sleep(");
-    let source = include_str!("supervisor_e2e.rs");
-    let lines: Vec<&str> = source.lines().collect();
-    let is_fixed_sleep = |line: &str| {
-        let line = line.trim_start();
-        if line.starts_with("//") || line.contains("sleep 60 &") {
+/// Marker that exempts a fixed sleep from [`fixed_sleeps_are_annotated`]
+/// when it sits on the sleep's line or the one above.
+const TIMING_GUARD_MARKER: &str = "timing-guard:";
+
+/// Split so the lint's own source does not match itself.
+const RUST_SLEEP: &str = concat!("thread::", "sleep(");
+
+/// The predicate behind [`fixed_sleeps_are_annotated`]: does `line` contain
+/// a fixed sleep? Either a Rust [`RUST_SLEEP`] anywhere, or a shell `sleep`
+/// command — at a word boundary, followed by blanks — whose first argument
+/// is a numeral (`0.2`, `.2`, `"2"`, `'2'`) or a `{}` interpolation. Only
+/// the `sleep 60 &` stay-alive occurrence is exempt; any other sleep on the
+/// same line still counts. Comment lines never count.
+fn line_has_fixed_sleep(line: &str) -> bool {
+    let line = line.trim_start();
+    if line.starts_with("//") {
+        return false;
+    }
+    if line.contains(RUST_SLEEP) {
+        return true;
+    }
+    line.match_indices("sleep").any(|(at, word)| {
+        let boundary = line[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        let after = &line[at + word.len()..];
+        let arg = after.trim_start_matches([' ', '\t']);
+        if !boundary || arg.len() == after.len() || arg.starts_with("60 &") {
             return false;
         }
-        line.contains(rust_sleep)
-            || line
-                .split("sleep ")
-                .skip(1)
-                .any(|rest| rest.starts_with(|c: char| c.is_ascii_digit() || c == '{'))
-    };
+        arg.trim_start_matches(['"', '\''])
+            .starts_with(|c: char| c.is_ascii_digit() || c == '.' || c == '{')
+    })
+}
+
+#[test]
+fn line_has_fixed_sleep_cases() {
+    // Each fixture line carries the marker so the self-lint skips it.
+    let cases: [(&str, bool); 16] = [
+        ("sleep 0.2", true),                             // timing-guard: lint fixture
+        ("sleep .2", true),                              // timing-guard: lint fixture
+        ("sleep  0.2", true),                            // timing-guard: lint fixture
+        ("sleep\t0.2", true),                            // timing-guard: lint fixture
+        ("sleep \"0.2\"", true),                         // timing-guard: lint fixture
+        ("sleep '2'", true),                             // timing-guard: lint fixture
+        ("sleep {secs}\\n\\", true),                     // timing-guard: lint fixture
+        ("while [ ! -e x ]; do sleep 0.05; done", true), // timing-guard: lint fixture
+        ("sleep 0.2; sleep 60 &", true),                 // timing-guard: lint fixture
+        ("thread::sleep(Duration::from_secs(1)); // sleep 60 &", true), // timing-guard: lint fixture
+        ("sleep 60 &\\n\\", false), // timing-guard: lint fixture
+        ("while :; do sleep 60 & wait $!; done\\n\"", false), // timing-guard: lint fixture
+        ("nosleep 10", false),      // timing-guard: lint fixture
+        ("thread_sleep 10", false), // timing-guard: lint fixture
+        ("// sleep 5", false),      // timing-guard: lint fixture
+        ("echo sleep", false),      // timing-guard: lint fixture
+    ];
+    for (line, expected) in cases {
+        assert_eq!(
+            line_has_fixed_sleep(line),
+            expected,
+            "line_has_fixed_sleep({line:?})"
+        );
+    }
+}
+
+/// Self-lint: every fixed sleep in this file — a Rust `thread::sleep(` or a
+/// shell `sleep <n>` inside a fake-daemon script, as decided by
+/// [`line_has_fixed_sleep`] — must carry a `// timing-guard: <reason>`
+/// marker on its own line or the one above, so a positive-path wait cannot
+/// quietly regress into a fixed delay (use a [`Barrier`] or [`wait_until`]
+/// instead). The `sleep 60 &` + `wait $!` stay-alive idiom of the
+/// long-running scripts is exempt.
+#[test]
+fn fixed_sleeps_are_annotated() {
+    const MARKER: &str = TIMING_GUARD_MARKER;
+    let source = include_str!("supervisor_e2e.rs");
+    let lines: Vec<&str> = source.lines().collect();
     let unannotated: Vec<String> = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| is_fixed_sleep(line))
+        .filter(|(_, line)| line_has_fixed_sleep(line))
         .filter(|(i, line)| {
             let above = if *i > 0 { lines[i - 1] } else { "" };
             !line.contains(MARKER) && !above.contains(MARKER)
