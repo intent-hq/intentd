@@ -396,6 +396,7 @@ async fn boot() -> Fixture {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.expect("seed workspace");
     let root_id = WorkspaceGitRootId::new();
