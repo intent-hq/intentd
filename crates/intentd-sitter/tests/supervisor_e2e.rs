@@ -3,7 +3,10 @@
 //! windows code paths are cfg-compiled but exercised via CI builds).
 //!
 //! Timing runs at millisecond scale through the `INTENTD_SITTER_*_MS` env
-//! overrides so no test sleeps for hours.
+//! overrides so no test sleeps for hours. Positive-path waits go through a
+//! [`Barrier`] or [`wait_until`]; the few fixed sleeps that remain carry a
+//! `// timing-guard: <reason>` marker, enforced repo-wide by the
+//! `fixed_sleep_lint` test in `intent-core`.
 
 #![cfg(unix)]
 
@@ -2883,99 +2886,4 @@ fn sitter_initiated_stop_does_not_respawn() {
         .filter(|line| line.starts_with("start "))
         .count();
     assert_eq!(starts, 1, "sitter-initiated stop must not respawn");
-}
-
-/// Marker that exempts a fixed sleep from [`fixed_sleeps_are_annotated`]
-/// when it sits on the sleep's line or the one above.
-const TIMING_GUARD_MARKER: &str = "timing-guard:";
-
-/// Split so the lint's own source does not match itself.
-const RUST_SLEEP: &str = concat!("thread::", "sleep(");
-
-/// The predicate behind [`fixed_sleeps_are_annotated`]: does `line` contain
-/// a fixed sleep? Either a Rust [`RUST_SLEEP`] anywhere, or a shell `sleep`
-/// command — at a word boundary, followed by blanks — whose first argument
-/// is a numeral (`0.2`, `.2`, `"2"`, `'2'`) or a `{}` interpolation. Only
-/// the `sleep 60 &` stay-alive occurrence is exempt; any other sleep on the
-/// same line still counts. Comment lines never count.
-fn line_has_fixed_sleep(line: &str) -> bool {
-    let line = line.trim_start();
-    if line.starts_with("//") {
-        return false;
-    }
-    if line.contains(RUST_SLEEP) {
-        return true;
-    }
-    line.match_indices("sleep").any(|(at, word)| {
-        let boundary = line[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-        let after = &line[at + word.len()..];
-        let arg = after.trim_start_matches([' ', '\t']);
-        if !boundary || arg.len() == after.len() || arg.starts_with("60 &") {
-            return false;
-        }
-        arg.trim_start_matches(['"', '\''])
-            .starts_with(|c: char| c.is_ascii_digit() || c == '.' || c == '{')
-    })
-}
-
-#[test]
-fn line_has_fixed_sleep_cases() {
-    // Each fixture line carries the marker so the self-lint skips it.
-    let cases: [(&str, bool); 16] = [
-        ("sleep 0.2", true),                             // timing-guard: lint fixture
-        ("sleep .2", true),                              // timing-guard: lint fixture
-        ("sleep  0.2", true),                            // timing-guard: lint fixture
-        ("sleep\t0.2", true),                            // timing-guard: lint fixture
-        ("sleep \"0.2\"", true),                         // timing-guard: lint fixture
-        ("sleep '2'", true),                             // timing-guard: lint fixture
-        ("sleep {secs}\\n\\", true),                     // timing-guard: lint fixture
-        ("while [ ! -e x ]; do sleep 0.05; done", true), // timing-guard: lint fixture
-        ("sleep 0.2; sleep 60 &", true),                 // timing-guard: lint fixture
-        ("thread::sleep(Duration::from_secs(1)); // sleep 60 &", true), // timing-guard: lint fixture
-        ("sleep 60 &\\n\\", false), // timing-guard: lint fixture
-        ("while :; do sleep 60 & wait $!; done\\n\"", false), // timing-guard: lint fixture
-        ("nosleep 10", false),      // timing-guard: lint fixture
-        ("thread_sleep 10", false), // timing-guard: lint fixture
-        ("// sleep 5", false),      // timing-guard: lint fixture
-        ("echo sleep", false),      // timing-guard: lint fixture
-    ];
-    for (line, expected) in cases {
-        assert_eq!(
-            line_has_fixed_sleep(line),
-            expected,
-            "line_has_fixed_sleep({line:?})"
-        );
-    }
-}
-
-/// Self-lint: every fixed sleep in this file — a Rust `thread::sleep(` or a
-/// shell `sleep <n>` inside a fake-daemon script, as decided by
-/// [`line_has_fixed_sleep`] — must carry a `// timing-guard: <reason>`
-/// marker on its own line or the one above, so a positive-path wait cannot
-/// quietly regress into a fixed delay (use a [`Barrier`] or [`wait_until`]
-/// instead). The `sleep 60 &` + `wait $!` stay-alive idiom of the
-/// long-running scripts is exempt.
-#[test]
-fn fixed_sleeps_are_annotated() {
-    const MARKER: &str = TIMING_GUARD_MARKER;
-    let source = include_str!("supervisor_e2e.rs");
-    let lines: Vec<&str> = source.lines().collect();
-    let unannotated: Vec<String> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line_has_fixed_sleep(line))
-        .filter(|(i, line)| {
-            let above = if *i > 0 { lines[i - 1] } else { "" };
-            !line.contains(MARKER) && !above.contains(MARKER)
-        })
-        .map(|(i, line)| format!("{}: {}", i + 1, line.trim()))
-        .collect();
-    assert!(
-        unannotated.is_empty(),
-        "fixed sleeps without a `// {MARKER} <reason>` marker on the line or the one above:\n{}",
-        unannotated.join("\n")
-    );
 }

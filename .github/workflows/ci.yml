@@ -389,6 +389,13 @@ jobs:
       # introduce a type the golden does not know.
       - name: Event-type literal lint
         run: cargo test -p intent-core --test event_type_lint
+      # Fixed-sleep lint: fails naming file:line for any `thread::sleep(` /
+      # `time::sleep(` / shell `sleep <n>` under `crates/*/tests/**` that has
+      # no `timing-guard: <reason>` marker and is not grandfathered by
+      # tests/fixed_sleep_baseline.txt (per-file counts, ratchets down only),
+      # so a positive-path wait cannot quietly regress into a fixed delay.
+      - name: Fixed-sleep lint
+        run: cargo test -p intent-core --test fixed_sleep_lint
       # Per-slot HOME for install-action — see the coverage-e2e job's comment
       # for the full rationale (shared ~/.install-action tmp/bin race across
       # the 8 tinybox slots; monorepo#1239).

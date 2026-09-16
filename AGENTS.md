@@ -227,6 +227,19 @@ in the catalog. A new event type goes into `ALL_EVENT_TYPES` (then regenerate th
 and is emitted via its constant; a string that is not an emitted event type opts out with
 `// event-type-lint: allow — <reason>` on the line immediately above the literal.
 
+The same job runs the fixed-sleep lint,
+`cargo test -p intent-core --test fixed_sleep_lint`: it fails naming `file:line` for every
+`thread::sleep(` / `time::sleep(` / shell `sleep <n>` under `crates/*/tests/**/*.rs` that
+is neither justified nor grandfathered (intent-hq/intentd#1924 → this lint). Positive-path
+waits belong on an observable event (a barrier file, a `wait_until` poll on the state
+under test), not a fixed delay; a sleep that is genuinely a timing guard opts out with
+`// timing-guard: <reason>` on its own line or the line immediately above, and the reason
+is required. Existing offenders are grandfathered by
+`crates/intent-core/tests/fixed_sleep_baseline.txt` (`<path> <count>` per file), which only
+ratchets down: when a file's unannotated count drops, the lint fails printing the exact
+replacement line to paste; raising an entry, or adding one for a new file, needs a
+justification in the PR.
+
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.
 
