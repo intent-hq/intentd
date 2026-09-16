@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.62] - 2026-09-16
+
+### 🧪 Testing
+
+- *(sitter,intentd)* Deterministic release-file barriers for the signal-handshake e2e suites ([#1924](https://github.com/intent-hq/intentd/pull/1924))
+
+
 ## [0.9.61] - 2026-09-16
 
 ### 🚀 Features
