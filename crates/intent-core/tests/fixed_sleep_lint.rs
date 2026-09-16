@@ -15,9 +15,15 @@
 //!   line has a fixed sleep when it contains `thread::sleep(` or
 //!   `time::sleep(` anywhere, or a shell `sleep` at a word boundary followed
 //!   by blanks and a numeral / `{}` argument. Only the `sleep 60 &` stay-alive
-//!   idiom is exempt; comment lines never count.
-//! - Marker: `timing-guard: <reason>` on the sleep's own line or the line
-//!   immediately above exempts it (`// timing-guard: poll interval`).
+//!   idiom is exempt — the `&` must be the whole backgrounding operator, so
+//!   `sleep 60 && …` and `sleep 60 &> …` still count; comment lines never
+//!   count.
+//! - Marker: `// timing-guard: <reason>` on the sleep's own line or the line
+//!   immediately above exempts it (`// timing-guard: poll interval`). It
+//!   counts only inside a `//` line comment (standalone or trailing; not in
+//!   a string literal or a `/* … */` block) and only with a nonempty reason.
+//!   A marker with no reason is malformed: it never exempts the sleep and the
+//!   report names it.
 //! - Baseline (`tests/fixed_sleep_baseline.txt`): one `<path> <count>` line
 //!   per file that still has unannotated sleeps, sorted by path. It only
 //!   ratchets down: a file over its entry (or absent from the baseline) fails
@@ -30,8 +36,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Marker that exempts a fixed sleep when it sits on the sleep's line or the
-/// one above.
+/// Marker that exempts a fixed sleep when it sits in a `//` comment, followed
+/// by a reason, on the sleep's line or the one above.
 const TIMING_GUARD_MARKER: &str = "timing-guard:";
 
 /// Split so the lint's own source does not match itself.
@@ -46,8 +52,9 @@ const SELF_FILE: &str = "crates/intent-core/tests/fixed_sleep_lint.rs";
 /// [`TIME_SLEEP`] anywhere, or a shell `sleep` command — at a word boundary,
 /// followed by blanks — whose first argument is a numeral (`0.2`, `.2`,
 /// `"2"`, `'2'`) or a `{}` interpolation. Only the `sleep 60 &` stay-alive
-/// occurrence is exempt; any other sleep on the same line still counts.
-/// Comment lines never count.
+/// occurrence is exempt — and only when that `&` is the whole backgrounding
+/// operator, not the start of `&&` or `&>`; any other sleep on the same line
+/// still counts. Comment lines never count.
 fn line_has_fixed_sleep(line: &str) -> bool {
     let line = line.trim_start();
     if line.starts_with("//") {
@@ -63,7 +70,7 @@ fn line_has_fixed_sleep(line: &str) -> bool {
             .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
         let after = &line[at + word.len()..];
         let arg = after.trim_start_matches([' ', '\t']);
-        if !boundary || arg.len() == after.len() || arg.starts_with("60 &") {
+        if !boundary || arg.len() == after.len() || is_stay_alive(arg) {
             return false;
         }
         arg.trim_start_matches(['"', '\''])
@@ -71,28 +78,96 @@ fn line_has_fixed_sleep(line: &str) -> bool {
     })
 }
 
+/// Is `arg` (the text after a shell `sleep`) the `60 &` stay-alive idiom? The
+/// `&` must be the complete operator: followed by nothing, whitespace, or any
+/// character other than `&` (`&&`) or `>` (`&>`).
+fn is_stay_alive(arg: &str) -> bool {
+    arg.strip_prefix("60 &")
+        .is_some_and(|rest| !rest.starts_with(['&', '>']))
+}
+
+/// Marker state of one line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Marker {
+    Absent,
+    WithReason,
+    /// `timing-guard:` in a `//` comment with nothing after it.
+    Malformed,
+}
+
+/// The `//` line comment on `line`, if any: the first `//` that is not inside
+/// a string or character literal.
+fn line_comment(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'\'' if !in_string => {
+                if bytes.get(i + 1) == Some(&b'\\') {
+                    if let Some(end) = line[i + 2..].find('\'') {
+                        i += 2 + end;
+                    }
+                } else if bytes.get(i + 2) == Some(&b'\'') {
+                    i += 2;
+                }
+            }
+            b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => return Some(&line[i..]),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `WithReason` when `line`'s `//` comment carries [`TIMING_GUARD_MARKER`]
+/// followed by a nonempty reason, `Malformed` when the marker has no reason,
+/// `Absent` otherwise (including a marker in a string literal or block
+/// comment).
+fn classify_marker(line: &str) -> Marker {
+    let Some(comment) = line_comment(line) else {
+        return Marker::Absent;
+    };
+    let Some((_, reason)) = comment.split_once(TIMING_GUARD_MARKER) else {
+        return Marker::Absent;
+    };
+    if reason.trim().is_empty() {
+        Marker::Malformed
+    } else {
+        Marker::WithReason
+    }
+}
+
 /// An unannotated fixed sleep: its 1-based line and trimmed text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Sleep {
     line: usize,
     text: String,
+    /// Its line or the one above carries a marker with no reason.
+    marker_malformed: bool,
 }
 
-/// Every fixed sleep in `source` that carries no marker on its own line or
-/// the line immediately above.
+/// Every fixed sleep in `source` that carries no reasoned marker on its own
+/// line or the line immediately above.
 fn unannotated_sleeps(source: &str) -> Vec<Sleep> {
     let lines: Vec<&str> = source.lines().collect();
     lines
         .iter()
         .enumerate()
         .filter(|(_, line)| line_has_fixed_sleep(line))
-        .filter(|(i, line)| {
-            let above = if *i > 0 { lines[i - 1] } else { "" };
-            !line.contains(TIMING_GUARD_MARKER) && !above.contains(TIMING_GUARD_MARKER)
-        })
-        .map(|(i, line)| Sleep {
-            line: i + 1,
-            text: line.trim().to_string(),
+        .filter_map(|(i, line)| {
+            let above = if i > 0 { lines[i - 1] } else { "" };
+            let markers = [classify_marker(line), classify_marker(above)];
+            if markers.contains(&Marker::WithReason) {
+                return None;
+            }
+            Some(Sleep {
+                line: i + 1,
+                text: line.trim().to_string(),
+                marker_malformed: markers.contains(&Marker::Malformed),
+            })
         })
         .collect()
 }
@@ -188,11 +263,30 @@ fn classify(counts: &BTreeMap<String, usize>, baseline: &BTreeMap<String, usize>
     findings
 }
 
-/// The failure report: every unannotated `file:line` of an over-baseline
-/// file plus the fix, and the exact baseline line to write for a file whose
-/// count went down or disappeared.
+/// Every sleep whose marker is malformed, as `path:line: text`.
+fn malformed_markers(sleeps: &BTreeMap<String, Vec<Sleep>>) -> Vec<String> {
+    sleeps
+        .iter()
+        .flat_map(|(path, sleeps)| {
+            sleeps
+                .iter()
+                .filter(|sleep| sleep.marker_malformed)
+                .map(move |sleep| format!("{path}:{}: {}", sleep.line, sleep.text))
+        })
+        .collect()
+}
+
+/// The failure report: every malformed marker, every unannotated `file:line`
+/// of an over-baseline file plus the fix, and the exact baseline line to
+/// write for a file whose count went down or disappeared.
 fn render(findings: &[Finding], sleeps: &BTreeMap<String, Vec<Sleep>>) -> String {
     let mut out = Vec::new();
+    for site in malformed_markers(sleeps) {
+        out.push(format!(
+            "{site}\n  timing-guard marker is malformed: expected `// {TIMING_GUARD_MARKER} <reason>` \
+             in a `//` comment; the reason is required."
+        ));
+    }
     for finding in findings {
         match finding {
             Finding::Over {
@@ -318,7 +412,7 @@ fn fixed_sleeps_are_annotated_or_baselined() {
         .collect();
     let findings = classify(&counts, &baseline);
     assert!(
-        findings.is_empty(),
+        findings.is_empty() && malformed_markers(&sleeps).is_empty(),
         "fixed sleeps in e2e tests out of step with {BASELINE_FILE}:\n\n{}\n",
         render(&findings, &sleeps)
     );
@@ -329,8 +423,8 @@ fn fixed_sleeps_are_annotated_or_baselined() {
 #[test]
 fn line_has_fixed_sleep_cases() {
     // The 16 cases pinned by the supervisor_e2e.rs self-lint (#1924), then
-    // the tokio and identifier-suffix cases this lint adds.
-    let cases: [(&str, bool); 19] = [
+    // the tokio, identifier-suffix and `&`-operator cases this lint adds.
+    let cases: [(&str, bool); 23] = [
         ("sleep 0.2", true),
         ("sleep .2", true),
         ("sleep  0.2", true),
@@ -353,6 +447,10 @@ fn line_has_fixed_sleep_cases() {
         ),
         ("time::sleep(d).await", true),
         ("fn sleep_then(after: Duration, f: impl FnOnce()) {", false),
+        ("sleep 60 && echo", true),
+        ("sleep 60 &>/dev/null", true),
+        ("sleep 60 & wait $!", false),
+        ("sleep 60 &", false),
     ];
     for (line, expected) in cases {
         assert_eq!(
@@ -387,6 +485,52 @@ fn poll() {
         vec![9, 10, 11]
     );
     assert_eq!(found[0].text, "thread::sleep(Duration::from_millis(5));");
+    assert!(found.iter().all(|s| !s.marker_malformed), "{found:?}");
+}
+
+#[test]
+fn marker_counts_only_in_a_line_comment_and_needs_a_reason() {
+    let src = "\
+fn cases() {
+    thread::sleep(d); // timing-guard: trailing reason exempts
+    let c = '\"'; thread::sleep(d); // timing-guard: char literal before the comment
+    // timing-guard: standalone reason exempts
+    thread::sleep(d);
+    // timing-guard:
+    thread::sleep(d);
+    thread::sleep(d); // timing-guard:
+    let _ = 1;
+    thread::sleep(d); // timing-guard:   \t
+    let _ = 1;
+    let s = \"timing-guard: in a string\"; thread::sleep(d);
+    let s = \"// timing-guard: in a string\";
+    thread::sleep(d);
+    /* timing-guard: block comment */ thread::sleep(d);
+    thread::sleep(d);
+}
+";
+    let found = unannotated_sleeps(src);
+    assert_eq!(
+        found
+            .iter()
+            .map(|s| (s.line, s.marker_malformed))
+            .collect::<Vec<_>>(),
+        vec![
+            (7, true),
+            (8, true),
+            (10, true),
+            (12, false),
+            (14, false),
+            (15, false),
+            (16, false),
+        ]
+    );
+    assert_eq!(
+        classify_marker("    // timing-guard: reason"),
+        Marker::WithReason
+    );
+    assert_eq!(classify_marker("    // timing-guard:"), Marker::Malformed);
+    assert_eq!(classify_marker("    let _ = 1;"), Marker::Absent);
 }
 
 #[test]
@@ -395,7 +539,8 @@ fn a_sleep_on_the_first_line_has_no_line_above() {
         unannotated_sleeps("thread::sleep(d);\n"),
         vec![Sleep {
             line: 1,
-            text: "thread::sleep(d);".to_string()
+            text: "thread::sleep(d);".to_string(),
+            marker_malformed: false,
         }]
     );
     assert_eq!(
@@ -489,19 +634,35 @@ fn classification_against_the_baseline() {
 
 #[test]
 fn report_names_every_line_over_baseline_and_the_corrected_entry() {
-    let sleeps = BTreeMap::from([(
-        "crates/a/tests/over.rs".to_string(),
-        vec![
-            Sleep {
-                line: 12,
-                text: "thread::sleep(d);".to_string(),
-            },
-            Sleep {
-                line: 40,
-                text: "tokio::time::sleep(d).await;".to_string(),
-            },
-        ],
-    )]);
+    let sleeps = BTreeMap::from([
+        (
+            "crates/a/tests/over.rs".to_string(),
+            vec![
+                Sleep {
+                    line: 12,
+                    text: "thread::sleep(d);".to_string(),
+                    marker_malformed: false,
+                },
+                Sleep {
+                    line: 40,
+                    text: "tokio::time::sleep(d).await;".to_string(),
+                    marker_malformed: false,
+                },
+            ],
+        ),
+        (
+            "crates/a/tests/marked.rs".to_string(),
+            vec![Sleep {
+                line: 7,
+                text: "thread::sleep(d); // timing-guard:".to_string(),
+                marker_malformed: true,
+            }],
+        ),
+    ]);
+    assert_eq!(
+        malformed_markers(&sleeps),
+        vec!["crates/a/tests/marked.rs:7: thread::sleep(d); // timing-guard:".to_string()]
+    );
     let findings = vec![
         Finding::Over {
             path: "crates/a/tests/over.rs".to_string(),
@@ -524,6 +685,12 @@ fn report_names_every_line_over_baseline_and_the_corrected_entry() {
         },
     ];
     let report = render(&findings, &sleeps);
+    assert!(
+        report.contains(
+            "crates/a/tests/marked.rs:7: thread::sleep(d); // timing-guard:\n  timing-guard marker is malformed: expected `// timing-guard: <reason>`"
+        ),
+        "{report}"
+    );
     assert!(
         report.contains("crates/a/tests/over.rs:12: thread::sleep(d);"),
         "{report}"
