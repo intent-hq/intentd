@@ -292,6 +292,14 @@ pub(crate) struct PrMonitorSnapshot {
     /// silently instead of emitting a false post-upgrade wake.
     #[serde(default)]
     pub ejection_tracked: bool,
+    /// When the forge read that produced this snapshot SUCCEEDED (RFC 3339).
+    /// The freshness anchor for superseding the snapshot with a workspace
+    /// copy ([`superseded_by_terminal_copy`]): the row's `last_polled_at`
+    /// also advances on failed polls, which do not re-observe the PR.
+    /// Absent on snapshots persisted before the field existed; never
+    /// participates in the change diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
 }
 
 impl PrMonitorSnapshot {
@@ -357,6 +365,7 @@ impl SharedPrSnapshot {
             review_comment_count: self.review_comment_count,
             requirements,
             ejection_tracked,
+            observed_at: None,
         }
     }
 }
@@ -847,10 +856,11 @@ pub(crate) fn fold_monitor_pr_signals(
 /// Whether an ACTIVE monitor's snapshot is superseded by a workspace-owned
 /// terminal copy of the same PR (by URL). A `Merged` copy always wins —
 /// merged is the one irreversible forge state. A `Closed` copy wins only
-/// when its forge `updatedAt` is later than the monitor's last poll (or the
-/// poll time is unknown): a closed PR can be reopened, and a monitor that
-/// polled after the copy's timestamp and still saw the PR open is then the
-/// fresher observation. An unparseable copy timestamp never supersedes.
+/// when its forge `updatedAt` is later than the snapshot's own observation
+/// time ([`snapshot_observed_at`]; unknown → the copy wins): a closed PR can
+/// be reopened, and a monitor that re-observed the PR open after the copy's
+/// timestamp is then the fresher observation. An unparseable copy timestamp
+/// never supersedes.
 fn superseded_by_terminal_copy(
     m: &PrMonitor,
     snapshot: &PrMonitorSnapshot,
@@ -861,14 +871,33 @@ fn superseded_by_terminal_copy(
             && match pr.status {
                 PullRequestStatus::Merged => true,
                 PullRequestStatus::Closed => parse_iso(&pr.updated_at).is_some_and(|updated| {
-                    m.last_polled_at
-                        .as_deref()
-                        .and_then(parse_iso)
-                        .is_none_or(|polled| updated > polled)
+                    snapshot_observed_at(m, snapshot).is_none_or(|observed| updated > observed)
                 }),
                 PullRequestStatus::Open | PullRequestStatus::Draft => false,
             }
     })
+}
+
+/// When the monitor's persisted snapshot was actually read off the forge:
+/// the snapshot's own `observed_at`, or — for a snapshot persisted before
+/// that field existed — the row's `last_polled_at` only while the last poll
+/// SUCCEEDED. A failed poll ([`Services::record_pr_monitor_error`]) advances
+/// `last_polled_at` but keeps the previous snapshot, so under a recorded
+/// error the poll time says nothing about the snapshot's age.
+fn snapshot_observed_at(
+    m: &PrMonitor,
+    snapshot: &PrMonitorSnapshot,
+) -> Option<time::OffsetDateTime> {
+    snapshot
+        .observed_at
+        .as_deref()
+        .and_then(parse_iso)
+        .or_else(|| {
+            if m.last_error.is_some() {
+                return None;
+            }
+            m.last_polled_at.as_deref().and_then(parse_iso)
+        })
 }
 
 /// Light metadata for one ACTIVE PR monitor — the idle-visibility
@@ -1251,13 +1280,14 @@ impl Services {
 
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = RepoRef::new(repo_owner, repo_name);
-        let snapshot = fetch_snapshot(sc.as_ref(), &repo_ref, pr_number, None).await?;
+        let mut snapshot = fetch_snapshot(sc.as_ref(), &repo_ref, pr_number, None).await?;
         invalidate_fetch_cache(
             &self.pr_monitor_fetch_cache,
             &pr_key_for(&repo_ref, pr_number.cast_signed()),
         );
-        let baseline = serde_json::to_string(&snapshot).ok();
         let now = now_iso();
+        snapshot.observed_at = Some(now.clone());
+        let baseline = serde_json::to_string(&snapshot).ok();
 
         let mut adopted_from = None;
         let mut monitor = match existing {
@@ -2117,7 +2147,9 @@ impl Services {
             .last_snapshot
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
-        let fresh = shared.materialize(previous.as_ref());
+        let now = now_iso();
+        let mut fresh = shared.materialize(previous.as_ref());
+        fresh.observed_at = Some(now.clone());
 
         // Upgrade backfill: an anchor persisted before ejection tracking
         // existed has no event field at all, so the first tracked poll would
@@ -2176,7 +2208,6 @@ impl Services {
             .unwrap()
             .contains_key(&monitor.monitor_id);
 
-        let now = now_iso();
         // Anchors: `pending_since` marks when the coalesced set first became
         // non-empty; both anchors reset when it empties (a full revert
         // leaves nothing pending — and nothing to wake about).
@@ -2981,6 +3012,9 @@ mod tests {
         rate_limit_list_comments: bool,
         /// PR number whose `get_pr` pends forever (hung-connection regression).
         hang_get_pr: Option<u64>,
+        /// A real RFC 3339 `updatedAt` for the PR record, overriding the
+        /// opaque `rev-N` stand-in when a test needs a comparable timestamp.
+        updated_at: Option<String>,
         /// Stands in for the forge's `updatedAt`: bumped by every
         /// [`StubForge::edit`] (as GitHub bumps it on reviews, comments,
         /// threads and pushes), left alone by [`StubForge::edit_quiet`] (as
@@ -3016,6 +3050,7 @@ mod tests {
                 rate_limit_list_reviews: false,
                 rate_limit_list_comments: false,
                 hang_get_pr: None,
+                updated_at: None,
             }
         }
     }
@@ -3203,7 +3238,10 @@ mod tests {
                 mergeable_state: Some(s.mergeable_state.clone()),
                 head_sha: Some(s.head_sha.clone()),
                 created_at: String::new(),
-                updated_at: format!("rev-{}", s.revision),
+                updated_at: s
+                    .updated_at
+                    .clone()
+                    .unwrap_or_else(|| format!("rev-{}", s.revision)),
             })
         }
         async fn list_prs(
@@ -3609,6 +3647,7 @@ mod tests {
                 merge_queue_ejection: None,
             },
             ejection_tracked: true,
+            observed_at: None,
         };
         f(&mut s);
         s
@@ -7914,6 +7953,58 @@ mod tests {
                 "an older closed copy yields to the fresher open poll"
             );
         }
+        // Regression (intentd#1923 re-review): freshness is the snapshot's
+        // OWN observation time, not the last poll attempt. Open snapshot
+        // observed at T1 → PR closed at T2 → a failed poll at T3 advanced
+        // `last_polled_at` (with a recorded error) but kept the T1 snapshot:
+        // the T2 copy is fresher than anything the monitor saw and wins.
+        let open_signal = MonitorPrSignals {
+            queued: false,
+            open: true,
+            ready: true,
+            merged: false,
+        };
+        let mut errored = mk(
+            PrMonitorState::Active,
+            snap(|s| {
+                ready_requirements(&mut s.requirements);
+                s.observed_at = Some("2026-01-03T00:00:00Z".into());
+            }),
+        );
+        errored.last_polled_at = Some("2026-01-05T00:00:00Z".into());
+        errored.last_error = Some("rate limited".into());
+        assert_eq!(
+            fold_monitor_pr_signals(std::slice::from_ref(&errored), &[&stale_closed]),
+            MonitorPrSignals::default(),
+            "a closed copy newer than the last SUCCESSFUL observation supersedes"
+        );
+        // ...while a snapshot that re-observed the PR open AFTER the copy's
+        // timestamp stays the fresher observation, failed poll or not.
+        let mut reopened = errored.clone();
+        reopened.last_snapshot = snap(|s| {
+            ready_requirements(&mut s.requirements);
+            s.observed_at = Some("2026-01-04T12:00:00Z".into());
+        });
+        assert_eq!(
+            fold_monitor_pr_signals(std::slice::from_ref(&reopened), &[&stale_closed]),
+            open_signal,
+            "the reopened-state protection survives a later failed poll"
+        );
+        // Legacy snapshot without `observedAt`: `last_polled_at` stands in
+        // only while the last poll succeeded; under a recorded error the
+        // snapshot's age is unknown and the copy wins.
+        let mut legacy_errored = polled.clone();
+        legacy_errored.last_error = Some("rate limited".into());
+        assert_eq!(
+            fold_monitor_pr_signals(std::slice::from_ref(&polled), &[&stale_closed]),
+            open_signal,
+            "legacy row, clean poll: the poll time anchors freshness"
+        );
+        assert_eq!(
+            fold_monitor_pr_signals(std::slice::from_ref(&legacy_errored), &[&stale_closed]),
+            MonitorPrSignals::default(),
+            "legacy row, failed poll: unknown freshness yields to the copy"
+        );
         // A terminal copy of ANOTHER PR leaves the monitor's signal alone.
         let other = copy(
             PullRequestStatus::Merged,
@@ -7986,6 +8077,80 @@ mod tests {
         assert_eq!(untouched.state, PrMonitorState::Active);
         assert_eq!(untouched.last_snapshot, monitor.last_snapshot);
         assert!(untouched.pending_changes.is_empty());
+    }
+
+    /// Regression (intentd#1923 re-review), end to end — the rate-limit
+    /// pause case: the monitor observes the PR open (T1), the PR closes on
+    /// the forge (T2), a poll FAILS (T3: `last_polled_at` advances, the T1
+    /// snapshot stays), then `github.pulls.get` folds the closed copy (T4).
+    /// The copy is newer than the monitor's last successful observation, so
+    /// the rollup leaves the PR stage instead of holding `pr_ready` on the
+    /// stale open snapshot until the forge answers again.
+    #[tokio::test]
+    async fn pulls_get_closed_fold_overrides_monitor_stale_across_failed_poll() {
+        use intent_core::WorkspaceApi;
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let monitor = register(&svc, &ws, &owner).await;
+        let observed_at: PrMonitorSnapshot =
+            serde_json::from_str(monitor.last_snapshot.as_deref().unwrap()).unwrap();
+        let observed_at = observed_at
+            .observed_at
+            .expect("registration stamps observedAt");
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        let open =
+            crate::pr_ops::build_pr_info(&forge.get_pr(&RepoRef::new("o", "r"), 42).await.unwrap());
+        row.pr_number = Some(42);
+        row.pr_url = Some(open.url.clone());
+        row.pr_status = Some(PullRequestStatus::Open);
+        row.active_pull_request = Some(open.clone());
+        row.pull_requests = Some(vec![open]);
+        svc.store().update_workspace_pr_linkage(&row).await.unwrap();
+
+        // T2: closed on the forge, strictly after the T1 observation.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let closed_at = now_iso();
+        assert!(parse_iso(&closed_at) > parse_iso(&observed_at));
+        forge.edit(|s| {
+            s.pr_state = PrState::Closed;
+            s.updated_at = Some(closed_at.clone());
+        });
+        // T3: the poll fails; the row records the error and the attempt
+        // time, but the snapshot is still the T1 open one.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        forge.edit(|s| s.fail_get_pr = true);
+        svc.poll_pr_monitors().await;
+        let failed = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(failed.last_error.is_some(), "error recorded");
+        assert_eq!(failed.last_snapshot, monitor.last_snapshot, "snapshot kept");
+        assert!(
+            parse_iso(failed.last_polled_at.as_deref().unwrap()) > parse_iso(&closed_at),
+            "the failed attempt is later than the close"
+        );
+
+        // T4: the passive fold reads the closed PR straight from the forge.
+        forge.edit(|s| s.fail_get_pr = false);
+        svc.github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        let mut after = svc.store().get_workspace(&ws).await.unwrap();
+        assert_eq!(after.pr_status, Some(PullRequestStatus::Closed));
+        svc.enrich_workspace_aggregates(&mut after).await;
+        assert!(
+            !matches!(
+                after.display_status,
+                Some(
+                    intent_core::WorkspaceDisplayStatus::PrReady
+                        | intent_core::WorkspaceDisplayStatus::PrOpen
+                        | intent_core::WorkspaceDisplayStatus::PrQueued
+                )
+            ),
+            "the closed fold outranks the stale open snapshot despite the failed poll: {:?}",
+            after.display_status
+        );
     }
 
     /// Orthogonality with the PR stages: a workspace whose linked PR reads
