@@ -10140,34 +10140,15 @@ impl Services {
             return Ok(());
         }
         let target_id = &target_session.id;
-        if self.has_ready_to_send(target_id)
-            || self.agent_is_busy(target_id.clone())
-            || target_session.attention_request_kind.is_some()
-            || self.agent_is_waiting_on_agents(target_id)
-            || !self
-                .list_event_subscriptions_for_agent(target_id)
-                .is_empty()
-            || self.pending_question_count(target_id).await > 0
+        match self
+            .agent_has_non_monitor_waiting_reason(target_session)
+            .await
         {
-            return Ok(());
-        }
-        match self.store.get_interrupted_agent(target_id).await {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {}
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
             Err(e) => {
                 tracing::warn!(
-                    "idle-target watch guard: interrupted_agent check failed for {}: {e}",
-                    target_id.0
-                );
-                return Ok(());
-            }
-        }
-        match self.store.count_active_hooks_by_agent(target_id).await {
-            Ok(0) => {}
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(
-                    "idle-target watch guard: active-hook count failed for {}: {e}",
+                    "idle-target watch guard: waiting-reason probe failed for {}: {e}",
                     target_id.0
                 );
                 return Ok(());
@@ -10189,6 +10170,35 @@ impl Services {
              agent.wakeOrCreate resumes its task",
             target_id.0
         )))
+    }
+
+    /// Every waiting reason [`Services::check_idle_target_watchable`] counts
+    /// EXCEPT active PR monitors: a ready-to-send queue entry, a busy
+    /// worker, an unresolved attention request, live outgoing completion
+    /// watches, live event subscriptions, pending structured questions, an
+    /// interrupted row, or active hooks. Shared with the PR-monitor
+    /// parent-takeover predicate (`pr_monitor.rs`), whose "the child has
+    /// nothing left to do but hold the monitor" test is exactly this set
+    /// being empty. Store probe failures are propagated so each caller
+    /// picks its own fail-open/fail-closed policy.
+    pub(crate) async fn agent_has_non_monitor_waiting_reason(
+        &self,
+        session: &AgentSession,
+    ) -> Result<bool> {
+        let agent_id = &session.id;
+        if self.has_ready_to_send(agent_id)
+            || self.agent_is_busy(agent_id.clone())
+            || session.attention_request_kind.is_some()
+            || self.agent_is_waiting_on_agents(agent_id)
+            || !self.list_event_subscriptions_for_agent(agent_id).is_empty()
+            || self.pending_question_count(agent_id).await > 0
+        {
+            return Ok(true);
+        }
+        if self.store.get_interrupted_agent(agent_id).await?.is_some() {
+            return Ok(true);
+        }
+        Ok(self.store.count_active_hooks_by_agent(agent_id).await? > 0)
     }
 
     /// The registration-time mutual-wait guard: rejects an explicit watch

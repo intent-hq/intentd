@@ -1219,6 +1219,14 @@ impl Harness for V1 {
         )
     }
 
+    fn pr_monitor_transferred_to_parent_notice(&self, label: &str, parent_id: &str) -> String {
+        format!(
+            "[PR monitor {label}] Your parent agent ({parent_id}) took over this monitor \
+             because your work had settled — it now receives the PR's wakes and this \
+             monitor will not report to you again. No action is needed."
+        )
+    }
+
     fn delegation_first_message(&self, body: Option<&str>, title: &str, note_id: &str) -> String {
         // Build the preamble from adjacent string literals (via `concat!`)
         // so no source-level indentation leaks into the emitted bytes. Every

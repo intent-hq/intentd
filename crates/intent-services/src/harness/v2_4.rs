@@ -340,6 +340,10 @@ impl Harness for V2_4 {
         V1.pr_monitor_cancelled_workspace_archived_notice(label)
     }
 
+    fn pr_monitor_transferred_to_parent_notice(&self, label: &str, parent_id: &str) -> String {
+        V1.pr_monitor_transferred_to_parent_notice(label, parent_id)
+    }
+
     fn delegation_first_message(&self, body: Option<&str>, title: &str, note_id: &str) -> String {
         V1.delegation_first_message(body, title, note_id)
     }

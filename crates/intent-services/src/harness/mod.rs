@@ -362,6 +362,9 @@ pub(crate) trait Harness: Send + Sync {
     fn pr_monitor_cancelled_from_app_notice(&self, label: &str) -> String;
     /// Archive-sweep cancel notice.
     fn pr_monitor_cancelled_workspace_archived_notice(&self, label: &str) -> String;
+    /// Former-owner notice when the monitor was taken over by the owner's
+    /// parent (`reason: "transferred"`).
+    fn pr_monitor_transferred_to_parent_notice(&self, label: &str, parent_id: &str) -> String;
 
     // --- Other conversation-reaching strings (`agent_ops.rs`) ---
 
