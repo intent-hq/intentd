@@ -1,5 +1,4 @@
 use std::io;
-use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
@@ -20,10 +19,13 @@ use nix::unistd::Pid;
 /// Drop signals only while `try_wait()` still reports the child as running;
 /// see the crate docs for the reaped-pid caveat.
 pub struct GuardedChild {
-    /// `ManuallyDrop` only so [`GuardedChild::disarm`] can move the child
-    /// out; `Drop` for the guard is what tears it down.
-    child: ManuallyDrop<Child>,
+    /// `None` only once [`GuardedChild::disarm`] has moved the child out,
+    /// which leaves `Drop` nothing to tear down; every other path sees `Some`.
+    child: Option<Child>,
 }
+
+/// The `Some` invariant [`GuardedChild::child`] documents.
+const CHILD_TAKEN: &str = "GuardedChild holds its child until `disarm` consumes the guard";
 
 impl GuardedChild {
     /// Spawn `cmd` in its own process group (`setpgid(0, 0)` in the child)
@@ -34,9 +36,7 @@ impl GuardedChild {
     /// Any error from [`Command::spawn`].
     pub fn spawn(cmd: &mut Command) -> io::Result<Self> {
         let child = cmd.process_group(0).spawn()?;
-        Ok(Self {
-            child: ManuallyDrop::new(child),
-        })
+        Ok(Self { child: Some(child) })
     }
 
     /// Poll `try_wait()` until the child exits or `timeout` elapses; `None`
@@ -80,13 +80,13 @@ impl GuardedChild {
     /// Hand the `Child` back and skip the kill on drop: the caller now owns
     /// its teardown.
     #[must_use]
-    pub fn disarm(self) -> Child {
-        // Forget the guard so its `Drop` (the kill) never runs, then move the
-        // child out of the forgotten shell.
-        let mut this = ManuallyDrop::new(self);
-        // SAFETY: `this` is never dropped and never used again after this
-        // line, so the child is moved out exactly once.
-        unsafe { ManuallyDrop::take(&mut this.child) }
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the child is only ever taken here, on the consuming call"
+    )]
+    pub fn disarm(mut self) -> Child {
+        // Taking the child leaves the guard's `Drop` (the kill) nothing to do.
+        self.child.take().expect(CHILD_TAKEN)
     }
 
     fn pid(&self) -> Pid {
@@ -97,29 +97,30 @@ impl GuardedChild {
 impl Deref for GuardedChild {
     type Target = Child;
     fn deref(&self) -> &Child {
-        &self.child
+        self.child.as_ref().expect(CHILD_TAKEN)
     }
 }
 
 impl DerefMut for GuardedChild {
     fn deref_mut(&mut self) -> &mut Child {
-        &mut self.child
+        self.child.as_mut().expect(CHILD_TAKEN)
     }
 }
 
 impl Drop for GuardedChild {
     fn drop(&mut self) {
+        // `disarm` took the child: nothing left to tear down.
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
         // Only while the child is still alive does its pid still name the
         // group (and cannot have been reused); a reaped child is the test's
         // own business.
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let pgid = Pid::from_raw(self.child.id().cast_signed());
+        if matches!(child.try_wait(), Ok(None)) {
+            let pgid = Pid::from_raw(child.id().cast_signed());
             let _ = killpg(pgid, Signal::SIGKILL);
-            let _ = self.child.wait();
+            let _ = child.wait();
         }
-        // SAFETY: `drop` runs at most once and nothing reads `self.child`
-        // afterwards; `disarm` forgets the guard, so it never reaches here.
-        unsafe { ManuallyDrop::drop(&mut self.child) };
     }
 }
 
