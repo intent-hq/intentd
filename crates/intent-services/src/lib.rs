@@ -1053,6 +1053,12 @@ pub struct Services {
     /// [`Services::rehydrate_pr_monitors`] and consumed by the first poll
     /// that acts on each entry; shared across clones.
     pr_monitor_catch_up: pr_monitor::PrMonitorCatchUp,
+    /// Per-PR memory of the sweep's last FULL forge fetch (change
+    /// fingerprint + shared snapshot), so a poll whose `get_pr` reports an
+    /// unchanged fingerprint reuses the previous sub-fetches instead of
+    /// re-issuing them (see [`pr_monitor::PrMonitorFetchCache`]). In-memory
+    /// only; shared across clones.
+    pr_monitor_fetch_cache: pr_monitor::PrMonitorFetchCache,
     /// Explicit override for the centralized PR-monitor loop's poll cadence
     /// (seconds). `None` — the production wiring — reads
     /// `prMonitor.pollSeconds` live from the settings registry; values below
@@ -1303,6 +1309,7 @@ impl Services {
             hook_store_fault: None,
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
+            pr_monitor_fetch_cache: Arc::new(Mutex::new(HashMap::new())),
             pr_monitor_poll_seconds: None,
             pr_monitor_hourly_request_budget: None,
             pr_monitor_logged_interval: Arc::new(Mutex::new(None)),
