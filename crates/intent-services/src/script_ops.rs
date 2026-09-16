@@ -101,6 +101,13 @@ pub(crate) struct ManagedScript {
     /// start (whether its launch succeeds or fails), or by a `stop` (the
     /// dismiss).
     lost_at_daemon_stop: bool,
+    /// Set by `stop_all` on every entry that was `running` when the shutdown
+    /// sweep began: `mark_exited` then leaves the `was_running` marker set
+    /// (instead of clearing it) so the next boot reads the run as lost. This
+    /// is what covers a `script.run` command — its completion task has no
+    /// supervisor handle for the sweep to await, so its exit could otherwise
+    /// land after the sweep's marker write and erase it.
+    running_at_shutdown: bool,
 }
 
 /// Process-wide monotonic counter behind [`ManagedScript::generation`]. Every
@@ -324,6 +331,7 @@ impl ScriptManager {
                 supervisor: None,
                 generation: next_generation(),
                 lost_at_daemon_stop: false,
+                running_at_shutdown: false,
             },
         );
         publish_event(
@@ -386,6 +394,7 @@ impl ScriptManager {
                     supervisor: None,
                     generation: next_generation(),
                     lost_at_daemon_stop: lost,
+                    running_at_shutdown: false,
                 }
             });
         }
@@ -499,6 +508,7 @@ impl ScriptManager {
                                             supervisor: None,
                                             generation: next_generation(),
                                             lost_at_daemon_stop: false,
+                                            running_at_shutdown: false,
                                         },
                                     );
                                 }
@@ -780,12 +790,16 @@ impl ScriptManager {
     ///    settle promptly; the await is time-bounded as a backstop so a
     ///    wedged supervisor can never stall daemon shutdown.
     ///
-    /// The settled supervisors persisted `was_running = false` on their way
-    /// out (`mark_exited`), but a *graceful* daemon shutdown should leave the
-    /// same reading as a daemon death (monorepo#932): the marker is
-    /// re-persisted for every script that was running when the sweep began —
-    /// a service so the FE can offer to resurrect it on next boot, a command
-    /// so it hydrates as the terminal `lost` exit rather than a silent `idle`.
+    /// A *graceful* daemon shutdown should leave the same reading as a daemon
+    /// death (monorepo#932): every script that was running when the sweep
+    /// began keeps its `was_running` marker — a service so the FE can offer
+    /// to resurrect it on next boot, a command so it hydrates as the terminal
+    /// `lost` exit rather than a silent `idle`. The entry is flagged
+    /// `running_at_shutdown` under the same lock that snapshots its status,
+    /// so the `mark_exited` its exit reaches (a supervisor's, or a
+    /// `script.run` completion task's — which has no handle to await) leaves
+    /// the marker set; the sweep re-persists it afterwards as a backstop for
+    /// a supervisor that never settles.
     pub(crate) async fn stop_all(&self) -> (usize, usize) {
         struct Stopped {
             ws: WorkspaceId,
@@ -799,14 +813,16 @@ impl ScriptManager {
                 .iter_mut()
                 .map(|((ws, id), m)| {
                     m.stopped_by_user = true;
+                    let running = m.state.status == ScriptStatus::Running;
+                    m.running_at_shutdown = running;
                     Stopped {
                         ws: ws.clone(),
                         id: id.clone(),
                         handle: m.supervisor.take(),
-                        running: m.state.status == ScriptStatus::Running,
+                        running,
                     }
                 })
-                .filter(|s| s.handle.is_some())
+                .filter(|s| s.handle.is_some() || s.running)
                 .collect()
         };
         let scripts = victims.len();
@@ -1335,7 +1351,9 @@ impl ScriptManager {
     /// Stored-on-write: an exit (user stop or natural) durably clears the
     /// `was_running` marker — the process is gone, so a daemon death from
     /// here on must not resurrect the tab (or report the run as lost). An
-    /// auto-restart's respawn re-sets it via `mark_running`.
+    /// auto-restart's respawn re-sets it via `mark_running`. The one
+    /// exception is an exit forced by the shutdown sweep (`running_at_shutdown`):
+    /// the marker stays set so the next boot reads the run as lost.
     async fn mark_exited(
         &self,
         ws: &WorkspaceId,
@@ -1343,7 +1361,7 @@ impl ScriptManager {
         generation: u64,
         exit: Option<PtyExit>,
     ) -> Option<(bool, u32)> {
-        let (state, flags) = {
+        let (state, flags, keep_marker) = {
             let mut guard = self.scripts.lock().unwrap();
             let m = guard
                 .get_mut(&(ws.clone(), script_id.to_string()))
@@ -1355,9 +1373,15 @@ impl ScriptManager {
                 m.state.error = Some(EXIT_UNOBSERVABLE_ERROR.to_string());
             }
             m.state.stopped_at = Some(now_iso());
-            (m.state.clone(), (m.stopped_by_user, m.state.restart_count))
+            (
+                m.state.clone(),
+                (m.stopped_by_user, m.state.restart_count),
+                m.running_at_shutdown,
+            )
         };
-        self.persist_was_running(ws, script_id, false).await;
+        if !keep_marker {
+            self.persist_was_running(ws, script_id, false).await;
+        }
         self.emit_state(ws, script_id, &state).await;
         Some(flags)
     }
@@ -3105,6 +3129,7 @@ mod tests {
     /// state: when the child is reaped out of band so the host cannot read
     /// its status, both surfaces report `-1` — never the host's placeholder
     /// code — and they always agree.
+    #[cfg(unix)]
     #[tokio::test]
     async fn script_run_result_exit_code_matches_runtime_state_when_unobserved() {
         use nix::sys::signal::{kill, Signal};
@@ -3200,6 +3225,7 @@ mod tests {
     /// the daemon dies. The out-of-band reap races the host's own exit
     /// polls; whichever wins, the run terminates and the reading matches what
     /// was observable.
+    #[cfg(unix)]
     #[tokio::test]
     async fn child_reaped_out_of_band_settles_exited_with_sentinel() {
         use nix::sys::signal::{kill, Signal};
@@ -4237,6 +4263,7 @@ mod tests {
     /// noise lasted, because each chunk reconstructed the poll sleep. The run
     /// must reach `exited` with a code within a bounded time (the poll plus
     /// the straggler reap's TERM grace) and the noisy descendant must be gone.
+    #[cfg(unix)]
     #[tokio::test]
     async fn noisy_descendant_cannot_starve_exit_poll_after_leader_is_killed() {
         use nix::sys::signal::{kill, Signal};
@@ -4372,6 +4399,68 @@ mod tests {
             markers.contains(&(h.ws.as_str().to_string(), id.clone())),
             "was_running marker survives graceful shutdown: {markers:?}"
         );
+    }
+
+    /// Regression (PR #1942 review): a command started with `script.run` has
+    /// no supervisor — its completion task is detached — so the shutdown
+    /// sweep used to skip it: `stop_all` only kept markers for entries with a
+    /// supervisor handle, and the completion task's `mark_exited` cleared the
+    /// `was_running` marker, so the run hydrated on the next boot as a silent
+    /// `idle` instead of the lost `exited`/`-1` reading a `script.start` run
+    /// gets. The sweep must count the running `script.run`, `script.run` must
+    /// still settle with a result, and the marker must survive so a fresh
+    /// `Services` over the same store hydrates the lost terminal state.
+    #[tokio::test]
+    async fn shutdown_pty_sessions_keeps_lost_marker_for_running_script_run() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "cmd", SERVICE_CMD, ScriptMode::Command).await;
+        let services = h.services.clone();
+        let (ws, sid) = (h.ws.clone(), id.clone());
+        let run = tokio::spawn(async move { services.script_run(ws, sid, None, None).await });
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+
+        let (scripts, ptys) = h.services.shutdown_pty_sessions().await;
+        assert_eq!(
+            scripts, 1,
+            "the running script.run counts as a stopped script"
+        );
+        assert_eq!(ptys, 1, "its PTY was killed in the sweep");
+
+        let result = tokio::time::timeout(LIVENESS, run)
+            .await
+            .expect("script.run settles after the sweep")
+            .expect("join")
+            .expect("run");
+        assert!(
+            result["exitCode"].is_i64(),
+            "run result carries a code: {result}"
+        );
+        let exited = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        assert!(
+            exited["data"]["exitCode"].is_i64(),
+            "exited carries a code: {exited}"
+        );
+
+        let store = h.services.store().clone();
+        let markers = store
+            .list_was_running_script_ids()
+            .await
+            .expect("list markers");
+        assert!(
+            markers.contains(&(h.ws.as_str().to_string(), id.clone())),
+            "was_running marker survives graceful shutdown for script.run: {markers:?}"
+        );
+
+        let svc2 = Services::new(store);
+        assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
+        let st = svc2
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "exited", "lost run is terminal: {st}");
+        assert_eq!(st["exitCode"], EXIT_CODE_UNOBSERVABLE, "sentinel: {st}");
+        assert_eq!(st["error"], LOST_AT_DAEMON_STOP_ERROR, "cause named: {st}");
     }
 
     /// A stop-all racing an auto-restart respawn (monorepo#1526): the

@@ -598,14 +598,16 @@ fn emit_data(bus: Option<&EventBus>, ws: &WorkspaceId, terminal_id: &str, bytes:
 }
 
 /// Publish a self-sufficient `terminal:exit` event (durable, emitted after the
-/// stream task has broadcast every `terminal:data` chunk).
+/// stream task has broadcast every `terminal:data` chunk). `exitCode` is
+/// `null` when the status could not be read — a kill tore the session down,
+/// or the host latched an unobservable exit — never the host's placeholder.
 async fn emit_exit(
     bus: Option<&EventBus>,
     ws: &WorkspaceId,
     terminal_id: &str,
     exit: Option<PtyExit>,
 ) {
-    let exit_code = exit.map(|e| e.exit_code);
+    let exit_code = exit.as_ref().and_then(observed_exit_code);
     publish_event(
         bus,
         terminal_event(
@@ -774,12 +776,20 @@ fn acp_resolve(terminal_id: &str) -> AcpResult<PtyId> {
 }
 
 /// Convert a host [`PtyExit`] into the ACP exit shape (`signal` is unavailable
-/// through the host abstraction).
+/// through the host abstraction; `exit_code` is absent when the status was
+/// not observable).
 fn to_exit_info(exit: &PtyExit) -> TerminalExitInfo {
     TerminalExitInfo {
-        exit_code: Some(exit.exit_code),
+        exit_code: observed_exit_code(exit),
         signal: None,
     }
+}
+
+/// The exit code a terminal surface may report as real: `None` when the host
+/// could not read the status (`observed == false`), so its placeholder
+/// [`PtyExit::UNOBSERVABLE_CODE`] never leaks to clients as a genuine `1`.
+fn observed_exit_code(exit: &PtyExit) -> Option<u32> {
+    exit.observed.then_some(exit.exit_code)
 }
 
 #[cfg(all(test, unix))]
@@ -2496,5 +2506,63 @@ mod tests {
             adapter.output(id).await,
             Err(AcpError::Terminal(_))
         ));
+    }
+
+    /// Regression (PR #1942 review): an exit the host could not observe
+    /// (`observed: false`, placeholder code `1`) must not reach a terminal
+    /// surface as a real `1`. The ACP exit shape omits the code, and
+    /// `terminal:exit` carries `exitCode: null` — the same reading a kill
+    /// already produces — while an observed status still passes through.
+    #[test]
+    fn unobserved_exit_code_is_omitted_from_acp_exit_info() {
+        let unobserved = to_exit_info(&PtyExit::unobservable());
+        assert_eq!(unobserved.exit_code, None);
+        assert!(unobserved.signal.is_none());
+
+        let observed = to_exit_info(&PtyExit {
+            exit_code: 3,
+            success: false,
+            observed: true,
+        });
+        assert_eq!(observed.exit_code, Some(3));
+    }
+
+    #[tokio::test]
+    async fn unobserved_exit_code_is_null_on_terminal_exit_event() {
+        let (_tmp, bus) = bus().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        emit_exit(
+            Some(&bus),
+            &ws("ws-exit"),
+            "t-unobserved",
+            Some(PtyExit::unobservable()),
+        )
+        .await;
+        let ev = wait_for_event(&mut sub, TERMINAL_EXIT, TIMEOUT)
+            .await
+            .expect("terminal:exit for the unobserved exit");
+        assert_eq!(ev.data["terminalId"], json!("t-unobserved"));
+        assert!(
+            ev.data["exitCode"].is_null(),
+            "placeholder code must not leak: {}",
+            ev.data
+        );
+
+        emit_exit(
+            Some(&bus),
+            &ws("ws-exit"),
+            "t-observed",
+            Some(PtyExit {
+                exit_code: 2,
+                success: false,
+                observed: true,
+            }),
+        )
+        .await;
+        let ev = wait_for_event(&mut sub, TERMINAL_EXIT, TIMEOUT)
+            .await
+            .expect("terminal:exit for the observed exit");
+        assert_eq!(ev.data["exitCode"], json!(2));
     }
 }
