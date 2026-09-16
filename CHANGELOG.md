@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.66] - 2026-09-16
+
+### 🧪 Testing
+
+- *(services)* Deflake concurrent retire unread settle test ([#1938](https://github.com/intent-hq/intentd/pull/1938))
+
+
 ## [0.9.65] - 2026-09-16
 
 ### 🚀 Features
