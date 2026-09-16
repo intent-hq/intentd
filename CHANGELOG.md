@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.64] - 2026-09-16
+
+### 🧪 Testing
+
+- Share a process-group GuardedChild across e2e suites and lint raw Child ([#1928](https://github.com/intent-hq/intentd/pull/1928))
+
+
 ## [0.9.63] - 2026-09-16
 
 ### 🐛 Bug Fixes
