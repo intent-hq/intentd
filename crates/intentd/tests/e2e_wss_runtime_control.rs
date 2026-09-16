@@ -88,8 +88,16 @@ fn configure_serve(cmd: &mut Command, data_dir: &Path, listen: &str, env: &[(&st
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve");
+    let mut cmd = common::serve_command();
+    configure_serve(&mut cmd, data_dir, listen, env);
+    cmd.spawn().expect("spawn intentd serve")
+}
+
+/// [`spawn_serve`] without the `INTENTD_TCP_PORT=0` seam: the listener binds
+/// the seeded/settings `server.wsApi.port`, for tests whose assertion IS that
+/// port (a same-port listener restart, a batch's explicit port).
+fn spawn_serve_fixed_port(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+    let mut cmd = common::serve_command_fixed_port();
     configure_serve(&mut cmd, data_dir, listen, env);
     cmd.spawn().expect("spawn intentd serve")
 }
@@ -117,6 +125,57 @@ fn spawn_serve_under_stand_in_sitter(
         .arg(daemon_pid_path);
     configure_serve(&mut cmd, data_dir, listen, env);
     spawn_retrying_etxtbsy(&mut cmd, "stand-in sitter wrapper")
+}
+
+/// Builder contract: `common::serve_command` spawns the `intentd` bin's
+/// `serve` subcommand with the `INTENTD_TCP_PORT=0` ephemeral-port seam
+/// baked in; `serve_command_fixed_port` omits the seam; a later `.env` on
+/// the same `Command` overrides the seam, so deliberate pins keep working.
+#[test]
+fn serve_command_builders_own_the_tcp_port_seam() {
+    use std::ffi::OsStr;
+
+    fn tcp_port_env(cmd: &Command) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == OsStr::new("INTENTD_TCP_PORT"))
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    let cmd = common::serve_command();
+    assert_eq!(cmd.get_program(), OsStr::new(env!("CARGO_BIN_EXE_intentd")));
+    assert_eq!(
+        cmd.get_args().collect::<Vec<_>>(),
+        vec![OsStr::new("serve")],
+        "serve_command adds exactly the `serve` subcommand"
+    );
+    assert_eq!(
+        tcp_port_env(&cmd),
+        Some("0".to_string()),
+        "serve_command carries the INTENTD_TCP_PORT=0 seam"
+    );
+
+    let fixed = common::serve_command_fixed_port();
+    assert_eq!(
+        fixed.get_program(),
+        OsStr::new(env!("CARGO_BIN_EXE_intentd"))
+    );
+    assert_eq!(
+        fixed.get_args().collect::<Vec<_>>(),
+        vec![OsStr::new("serve")]
+    );
+    assert_eq!(
+        tcp_port_env(&fixed),
+        None,
+        "serve_command_fixed_port sets no INTENTD_TCP_PORT"
+    );
+
+    let mut pinned = common::serve_command();
+    pinned.env("INTENTD_TCP_PORT", "7000");
+    assert_eq!(
+        tcp_port_env(&pinned),
+        Some("7000".to_string()),
+        "a later .env overrides the builder's seam"
+    );
 }
 
 /// `spawn` with a bounded retry on ETXTBSY: a concurrently forked test
@@ -325,7 +384,7 @@ where
 async fn runtime_ws_listener_toggle_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     // Start daemon with both UDS and TCP (server.wsApi.enabled seeded in config.toml)
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -642,11 +701,11 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
 async fn batch_hook_ordering_port_before_enable() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    // No INTENTD_TCP_PORT: the env-0 ephemeral seam would override the batch's
+    // Fixed port: the env-0 ephemeral seam would override the batch's
     // explicit port and the bound port is exactly what proves hook ordering.
     // Boot UDS-only (no wsApi seed) so the batch below exercises a cold start.
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    let child = spawn_serve(&data_dir, "uds", &env);
+    let child = spawn_serve_fixed_port(&data_dir, "uds", &env);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -715,7 +774,7 @@ async fn wss_system_status_includes_capacity_version_uptime() {
     // existing fields (additive change for FE health menu).
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
         data_dir: data_dir.clone(),
@@ -894,6 +953,8 @@ async fn wss_system_request_update_signals_the_sitter() {
     std::fs::copy("/bin/sh", &sitter_bin).expect("copy stand-in sitter shell");
     let daemon_pid_path = sitter_dir.join("daemon.pid");
 
+    // The wrapper shell, not the `intentd` bin, is the spawned program, so
+    // `common::serve_command` cannot build it: carry its seam explicitly.
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let mut daemon = Daemon {
         child: spawn_serve_under_stand_in_sitter(
@@ -1012,7 +1073,7 @@ async fn wss_system_status_reports_budget_fields_when_installed() {
         "[agents]\nmemoryBudgetMb = 20480\n",
     )
     .expect("seed config.toml with agents.memoryBudgetMb");
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
         data_dir: data_dir.clone(),
@@ -1070,9 +1131,10 @@ async fn runtime_toggled_wss_serves_system_status() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    // Start daemon with ONLY UDS (no wsApi config seed)
+    // Start daemon with ONLY UDS (no wsApi config seed); fixed port so the
+    // runtime toggle binds exactly the port the settings.update names.
     let _daemon = Daemon {
-        child: spawn_serve(&data_dir, "uds", &env),
+        child: spawn_serve_fixed_port(&data_dir, "uds", &env),
         data_dir: data_dir.clone(),
         cleanup_data_dir: true,
     };
@@ -1195,7 +1257,7 @@ async fn runtime_bind_address_change_restarts_listener() {
     // Fixed seeded port (no INTENTD_TCP_PORT=0 seam) so the restarted
     // listener rebinds the same port and only the address changes.
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    let child = spawn_serve(&data_dir, "both", &env);
+    let child = spawn_serve_fixed_port(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -1366,8 +1428,9 @@ async fn runtime_bind_address_list_applies_and_validates() {
     }
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
+    // Fixed seeded port: the list-form restart must rebind the same port.
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    let child = spawn_serve(&data_dir, "both", &env);
+    let child = spawn_serve_fixed_port(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -1589,9 +1652,8 @@ async fn tunnel_settings_over_wss() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let tailcat = write_fake_tailcat(&data_dir);
     let tailcat_s = tailcat.to_string_lossy().to_string();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_TAILCAT_BIN", &tailcat_s),
     ];
     let child = spawn_serve(&data_dir, "both", &env);

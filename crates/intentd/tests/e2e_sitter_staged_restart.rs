@@ -13,7 +13,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::time::Duration;
 
 use nix::sys::signal::{self, Signal};
@@ -126,9 +126,8 @@ async fn launch_daemon_with(
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir workspaces dir");
     let behavior = json!({ "blockUntilCancel": true, "response": "parked" }).to_string();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    let mut command = common::serve_command();
     command
-        .arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -246,12 +245,11 @@ async fn sigusr2_during_held_teardown(trigger: StopTrigger) {
     common::enable_ws_api(data_dir);
     let tailcat_s = tailcat.to_string_lossy().to_string();
     let release_s = release_path.to_string_lossy().to_string();
-    // `INTENTD_TCP_PORT=0` binds an OS-assigned port, overriding the fixed
+    // `common::serve_command` binds an OS-assigned port, overriding the fixed
     // port `enable_ws_api` reserved and released, so a concurrent test cannot
     // claim it first. Nothing here needs the actual port number.
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_TAILCAT_BIN", &tailcat_s),
         (FAKE_TAILCAT_RELEASE_ENV, &release_s),
     ];

@@ -547,24 +547,54 @@ async fn await_wss_stopped_impl(socket: &Path, log_path: Option<&Path>) {
     }
 }
 
+/// The one way an e2e suite spawns `intentd serve`: the `intentd` test binary
+/// with the `serve` subcommand and the `INTENTD_TCP_PORT=0` ephemeral-port
+/// seam (monorepo#1051) already set, so a daemon whose WSS listener is enabled
+/// ([`enable_ws_api`]) binds a true OS-assigned port instead of racing another
+/// process for the seeded one. Callers add everything else themselves (data
+/// dir, workspaces dir, token, stdio, `process_group`, mock-agent env): the
+/// builder stays thin so migration is mechanical. The seam is inert for a
+/// UDS-only daemon (no WSS listener, no bind). A later `.env("INTENTD_TCP_PORT",
+/// …)` on the returned `Command` overrides the seam, so a deliberate pin (e.g.
+/// an out-of-range value to prove startup refusal) still works.
+///
+/// `serve_spawn_guard.rs` fails the suite on any other `serve` spawn of the
+/// `intentd` binary outside this module.
+pub fn serve_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd.arg("serve").env("INTENTD_TCP_PORT", "0");
+    cmd
+}
+
+/// [`serve_command`] WITHOUT the `INTENTD_TCP_PORT=0` seam: the WSS listener
+/// binds the `server.wsApi.port` seeded by [`enable_ws_api`] (or set later via
+/// `settings.update`), accepting the reserve-then-release TOCTOU window on
+/// that port. Only for suites that need the settings-file port to be the
+/// bound port — a listener restart that must rebind the same port, or a
+/// settings batch whose explicit port is exactly what the test proves.
+pub fn serve_command_fixed_port() -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd.arg("serve");
+    cmd
+}
+
 /// Enable the WSS/TCP listener for a daemon booted from `data_dir` by seeding
 /// `config.toml` with `[server.wsApi] enabled = true` plus an OS-assigned free
 /// port (the config-driven replacement for the retired `serve --listen both`
 /// flag: UDS always serves; the WSS listener boot-starts iff the effective
 /// `server.wsApi.enabled` is true, binding `server.wsApi.port`).
 ///
-/// Port interplay with the `INTENTD_TCP_PORT=0` seam (monorepo#1051): suites
-/// that spawn the daemon with `INTENTD_TCP_PORT=0` get a true OS-assigned
-/// ephemeral bind — the seam wins over the seeded settings port, eliminating
-/// the reserve-then-release TOCTOU race where another process grabbed the
-/// seeded port between this helper releasing it and the daemon binding it
-/// after full boot. The seeded port is only a fallback for spawns without the
-/// seam, keeping them off the fixed 5181 default that would collide across
-/// parallel daemons; such suites (and any daemon restarted on the same data
-/// dir with the seam, whose ephemeral port changes across boots) must read
-/// the real port from `system.status` ([`await_wss_status`]), never from the
-/// seeded config value. Appends to an existing seeded config; no-op if the
-/// table is already present.
+/// Port interplay: daemons spawned via [`serve_command`] carry the
+/// `INTENTD_TCP_PORT=0` seam, which wins over the seeded settings port, so
+/// they get a true OS-assigned ephemeral bind and never race another process
+/// for the port this helper reserved and released before the daemon booted
+/// (monorepo#1051). The seeded port is bound only by
+/// [`serve_command_fixed_port`] spawns, keeping them off the fixed 5181
+/// default that would collide across parallel daemons. Either way, read the
+/// real port from `system.status` ([`await_wss_status`]), never from the
+/// seeded config value — with the seam, the ephemeral port changes across
+/// boots on the same data dir. Appends to an existing seeded config; no-op if
+/// the table is already present.
 pub fn enable_ws_api(data_dir: &std::path::Path) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");

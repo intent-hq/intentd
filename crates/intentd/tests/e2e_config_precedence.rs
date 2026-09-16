@@ -10,7 +10,7 @@
 #![cfg(unix)]
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -31,9 +31,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -360,8 +359,7 @@ fn invalid_config_refuses_startup_with_key_in_error() {
     ] {
         let data_dir = temp_data_dir();
         std::fs::write(data_dir.path().join("config.toml"), body).expect("seed config.toml");
-        let out = Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .args(["serve"])
+        let out = common::serve_command()
             .env("INTENTD_DATA_DIR", data_dir.path())
             .output()
             .expect("run intentd serve");
@@ -387,8 +385,8 @@ fn invalid_config_refuses_startup_with_key_in_error() {
 #[test]
 fn out_of_range_env_pin_refuses_startup() {
     let data_dir = temp_data_dir();
-    let out = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["serve"])
+    // The explicit pin overrides the builder's ephemeral seam.
+    let out = common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir.path())
         .env("INTENTD_TCP_PORT", "80")
         .output()
