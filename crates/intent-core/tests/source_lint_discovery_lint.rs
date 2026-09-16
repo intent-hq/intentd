@@ -16,8 +16,13 @@
 //!   --no-deps`, no build): a crate with `autotests = false`, a lint placed in
 //!   a `tests/<subdir>/` cargo does not auto-discover, or a `[[test]]` renamed
 //!   away from the suffix would otherwise be silently skipped by the glob;
-//! - `.github/workflows/ci.yml` no longer contains the literal glob
-//!   invocation, so the wiring cannot quietly revert to hand-listing.
+//! - the `check` job in `.github/workflows/ci.yml` has no non-comment `run:`
+//!   line carrying the literal glob invocation, so the wiring cannot quietly
+//!   revert to hand-listing, be commented out, or drift into another job. This
+//!   is a bounded textual check (no YAML parser): the job block is the lines
+//!   between the two-space-indented `check:` key and the next key at that
+//!   indent or shallower, and the invocation must sit on the `run:` line
+//!   itself, not inside a `run: |` block.
 //!
 //! The workspace root is located from `CARGO_MANIFEST_DIR`, as the other lints
 //! do; the checks themselves take any root, which is how the fixture tests
@@ -111,6 +116,31 @@ fn lint_target_sources(root: &Path) -> BTreeSet<PathBuf> {
         .collect()
 }
 
+/// Whether the `check` job in the workflow text has a non-comment `run:` line
+/// invoking the lint glob.
+fn check_job_runs_glob(ci: &str) -> bool {
+    let mut in_check = false;
+    for line in ci.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if indent <= 2 {
+            in_check = indent == 2 && trimmed == "check:";
+            continue;
+        }
+        if in_check
+            && trimmed
+                .strip_prefix("run:")
+                .is_some_and(|rest| rest.contains(CI_INVOCATION))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn display_rel(rel: &Path) -> String {
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -138,10 +168,11 @@ fn undiscovered_lints(root: &Path) -> Vec<String> {
         })
         .collect();
     let ci = fs::read_to_string(root.join(CI_WORKFLOW)).unwrap_or_default();
-    if !ci.contains(CI_INVOCATION) {
+    if !check_job_runs_glob(&ci) {
         failures.push(format!(
-            "{CI_WORKFLOW}: no step runs `{CI_INVOCATION}` — the check job must select source \
-             lints by the `*_lint` glob, not by hand-listing them"
+            "{CI_WORKFLOW}: no non-comment `run:` line in the `check` job runs \
+             `{CI_INVOCATION}` — the check job must select source lints by the `*_lint` \
+             glob, not by hand-listing them"
         ));
     }
     failures
@@ -172,9 +203,10 @@ mod fixture {
     use std::fs;
     use std::path::Path;
 
-    /// A throwaway workspace with one crate `a` (auto-discovered tests unless
-    /// `autotests` is `Some(false)`) and a ci.yml carrying the glob step.
-    fn fixture(dir: &Path, autotests: Option<bool>) {
+    /// A throwaway workspace with one crate `a` holding `tests/x_lint.rs`
+    /// (`manifest_extra` is appended to its `Cargo.toml`) and a ci.yml whose
+    /// `check` job carries the glob step.
+    fn fixture(dir: &Path, manifest_extra: &str) {
         fs::write(
             dir.join("Cargo.toml"),
             "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
@@ -185,70 +217,115 @@ mod fixture {
         fs::create_dir_all(krate.join("tests")).unwrap();
         let mut manifest =
             String::from("[package]\nname = \"a\"\nversion = \"0.0.0\"\nedition = \"2021\"\n");
-        if let Some(flag) = autotests {
-            manifest.push_str("autotests = ");
-            manifest.push_str(if flag { "true\n" } else { "false\n" });
-        }
+        manifest.push_str(manifest_extra);
         fs::write(krate.join("Cargo.toml"), manifest).unwrap();
         fs::write(krate.join("src/lib.rs"), "").unwrap();
         fs::write(krate.join("tests/x_lint.rs"), "#[test]\nfn t() {}\n").unwrap();
+        write_ci(
+            dir,
+            &format!(
+                "jobs:\n  check:\n    steps:\n      - name: Source lints\n        run: {CI_INVOCATION}\n"
+            ),
+        );
+    }
+
+    fn write_ci(dir: &Path, content: &str) {
         let ci = dir.join(CI_WORKFLOW);
         fs::create_dir_all(ci.parent().unwrap()).unwrap();
-        fs::write(
-            ci,
-            format!("      - name: Source lints\n        run: {CI_INVOCATION}\n"),
-        )
-        .unwrap();
+        fs::write(ci, content).unwrap();
+    }
+
+    fn assert_single_failure_at(failures: &[String], prefix: &str) {
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].starts_with(prefix), "{failures:?}");
     }
 
     #[test]
     fn all_lint_files_discovered_passes() {
         let tmp = tempfile::tempdir().unwrap();
-        fixture(tmp.path(), None);
+        fixture(tmp.path(), "");
         assert_eq!(undiscovered_lints(tmp.path()), Vec::<String>::new());
     }
 
     #[test]
     fn nested_lint_file_is_reported() {
         let tmp = tempfile::tempdir().unwrap();
-        fixture(tmp.path(), None);
+        fixture(tmp.path(), "");
         let nested = tmp.path().join("crates/a/tests/sub");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("y_lint.rs"), "#[test]\nfn t() {}\n").unwrap();
-        let failures = undiscovered_lints(tmp.path());
-        assert_eq!(failures.len(), 1, "{failures:?}");
-        assert!(
-            failures[0].starts_with("crates/a/tests/sub/y_lint.rs: "),
-            "{failures:?}"
+        assert_single_failure_at(
+            &undiscovered_lints(tmp.path()),
+            "crates/a/tests/sub/y_lint.rs: ",
         );
     }
 
     #[test]
     fn autotests_false_crate_is_reported() {
         let tmp = tempfile::tempdir().unwrap();
-        fixture(tmp.path(), Some(false));
-        let failures = undiscovered_lints(tmp.path());
-        assert_eq!(failures.len(), 1, "{failures:?}");
-        assert!(
-            failures[0].starts_with("crates/a/tests/x_lint.rs: "),
-            "{failures:?}"
+        fixture(tmp.path(), "autotests = false\n");
+        assert_single_failure_at(
+            &undiscovered_lints(tmp.path()),
+            "crates/a/tests/x_lint.rs: ",
+        );
+    }
+
+    #[test]
+    fn test_target_renamed_away_from_the_suffix_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(
+            tmp.path(),
+            "[[test]]\nname = \"x\"\npath = \"tests/x_lint.rs\"\n",
+        );
+        assert_single_failure_at(
+            &undiscovered_lints(tmp.path()),
+            "crates/a/tests/x_lint.rs: ",
         );
     }
 
     #[test]
     fn ci_without_the_glob_is_reported() {
         let tmp = tempfile::tempdir().unwrap();
-        fixture(tmp.path(), None);
-        fs::write(
-            tmp.path().join(CI_WORKFLOW),
-            "      - name: Fixed-sleep lint\n        run: cargo test -p a --test x_lint\n",
-        )
-        .unwrap();
-        let failures = undiscovered_lints(tmp.path());
-        assert_eq!(failures.len(), 1, "{failures:?}");
-        assert!(
-            failures[0].starts_with(".github/workflows/ci.yml: "),
-            "{failures:?}"
+        fixture(tmp.path(), "");
+        write_ci(
+            tmp.path(),
+            "jobs:\n  check:\n    steps:\n      - name: Fixed-sleep lint\n        run: cargo test -p a --test x_lint\n",
+        );
+        assert_single_failure_at(
+            &undiscovered_lints(tmp.path()),
+            ".github/workflows/ci.yml: ",
+        );
+    }
+
+    #[test]
+    fn ci_with_the_glob_commented_out_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_ci(
+            tmp.path(),
+            &format!(
+                "jobs:\n  check:\n    steps:\n      # - name: Source lints\n      #   run: {CI_INVOCATION}\n      - run: cargo fmt --check\n"
+            ),
+        );
+        assert_single_failure_at(
+            &undiscovered_lints(tmp.path()),
+            ".github/workflows/ci.yml: ",
+        );
+    }
+
+    #[test]
+    fn ci_with_the_glob_only_in_another_job_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_ci(
+            tmp.path(),
+            &format!(
+                "jobs:\n  check:\n    steps:\n      - run: cargo fmt --check\n  build:\n    steps:\n      - name: Source lints\n        run: {CI_INVOCATION}\n"
+            ),
+        );
+        assert_single_failure_at(
+            &undiscovered_lints(tmp.path()),
+            ".github/workflows/ci.yml: ",
         );
     }
 }

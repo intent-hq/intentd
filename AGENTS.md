@@ -223,9 +223,10 @@ integration test is a source-scanning lint, selected by convention — run them 
 `packages/intentd`. Each lint fails naming `file:line`; its rationale, heuristic, and
 limits live in its module doc. `source_lint_discovery_lint` fails when a `*_lint.rs` file
 exists that the glob does not select (nested dir, `autotests = false`, renamed `[[test]]`)
-or when ci.yml drops the glob step, so a new lint needs no CI, Makefile, or docs wiring —
-add the file and a row below. Every opt-out marker requires a reason; baselines only
-ratchet down (the lint fails until a fixed file's entry is removed or lowered).
+or when ci.yml's `check` job has no non-comment `run:` line invoking the glob, so a new
+lint needs no CI, Makefile, or docs wiring — add the file and a row below. Every opt-out
+marker requires a reason; baselines only ratchet down (the lint fails until a fixed
+file's entry is removed or lowered).
 
 | Lint | Fails on | Opt-out / baseline |
 | --- | --- | --- |
@@ -236,7 +237,7 @@ ratchet down (the lint fails until a fixed file's entry is removed or lowered).
 | `tmp_hygiene_lint` | a raw `PathBuf::from("/tmp")` / `Path::new("/tmp")` / `temp_dir().join(..)` in test code instead of `test_tempdir` | trailing `// tmp-hygiene: allow — <reason>` |
 | `repo_cache_path_lint` | a literal `".repo-cache"` in test code instead of `intent_git::repo_cache::cache_root_for` / `cache_path_for` | trailing `// repo-cache-path: allow — <reason>` |
 | `serve_spawn_lint` | a single-statement `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"`, or a file calling `enable_ws_api(` without `serve_command` in code | `// serve-spawn: allow — <reason>` on the statement line, or anywhere in the file for the second rule |
-| `source_lint_discovery_lint` | a `*_lint.rs` file the glob does not select, or ci.yml without the glob step | none |
+| `source_lint_discovery_lint` | a `*_lint.rs` file the glob does not select, or a ci.yml `check` job with no non-comment `run:` line invoking the glob | none |
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.
