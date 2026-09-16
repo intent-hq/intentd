@@ -1223,7 +1223,9 @@ impl Harness for V1 {
         format!(
             "[PR monitor {label}] Your parent agent ({parent_id}) took over this monitor \
              because your work had settled — it now receives the PR's wakes and this \
-             monitor will not report to you again. No action is needed."
+             monitor will not report to you again. Do not re-register a monitor on this \
+             PR (ws.pr.monitor would be refused while your parent holds it); no other \
+             action is needed."
         )
     }
 

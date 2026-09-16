@@ -6705,15 +6705,28 @@ impl Services {
     /// registry count ([`Services::pending_question_count`]). Bounded: one
     /// session read plus at most one single-row message read
     /// ([`Store::get_agent_message_by_id`]) per call — this runs on every
-    /// turn prompt. Store errors fail open to `0`.
+    /// turn prompt. Store errors fail open to `0`
+    /// ([`Services::try_pending_question_tail_count`] is the propagating form).
     pub(crate) async fn pending_question_tail_count(&self, agent_id: &AgentId) -> usize {
-        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
-            return 0;
-        };
+        self.try_pending_question_tail_count(agent_id)
+            .await
+            .unwrap_or(0)
+    }
+
+    /// [`Services::pending_question_tail_count`] with store read/decode
+    /// errors PROPAGATED instead of collapsed to `0`, for callers whose
+    /// decision must fail closed on an unknown pending-question state (the
+    /// PR-monitor parent-takeover predicate). A marker pointing at a message
+    /// that no longer exists is an ordinary `0`, not an error.
+    pub(crate) async fn try_pending_question_tail_count(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<usize> {
+        let session = self.store.get_agent_session_summary(agent_id).await?;
         let pending = if session.pending_questions_marker_written() {
             session.pending_questions_message_id().map(str::to_string)
         } else {
-            let pending = self.pending_questions_from_tail(agent_id).await;
+            let pending = self.try_pending_questions_from_tail(agent_id).await?;
             if let Some(id) = pending.as_deref() {
                 self.record_pending_questions_marker(&session.workspace_id, agent_id, id)
                     .await;
@@ -6721,15 +6734,19 @@ impl Services {
             pending
         };
         let Some(pending) = pending else {
-            return 0;
+            return Ok(0);
         };
         if session.dismissed_questions_message_id() == Some(pending.as_str()) {
-            return 0;
+            return Ok(0);
         }
-        let Ok(Some(msg)) = self.store.get_agent_message_by_id(agent_id, &pending).await else {
-            return 0;
+        let Some(msg) = self
+            .store
+            .get_agent_message_by_id(agent_id, &pending)
+            .await?
+        else {
+            return Ok(0);
         };
-        question_block_count(&msg.content)
+        Ok(question_block_count(&msg.content))
     }
 
     /// This agent's structured questions currently pending — the
@@ -6749,29 +6766,46 @@ impl Services {
         in_turn + self.pending_question_tail_count(agent_id).await
     }
 
+    /// [`Services::pending_question_count`] with the tail-count's store
+    /// read/decode errors propagated ([`Services::try_pending_question_tail_count`]);
+    /// the in-turn registry count is in-memory and cannot fail.
+    pub(crate) async fn try_pending_question_count(&self, agent_id: &AgentId) -> Result<usize> {
+        let in_turn = self.turn_attachments.pending_count_by_mime(
+            agent_id,
+            intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+        );
+        Ok(in_turn + self.try_pending_question_tail_count(agent_id).await?)
+    }
+
     /// Legacy transcript tail-walk derivation, retained as the pre-upgrade
     /// fallback for sessions with no persisted pending-questions marker (see
     /// [`Services::questions_pending`]). Returns the id of the
     /// question-bearing assistant message pending on the session, so the
-    /// caller can materialize it as the marker.
+    /// caller can materialize it as the marker. Store errors fail open
+    /// (`None`); [`Services::try_pending_questions_from_tail`] propagates them.
     async fn pending_questions_from_tail(&self, agent_id: &AgentId) -> Option<String> {
+        self.try_pending_questions_from_tail(agent_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn try_pending_questions_from_tail(&self, agent_id: &AgentId) -> Result<Option<String>> {
         // Trailing `system` rows (e.g. repeated interruption notices) are
         // transparent to the derivation, so the anchor is simply the newest
         // non-system row — resolved by the store in one index-backed
         // statement that decodes at most ONE message
         // ([`Store::get_last_non_system_message`]), never by paging full
         // rows back through the tail. An empty or all-system transcript has
-        // nothing pending; store errors fail open.
-        let Ok(Some(last)) = self.store.get_last_non_system_message(agent_id).await else {
-            return None;
+        // nothing pending.
+        let Some(last) = self.store.get_last_non_system_message(agent_id).await? else {
+            return Ok(None);
         };
         if last.role != "assistant" || !has_question_blocks(&last.content) {
-            return None;
+            return Ok(None);
         }
-        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
-            return None;
-        };
-        (session.dismissed_questions_message_id() != Some(last.id.as_str())).then_some(last.id)
+        let session = self.store.get_agent_session_summary(agent_id).await?;
+        Ok((session.dismissed_questions_message_id() != Some(last.id.as_str())).then_some(last.id))
     }
 
     /// Persist the pending-questions marker for `message_id` — the assistant
@@ -10179,8 +10213,11 @@ impl Services {
     /// interrupted row, or active hooks. Shared with the PR-monitor
     /// parent-takeover predicate (`pr_monitor.rs`), whose "the child has
     /// nothing left to do but hold the monitor" test is exactly this set
-    /// being empty. Store probe failures are propagated so each caller
-    /// picks its own fail-open/fail-closed policy.
+    /// being empty. The interrupted-row and hook probe failures are
+    /// propagated so each caller picks its own fail-open/fail-closed policy;
+    /// the pending-question probe keeps the convenience API's fail-open
+    /// `0`, so a fail-closed caller pre-checks with
+    /// [`Services::try_pending_question_count`].
     pub(crate) async fn agent_has_non_monitor_waiting_reason(
         &self,
         session: &AgentSession,

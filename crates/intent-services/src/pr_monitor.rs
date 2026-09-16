@@ -1502,7 +1502,10 @@ impl Services {
     /// questions, live watches/subscriptions, or active hooks keeps its
     /// monitor. Every store probe fails CLOSED (not settled → the ordinary
     /// refusal): a takeover is a re-parenting write on a live agent's row,
-    /// so uncertainty must never adopt.
+    /// so uncertainty must never adopt — including the pending-question
+    /// read, which the shared helper's convenience API collapses to "none
+    /// pending" and is therefore probed here first in its propagating form
+    /// ([`Services::try_pending_question_count`]).
     async fn pr_monitor_child_settled(&self, child: &intent_core::AgentSession) -> bool {
         if let Some(task_note_id) = child.task_note_id.as_ref() {
             match self.store.get_note(&child.workspace_id, task_note_id).await {
@@ -1529,6 +1532,18 @@ impl Services {
         }
         if !matches!(child.status, AgentStatus::RuntimeIdle) {
             return false;
+        }
+        match self.try_pending_question_count(&child.id).await {
+            Ok(0) => {}
+            Ok(_) => return false,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %child.id.0,
+                    error = %e,
+                    "pr monitor takeover: pending-question probe failed; refusing"
+                );
+                return false;
+            }
         }
         match self.agent_has_non_monitor_waiting_reason(child).await {
             Ok(waiting) => !waiting,
@@ -4920,7 +4935,9 @@ mod tests {
         let notice = format!(
             "[PR monitor o/r#42] Your parent agent ({}) took over this monitor because \
              your work had settled — it now receives the PR's wakes and this monitor will \
-             not report to you again. No action is needed.",
+             not report to you again. Do not re-register a monitor on this PR \
+             (ws.pr.monitor would be refused while your parent holds it); no other action \
+             is needed.",
             parent.0
         );
         assert!(text.contains(&notice), "{text}");
@@ -5073,6 +5090,55 @@ mod tests {
                 .contains("sub-agent"),
             "{refused}"
         );
+    }
+
+    /// Store probes on the takeover path fail CLOSED: an idle child whose
+    /// pending-question state cannot be read (its newest transcript row no
+    /// longer decodes, so the question derivation errors while every other
+    /// probe succeeds) is refused, and the row keeps its owner. The
+    /// convenience count would have collapsed that error to "none pending"
+    /// and adopted.
+    #[tokio::test]
+    async fn a_parent_is_refused_when_the_childs_pending_question_state_is_unreadable() {
+        let (_db, _root, svc, _forge, ws, parent) = setup().await;
+        let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::RuntimeIdle).await;
+        let first = register(&svc, &ws, &child).await;
+        let msg = svc
+            .store()
+            .append_agent_message(&child, "assistant", &json!([]), &now_iso())
+            .await
+            .expect("assistant row");
+        sqlx::query("UPDATE agent_message SET content = '{bad' WHERE id = ?")
+            .bind(&msg.id)
+            .execute(svc.store().write_pool())
+            .await
+            .expect("corrupt message content");
+        assert!(
+            svc.try_pending_question_count(&child).await.is_err(),
+            "the propagating probe surfaces the decode error"
+        );
+        assert_eq!(
+            svc.pending_question_count(&child).await,
+            0,
+            "the convenience count still fails open"
+        );
+
+        let refused = svc
+            .pr_monitor_start_op(&ws, &parent, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(refused["reason"], json!("already-monitored"), "{refused}");
+        assert_eq!(refused["ownerAgentId"], json!(child.to_string()));
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(row.agent_id, child, "not re-parented");
+        assert_eq!(row.state, PrMonitorState::Active);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_message WHERE agent_id = ?")
+            .bind(&child.0)
+            .fetch_one(svc.store().write_pool())
+            .await
+            .expect("count child rows");
+        assert_eq!(rows, 1, "no wake without a transfer");
     }
 
     /// Only the DIRECT parent may take over: the parent's own parent is
