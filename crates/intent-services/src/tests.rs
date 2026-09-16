@@ -20067,7 +20067,7 @@ pub(crate) mod pr {
     /// `activePullRequest`, and the pool entry to Merged, emits one
     /// `pr:updated` and one `displayStatus-changed` to `pr_merged`, keeps
     /// the link (no discovery/unlink), and an identical re-fetch is a no-op.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_folds_merged_status_into_linked_workspace() {
         let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
         let (_t, _root, svc, ws_id) = fold_setup(|ws| {
@@ -20139,7 +20139,7 @@ pub(crate) mod pr {
     /// holds #43 (Open) — the fetch upserts the pool entry to Merged, leaves
     /// the (absent) link alone, and emits `pr:updated` plus the transition
     /// to `pr_merged`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_folds_merged_status_into_pool_only_workspace() {
         let (_t, _root, svc, ws_id) = fold_setup(|ws| {
             ws.pull_requests = Some(vec![pool_entry(
@@ -20184,7 +20184,7 @@ pub(crate) mod pr {
     /// upserts the root's pool entry to Merged, persists via the scoped
     /// git-root PR write, and emits `gitRoot:updated` plus the owning
     /// workspace's transition to `pr_merged`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_folds_merged_status_into_git_root_pool_entry() {
         let (_t, _root, svc, ws_id) = fold_setup(|_| {}).await;
         let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
@@ -20234,7 +20234,7 @@ pub(crate) mod pr {
 
     /// A PR nobody references: the response is served as before and the
     /// fold writes nothing — no row touched, no event of any kind.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_for_unreferenced_pr_writes_nothing() {
         let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
         let (_t, _root, svc, ws_id) = fold_setup(|ws| {
@@ -20276,7 +20276,7 @@ pub(crate) mod pr {
     /// A store failure inside the fold (the scoped PR-linkage write aborted
     /// by an injected trigger) never fails the RPC: the hover card still gets
     /// its `{ pull }`, the persisted state is untouched, and no event fires.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_fold_persist_failure_never_fails_the_rpc() {
         let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
         let (_t, _root, svc, ws_id) = fold_setup(|ws| {
@@ -20315,7 +20315,7 @@ pub(crate) mod pr {
     /// A store failure in the fold's lookup itself (a referencing row whose
     /// persisted pool no longer decodes) surfaces as the fold's `Err` and is
     /// equally fail-soft at the RPC boundary.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_fold_lookup_failure_never_fails_the_rpc() {
         let (_t, _root, svc, ws_id) = fold_setup(|_| {}).await;
         sqlx::query("UPDATE workspace SET pull_requests = ? WHERE id = ?")
@@ -20345,7 +20345,7 @@ pub(crate) mod pr {
     /// the single fetched snapshot — never `[Merged, Open]` with the stale
     /// duplicate holding the rollup at `pr_ready` — and the collapsed pool
     /// is stable under an identical re-fetch.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_fold_collapses_duplicate_pool_entries() {
         let open = pool_entry(43, intent_core::PullRequestStatus::Open, "");
         let (_t, _root, svc, ws_id) = fold_setup(|ws| {
@@ -20382,7 +20382,7 @@ pub(crate) mod pr {
     /// the forge answers with its canonical `o/r` URL — the store lookups
     /// compare `COLLATE NOCASE`, the pool upsert replaces (not appends), and
     /// the persisted copies adopt the forge casing.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_folds_case_variant_persisted_urls() {
         let mut open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
         open.url = "https://github.com/O/R/pull/42".into();

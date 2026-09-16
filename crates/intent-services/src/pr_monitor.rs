@@ -11392,7 +11392,7 @@ mod tests {
     /// merge — the stale monitor signal yields to the fresh terminal copy
     /// instead of holding the sidebar at `pr_open` until the next sweep —
     /// while the monitor row itself (snapshot, state) is left for the sweep.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_terminal_fold_overrides_stale_active_monitor_signal() {
         use intent_core::WorkspaceApi;
         let (_db, _root, svc, forge, ws, owner) = setup().await;
@@ -11450,7 +11450,7 @@ mod tests {
     /// The copy is newer than the monitor's last successful observation, so
     /// the rollup leaves the PR stage instead of holding `pr_ready` on the
     /// stale open snapshot until the forge answers again.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_closed_fold_overrides_monitor_stale_across_failed_poll() {
         use intent_core::WorkspaceApi;
         let (_db, _root, svc, forge, ws, owner) = setup().await;
