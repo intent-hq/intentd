@@ -593,8 +593,9 @@ pub fn serve_command_fixed_port() -> std::process::Command {
 /// default that would collide across parallel daemons. Either way, read the
 /// real port from `system.status` ([`await_wss_status`]), never from the
 /// seeded config value — with the seam, the ephemeral port changes across
-/// boots on the same data dir. Appends to an existing seeded config; no-op if
-/// the table is already present.
+/// boots on the same data dir. `serve_spawn_guard.rs` enforces this: a file
+/// that calls this helper must spawn through one of the two builders. Appends
+/// to an existing seeded config; no-op if the table is already present.
 pub fn enable_ws_api(data_dir: &std::path::Path) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");
