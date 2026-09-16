@@ -55,6 +55,18 @@ pub(crate) const EXIT_UNOBSERVABLE_ERROR: &str = "exit status unobservable";
 /// script that was running when the previous daemon process stopped.
 pub(crate) const LOST_AT_DAEMON_STOP_ERROR: &str =
     "lost: the daemon stopped while the script was running";
+
+/// The `exitCode` a finished run reports — one rule for both surfaces, the
+/// runtime state (`mark_exited`) and the `script.run` result envelope: the
+/// real code when the host observed the status, else
+/// [`EXIT_CODE_UNOBSERVABLE`] (no `PtyExit` at all, or one the host latched
+/// as unobserved — its placeholder code is never surfaced as real).
+fn terminal_exit_code(exit: Option<&PtyExit>) -> i64 {
+    match exit {
+        Some(e) if e.observed => i64::from(e.exit_code),
+        _ => EXIT_CODE_UNOBSERVABLE,
+    }
+}
 /// Backstop on awaiting supervisor settles during shutdown `stop_all`
 /// (monorepo#1526): their PTYs are already dead, so they normally settle in
 /// milliseconds — this bound only guards a wedged supervisor from stalling
@@ -81,7 +93,8 @@ pub(crate) struct ManagedScript {
     /// was still persisted (the daemon stopped mid-run): the runtime state
     /// carries the `exited`/`-1`/[`LOST_AT_DAEMON_STOP_ERROR`] reading and
     /// the marker is still set. Cleared — with the marker — by the next
-    /// start, or by a `stop` (the dismiss).
+    /// start (whether its launch succeeds or fails), or by a `stop` (the
+    /// dismiss).
     lost_at_daemon_stop: bool,
 }
 
@@ -987,7 +1000,7 @@ impl ScriptManager {
             output = last_n_lines(&output, usize::try_from(n).expect("value fits in usize"));
         }
         Ok(json!({
-            "exitCode": exit.map(|e| i64::from(e.exit_code)),
+            "exitCode": terminal_exit_code(exit.as_ref()),
             "output": output,
             "timedOut": timed_out,
         }))
@@ -1321,10 +1334,9 @@ impl ScriptManager {
                 .get_mut(&(ws.clone(), script_id.to_string()))
                 .filter(|m| m.generation == generation)?;
             m.state.status = ScriptStatus::Exited;
-            if let Some(e) = exit.filter(|e| e.observed) {
-                m.state.exit_code = Some(i64::from(e.exit_code));
-            } else {
-                m.state.exit_code = Some(EXIT_CODE_UNOBSERVABLE);
+            let code = terminal_exit_code(exit.as_ref());
+            m.state.exit_code = Some(code);
+            if code == EXIT_CODE_UNOBSERVABLE {
                 m.state.error = Some(EXIT_UNOBSERVABLE_ERROR.to_string());
             }
             m.state.stopped_at = Some(now_iso());
@@ -1352,8 +1364,15 @@ impl ScriptManager {
     /// with [`EXIT_CODE_UNOBSERVABLE`] (no process ever ran, so there is no
     /// code) and the failure as `error`, then emit `script:state`. A gone or
     /// recreated entry (generation mismatch) is left untouched.
+    ///
+    /// A command-mode entry still carrying the hydrated `lost` reading (this
+    /// launch was its retry) has that reading superseded by the failure: the
+    /// flag and the persisted `was_running` marker are cleared, so the next
+    /// boot hydrates it as plain `idle` rather than resurrecting the daemon
+    /// loss. A service's `previouslyRunning` marker is untouched — the
+    /// restore affordance stays until `mark_running` or a dismiss.
     async fn fail(&self, ws: &WorkspaceId, script_id: &str, generation: u64, err: &str) {
-        let state = {
+        let (state, lost_superseded) = {
             let mut guard = self.scripts.lock().unwrap();
             let Some(m) = guard
                 .get_mut(&(ws.clone(), script_id.to_string()))
@@ -1366,8 +1385,11 @@ impl ScriptManager {
             m.state.error = Some(err.to_string());
             m.state.stopped_at = Some(now_iso());
             m.pty_id = None;
-            m.state.clone()
+            (m.state.clone(), std::mem::take(&mut m.lost_at_daemon_stop))
         };
+        if lost_superseded {
+            self.persist_was_running(ws, script_id, false).await;
+        }
         self.emit_state(ws, script_id, &state).await;
     }
 
@@ -2914,6 +2936,211 @@ mod tests {
                 .is_empty(),
             "stop of the new run clears the marker"
         );
+    }
+
+    /// A hydrated lost command whose retry fails to launch (its cwd is
+    /// unavailable at the retry — here rejected by `resolve_cwd`, the
+    /// synchronous launch failure that lands in `fail()`; a merely vanished
+    /// directory is not a spawn failure, the PTY layer falls back to `$HOME`)
+    /// must not keep the stale `was_running` marker: the failure supersedes
+    /// the lost reading and the next boot hydrates a plain `idle`, not
+    /// another daemon-loss report for a run that already settled.
+    #[tokio::test]
+    async fn failed_relaunch_of_lost_command_clears_marker() {
+        let h = harness_with_worktree(true).await;
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "cmd".into(),
+                command: "echo never".into(),
+                mode: ScriptMode::Command,
+                cwd: Some("../escape".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let store = h.services.store().clone();
+
+        // The daemon died mid-run: the marker is still set on the next boot.
+        store
+            .set_script_was_running(h.ws.as_str(), &id, true)
+            .await
+            .expect("arm marker");
+        let bus2 = EventBus::new(store.clone());
+        let svc2 = Services::new(store.clone()).with_event_bus(bus2.clone());
+        let mut sub2 = bus2.subscribe(SubscriptionFilter {
+            event_types: vec!["script:*".to_string()],
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        });
+        assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
+        let st = svc2
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(
+            st["error"], LOST_AT_DAEMON_STOP_ERROR,
+            "hydrated lost: {st}"
+        );
+
+        // The retry fails in the launch path before any process runs.
+        svc2.script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let ev = await_state(&mut sub2, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        assert_eq!(ev["data"]["exitCode"], EXIT_CODE_UNOBSERVABLE, "{ev}");
+        assert_ne!(
+            ev["data"]["error"], LOST_AT_DAEMON_STOP_ERROR,
+            "the launch failure, not the lost reading, is the error: {ev}"
+        );
+        assert!(
+            store
+                .list_was_running_script_ids()
+                .await
+                .expect("list")
+                .is_empty(),
+            "a failed relaunch durably clears the lost marker"
+        );
+
+        // Fresh boot: plain idle, nothing resurrected as lost.
+        let svc3 = Services::new(store.clone());
+        assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 1);
+        let st = svc3.script_status(h.ws.clone(), id).await.expect("status");
+        assert_eq!(st["status"], "idle", "post-failure hydration: {st}");
+        assert!(
+            st.get("exitCode").is_none()
+                && st.get("error").is_none()
+                && st.get("previouslyRunning").is_none(),
+            "no marker-derived reading survives: {st}"
+        );
+    }
+
+    /// A service whose relaunch fails keeps its hydrated `previouslyRunning`
+    /// marker exactly as before: the restore affordance is only consumed by
+    /// a successful `mark_running` or a dismiss, never by a launch failure.
+    #[tokio::test]
+    async fn failed_relaunch_of_marked_service_keeps_marker() {
+        let h = harness_with_worktree(true).await;
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "svc".into(),
+                command: SERVICE_CMD.into(),
+                mode: ScriptMode::Service,
+                cwd: Some("../escape".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let store = h.services.store().clone();
+        store
+            .set_script_was_running(h.ws.as_str(), &id, true)
+            .await
+            .expect("arm marker");
+        let bus2 = EventBus::new(store.clone());
+        let svc2 = Services::new(store.clone()).with_event_bus(bus2.clone());
+        let mut sub2 = bus2.subscribe(SubscriptionFilter {
+            event_types: vec!["script:*".to_string()],
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        });
+        assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
+        svc2.script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        await_state(&mut sub2, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        assert_eq!(
+            store.list_was_running_script_ids().await.expect("list"),
+            vec![(h.ws.as_str().to_string(), id.clone())],
+            "service semantics unchanged: the marker survives a launch failure"
+        );
+        let svc3 = Services::new(store.clone());
+        assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 1);
+        let st = svc3.script_status(h.ws.clone(), id).await.expect("status");
+        assert_eq!(st["status"], "idle", "{st}");
+        assert_eq!(st["previouslyRunning"], true, "{st}");
+    }
+
+    /// One exit-code contract for both surfaces: the mapping behind the
+    /// runtime state and the `script.run` result reports the real code only
+    /// when the host observed it, and the `-1` sentinel otherwise — an
+    /// unobserved `PtyExit` never leaks its placeholder code.
+    #[test]
+    fn terminal_exit_code_maps_unobserved_to_sentinel() {
+        let observed = PtyExit {
+            exit_code: 3,
+            success: false,
+            observed: true,
+        };
+        assert_eq!(terminal_exit_code(Some(&observed)), 3);
+        let unobserved = PtyExit::unobservable();
+        assert_ne!(
+            i64::from(unobserved.exit_code),
+            EXIT_CODE_UNOBSERVABLE,
+            "the placeholder is distinct, so the mapping is observable"
+        );
+        assert_eq!(
+            terminal_exit_code(Some(&unobserved)),
+            EXIT_CODE_UNOBSERVABLE
+        );
+        assert_eq!(terminal_exit_code(None), EXIT_CODE_UNOBSERVABLE);
+    }
+
+    /// `script.run`'s result `exitCode` follows the same rule as the runtime
+    /// state: when the child is reaped out of band so the host cannot read
+    /// its status, both surfaces report `-1` — never the host's placeholder
+    /// code — and they always agree.
+    #[tokio::test]
+    async fn script_run_result_exit_code_matches_runtime_state_when_unobserved() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "cmd", SERVICE_CMD, ScriptMode::Command).await;
+        let services = h.services.clone();
+        let ws = h.ws.clone();
+        let sid = id.clone();
+        let run = tokio::spawn(async move { services.script_run(ws, sid, None, None).await });
+        let ev = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let pid = Pid::from_raw(
+            i32::try_from(
+                ev["data"]["pid"]
+                    .as_u64()
+                    .expect("running state carries the pid"),
+            )
+            .expect("pid fits"),
+        );
+
+        let reaper = std::thread::spawn(move || waitpid(pid, None));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        kill(pid, Signal::SIGKILL).expect("kill script child");
+        let reaped_by_test = reaper.join().expect("reaper thread").is_ok();
+
+        let out = run.await.expect("run task").expect("run");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "exited", "{st}");
+        assert!(
+            out["exitCode"].is_i64(),
+            "run result always carries a code: {out}"
+        );
+        assert_eq!(
+            out["exitCode"], st["exitCode"],
+            "one contract, both surfaces: run={out} status={st}"
+        );
+        if reaped_by_test {
+            assert_eq!(out["exitCode"], EXIT_CODE_UNOBSERVABLE, "{out}");
+        } else {
+            assert_ne!(
+                out["exitCode"], EXIT_CODE_UNOBSERVABLE,
+                "host read it: {out}"
+            );
+        }
     }
 
     /// `mark_exited` without an observable status (the host never yielded a
