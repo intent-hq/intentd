@@ -19,9 +19,10 @@
 //!   — in a type position: immediately after `->` (return type), after a
 //!   single `:` (field, binding, or parameter type), as a generic argument
 //!   (after `<`, or after a `,` whose enclosing bracket is `<`:
-//!   `Option<Child>`, `Result<E, Child>`), or as a tuple element (after `(`,
+//!   `Option<Child>`, `Result<E, Child>`), as a tuple element (after `(`,
 //!   or after a `,` whose enclosing bracket is `(`: `-> (Child, u16)`,
-//!   `struct LiveProcess(Child)`, `Vec<(u16, Child)>`). A visibility
+//!   `struct LiveProcess(Child)`, `Vec<(u16, Child)>`), or as an array /
+//!   slice element (after `[`: `[Child; 1]`, `Box<[Child]>`). A visibility
 //!   qualifier between the marker and the type — `pub`, `pub(crate)`,
 //!   `pub(super)`, `pub(self)`, `pub(in path)` — is skipped, so tuple-struct
 //!   fields such as `struct P(pub Child)` and `(u16, pub(crate) Child)` are
@@ -518,7 +519,7 @@ fn is_type_position(chars: &[char], start: usize) -> bool {
     match chars[k] {
         '>' => k > 0 && chars[k - 1] == '-',
         ':' => k == 0 || chars[k - 1] != ':',
-        '<' | '(' => true,
+        '<' | '(' | '[' => true,
         ',' => matches!(enclosing_open_bracket(chars, k), Some('<' | '(')),
         _ => false,
     }
@@ -720,6 +721,20 @@ mod heuristic {
                    fn h() -> (u16, std::process::Child, Arc<C>) { todo!() }\n\
                    let x: (Child, u16) = todo!();\n\
                    fn k() -> (u16, &Child) { todo!() }\n";
+        assert_eq!(hit_lines(src), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn array_and_slice_elements_hit() {
+        let src = "struct S { children: [Child; 1] }\n\
+                   fn f() -> Box<[Child]> { todo!() }\n\
+                   fn g(children: &mut [Child]) {}\n\
+                   let x: [std::process::Child; 2] = todo!();\n\
+                   fn h() -> Vec<[Option<Child>; 1]> { todo!() }\n\
+                   let bytes: [u8; 4] = [0; 4];\n\
+                   let pids = [child_pid, other_pid];\n\
+                   let kinds = [Kind::Child, Kind::Parent];\n\
+                   fn k() -> [GuardedChild; 1] { todo!() }\n";
         assert_eq!(hit_lines(src), vec![1, 2, 3, 4, 5]);
     }
 
