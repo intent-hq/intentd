@@ -14,10 +14,12 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use intentd_test_support::{Barrier, GuardedChild};
-use nix::sys::signal::Signal;
+use nix::errno::Errno;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedReadHalf;
@@ -142,13 +144,14 @@ async fn launch_daemon_with(
     (daemon, socket)
 }
 
-/// Write the HELD fake tailcat into `dir`: `genkey` touches
-/// `<release>.entered` (proof the daemon's tunnel mutex is now held across
-/// the blocked `ensure_key`; see [`Barrier::entered`]), blocks until the
-/// release file named by [`FAKE_TAILCAT_RELEASE_ENV`] exists (the same wait
-/// loop as [`Barrier::sh_wait`], reading the path from the environment), then
-/// writes the key; `serve` behaves like the other fake tailcats (prints the
-/// JSON address, sleeps).
+/// Write the HELD fake tailcat into `dir`: `genkey` records its pid in
+/// `<release>.pid` (see [`HeldGenkey::pid`]), touches `<release>.entered`
+/// (proof the daemon's tunnel mutex is now held across the blocked
+/// `ensure_key`; see [`Barrier::entered`]), blocks until the release file
+/// named by [`FAKE_TAILCAT_RELEASE_ENV`] exists (the same wait loop as
+/// [`Barrier::sh_wait`], reading the path from the environment), then writes
+/// the key; `serve` behaves like the other fake tailcats (prints the JSON
+/// address, sleeps).
 fn write_held_fake_tailcat(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("fake-tailcat-held.sh");
@@ -163,6 +166,7 @@ for arg in "$@"; do
 done
 case "$1" in
   genkey)
+    echo $$ > "{release}.pid"
     : > "{release}.entered"
     while [ ! -e "{release}" ]; do sleep 0.05; done
     printf 'key-%s' $$ > "$key"
@@ -180,6 +184,79 @@ esac
     path
 }
 
+/// The held fake `genkey`'s barrier plus its release-on-unwind fallback.
+///
+/// `GuardedChild` (correctly) skips the group kill once the daemon has been
+/// reaped, so a test that reaps its daemon and then panics would leave the
+/// fake `genkey` parked on the barrier forever. Dropping this guard releases
+/// the barrier and waits, bounded, for the recorded `genkey` pid to be gone,
+/// so the sidecar cannot race the `TempDir` removal. Declare it after the
+/// `TempDir` and before the [`Daemon`]: locals drop in reverse order, so the
+/// daemon goes first, then this guard, then the directory.
+struct HeldGenkey {
+    barrier: Barrier,
+    pid_path: PathBuf,
+}
+
+impl HeldGenkey {
+    fn new(data_dir: &Path) -> Self {
+        let barrier = Barrier::new(data_dir, "genkey");
+        let mut pid_path = barrier.path().as_os_str().to_owned();
+        pid_path.push(".pid");
+        Self {
+            barrier,
+            pid_path: pid_path.into(),
+        }
+    }
+
+    fn barrier(&self) -> &Barrier {
+        &self.barrier
+    }
+
+    /// The pid the fake `genkey` recorded on arrival, once it has.
+    fn pid(&self) -> Option<u32> {
+        std::fs::read_to_string(&self.pid_path)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+}
+
+impl Drop for HeldGenkey {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.barrier.path(), b"");
+        let Some(pid) = self.pid() else {
+            return;
+        };
+        if !wait_for_process_exit(pid, common::test_timeout(Duration::from_secs(5))) {
+            eprintln!("fake tailcat genkey {pid} still alive after the barrier release");
+        }
+    }
+}
+
+/// Whether `pid` still names a process (signal 0 probe), zombies included.
+fn process_alive(pid: u32) -> bool {
+    match kill(Pid::from_raw(pid.cast_signed()), None) {
+        Ok(()) => true,
+        Err(Errno::ESRCH) => false,
+        Err(e) => panic!("kill({pid}, 0): {e}"),
+    }
+}
+
+/// Poll `kill(pid, 0)` until it reports `ESRCH` or `budget` elapses; whether
+/// the process left in time.
+fn wait_for_process_exit(pid: u32, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while process_alive(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
 /// Poll for the fake `genkey` to reach `barrier` within `budget`; panics
 /// (with the daemon log) if it never does.
 async fn wait_for_entered(barrier: &Barrier, budget: Duration, daemon: &Daemon) {
@@ -193,6 +270,49 @@ async fn wait_for_entered(barrier: &Barrier, budget: Duration, daemon: &Daemon) 
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Boot a supervised daemon with the WSS listener up and a HELD fake tailcat
+/// in `data_dir`, enable the tunnel at runtime (the RPC parks inside
+/// `start_tunnel` holding the tunnel mutex, blocked on the fake `genkey`),
+/// and wait for the `genkey` to reach `genkey`'s barrier. The returned
+/// [`Client`] is the never-awaited tunnel connection; keep it alive for as
+/// long as the hold must last.
+async fn launch_held_teardown(
+    data_dir: &Path,
+    script: &str,
+    genkey: &HeldGenkey,
+) -> (Daemon, PathBuf, Client) {
+    let tailcat = write_held_fake_tailcat(data_dir);
+    common::enable_ws_api(data_dir);
+    let tailcat_s = tailcat.to_string_lossy().to_string();
+    let release_s = genkey.barrier().path().to_string_lossy().to_string();
+    // `common::serve_command` binds an OS-assigned port, overriding the fixed
+    // port `enable_ws_api` reserved and released, so a concurrent test cannot
+    // claim it first. Nothing here needs the actual port number.
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TAILCAT_BIN", &tailcat_s),
+        (FAKE_TAILCAT_RELEASE_ENV, &release_s),
+    ];
+    let (daemon, socket) = launch_daemon_with(data_dir, script, true, &env).await;
+    // `start_tunnel` requires the WSS listener to be up.
+    let status = common::await_wss_status_logged(&socket, &daemon.log_path).await;
+    assert!(status["result"]["port"].as_u64().is_some(), "{status}");
+
+    // Enable the tunnel on a dedicated connection whose response is never
+    // awaited: the hook is parked in `start_tunnel` → `ensure_key` → the
+    // held fake `genkey`, holding the tunnel mutex until released.
+    let mut tunnel_client = Client::connect(&socket).await;
+    tunnel_client
+        .send(
+            1,
+            "settings.update",
+            json!({ "changes": [{ "path": "server.tunnel.enabled", "value": true }] }),
+        )
+        .await;
+    wait_for_entered(genkey.barrier(), exit_budget(), &daemon).await;
+    (daemon, socket, tunnel_client)
 }
 
 /// How the requested stop that must win the shutdown race is triggered.
@@ -215,39 +335,12 @@ async fn sigusr2_during_held_teardown(trigger: StopTrigger) {
     };
     let data_dir_guard = common::test_tempdir("itd-sr-");
     let data_dir = data_dir_guard.path();
-    let tailcat = write_held_fake_tailcat(data_dir);
     // Declared before `daemon` so the daemon (and the fake `genkey` parked in
-    // its process group) is torn down first on drop; nothing is left waiting
-    // on the barrier after a panic.
-    let barrier = Barrier::new(data_dir, "genkey");
-    common::enable_ws_api(data_dir);
-    let tailcat_s = tailcat.to_string_lossy().to_string();
-    let release_s = barrier.path().to_string_lossy().to_string();
-    // `common::serve_command` binds an OS-assigned port, overriding the fixed
-    // port `enable_ws_api` reserved and released, so a concurrent test cannot
-    // claim it first. Nothing here needs the actual port number.
-    let env: [(&str, &str); 3] = [
-        ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TAILCAT_BIN", &tailcat_s),
-        (FAKE_TAILCAT_RELEASE_ENV, &release_s),
-    ];
-    let (mut daemon, socket) = launch_daemon_with(data_dir, &script, true, &env).await;
-    // `start_tunnel` requires the WSS listener to be up.
-    let status = common::await_wss_status_logged(&socket, &daemon.log_path).await;
-    assert!(status["result"]["port"].as_u64().is_some(), "{status}");
-
-    // Enable the tunnel on a dedicated connection whose response is never
-    // awaited: the hook is parked in `start_tunnel` → `ensure_key` → the
-    // held fake `genkey`, holding the tunnel mutex until released.
-    let mut tunnel_client = Client::connect(&socket).await;
-    tunnel_client
-        .send(
-            1,
-            "settings.update",
-            json!({ "changes": [{ "path": "server.tunnel.enabled", "value": true }] }),
-        )
-        .await;
-    wait_for_entered(&barrier, exit_budget(), &daemon).await;
+    // its process group) is torn down first on drop; the guard then releases
+    // whatever is still waiting on the barrier before the directory goes.
+    let genkey = HeldGenkey::new(data_dir);
+    let (mut daemon, socket, _tunnel_client) =
+        launch_held_teardown(data_dir, &script, &genkey).await;
 
     match trigger {
         StopTrigger::Sigterm => daemon.signal(Signal::SIGTERM),
@@ -280,7 +373,7 @@ async fn sigusr2_during_held_teardown(trigger: StopTrigger) {
     let log = daemon.log();
     assert!(!log.contains("staged update restart accepted"), "{log}");
 
-    barrier.release();
+    genkey.barrier().release();
     let status = daemon.wait_exit(exit_budget()).await.unwrap_or_else(|| {
         panic!(
             "daemon did not exit after the barrier was released\n--- daemon log ---\n{}",
@@ -594,6 +687,44 @@ async fn sigusr2_during_held_teardown_after_sigterm_does_not_hijack_the_exit_cod
 #[tokio::test]
 async fn sigusr2_during_held_teardown_after_system_shutdown_does_not_hijack_the_exit_code() {
     sigusr2_during_held_teardown(StopTrigger::SystemShutdown).await;
+}
+
+/// A held-teardown test that reaps its daemon and then leaves (early exit or
+/// panic) must not leave the fake `genkey` parked behind the barrier:
+/// `GuardedChild` skips the group kill on a reaped pid, so the release is on
+/// [`HeldGenkey`], which also waits for the sidecar to be gone before the
+/// `TempDir` is removed.
+#[tokio::test]
+async fn reaped_daemon_still_releases_the_parked_genkey_on_drop() {
+    let Some(script) = mock_agent_script() else {
+        return;
+    };
+    let data_dir_guard = common::test_tempdir("itd-sr-");
+    let data_dir = data_dir_guard.path();
+    let genkey_pid = {
+        let genkey = HeldGenkey::new(data_dir);
+        let (mut daemon, _socket, _tunnel_client) =
+            launch_held_teardown(data_dir, &script, &genkey).await;
+        let genkey_pid = genkey
+            .pid()
+            .expect("fake genkey recorded its pid on arrival");
+        assert!(process_alive(genkey_pid), "fake genkey must be parked");
+
+        // Mirror the early-exit path: SIGKILL only the daemon and reap it, so
+        // the guard's group kill on drop is (correctly) a no-op.
+        daemon.child.kill().expect("kill daemon");
+        daemon.child.wait().expect("reap daemon");
+        assert!(
+            process_alive(genkey_pid),
+            "fake genkey must outlive its reaped daemon until released"
+        );
+        genkey_pid
+    };
+
+    assert!(
+        wait_for_process_exit(genkey_pid, common::test_timeout(Duration::from_secs(5))),
+        "fake genkey {genkey_pid} still alive after the held-teardown scope ended"
+    );
 }
 
 /// Without the sitter's handshake marker SIGUSR2 is logged and ignored (the
