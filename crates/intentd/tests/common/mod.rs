@@ -558,8 +558,11 @@ async fn await_wss_stopped_impl(socket: &Path, log_path: Option<&Path>) {
 /// …)` on the returned `Command` overrides the seam, so a deliberate pin (e.g.
 /// an out-of-range value to prove startup refusal) still works.
 ///
-/// `serve_spawn_guard.rs` fails the suite on any other `serve` spawn of the
-/// `intentd` binary outside this module.
+/// `serve_spawn_guard.rs` is a bounded textual backstop for this: it fails
+/// the suite on a single-statement `Command::new(env!("CARGO_BIN_EXE_intentd"))
+/// … "serve"` outside this module (30-line cap), and on a file whose code calls
+/// [`enable_ws_api`] without a builder call in code. A split-statement raw
+/// spawn in a file that also calls a builder is not detected.
 pub fn serve_command() -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve").env("INTENTD_TCP_PORT", "0");
@@ -593,9 +596,11 @@ pub fn serve_command_fixed_port() -> std::process::Command {
 /// default that would collide across parallel daemons. Either way, read the
 /// real port from `system.status` ([`await_wss_status`]), never from the
 /// seeded config value — with the seam, the ephemeral port changes across
-/// boots on the same data dir. `serve_spawn_guard.rs` enforces this: a file
-/// that calls this helper must spawn through one of the two builders. Appends
-/// to an existing seeded config; no-op if the table is already present.
+/// boots on the same data dir. `serve_spawn_guard.rs` backs this up with a
+/// file-level rule: a file whose code calls this helper must also call one of
+/// the two builders in code (comments do not count), or carry a reasoned
+/// `serve-spawn: allow` marker. Appends to an existing seeded config; no-op if
+/// the table is already present.
 pub fn enable_ws_api(data_dir: &std::path::Path) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");

@@ -173,12 +173,14 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
 - **Daemon spawns** — build them with `common::serve_command()` (the `intentd` binary,
   `serve`, and the `INTENTD_TCP_PORT=0` ephemeral-port seam so WSS daemons never race for
   the port `enable_ws_api` seeded), or `common::serve_command_fixed_port()` only when the
-  test must bind the settings-file port. `serve_spawn_guard.rs` fails the suite on any other
-  `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"` statement, and on a file that
-  calls `enable_ws_api(` without `serve_command`. Opt out with
-  `// serve-spawn: allow — <reason>` — on the offending statement's line for the first
-  rule, anywhere in the file for the second (wrapper-program launchers only; reason
-  required).
+  test must bind the settings-file port. `serve_spawn_guard.rs` is a bounded textual
+  backstop: it fails the suite on a single-statement
+  `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"` (30-line cap), and on a file
+  whose code calls `enable_ws_api(` without `serve_command` in code (comments stripped;
+  a split-statement raw spawn beside a genuine builder call is not detected). Opt out
+  with `// serve-spawn: allow — <reason>` — on the offending statement's line for the
+  first rule, anywhere in the file for the second (wrapper-program launchers only;
+  reason required).
 
 ### Asserting the protocol contract
 

@@ -6,21 +6,28 @@
 //! for suites that must bind the settings-file port. A file-local
 //! `Command::new(env!("CARGO_BIN_EXE_intentd")).arg("serve")` bypasses the seam
 //! and races other daemons for the seeded port (intentd#1924, thread
-//! r4022009875) — this test fails naming the offending `file:line`s so the
-//! race class cannot return silently.
+//! r4022009875) — this test fails naming the offending `file:line`s.
 //!
-//! Rules, applied to every `.rs` under `crates/intentd/tests/` except the
-//! builder module and this guard:
+//! This is a bounded textual heuristic, not a dataflow analysis. Rules,
+//! applied to every `.rs` under `crates/intentd/tests/` except the builder
+//! module and this guard:
 //!
-//! 1. A line containing `Command::new(env!("CARGO_BIN_EXE_intentd"))`
-//!    (whitespace-insensitive; std and tokio forms alike) is an offender when
-//!    the statement it starts — from that line through the first line whose
-//!    code part ends with `;` or `{`, capped at 30 lines — contains the literal
-//!    `"serve"`. Non-`serve` CLI invocations (`doctor`, `status`, `stop`, …)
-//!    are not flagged.
-//! 2. A file that calls `enable_ws_api(` must also mention `serve_command`;
-//!    this catches launchers that bind the binary path to a variable and add
-//!    `"serve"` in a later statement.
+//! 1. Statement backstop. A line containing
+//!    `Command::new(env!("CARGO_BIN_EXE_intentd"))` (whitespace-insensitive;
+//!    std and tokio forms alike) is an offender when the single statement it
+//!    starts — from that line through the first line whose code part ends with
+//!    `;` or `{`, capped at 30 lines (fail-open past the cap) — contains the
+//!    literal `"serve"`. Non-`serve` CLI invocations (`doctor`, `status`,
+//!    `stop`, …) are not flagged.
+//! 2. File rule, the primary net for WSS suites. A file whose code calls
+//!    `enable_ws_api(` must also name `serve_command` in code; `//` and
+//!    `/* … */` comments are stripped first (string literals are not), so a
+//!    comment mentioning the builder does not satisfy the rule. This catches a
+//!    launcher that binds the constructor to a variable and adds `"serve"` in
+//!    a later statement — but only while the file has no genuine builder call.
+//!
+//! Out of reach by design: a split-statement raw spawn in a file that also
+//! calls a builder, and a constructor split across the `Command::new(` line.
 //!
 //! A deliberate exception opts out with `// serve-spawn: allow — <reason>`: on
 //! the `Command::new` line for rule 1, or on any line of the file for rule 2.
@@ -33,6 +40,7 @@ const ALLOW_MARKER: &str = "// serve-spawn: allow";
 const SPAWN: &str = r#"Command::new(env!("CARGO_BIN_EXE_intentd"))"#;
 const SERVE_LITERAL: &str = "\"serve\"";
 const ENABLE_WS_API: &str = "enable_ws_api(";
+const BUILDER_IDENT: &str = "serve_command";
 const MAX_STATEMENT_LINES: usize = 30;
 
 /// The builder module (defines the only sanctioned spawns) and this guard
@@ -80,6 +88,51 @@ fn strip_ws(s: &str) -> String {
 
 fn code_part(line: &str) -> &str {
     line.split("//").next().unwrap_or(line)
+}
+
+/// `src` with `//` line comments and `/* … */` block comments blanked, one
+/// output entry per input line so line numbers survive. String literals are
+/// not recognized: a `//` or `/*` inside one is treated as a comment opener.
+fn strip_comments(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in src.lines() {
+        let mut code = String::new();
+        let mut rest = line;
+        loop {
+            if in_block {
+                match rest.find("*/") {
+                    Some(end) => {
+                        rest = &rest[end + 2..];
+                        in_block = false;
+                    }
+                    None => break,
+                }
+                continue;
+            }
+            match (rest.find("//"), rest.find("/*")) {
+                (Some(l), Some(b)) if l < b => {
+                    code.push_str(&rest[..l]);
+                    break;
+                }
+                (Some(l), None) => {
+                    code.push_str(&rest[..l]);
+                    break;
+                }
+                (_, Some(b)) => {
+                    code.push_str(&rest[..b]);
+                    rest = &rest[b + 2..];
+                    in_block = true;
+                }
+                (None, None) => {
+                    code.push_str(rest);
+                    break;
+                }
+            }
+        }
+        out.push(code);
+    }
+    out
 }
 
 fn ends_statement(line: &str) -> bool {
@@ -134,7 +187,7 @@ enum Offense {
     /// An allow marker without a reason on `line`.
     MalformedMarker { line: usize },
     /// Rule 2: the file enables the WSS listener (first `enable_ws_api(` call
-    /// on `line`) but never names the builder.
+    /// in code on `line`) but never names the builder in code.
     MissingBuilder { line: usize },
 }
 
@@ -172,9 +225,11 @@ fn statement_code(lines: &[&str], start: usize) -> String {
 }
 
 /// Classify one test source file. Offenses are in line order; the file-level
-/// [`Offense::MissingBuilder`] comes last.
+/// [`Offense::MissingBuilder`] comes last and is decided on comment-stripped
+/// code only.
 fn classify(src: &str) -> Vec<Offense> {
     let lines: Vec<&str> = src.lines().collect();
+    let code_lines = strip_comments(src);
     let mut offenses = Vec::new();
     let mut has_reasoned_marker = false;
     for (i, line) in lines.iter().enumerate() {
@@ -191,8 +246,8 @@ fn classify(src: &str) -> Vec<Offense> {
             offenses.push(Offense::RawServeSpawn { line: i + 1 });
         }
     }
-    if !src.contains("serve_command") && !has_reasoned_marker {
-        if let Some(i) = lines.iter().position(|l| l.contains(ENABLE_WS_API)) {
+    if !code_lines.iter().any(|l| l.contains(BUILDER_IDENT)) && !has_reasoned_marker {
+        if let Some(i) = code_lines.iter().position(|l| l.contains(ENABLE_WS_API)) {
             offenses.push(Offense::MissingBuilder { line: i + 1 });
         }
     }
@@ -403,6 +458,52 @@ fn spawn(data_dir: &Path) -> Child {
             "common::enable_ws_api(&d);\nlet mut cmd = common::serve_command_fixed_port();\n";
         assert_eq!(classify(default), Vec::<Offense>::new());
         assert_eq!(classify(fixed), Vec::<Offense>::new());
+    }
+
+    /// Reviewer reproducer (intentd#1927 r4022725383): the pre-migration
+    /// two-statement launcher shape plus a builder mention in a comment.
+    #[test]
+    fn comment_only_builder_mention_does_not_satisfy_the_file_rule() {
+        let src = r#"// Prefer common::serve_command() for launches
+common::enable_ws_api(&dir);
+let mut command = Command::new(env!("CARGO_BIN_EXE_intentd"));
+command.arg("serve");
+"#;
+        assert_eq!(classify(src), vec![Offense::MissingBuilder { line: 2 }]);
+    }
+
+    #[test]
+    fn block_comment_builder_mention_does_not_satisfy_the_file_rule() {
+        let inline = "common::enable_ws_api(&d); /* see common::serve_command() */\n";
+        let spanning =
+            "/*\n * Spawn via common::serve_command()\n */\ncommon::enable_ws_api(&d);\n";
+        assert_eq!(classify(inline), vec![Offense::MissingBuilder { line: 1 }]);
+        assert_eq!(
+            classify(spanning),
+            vec![Offense::MissingBuilder { line: 4 }]
+        );
+    }
+
+    #[test]
+    fn code_builder_call_with_a_comment_passes_the_file_rule() {
+        let src = "// helpers live in common::serve_command()\ncommon::enable_ws_api(&d);\n\
+                   let mut cmd = common::serve_command(); // seam applied\n";
+        assert_eq!(classify(src), Vec::<Offense>::new());
+    }
+
+    #[test]
+    fn enable_ws_api_in_a_comment_does_not_trigger_the_file_rule() {
+        let src = "// callers of enable_ws_api( must use the builder\n/* enable_ws_api(&d); */\n";
+        assert_eq!(classify(src), Vec::<Offense>::new());
+    }
+
+    #[test]
+    fn builder_call_does_not_excuse_a_raw_single_statement_serve_spawn() {
+        let src = r#"common::enable_ws_api(&d);
+let _ok = common::serve_command();
+let raw = Command::new(env!("CARGO_BIN_EXE_intentd")).arg("serve");
+"#;
+        assert_eq!(classify(src), vec![Offense::RawServeSpawn { line: 3 }]);
     }
 
     #[test]
