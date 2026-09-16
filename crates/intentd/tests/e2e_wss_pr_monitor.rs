@@ -1571,7 +1571,7 @@ async fn pr_monitor_wakes_over_wss(
 /// `agent.getConversation` carries one `pr_monitor_wake` row with
 /// `reason: "transferred"` and `adoptedBy` naming the parent. The parent
 /// itself is not woken by its own takeover.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn a_settled_childs_monitor_is_adopted_by_its_parent_over_wss() {
     let fx = boot().await;
     let child_id = seed_child_agent(&fx, "agent-prmon-child", AgentStatus::Active).await;
@@ -1688,7 +1688,7 @@ async fn a_settled_childs_monitor_is_adopted_by_its_parent_over_wss() {
 /// single under the child, and no transfer notice is written. Once the hook
 /// is gone the child is idle with nothing pending but the monitor, and the
 /// same call adopts even though the task still reads `in_progress`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn a_parent_is_refused_while_its_child_is_still_working_over_wss() {
     let fx = boot().await;
     let child_id = seed_child_agent(&fx, "agent-prmon-child", AgentStatus::RuntimeIdle).await;
