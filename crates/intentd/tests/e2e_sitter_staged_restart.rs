@@ -3,8 +3,9 @@
 //! the handshake via `INTENTD_SITTER_IDLE_RESTART`) that receives SIGUSR2
 //! ("a newer version is staged") exits with the restart-for-update code —
 //! immediately when idle, and only once the in-flight turn ends when busy —
-//! a SIGTERM while that restart is still pending exits 0, and an
-//! unsupervised daemon ignores the signal.
+//! a SIGTERM while that restart is still pending exits 0, a SIGUSR2 landing
+//! after SIGTERM has already won is ignored, and an unsupervised daemon
+//! ignores the signal.
 
 #![cfg(unix)]
 
@@ -50,6 +51,23 @@ impl Daemon {
 
     fn log(&self) -> String {
         std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+
+    /// Poll the log for `needle` within `budget`; panics (with the log) if it
+    /// never appears.
+    async fn wait_for_log(&self, needle: &str, budget: Duration) {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if self.log().contains(needle) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "daemon log never contained {needle:?}\n--- daemon log ---\n{}",
+                self.log()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Poll for process exit within `budget`; `None` if still running.
@@ -382,6 +400,44 @@ async fn sigterm_during_pending_restart_exits_cleanly() {
         daemon.log()
     );
     let log = daemon.log();
+    assert!(!log.contains("exiting for staged update restart"), "{log}");
+}
+
+/// A requested stop that has already won is never hijacked by a staged
+/// restart landing during teardown: once SIGTERM has latched the shutdown
+/// cause, a SIGUSR2 arriving while the daemon is still tearing down (idle, so
+/// the exit-when-idle would otherwise fire at once) is ignored and the daemon
+/// exits 0 — the sitter must not respawn a daemon the user stopped.
+#[tokio::test]
+async fn sigusr2_after_sigterm_won_does_not_hijack_the_exit_code() {
+    let Some(script) = mock_agent_script() else {
+        return;
+    };
+    let data_dir_guard = common::test_tempdir("itd-sr-");
+    let (mut daemon, _socket) = launch_daemon(data_dir_guard.path(), &script, true).await;
+
+    daemon.signal(Signal::SIGTERM);
+    daemon
+        .wait_for_log("shutdown cause latched: requested stop", exit_budget())
+        .await;
+    // The stop has won; the daemon is now in teardown (or already gone — a
+    // signal to a not-yet-reaped child is still accepted).
+    daemon.signal(Signal::SIGUSR2);
+
+    let status = daemon.wait_exit(exit_budget()).await.unwrap_or_else(|| {
+        panic!(
+            "daemon did not exit on SIGTERM\n--- daemon log ---\n{}",
+            daemon.log()
+        )
+    });
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "exit status {status}\n--- daemon log ---\n{}",
+        daemon.log()
+    );
+    let log = daemon.log();
+    assert!(!log.contains("staged update restart accepted"), "{log}");
     assert!(!log.contains("exiting for staged update restart"), "{log}");
 }
 
