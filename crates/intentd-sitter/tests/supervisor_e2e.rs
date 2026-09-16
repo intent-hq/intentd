@@ -321,9 +321,10 @@ fn crash_env_script(code: i32) -> String {
 
 /// Fake daemon speaking the idle-restart handshake: the start line records
 /// the update-restart and idle-restart markers; SIGTERM/SIGINT log a `term`
-/// line and exit 0; SIGUSR2 logs a `usr2` line, stays alive a moment (so a
-/// test can prove nothing else was sent), then exits with
-/// [`RESTART_FOR_UPDATE_EXIT_CODE`].
+/// line and exit 0; SIGUSR2 logs a `usr2` line, then stays alive until the
+/// test creates the release file ([`idle_restart_release_path`]) — so a
+/// test can assert the held state for as long as it needs — and only then
+/// exits with [`RESTART_FOR_UPDATE_EXIT_CODE`].
 fn idle_restart_script(version: &str) -> String {
     format!(
         "#!/bin/sh\n\
@@ -331,13 +332,18 @@ fn idle_restart_script(version: &str) -> String {
          \"${{{UPDATE_RESTART_ENV}:-unset}}\" \"${{{IDLE_RESTART_ENV}:-unset}}\" \
          >> \"${FAKE_DAEMON_LOG}\"\n\
          trap 'echo \"term {version}\" >> \"${FAKE_DAEMON_LOG}\"; exit 0' TERM INT\n\
-         trap 'echo \"usr2 {version}\" >> \"${FAKE_DAEMON_LOG}\"; sleep 0.5; \
+         trap 'echo \"usr2 {version}\" >> \"${FAKE_DAEMON_LOG}\"; \
+         while [ ! -e \"${FAKE_DAEMON_LOG}{IDLE_RESTART_RELEASE_SUFFIX}\" ]; do sleep 0.05; done; \
          exit {RESTART_FOR_UPDATE_EXIT_CODE}' USR2\n\
          sleep 60 &\n\
          wait $!\n\
          exit 0\n"
     )
 }
+
+/// Appended to the fake-daemon log path to name the file whose creation
+/// lets an [`idle_restart_script`] daemon finish its SIGUSR2 hand-off.
+const IDLE_RESTART_RELEASE_SUFFIX: &str = ".release";
 
 /// Like [`idle_restart_script`] but SIGUSR2 is only logged, never acted on:
 /// a daemon that never gets idle.
@@ -406,6 +412,14 @@ fn daemon_log_path(data_dir: &Path) -> std::path::PathBuf {
 
 fn stderr_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("sitter-stderr.log")
+}
+
+/// The release file an [`idle_restart_script`] daemon waits for after
+/// logging SIGUSR2; creating it lets the daemon exit for restart.
+fn idle_restart_release_path(data_dir: &Path) -> std::path::PathBuf {
+    let mut path = daemon_log_path(data_dir).into_os_string();
+    path.push(IDLE_RESTART_RELEASE_SUFFIX);
+    path.into()
 }
 
 fn read_or_empty(path: &Path) -> String {
@@ -2019,14 +2033,20 @@ fn sigusr2_stages_update_and_respawns_when_daemon_exits_for_restart() {
             manifest_json("0.2.0", &base_url, &asset, &sha),
         );
     }
+    let stderr = stderr_path(dir.path());
     send_signal(&sitter, "USR2");
     wait_until(
-        "daemon 0.1.0 to receive SIGUSR2",
+        "daemon 0.1.0 to receive SIGUSR2 and the sitter to log the hand-off",
         Duration::from_secs(15),
-        || read_or_empty(&log_path).contains("usr2 0.1.0"),
+        || {
+            read_or_empty(&log_path).contains("usr2 0.1.0")
+                && read_or_empty(&stderr).contains("asking daemon to restart when idle")
+        },
     );
-    // The daemon is still alive (its handler is sleeping before the exit):
-    // the sitter must not have stopped it or respawned anything yet.
+    // The daemon holds at the hand-off until the test releases it, so this
+    // state is stable for as long as the assertions take: the sitter must
+    // not have stopped it or respawned anything, and must still be
+    // supervising it.
     let staged = read_or_empty(&log_path);
     assert!(
         !staged.contains("term") && !staged.contains("start 0.2.0"),
@@ -2037,9 +2057,14 @@ fn sigusr2_stages_update_and_respawns_when_daemon_exits_for_restart() {
         Some("0.2.0"),
         "the install must be committed before the daemon is asked to restart"
     );
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must keep supervising the daemon it asked to restart"
+    );
 
-    // Well under the 30s backoff: the restart-for-update exit must respawn
-    // the staged version at once.
+    // Release the daemon: it exits with the restart-for-update code, and —
+    // well under the 30s backoff — the staged version must respawn at once.
+    fs::write(idle_restart_release_path(dir.path()), b"").unwrap();
     wait_until("daemon 0.2.0 to start", Duration::from_secs(10), || {
         read_or_empty(&log_path).contains("start 0.2.0")
     });
@@ -2063,7 +2088,7 @@ fn sigusr2_stages_update_and_respawns_when_daemon_exits_for_restart() {
         ],
         "SIGUSR2 hand-off, no SIGTERM to 0.1.0, update-marked respawn"
     );
-    let stderr = read_or_empty(&stderr_path(dir.path()));
+    let stderr = read_or_empty(&stderr);
     assert!(
         stderr.contains("SIGUSR2 received; checking for updates now"),
         "stderr: {stderr}"
