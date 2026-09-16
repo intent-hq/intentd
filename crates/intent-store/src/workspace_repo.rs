@@ -755,7 +755,9 @@ impl Store {
     /// linked via `pr_url` or carrying a `pull_requests` pool entry with that
     /// URL — oldest first. Backs the passive `github.pulls.get` fold: the
     /// match runs in SQL (`json_each` over the pool column) so only the
-    /// referencing rows are decoded. The seeded virtual [`CHIEF_WORKSPACE_ID`]
+    /// referencing rows are decoded, and compares `COLLATE NOCASE` because
+    /// forge slugs are case-insensitive while persisted URLs may carry a
+    /// client-supplied casing. The seeded virtual [`CHIEF_WORKSPACE_ID`]
     /// row is excluded like [`Self::list_workspaces`].
     ///
     /// # Errors
@@ -764,10 +766,10 @@ impl Store {
     pub async fn list_workspaces_referencing_pr_url(&self, url: &str) -> Result<Vec<Workspace>> {
         let sql = format!(
             "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND archived = 0 \
-             AND is_remote = 0 AND (pr_url = ? OR (pull_requests IS NOT NULL \
+             AND is_remote = 0 AND (pr_url = ? COLLATE NOCASE OR (pull_requests IS NOT NULL \
              AND json_valid(pull_requests) AND EXISTS (\
              SELECT 1 FROM json_each(workspace.pull_requests) AS je \
-             WHERE je.value ->> '$.url' = ?))) ORDER BY created_at"
+             WHERE je.value ->> '$.url' = ? COLLATE NOCASE))) ORDER BY created_at"
         );
         let rows = sqlx::query(&sql)
             .bind(CHIEF_WORKSPACE_ID)

@@ -342,7 +342,11 @@ struct WorkspaceAggregateSnapshot {
     unread: Option<HashSet<WorkspaceId>>,
     active_hooks: HashSet<WorkspaceId>,
     active_pr_monitors: HashSet<WorkspaceId>,
-    monitor_pr_signals: HashMap<WorkspaceId, workspace_status::MonitorPrSignals>,
+    /// Each workspace's displayStatus-relevant PR monitor rows from the
+    /// list's ONE bulk monitor read; folded per row during enrichment,
+    /// once the workspace's own PR copies are at hand
+    /// ([`pr_monitor::fold_monitor_pr_signals`]).
+    monitor_rows: HashMap<WorkspaceId, Vec<intent_core::PrMonitor>>,
     /// PRs persisted on each workspace's secondary git roots
     /// (`workspace_git_root.pull_requests`): the list's ONE bulk git-root
     /// read, fed to the displayStatus PR rungs during enrichment and then
@@ -2703,10 +2707,6 @@ impl Services {
                     .push(monitor);
             }
         }
-        let monitor_pr_signals = monitor_rows
-            .into_iter()
-            .map(|(id, monitors)| (id, pr_monitor::fold_monitor_pr_signals(&monitors)))
-            .collect();
         // A read failure degrades to no git-root PRs (the pre-fold
         // derivation) rather than failing the list.
         let mut git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>> = HashMap::new();
@@ -2775,7 +2775,7 @@ impl Services {
             unread: unread.ok(),
             active_hooks: active_hooks.unwrap_or_default(),
             active_pr_monitors,
-            monitor_pr_signals,
+            monitor_rows,
             git_root_prs,
             legacy_question_holds,
             cow_supported,
@@ -2844,10 +2844,10 @@ impl Services {
             unread,
             Some(workspace_status::WorkspaceStatusSnapshot {
                 waiting,
-                monitor_pr_signals: snapshot
-                    .monitor_pr_signals
+                monitor_rows: snapshot
+                    .monitor_rows
                     .get(&ws.id)
-                    .copied()
+                    .map(Vec::as_slice)
                     .unwrap_or_default(),
                 git_root_prs: snapshot
                     .git_root_prs
@@ -4939,9 +4939,12 @@ impl Services {
     /// existing event plumbing instead of waiting for the next sweep.
     ///
     /// Every live (non-archived, non-remote) workspace referencing the PR by
-    /// URL — linked via `prUrl` or carrying a `pullRequests` pool entry —
-    /// gets the pool entry upserted (URL-keyed: pools can be cross-repo, so
-    /// a same-numbered PR from another repository is never touched); when
+    /// URL — linked via `prUrl` or carrying a `pullRequests` pool entry,
+    /// compared ignoring ASCII case ([`pr_ops::same_pr_url`]) so a
+    /// client-cased persisted URL still folds — gets the pool entry
+    /// upserted (URL-keyed: pools can be cross-repo, so a same-numbered PR
+    /// from another repository is never touched; same-URL duplicates
+    /// collapse into the fetched snapshot); when
     /// the PR is the workspace's linked one (same repo and number) the
     /// linked columns update exactly like the update path of
     /// [`Self::refresh_workspace_pr_with_sc`]. Git roots whose pool holds
@@ -5000,7 +5003,7 @@ impl Services {
             if root
                 .pull_requests
                 .as_deref()
-                .is_some_and(|items| items.iter().any(|p| p.url == pr.url))
+                .is_some_and(|items| items.iter().any(|p| pr_ops::same_pr_url(&p.url, &pr.url)))
             {
                 changed |= pr_ops::upsert_pr_info_by_url(&mut root.pull_requests, &info);
             }

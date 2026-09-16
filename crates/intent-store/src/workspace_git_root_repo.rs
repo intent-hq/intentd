@@ -298,7 +298,8 @@ impl Store {
     /// `github.pulls.get` fold (mirrors
     /// [`Store::list_workspaces_referencing_pr_url`]): the match runs in
     /// SQL (`json_each` over the pool column) so only referencing rows are
-    /// decoded.
+    /// decoded, and compares `COLLATE NOCASE` (forge slugs are
+    /// case-insensitive).
     ///
     /// # Errors
     ///
@@ -310,9 +311,10 @@ impl Store {
         let sql = format!(
             "SELECT {COLUMNS} FROM workspace_git_root WHERE workspace_id IN \
              (SELECT id FROM workspace WHERE archived = 0 AND is_remote = 0) \
-             AND (pr_url = ? OR (pull_requests IS NOT NULL AND json_valid(pull_requests) \
+             AND (pr_url = ? COLLATE NOCASE OR (pull_requests IS NOT NULL \
+             AND json_valid(pull_requests) \
              AND EXISTS (SELECT 1 FROM json_each(workspace_git_root.pull_requests) AS je \
-             WHERE je.value ->> '$.url' = ?))) ORDER BY created_at"
+             WHERE je.value ->> '$.url' = ? COLLATE NOCASE))) ORDER BY created_at"
         );
         let rows = sqlx::query(&sql)
             .bind(url)

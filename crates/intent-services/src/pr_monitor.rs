@@ -785,7 +785,20 @@ fn requirements_ready(req: &MergeRequirements) -> bool {
 /// one). An ACTIVE row already showing a terminal snapshot (a poll
 /// observed the merge but lost its guarded terminalize write) contributes
 /// nothing — the next tick re-detects and completes it.
-pub(crate) fn fold_monitor_pr_signals(monitors: &[PrMonitor]) -> MonitorPrSignals {
+///
+/// `terminal_prs` are the workspace's own PR copies already persisted
+/// merged/closed ([`crate::workspace_status::terminal_pr_copies`]): an
+/// ACTIVE row whose snapshot names the same PR URL ([`pr_ops::same_pr_url`])
+/// contributes nothing when that copy is fresher than the row's last poll
+/// ([`superseded_by_terminal_copy`]) — the passive `github.pulls.get` fold
+/// writes the copy straight from the forge, so the sidebar must not wait
+/// for the monitor sweep to re-observe the merge. Only the derivation
+/// yields; the row's snapshot, pending changes, and debounce state are
+/// untouched, so the monitor's own terminal report still fires.
+pub(crate) fn fold_monitor_pr_signals(
+    monitors: &[PrMonitor],
+    terminal_prs: &[&PullRequestInfo],
+) -> MonitorPrSignals {
     let mut signals = MonitorPrSignals::default();
     let mut latest_completed: Option<&PrMonitor> = None;
     for m in monitors {
@@ -798,6 +811,9 @@ pub(crate) fn fold_monitor_pr_signals(monitors: &[PrMonitor]) -> MonitorPrSignal
                 else {
                     continue;
                 };
+                if superseded_by_terminal_copy(m, &snapshot, terminal_prs) {
+                    continue;
+                }
                 let req = &snapshot.requirements;
                 if matches!(req.state.as_str(), "open" | "draft") {
                     signals.open = true;
@@ -826,6 +842,33 @@ pub(crate) fn fold_monitor_pr_signals(monitors: &[PrMonitor]) -> MonitorPrSignal
         signals.merged = merged;
     }
     signals
+}
+
+/// Whether an ACTIVE monitor's snapshot is superseded by a workspace-owned
+/// terminal copy of the same PR (by URL). A `Merged` copy always wins —
+/// merged is the one irreversible forge state. A `Closed` copy wins only
+/// when its forge `updatedAt` is later than the monitor's last poll (or the
+/// poll time is unknown): a closed PR can be reopened, and a monitor that
+/// polled after the copy's timestamp and still saw the PR open is then the
+/// fresher observation. An unparseable copy timestamp never supersedes.
+fn superseded_by_terminal_copy(
+    m: &PrMonitor,
+    snapshot: &PrMonitorSnapshot,
+    terminal_prs: &[&PullRequestInfo],
+) -> bool {
+    terminal_prs.iter().any(|pr| {
+        pr_ops::same_pr_url(&pr.url, &snapshot.url)
+            && match pr.status {
+                PullRequestStatus::Merged => true,
+                PullRequestStatus::Closed => parse_iso(&pr.updated_at).is_some_and(|updated| {
+                    m.last_polled_at
+                        .as_deref()
+                        .and_then(parse_iso)
+                        .is_none_or(|polled| updated > polled)
+                }),
+                PullRequestStatus::Open | PullRequestStatus::Draft => false,
+            }
+    })
 }
 
 /// Light metadata for one ACTIVE PR monitor — the idle-visibility
@@ -1525,17 +1568,20 @@ impl Services {
     /// indefinitely. Best-effort: a store read failure is logged and reads
     /// as no signals (mirrors
     /// [`Services::workspace_has_active_pr_monitors`]) so list/get emission
-    /// is never wedged and PR stages are never fabricated.
+    /// is never wedged and PR stages are never fabricated. `terminal_prs`
+    /// are the workspace's own merged/closed PR copies an active monitor's
+    /// open snapshot yields to ([`fold_monitor_pr_signals`]).
     pub(crate) async fn workspace_monitor_pr_signals(
         &self,
         workspace_id: &WorkspaceId,
+        terminal_prs: &[&PullRequestInfo],
     ) -> MonitorPrSignals {
         match self
             .store
             .list_display_status_pr_monitors_by_workspace(workspace_id)
             .await
         {
-            Ok(monitors) => fold_monitor_pr_signals(&monitors),
+            Ok(monitors) => fold_monitor_pr_signals(&monitors, terminal_prs),
             Err(e) => {
                 tracing::warn!(
                     workspace = %workspace_id.0,
@@ -7619,7 +7665,7 @@ mod tests {
             snap(|s| ready_requirements(&mut s.requirements)),
         );
         assert_eq!(
-            fold_monitor_pr_signals(std::slice::from_ref(&ready)),
+            fold_monitor_pr_signals(std::slice::from_ref(&ready), &[]),
             MonitorPrSignals {
                 queued: false,
                 open: true,
@@ -7643,7 +7689,7 @@ mod tests {
         );
         for m in [&queued, &queued_clear] {
             assert_eq!(
-                fold_monitor_pr_signals(std::slice::from_ref(m)),
+                fold_monitor_pr_signals(std::slice::from_ref(m), &[]),
                 MonitorPrSignals {
                     queued: true,
                     open: true,
@@ -7662,7 +7708,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            fold_monitor_pr_signals(std::slice::from_ref(&queued_draft)),
+            fold_monitor_pr_signals(std::slice::from_ref(&queued_draft), &[]),
             MonitorPrSignals {
                 queued: false,
                 open: true,
@@ -7713,7 +7759,7 @@ mod tests {
             &unknown_state,
         ] {
             assert_eq!(
-                fold_monitor_pr_signals(std::slice::from_ref(m)),
+                fold_monitor_pr_signals(std::slice::from_ref(m), &[]),
                 MonitorPrSignals {
                     queued: false,
                     open: true,
@@ -7728,7 +7774,7 @@ mod tests {
             snap(|s| s.requirements.state = "merged".into()),
         );
         assert_eq!(
-            fold_monitor_pr_signals(std::slice::from_ref(&merged)),
+            fold_monitor_pr_signals(std::slice::from_ref(&merged), &[]),
             MonitorPrSignals {
                 queued: false,
                 open: false,
@@ -7749,12 +7795,12 @@ mod tests {
         let no_snapshot = mk(PrMonitorState::Active, None);
         let bad_blob = mk(PrMonitorState::Active, Some("{not json".into()));
         assert_eq!(
-            fold_monitor_pr_signals(&[closed, active_terminal, no_snapshot, bad_blob]),
+            fold_monitor_pr_signals(&[closed, active_terminal, no_snapshot, bad_blob], &[]),
             MonitorPrSignals::default()
         );
         // Signals aggregate across rows.
         assert_eq!(
-            fold_monitor_pr_signals(&[ready, queued, merged.clone()]),
+            fold_monitor_pr_signals(&[ready.clone(), queued, merged.clone()], &[]),
             MonitorPrSignals {
                 queued: true,
                 open: true,
@@ -7771,14 +7817,14 @@ mod tests {
         );
         newer_closed.updated_at = "2026-01-02T00:00:00Z".into();
         assert_eq!(
-            fold_monitor_pr_signals(&[merged.clone(), newer_closed.clone()]),
+            fold_monitor_pr_signals(&[merged.clone(), newer_closed.clone()], &[]),
             MonitorPrSignals::default(),
             "newer closed-unmerged monitor wins over an older merged one"
         );
         // Order-independent: the fold picks the latest by updated_at, not
         // by slice position.
         assert_eq!(
-            fold_monitor_pr_signals(&[newer_closed, merged.clone()]),
+            fold_monitor_pr_signals(&[newer_closed, merged.clone()], &[]),
             MonitorPrSignals::default()
         );
         // And the reverse: a newer merged monitor after an older closed one.
@@ -7792,7 +7838,7 @@ mod tests {
             snap(|s| s.requirements.state = "closed".into()),
         );
         assert_eq!(
-            fold_monitor_pr_signals(&[older_closed, newer_merged]),
+            fold_monitor_pr_signals(&[older_closed, newer_merged], &[]),
             MonitorPrSignals {
                 queued: false,
                 open: false,
@@ -7800,6 +7846,146 @@ mod tests {
                 merged: true
             }
         );
+
+        // Regression (intent-hq/intentd#1923 review): a workspace-owned
+        // terminal copy of the monitored PR — written by the passive
+        // `github.pulls.get` fold — supersedes the ACTIVE row's stale open
+        // snapshot, so the rollup never waits for the monitor sweep.
+        let copy = |status: PullRequestStatus, url: &str, updated_at: &str| PullRequestInfo {
+            id: "42".into(),
+            number: 42,
+            url: url.into(),
+            title: "Add thing".into(),
+            status,
+            created_at: String::new(),
+            updated_at: updated_at.into(),
+            base_ref: None,
+            head_ref: None,
+            head_sha: None,
+            author: None,
+            mergeable: None,
+            mergeable_state: None,
+            is_draft: None,
+        };
+        let mut polled = ready.clone();
+        polled.last_polled_at = Some("2026-01-05T00:00:00Z".into());
+        // Merged is irreversible: it supersedes whatever the poll timing, and
+        // the URL match folds ASCII case.
+        let merged_copy = copy(
+            PullRequestStatus::Merged,
+            "https://github.com/O/R/pull/42",
+            "2026-01-01T00:00:00Z",
+        );
+        assert_eq!(
+            fold_monitor_pr_signals(std::slice::from_ref(&polled), &[&merged_copy]),
+            MonitorPrSignals::default(),
+            "a merged workspace copy silences the stale open monitor"
+        );
+        // Closed can be reopened: only a copy fresher than the last poll
+        // supersedes; an older one (or an unparseable timestamp) does not.
+        let fresh_closed = copy(
+            PullRequestStatus::Closed,
+            "https://github.com/o/r/pull/42",
+            "2026-01-06T00:00:00Z",
+        );
+        let stale_closed = copy(
+            PullRequestStatus::Closed,
+            "https://github.com/o/r/pull/42",
+            "2026-01-04T00:00:00Z",
+        );
+        let undated_closed = copy(
+            PullRequestStatus::Closed,
+            "https://github.com/o/r/pull/42",
+            "",
+        );
+        assert_eq!(
+            fold_monitor_pr_signals(std::slice::from_ref(&polled), &[&fresh_closed]),
+            MonitorPrSignals::default()
+        );
+        for stale in [&stale_closed, &undated_closed] {
+            assert_eq!(
+                fold_monitor_pr_signals(std::slice::from_ref(&polled), &[stale]),
+                MonitorPrSignals {
+                    queued: false,
+                    open: true,
+                    ready: true,
+                    merged: false
+                },
+                "an older closed copy yields to the fresher open poll"
+            );
+        }
+        // A terminal copy of ANOTHER PR leaves the monitor's signal alone.
+        let other = copy(
+            PullRequestStatus::Merged,
+            "https://github.com/o/r/pull/7",
+            "2026-01-06T00:00:00Z",
+        );
+        assert_eq!(
+            fold_monitor_pr_signals(std::slice::from_ref(&polled), &[&other]),
+            MonitorPrSignals {
+                queued: false,
+                open: true,
+                ready: true,
+                merged: false
+            }
+        );
+    }
+
+    /// Regression (intent-hq/intentd#1923 review), end to end: a workspace
+    /// whose linked PR #42 is also watched by an ACTIVE monitor (open
+    /// snapshot) reads `pr_merged` right after `github.pulls.get` folds the
+    /// merge — the stale monitor signal yields to the fresh terminal copy
+    /// instead of holding the sidebar at `pr_open` until the next sweep —
+    /// while the monitor row itself (snapshot, state) is left for the sweep.
+    #[tokio::test]
+    async fn pulls_get_terminal_fold_overrides_stale_active_monitor_signal() {
+        use intent_core::WorkspaceApi;
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let monitor = register(&svc, &ws, &owner).await;
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        let open =
+            crate::pr_ops::build_pr_info(&forge.get_pr(&RepoRef::new("o", "r"), 42).await.unwrap());
+        row.pr_number = Some(42);
+        row.pr_url = Some(open.url.clone());
+        row.pr_status = Some(PullRequestStatus::Open);
+        row.active_pull_request = Some(open.clone());
+        row.pull_requests = Some(vec![open]);
+        svc.store().update_workspace_pr_linkage(&row).await.unwrap();
+        let mut before = svc.store().get_workspace(&ws).await.unwrap();
+        svc.enrich_workspace_aggregates(&mut before).await;
+        assert_eq!(
+            before.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady),
+            "linked clean PR + open monitor read pr_ready before the fold"
+        );
+
+        forge.edit(|s| s.pr_state = PrState::Merged);
+        svc.github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+
+        let mut after = svc.store().get_workspace(&ws).await.unwrap();
+        assert_eq!(after.pr_status, Some(PullRequestStatus::Merged));
+        svc.enrich_workspace_aggregates(&mut after).await;
+        assert_eq!(
+            after.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::PrMerged),
+            "the fresh terminal fold outranks the monitor's stale open snapshot"
+        );
+        let list = svc.list_workspaces(false).await.unwrap();
+        assert_eq!(
+            list.iter().find(|w| w.id == ws).unwrap().display_status,
+            Some(intent_core::WorkspaceDisplayStatus::PrMerged),
+            "the list path folds the same way"
+        );
+        let untouched = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(untouched.state, PrMonitorState::Active);
+        assert_eq!(untouched.last_snapshot, monitor.last_snapshot);
+        assert!(untouched.pending_changes.is_empty());
     }
 
     /// Orthogonality with the PR stages: a workspace whose linked PR reads

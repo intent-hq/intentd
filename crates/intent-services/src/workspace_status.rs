@@ -293,7 +293,23 @@ impl Services {
         // signals (hooks/subscriptions) no longer fold into the promotion —
         // they surface as the orthogonal `waiting` flag above — but
         // agent-monitored PRs DO feed the PR rungs: an active monitor on an
-        // open PR (including cross-repo) reads as an open-PR signal.
+        // open PR (including cross-repo) reads as an open-PR signal, unless
+        // a workspace-owned copy of that PR already reached a fresher
+        // terminal lifecycle ([`terminal_pr_copies`]).
+        let terminal_prs = terminal_pr_copies(
+            ws.active_pull_request.as_ref(),
+            ws.pull_requests.as_deref().unwrap_or_default(),
+            git_root_prs,
+        );
+        let monitor_prs = match snapshot {
+            Some(snapshot) => {
+                crate::pr_monitor::fold_monitor_pr_signals(snapshot.monitor_rows, &terminal_prs)
+            }
+            None => {
+                self.workspace_monitor_pr_signals(&ws.id, &terminal_prs)
+                    .await
+            }
+        };
         let display_status = compute_display_status(
             self.workspace_attention_signals_with_legacy_holds(
                 &ws.id,
@@ -308,10 +324,7 @@ impl Services {
             git_root_prs,
             ws.pr_url.as_deref(),
             ws.pr_status,
-            match snapshot {
-                Some(snapshot) => snapshot.monitor_pr_signals,
-                None => self.workspace_monitor_pr_signals(&ws.id).await,
-            },
+            monitor_prs,
             ws.task_stats.as_ref(),
         );
         self.last_display_statuses
@@ -403,7 +416,19 @@ impl Services {
         // ([`Services::workspace_is_waiting`]); only a live agent turn
         // promotes here. Agent-monitored PRs and git-root PRs feed the PR
         // rungs, so the monitor lifecycle choke points
-        // (register/complete/cancel) route through this recompute.
+        // (register/complete/cancel) route through this recompute. A
+        // workspace-owned terminal copy of a monitored PR supersedes the
+        // monitor's open snapshot ([`terminal_pr_copies`]), so the passive
+        // `github.pulls.get` fold moves the rollup without waiting for the
+        // monitor sweep.
+        let terminal_prs = terminal_pr_copies(
+            ws.active_pull_request.as_ref(),
+            ws.pull_requests.as_deref().unwrap_or_default(),
+            &git_root_prs,
+        );
+        let monitor_prs = self
+            .workspace_monitor_pr_signals(workspace_id, &terminal_prs)
+            .await;
         let status = compute_display_status(
             signals,
             self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning,
@@ -412,7 +437,7 @@ impl Services {
             &git_root_prs,
             ws.pr_url.as_deref(),
             ws.pr_status,
-            self.workspace_monitor_pr_signals(workspace_id).await,
+            monitor_prs,
             Some(&task_stats),
         );
         let Some(transitioned) =
@@ -632,11 +657,40 @@ impl Services {
 #[derive(Clone, Copy)]
 pub(crate) struct WorkspaceStatusSnapshot<'a> {
     pub(crate) waiting: bool,
-    pub(crate) monitor_pr_signals: MonitorPrSignals,
+    /// The workspace's displayStatus-relevant PR monitor rows, from the list
+    /// call's one bulk read; folded into [`MonitorPrSignals`] per row
+    /// against the workspace's own terminal PR copies
+    /// ([`crate::pr_monitor::fold_monitor_pr_signals`]).
+    pub(crate) monitor_rows: &'a [intent_core::PrMonitor],
     /// PRs persisted on the workspace's secondary git roots, from the list
     /// call's one bulk read (`list_workspace_git_roots_with_prs`).
     pub(crate) git_root_prs: &'a [PullRequestInfo],
     pub(crate) legacy_question_holds: &'a HashSet<AgentId>,
+}
+
+/// The workspace-owned PR copies (linked `activePullRequest`, pooled
+/// `pullRequests`, git-root pools) whose persisted lifecycle is terminal
+/// (merged or closed) — the set an ACTIVE monitor's open snapshot of the
+/// same PR yields to in [`crate::pr_monitor::fold_monitor_pr_signals`]. The
+/// passive `github.pulls.get` fold writes these copies straight from the
+/// forge, so a fresh terminal copy must move the rollup without waiting for
+/// the monitor sweep to re-observe it.
+pub(crate) fn terminal_pr_copies<'a>(
+    active_pr: Option<&'a PullRequestInfo>,
+    pull_requests: &'a [PullRequestInfo],
+    git_root_prs: &'a [PullRequestInfo],
+) -> Vec<&'a PullRequestInfo> {
+    active_pr
+        .into_iter()
+        .chain(pull_requests)
+        .chain(git_root_prs)
+        .filter(|pr| {
+            matches!(
+                pr.status,
+                PullRequestStatus::Merged | PullRequestStatus::Closed
+            )
+        })
+        .collect()
 }
 
 /// Attention-axis inputs to [`compute_display_status`], probed by
@@ -660,7 +714,9 @@ pub(crate) struct AttentionSignals {
 /// via `ws.pr.monitor` — including a cross-repo PR that never appears in the
 /// workspace's own PR linkage — participates in the PR rungs of
 /// [`compute_display_status`]. Derived purely from persisted
-/// `state`/`last_snapshot` columns: no forge calls.
+/// `state`/`last_snapshot` columns (plus the workspace's own terminal PR
+/// copies, which an ACTIVE monitor's stale open snapshot yields to): no
+/// forge calls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[expect(clippy::struct_excessive_bools)]
 pub(crate) struct MonitorPrSignals {
@@ -714,7 +770,9 @@ pub(crate) struct MonitorPrSignals {
 ///    is in the merge queue (not draft), `pr_ready` when the snapshot's full
 ///    merge-requirements checklist is clear and the PR is not draft, else
 ///    `pr_open` — so a workspace watching an open PR (including cross-repo)
-///    never falls through to `complete`/`idle`. When none of those carries
+///    never falls through to `complete`/`idle`; a monitor whose PR the
+///    workspace already holds as a fresher terminal copy contributes
+///    nothing ([`terminal_pr_copies`]). When none of those carries
 ///    an open/draft entry but the workspace `prStatus` column is
 ///    `Open`/`Draft`, that column is the fallback PR-stage signal and
 ///    yields `pr_open` (never `pr_ready`: the column carries no mergeable

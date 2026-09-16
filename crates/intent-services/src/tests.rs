@@ -19438,6 +19438,112 @@ mod pr {
         assert_eq!(v["pull"]["merged"], true);
     }
 
+    /// Regression (intent-hq/intentd#1923 review): a pool persisted with the
+    /// same URL twice (`workspace.update` accepts duplicates) collapses into
+    /// the single fetched snapshot — never `[Merged, Open]` with the stale
+    /// duplicate holding the rollup at `pr_ready` — and the collapsed pool
+    /// is stable under an identical re-fetch.
+    #[tokio::test]
+    async fn pulls_get_fold_collapses_duplicate_pool_entries() {
+        let open = pool_entry(43, intent_core::PullRequestStatus::Open, "");
+        let (_t, _root, svc, ws_id) = fold_setup(|ws| {
+            ws.pull_requests = Some(vec![open.clone(), open.clone()]);
+        })
+        .await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        svc.github_pulls_get("o".into(), "r".into(), 43)
+            .await
+            .expect("pulls.get");
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1, "same-URL duplicates collapse");
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_merged")]
+        );
+
+        svc.github_pulls_get("o".into(), "r".into(), 43)
+            .await
+            .expect("pulls.get again");
+        let again = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(again.updated_at, after.updated_at, "re-fetch is a no-op");
+    }
+
+    /// Regression (intent-hq/intentd#1923 review): PR URL identity folds
+    /// ASCII case end to end. A workspace linked through a client-cased
+    /// `O/R` URL (and a git root pooling the same variant) still folds when
+    /// the forge answers with its canonical `o/r` URL — the store lookups
+    /// compare `COLLATE NOCASE`, the pool upsert replaces (not appends), and
+    /// the persisted copies adopt the forge casing.
+    #[tokio::test]
+    async fn pulls_get_folds_case_variant_persisted_urls() {
+        let mut open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
+        open.url = "https://github.com/O/R/pull/42".into();
+        let (_t, _root, svc, ws_id) = fold_setup(|ws| {
+            ws.pr_number = Some(42);
+            ws.pr_url = Some(open.url.clone());
+            ws.pr_status = Some(intent_core::PullRequestStatus::Open);
+            ws.active_pull_request = Some(open.clone());
+            ws.pull_requests = Some(vec![open.clone()]);
+        })
+        .await;
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let mut root = sweep_root(&ws_id, &secondary.dir, Some(("o", "r")));
+        root.pull_requests = Some(vec![open.clone()]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        seed_display_status(&svc, &ws_id).await;
+
+        let canonical = "https://github.com/o/r/pull/42";
+        assert_eq!(
+            svc.store()
+                .list_workspaces_referencing_pr_url(canonical)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "workspace lookup folds URL case"
+        );
+        assert_eq!(
+            svc.store()
+                .list_workspace_git_roots_referencing_pr_url(canonical)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "git-root lookup folds URL case"
+        );
+
+        svc.github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Merged)
+        );
+        assert_eq!(after.pr_url.as_deref(), Some(canonical));
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1, "case variant replaced, not appended");
+        assert_eq!(list[0].url, canonical);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
+
+        let roots = svc.store().list_workspace_git_roots(&ws_id).await.unwrap();
+        let root_list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(root_list.len(), 1);
+        assert_eq!(root_list[0].url, canonical);
+        assert_eq!(root_list[0].status, intent_core::PullRequestStatus::Merged);
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_merged")]
+        );
+    }
+
     /// Unlinking on a branch mismatch still refreshes an existing pool entry
     /// for that PR in place — the fetched snapshot is authoritative and
     /// already paid for — without the heal re-fetching it this pass.

@@ -333,26 +333,45 @@ pub(crate) fn upsert_pr_info(
     true
 }
 
+/// PR URL identity for the passive `github.pulls.get` fold. The forge serves
+/// PR URLs in its canonical slug casing while persisted URLs may carry a
+/// client-supplied variant (`workspace.update` accepts them unchanged), so
+/// two URLs name the same PR when they agree ignoring ASCII case — the
+/// in-memory counterpart of the `COLLATE NOCASE` store lookups
+/// (`list_workspaces_referencing_pr_url` and its git-root sibling).
+pub(crate) fn same_pr_url(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
 /// URL-keyed sibling of [`upsert_pr_info`] for the passive `github.pulls.get`
-/// fold: a fetched snapshot replaces the pool entry sharing its `url`
-/// (appending when absent) and never a same-numbered PR from another
-/// repository. Returns `true` when the list actually changed.
+/// fold: a fetched snapshot replaces every pool entry sharing its `url`
+/// ([`same_pr_url`]; appending when absent) and never a same-numbered PR from
+/// another repository. Pre-existing same-URL duplicates collapse into the
+/// single fetched snapshot at the first duplicate's position, so no stale
+/// copy outlives the fold. Returns `true` when the list actually changed.
 pub(crate) fn upsert_pr_info_by_url(
     list: &mut Option<Vec<PullRequestInfo>>,
     info: &PullRequestInfo,
 ) -> bool {
     let items = list.get_or_insert_with(Vec::new);
-    match items.iter_mut().find(|p| p.url == info.url) {
-        Some(existing) if *existing == *info => false,
-        Some(existing) => {
-            *existing = info.clone();
-            true
+    let same = |p: &PullRequestInfo| same_pr_url(&p.url, &info.url);
+    let matches = items.iter().filter(|p| same(p)).count();
+    if matches == 1 {
+        let existing = items.iter_mut().find(|p| same(p)).unwrap();
+        if *existing == *info {
+            return false;
         }
-        None => {
-            items.push(info.clone());
-            true
-        }
+        *existing = info.clone();
+        return true;
     }
+    if matches == 0 {
+        items.push(info.clone());
+        return true;
+    }
+    let first = items.iter().position(&same).unwrap();
+    items.retain(|p| !same(p));
+    items.insert(first, info.clone());
+    true
 }
 
 /// Cap on stale `pull_requests` re-fetches per git root per sweep
@@ -1445,6 +1464,52 @@ mod tests {
         assert_eq!(items[0].number, items[1].number);
         assert_eq!(items[0].status, PullRequestStatus::Merged);
         assert_eq!(items[1].url, other_info.url);
+    }
+
+    /// Regression (intent-hq/intentd#1923 review): a persisted pool holding
+    /// the same URL twice (`workspace.update` accepts duplicates) collapses
+    /// into the single fetched snapshot at the first duplicate's position —
+    /// never `[Merged, Open]` with a stale copy keeping the rollup at
+    /// `pr_ready` — while a distinct cross-repo URL survives.
+    #[test]
+    fn upserts_pr_info_by_url_collapses_same_url_duplicates() {
+        let open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
+        let mut other_repo = pr(PrState::Open, false, None, None);
+        other_repo.url = "https://github.com/other/repo/pull/1".into();
+        let other_info = build_pr_info(&other_repo);
+        let mut list = Some(vec![open.clone(), other_info.clone(), open.clone()]);
+
+        let merged = build_pr_info(&pr(PrState::Merged, false, None, None));
+        assert!(upsert_pr_info_by_url(&mut list, &merged));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[1].url, other_info.url);
+        // The collapsed pool is stable: an identical re-fetch is a no-op.
+        assert!(!upsert_pr_info_by_url(&mut list, &merged));
+    }
+
+    /// Regression (intent-hq/intentd#1923 review): PR URL identity folds
+    /// ASCII case — a persisted `example/repo` URL is the same PR as the
+    /// forge's canonical `Example/Repo` casing, so the fetched snapshot
+    /// replaces it (adopting the forge casing) instead of appending a
+    /// duplicate.
+    #[test]
+    fn upserts_pr_info_by_url_matches_case_variant_urls() {
+        let mut persisted = pr(PrState::Open, false, Some(true), Some("clean"));
+        persisted.url = "https://github.com/example/repo/pull/42".into();
+        let mut list = Some(vec![build_pr_info(&persisted)]);
+
+        let mut fetched = pr(PrState::Merged, false, None, None);
+        fetched.url = "https://github.com/Example/Repo/pull/42".into();
+        let fetched_info = build_pr_info(&fetched);
+        assert!(same_pr_url(&persisted.url, &fetched.url));
+        assert!(upsert_pr_info_by_url(&mut list, &fetched_info));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[0].url, fetched_info.url);
+        assert!(!upsert_pr_info_by_url(&mut list, &fetched_info));
     }
 
     #[test]
