@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.60] - 2026-09-16
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Let a live agent adopt a monitor owned by a dead agent ([#1916](https://github.com/intent-hq/intentd/pull/1916))
+
+
 ## [0.9.59] - 2026-09-15
 
 ### 🐛 Bug Fixes
