@@ -227,6 +227,21 @@ pub trait SystemControl: Send + Sync {
     /// sitter-supervised (or signaling is unsupported on this platform);
     /// the handler maps it to `-32603`.
     fn request_update(&self) -> Result<(), String>;
+    /// Whether this daemon can install a fixed release through its supervisor.
+    fn exact_update_supported(&self) -> bool {
+        false
+    }
+    /// Latest exact update operation; absent before the first request.
+    fn target_update_status(&self) -> Option<Value> {
+        None
+    }
+    /// Start an asynchronous fixed-release install. Never falls back to a channel.
+    ///
+    /// # Errors
+    /// Returns a reason when the request cannot be started.
+    fn request_exact_update(&self, _target: &str) -> Result<(), String> {
+        Err("exact-version updates are not supported".into())
+    }
     /// Import legacy workspaces into the daemon's live store.
     fn import_legacy(
         &self,
@@ -247,7 +262,9 @@ pub trait SystemControl: Send + Sync {
 pub(crate) enum SystemMethod {
     Status,
     Shutdown,
-    RequestUpdate,
+    RequestUpdate {
+        target: Result<Option<String>, ()>,
+    },
     ImportLegacy {
         force: Result<bool, ()>,
     },
@@ -284,7 +301,20 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
     let method = match method {
         "system.status" => SystemMethod::Status,
         "system.shutdown" => SystemMethod::Shutdown,
-        "system.requestUpdate" => SystemMethod::RequestUpdate,
+        "system.requestUpdate" => {
+            let target = match obj.get("params") {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::Object(params)) if params.keys().all(|key| key == "targetVersion") => {
+                    match params.get("targetVersion") {
+                        None => Ok(None),
+                        Some(Value::String(target)) => Ok(Some(target.clone())),
+                        _ => Err(()),
+                    }
+                }
+                _ => Err(()),
+            };
+            SystemMethod::RequestUpdate { target }
+        }
         "system.importLegacy" => {
             let force = match obj.get("params") {
                 None | Some(Value::Null) => Ok(false),
@@ -454,7 +484,14 @@ pub(crate) async fn handle(
     is_uds: bool,
 ) -> Option<String> {
     let result: Result<Value, (i32, String)> = match req.method {
-        SystemMethod::Status => Ok(status_json(&control.status(), is_local)),
+        SystemMethod::Status => {
+            let mut status = status_json(&control.status(), is_local);
+            status["exactUpdateSupported"] = json!(control.exact_update_supported());
+            if let Some(update) = control.target_update_status() {
+                status["targetUpdate"] = update;
+            }
+            Ok(status)
+        }
         SystemMethod::Shutdown if !is_uds => Err((
             -32001,
             "system.shutdown is available over UDS only".to_string(),
@@ -463,7 +500,28 @@ pub(crate) async fn handle(
             control.request_shutdown();
             Ok(json!({ "ok": true, "stopping": true }))
         }
-        SystemMethod::RequestUpdate => control
+        SystemMethod::RequestUpdate { target: Err(()) } => {
+            Err((-32602, "expected optional targetVersion string".into()))
+        }
+        SystemMethod::RequestUpdate {
+            target: Ok(Some(target)),
+        } => match semver::Version::parse(&target) {
+            Ok(version) if target.len() <= 128 && version.build.is_empty() => {
+                if control.exact_update_supported() {
+                    control
+                        .request_exact_update(&target)
+                        .map(|()| json!({ "ok": true, "targetVersion": target }))
+                        .map_err(|message| (-32603, message))
+                } else {
+                    Err((-32603, "exact-version updates are not supported".into()))
+                }
+            }
+            _ => Err((
+                -32602,
+                "targetVersion must be a release semver without prefix or build metadata".into(),
+            )),
+        },
+        SystemMethod::RequestUpdate { target: Ok(None) } => control
             .request_update()
             .map(|()| json!({ "ok": true }))
             .map_err(|message| (-32603, message)),

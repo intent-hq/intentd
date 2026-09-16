@@ -8,6 +8,7 @@ license.workspace = true
 description = "UDS/TCP/TLS listeners, JSON-RPC router, auth, heartbeat, lifecycle (§16)"
 
 [dependencies]
+semver = "1.0.28"
 intent-core = { path = "../intent-core", version = "0.9.66" }
 intent-services = { path = "../intent-services", version = "0.9.66" }
 tokio = { workspace = true }
