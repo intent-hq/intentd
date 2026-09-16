@@ -26,6 +26,7 @@ use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::MissedTickBehavior;
 
 use crate::events::EventBus;
 use crate::shell::{default_shell, scrubbed_env_vars_except, shell_args};
@@ -42,6 +43,10 @@ const AUTO_RESTART_MAX_RETRIES: u32 = 5;
 pub(crate) const TOO_FAST_MS: u128 = 2000;
 /// How often the streamer polls for a natural process exit (mirrors `terminal_ops`).
 const EXIT_POLL: Duration = Duration::from_millis(25);
+/// Cap on output chunks drained after the exit poll has ended a run: the
+/// queue holds at most the fan-out capacity of already-produced chunks, so
+/// anything past this is a straggler still writing to the held slave.
+const EXIT_DRAIN_MAX_CHUNKS: usize = 4096;
 /// `exitCode` sentinel written whenever a run ends without an observable
 /// status: the terminal state is total — `exited` always carries a code — and
 /// `-1` (impossible for a real process) marks the code as unknown; `error`
@@ -1131,6 +1136,13 @@ impl ScriptManager {
     /// never trips this). The caller then records the run with the
     /// [`EXIT_CODE_UNOBSERVABLE`] sentinel instead of sitting `running`
     /// until the daemon dies.
+    ///
+    /// The poll is a persistent interval, not a sleep re-armed per output
+    /// chunk: a descendant that keeps the slave open and prints faster than
+    /// `EXIT_POLL` must not postpone the exit check (and the caller's group
+    /// reap) indefinitely. For the same reason the post-exit drain is bounded
+    /// by [`EXIT_DRAIN_MAX_CHUNKS`] — anything beyond it is a straggler still
+    /// producing, which the caller's `reap_group_stragglers` ends.
     async fn run_one(
         &self,
         ws: &WorkspaceId,
@@ -1152,25 +1164,18 @@ impl ScriptManager {
                     .await;
             }
         }
+        let mut poll = tokio::time::interval_at(tokio::time::Instant::now() + EXIT_POLL, EXIT_POLL);
+        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                recv = live.recv() => match recv {
-                    Ok(chunk) => {
-                        self.emit_output(ws, script_id, &chunk);
-                        if !url_done {
-                            url_done = self.try_detect_url(ws, script_id, &chunk).await;
-                        }
-                    }
-                    Err(RecvError::Lagged(_)) => {},
-                    Err(RecvError::Closed) => break,
-                },
-                () = tokio::time::sleep(EXIT_POLL) => {
+                biased;
+                _ = poll.tick() => {
                     let ended = match self.pty.try_exit(pty_id) {
                         Ok(Some(_)) | Err(_) => true,
                         Ok(None) => pid.is_some_and(pid_gone),
                     };
                     if ended {
-                        loop {
+                        for _ in 0..EXIT_DRAIN_MAX_CHUNKS {
                             match live.try_recv() {
                                 Ok(chunk) => {
                                     self.emit_output(ws, script_id, &chunk);
@@ -1186,6 +1191,16 @@ impl ScriptManager {
                         break;
                     }
                 }
+                recv = live.recv() => match recv {
+                    Ok(chunk) => {
+                        self.emit_output(ws, script_id, &chunk);
+                        if !url_done {
+                            url_done = self.try_detect_url(ws, script_id, &chunk).await;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {},
+                    Err(RecvError::Closed) => break,
+                },
             }
         }
         self.pty.try_exit(pty_id).ok().flatten()
@@ -4213,6 +4228,89 @@ mod tests {
             .await
             .expect("status");
         assert_ne!(st["status"], "running", "status reflects the dead group");
+    }
+
+    /// Regression (PR #1942 review): the exit poll must not be re-armed by
+    /// output. A leader killed with SIGKILL out of band while a TERM+HUP-trapping
+    /// descendant keeps the slave open and prints every ~1ms — faster than
+    /// `EXIT_POLL` — used to leave the command `running` for as long as the
+    /// noise lasted, because each chunk reconstructed the poll sleep. The run
+    /// must reach `exited` with a code within a bounded time (the poll plus
+    /// the straggler reap's TERM grace) and the noisy descendant must be gone.
+    #[tokio::test]
+    async fn noisy_descendant_cannot_starve_exit_poll_after_leader_is_killed() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+
+        let h = harness().await;
+        let (flag, pidfile) = straggler_paths("noisy");
+        let cmd = format!(
+            r#"sh -c 'trap "" TERM HUP; : > "{f}"; while :; do echo noise; sleep 0.001; done' & echo $! > "{p}"; while [ ! -e "{f}" ]; do sleep 0.05; done; wait"#,
+            f = flag.0.display(),
+            p = pidfile.0.display()
+        );
+        let id = create_simple(&h, "noisy", &cmd, ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let straggler = await_straggler_pid(&pidfile.0).await;
+        let _guard = KillOnDrop(straggler);
+        assert!(
+            pid_alive(straggler),
+            "noisy descendant alive before the kill"
+        );
+
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        let leader = loop {
+            let st = h
+                .services
+                .script_status(h.ws.clone(), id.clone())
+                .await
+                .expect("status");
+            if st["status"] == "running" {
+                if let Some(pid) = st["pid"].as_i64() {
+                    break pid;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "script never reported running with a pid: {st}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        kill(
+            Pid::from_raw(i32::try_from(leader).expect("pid fits")),
+            Signal::SIGKILL,
+        )
+        .expect("kill script leader");
+
+        // Bounded: one poll to notice the dead leader, the straggler reap's
+        // SIGTERM→grace→SIGKILL escalation, then the `exited` write — well
+        // under this deadline even on a loaded host, while the old per-chunk
+        // sleep never fired at all under the ~1ms noise.
+        let bound = Duration::from_secs(20);
+        let deadline = tokio::time::Instant::now() + bound;
+        let st = loop {
+            let st = h
+                .services
+                .script_status(h.ws.clone(), id.clone())
+                .await
+                .expect("status");
+            if st["status"] == "exited" {
+                break st;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "noisy descendant starved the exit poll: still {st} after {bound:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            st["exitCode"].is_i64(),
+            "exited always carries a code: {st}"
+        );
+        await_pid_dead(straggler, "noisy TERM+HUP-trapping descendant").await;
     }
 
     /// Clean daemon shutdown (monorepo#1526): `shutdown_pty_sessions` flags a
