@@ -2217,8 +2217,10 @@ pub struct AgentManager {
     busy: Arc<Mutex<HashSet<AgentId>>>,
     /// Start of the current stretch with no turn in flight: `Some(boot)`
     /// initially, cleared on the `busy` empty → non-empty edge and re-armed
-    /// on the non-empty → empty edge — both under the `busy` lock (lock
-    /// order busy → `idle_since`), so a turn that starts AND ends between two
+    /// on the non-empty → empty edge. Every access — the two writers AND the
+    /// [`Self::idle_since`] reader — happens under the `busy` lock (lock
+    /// order busy → `idle_since`), so the pair (`busy`, `idle_since`) is always
+    /// observed consistently and a turn that starts AND ends between two
     /// samples still moves the timestamp forward. Consulted by the
     /// composition root's continuous-idle gate for the sitter update
     /// handshake.
@@ -5340,10 +5342,21 @@ impl AgentManager {
     /// reads is still reflected: the returned instant is never earlier than
     /// the end of the most recent turn.
     ///
+    /// The read takes the `busy` lock first (busy → `idle_since`, the
+    /// writers' order) and answers `None` whenever `busy` is non-empty, so it
+    /// is atomic against [`Self::claim_slot_sync`] / [`Self::release_slot_sync`]:
+    /// it can never return the stale pre-turn `Some` in the window between a
+    /// slot becoming visible in `busy` and the timestamp being cleared — a
+    /// `Some` answer means no turn was in flight at the instant of the read.
+    ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn idle_since(&self) -> Option<Instant> {
+        let busy = self.busy.lock().unwrap();
+        if !busy.is_empty() {
+            return None;
+        }
         *self.idle_since.lock().unwrap()
     }
 

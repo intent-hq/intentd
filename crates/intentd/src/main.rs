@@ -2505,10 +2505,21 @@ async fn cmd_serve(
 
     let shutdown = {
         let notify = shutdown_notify.clone();
+        #[cfg(unix)]
+        let idle_update_state = idle_update_state.clone();
         async move {
             tokio::select! {
                 () = shutdown_signal() => {}
                 () = notify.notified() => tracing::info!("shutdown requested via system.shutdown"),
+            }
+            // Latch the cause at the decision point, before any teardown
+            // await: a staged restart that fires later must not overwrite a
+            // requested stop. The compare-and-set loses (correctly) when the
+            // staged-restart watcher latched `RestartForUpdate` before
+            // notifying, or `system.shutdown` already latched `Stop`.
+            #[cfg(unix)]
+            if idle_update_state.latch_shutdown_cause(ShutdownCause::Stop) {
+                tracing::info!("shutdown cause latched: requested stop");
             }
         }
     };
@@ -2596,6 +2607,17 @@ async fn cmd_serve(
     )
     .await;
     repository_metadata_prewarm.abort();
+    // The shutdown cause is latched by now; retire the sitter handshake tasks
+    // FIRST, before any teardown await (the tunnel stop below can block for
+    // its whole address timeout), so no idle-update SIGUSR2 goes out to the
+    // sitter mid-teardown and the exit-when-idle cannot even attempt to
+    // contest a requested stop. The write-once latch is the correctness
+    // guarantee; this ordering keeps the window empty in practice.
+    #[cfg(unix)]
+    {
+        idle_update_requester.abort();
+        staged_restart_watcher.abort();
+    }
     serve_result?;
 
     // Clean shutdown: stop the tailcat tunnel sidecar (kill the child), stop
@@ -2618,11 +2640,6 @@ async fn cmd_serve(
     retention_task.abort();
     idempotency_reap_task.abort();
     merge_retry_task.abort();
-    #[cfg(unix)]
-    {
-        idle_update_requester.abort();
-        staged_restart_watcher.abort();
-    }
     // Drop the watcher registry (and every filesystem/skills/specialists watch
     // it owns) plus the config.toml live-reload watch by aborting the tasks
     // that hold them.
@@ -3835,6 +3852,15 @@ impl SystemControl for DaemonControl {
     }
 
     fn request_shutdown(&self) {
+        // Decide the cause before waking the serve loop so a staged restart
+        // draining to idle in between cannot claim the exit code.
+        #[cfg(unix)]
+        if self
+            .idle_update_state
+            .latch_shutdown_cause(ShutdownCause::Stop)
+        {
+            tracing::info!("shutdown cause latched: requested stop");
+        }
         // `notify_one` stores a permit if the serve loop is not yet awaiting, so
         // the shutdown is never lost to a race with a freshly-arrived RPC.
         self.shutdown.notify_one();
@@ -4578,9 +4604,10 @@ fn signal_sitter_idle_update_with_parent(
 }
 
 /// Shared state of the sitter idle-update handshake: written by the idle
-/// update requester (`timing`) and the SIGUSR2 staged-restart watcher
-/// (`restart_pending`, `restart_exit`), read by the serve loop's exit-code
-/// decision and available to `system.status` reporters.
+/// update requester (`timing`), the SIGUSR2 staged-restart watcher
+/// (`restart_pending`, `shutdown_cause`) and the two requested-stop paths
+/// (`shutdown_cause`), read by the serve loop's exit-code decision and
+/// available to `system.status` reporters.
 #[cfg(unix)]
 struct IdleUpdateState {
     /// The sitter advertised the handshake at boot ([`SITTER_IDLE_RESTART`]).
@@ -4591,12 +4618,43 @@ struct IdleUpdateState {
     /// [`RESTART_FOR_UPDATE_EXIT_CODE`] as soon as it is idle. Suppresses
     /// further idle update requests meanwhile.
     restart_pending: std::sync::atomic::AtomicBool,
-    /// The exit-when-idle actually fired the shutdown, so the exit code must
-    /// be the restart code — distinct from `restart_pending` so an unrelated
-    /// SIGTERM arriving while a restart is pending still exits cleanly.
-    restart_exit: std::sync::atomic::AtomicBool,
+    /// Why the serve loop is shutting down, as a [`ShutdownCause`]
+    /// discriminant. Latched WRITE-ONCE (compare-and-set from `Undecided`)
+    /// at the moment the shutdown decision is made — before any teardown
+    /// await — so a requested stop (SIGTERM / Ctrl-C / `system.shutdown`)
+    /// can never be overwritten by a staged restart that lands during
+    /// teardown, and vice versa. Distinct from `restart_pending`: a pending
+    /// restart only becomes the exit cause if the exit-when-idle wins the
+    /// latch.
+    shutdown_cause: std::sync::atomic::AtomicU8,
     /// Requester bookkeeping, refreshed on every tick.
     timing: std::sync::Mutex<IdleUpdateTiming>,
+}
+
+/// The serve loop's shutdown cause (see [`IdleUpdateState::shutdown_cause`]).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ShutdownCause {
+    /// No shutdown decision has been made yet.
+    Undecided = 0,
+    /// A requested stop: SIGTERM / Ctrl-C or `system.shutdown`. Exits 0.
+    Stop = 1,
+    /// The staged-restart exit-when-idle fired. Exits with
+    /// [`RESTART_FOR_UPDATE_EXIT_CODE`] so the sitter respawns the staged
+    /// version.
+    RestartForUpdate = 2,
+}
+
+#[cfg(unix)]
+impl ShutdownCause {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Stop,
+            2 => Self::RestartForUpdate,
+            _ => Self::Undecided,
+        }
+    }
 }
 
 /// Idle update requester bookkeeping (see [`IdleUpdateState::timing`]).
@@ -4621,7 +4679,7 @@ impl IdleUpdateState {
             advertised,
             boot_at: std::time::Instant::now(),
             restart_pending: std::sync::atomic::AtomicBool::new(false),
-            restart_exit: std::sync::atomic::AtomicBool::new(false),
+            shutdown_cause: std::sync::atomic::AtomicU8::new(ShutdownCause::Undecided as u8),
             timing: std::sync::Mutex::new(IdleUpdateTiming::default()),
         }
     }
@@ -4631,8 +4689,33 @@ impl IdleUpdateState {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn shutdown_cause(&self) -> ShutdownCause {
+        ShutdownCause::from_u8(
+            self.shutdown_cause
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Latch the shutdown cause if none has been decided yet. Returns whether
+    /// THIS call decided it; a `false` means an earlier decision stands (read
+    /// it back with [`Self::shutdown_cause`]). `Undecided` is never latched.
+    fn latch_shutdown_cause(&self, cause: ShutdownCause) -> bool {
+        cause != ShutdownCause::Undecided
+            && self
+                .shutdown_cause
+                .compare_exchange(
+                    ShutdownCause::Undecided as u8,
+                    cause as u8,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+    }
+
+    /// The exit-when-idle won the shutdown decision, so the serve loop must
+    /// exit with [`RESTART_FOR_UPDATE_EXIT_CODE`].
     fn restart_exit_fired(&self) -> bool {
-        self.restart_exit.load(std::sync::atomic::Ordering::Relaxed)
+        self.shutdown_cause() == ShutdownCause::RestartForUpdate
     }
 
     fn timing(&self) -> IdleUpdateTiming {
@@ -4883,6 +4966,13 @@ fn spawn_idle_update_requester(
 /// [`RESTART_FOR_UPDATE_EXIT_CODE`]. Installed even when the handshake was
 /// not advertised so a stray SIGUSR2 cannot kill the daemon via the default
 /// disposition; it is then logged and ignored.
+///
+/// The exit-when-idle competes for the write-once
+/// [`IdleUpdateState::shutdown_cause`] latch: once a requested stop has
+/// been decided (SIGTERM / `system.shutdown`), a SIGUSR2 arriving during
+/// teardown is ignored and a pending restart that drains to idle mid-teardown
+/// does not flip the exit code — the sitter must never respawn a daemon the
+/// user explicitly stopped.
 #[cfg(unix)]
 fn spawn_staged_restart_watcher(
     manager: Arc<AgentManager>,
@@ -4908,6 +4998,10 @@ fn spawn_staged_restart_watcher(
                 );
                 continue;
             }
+            if state.shutdown_cause() != ShutdownCause::Undecided {
+                tracing::info!("SIGUSR2 received after shutdown was already decided; ignored");
+                continue;
+            }
             if state.is_restart_pending() {
                 tracing::debug!(
                     "SIGUSR2 received while a staged update restart is already pending"
@@ -4919,6 +5013,12 @@ fn spawn_staged_restart_watcher(
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::info!("staged update restart accepted; exiting once no turn is in flight");
             loop {
+                if state.shutdown_cause() != ShutdownCause::Undecided {
+                    tracing::info!(
+                        "shutdown already in progress; staged update restart not applied"
+                    );
+                    return;
+                }
                 let busy = manager.list_busy().len();
                 if busy == 0 {
                     break;
@@ -4926,9 +5026,13 @@ fn spawn_staged_restart_watcher(
                 tracing::debug!(busy, "staged update restart waiting for in-flight turns");
                 tokio::time::sleep(STAGED_RESTART_POLL).await;
             }
-            state
-                .restart_exit
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Latch BEFORE notifying so the serve loop's own `Stop` latch on
+            // wake loses to this decision; a lost race means a requested
+            // stop already won and the restart must not hijack it.
+            if !state.latch_shutdown_cause(ShutdownCause::RestartForUpdate) {
+                tracing::info!("shutdown already in progress; staged update restart not applied");
+                return;
+            }
             tracing::info!(
                 exit_code = RESTART_FOR_UPDATE_EXIT_CODE,
                 "daemon idle; exiting for staged update restart"
@@ -7563,9 +7667,9 @@ mod tests {
         assert!(!decide(at(1200), Some(boot), None, false, &not_advertised));
     }
 
-    /// The exit-code decision is keyed on `restart_exit` (the exit-when-idle
-    /// actually fired), not `restart_pending`: an unrelated shutdown while a
-    /// restart is pending must still exit cleanly.
+    /// The exit-code decision is keyed on the shutdown cause (the
+    /// exit-when-idle actually won the latch), not `restart_pending`: an
+    /// unrelated shutdown while a restart is pending must still exit cleanly.
     #[cfg(unix)]
     #[test]
     fn staged_restart_exit_is_distinct_from_pending() {
@@ -7573,16 +7677,42 @@ mod tests {
         assert!(state.advertised);
         assert!(!state.is_restart_pending());
         assert!(!state.restart_exit_fired());
+        assert_eq!(state.shutdown_cause(), ShutdownCause::Undecided);
         assert_eq!(state.timing(), IdleUpdateTiming::default());
         state
             .restart_pending
             .store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(state.is_restart_pending());
         assert!(!state.restart_exit_fired());
-        state
-            .restart_exit
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(state.latch_shutdown_cause(ShutdownCause::RestartForUpdate));
         assert!(state.restart_exit_fired());
+    }
+
+    /// The shutdown cause is write-once: whichever decision lands first
+    /// stands. A requested stop that has already won is never overwritten by
+    /// a staged restart landing during teardown (the reviewer's SIGTERM →
+    /// SIGUSR2 hijack), and a restart that won first is not demoted by the
+    /// serve loop's own `Stop` latch on wake. `Undecided` never latches.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_cause_latch_is_write_once() {
+        let stop_first = IdleUpdateState::new(true);
+        assert!(!stop_first.latch_shutdown_cause(ShutdownCause::Undecided));
+        assert_eq!(stop_first.shutdown_cause(), ShutdownCause::Undecided);
+        assert!(stop_first.latch_shutdown_cause(ShutdownCause::Stop));
+        assert!(!stop_first.latch_shutdown_cause(ShutdownCause::RestartForUpdate));
+        assert!(!stop_first.latch_shutdown_cause(ShutdownCause::Stop));
+        assert_eq!(stop_first.shutdown_cause(), ShutdownCause::Stop);
+        assert!(!stop_first.restart_exit_fired());
+
+        let restart_first = IdleUpdateState::new(true);
+        assert!(restart_first.latch_shutdown_cause(ShutdownCause::RestartForUpdate));
+        assert!(!restart_first.latch_shutdown_cause(ShutdownCause::Stop));
+        assert_eq!(
+            restart_first.shutdown_cause(),
+            ShutdownCause::RestartForUpdate
+        );
+        assert!(restart_first.restart_exit_fired());
     }
 
     /// `instant_to_iso` projects instants on BOTH sides of `now` onto the
