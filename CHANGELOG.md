@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.65] - 2026-09-16
+
+### 🚀 Features
+
+- *(pr-monitor)* Let a parent adopt a settled child's monitor ([#1935](https://github.com/intent-hq/intentd/pull/1935))
+
+### ⚙️ Miscellaneous Tasks
+
+- Select source lints by the *_lint convention and lint their discovery ([#1937](https://github.com/intent-hq/intentd/pull/1937))
+
+
 ## [0.9.64] - 2026-09-16
 
 ### 🧪 Testing
