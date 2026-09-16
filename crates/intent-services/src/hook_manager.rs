@@ -323,9 +323,12 @@ impl ScheduleKind {
 
 /// Parse a cron expression under the accepted grammar: standard 5-field
 /// (minute granularity — a seconds field is rejected), evaluated in UTC.
+/// `sloppy_ranges` keeps the croner 3.x shortcut step syntax (`5/5`)
+/// accepted so hooks persisted before the croner 4 upgrade still parse.
 fn parse_cron(expr: &str) -> Result<croner::Cron> {
     croner::parser::CronParser::builder()
         .seconds(croner::parser::Seconds::Disallowed)
+        .sloppy_ranges(true)
         .build()
         .parse(expr)
         .map_err(|e| {
@@ -2441,6 +2444,19 @@ mod tests {
         }
         let hooks = svc.store().list_hooks_by_agent(&owner).await.unwrap();
         assert!(hooks.is_empty());
+    }
+
+    /// Cron grammar back-compat: the croner 3.x shortcut step syntax
+    /// (`5/5` — start at 5, step by 5) keeps parsing alongside the standard
+    /// `*/5` form so persisted user hooks survive the croner 4 upgrade (which
+    /// rejects the shortcut by default); a seconds field stays rejected.
+    #[test]
+    fn parse_cron_keeps_sloppy_step_syntax_and_rejects_seconds() {
+        for ok in ["5/5 * * * *", "*/5 * * * *"] {
+            parse_cron(ok).unwrap_or_else(|e| panic!("expected {ok:?} to parse: {e}"));
+        }
+        let err = parse_cron("*/5 * * * * *").unwrap_err();
+        assert!(err.to_string().contains("no seconds"), "{err}");
     }
 
     /// Cron-kind validation: garbage and six-field (seconds) expressions are
