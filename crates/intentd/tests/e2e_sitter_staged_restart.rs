@@ -260,6 +260,7 @@ fn wait_for_process_exit(pid: u32, budget: Duration) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
+        // timing-guard: poll interval
         std::thread::sleep(Duration::from_millis(20));
     }
     true
