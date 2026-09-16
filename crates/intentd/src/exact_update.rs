@@ -45,8 +45,11 @@ impl ExactUpdate {
 
     pub(crate) fn start(&self, pid_path: &Path, target: &str) -> Result<(), String> {
         let version = validate_exact_version(target).map_err(|e| e.to_string())?;
-        let current =
-            validate_exact_version(env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
+        // Cargo validates this version; build metadata does not affect precedence.
+        let current = env!("CARGO_PKG_VERSION")
+            .split_once('+')
+            .map_or(env!("CARGO_PKG_VERSION"), |(version, _)| version);
+        let current = validate_exact_version(current).map_err(|e| e.to_string())?;
         if !version.cmp_precedence(&current).is_gt() {
             return Err("target version must be newer than the running daemon".into());
         }

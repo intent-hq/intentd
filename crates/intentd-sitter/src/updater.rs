@@ -124,7 +124,8 @@ impl Updater {
     /// Returns an error for an invalid target, downgrade, or failed verification/install.
     pub fn install_exact(&self, target: &str, running: &str) -> Result<UpdateOutcome, UpdateError> {
         let version = validate_exact_version(target)?;
-        let running = validate_exact_version(running)?;
+        let running = semver::Version::parse(running)
+            .map_err(|e| UpdateError::ExactVersion(format!("invalid running version: {e}")))?;
         if version.cmp_precedence(&running).is_lt() {
             return Err(UpdateError::ExactVersion(
                 "downgrades are not allowed".into(),
@@ -132,7 +133,9 @@ impl Updater {
         }
         let installed = state::load(&self.paths.state_path);
         if let Some(current) = installed.current_version.as_deref() {
-            let current_version = validate_exact_version(current)?;
+            let current_version = semver::Version::parse(current).map_err(|e| {
+                UpdateError::ExactVersion(format!("invalid installed version: {e}"))
+            })?;
             if version.cmp_precedence(&current_version).is_lt() {
                 return Err(UpdateError::ExactVersion(
                     "a newer version is already installed".into(),
@@ -150,7 +153,8 @@ impl Updater {
             .tmp_dir
             .join(format!("exact-{}-{}", std::process::id(), target));
         fs::create_dir_all(&tmp_dir)?;
-        let result = self.download_and_install(target, installed.channel, &entry, &tmp_dir, false);
+        let result =
+            self.download_and_install(target, installed.channel, &entry, &tmp_dir, false, true);
         let _ = fs::remove_dir_all(&tmp_dir);
         match result? {
             UpdateOutcome::AlreadyCurrent { version } if version != target => Err(
@@ -355,7 +359,8 @@ impl Updater {
                 .unwrap_or_default()
         ));
         fs::create_dir_all(&tmp_dir)?;
-        let result = self.download_and_install(&manifest.version, channel, entry, &tmp_dir, force);
+        let result =
+            self.download_and_install(&manifest.version, channel, entry, &tmp_dir, force, false);
         let _ = fs::remove_dir_all(&tmp_dir);
         result
     }
@@ -367,6 +372,7 @@ impl Updater {
         entry: &PlatformEntry,
         tmp_dir: &Path,
         force: bool,
+        exact: bool,
     ) -> Result<UpdateOutcome, UpdateError> {
         let archive_path = tmp_dir.join(&entry.asset);
         self.download_verified(entry, &archive_path)?;
@@ -387,7 +393,21 @@ impl Updater {
         let latest = state::load(&self.paths.state_path);
         if !force {
             if let Some(current) = latest.current_version.as_deref() {
-                if manifest_is_newer(current, version).unwrap_or(false) {
+                // Channel checks recover a missing binary even when the channel
+                // trails recorded state. Exact requests retain the state version
+                // as a downgrade floor regardless of whether its binary exists.
+                let newer = if exact {
+                    let current = semver::Version::parse(current).map_err(|e| {
+                        UpdateError::ExactVersion(format!("invalid installed version: {e}"))
+                    })?;
+                    current
+                        .cmp_precedence(&validate_exact_version(version)?)
+                        .is_gt()
+                } else {
+                    self.paths.daemon_binary(current).exists()
+                        && manifest_is_newer(current, version).unwrap_or(false)
+                };
+                if newer {
                     return Ok(UpdateOutcome::AlreadyCurrent {
                         version: current.into(),
                     });
@@ -401,7 +421,9 @@ impl Updater {
         // between the comparison and this commit.
         let mut new_state = latest;
         let previous = new_state.current_version.take();
-        new_state.channel = channel;
+        if !exact {
+            new_state.channel = channel;
+        }
         new_state.current_version = Some(version.to_string());
         state::save(&self.paths.state_path, &new_state)?;
 
