@@ -175,8 +175,10 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
   the port `enable_ws_api` seeded), or `common::serve_command_fixed_port()` only when the
   test must bind the settings-file port. `serve_spawn_guard.rs` fails the suite on any other
   `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"` statement, and on a file that
-  calls `enable_ws_api(` without `serve_command`, unless the line carries
-  `// serve-spawn: allow — <reason>` (wrapper-program launchers only; reason required).
+  calls `enable_ws_api(` without `serve_command`. Opt out with
+  `// serve-spawn: allow — <reason>` — on the offending statement's line for the first
+  rule, anywhere in the file for the second (wrapper-program launchers only; reason
+  required).
 
 ### Asserting the protocol contract
 

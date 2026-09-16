@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 const ALLOW_MARKER: &str = "// serve-spawn: allow";
 const SPAWN: &str = r#"Command::new(env!("CARGO_BIN_EXE_intentd"))"#;
 const SERVE_LITERAL: &str = "\"serve\"";
+const ENABLE_WS_API: &str = "enable_ws_api(";
 const MAX_STATEMENT_LINES: usize = 30;
 
 /// The builder module (defines the only sanctioned spawns) and this guard
@@ -132,8 +133,9 @@ enum Offense {
     RawServeSpawn { line: usize },
     /// An allow marker without a reason on `line`.
     MalformedMarker { line: usize },
-    /// Rule 2: the file enables the WSS listener but never names the builder.
-    MissingBuilder,
+    /// Rule 2: the file enables the WSS listener (first `enable_ws_api(` call
+    /// on `line`) but never names the builder.
+    MissingBuilder { line: usize },
 }
 
 impl Offense {
@@ -145,8 +147,9 @@ impl Offense {
             Offense::MalformedMarker { line } => format!(
                 "{rel}:{line}: malformed opt-out marker (expected `{ALLOW_MARKER} — <reason>`)"
             ),
-            Offense::MissingBuilder => format!(
-                "{rel}: calls `enable_ws_api(` but never uses `serve_command` — \
+            Offense::MissingBuilder { line } => format!(
+                "{rel}:{line}: calls `enable_ws_api(` but the file never uses \
+                 `common::serve_command()` / `serve_command_fixed_port()` — \
                  the daemon is spawned some other way"
             ),
         }
@@ -188,8 +191,10 @@ fn classify(src: &str) -> Vec<Offense> {
             offenses.push(Offense::RawServeSpawn { line: i + 1 });
         }
     }
-    if src.contains("enable_ws_api(") && !src.contains("serve_command") && !has_reasoned_marker {
-        offenses.push(Offense::MissingBuilder);
+    if !src.contains("serve_command") && !has_reasoned_marker {
+        if let Some(i) = lines.iter().position(|l| l.contains(ENABLE_WS_API)) {
+            offenses.push(Offense::MissingBuilder { line: i + 1 });
+        }
     }
     offenses
 }
@@ -368,7 +373,27 @@ fn spawn(data_dir: &Path) -> Child {
     Command::new(bin).arg("serve").spawn().unwrap()
 }
 "#;
-        assert_eq!(classify(src), vec![Offense::MissingBuilder]);
+        assert_eq!(classify(src), vec![Offense::MissingBuilder { line: 3 }]);
+    }
+
+    #[test]
+    fn missing_builder_diagnostic_names_the_first_enable_ws_api_line() {
+        let src = "use std::process::Command;\n\nfn boot(d: &Path) {\n    common::enable_ws_api(d);\n    common::enable_ws_api(d);\n}\n";
+        let offenses = classify(src);
+        assert_eq!(offenses, vec![Offense::MissingBuilder { line: 4 }]);
+        let diagnostic = offenses[0].describe("crates/intentd/tests/x.rs");
+        assert!(
+            diagnostic.starts_with("crates/intentd/tests/x.rs:4: "),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("common::serve_command()"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("serve_command_fixed_port()"),
+            "{diagnostic}"
+        );
     }
 
     #[test]
@@ -390,7 +415,7 @@ fn spawn(data_dir: &Path) -> Child {
             classify(unreasoned),
             vec![
                 Offense::MalformedMarker { line: 1 },
-                Offense::MissingBuilder
+                Offense::MissingBuilder { line: 2 }
             ]
         );
     }
