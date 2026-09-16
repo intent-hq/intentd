@@ -14,7 +14,7 @@ mod common;
 
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,9 +60,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         // Reduce token-resolution noise: strip env PATs. The `gh` CLI
@@ -353,9 +352,8 @@ async fn github_device_flow_full_lifecycle_over_wss() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_s = secrets_file.to_string_lossy().to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_SECRETS_FILE", &secrets_s),
         ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
     ];
@@ -470,9 +468,8 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_s = secrets_file.to_string_lossy().to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_SECRETS_FILE", &secrets_s),
         ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
     ];

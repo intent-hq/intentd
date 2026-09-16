@@ -64,9 +64,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -307,7 +306,7 @@ async fn mcp_servers_remote_probe_over_wss() {
 
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
@@ -487,7 +486,7 @@ async fn mcp_servers_oauth_auth_required_and_restart_recovery_over_wss() {
 
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
@@ -651,7 +650,7 @@ async fn mcp_servers_update_preserves_redacted_secrets_over_wss() {
 
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
@@ -794,7 +793,7 @@ async fn mcp_servers_update_preserves_redacted_secrets_over_wss() {
 async fn mcp_servers_create_rejects_redaction_placeholder_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
@@ -910,7 +909,7 @@ async fn mcp_test_connection_over_wss() {
 
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
@@ -987,7 +986,7 @@ async fn mcp_servers_workspace_scoped_toggle_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");

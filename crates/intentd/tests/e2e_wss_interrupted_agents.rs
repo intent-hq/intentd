@@ -17,7 +17,7 @@ mod common;
 
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -233,12 +233,10 @@ async fn interrupted_agents_persisted_across_restart() {
     // Pin resumeInterruptedOnStart=off: this suite asserts pending rows
     // survive a restart, but the `auto` default resumes on headless hosts.
     common::disable_resume_on_start(&data_dir);
-    let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd1.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd1 = common::serve_command();
+    cmd1.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -332,12 +330,10 @@ async fn interrupted_agents_persisted_across_restart() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd2.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd2 = common::serve_command();
+    cmd2.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -385,12 +381,10 @@ async fn interrupted_agents_persisted_across_restart() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd3 = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd3.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd3 = common::serve_command();
+    cmd3.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -476,12 +470,10 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     // Pin resumeInterruptedOnStart=off: this suite asserts the captured row
     // is still pending after restart, but `auto` resumes on headless hosts.
     common::disable_resume_on_start(&data_dir);
-    let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd1.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd1 = common::serve_command();
+    cmd1.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("MOCK_AGENT_SCRIPT_PATH", &script)
         .env("MOCK_AGENT_BEHAVIOR", &behavior)
         .stdout(Stdio::null())
@@ -592,12 +584,10 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd2.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd2 = common::serve_command();
+    cmd2.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon2.log")).unwrap(),

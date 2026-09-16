@@ -16,7 +16,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,9 +68,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -347,9 +346,8 @@ async fn transient_prompt_fetch_failure_retries_in_place_over_wss() {
         "response": "recovered after transient fetch failures",
     })
     .to_string();
-    let env: [(&str, &str); 6] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -500,9 +498,8 @@ async fn failed_prompt_turn_preserves_partial_transcript_over_wss() {
         "response": "recovered after provider prompt error",
     })
     .to_string();
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -780,9 +777,8 @@ async fn poisoned_session_quarantines_send_message_over_wss() {
         },
     })
     .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
