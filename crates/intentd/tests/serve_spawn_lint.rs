@@ -1,4 +1,4 @@
-//! Source-scan guard: e2e suites spawn `intentd serve` only through the shared
+//! Source lint: e2e suites spawn `intentd serve` only through the shared
 //! builders in `crates/intentd/tests/common/mod.rs`.
 //!
 //! `common::serve_command()` owns the `INTENTD_TCP_PORT=0` ephemeral-port seam
@@ -10,7 +10,7 @@
 //!
 //! This is a bounded textual heuristic, not a dataflow analysis. Rules,
 //! applied to every `.rs` under `crates/intentd/tests/` except the builder
-//! module and this guard:
+//! module and this lint:
 //!
 //! 1. Statement backstop. A line containing
 //!    `Command::new(env!("CARGO_BIN_EXE_intentd"))` (whitespace-insensitive;
@@ -43,11 +43,11 @@ const ENABLE_WS_API: &str = "enable_ws_api(";
 const BUILDER_IDENT: &str = "serve_command";
 const MAX_STATEMENT_LINES: usize = 30;
 
-/// The builder module (defines the only sanctioned spawns) and this guard
+/// The builder module (defines the only sanctioned spawns) and this lint
 /// (whose docs quote the patterns).
 const EXEMPT_FILES: &[&str] = &[
     "crates/intentd/tests/common/mod.rs",
-    "crates/intentd/tests/serve_spawn_guard.rs",
+    "crates/intentd/tests/serve_spawn_lint.rs",
 ];
 
 fn workspace_root() -> PathBuf {

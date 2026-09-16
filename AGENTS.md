@@ -163,17 +163,17 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
   `common::test_tempdir_in("/tmp", prefix)` (or `test_support::test_tempdir` inside
   `intent-services`), declared before any guard that kills a daemon child: the `TempDir`
   sweeps on drop (including on panic) and `INTENTD_TEST_KEEP_TMP=1` keeps it for
-  debugging. `tmp_hygiene_guard.rs` fails the suite on any raw `PathBuf::from("/tmp")` /
+  debugging. `tmp_hygiene_lint.rs` fails the suite on any raw `PathBuf::from("/tmp")` /
   `Path::new("/tmp")` / `temp_dir().join(..)` in test code unless the line ends with
   `// tmp-hygiene: allow — <reason>` (pure path arithmetic only).
 - **Repo-cache paths** — derive them with `intent_git::repo_cache::cache_root_for` /
-  `cache_path_for`, never `join(".repo-cache")`. `repo_cache_path_guard.rs` fails the
+  `cache_path_for`, never `join(".repo-cache")`. `repo_cache_path_lint.rs` fails the
   suite on a literal `".repo-cache"` in test code unless the line ends with
   `// repo-cache-path: allow — <reason>`.
 - **Daemon spawns** — build them with `common::serve_command()` (the `intentd` binary,
   `serve`, and the `INTENTD_TCP_PORT=0` ephemeral-port seam so WSS daemons never race for
   the port `enable_ws_api` seeded), or `common::serve_command_fixed_port()` only when the
-  test must bind the settings-file port. `serve_spawn_guard.rs` is a bounded textual
+  test must bind the settings-file port. `serve_spawn_lint.rs` is a bounded textual
   backstop: it fails the suite on a single-statement
   `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"` (30-line cap), and on a file
   whose code calls `enable_ws_api(` without `serve_command` in code (comments stripped;
@@ -217,52 +217,26 @@ Raw invocations must also run under the rustup-managed toolchain pinned in
 `PATH` — a Homebrew cargo once ran the gates on the wrong toolchain, see
 intent-hq/intentd#1853); the `make` targets are the supported path.
 
-The CI `check` job also runs the repo-slug fold lint,
-`cargo test -p intent-core --test repo_slug_fold_lint`, a deliberately narrow source
-heuristic: it fails naming `file:line` for every statement outside
-`intent_core::RepoRef` where a case-fold call (`to_lowercase`, `to_ascii_lowercase`,
-`eq_ignore_ascii_case`, `make_ascii_lowercase`) co-occurs with an `owner` / `repo` /
-`repository` / `slug` identifier (intent-hq/intentd#1809 → #1815). It does not prove
-every raw slug comparison is caught — route slug identity through `RepoRef` regardless.
-A flagged site that is not slug identity opts out with
-`// repo-slug-fold: allow — <reason>` on the line immediately above the statement, and
-the reason is required.
+The CI `check` job also runs the **source lints**: every `crates/<crate>/tests/*_lint.rs`
+integration test is a source-scanning lint, selected by convention — run them all with
+`make lint-sources` from the monorepo root or `cargo test --workspace --test '*_lint'` in
+`packages/intentd`. Each lint fails naming `file:line`; its rationale, heuristic, and
+limits live in its module doc. `source_lint_discovery_lint` fails when a `*_lint.rs` file
+exists that the glob does not select (nested dir, `autotests = false`, renamed `[[test]]`)
+or when ci.yml drops the glob step, so a new lint needs no CI, Makefile, or docs wiring —
+add the file and a row below. Every opt-out marker requires a reason; baselines only
+ratchet down (the lint fails until a fixed file's entry is removed or lowered).
 
-The same job runs the event-type literal lint,
-`cargo test -p intent-core --test event_type_lint`: `intent_core::events::ALL_EVENT_TYPES`
-is mirrored into the checked-in golden `crates/intent-core/tests/goldens/event_types.json`
-(`cargo test -p intent-core --test events` fails naming the drift; regenerate with
-`INTENTD_UPDATE_GOLDENS=1`), and the lint fails naming `file:line` for every
-`note:` / `task:` / `workspace:` / `agent:` string literal outside test code that is not
-in the catalog. A new event type goes into `ALL_EVENT_TYPES` (then regenerate the golden)
-and is emitted via its constant; a string that is not an emitted event type opts out with
-`// event-type-lint: allow — <reason>` on the line immediately above the literal.
-
-The same job runs the fixed-sleep lint,
-`cargo test -p intent-core --test fixed_sleep_lint`: it fails naming `file:line` for every
-`thread::sleep(` / `time::sleep(` / shell `sleep <n>` under `crates/*/tests/**/*.rs` that
-is neither justified nor grandfathered (intent-hq/intentd#1924 → this lint). Positive-path
-waits belong on an observable event (a barrier file, a `wait_until` poll on the state
-under test), not a fixed delay; a sleep that is genuinely a timing guard opts out with
-`// timing-guard: <reason>` on its own line or the line immediately above, and the reason
-is required. Existing offenders are grandfathered by
-`crates/intent-core/tests/fixed_sleep_baseline.txt` (`<path> <count>` per file), which only
-ratchets down: when a file's unannotated count drops, the lint fails printing the exact
-replacement line to paste; raising an entry, or adding one for a new file, needs a
-justification in the PR.
-
-The same job runs the raw-`Child` lint,
-`cargo test -p intentd-test-support --test raw_child_lint` (`make lint-raw-child`): it
-fails naming `file:line` wherever a file under `crates/*/tests/**/*.rs` names
-`std::process::Child` as a type — return type, field, binding, parameter, generic
-argument, or tuple element such as `-> (Child, u16)` — instead of holding it in
-`intentd_test_support::GuardedChild` (a bare `Child`
-leaks the process, and everything it spawned, when the test panics before its
-teardown). Borrows (`&Child`, `&mut Child`) and `use` paths are not hits. Suites not yet
-migrated are listed in the lint's `BASELINE`, which only shrinks: once a file has no
-hits left, the lint fails until its entry is deleted. A site that genuinely must own a
-bare `Child` opts out with `// raw-child: allow — <reason>` on the line immediately
-above it; the reason is required.
+| Lint | Fails on | Opt-out / baseline |
+| --- | --- | --- |
+| `repo_slug_fold_lint` | a case-fold call on an `owner` / `repo` / `repository` / `slug` identifier outside `intent_core::RepoRef` (intent-hq/intentd#1809 → #1815); route slug identity through `RepoRef` regardless | `// repo-slug-fold: allow — <reason>` on the line above |
+| `event_type_lint` | a `note:` / `task:` / `workspace:` / `agent:` string literal outside test code not in `intent_core::events::ALL_EVENT_TYPES`; add the type there, regenerate the golden `crates/intent-core/tests/goldens/event_types.json` with `INTENTD_UPDATE_GOLDENS=1`, and emit via the constant | `// event-type-lint: allow — <reason>` on the line above |
+| `fixed_sleep_lint` | `thread::sleep(` / `time::sleep(` / shell `sleep <n>` under `crates/*/tests/**` (intent-hq/intentd#1924); wait on an observable event instead | `// timing-guard: <reason>` on the line or the line above; `crates/intent-core/tests/fixed_sleep_baseline.txt` (`<path> <count>`) |
+| `raw_child_lint` | a test file naming `std::process::Child` as a type instead of holding an `intentd_test_support::GuardedChild` (borrows and `use` paths are not hits) | `// raw-child: allow — <reason>` on the line above; the lint's `BASELINE` |
+| `tmp_hygiene_lint` | a raw `PathBuf::from("/tmp")` / `Path::new("/tmp")` / `temp_dir().join(..)` in test code instead of `test_tempdir` | trailing `// tmp-hygiene: allow — <reason>` |
+| `repo_cache_path_lint` | a literal `".repo-cache"` in test code instead of `intent_git::repo_cache::cache_root_for` / `cache_path_for` | trailing `// repo-cache-path: allow — <reason>` |
+| `serve_spawn_lint` | a single-statement `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"`, or a file calling `enable_ws_api(` without `serve_command` in code | `// serve-spawn: allow — <reason>` on the statement line, or anywhere in the file for the second rule |
+| `source_lint_discovery_lint` | a `*_lint.rs` file the glob does not select, or ci.yml without the glob step | none |
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.

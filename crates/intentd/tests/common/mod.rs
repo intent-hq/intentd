@@ -558,7 +558,7 @@ async fn await_wss_stopped_impl(socket: &Path, log_path: Option<&Path>) {
 /// …)` on the returned `Command` overrides the seam, so a deliberate pin (e.g.
 /// an out-of-range value to prove startup refusal) still works.
 ///
-/// `serve_spawn_guard.rs` is a bounded textual backstop for this: it fails
+/// `serve_spawn_lint.rs` is a bounded textual backstop for this: it fails
 /// the suite on a single-statement `Command::new(env!("CARGO_BIN_EXE_intentd"))
 /// … "serve"` outside this module (30-line cap), and on a file whose code calls
 /// [`enable_ws_api`] without a builder call in code. A split-statement raw
@@ -596,7 +596,7 @@ pub fn serve_command_fixed_port() -> std::process::Command {
 /// default that would collide across parallel daemons. Either way, read the
 /// real port from `system.status` ([`await_wss_status`]), never from the
 /// seeded config value — with the seam, the ephemeral port changes across
-/// boots on the same data dir. `serve_spawn_guard.rs` backs this up with a
+/// boots on the same data dir. `serve_spawn_lint.rs` backs this up with a
 /// file-level rule: a file whose code calls this helper must also call one of
 /// the two builders in code (comments do not count), or carry a reasoned
 /// `serve-spawn: allow` marker. Appends to an existing seeded config; no-op if

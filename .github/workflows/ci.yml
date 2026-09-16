@@ -374,36 +374,15 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      # Repo-slug fold lint (intent-hq/intentd#1809 → #1815): GitHub owner/name
-      # slugs are case-insensitive, and every hand-rolled `to_lowercase` /
-      # `eq_ignore_ascii_case` on a slug outside `intent_core::RepoRef` was a
-      # place the fold could be missed. This source-scanning test fails naming
-      # file:line; it runs here, next to Clippy, so every PR gets the verdict
-      # from the lint job rather than buried in the test matrix.
-      - name: Repo-slug fold lint
-        run: cargo test -p intent-core --test repo_slug_fold_lint
-      # Event-type literal lint: fails naming file:line for any
-      # `note:`/`task:`/`workspace:`/`agent:` string literal outside test code
-      # that is not in `intent_core::events::ALL_EVENT_TYPES` (the catalog
-      # mirrored into tests/goldens/event_types.json), so an emitter cannot
-      # introduce a type the golden does not know.
-      - name: Event-type literal lint
-        run: cargo test -p intent-core --test event_type_lint
-      # Fixed-sleep lint: fails naming file:line for any `thread::sleep(` /
-      # `time::sleep(` / shell `sleep <n>` under `crates/*/tests/**` that has
-      # no `timing-guard: <reason>` marker and is not grandfathered by
-      # tests/fixed_sleep_baseline.txt (per-file counts, ratchets down only),
-      # so a positive-path wait cannot quietly regress into a fixed delay.
-      - name: Fixed-sleep lint
-        run: cargo test -p intent-core --test fixed_sleep_lint
-      # Raw-Child lint: fails naming file:line wherever a test file under
-      # crates/*/tests names `std::process::Child` as a type (return, field,
-      # binding, or generic argument) instead of holding it in
-      # `intentd_test_support::GuardedChild` — a bare `Child` leaks the
-      # process, and everything it spawned, when the test panics before its
-      # teardown. Unmigrated suites sit in the lint's shrink-only BASELINE.
-      - name: Raw-Child lint
-        run: cargo test -p intentd-test-support --test raw_child_lint
+      # Source lints: every `crates/*/tests/*_lint.rs` integration test is a
+      # source-scanning lint and is selected by the `--test` glob, so a new
+      # lint needs no wiring here. Each lint's rationale lives in its module
+      # doc; `source_lint_discovery_lint` fails when a `*_lint.rs` file exists
+      # that cargo does not expose as a matching test target. The lints run
+      # here, next to Clippy, so every PR gets the verdict from the lint job
+      # rather than buried in the test matrix.
+      - name: Source lints
+        run: cargo test --workspace --test '*_lint'
       # Per-slot HOME for install-action — see the coverage-e2e job's comment
       # for the full rationale (shared ~/.install-action tmp/bin race across
       # the 8 tinybox slots; monorepo#1239).
