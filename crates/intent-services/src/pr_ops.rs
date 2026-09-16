@@ -998,24 +998,24 @@ pub(crate) async fn fetch_merge_requirements(
     repo_ref: &RepoRef,
     number: u64,
 ) -> Result<MergeRequirements> {
-    let (_, requirements, _, _) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
-    Ok(requirements)
+    let (_, read) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
+    Ok(read.requirements)
 }
 
 /// [`fetch_merge_requirements`] plus the by-products the PR monitor needs
 /// for its own snapshot — the [`PullRequest`] the checklist was composed from
-/// (title / url / head SHA), the review-comment count from the same thread
-/// fetch, and the probe-answered flag (see [`merge_requirements_for_pr`]) —
-/// so a poll never repeats the `get_pr` / thread reads.
+/// (title / url / head SHA) and the [`MergeRequirementsRead`] it came with
+/// (review-comment count from the same thread fetch, probe-answered flag,
+/// sub-read completeness) — so a poll never repeats the `get_pr` / thread
+/// reads.
 pub(crate) async fn fetch_merge_requirements_detailed(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
-) -> Result<(PullRequest, MergeRequirements, i64, bool)> {
+) -> Result<(PullRequest, MergeRequirementsRead)> {
     let pr = sc.get_pr(repo_ref, number).await.map_err(map_sc_err)?;
-    let (requirements, review_comments, ejection_known) =
-        merge_requirements_for_pr(sc, repo_ref, number, &pr).await?;
-    Ok((pr, requirements, review_comments, ejection_known))
+    let read = merge_requirements_for_pr_detailed(sc, repo_ref, number, &pr).await?;
+    Ok((pr, read))
 }
 
 /// Split a best-effort forge read into "answered" / "degraded" while
@@ -1053,6 +1053,40 @@ pub(crate) async fn merge_requirements_for_pr(
     number: u64,
     pr: &PullRequest,
 ) -> Result<(MergeRequirements, i64, bool)> {
+    let read = merge_requirements_for_pr_detailed(sc, repo_ref, number, pr).await?;
+    Ok((
+        read.requirements,
+        read.review_comment_count,
+        read.ejection_known,
+    ))
+}
+
+/// [`merge_requirements_for_pr`]'s result plus whether EVERY sub-read behind
+/// it answered — the PR monitor's precondition for reusing a checklist on
+/// later polls instead of re-fetching it.
+#[derive(Debug, Clone)]
+pub(crate) struct MergeRequirementsRead {
+    pub(crate) requirements: MergeRequirements,
+    /// Review-comment count from the same thread fetch.
+    pub(crate) review_comment_count: i64,
+    /// Whether the merge-requirements probe itself answered (the only source
+    /// of the merge-queue ejection signal).
+    pub(crate) ejection_known: bool,
+    /// `false` when ANY sub-read degraded — probe, reviews, review decision,
+    /// fallback check runs, or review threads (whose fallback cannot report
+    /// thread resolution) — so the checklist carries a default in place of a
+    /// signal the forge may answer on the next read.
+    pub(crate) complete: bool,
+}
+
+/// [`merge_requirements_for_pr`] reporting per-sub-read completeness (see
+/// [`MergeRequirementsRead::complete`]).
+pub(crate) async fn merge_requirements_for_pr_detailed(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    pr: &PullRequest,
+) -> Result<MergeRequirementsRead> {
     let (signals, reviews) = tokio::join!(
         sc.merge_requirements(repo_ref, number),
         sc.list_reviews(repo_ref, number)
@@ -1068,6 +1102,7 @@ pub(crate) async fn merge_requirements_for_pr(
     // Captured BEFORE the review-decision backfill below can fabricate a
     // stub `signals` for a failed probe.
     let ejection_known = signals.is_some();
+    let mut complete = ejection_known && reviews.is_some();
     let agg = aggregate_reviews(&reviews.unwrap_or_default());
 
     // The probe carries the forge's `reviewDecision`; when it did not — no
@@ -1084,9 +1119,9 @@ pub(crate) async fn merge_requirements_for_pr(
                     "merge requirements: review_decision fetch failed, falling back to aggregate"
                 );
             }),
-        )?
-        .flatten();
-        if let Some(decision) = decision {
+        )?;
+        complete &= decision.is_some();
+        if let Some(decision) = decision.flatten() {
             signals.get_or_insert_with(Default::default).review_decision = Some(decision);
         }
     }
@@ -1100,8 +1135,9 @@ pub(crate) async fn merge_requirements_for_pr(
         .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
     let fallback_runs = match head_ref {
         Some(git_ref) if !rollup_known && sc.capabilities().check_runs => {
-            degrade_unless_rate_limited(sc.check_runs(repo_ref, &git_ref).await)?
-                .unwrap_or_default()
+            let runs = degrade_unless_rate_limited(sc.check_runs(repo_ref, &git_ref).await)?;
+            complete &= runs.is_some();
+            runs.unwrap_or_default()
         }
         _ => Vec::new(),
     };
@@ -1130,6 +1166,7 @@ pub(crate) async fn merge_requirements_for_pr(
                 pr_number = number,
                 "merge requirements: review threads unavailable, falling back to REST comments (thread resolution state unavailable, unresolved count reported as unknown)"
             );
+            complete = false;
             match fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)).await {
                 Ok((comments, _, _)) => {
                     (count_thread_comments(&fallback_threads(comments)).0, None)
@@ -1150,7 +1187,12 @@ pub(crate) async fn merge_requirements_for_pr(
     };
 
     let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
-    Ok((requirements, review_comments, ejection_known))
+    Ok(MergeRequirementsRead {
+        requirements,
+        review_comment_count: review_comments,
+        ejection_known,
+        complete,
+    })
 }
 
 // ===========================================================================
