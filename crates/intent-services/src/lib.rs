@@ -4933,6 +4933,110 @@ impl Services {
         }
     }
 
+    /// Passively fold a PR snapshot fetched on demand (`github.pulls.get`,
+    /// the FE hover card) into the daemon-owned PR state, so the sidebar's
+    /// `displayStatus` grouping reflects the fresh status through the
+    /// existing event plumbing instead of waiting for the next sweep.
+    ///
+    /// Every live (non-archived, non-remote) workspace referencing the PR by
+    /// URL — linked via `prUrl` or carrying a `pullRequests` pool entry —
+    /// gets the pool entry upserted (URL-keyed: pools can be cross-repo, so
+    /// a same-numbered PR from another repository is never touched); when
+    /// the PR is the workspace's linked one (same repo and number) the
+    /// linked columns update exactly like the update path of
+    /// [`Self::refresh_workspace_pr_with_sc`]. Git roots whose pool holds
+    /// the URL (or whose linked PR it is) fold the same way. Deltas persist
+    /// through the scoped PR-linkage writes and emit `pr:updated` /
+    /// `gitRoot:updated` plus the displayStatus transition. This is a
+    /// passive fold: it never runs relink discovery or the stale-unlink
+    /// rule (a hover must not re-shape linkage), and a PR nobody references
+    /// writes nothing. Per-row persist failures WARN and continue; only the
+    /// lookups themselves surface as `Err`, and the RPC caller treats that
+    /// as fail-soft too.
+    pub(crate) async fn fold_fetched_pr(
+        &self,
+        repo_ref: &intent_sourcecontrol::RepoRef,
+        pr: &intent_sourcecontrol::PullRequest,
+    ) -> Result<()> {
+        let info = pr_ops::build_pr_info(pr);
+        let workspaces = self
+            .store
+            .list_workspaces_referencing_pr_url(&pr.url)
+            .await?;
+        for mut ws in workspaces {
+            let mut changed = pr_ops::upsert_pr_info_by_url(&mut ws.pull_requests, &info);
+            let linked = ws.pr_number == Some(pr.number) && ws.repo().as_ref() == Some(repo_ref);
+            if linked
+                && (ws.pr_status != Some(info.status)
+                    || ws.active_pull_request.as_ref() != Some(&info)
+                    || ws.pr_url.as_deref() != Some(pr.url.as_str()))
+            {
+                ws.pr_status = Some(info.status);
+                ws.pr_url = Some(pr.url.clone());
+                ws.active_pull_request = Some(info.clone());
+                changed = true;
+            }
+            if !changed {
+                continue;
+            }
+            ws.updated_at = now_iso();
+            if let Err(e) = self.store.update_workspace_pr_linkage(&ws).await {
+                tracing::warn!(
+                    workspace_id = %ws.id.as_str(),
+                    error = %e,
+                    "pr fold: persisting workspace PR delta failed"
+                );
+                continue;
+            }
+            publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
+            self.maybe_emit_display_status_changed(&ws.id).await;
+        }
+        let roots = self
+            .store
+            .list_workspace_git_roots_referencing_pr_url(&pr.url)
+            .await?;
+        for mut root in roots {
+            let mut changed = false;
+            if root
+                .pull_requests
+                .as_deref()
+                .is_some_and(|items| items.iter().any(|p| p.url == pr.url))
+            {
+                changed |= pr_ops::upsert_pr_info_by_url(&mut root.pull_requests, &info);
+            }
+            let linked =
+                root.pr_number == Some(pr.number) && root.repo().as_ref() == Some(repo_ref);
+            if linked
+                && (root.pr_status != Some(info.status)
+                    || root.pr_url.as_deref() != Some(pr.url.as_str()))
+            {
+                root.pr_status = Some(info.status);
+                root.pr_url = Some(pr.url.clone());
+                changed = true;
+            }
+            if !changed {
+                continue;
+            }
+            root.updated_at = now_iso();
+            if let Err(e) = self.store.update_workspace_git_root_pr(&root).await {
+                tracing::warn!(
+                    git_root = %root.id.as_str(),
+                    error = %e,
+                    "pr fold: persisting git root PR delta failed"
+                );
+                continue;
+            }
+            publish_event(
+                self.event_bus.as_ref(),
+                git_root_changed_event(GIT_ROOT_UPDATED, &root),
+            )
+            .await;
+            self.maybe_emit_display_status_changed(&root.workspace_id)
+                .await;
+        }
+        Ok(())
+    }
+
     /// Refresh active workspaces' PR linkage: existing links are re-fetched
     /// (persisting deltas + emitting `pr:updated`/`pr:unlinked`), and unlinked
     /// workspaces discover a matching open PR by head ref or baseRef
@@ -28171,6 +28275,17 @@ impl WorkspaceApi for Services {
                 .get_pr(&repo_ref, number)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
+            // Fail-soft: the hover card always gets its `{ pull }`; a fold
+            // failure only costs the daemon-owned state its early refresh.
+            if let Err(e) = self.fold_fetched_pr(&repo_ref, &pr).await {
+                tracing::warn!(
+                    owner = %repo_ref.owner,
+                    repo = %repo_ref.name,
+                    pr_number = number,
+                    error = %e,
+                    "github.pulls.get: folding the fetched PR into workspace PR state failed"
+                );
+            }
             Ok(serde_json::json!({ "pull": github_ops::pull_to_json(&pr) }))
         })
     }

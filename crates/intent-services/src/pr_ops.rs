@@ -333,6 +333,28 @@ pub(crate) fn upsert_pr_info(
     true
 }
 
+/// URL-keyed sibling of [`upsert_pr_info`] for the passive `github.pulls.get`
+/// fold: a fetched snapshot replaces the pool entry sharing its `url`
+/// (appending when absent) and never a same-numbered PR from another
+/// repository. Returns `true` when the list actually changed.
+pub(crate) fn upsert_pr_info_by_url(
+    list: &mut Option<Vec<PullRequestInfo>>,
+    info: &PullRequestInfo,
+) -> bool {
+    let items = list.get_or_insert_with(Vec::new);
+    match items.iter_mut().find(|p| p.url == info.url) {
+        Some(existing) if *existing == *info => false,
+        Some(existing) => {
+            *existing = info.clone();
+            true
+        }
+        None => {
+            items.push(info.clone());
+            true
+        }
+    }
+}
+
 /// Cap on stale `pull_requests` re-fetches per git root per sweep
 /// (monorepo#3127). Bounds the forge calls added by
 /// [`refresh_stale_pool_entries`] so a long PR history stays within the
@@ -1352,6 +1374,35 @@ mod tests {
         assert_eq!(items[0].number, merged.number);
         assert_eq!(items[0].status, PullRequestStatus::Merged);
         assert_eq!(items[1].number, 2);
+    }
+
+    #[test]
+    fn upserts_pr_info_by_url_never_touches_a_same_numbered_stranger() {
+        let open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
+        let mut list: Option<Vec<PullRequestInfo>> = None;
+
+        // Insert into an absent list; identical snapshot is a no-op.
+        assert!(upsert_pr_info_by_url(&mut list, &open));
+        assert!(!upsert_pr_info_by_url(&mut list, &open));
+        assert_eq!(list.as_ref().unwrap().len(), 1);
+
+        // Same URL, different snapshot: replaced in place.
+        let merged = build_pr_info(&pr(PrState::Merged, false, None, None));
+        assert!(upsert_pr_info_by_url(&mut list, &merged));
+        assert_eq!(list.as_ref().unwrap().len(), 1);
+        assert_eq!(list.as_ref().unwrap()[0].status, PullRequestStatus::Merged);
+
+        // Same number from another repository (cross-repo pool): appended,
+        // and the original entry is left untouched.
+        let mut other_repo = pr(PrState::Open, false, None, None);
+        other_repo.url = "https://github.com/other/repo/pull/1".into();
+        let other_info = build_pr_info(&other_repo);
+        assert!(upsert_pr_info_by_url(&mut list, &other_info));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].number, items[1].number);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[1].url, other_info.url);
     }
 
     #[test]

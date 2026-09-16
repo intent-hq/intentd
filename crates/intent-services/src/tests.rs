@@ -19107,6 +19107,337 @@ mod pr {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // `github.pulls.get` fold: the on-demand hover-card fetch passively folds
+    // the fetched PR into the daemon-owned PR state of every workspace / git
+    // root referencing it by URL (no discovery, no unlink), emitting
+    // `pr:updated` / `gitRoot:updated` plus the displayStatus transition;
+    // an unreferenced PR writes nothing and a fold failure never fails the
+    // RPC.
+    // ------------------------------------------------------------------------
+
+    /// Bus-wired service whose forge reports every PR merged, plus a seeded
+    /// `o/r` workspace on branch `feature` with one complete task note (so a
+    /// merged PR rolls up to `pr_merged`). `seed` shapes the workspace's PR
+    /// columns before insert.
+    async fn fold_setup(
+        seed: impl FnOnce(&mut intent_core::Workspace),
+    ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.branch = "feature".into();
+        ws.repository_owner = Some("o".into());
+        ws.repository_name = Some("r".into());
+        seed(&mut ws);
+        store.insert_workspace(&ws).await.expect("ws");
+        store
+            .insert_note(&sweep_task_note(&ws_id, intent_core::TaskStatus::Complete))
+            .await
+            .unwrap();
+        let bus = crate::EventBus::new(store.clone());
+        let wsroot = super::WorkspacesRoot::new();
+        let svc = Services::new(store)
+            .with_event_bus(bus)
+            .with_workspaces_root(wsroot.path().to_path_buf())
+            .with_source_control(Arc::new(StubForge {
+                merged_linked: true,
+                ..Default::default()
+            }));
+        (tmp, wsroot, svc, ws_id)
+    }
+
+    /// Seed the displayStatus baseline for `ws_id` via a list read (a seed
+    /// never emits) and return the observed rung.
+    async fn seed_display_status(
+        svc: &Services,
+        ws_id: &WorkspaceId,
+    ) -> Option<intent_core::WorkspaceDisplayStatus> {
+        let list = svc.list_workspaces(false).await.unwrap();
+        let row = list.iter().find(|w| &w.id == ws_id).expect("row");
+        assert!(display_status_events(svc, ws_id).await.is_empty());
+        row.display_status
+    }
+
+    /// The linked case: a workspace linked to #42 (persisted Open) whose PR
+    /// the forge now reports merged — `github.pulls.get` flips `prStatus`,
+    /// `activePullRequest`, and the pool entry to Merged, emits one
+    /// `pr:updated` and one `displayStatus-changed` to `pr_merged`, keeps
+    /// the link (no discovery/unlink), and an identical re-fetch is a no-op.
+    #[tokio::test]
+    async fn pulls_get_folds_merged_status_into_linked_workspace() {
+        let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
+        let (_t, _root, svc, ws_id) = fold_setup(|ws| {
+            ws.pr_number = Some(42);
+            ws.pr_url = Some(open.url.clone());
+            ws.pr_status = Some(intent_core::PullRequestStatus::Open);
+            ws.active_pull_request = Some(open.clone());
+            ws.pull_requests = Some(vec![open.clone()]);
+        })
+        .await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(v["pull"]["number"], 42);
+        assert_eq!(v["pull"]["merged"], true);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42), "passive fold keeps the link");
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Merged)
+        );
+        assert_eq!(
+            after.active_pull_request.as_ref().map(|p| p.status),
+            Some(intent_core::PullRequestStatus::Merged)
+        );
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
+
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data["prNumber"], 42);
+        assert_eq!(evs[0].data["prStatus"], "Merged");
+        assert_eq!(evs[0].data["pullRequests"][0]["status"], "Merged");
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_merged")]
+        );
+
+        // Identical forge state: nothing persists, nothing emits.
+        svc.github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get again");
+        let again = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(again.updated_at, after.updated_at);
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(display_status_events(&svc, &ws_id).await.len(), 1);
+    }
+
+    /// The pool-only case: an unlinked workspace whose `pullRequests` pool
+    /// holds #43 (Open) — the fetch upserts the pool entry to Merged, leaves
+    /// the (absent) link alone, and emits `pr:updated` plus the transition
+    /// to `pr_merged`.
+    #[tokio::test]
+    async fn pulls_get_folds_merged_status_into_pool_only_workspace() {
+        let (_t, _root, svc, ws_id) = fold_setup(|ws| {
+            ws.pull_requests = Some(vec![pool_entry(
+                43,
+                intent_core::PullRequestStatus::Open,
+                "",
+            )]);
+        })
+        .await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        svc.github_pulls_get("o".into(), "r".into(), 43)
+            .await
+            .expect("pulls.get");
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, None, "passive fold never links");
+        assert_eq!(after.pr_status, None);
+        assert!(after.active_pull_request.is_none());
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 43);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
+
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data["pullRequests"][0]["status"], "Merged");
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_merged")]
+        );
+    }
+
+    /// The git-root case: a root whose pool holds #42 (Open) — the fetch
+    /// upserts the root's pool entry to Merged, persists via the scoped
+    /// git-root PR write, and emits `gitRoot:updated` plus the owning
+    /// workspace's transition to `pr_merged`.
+    #[tokio::test]
+    async fn pulls_get_folds_merged_status_into_git_root_pool_entry() {
+        let (_t, _root, svc, ws_id) = fold_setup(|_| {}).await;
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let mut root = sweep_root(&ws_id, &secondary.dir, Some(("o", "r")));
+        root.pull_requests = Some(vec![pool_entry(
+            42,
+            intent_core::PullRequestStatus::Open,
+            "",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        svc.github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+
+        let roots = svc.store().list_workspace_git_roots(&ws_id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
+        assert_eq!(roots[0].pr_number, None, "passive fold never links");
+
+        let updated = svc
+            .store()
+            .events_by_type(&ws_id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(
+            updated[0].data["gitRoot"]["pullRequests"][0]["status"],
+            "Merged"
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_merged")]
+        );
+    }
+
+    /// A PR nobody references: the response is served as before and the
+    /// fold writes nothing — no row touched, no event of any kind.
+    #[tokio::test]
+    async fn pulls_get_for_unreferenced_pr_writes_nothing() {
+        let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
+        let (_t, _root, svc, ws_id) = fold_setup(|ws| {
+            ws.pr_number = Some(42);
+            ws.pr_url = Some(open.url.clone());
+            ws.pr_status = Some(intent_core::PullRequestStatus::Open);
+            ws.active_pull_request = Some(open.clone());
+            ws.pull_requests = Some(vec![open.clone()]);
+        })
+        .await;
+        seed_display_status(&svc, &ws_id).await;
+        let before = svc.store().get_workspace(&ws_id).await.unwrap();
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 99)
+            .await
+            .expect("pulls.get");
+        assert_eq!(v["pull"]["number"], 99);
+        assert_eq!(v["pull"]["merged"], true);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after, before);
+        for ty in [
+            "pr:updated",
+            "gitRoot:updated",
+            "workspace:displayStatus-changed",
+        ] {
+            assert!(
+                svc.store()
+                    .events_by_type(&ws_id, ty, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "no {ty} for an unreferenced PR"
+            );
+        }
+    }
+
+    /// A store failure inside the fold (the scoped PR-linkage write aborted
+    /// by an injected trigger) never fails the RPC: the hover card still gets
+    /// its `{ pull }`, the persisted state is untouched, and no event fires.
+    #[tokio::test]
+    async fn pulls_get_fold_persist_failure_never_fails_the_rpc() {
+        let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
+        let (_t, _root, svc, ws_id) = fold_setup(|ws| {
+            ws.pr_number = Some(42);
+            ws.pr_url = Some(open.url.clone());
+            ws.pr_status = Some(intent_core::PullRequestStatus::Open);
+            ws.active_pull_request = Some(open.clone());
+            ws.pull_requests = Some(vec![open.clone()]);
+        })
+        .await;
+        sqlx::query(
+            "CREATE TRIGGER fold_fail BEFORE UPDATE OF pr_status ON workspace \
+             BEGIN SELECT RAISE(ABORT, 'injected fold failure'); END",
+        )
+        .execute(svc.store().write_pool())
+        .await
+        .expect("arm trigger");
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("fold failure is fail-soft");
+        assert_eq!(v["pull"]["number"], 42);
+        assert_eq!(v["pull"]["merged"], true);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A store failure in the fold's lookup itself (a referencing row whose
+    /// persisted pool no longer decodes) surfaces as the fold's `Err` and is
+    /// equally fail-soft at the RPC boundary.
+    #[tokio::test]
+    async fn pulls_get_fold_lookup_failure_never_fails_the_rpc() {
+        let (_t, _root, svc, ws_id) = fold_setup(|_| {}).await;
+        sqlx::query("UPDATE workspace SET pull_requests = ? WHERE id = ?")
+            .bind(r#"[{"url":"https://github.com/o/r/pull/42"}]"#)
+            .bind(ws_id.as_str())
+            .execute(svc.store().write_pool())
+            .await
+            .expect("corrupt pool");
+        assert!(
+            svc.store()
+                .list_workspaces_referencing_pr_url("https://github.com/o/r/pull/42")
+                .await
+                .is_err(),
+            "the lookup itself fails on the undecodable row"
+        );
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("fold failure is fail-soft");
+        assert_eq!(v["pull"]["number"], 42);
+        assert_eq!(v["pull"]["merged"], true);
+    }
+
     /// Unlinking on a branch mismatch still refreshes an existing pool entry
     /// for that PR in place — the fetched snapshot is authoritative and
     /// already paid for — without the heal re-fetching it this pass.

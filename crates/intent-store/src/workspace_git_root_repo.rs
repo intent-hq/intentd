@@ -292,6 +292,41 @@ impl Store {
         rows.iter().map(root_from_row).collect()
     }
 
+    /// Git roots of live (non-archived, non-remote) workspaces referencing a
+    /// PR by URL — linked via `pr_url` or carrying a `pull_requests` pool
+    /// entry with that URL — oldest first. Backs the passive
+    /// `github.pulls.get` fold (mirrors
+    /// [`Store::list_workspaces_referencing_pr_url`]): the match runs in
+    /// SQL (`json_each` over the pool column) so only referencing rows are
+    /// decoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspace_git_roots_referencing_pr_url(
+        &self,
+        url: &str,
+    ) -> Result<Vec<WorkspaceGitRoot>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM workspace_git_root WHERE workspace_id IN \
+             (SELECT id FROM workspace WHERE archived = 0 AND is_remote = 0) \
+             AND (pr_url = ? OR (pull_requests IS NOT NULL AND json_valid(pull_requests) \
+             AND EXISTS (SELECT 1 FROM json_each(workspace_git_root.pull_requests) AS je \
+             WHERE je.value ->> '$.url' = ?))) ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(url)
+            .bind(url)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "list workspace git roots referencing pr url failed: {e}"
+                ))
+            })?;
+        rows.iter().map(root_from_row).collect()
+    }
+
     /// Delete a git root by id; `NotFound` when absent.
     ///
     /// # Errors
