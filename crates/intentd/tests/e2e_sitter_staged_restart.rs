@@ -191,8 +191,16 @@ esac
 /// fake `genkey` parked on the barrier forever. Dropping this guard releases
 /// the barrier and waits, bounded, for the recorded `genkey` pid to be gone,
 /// so the sidecar cannot race the `TempDir` removal. Declare it after the
-/// `TempDir` and before the [`Daemon`]: locals drop in reverse order, so the
-/// daemon goes first, then this guard, then the directory.
+/// `TempDir` *and* after a [`common::suppress_failure_retention`] guard, and
+/// before the [`Daemon`]: locals drop in reverse order, so the daemon goes
+/// first, then this guard, then the retention guard, then the directory.
+///
+/// The retention guard is load-bearing, not a courtesy: without it the
+/// failure-retention panic hook renames the data dir to `failed-*` *before*
+/// unwinding starts, so this drop would write the release to a path that no
+/// longer exists and find no pid — the parked `genkey` would leak. Under the
+/// guard the hook stands down and the retention (rename + diagnostics) runs
+/// from the guard's own drop, i.e. after this release has completed.
 struct HeldGenkey {
     barrier: Barrier,
     pid_path: PathBuf,
@@ -335,9 +343,12 @@ async fn sigusr2_during_held_teardown(trigger: StopTrigger) {
     };
     let data_dir_guard = common::test_tempdir("itd-sr-");
     let data_dir = data_dir_guard.path();
-    // Declared before `daemon` so the daemon (and the fake `genkey` parked in
-    // its process group) is torn down first on drop; the guard then releases
-    // whatever is still waiting on the barrier before the directory goes.
+    // Drop order on unwind is `daemon` → `genkey` → `_retain` → the TempDir:
+    // the daemon (and the fake `genkey` parked in its process group) is torn
+    // down first; `genkey` then releases whatever is still waiting on the
+    // barrier while the data dir is still at its original path; only then
+    // does `_retain` rename it to `failed-*` for post-mortem.
+    let _retain = common::suppress_failure_retention();
     let genkey = HeldGenkey::new(data_dir);
     let (mut daemon, socket, _tunnel_client) =
         launch_held_teardown(data_dir, &script, &genkey).await;
@@ -689,41 +700,66 @@ async fn sigusr2_during_held_teardown_after_system_shutdown_does_not_hijack_the_
     sigusr2_during_held_teardown(StopTrigger::SystemShutdown).await;
 }
 
-/// A held-teardown test that reaps its daemon and then leaves (early exit or
-/// panic) must not leave the fake `genkey` parked behind the barrier:
-/// `GuardedChild` skips the group kill on a reaped pid, so the release is on
-/// [`HeldGenkey`], which also waits for the sidecar to be gone before the
-/// `TempDir` is removed.
-#[tokio::test]
-async fn reaped_daemon_still_releases_the_parked_genkey_on_drop() {
+/// A held-teardown test that reaps its daemon and then PANICS must not leave
+/// the fake `genkey` parked behind the barrier: `GuardedChild` skips the
+/// group kill on a reaped pid, so the release is on [`HeldGenkey`], which
+/// also waits for the sidecar to be gone before the `TempDir` is removed.
+///
+/// The panic is real and caught here, with every guard created inside the
+/// catch boundary and failure-time tempdir retention at its default, so the
+/// same panic hook a genuine assertion failure would trigger is what runs:
+/// it renames the data dir to `failed-*` before unwinding unless the test
+/// body holds the retention guard, in which case the release lands first.
+/// A plain `#[test]` with its own runtime, because `catch_unwind` needs the
+/// panic to cross a synchronous `block_on`.
+#[test]
+fn reaped_daemon_still_releases_the_parked_genkey_on_panic() {
     let Some(script) = mock_agent_script() else {
         return;
     };
-    let data_dir_guard = common::test_tempdir("itd-sr-");
-    let data_dir = data_dir_guard.path();
-    let genkey_pid = {
-        let genkey = HeldGenkey::new(data_dir);
-        let (mut daemon, _socket, _tunnel_client) =
-            launch_held_teardown(data_dir, &script, &genkey).await;
-        let genkey_pid = genkey
-            .pid()
-            .expect("fake genkey recorded its pid on arrival");
-        assert!(process_alive(genkey_pid), "fake genkey must be parked");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    let mut observed: Option<(u32, PathBuf)> = None;
 
-        // Mirror the early-exit path: SIGKILL only the daemon and reap it, so
-        // the guard's group kill on drop is (correctly) a no-op.
-        daemon.child.kill().expect("kill daemon");
-        daemon.child.wait().expect("reap daemon");
-        assert!(
-            process_alive(genkey_pid),
-            "fake genkey must outlive its reaped daemon until released"
-        );
-        genkey_pid
-    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            let data_dir_guard = common::test_tempdir("itd-sr-");
+            let data_dir = data_dir_guard.path();
+            let _retain = common::suppress_failure_retention();
+            let genkey = HeldGenkey::new(data_dir);
+            let (mut daemon, _socket, _tunnel_client) =
+                launch_held_teardown(data_dir, &script, &genkey).await;
+            let genkey_pid = genkey
+                .pid()
+                .expect("fake genkey recorded its pid on arrival");
+            assert!(process_alive(genkey_pid), "fake genkey must be parked");
 
+            // Mirror the early-exit path: SIGKILL only the daemon and reap it,
+            // so the guard's group kill on drop is (correctly) a no-op.
+            daemon.child.kill().expect("kill daemon");
+            daemon.child.wait().expect("reap daemon");
+            assert!(
+                process_alive(genkey_pid),
+                "fake genkey must outlive its reaped daemon until released"
+            );
+            observed = Some((genkey_pid, data_dir.to_path_buf()));
+            panic!("intentional: unwind through the held-teardown guards");
+        });
+    }));
+    assert!(outcome.is_err(), "the intentional panic must propagate");
+    let (genkey_pid, original) = observed.expect("panicked after the daemon was reaped");
+
+    let gone = wait_for_process_exit(genkey_pid, common::test_timeout(Duration::from_secs(5)));
+    // The panic retained the data dir as `failed-*`; sweep it (and, under
+    // `INTENTD_TEST_KEEP_TMP`, leave the kept original alone) so a passing
+    // run leaves nothing behind before the outcome is asserted.
+    let retained = common::retained_path_for(&original);
+    let _ = std::fs::remove_dir_all(&retained);
     assert!(
-        wait_for_process_exit(genkey_pid, common::test_timeout(Duration::from_secs(5))),
-        "fake genkey {genkey_pid} still alive after the held-teardown scope ended"
+        gone,
+        "fake genkey {genkey_pid} still alive after the held-teardown guards unwound"
     );
 }
 
