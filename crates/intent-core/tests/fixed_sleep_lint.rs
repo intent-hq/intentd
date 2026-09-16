@@ -20,10 +20,12 @@
 //!   count.
 //! - Marker: `// timing-guard: <reason>` on the sleep's own line or the line
 //!   immediately above exempts it (`// timing-guard: poll interval`). It
-//!   counts only inside a `//` line comment (standalone or trailing; not in
-//!   a string literal or a `/* … */` block) and only with a nonempty reason.
-//!   A marker with no reason is malformed: it never exempts the sleep and the
-//!   report names it.
+//!   counts only inside a `//` line comment (standalone or trailing) and only
+//!   with a nonempty reason. A marker with no reason is malformed: it never
+//!   exempts the sleep and the report names it. Detection is line-based: it
+//!   skips ordinary `"…"` / `'…'` literals on that line but tracks no
+//!   block-comment or raw-string state, so a `//` inside `/* … */` or `r#"…"#`
+//!   reads as a comment — a marker can be spoofed only deliberately.
 //! - Baseline (`tests/fixed_sleep_baseline.txt`): one `<path> <count>` line
 //!   per file that still has unannotated sleeps, sorted by path. It only
 //!   ratchets down: a file over its entry (or absent from the baseline) fails
@@ -96,7 +98,9 @@ enum Marker {
 }
 
 /// The `//` line comment on `line`, if any: the first `//` that is not inside
-/// a string or character literal.
+/// an ordinary `"…"` or `'…'` literal. Line-based on purpose: block comments
+/// and raw strings are not tracked, so a `//` inside them is taken as a
+/// comment.
 fn line_comment(line: &str) -> Option<&str> {
     let bytes = line.as_bytes();
     let mut in_string = false;
@@ -124,8 +128,8 @@ fn line_comment(line: &str) -> Option<&str> {
 
 /// `WithReason` when `line`'s `//` comment carries [`TIMING_GUARD_MARKER`]
 /// followed by a nonempty reason, `Malformed` when the marker has no reason,
-/// `Absent` otherwise (including a marker in a string literal or block
-/// comment).
+/// `Absent` otherwise (including a marker in an ordinary string literal or
+/// with no `//` before it; see [`line_comment`] for what is not tracked).
 fn classify_marker(line: &str) -> Marker {
     let Some(comment) = line_comment(line) else {
         return Marker::Absent;
