@@ -1088,10 +1088,10 @@ pub struct Services {
     /// from the settings registry; values outside [floor, ceiling] are
     /// clamped at read time.
     pr_monitor_quota_share_percent: Option<u64>,
-    /// The last effective per-PR poll interval (seconds) the monitor loop
-    /// logged, so a cadence change is logged once — never per tick. Shared
-    /// across clones.
-    pr_monitor_logged_interval: Arc<Mutex<Option<u64>>>,
+    /// The last cadence (effective per-PR poll interval, or a quota
+    /// deferral) the monitor loop logged, so a cadence change is logged
+    /// once — never per tick. Shared across clones.
+    pr_monitor_logged_interval: Arc<Mutex<Option<pr_monitor::LoggedCadence>>>,
     /// Explicit override for the debounce quiet window (seconds) before a
     /// changed PR's consolidated wake is delivered. `None` — the production
     /// wiring — reads `prMonitor.debounceSeconds` live from the settings

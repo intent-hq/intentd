@@ -39,10 +39,11 @@
 //! quota-free `rate_limit` probe and stretches the interval further when
 //! the projected spend to the window's reset would exceed
 //! `prMonitor.quotaSharePercent` of the REMAINING quota
-//! ([`quota_stretched_interval_secs`]) — the quota is shared with agents'
-//! own `gh` use and the PR-refresh sweep, so the monitor slows down before
-//! the shared rate-limit gate has to stop it; a host without the signal
-//! plans on the hourly budget alone. Genuine
+//! ([`plan_quota_cadence`]) — and defers every poll until the window
+//! resets once that share cannot pay for a single fetch. The quota is
+//! shared with agents' own `gh` use and the PR-refresh sweep, so the
+//! monitor slows down before the shared rate-limit gate has to stop it; a
+//! host without the signal plans on the hourly budget alone. Genuine
 //! quota exhaustion is handled by the shared rate-limit gate instead. The
 //! debounce window is evaluated at that effective cadence, so a wake may
 //! arrive up to one effective interval late.
@@ -153,24 +154,59 @@ impl QuotaWindow {
     }
 }
 
-/// The per-PR poll interval (seconds) needed to keep the PROJECTED spend
-/// until the window resets — `distinct_prs × PR_MONITOR_REQUESTS_PER_POLL ×
-/// reset_in_secs / interval` — within `share_percent` of the remaining
-/// quota: `ceil(distinct_prs × 3 × reset_in_secs × 100 / (remaining ×
-/// share))`, rounded UP to a whole number of `poll_secs` ticks (the revisit
-/// lands on a tick boundary anyway, and tick alignment keeps the
-/// once-per-change cadence INFO from re-logging every tick as `remaining`
-/// drifts). When the allowed share rounds to zero requests, the interval is
-/// the rest of the window: nothing is planned before the reset. The share
-/// is clamped into its catalog range first. A `None` window (probe failed,
-/// host without the signal, reset already passed) plans nothing — the
-/// caller keeps today's hourly-budget formula.
-pub(crate) fn quota_stretched_interval_secs(
+/// What the remaining forge quota lets one due-sweep tick plan
+/// ([`plan_quota_cadence`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuotaCadence {
+    /// Poll each PR no more often than this many seconds (tick-aligned).
+    Interval(u64),
+    /// The allowed share cannot pay for a single fetch: nothing is due —
+    /// however stale, catch-up-marked or never-polled — until the window
+    /// resets, `reset_in_secs` from this tick's probe.
+    DeferUntilReset { reset_in_secs: u64 },
+}
+
+/// The cadence the monitor loop last logged, so a change (interval to
+/// interval, interval to deferral and back) is logged once — never per tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoggedCadence {
+    /// The effective per-PR poll interval, in seconds.
+    Interval(u64),
+    /// Polling deferred until the quota window resets.
+    Deferred,
+}
+
+/// Plan the per-PR cadence that keeps the PROJECTED spend until the window
+/// resets — `distinct_prs × PR_MONITOR_REQUESTS_PER_POLL × reset_in_secs /
+/// interval` — within `share_percent` of the remaining quota (the share is
+/// clamped into its catalog range first). With `allowed = remaining ×
+/// share / 100` requests:
+///
+/// - `allowed < PR_MONITOR_REQUESTS_PER_POLL` — the share cannot cover even
+///   one fetch: [`QuotaCadence::DeferUntilReset`]. A deferral is measured
+///   from NOW (this tick's probe), never from a monitor's `lastPolledAt`:
+///   an interval anchored on a stale stamp would fall due inside the
+///   window as the horizon shrinks, and would not bind catch-up rows at
+///   all.
+/// - otherwise [`QuotaCadence::Interval`]`(ceil(distinct_prs × 3 ×
+///   reset_in_secs / allowed))`, rounded UP to a whole number of
+///   `poll_secs` ticks (the revisit lands on a tick boundary anyway, and
+///   tick alignment keeps the once-per-change cadence INFO from re-logging
+///   every tick as `remaining` drifts).
+///
+/// The plan is monotone non-increasing in `remaining`: less quota never
+/// polls sooner (a deferral counts as slower than any interval). The
+/// `pollSeconds` floor is the caller's: it takes the max with the
+/// hourly-budget cadence, which is never below the configured cadence. A
+/// `None` window (probe failed, host without the signal, reset already
+/// passed) or no monitored PR plans nothing — the caller keeps today's
+/// hourly-budget formula.
+pub(crate) fn plan_quota_cadence(
     distinct_prs: usize,
     poll_secs: u64,
     window: Option<QuotaWindow>,
     share_percent: u64,
-) -> Option<u64> {
+) -> Option<QuotaCadence> {
     let window = window?;
     if distinct_prs == 0 {
         return None;
@@ -181,15 +217,18 @@ pub(crate) fn quota_stretched_interval_secs(
         MAX_PR_MONITOR_QUOTA_SHARE_PERCENT,
     );
     let allowed = window.remaining.saturating_mul(share_percent) / 100;
-    let needed = if allowed == 0 {
-        window.reset_in_secs
-    } else {
-        (distinct_prs as u64)
-            .saturating_mul(PR_MONITOR_REQUESTS_PER_POLL)
-            .saturating_mul(window.reset_in_secs)
-            .div_ceil(allowed)
-    };
-    Some(needed.div_ceil(poll_secs).saturating_mul(poll_secs))
+    if allowed < PR_MONITOR_REQUESTS_PER_POLL {
+        return Some(QuotaCadence::DeferUntilReset {
+            reset_in_secs: window.reset_in_secs,
+        });
+    }
+    let needed = (distinct_prs as u64)
+        .saturating_mul(PR_MONITOR_REQUESTS_PER_POLL)
+        .saturating_mul(window.reset_in_secs)
+        .div_ceil(allowed);
+    Some(QuotaCadence::Interval(
+        needed.div_ceil(poll_secs).saturating_mul(poll_secs),
+    ))
 }
 
 /// How many distinct PRs one due-sweep tick may fetch so that `distinct_prs`
@@ -1310,6 +1349,29 @@ impl Services {
         QuotaWindow::from_status(&status, now_unix)
     }
 
+    /// Log a quota deferral at INFO once per deferral run (never per tick):
+    /// the share of the remaining quota cannot pay for one fetch, so no PR
+    /// is polled until the window resets. The next interval cadence logs
+    /// again when polling resumes.
+    fn note_pr_monitor_deferral(&self, distinct_prs: usize, window: QuotaWindow) {
+        let mut last = self.pr_monitor_logged_interval.lock().unwrap();
+        if *last == Some(LoggedCadence::Deferred) {
+            return;
+        }
+        *last = Some(LoggedCadence::Deferred);
+        tracing::info!(
+            distinct_prs,
+            quota_remaining = window.remaining,
+            quota_reset_in_secs = window.reset_in_secs,
+            quota_share_percent = self.pr_monitor_quota_share_percent(),
+            "pr monitor: {distinct_prs} distinct PRs monitored, polling deferred until the forge \
+             quota window resets in {}s ({} requests left; the configured share does not cover \
+             one fetch)",
+            window.reset_in_secs,
+            window.remaining
+        );
+    }
+
     /// Log the effective per-PR interval at INFO once per change (never per
     /// tick), so the daemon log shows when the monitored-PR count — or a
     /// running-low forge quota (`quota`, present only when the remaining
@@ -1324,10 +1386,10 @@ impl Services {
         quota: Option<QuotaWindow>,
     ) {
         let mut last = self.pr_monitor_logged_interval.lock().unwrap();
-        if *last == Some(effective_secs) {
+        if *last == Some(LoggedCadence::Interval(effective_secs)) {
             return;
         }
-        *last = Some(effective_secs);
+        *last = Some(LoggedCadence::Interval(effective_secs));
         if let Some(window) = quota.filter(|_| effective_secs > budget_secs) {
             tracing::info!(
                 distinct_prs,
@@ -2317,7 +2379,8 @@ impl Services {
     /// the cadence instead ([`Services::pr_monitor_quota_window`]): the
     /// effective interval is stretched ahead of exhaustion so the projected
     /// spend to the window's reset stays within `prMonitor.quotaSharePercent`
-    /// of the remaining quota ([`quota_stretched_interval_secs`]). A tick
+    /// of the remaining quota ([`plan_quota_cadence`]) — or, once that share
+    /// cannot pay for one fetch, nothing is polled until the window resets. A tick
     /// that lifted the pause reuses the lift's probe — one probe per tick
     /// either way; a full sweep (`skip_fresh == false`) plans no cadence and
     /// spends none.
@@ -2446,7 +2509,11 @@ impl Services {
     /// quota (`quota`, this tick's probe) would not cover the projected
     /// spend to the window's reset — then keep the oldest-polled due PRs —
     /// every sibling monitor included — up to this tick's fetch cap
-    /// ([`select_due_pr_monitors`]).
+    /// ([`select_due_pr_monitors`]). When the quota share cannot pay for
+    /// one fetch the tick selects NOTHING: the deferral is decided here,
+    /// before the stale-anchor and catch-up rules, so neither an old
+    /// `lastPolledAt` nor a catch-up marker spends against an exhausted
+    /// window; both are honoured on the first tick after the reset.
     fn select_due_pr_monitors(
         &self,
         monitors: Vec<PrMonitor>,
@@ -2459,13 +2526,21 @@ impl Services {
             poll_secs,
             self.pr_monitor_hourly_request_budget(),
         );
-        let effective_secs = quota_stretched_interval_secs(
+        let effective_secs = match plan_quota_cadence(
             distinct_prs,
             poll_secs,
             quota,
             self.pr_monitor_quota_share_percent(),
-        )
-        .map_or(budget_secs, |quota_secs| quota_secs.max(budget_secs));
+        ) {
+            Some(QuotaCadence::DeferUntilReset { .. }) => {
+                if let Some(window) = quota {
+                    self.note_pr_monitor_deferral(distinct_prs, window);
+                }
+                return Vec::new();
+            }
+            Some(QuotaCadence::Interval(quota_secs)) => quota_secs.max(budget_secs),
+            None => budget_secs,
+        };
         self.note_pr_monitor_cadence(distinct_prs, effective_secs, poll_secs, budget_secs, quota);
         let interval = time::Duration::seconds(effective_secs.cast_signed());
         let now = time::OffsetDateTime::now_utc();
@@ -7267,11 +7342,14 @@ mod tests {
     /// Quota-window math table: a full window plans nothing beyond the
     /// hourly budget (the caller takes the max), a low one stretches the
     /// interval so the projected spend to reset fits the share, the interval
-    /// is tick-aligned, an exhausted share waits out the window, and no
-    /// usable window (probe failed, host without the signal, reset already
-    /// passed, no PRs) plans nothing at all.
+    /// is tick-aligned, a share that cannot pay for one fetch defers until
+    /// the window resets (and the plan is monotone non-increasing in the
+    /// remaining quota — less quota never polls sooner), and no usable
+    /// window (probe failed, host without the signal, reset already passed,
+    /// no PRs) plans nothing at all.
     #[test]
-    fn quota_stretched_interval_scales_with_remaining_quota_and_reset() {
+    fn quota_cadence_scales_with_remaining_quota_and_defers_below_one_fetch() {
+        use QuotaCadence::{DeferUntilReset, Interval};
         let window = |remaining, reset_in_secs| {
             Some(QuotaWindow {
                 remaining,
@@ -7281,59 +7359,86 @@ mod tests {
         // The 2026-09-16 shape: 14 PRs at the 30s floor. A full 5,000
         // window an hour out is plenty — 90s, below the budget's 101s.
         assert_eq!(
-            quota_stretched_interval_secs(14, 30, window(4_000, 3_600), 50),
-            Some(90)
+            plan_quota_cadence(14, 30, window(4_000, 3_600), 50),
+            Some(Interval(90))
         );
         assert_eq!(effective_pr_monitor_interval_secs(14, 30, 1500), 101);
         // 300 left with half an hour to go: 14 × 3 × 1800 / 150 = 504 → the
         // 510s tick.
         assert_eq!(
-            quota_stretched_interval_secs(14, 30, window(300, 1_800), 50),
-            Some(510)
+            plan_quota_cadence(14, 30, window(300, 1_800), 50),
+            Some(Interval(510))
         );
         // A larger share stretches less; the floor share stretches most.
         assert_eq!(
-            quota_stretched_interval_secs(14, 30, window(300, 1_800), 100),
-            Some(270)
+            plan_quota_cadence(14, 30, window(300, 1_800), 100),
+            Some(Interval(270))
         );
         assert_eq!(
-            quota_stretched_interval_secs(14, 30, window(300, 1_800), 1),
-            Some(25_200)
+            plan_quota_cadence(14, 30, window(300, 1_800), 1),
+            Some(Interval(25_200))
         );
         // Out-of-range shares clamp into the catalog range.
         assert_eq!(
-            quota_stretched_interval_secs(14, 30, window(300, 1_800), 0),
-            quota_stretched_interval_secs(14, 30, window(300, 1_800), 1)
+            plan_quota_cadence(14, 30, window(300, 1_800), 0),
+            plan_quota_cadence(14, 30, window(300, 1_800), 1)
         );
         assert_eq!(
-            quota_stretched_interval_secs(14, 30, window(300, 1_800), 250),
-            quota_stretched_interval_secs(14, 30, window(300, 1_800), 100)
+            plan_quota_cadence(14, 30, window(300, 1_800), 250),
+            plan_quota_cadence(14, 30, window(300, 1_800), 100)
         );
-        // Nothing left (or a share rounding to no requests): wait out the
-        // window, tick-aligned.
+        // The share must pay for a whole fetch (3 requests): 6 left at 50%
+        // is the last interval regime (3 allowed → 14 × 3 × 1800 / 3);
+        // 5, 2, 1 and 0 left all defer to the reset — never an interval
+        // shorter than the one more quota planned.
         assert_eq!(
-            quota_stretched_interval_secs(14, 30, window(0, 1_800), 50),
-            Some(1_800)
+            plan_quota_cadence(14, 30, window(6, 1_800), 50),
+            Some(Interval(25_200))
         );
+        for remaining in [5, 2, 1, 0] {
+            assert_eq!(
+                plan_quota_cadence(14, 30, window(remaining, 1_800), 50),
+                Some(DeferUntilReset {
+                    reset_in_secs: 1_800
+                }),
+                "remaining {remaining}"
+            );
+        }
         assert_eq!(
-            quota_stretched_interval_secs(14, 30, window(1, 1_000), 50),
-            Some(1_020)
+            plan_quota_cadence(14, 30, window(1, 1_000), 50),
+            Some(DeferUntilReset {
+                reset_in_secs: 1_000
+            })
         );
+        // Monotone non-increasing in the remaining quota across the whole
+        // window (a deferral counts as slower than any interval).
+        let slowness = |remaining| match plan_quota_cadence(14, 30, window(remaining, 1_800), 50) {
+            Some(Interval(secs)) => secs,
+            Some(DeferUntilReset { .. }) => u64::MAX,
+            None => unreachable!("a window and PRs always plan"),
+        };
+        let mut previous = slowness(0);
+        for remaining in 1..=5_000 {
+            let current = slowness(remaining);
+            assert!(
+                current <= previous,
+                "remaining {remaining} plans {current}s after {} planned {previous}s",
+                remaining - 1
+            );
+            previous = current;
+        }
         // Tick alignment follows the configured cadence (floor-clamped).
         assert_eq!(
-            quota_stretched_interval_secs(14, 100, window(300, 1_800), 50),
-            Some(600)
+            plan_quota_cadence(14, 100, window(300, 1_800), 50),
+            Some(Interval(600))
         );
         assert_eq!(
-            quota_stretched_interval_secs(1, 0, window(1, 5), 100),
-            Some(MIN_PR_MONITOR_POLL_SECONDS * 2)
+            plan_quota_cadence(1, 0, window(3, 15), 100),
+            Some(Interval(MIN_PR_MONITOR_POLL_SECONDS * 2))
         );
         // No window, or no PRs: nothing planned.
-        assert_eq!(quota_stretched_interval_secs(14, 30, None, 50), None);
-        assert_eq!(
-            quota_stretched_interval_secs(0, 30, window(300, 1_800), 50),
-            None
-        );
+        assert_eq!(plan_quota_cadence(14, 30, None, 50), None);
+        assert_eq!(plan_quota_cadence(0, 30, window(300, 1_800), 50), None);
 
         // The window reduces the probe: both signals required, a reset in
         // the past is unusable, a nonsense reset clamps to the pause cap.
@@ -8639,6 +8744,100 @@ mod tests {
         assert!(svc.sweep_rate_limit_paused_until().is_none(), "lifted");
         assert_eq!(probes(), 9, "the lift's probe is reused for the cadence");
         assert_eq!(forge.take_fetched_numbers().len(), 3);
+    }
+
+    /// A share of the remaining quota that cannot pay for one fetch defers
+    /// EVERY poll until the window resets — measured from each tick's probe,
+    /// not from `lastPolledAt`: rows older than the reset horizon and
+    /// catch-up-marked rows (which bypass the interval) are not fetched
+    /// either, and the deferral holds as the horizon shrinks tick after
+    /// tick. Each tick still spends its single quota-free probe, the
+    /// catch-up markers survive, and the first tick under a fresh window
+    /// polls the stale and catch-up rows.
+    #[tokio::test]
+    async fn a_zero_budget_defers_every_poll_until_the_window_resets() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitor_poll_seconds(30)
+            .with_pr_monitor_hourly_request_budget(1500)
+            .with_pr_monitor_quota_share_percent(50);
+        let mut ids = Vec::new();
+        for pr in 1_u64..=3 {
+            let (m, _) = svc
+                .pr_monitor_register(&ws, &owner, "o", "r", pr)
+                .await
+                .expect("register");
+            ids.push(m.monitor_id);
+        }
+        forge.take_fetched_numbers();
+        let probes = || forge.sub_fetches("rate_limit_status");
+        let marked = || svc.pr_monitor_catch_up.lock().unwrap().len();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Older than the whole reset horizon: an interval anchored on this
+        // stamp would already have elapsed.
+        let forty_minutes_ago = intent_core::iso_from_unix_secs((now_unix - 2_400).cast_signed());
+        for id in &ids {
+            backdate(&svc, id, &forty_minutes_ago).await;
+        }
+        // And catch-up marked, as after a daemon restart.
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 3);
+        assert_eq!(marked(), 3);
+
+        // 2 requests left at 50%: one allowed request cannot cover a fetch.
+        forge.edit(|s| {
+            s.rate_limit_remaining = Some(2);
+            s.rate_limit_limit = Some(5_000);
+            s.rate_limit_reset_at = Some(now_unix + 1_800);
+        });
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(probes(), 1, "a deferred tick still spends its one probe");
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "neither the stale anchors nor the catch-up markers are fetched"
+        );
+        // The horizon shrinks across the following ticks: still deferred.
+        forge.edit(|s| s.rate_limit_reset_at = Some(now_unix + 900));
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(probes(), 2);
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "a shrinking horizon does not make the stale rows due"
+        );
+        forge.edit(|s| {
+            s.rate_limit_remaining = Some(0);
+            s.rate_limit_reset_at = Some(now_unix + 60);
+        });
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(probes(), 3);
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "nothing left near the reset: still nothing fetched"
+        );
+        assert_eq!(marked(), 3, "the catch-up markers survive the deferral");
+        for id in &ids {
+            let row = svc.store().get_pr_monitor(id).await.unwrap();
+            assert_eq!(
+                row.last_polled_at.as_deref(),
+                Some(forty_minutes_ago.as_str()),
+                "a deferred tick stamps nothing"
+            );
+        }
+
+        // A fresh window: the stale, catch-up rows are polled on the next
+        // tick.
+        forge.edit(|s| {
+            s.rate_limit_remaining = Some(5_000);
+            s.rate_limit_reset_at = Some(now_unix + 3_600);
+        });
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(probes(), 4);
+        let mut fetched = forge.take_fetched_numbers();
+        fetched.sort_unstable();
+        assert_eq!(fetched, vec![1, 2, 3]);
+        assert_eq!(marked(), 0, "the catch-up polls cleared the markers");
     }
 
     /// The early lift clears the annotation even on a monitor the lifted
