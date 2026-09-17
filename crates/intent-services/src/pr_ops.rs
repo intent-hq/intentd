@@ -15,9 +15,10 @@ use std::sync::Arc;
 
 use intent_core::{parse_iso, Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
 use intent_sourcecontrol::{
-    CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrQuery, PrState,
-    PullRequest, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
-    ReviewVerdict, RollupCheck, SourceControl, SourceControlRegistry, SourceControlSettings,
+    CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrObservation,
+    PrQuery, PrState, PullRequest, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread,
+    ReviewThreadComment, ReviewVerdict, RollupCheck, SourceControl, SourceControlRegistry,
+    SourceControlSettings,
 };
 use time::OffsetDateTime;
 
@@ -1145,65 +1146,12 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
         }
     }
 
-    // The REST check-runs are only needed when the probe carried no rollup.
-    let rollup_known = signals.as_ref().is_some_and(|s| s.checks_known);
-    let head_ref = pr
-        .head_sha
-        .clone()
-        .filter(|s| !s.is_empty())
-        .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
-    let fallback_runs = match head_ref {
-        Some(git_ref) if !rollup_known && sc.capabilities().check_runs => {
-            let runs = degrade_unless_rate_limited(sc.check_runs(repo_ref, &git_ref).await)?;
-            complete &= runs.is_some();
-            runs.unwrap_or_default()
-        }
-        _ => Vec::new(),
-    };
-
-    // Inline review comments: threads via GraphQL when available, else the
-    // flat REST list grouped by reply parent. Resolution state is unavailable
-    // on the fallback path, so the unresolved count is reported as unknown
-    // (`None`) there rather than inflated to every thread or defaulted to
-    // zero — both degradations are logged at `warn` so they are visible at
-    // the default log level.
-    let (review_comments, unresolved) = match fetch_all_pages(|p| {
-        sc.get_review_threads(repo_ref, number, p)
-    })
-    .await
-    {
-        Ok((threads, _, _)) => {
-            let (comments, unresolved) = count_thread_comments(&threads);
-            (comments, Some(unresolved))
-        }
-        Err(intent_sourcecontrol::Error::RateLimited(msg)) => {
-            return Err(Error::RateLimited(msg));
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                pr_number = number,
-                "merge requirements: review threads unavailable, falling back to REST comments (thread resolution state unavailable, unresolved count reported as unknown)"
-            );
-            complete = false;
-            match fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)).await {
-                Ok((comments, _, _)) => {
-                    (count_thread_comments(&fallback_threads(comments)).0, None)
-                }
-                Err(intent_sourcecontrol::Error::RateLimited(msg)) => {
-                    return Err(Error::RateLimited(msg));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        pr_number = number,
-                        "merge requirements: review comments unavailable, reporting zero review comments and unknown unresolved"
-                    );
-                    (0, None)
-                }
-            }
-        }
-    };
+    let (fallback_runs, runs_complete) =
+        fallback_check_runs(sc, repo_ref, pr, signals.as_ref()).await?;
+    complete &= runs_complete;
+    let (review_comments, unresolved, threads_complete) =
+        read_review_thread_tally(sc, repo_ref, number).await?;
+    complete &= threads_complete;
 
     let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
     Ok(MergeRequirementsRead {
@@ -1212,6 +1160,125 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
         ejection_known,
         complete,
     })
+}
+
+/// [`merge_requirements_for_pr_detailed`] composed from a folded
+/// [`PrObservation`] (the PR monitor's one-round-trip read) instead of the
+/// per-signal reads: the observation already carries the probe, the reviews,
+/// the thread tally and the review decision — its `reviewDecision` IS the
+/// standalone read's answer, so a `None` there is authoritative and never
+/// re-fetched — leaving only the base branch's rules to read (when the host
+/// did not fold them in), plus the same per-piece fallbacks as the
+/// per-signal path: the REST check-runs when the probe carried no rollup,
+/// and the paged reviews / review threads when the PR outgrew the
+/// observation's windows. Same completeness and quota semantics.
+pub(crate) async fn merge_requirements_from_observation(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    observation: &PrObservation,
+) -> Result<MergeRequirementsRead> {
+    let pr = &observation.pr;
+    let mut signals = observation.signals.clone();
+    let mut complete = true;
+    if signals.branch_rules.is_none() && !pr.target_branch.is_empty() {
+        signals.branch_rules =
+            degrade_unless_rate_limited(sc.branch_rules(repo_ref, &pr.target_branch).await)?;
+    }
+    let reviews = if let Some(reviews) = &observation.reviews {
+        Some(reviews.clone())
+    } else {
+        let reviews = degrade_unless_rate_limited(sc.list_reviews(repo_ref, number).await)?;
+        complete &= reviews.is_some();
+        reviews
+    };
+    let agg = aggregate_reviews(&reviews.unwrap_or_default());
+
+    let (fallback_runs, runs_complete) =
+        fallback_check_runs(sc, repo_ref, pr, Some(&signals)).await?;
+    complete &= runs_complete;
+    let (review_comments, unresolved, threads_complete) = match observation.threads {
+        Some(tally) => (tally.review_comment_count, Some(tally.unresolved), true),
+        None => read_review_thread_tally(sc, repo_ref, number).await?,
+    };
+    complete &= threads_complete;
+
+    let requirements = merge_requirements(pr, Some(&signals), &fallback_runs, &agg, unresolved);
+    Ok(MergeRequirementsRead {
+        requirements,
+        review_comment_count: review_comments,
+        ejection_known: true,
+        complete,
+    })
+}
+
+/// The REST check-runs on the PR head, read only when the probe carried no
+/// rollup (and the host supports check-runs). Returns the runs — empty when
+/// not needed — and whether the read (if issued) answered.
+async fn fallback_check_runs(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    pr: &PullRequest,
+    signals: Option<&MergeRequirementSignals>,
+) -> Result<(Vec<CheckRun>, bool)> {
+    let rollup_known = signals.is_some_and(|s| s.checks_known);
+    let head_ref = pr
+        .head_sha
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
+    match head_ref {
+        Some(git_ref) if !rollup_known && sc.capabilities().check_runs => {
+            let runs = degrade_unless_rate_limited(sc.check_runs(repo_ref, &git_ref).await)?;
+            let complete = runs.is_some();
+            Ok((runs.unwrap_or_default(), complete))
+        }
+        _ => Ok((Vec::new(), true)),
+    }
+}
+
+/// Inline review comments: threads via GraphQL when available, else the
+/// flat REST list grouped by reply parent. Resolution state is unavailable
+/// on the fallback path, so the unresolved count is reported as unknown
+/// (`None`) there rather than inflated to every thread or defaulted to
+/// zero — both degradations are logged at `warn` so they are visible at
+/// the default log level. Returns `(review_comment_count, unresolved,
+/// complete)`, `complete` being false on either degradation.
+async fn read_review_thread_tally(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+) -> Result<(i64, Option<i64>, bool)> {
+    match fetch_all_pages(|p| sc.get_review_threads(repo_ref, number, p)).await {
+        Ok((threads, _, _)) => {
+            let (comments, unresolved) = count_thread_comments(&threads);
+            Ok((comments, Some(unresolved), true))
+        }
+        Err(intent_sourcecontrol::Error::RateLimited(msg)) => Err(Error::RateLimited(msg)),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                pr_number = number,
+                "merge requirements: review threads unavailable, falling back to REST comments (thread resolution state unavailable, unresolved count reported as unknown)"
+            );
+            match fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)).await {
+                Ok((comments, _, _)) => Ok((
+                    count_thread_comments(&fallback_threads(comments)).0,
+                    None,
+                    false,
+                )),
+                Err(intent_sourcecontrol::Error::RateLimited(msg)) => Err(Error::RateLimited(msg)),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        pr_number = number,
+                        "merge requirements: review comments unavailable, reporting zero review comments and unknown unresolved"
+                    );
+                    Ok((0, None, false))
+                }
+            }
+        }
+    }
 }
 
 // ===========================================================================

@@ -492,3 +492,35 @@ pub struct MergeRequirementSignals {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_removal: Option<MergeQueueRemoval>,
 }
+
+/// Tallies of a pull request's inline review threads: the total number of
+/// review comments across every thread (replies included) and the number of
+/// unresolved threads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewThreadTally {
+    pub review_comment_count: i64,
+    pub unresolved: i64,
+}
+
+/// Everything the PR monitor's per-poll snapshot needs about one pull
+/// request, read by [`crate::SourceControl::pr_observation`] in ONE forge
+/// round trip where the host can fold it (GitHub GraphQL): the
+/// [`PullRequest`] itself, the merge-requirement signals, the submitted
+/// reviews, the review-thread tally, and the conversation-comment count.
+///
+/// The bounded windows degrade to `None` rather than truncating silently:
+/// `reviews` is `None` when the PR has more reviews than one window carries,
+/// `threads` when it has more review threads — callers then take the paged
+/// per-signal reads for that piece only. `signals.branch_rules` is `None`
+/// unless the host folded the base branch's rules in; callers read them via
+/// [`crate::SourceControl::branch_rules`] when they need them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrObservation {
+    pub pr: PullRequest,
+    pub signals: MergeRequirementSignals,
+    pub reviews: Option<Vec<Review>>,
+    pub threads: Option<ReviewThreadTally>,
+    pub conversation_count: i64,
+}

@@ -27,9 +27,9 @@ pub use model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review, ReviewComment,
-    ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, ScCapabilities,
-    UserIdentity,
+    PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
+    ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
+    ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
 };
 pub use registry::{GithubSettings, SourceControlRegistry, SourceControlSettings};
 pub use token::TokenSource;
@@ -180,6 +180,30 @@ pub trait SourceControl: Send + Sync {
         _number: u64,
     ) -> Result<MergeRequirementSignals> {
         Err(Error::Unsupported("merge requirements probe".to_string()))
+    }
+
+    /// The merge-relevant rules of one branch (GitHub
+    /// `GET /repos/{owner}/{repo}/rules/branches/{branch}`) — the base-branch
+    /// sub-read of [`merge_requirements`](Self::merge_requirements), exposed
+    /// on its own so a caller holding a [`PrObservation`] can read the rules
+    /// only when it needs them. Hosts without the endpoint return
+    /// [`Error::Unsupported`] (the default implementation).
+    async fn branch_rules(&self, _repo: &RepoRef, _branch: &str) -> Result<BranchRules> {
+        Err(Error::Unsupported("branch rules".to_string()))
+    }
+
+    /// Everything the PR monitor's per-poll snapshot needs, in ONE round
+    /// trip: the [`PullRequest`], the [`MergeRequirementSignals`] (minus the
+    /// base branch's rules, see [`PrObservation`]), the submitted reviews,
+    /// the review-thread tally and the conversation-comment count. Replaces
+    /// the `get_pr` / `merge_requirements` / `list_reviews` /
+    /// `get_review_threads` / `list_comments` sequence on hosts that can
+    /// fold it (GitHub GraphQL). `Ok(None)` — the default — means the host
+    /// has no folded read and callers take the per-signal reads instead;
+    /// an `Err` fails the observation the same way a failing `get_pr`
+    /// would, [`Error::RateLimited`] included.
+    async fn pr_observation(&self, _repo: &RepoRef, _number: u64) -> Result<Option<PrObservation>> {
+        Ok(None)
     }
 
     /// List issue/PR (conversation) comments.
