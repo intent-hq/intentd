@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.68] - 2026-09-17
+
+### 🧪 Testing
+
+- *(install.ps1)* Pester coverage for the startup wait and Scheduled Task registration ([#1944](https://github.com/intent-hq/intentd/pull/1944))
+
+
 ## [0.9.67] - 2026-09-17
 
 ### 🐛 Bug Fixes
