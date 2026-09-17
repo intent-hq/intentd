@@ -9382,7 +9382,7 @@ async fn join_workspace_by_invite_consumes_the_presented_credential_once_under_c
                 .await
                 .expect("list")
                 .into_iter()
-                .filter(|c| c.is_active())
+                .filter(intent_core::PrincipalCredential::is_active)
                 .map(|c| c.token_hash)
                 .collect::<Vec<_>>()
         }
