@@ -878,6 +878,40 @@ fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
     }
 }
 
+/// Catalog default for `agents.memoryBudgetMb`: the budget the *absent* key
+/// (auto) resolves to on this host, in MB — the same figure boot wiring
+/// installs through [`agent_memory_budget_bytes`] via
+/// [`crate::agent_manager::recommended_memory_budget_bytes`].
+///
+/// The wire `value` stays `null` while the key is absent (the registry reads
+/// the file, not the catalog), so `defaultValue` is what lets a client tell
+/// "auto, currently N MB" apart from an explicit `0` (off). Without it the FE
+/// rendered the absent key as "Off" while the daemon was enforcing a budget.
+/// Should the auto policy ever resolve to off, this must follow and advertise
+/// `0` — the default describes what auto *does*, not a suggested value.
+///
+/// Detected once and cached, for the same reason as [`memory_budget_max_mb`].
+fn memory_budget_default_mb() -> f64 {
+    static DETECTED: OnceLock<f64> = OnceLock::new();
+    *DETECTED
+        .get_or_init(|| memory_budget_default_mb_for(crate::agent_manager::total_memory_bytes()))
+}
+
+/// [`memory_budget_default_mb`] against an explicit detection result, so the
+/// detected and undetected branches are both testable on one host.
+///
+/// An undetected total is treated as `0`, which the recommendation floors to
+/// its 4 GB minimum — matching what boot installs when `sysinfo` reports no
+/// RAM, so the advertised default never describes a budget the daemon does
+/// not actually run.
+// MiB counts above 2^53 do not occur; loss-free in f64.
+#[expect(clippy::cast_precision_loss)]
+fn memory_budget_default_mb_for(total_memory_bytes: Option<u64>) -> f64 {
+    let bytes =
+        crate::agent_manager::recommended_memory_budget_bytes(total_memory_bytes.unwrap_or(0));
+    (bytes / (1024 * 1024)) as f64
+}
+
 fn enumerated(
     path: &'static str,
     label: &'static str,
@@ -1463,18 +1497,19 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(200.0), // Upper bound to prevent resource exhaustion
             0.0,
         ),
-        // No `default_value`: the default is the *absent* key (auto, derived
-        // from system RAM), which `number()` cannot express (monorepo#2063).
+        // The default is the *absent* key (auto, monorepo#2063); `default_value`
+        // advertises the budget auto resolves to on this host so a client can
+        // tell auto apart from an explicit 0 while `value` reads null.
         SettingDefinition {
             path: "agents.memoryBudgetMb",
             label: "Agent memory budget (MB)",
-            description: "Aggregate resident memory the daemon's whole child-process tree may use before it reclaims: new agent spawns queue behind idle-process eviction, and a background sweep drains idle agents largest-first while over budget (absent = auto, derived from system RAM; 0 = off; nothing running is ever killed; changes apply on daemon restart)",
+            description: "Aggregate resident memory the daemon's whole child-process tree may use before it reclaims: new agent spawns queue behind idle-process eviction, and a background sweep drains idle agents largest-first while over budget (absent = auto, the RAM-derived budget advertised as this setting's default; 0 = off; nothing running is ever killed; changes apply on daemon restart)",
             category: "agents",
             ty: SettingType::Number {
                 min: Some(0.0),
                 max: Some(memory_budget_max_mb()),
             },
-            default_value: None,
+            default_value: Some(json!(memory_budget_default_mb())),
             sensitive: false,
             read_only: false,
             token_impact: None,
@@ -3011,8 +3046,10 @@ mod tests {
     /// matrix (monorepo#2063): absent = auto (resolves to the recommended budget
     /// derived from system RAM), explicit 0 = off (a 0 must stay `None` rather
     /// than becoming a 0-byte budget that would refuse every spawn), positive =
-    /// MB converted to bytes. The catalog carries no `default_value` because the
-    /// default is the absent key.
+    /// MB converted to bytes. The default is the absent key, and the catalog
+    /// advertises the budget auto resolves to on this host as `default_value`
+    /// so a client can tell auto apart from an explicit 0 while `value` is
+    /// null.
     #[test]
     fn agent_memory_budget_matrix_absent_auto_zero_off_positive_bytes() {
         use crate::agent_manager::recommended_memory_budget_bytes;
@@ -3029,7 +3066,15 @@ mod tests {
         // usable range rather than a degenerate 0..0.
         assert_eq!(max, Some(memory_budget_max_mb()));
         assert!(max.expect("bounded") > 0.0);
-        assert_eq!(def.default_value, None, "the default is the absent key");
+        assert_eq!(
+            def.default_value,
+            Some(json!(memory_budget_default_mb())),
+            "the default advertises the auto budget for this host"
+        );
+        assert!(
+            memory_budget_default_mb() > 0.0,
+            "auto never resolves to off, so the advertised default is never 0"
+        );
         assert!(KNOWN_PATHS.contains(&"agents.memoryBudgetMb"));
 
         let mut settings = SettingsFile::default();
@@ -3088,6 +3133,49 @@ mod tests {
             memory_budget_max_mb(),
             memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes()),
         );
+    }
+
+    /// The `agents.memoryBudgetMb` catalog default is the budget the absent
+    /// key resolves to — `recommended_memory_budget_bytes` in MB — so what
+    /// `settings.get` advertises as `defaultValue` is what boot installs when
+    /// the key is absent: `(RAM − 8 GB) / 2` floored at 4 GB, and the 4 GB
+    /// floor where RAM is undetected (boot sees a 0 total there too). It is
+    /// never 0, because auto never resolves to off.
+    #[test]
+    // Asserting exact whole-valued MB figures; the MiB count fits in f64 exactly.
+    #[expect(clippy::float_cmp, clippy::cast_precision_loss)]
+    fn memory_budget_default_is_the_auto_budget_in_mb() {
+        use crate::agent_manager::recommended_memory_budget_bytes;
+        assert_eq!(
+            memory_budget_default_mb_for(Some(48 * 1024 * 1024 * 1024)),
+            20_480.0
+        );
+        assert_eq!(
+            memory_budget_default_mb_for(Some(16 * 1024 * 1024 * 1024)),
+            4_096.0
+        );
+        assert_eq!(memory_budget_default_mb_for(Some(0)), 4_096.0);
+        assert_eq!(memory_budget_default_mb_for(None), 4_096.0);
+
+        // The wired-up form agrees with the injectable one and with the byte
+        // figure boot installs on this host.
+        let detected = crate::agent_manager::total_memory_bytes();
+        assert_eq!(
+            memory_budget_default_mb(),
+            memory_budget_default_mb_for(detected)
+        );
+        let settings = SettingsFile::default();
+        let installed = agent_memory_budget_bytes(&settings, detected.unwrap_or(0))
+            .expect("absent key resolves to a budget");
+        assert_eq!(
+            installed,
+            recommended_memory_budget_bytes(detected.unwrap_or(0))
+        );
+        assert_eq!(
+            memory_budget_default_mb(),
+            (installed / (1024 * 1024)) as f64
+        );
+        assert!(memory_budget_default_mb() > 0.0);
     }
 
     /// The catalog bound may be tighter than the `config.toml` parse bound but
