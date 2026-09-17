@@ -50,10 +50,13 @@ fn classify_picks_the_two_invite_methods_only() {
     assert!(classify(&json!({ "jsonrpc": "2.0", "id": {}, "method": "invite.redeem" })).is_none());
 }
 
-/// Records which redeem phase ran and returns a canned invite error.
+/// Records which redeem phase ran; phase 1 returns the service payload for
+/// the `GOOD_SECRET` and a canned invite error otherwise.
 struct RedeemStub {
     calls: std::sync::Mutex<Vec<String>>,
 }
+
+const GOOD_SECRET: &str = "good";
 
 impl WorkspaceApi for RedeemStub {
     fn invite_redeem_start(
@@ -65,7 +68,21 @@ impl WorkspaceApi for RedeemStub {
             .lock()
             .unwrap()
             .push(format!("start:{invite_id}:{secret}"));
-        Box::pin(async { Err(intent_core::Error::Invite(InviteErrorKind::Expired)) })
+        Box::pin(async move {
+            if secret == GOOD_SECRET {
+                Ok(json!({
+                    "flowId": "flow-1",
+                    "userCode": "ABCD-1234",
+                    "verificationUri": "https://github.com/login/device",
+                    "expiresIn": 900,
+                    "interval": 5,
+                    "workspaceId": "ws-1",
+                    "workspaceTitle": "Shared",
+                }))
+            } else {
+                Err(intent_core::Error::Invite(InviteErrorKind::Expired))
+            }
+        })
     }
     fn invite_redeem_wait(
         &self,
@@ -103,6 +120,11 @@ async fn redeem_routes_phases_and_maps_invite_errors_to_data_code() {
     .unwrap();
     let frame: Value = serde_json::from_str(&handle_redeem(req, &api).await.unwrap()).unwrap();
     assert_eq!(frame["result"]["status"], json!("authorized"));
+    assert!(
+        frame["result"].get("hostname").is_none()
+            && frame["result"].get("prettyHostname").is_none(),
+        "phase 2 carries no host identity: {frame}"
+    );
 
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 9, "method": "invite.redeem", "params": {} }))
@@ -121,6 +143,30 @@ async fn redeem_routes_phases_and_maps_invite_errors_to_data_code() {
         *stub.calls.lock().unwrap(),
         vec!["start:inv:sec".to_string(), "wait:flow-1".to_string()]
     );
+}
+
+#[tokio::test]
+async fn redeem_start_extends_the_service_result_with_host_identity() {
+    let api: Arc<dyn WorkspaceApi> = Arc::new(RedeemStub {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 10, "method": "invite.redeem",
+        "params": { "inviteId": "inv", "secret": GOOD_SECRET }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_redeem(req, &api).await.unwrap()).unwrap();
+    let result = &frame["result"];
+    assert_eq!(result["flowId"], json!("flow-1"), "{frame}");
+    assert_eq!(result["workspaceTitle"], json!("Shared"));
+    let hostname = result["hostname"].as_str().expect("hostname is a string");
+    let pretty = result["prettyHostname"]
+        .as_str()
+        .expect("prettyHostname is a string");
+    assert!(!hostname.is_empty(), "{frame}");
+    assert!(!pretty.is_empty(), "{frame}");
+    assert_eq!(hostname, crate::local_hostname());
+    assert_eq!(pretty, crate::pretty_hostname());
 }
 
 #[tokio::test]
