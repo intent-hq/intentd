@@ -9182,6 +9182,7 @@ async fn wss_guest_connection_caps_apply_live_on_settings_update() {
                 if resp.contains(want) {
                     return resp;
                 }
+                // timing-guard: poll interval
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             panic!("guestConnections never reached {want}")
@@ -9211,6 +9212,7 @@ async fn wss_guest_connection_caps_apply_live_on_settings_update() {
                 if current == value {
                     return;
                 }
+                // timing-guard: poll interval
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             panic!(
@@ -9304,6 +9306,7 @@ async fn wss_guest_connection_caps_release_after_early_reject_and_heartbeat_abor
         async move {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while health().await != wanted {
+                    // timing-guard: poll interval
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
