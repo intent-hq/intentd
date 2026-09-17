@@ -171,9 +171,11 @@ pub trait SourceControl: Send + Sync {
     ///
     /// Sub-reads degrade individually — unreadable branch rules yield
     /// `branch_rules: None`, a missing rollup yields `checks_known: false` —
-    /// so a partially-visible forge still produces a usable probe. Hosts
-    /// without the signals return [`Error::Unsupported`] (the default
-    /// implementation).
+    /// so a partially-visible forge still produces a usable probe. Quota
+    /// exhaustion is the one non-degrading failure: [`Error::RateLimited`]
+    /// from any sub-read propagates so callers pause instead of persisting
+    /// a degraded probe as a successful read. Hosts without the signals
+    /// return [`Error::Unsupported`] (the default implementation).
     async fn merge_requirements(
         &self,
         _repo: &RepoRef,

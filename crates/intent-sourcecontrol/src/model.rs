@@ -481,7 +481,9 @@ pub struct MergeRequirementSignals {
     /// the host did not report the rollup at all.
     pub checks_known: bool,
     /// Base-branch rules, or `None` when they are unreadable (missing scope,
-    /// unsupported endpoint) — a degraded but non-fatal probe.
+    /// unsupported endpoint) — a degraded but non-fatal probe. Quota
+    /// exhaustion on that read is never folded into `None`; it fails the
+    /// probe with [`crate::Error::RateLimited`].
     pub branch_rules: Option<BranchRules>,
     /// Whether the PR is currently queued in the host's merge queue (GitHub
     /// GraphQL `isInMergeQueue`). `None` when the host does not report it.
