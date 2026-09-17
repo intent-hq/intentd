@@ -963,6 +963,14 @@ fn without_merge_queue_selections(query: &str) -> String {
 /// pages; `pageInfo` tells the caller when a PR outgrew them so it can take
 /// the paged reads instead of trusting a truncated tally. `contexts(first:
 /// 100)` keeps the probe's known ceiling.
+///
+/// Count parity: the `totalCount`s are unbounded, but the per-signal reads
+/// they replace are not — `list_comments` is a single `per_page=100` page
+/// and [`REVIEW_THREADS_QUERY`] selects `comments(first: 100)` per thread —
+/// so the parse saturates each count at the same ceiling
+/// ([`OBSERVED_COUNT_CEILING`]). Otherwise a poll that fell back to the
+/// per-signal reads on a busy PR would report a different count for the
+/// same forge state and fabricate a new-comment change.
 const PR_OBSERVATION_QUERY: &str = r"
 query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!) {
   repository(owner: $owner, name: $repo) {
@@ -1141,9 +1149,26 @@ fn parse_observed_reviews(pr: &Value) -> Option<Vec<Review>> {
     )
 }
 
+/// The ceiling a folded `totalCount` saturates at so it equals what the
+/// per-signal read reports: one `per_page=100` page of conversation
+/// comments, `comments(first: 100)` per review thread.
+const OBSERVED_COUNT_CEILING: i64 = REST_MAX_PER_PAGE as i64;
+
+/// A `{ totalCount }` selection saturated at [`OBSERVED_COUNT_CEILING`];
+/// `0` when absent.
+fn observed_count(connection: Option<&Value>) -> i64 {
+    connection
+        .and_then(|c| c.get("totalCount"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .min(OBSERVED_COUNT_CEILING)
+}
+
 /// The `reviewThreads(first: 100)` window of [`PR_OBSERVATION_QUERY`] as a
 /// [`ReviewThreadTally`], or `None` when `hasNextPage` says the PR has more
-/// threads than the window carries.
+/// threads than the window carries. Each thread's comment count saturates
+/// at [`OBSERVED_COUNT_CEILING`], as the paged read's `comments(first: 100)`
+/// does.
 fn parse_observed_threads(pr: &Value) -> Option<ReviewThreadTally> {
     let threads = pr.get("reviewThreads")?;
     if threads
@@ -1156,10 +1181,7 @@ fn parse_observed_threads(pr: &Value) -> Option<ReviewThreadTally> {
     let nodes = threads.get("nodes").and_then(Value::as_array)?;
     let mut tally = ReviewThreadTally::default();
     for thread in nodes {
-        tally.review_comment_count += thread
-            .pointer("/comments/totalCount")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        tally.review_comment_count += observed_count(thread.get("comments"));
         if !thread
             .get("isResolved")
             .and_then(Value::as_bool)
@@ -1769,10 +1791,8 @@ impl SourceControl for GitHubSourceControl {
             signals: parse_merge_requirement_signals(&data),
             reviews: parse_observed_reviews(pr),
             threads: parse_observed_threads(pr),
-            conversation_count: pr
-                .pointer("/comments/totalCount")
-                .and_then(Value::as_i64)
-                .unwrap_or(0),
+            // Saturated like `list_comments`' single page below.
+            conversation_count: observed_count(pr.get("comments")),
         }))
     }
 
@@ -2409,6 +2429,35 @@ mod tests {
         assert_eq!(parse_observed_threads(&overflowing), None);
         assert_eq!(parse_observed_reviews(&json!({})), None);
         assert_eq!(parse_observed_threads(&json!({})), None);
+    }
+
+    /// The folded `totalCount`s saturate where the per-signal reads do —
+    /// `list_comments` at one `per_page=100` page, a thread's comments at
+    /// `comments(first: 100)` — so a fallback poll reports the same count.
+    #[test]
+    fn observed_counts_saturate_at_the_per_signal_ceiling() {
+        assert_eq!(observed_count(None), 0);
+        assert_eq!(observed_count(Some(&json!({ "totalCount": 7 }))), 7);
+        assert_eq!(observed_count(Some(&json!({ "totalCount": 100 }))), 100);
+        assert_eq!(observed_count(Some(&json!({ "totalCount": 101 }))), 100);
+        assert_eq!(observed_count(Some(&json!({ "totalCount": 5000 }))), 100);
+
+        let pr = json!({
+            "reviewThreads": {
+                "pageInfo": { "hasNextPage": false },
+                "nodes": [
+                    { "isResolved": false, "comments": { "totalCount": 250 } },
+                    { "isResolved": true, "comments": { "totalCount": 3 } },
+                ]
+            },
+        });
+        assert_eq!(
+            parse_observed_threads(&pr),
+            Some(ReviewThreadTally {
+                review_comment_count: 103,
+                unresolved: 1,
+            })
+        );
     }
 
     #[test]
