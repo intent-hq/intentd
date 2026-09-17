@@ -9047,6 +9047,7 @@ async fn wss_guest_connection_caps_refuse_503_and_release_on_disconnect() {
                 if resp.contains(want) {
                     return resp;
                 }
+                // timing-guard: poll interval
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             panic!("guestConnections never reached {want}")
