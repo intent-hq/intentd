@@ -15658,10 +15658,12 @@ async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
 /// A second `resumed` — the timeout/wakeup double-emit this pins against —
 /// would land before that `stream:end`, so draining to it is the check.
 ///
-/// The slot is freed with `agent.stop` (interrupt): the interrupt releases
-/// the holder's busy slot BEFORE marking its process idle, so the woken
-/// waiter's claim on the idle holder succeeds and it admits in one pass. The
-/// natural-turn-end route is pinned separately by
+/// The slot is freed with `agent.stop` (interrupt): the interrupt first marks
+/// the holder's process idle WITHOUT waking (`mark_idle_slot_held`), then its
+/// `end_turn` releases the busy slot and only then wakes the waiter
+/// (`release_slot_sync` → `wake_waiter_if_idle`, intent-hq/intent#5253), so
+/// the woken waiter's claim on the idle holder succeeds and it admits in one
+/// pass. The natural-turn-end route is pinned separately by
 /// `natural_turn_end_admits_queued_spawn_in_one_pass_over_wss`.
 #[tokio::test]
 async fn queued_spawn_resumes_exactly_once_over_wss() {
@@ -15812,9 +15814,9 @@ async fn queued_spawn_resumes_exactly_once_over_wss() {
         queued_frames[0]
     );
 
-    // Interrupt the holder mid-turn: its busy slot is released, its process
-    // marked idle, and that wakeup admits the waiter (evicting the idle
-    // holder for the slot).
+    // Interrupt the holder mid-turn: its process is marked idle without a
+    // wake, then its busy slot is released and that release wakes the waiter,
+    // which admits (evicting the idle holder for the slot).
     let stopped = wss_rpc(&mut rpc, 14, "agent.stop", json!({ "agentId": holder })).await;
     assert_eq!(stopped["success"], true, "holder stop ok: {stopped}");
 
