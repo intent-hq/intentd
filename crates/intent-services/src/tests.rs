@@ -15377,6 +15377,9 @@ mod pr {
         seen_pr_queries: std::sync::Mutex<Vec<PrQuery>>,
         /// Every [`IssueQuery`] handed to `list_issues`, in call order.
         seen_issue_queries: std::sync::Mutex<Vec<IssueQuery>>,
+        /// Runs at the start of every `list_comments` (the last forge read
+        /// of `pr_state`), so a test can move daemon state mid-snapshot.
+        on_list_comments: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     /// The blended multi-repo page a forge answers for a search whose
@@ -15706,6 +15709,9 @@ mod pr {
             }
         }
         async fn list_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Comment>> {
+            if let Some(hook) = self.on_list_comments.lock().unwrap().as_ref() {
+                hook();
+            }
             Ok(vec![Comment {
                 id: "1".into(),
                 author: "u".into(),
@@ -16775,6 +16781,52 @@ mod pr {
             .expect("snapshot");
         assert_eq!(v["repo"], "acme/widgets");
         assert_eq!(v["prNumber"], 42);
+    }
+
+    /// `pausedUntil` on the snapshot describes the global rate-limit gate as
+    /// of the snapshot's COMPLETION, not its start: the gate is sampled after
+    /// the awaited forge reads, so a pause opened while they were in flight
+    /// is carried (RFC 3339, the gate's deadline) and a pause lifted while
+    /// they were in flight is omitted — never a stale value either way.
+    #[tokio::test]
+    async fn state_snapshot_paused_until_reflects_the_gate_after_the_forge_reads() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, ws) = setup_with_shared(forge.clone(), true).await;
+
+        // Gate open at the start, paused by the last forge read.
+        let gate = svc.sweep_rate_limit.clone();
+        *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
+            assert!(gate.pause_for(std::time::Duration::from_secs(3600)));
+        }));
+        let v = svc.pr_state(ws.clone(), 42, None).await.expect("snapshot");
+        let until = svc
+            .sweep_rate_limit_paused_until()
+            .expect("the read left the gate paused");
+        assert_eq!(
+            v["pausedUntil"],
+            json!(until),
+            "a pause opened during the reads is on the snapshot: {v}"
+        );
+        assert!(
+            time::OffsetDateTime::parse(&until, &time::format_description::well_known::Rfc3339)
+                .is_ok(),
+            "pausedUntil is RFC 3339: {until}"
+        );
+
+        // Gate paused at the start, lifted by the last forge read.
+        let gate = svc.sweep_rate_limit.clone();
+        *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
+            assert!(gate.lift());
+        }));
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        assert!(
+            svc.sweep_rate_limit_paused_until().is_none(),
+            "the read left the gate open"
+        );
+        assert!(
+            v.get("pausedUntil").is_none(),
+            "a pause lifted during the reads is not retained: {v}"
+        );
     }
 
     #[tokio::test]
