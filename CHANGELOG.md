@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.70] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Surface the forge rate-limit pause on every active monitor ([#1945](https://github.com/intent-hq/intentd/pull/1945))
+
+
 ## [0.9.69] - 2026-09-17
 
 ### 🐛 Bug Fixes
