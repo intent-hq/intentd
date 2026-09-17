@@ -641,6 +641,29 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Stamp `last_error` on EVERY active monitor across all workspaces — the
+    /// global forge rate-limit pause opening (monorepo#2961): the monitors the
+    /// paused sweeps will not reach must not sit under a stale checklist with
+    /// an empty `lastError`. Deliberately leaves `updated_at` (the
+    /// optimistic-concurrency token) and `last_polled_at` alone: the stamp is
+    /// an annotation, not a poll, so an in-flight poll's guarded write-back
+    /// still lands — and a successful one clears the stamp, which is exactly
+    /// right for that monitor. Returns the number of rows stamped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn set_active_pr_monitors_error(&self, error: &str) -> Result<u64> {
+        let res = sqlx::query("UPDATE pr_monitor SET last_error = ? WHERE state = 'active'")
+            .bind(error)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("stamp active pr monitors error failed: {e}"))
+            })?;
+        Ok(res.rows_affected())
+    }
+
     /// Re-parent an ACTIVE monitor from `from_agent_id` to `to_agent_id` and
     /// re-arm it in the same statement (the [`Store::update_pr_monitor_poll`]
     /// write-back), so a reader never observes the new owner with the old
@@ -1229,6 +1252,72 @@ mod tests {
                 .expect("repeat complete"),
             "a terminal row is never completed twice"
         );
+    }
+
+    /// The pause stamp reaches every ACTIVE row (across workspaces), skips
+    /// terminal rows, and moves neither `updated_at` nor `last_polled_at`, so
+    /// a poll write-back guarded on the pre-stamp `updated_at` still lands
+    /// and clears the stamp.
+    #[tokio::test]
+    async fn active_monitors_error_stamp_spares_terminal_rows_and_the_guard() {
+        let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
+        let ts = now_iso();
+        let active = test_monitor(&ws_id, &agent_id, &ts);
+        let mut other_pr = test_monitor(&ws_id, &agent_id, &ts);
+        other_pr.pr_number = 43;
+        let mut completed = test_monitor(&ws_id, &agent_id, &ts);
+        completed.pr_number = 44;
+        completed.state = PrMonitorState::Completed;
+        completed.last_error = Some("old failure".to_string());
+        for m in [&active, &other_pr, &completed] {
+            assert!(store.insert_pr_monitor(m).await.expect("insert"));
+        }
+
+        let stamped = store
+            .set_active_pr_monitors_error("rate limited; paused until T")
+            .await
+            .expect("stamp");
+        assert_eq!(stamped, 2);
+        for m in [&active, &other_pr] {
+            let read = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+            assert_eq!(
+                read.last_error.as_deref(),
+                Some("rate limited; paused until T")
+            );
+            assert_eq!(
+                read.updated_at, m.updated_at,
+                "the guard token is untouched"
+            );
+            assert_eq!(read.last_polled_at, None, "a stamp is not a poll");
+        }
+        let terminal = store
+            .get_pr_monitor(&completed.monitor_id)
+            .await
+            .expect("get");
+        assert_eq!(terminal.last_error.as_deref(), Some("old failure"));
+
+        // A poll that read the row before the stamp still writes back — and
+        // its success clears the stamp.
+        let now = now_iso();
+        assert!(store
+            .update_pr_monitor_poll(
+                &active.monitor_id,
+                PrMonitorPollUpdate {
+                    last_snapshot: active.last_snapshot.as_deref(),
+                    baseline_snapshot: active.baseline_snapshot.as_deref(),
+                    pending_changes: &[],
+                    pending_since: None,
+                    last_change_at: None,
+                    last_polled_at: Some(&now),
+                    last_error: None,
+                    updated_at: &now,
+                    expected_updated_at: &active.updated_at,
+                },
+            )
+            .await
+            .expect("poll write-back"));
+        let cleared = store.get_pr_monitor(&active.monitor_id).await.expect("get");
+        assert_eq!(cleared.last_error, None);
     }
 
     /// The 0089 migration backfills `baseline_snapshot` from `last_snapshot`

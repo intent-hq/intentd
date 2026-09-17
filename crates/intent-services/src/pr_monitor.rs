@@ -1009,7 +1009,10 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
 /// persisted baseline snapshot; the key is OMITTED (never null) when the
 /// monitor has no baseline yet. The `transferred` wake
 /// ([`Services::wake_former_owner_after_transfer`]) adds `adoptedBy`.
-fn pr_monitor_wake_metadata(m: &PrMonitor, reason: &str) -> Value {
+/// `paused_until` is the global rate-limit pause deadline
+/// ([`Services::sweep_rate_limit_paused_until`]): the key `pausedUntil` is
+/// present only while the gate is closed (never null).
+fn pr_monitor_wake_metadata(m: &PrMonitor, reason: &str, paused_until: Option<&str>) -> Value {
     let mut metadata = json!({
         "type": "pr_monitor_wake",
         "monitorId": m.monitor_id,
@@ -1025,6 +1028,9 @@ fn pr_monitor_wake_metadata(m: &PrMonitor, reason: &str) -> Value {
     if let Some(url) = url {
         metadata["url"] = Value::String(url);
     }
+    if let Some(until) = paused_until {
+        metadata["pausedUntil"] = Value::String(until.to_string());
+    }
     metadata
 }
 
@@ -1034,7 +1040,13 @@ fn pr_monitor_wake_metadata(m: &PrMonitor, reason: &str) -> Value {
 /// debounce emit, and when the last change landed. Everything is read off the
 /// persisted row (the baseline snapshot column is parsed, never re-fetched),
 /// so a list stays O(rows returned).
-fn pr_monitor_wire(m: &PrMonitor) -> Value {
+///
+/// `paused_until` is the global rate-limit pause deadline
+/// ([`Services::sweep_rate_limit_paused_until`]), read once per call off the
+/// in-memory gate: an ACTIVE row carries it as `pausedUntil` while the gate
+/// is closed (its checklist is not being refreshed), and the key is absent
+/// otherwise — never null, and never on a terminal row.
+fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
     let snapshot: Option<PrMonitorSnapshot> = m
         .last_snapshot
         .as_deref()
@@ -1061,6 +1073,9 @@ fn pr_monitor_wire(m: &PrMonitor) -> Value {
         if let Some(v) = value {
             obj.insert(key.to_string(), Value::String(v.clone()));
         }
+    }
+    if let Some(until) = paused_until.filter(|_| m.state == PrMonitorState::Active) {
+        obj.insert("pausedUntil".to_string(), Value::String(until.to_string()));
     }
     if let Some(s) = snapshot {
         let r = &s.requirements;
@@ -2140,10 +2155,11 @@ impl Services {
     /// PR-refresh and git-root sweeps (monorepo#2961): while the gate is
     /// paused the tick is skipped before any forge call (no `lastError`
     /// churn; catch-up markers survive for the post-pause sweep), and a
-    /// fetch that fails with [`Error::RateLimited`] opens the pause, records
-    /// a pause `lastError` on every monitor of that PR, and stops fetching
-    /// further PRs in this sweep — monitors not yet reached keep their
-    /// previous `lastError` and baseline. The shared gate is re-consulted
+    /// fetch that fails with [`Error::RateLimited`] opens the pause — which
+    /// stamps the pause `lastError` on every active monitor, this sweep's
+    /// and every other workspace's alike — and stops fetching further PRs
+    /// in this sweep; monitors not yet reached keep their baseline and
+    /// `lastPolledAt`. The shared gate is re-consulted
     /// before EVERY vacant-cache fetch, not just at the top of the sweep, so
     /// a pause opened mid-sweep by a sibling sweep (PR refresh, git roots)
     /// stops this sweep's remaining fetches too.
@@ -2224,13 +2240,7 @@ impl Services {
                         Ok(Err(Error::RateLimited(detail))) => {
                             self.pause_sweeps_for_rate_limit(&sc, &detail).await;
                             rate_limited = true;
-                            let pause_secs = self
-                                .sweep_rate_limit
-                                .paused_remaining()
-                                .map_or(0, |d| d.as_secs());
-                            Err(format!(
-                                "rate limited; PR monitor polling paused for ~{pause_secs}s"
-                            ))
+                            Err(self.rate_limit_pause_error())
                         }
                         Ok(result) => result.map_err(|e| e.to_string()),
                         Err(_) => Err(format!(
@@ -2797,7 +2807,8 @@ impl Services {
     /// watches (a successful wake makes the backstop a no-op — the
     /// queued/running wake turn owns the settlement).
     async fn wake_pr_monitor_owner(&self, monitor: &PrMonitor, message: &str, reason: &str) {
-        let metadata = pr_monitor_wake_metadata(monitor, reason);
+        let paused_until = self.sweep_rate_limit_paused_until();
+        let metadata = pr_monitor_wake_metadata(monitor, reason, paused_until.as_deref());
         if let Err(e) = self
             .deliver_wake_message(
                 &monitor.workspace_id,
@@ -2830,7 +2841,8 @@ impl Services {
         let label = monitor_label(former);
         let message =
             crate::harness::latest().pr_monitor_transferred_to_parent_notice(&label, &adopter.0);
-        let mut metadata = pr_monitor_wake_metadata(former, "transferred");
+        let paused_until = self.sweep_rate_limit_paused_until();
+        let mut metadata = pr_monitor_wake_metadata(former, "transferred", paused_until.as_deref());
         metadata["adoptedBy"] = json!(adopter);
         if let Err(e) = self
             .deliver_wake_message(
@@ -2891,9 +2903,10 @@ impl Services {
                 requirements,
                 adopted_from,
             } => {
+                let paused_until = self.sweep_rate_limit_paused_until();
                 let mut payload = json!({
                     "ok": true,
-                    "monitor": pr_monitor_wire(&monitor),
+                    "monitor": pr_monitor_wire(&monitor, paused_until.as_deref()),
                     "requirements": requirements,
                 });
                 if let Some(from) = adopted_from {
@@ -2928,7 +2941,8 @@ impl Services {
         let monitor = self
             .pr_monitor_cancel(workspace_id, &existing.monitor_id, Some(agent_id))
             .await?;
-        Ok(json!({ "ok": true, "monitor": pr_monitor_wire(&monitor) }))
+        let paused_until = self.sweep_rate_limit_paused_until();
+        Ok(json!({ "ok": true, "monitor": pr_monitor_wire(&monitor, paused_until.as_deref()) }))
     }
 
     /// `ws.pr.monitors` / wire `prMonitor.list`: `{ monitors: [...] }`.
@@ -2943,10 +2957,11 @@ impl Services {
             Some(a) => self.pr_monitors_for_agent(a).await?,
             None => self.pr_monitors_for_workspace(workspace_id).await?,
         };
+        let paused_until = self.sweep_rate_limit_paused_until();
         let monitors: Vec<Value> = monitors
             .into_iter()
             .filter(|m| &m.workspace_id == workspace_id)
-            .map(|m| pr_monitor_wire(&m))
+            .map(|m| pr_monitor_wire(&m, paused_until.as_deref()))
             .collect();
         Ok(json!({ "monitors": monitors }))
     }
@@ -2961,7 +2976,8 @@ impl Services {
         let monitor = self
             .pr_monitor_cancel(workspace_id, monitor_id, None)
             .await?;
-        Ok(json!({ "ok": true, "monitor": pr_monitor_wire(&monitor) }))
+        let paused_until = self.sweep_rate_limit_paused_until();
+        Ok(json!({ "ok": true, "monitor": pr_monitor_wire(&monitor, paused_until.as_deref()) }))
     }
 
     /// Wire `prMonitor.flush`: emit the pending debounced changes now.
@@ -3893,13 +3909,13 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
         };
-        let wire = pr_monitor_wire(&m);
+        let wire = pr_monitor_wire(&m, None);
         assert_eq!(wire["lastSnapshot"]["isInMergeQueue"], json!(true));
 
         // Not queued / unknown: the key is absent, never null.
         s.requirements.is_in_merge_queue = None;
         m.last_snapshot = Some(serde_json::to_string(&s).unwrap());
-        let wire = pr_monitor_wire(&m);
+        let wire = pr_monitor_wire(&m, None);
         assert!(wire["lastSnapshot"].get("isInMergeQueue").is_none());
         // Same presence rule for the ejection event.
         assert!(wire["lastSnapshot"].get("mergeQueueEjection").is_none());
@@ -3908,11 +3924,53 @@ mod tests {
             reason: Some("failed_checks".into()),
         });
         m.last_snapshot = Some(serde_json::to_string(&s).unwrap());
-        let wire = pr_monitor_wire(&m);
+        let wire = pr_monitor_wire(&m, None);
         assert_eq!(
             wire["lastSnapshot"]["mergeQueueEjection"],
             json!({ "at": "2026-01-02T03:04:05Z", "reason": "failed_checks" })
         );
+    }
+
+    /// `pausedUntil` follows the same presence rule: an ACTIVE row carries
+    /// the global rate-limit pause deadline while the gate is closed, and
+    /// the key is absent (never null) when the gate is open or the row is
+    /// terminal — a completed monitor is not being polled either way.
+    #[test]
+    fn paused_until_projects_only_onto_active_rows_while_paused() {
+        let ts = "2026-01-01T00:00:00Z".to_string();
+        let mut m = PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            state: PrMonitorState::Active,
+            last_snapshot: None,
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: Some(
+                "rate limited; PR monitor polling paused until 2026-09-17T02:39:15Z".into(),
+            ),
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        let wire = pr_monitor_wire(&m, Some("2026-09-17T02:39:15Z"));
+        assert_eq!(wire["pausedUntil"], json!("2026-09-17T02:39:15Z"));
+        assert_eq!(
+            wire["lastError"],
+            json!("rate limited; PR monitor polling paused until 2026-09-17T02:39:15Z")
+        );
+
+        let wire = pr_monitor_wire(&m, None);
+        assert!(wire.get("pausedUntil").is_none(), "{wire}");
+
+        m.state = PrMonitorState::Completed;
+        let wire = pr_monitor_wire(&m, Some("2026-09-17T02:39:15Z"));
+        assert!(wire.get("pausedUntil").is_none(), "{wire}");
     }
 
     /// An unreadable thread count (`threads.unresolved == None`) is unknown,
@@ -3958,7 +4016,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
         };
-        let wire = pr_monitor_wire(&m);
+        let wire = pr_monitor_wire(&m, None);
         assert!(wire["lastSnapshot"]["threads"].get("unresolved").is_none());
         assert_eq!(
             wire["lastSnapshot"]["threads"]["resolutionRequired"],
@@ -3967,7 +4025,7 @@ mod tests {
 
         s.requirements.threads.unresolved = Some(3);
         m.last_snapshot = Some(serde_json::to_string(&s).unwrap());
-        let wire = pr_monitor_wire(&m);
+        let wire = pr_monitor_wire(&m, None);
         assert_eq!(wire["lastSnapshot"]["threads"]["unresolved"], json!(3));
     }
 
@@ -6021,18 +6079,23 @@ mod tests {
             updated_at: now,
         };
 
-        let metadata = pr_monitor_wake_metadata(&m, "changed");
+        let metadata = pr_monitor_wake_metadata(&m, "changed", None);
         assert_eq!(metadata["type"], json!("pr_monitor_wake"));
         assert_eq!(metadata["repo"], json!("o/r"));
         assert_eq!(metadata["prNumber"], json!(42));
         assert_eq!(metadata["reason"], json!("changed"));
         assert_eq!(metadata["url"], json!("https://github.com/o/r/pull/42"));
+        assert!(metadata.get("pausedUntil").is_none(), "{metadata}");
 
         // No baseline yet: the key is ABSENT, never null.
         m.last_snapshot = None;
-        let metadata = pr_monitor_wake_metadata(&m, "cancelled");
+        let metadata = pr_monitor_wake_metadata(&m, "cancelled", None);
         assert!(metadata.get("url").is_none(), "{metadata}");
         assert_eq!(metadata["reason"], json!("cancelled"));
+
+        // While the global rate-limit pause is active the wake names it.
+        let metadata = pr_monitor_wake_metadata(&m, "cancelled", Some("2026-09-17T02:39:15Z"));
+        assert_eq!(metadata["pausedUntil"], json!("2026-09-17T02:39:15Z"));
     }
 
     #[tokio::test]
@@ -7155,12 +7218,25 @@ mod tests {
         }
     }
 
+    /// The `lastError` every active monitor carries while the global
+    /// rate-limit pause is active, naming the gate's wall-clock deadline.
+    fn expected_pause_error(svc: &Services) -> String {
+        let until = svc
+            .sweep_rate_limit_paused_until()
+            .expect("the gate is paused");
+        assert!(
+            parse_iso(&until).is_some(),
+            "pausedUntil is RFC 3339: {until}"
+        );
+        format!("rate limited; PR monitor polling paused until {until}")
+    }
+
     /// A forge fetch failing with the quota-exhausted error pauses the
     /// global sweep rate-limit gate (monorepo#2961): the sweep stops
-    /// fetching further PRs, every monitor of the rate-limited PR records
-    /// the pause as `lastError` while monitors not yet reached keep their
-    /// previous row, later sweeps make zero forge calls while paused, and
-    /// the first successful post-pause poll clears the error.
+    /// fetching further PRs, EVERY active monitor — the rate-limited PR's
+    /// and the ones not reached alike — records the pause as `lastError`
+    /// naming the deadline, later sweeps make zero forge calls while paused,
+    /// and the first successful post-pause poll clears the error.
     #[tokio::test]
     async fn a_rate_limited_fetch_pauses_the_gate_and_skips_the_rest_of_the_sweep() {
         async fn row(svc: &Services, id: &PrMonitorId) -> PrMonitor {
@@ -7189,6 +7265,13 @@ mod tests {
             ids.push(m.monitor_id);
         }
         forge.take_fetched_numbers();
+        let before: Vec<PrMonitor> = {
+            let mut rows = Vec::new();
+            for id in &ids {
+                rows.push(row(&svc, id).await);
+            }
+            rows
+        };
 
         forge.edit(|s| s.rate_limit_get_pr = true);
         svc.poll_due_pr_monitors().await;
@@ -7201,25 +7284,30 @@ mod tests {
             svc.sweep_rate_limit.paused_remaining().is_some(),
             "the global gate is paused"
         );
+        let pause_error = expected_pause_error(&svc);
         let mut paused_rows = Vec::new();
         for id in &ids[..2] {
             let paused = row(&svc, id).await;
-            assert!(
-                paused
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|e| e.starts_with("rate limited; PR monitor polling paused for ~")),
-                "both monitors on the rate-limited PR record the pause: {:?}",
-                paused.last_error
+            assert_eq!(
+                paused.last_error.as_deref(),
+                Some(pause_error.as_str()),
+                "both monitors on the rate-limited PR record the pause"
             );
             paused_rows.push(paused);
         }
-        for id in &ids[2..] {
+        for (id, previous) in ids[2..].iter().zip(&before[2..]) {
+            let paused = row(&svc, id).await;
             assert_eq!(
-                last_error(&svc, id).await,
-                None,
-                "monitors not reached keep their previous row"
+                paused.last_error.as_deref(),
+                Some(pause_error.as_str()),
+                "monitors not reached carry the pause too"
             );
+            assert_eq!(
+                paused.last_polled_at, previous.last_polled_at,
+                "the stamp is not a poll"
+            );
+            assert_eq!(paused.last_snapshot, previous.last_snapshot);
+            paused_rows.push(paused);
         }
 
         // While paused, sweeps skip the forge entirely — even a due sweep
@@ -7233,7 +7321,7 @@ mod tests {
             forge.take_fetched_numbers().is_empty(),
             "no forge calls while the gate is paused"
         );
-        for (id, paused) in ids[..2].iter().zip(&paused_rows) {
+        for (id, paused) in ids.iter().zip(&paused_rows) {
             assert_eq!(
                 &row(&svc, id).await,
                 paused,
@@ -7366,27 +7454,27 @@ mod tests {
                 svc.sweep_rate_limit.paused_remaining().is_some(),
                 "{rate_limit_read}: the global gate is paused"
             );
+            let pause_error = expected_pause_error(&svc);
             let paused = svc.store().get_pr_monitor(&ids[0]).await.unwrap();
-            assert!(
-                paused
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|e| e.starts_with("rate limited; PR monitor polling paused for ~")),
-                "{rate_limit_read}: the pause is recorded as lastError: {:?}",
-                paused.last_error
+            assert_eq!(
+                paused.last_error.as_deref(),
+                Some(pause_error.as_str()),
+                "{rate_limit_read}: the pause is recorded as lastError"
             );
             assert_eq!(
                 paused.last_snapshot, baseline.last_snapshot,
                 "{rate_limit_read}: the baseline is untouched"
             );
+            let not_reached = svc.store().get_pr_monitor(&ids[1]).await.unwrap();
             assert_eq!(
-                svc.store()
-                    .get_pr_monitor(&ids[1])
-                    .await
-                    .unwrap()
-                    .last_error,
-                None,
-                "{rate_limit_read}: the monitor not reached keeps its previous row"
+                not_reached.last_error.as_deref(),
+                Some(pause_error.as_str()),
+                "{rate_limit_read}: the monitor not reached carries the pause too"
+            );
+            assert_eq!(
+                not_reached.last_polled_at.as_deref(),
+                Some("2020-01-01T00:00:02Z"),
+                "{rate_limit_read}: the stamp is not a poll"
             );
 
             // Pause window over and quota back: the poll succeeds, clears
@@ -7404,6 +7492,121 @@ mod tests {
                 "{rate_limit_read}: the change is observed once quota is back"
             );
         }
+    }
+
+    /// Regression (2026-09-17 incident): the pause was opened by the
+    /// PR-REFRESH sweep, not by a monitor fetch, so no monitor's own fetch
+    /// ever recorded it — every row sat on `lastError = NULL` with a frozen
+    /// `lastPolledAt` and a checklist going stale for an hour. Whichever
+    /// sweep trips the limit, EVERY active monitor across workspaces must
+    /// carry the pause `lastError` naming the deadline, `ws.pr.monitors`
+    /// rows must expose `pausedUntil` while the gate is closed, and the
+    /// first post-pause sweep clears the error — completing a PR that
+    /// merged during the blackout and waking its owner.
+    #[tokio::test]
+    async fn a_pause_opened_by_the_pr_refresh_sweep_is_surfaced_on_every_active_monitor() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitor_poll_seconds(30)
+            .with_pr_monitor_hourly_request_budget(1500);
+        let (ws2, sibling) = sibling_workspace(&svc, "agent-prmon-sibling").await;
+        let (first, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 1)
+            .await
+            .expect("register");
+        let (second, _) = svc
+            .pr_monitor_register(&ws2, &sibling, "o", "r", 2)
+            .await
+            .expect("register");
+        backdate(&svc, &first.monitor_id, "2020-01-01T00:00:01Z").await;
+        backdate(&svc, &second.monitor_id, "2020-01-01T00:00:02Z").await;
+        forge.take_fetched_numbers();
+
+        // The workspace is linked to PR 42 on a feature branch, so the
+        // PR-refresh sweep re-fetches it — and hits the exhausted quota.
+        let mut linked = svc.store().get_workspace(&ws).await.unwrap();
+        linked.branch = "feature".into();
+        linked.pr_number = Some(42);
+        linked.pr_url = Some("https://github.com/o/r/pull/42".into());
+        svc.store().update_workspace(&linked).await.unwrap();
+        forge.edit(|s| s.rate_limit_get_pr = true);
+        svc.refresh_all_workspace_prs(0).await;
+        assert!(
+            svc.sweep_rate_limit.paused_remaining().is_some(),
+            "the PR-refresh sweep opened the global pause"
+        );
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![42],
+            "no monitor fetch was involved"
+        );
+
+        let pause_error = expected_pause_error(&svc);
+        let paused_until = svc.sweep_rate_limit_paused_until().unwrap();
+        for (monitor, polled) in [
+            (&first, "2020-01-01T00:00:01Z"),
+            (&second, "2020-01-01T00:00:02Z"),
+        ] {
+            let row = svc
+                .store()
+                .get_pr_monitor(&monitor.monitor_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                row.last_error.as_deref(),
+                Some(pause_error.as_str()),
+                "every active monitor, in every workspace, carries the pause"
+            );
+            assert_eq!(row.last_polled_at.as_deref(), Some(polled), "not a poll");
+            assert_eq!(
+                row.last_snapshot, monitor.last_snapshot,
+                "baseline untouched"
+            );
+        }
+
+        // `ws.pr.monitors` labels the stale checklist with the deadline.
+        for (ws, who, monitor) in [(&ws, &owner, &first), (&ws2, &sibling, &second)] {
+            let listed = svc.pr_monitor_list_op(ws, Some(who)).await.unwrap();
+            let rows = listed["monitors"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["monitorId"], json!(monitor.monitor_id));
+            assert_eq!(rows[0]["pausedUntil"], json!(paused_until));
+            assert_eq!(rows[0]["lastError"], json!(pause_error));
+        }
+
+        // The monitor sweep honours the pause: no forge calls.
+        svc.poll_due_pr_monitors().await;
+        assert!(forge.take_fetched_numbers().is_empty());
+
+        // Pause window over and quota back: PR 1 merged during the blackout.
+        // The first post-pause sweep clears the pause on every monitor,
+        // completes PR 1's monitor and wakes its owner; `pausedUntil` is
+        // gone from the rows.
+        svc.sweep_rate_limit.clear();
+        forge.edit(|s| {
+            s.rate_limit_get_pr = false;
+            s.pr_state = PrState::Merged;
+        });
+        svc.poll_pr_monitors().await;
+        let completed = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(completed.state, PrMonitorState::Completed);
+        assert_eq!(completed.last_error, None);
+        assert!(
+            owner_messages(&svc, &owner)
+                .await
+                .contains("[PR monitor o/r#1]"),
+            "the owner gets the final wake once polling resumes"
+        );
+        let recovered = svc
+            .store()
+            .get_pr_monitor(&second.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(recovered.last_error, None);
+        let listed = svc.pr_monitor_list_op(&ws2, Some(&sibling)).await.unwrap();
+        let row = &listed["monitors"].as_array().unwrap()[0];
+        assert!(row.get("pausedUntil").is_none(), "{row}");
+        assert!(row.get("lastError").is_none(), "{row}");
     }
 
     /// Sibling monitors on one PR count once toward the effective interval

@@ -4513,6 +4513,28 @@ impl Services {
         self.sweep_rate_limit.paused_remaining().is_some()
     }
 
+    /// The RFC 3339 (whole-second) deadline of the active global rate-limit
+    /// pause, or `None` while the gate is open — the `pausedUntil` value the
+    /// PR-monitor surfaces carry so a checklist can be labelled stale.
+    pub(crate) fn sweep_rate_limit_paused_until(&self) -> Option<String> {
+        let until = self.sweep_rate_limit.paused_until()?;
+        let until = time::OffsetDateTime::from(until)
+            .replace_nanosecond(0)
+            .ok()?;
+        until
+            .format(&time::format_description::well_known::Rfc3339)
+            .ok()
+    }
+
+    /// The `lastError` stamped on PR monitors while the global rate-limit
+    /// pause is active, naming the pause deadline.
+    pub(crate) fn rate_limit_pause_error(&self) -> String {
+        match self.sweep_rate_limit_paused_until() {
+            Some(until) => format!("rate limited; PR monitor polling paused until {until}"),
+            None => "rate limited; PR monitor polling paused".to_string(),
+        }
+    }
+
     /// A sweep forge call failed with [`Error::RateLimited`]: pause all
     /// forge-touching sweep work globally until the quota window resets.
     /// The pause honors the forge-reported reset timestamp (GitHub's free
@@ -4521,6 +4543,15 @@ impl Services {
     /// pause window (the opening trigger); repeat triggers while paused
     /// extend the deadline silently, coalescing what used to be one WARN
     /// per root/workspace per tick.
+    ///
+    /// Opening the window also stamps the pause as `lastError` on EVERY
+    /// active PR monitor across workspaces: whichever sweep tripped the
+    /// limit, no monitor is polled until the window elapses, and a monitor
+    /// whose checklist is going stale must say so instead of sitting on an
+    /// empty `lastError` with a frozen `lastPolledAt`. The stamp leaves the
+    /// rows' concurrency token alone (see
+    /// [`Store::set_active_pr_monitors_error`]); the first successful
+    /// post-pause poll clears it.
     async fn pause_sweeps_for_rate_limit(
         &self,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
@@ -4538,6 +4569,20 @@ impl Services {
                 detail,
                 "forge rate limit hit: pausing pr refresh, git root + pr monitor sweeps globally"
             );
+            match self
+                .store
+                .set_active_pr_monitors_error(&self.rate_limit_pause_error())
+                .await
+            {
+                Ok(stamped) => tracing::debug!(
+                    stamped,
+                    "forge rate limit hit: pause recorded as lastError on active pr monitors"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "forge rate limit hit: failed to record the pause on active pr monitors"
+                ),
+            }
         }
     }
 
@@ -28146,6 +28191,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
+        let paused_until = self.sweep_rate_limit_paused_until();
         Box::pin(async move {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             // Cross-repo override (`{ repo: "owner/name" }`) wins over the
@@ -28249,6 +28295,13 @@ impl WorkspaceApi for Services {
             // resolution state was unreadable.
             if let Some(count) = unresolved_thread_count {
                 snapshot["comments"]["unresolvedThreadCount"] = serde_json::json!(count);
+            }
+            // Presence-detected: while the daemon's global forge rate-limit
+            // pause is active, the PR monitors' checklists are not being
+            // refreshed — the deadline lets the caller label them stale.
+            // This one-shot read itself is not gated.
+            if let Some(until) = paused_until {
+                snapshot["pausedUntil"] = serde_json::json!(until);
             }
             Ok(snapshot)
         })

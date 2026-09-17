@@ -13,7 +13,7 @@
 //! fresh pause). Sweep-local work (submodule auto-detect, prune, commit-sha
 //! backfill) never pauses — only forge calls do.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Fallback pause when the forge cannot report its reset timestamp (host
 /// without the signal, or the free `rate_limit` probe itself failed).
@@ -49,21 +49,42 @@ pub(crate) fn pause_duration(reset_unix: Option<u64>, now_unix: u64) -> Duration
     base.clamp(RATE_LIMIT_MIN_PAUSE, RATE_LIMIT_MAX_PAUSE)
 }
 
+/// The pause deadline on both clocks: the monotonic instant the gate
+/// compares against, and the wall-clock time surfaced to users and agents
+/// (`pausedUntil`, the pause `lastError`) — captured once at pause time so
+/// every surface names the same second.
+#[derive(Clone, Copy)]
+struct PauseDeadline {
+    at: Instant,
+    wall: SystemTime,
+}
+
 /// The shared pause state. Interior-mutable so one instance can sit in an
 /// `Arc` across [`crate::Services`] clones; the mutex is only ever held for
 /// a read/compare/store, never across an await.
 #[derive(Default)]
 pub(crate) struct RateLimitGate {
-    paused_until: std::sync::Mutex<Option<Instant>>,
+    paused_until: std::sync::Mutex<Option<PauseDeadline>>,
 }
 
 impl RateLimitGate {
+    fn active_deadline(&self) -> Option<PauseDeadline> {
+        let deadline = (*self.paused_until.lock().expect("gate lock"))?;
+        (deadline.at > Instant::now()).then_some(deadline)
+    }
+
     /// Remaining pause, or `None` when the gate is open (never paused, or
     /// the window elapsed — the gate re-opens implicitly, no reset call).
     pub(crate) fn paused_remaining(&self) -> Option<Duration> {
-        let deadline = (*self.paused_until.lock().expect("gate lock"))?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let deadline = self.active_deadline()?;
+        let remaining = deadline.at.saturating_duration_since(Instant::now());
         (remaining > Duration::ZERO).then_some(remaining)
+    }
+
+    /// The wall-clock deadline of the active pause window, or `None` when
+    /// the gate is open.
+    pub(crate) fn paused_until(&self) -> Option<SystemTime> {
+        self.active_deadline().map(|d| d.wall)
     }
 
     /// Pause forge-touching sweep work for `duration` from now. Returns
@@ -72,11 +93,15 @@ impl RateLimitGate {
     /// deadline is extended if the new one is later, but reporting stays
     /// coalesced to the window's first trigger.
     pub(crate) fn pause_for(&self, duration: Duration) -> bool {
-        let deadline = Instant::now() + duration;
+        let now = Instant::now();
+        let deadline = PauseDeadline {
+            at: now + duration,
+            wall: SystemTime::now() + duration,
+        };
         let mut slot = self.paused_until.lock().expect("gate lock");
         match *slot {
-            Some(existing) if existing > Instant::now() => {
-                if deadline > existing {
+            Some(existing) if existing.at > now => {
+                if deadline.at > existing.at {
                     *slot = Some(deadline);
                 }
                 false
@@ -140,16 +165,21 @@ mod tests {
     fn gate_opens_after_the_window_and_coalesces_triggers() {
         let gate = RateLimitGate::default();
         assert!(gate.paused_remaining().is_none());
+        assert!(gate.paused_until().is_none());
 
         // First trigger opens the window (caller logs); a second trigger
         // while paused is coalesced (no second WARN).
+        let before = SystemTime::now();
         assert!(gate.pause_for(Duration::from_secs(60)));
         assert!(gate.paused_remaining().is_some());
+        let until = gate.paused_until().expect("wall-clock deadline");
+        assert!(until >= before + Duration::from_secs(60));
         assert!(!gate.pause_for(Duration::from_secs(60)));
 
-        // A later deadline extends silently.
+        // A later deadline extends silently, on both clocks.
         assert!(!gate.pause_for(Duration::from_secs(120)));
         assert!(gate.paused_remaining().unwrap() > Duration::from_secs(60));
+        assert!(gate.paused_until().unwrap() > until);
     }
 
     #[test]
@@ -158,6 +188,7 @@ mod tests {
         assert!(gate.pause_for(Duration::from_millis(5)));
         std::thread::sleep(Duration::from_millis(10));
         assert!(gate.paused_remaining().is_none());
+        assert!(gate.paused_until().is_none());
         // The next trigger is a NEW window and warns again.
         assert!(gate.pause_for(Duration::from_secs(60)));
     }
