@@ -278,8 +278,9 @@ async fn slot_held_idle_flip_defers_the_wakeup_to_the_slot_release() {
         "the spawn queued behind the active holder"
     );
 
-    // A release while the process is still ACTIVE (a turn aborted mid-stream)
-    // wakes nobody: `mark_idle` on that path performs the wake.
+    // A release while the process is still ACTIVE wakes nobody: the process
+    // is not claimable yet, so the wake belongs to whichever release follows
+    // its idle flip.
     reg.wake_waiter_if_idle(&a);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(

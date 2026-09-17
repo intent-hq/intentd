@@ -1373,16 +1373,14 @@ impl ProcessRegistry {
         }
     }
 
-    /// Mark a process idle (eligible for eviction) and wake a queued spawn so it
-    /// can take the freed slot immediately. When a waiter is resumed, logs + emits
-    /// `agent:process:resumed` via the event callback.
-    ///
-    /// Only for callers that have ALREADY released the agent's in-flight busy
-    /// slot (the `interrupt` path: `end_turn` then this). While the busy slot
-    /// is still held the woken waiter's claim on this process would lose to it
-    /// (`try_claim` checks `busy` first) — use [`Self::mark_idle_slot_held`]
-    /// there and let the slot release wake the waiter
-    /// ([`Self::wake_waiter_if_idle`], intent-hq/intent#5253).
+    /// Test helper: mark a process idle (eligible for eviction) and wake a
+    /// queued spawn in one step — a registered process flipping idle with no
+    /// busy slot in the picture. Production paths never do both here: the
+    /// manager flips with [`Self::mark_idle_slot_held`] while the busy slot is
+    /// still held and wakes from the slot release
+    /// ([`Self::wake_waiter_if_idle`], intent-hq/intent#5253), so one freed
+    /// slot wakes exactly one waiter.
+    #[cfg(test)]
     pub(crate) fn mark_idle(&self, agent_id: &AgentId) {
         if self.mark_idle_slot_held(agent_id) {
             self.wake_waiter_if_idle(agent_id);
@@ -1391,12 +1389,14 @@ impl ProcessRegistry {
 
     /// Mark a process idle WITHOUT waking a queued spawn: the caller still
     /// holds the agent's in-flight busy slot (a prompt worker between
-    /// `run_turn` and its `end_turn`), so a waiter woken now could not claim
-    /// this process yet — it would fail `try_claim`, re-queue (a second
-    /// `agent:process:queued`) and only admit on its next timed re-check
-    /// (intent-hq/intent#5253). The wake happens when the slot is released
-    /// ([`Self::wake_waiter_if_idle`] from the manager's slot release).
-    /// Returns whether the process is registered.
+    /// `run_turn` and its `end_turn`; `interrupt` before its `end_turn`), so a
+    /// waiter woken now could not claim this process yet — it would fail
+    /// `try_claim`, re-queue (a second `agent:process:queued`) and only admit
+    /// on its next timed re-check (intent-hq/intent#5253). The wake happens
+    /// when the slot is released ([`Self::wake_waiter_if_idle`] from the
+    /// manager's slot release), and only then — a flip on an agent holding no
+    /// slot (an interrupt between turns) wakes nobody, since no slot was
+    /// freed. Returns whether the process is registered.
     pub(crate) fn mark_idle_slot_held(&self, agent_id: &AgentId) -> bool {
         let mut inner = self.inner.lock().unwrap();
         match inner.entries.get_mut(agent_id) {
@@ -1412,10 +1412,10 @@ impl ProcessRegistry {
     /// Wake one queued spawn when `agent_id`'s process is registered and idle
     /// — i.e. it just became claimable as an eviction candidate. Called by the
     /// manager once the agent's busy slot is released, so the woken waiter's
-    /// claim succeeds in one pass. A process still marked active (a turn
-    /// aborted mid-stream; `mark_idle` follows and wakes) or already
-    /// deregistered (`deregister` woke) wakes nobody. When a waiter is
-    /// resumed, logs + emits `agent:process:resumed` via the event callback.
+    /// claim succeeds in one pass. A process still marked active (a turn's
+    /// slot released before its idle flip) or already deregistered
+    /// (`deregister` woke) wakes nobody. When a waiter is resumed, logs +
+    /// emits `agent:process:resumed` via the event callback.
     pub(crate) fn wake_waiter_if_idle(&self, agent_id: &AgentId) {
         let resumed_agent = {
             let mut inner = self.inner.lock().unwrap();
@@ -5023,12 +5023,13 @@ impl AgentManager {
             .get(agent_id)
             .cloned()
             .or_else(|| session.as_ref().map(|s| s.workspace_id.clone()));
+        // Mark the process idle (reapable) but keep its handle so it survives
+        // for a follow-up resume. Flip BEFORE the slot release so the release
+        // wakes a queued spawn exactly when a slot was actually freed (#5253):
+        // an interrupt between turns (slot already released by the worker,
+        // whose release already woke) then wakes nobody a second time.
+        self.registry.mark_idle_slot_held(agent_id);
         self.end_turn(agent_id).await;
-        // Mark the process idle (reapable) but keep its handle so it survives for
-        // a follow-up resume. The busy slot is already released above, so this
-        // is the waking variant: the woken waiter's claim on the idle process
-        // succeeds in one pass (#5253).
-        self.registry.mark_idle(agent_id);
         // Emit the single terminal `agent:stream:end` on stop (parity #14): the
         // aborted worker's `run_prompt_turn` no longer reaches its own emit.
         // Unlike the normal-completion emit, the interrupt terminal carries
