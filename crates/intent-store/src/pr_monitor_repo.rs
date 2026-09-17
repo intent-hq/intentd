@@ -115,15 +115,13 @@ pub struct PrMonitorPollUpdate<'a> {
     pub last_change_at: Option<&'a str>,
     pub last_polled_at: Option<&'a str>,
     /// The caller's `last_error`: a genuine fetch error, `None` after a
-    /// success, either optionally carrying a pause annotation
-    /// ([`pr_monitor_pause_error`]) the caller composed. NOT written
-    /// verbatim — the statement composes the landed value from this and the
-    /// row's CURRENT `last_error` (see [`pause_preserving_last_error_sql`]):
-    /// a pause annotation bulk-stamped between the caller's read and its
-    /// write survives with the later deadline, and a caller annotation
-    /// landing on a row that carries none (the pause was cleared in between)
-    /// is dropped — the row, not the capture, decides whether a pause is in
-    /// force.
+    /// success. NOT written verbatim — the statement composes the landed
+    /// value from its genuine part and the row's CURRENT pause annotation
+    /// (see [`pause_preserving_last_error_sql`]): an unexpired annotation
+    /// on the row survives the write, a pause annotation the caller's value
+    /// carries ([`pr_monitor_pause_error`], e.g. the error of a fetch that
+    /// itself hit the limit) is stripped and never written — the row, not
+    /// the caller, decides whether a pause is in force and until when.
     pub last_error: Option<&'a str>,
     pub updated_at: &'a str,
     /// The `updated_at` the caller read; the write lands only if it still
@@ -144,12 +142,12 @@ fn row_pause_sql(marker: &str) -> String {
 /// The SQL expression for the `last_error` a guarded write-back lands,
 /// composed from the row's CURRENT `last_error` and the caller's `genuine`
 /// (a `?N` placeholder): the caller's value minus any pause annotation it
-/// carries, then `"; "` and the pause annotation naming the LATEST deadline
-/// among the row's and the caller's that is not before `floor` (a `?N`
-/// placeholder bound to this write's `updated_at`), compared at whole
-/// seconds ([`pause_deadline_secs_sql`]) — PROVIDED the row carries an
-/// unexpired annotation of its own; a row without one lands without one,
-/// whatever the caller captured. `marker` is the `?N` placeholder bound to
+/// carries, then `"; "` and the ROW's pause annotation — kept iff its
+/// deadline is not before `floor` (a `?N` placeholder bound to this
+/// write's `updated_at`), compared at whole seconds
+/// ([`pause_deadline_secs_sql`]). A row without an unexpired annotation
+/// lands without one, whatever the caller captured; a row with one keeps
+/// exactly it. `marker` is the `?N` placeholder bound to
 /// [`PR_MONITOR_PAUSE_MARKER`].
 ///
 /// Composed in SQL rather than from a Rust-side capture because the bulk
@@ -158,31 +156,20 @@ fn row_pause_sql(marker: &str) -> String {
 /// `updated_at` alone: a pause opening, extending, or being lifted between
 /// a poll's gate read and its write-back cannot fail the guard, so the
 /// write must be able neither to clobber a stamp nor to resurrect a cleared
-/// one. The row is therefore the source of truth for whether a pause is in
-/// force: the caller's capture can only move an annotation the row already
-/// carries to a later deadline (the stamp of an extension it read ahead of
-/// landing), never introduce one — every pause is stamped on the rows by
-/// its opener, so a capture that finds the row bare is stale. An
-/// annotation whose deadline has passed the floor is dropped — the first
-/// post-pause write clears the pause.
+/// one. The row is therefore the ONLY source of truth for the pause: the
+/// caller's capture never introduces an annotation nor moves the row's to
+/// another deadline — an annotation on the row is no proof it names the
+/// same pause the caller read (a lifted pause's capture landing after a
+/// shorter pause was stamped would otherwise re-extend it past the lift
+/// that reconciles it), and every opening or extension is stamped on the
+/// rows by the serialized gate transition anyway. An annotation whose
+/// deadline has passed the floor is dropped — the first post-pause write
+/// clears the pause.
 fn pause_preserving_last_error_sql(genuine: &str, marker: &str, floor: &str) -> String {
     let row_pause = row_pause_sql(marker);
-    let caller_pause = format!(
-        "CASE WHEN instr(COALESCE({genuine}, ''), {marker}) > 0 \
-             THEN substr({genuine}, instr({genuine}, {marker})) ELSE '' END"
-    );
     let row_deadline = pause_deadline_secs_sql(&row_pause, marker);
-    let caller_deadline = pause_deadline_secs_sql(&caller_pause, marker);
     let floor_secs = instant_secs_sql(floor);
-    let kept_row = format!("CASE WHEN {row_deadline} >= {floor_secs} THEN {row_pause} ELSE '' END");
-    let kept_caller =
-        format!("CASE WHEN {caller_deadline} >= {floor_secs} THEN {caller_pause} ELSE '' END");
-    let pause = format!(
-        "CASE WHEN {kept_row} = '' THEN NULL \
-              WHEN {kept_caller} = '' THEN {kept_row} \
-              WHEN {caller_deadline} > {row_deadline} THEN {kept_caller} \
-              ELSE {kept_row} END"
-    );
+    let pause = format!("CASE WHEN {row_deadline} >= {floor_secs} THEN {row_pause} ELSE NULL END");
     let caller_genuine = format!(
         "NULLIF(CASE WHEN instr(COALESCE({genuine}, ''), {marker}) > 0 \
                     THEN rtrim(substr({genuine}, 1, instr({genuine}, {marker}) - 1), '; ') \
@@ -1594,8 +1581,9 @@ mod tests {
     /// driven at the statement level: the caller's `last_error` was
     /// composed from a gate read that a bulk stamp then overtook, and the
     /// guard cannot catch it (the stamp leaves `updated_at` alone). Whatever
-    /// the caller captured, the landed row names the LATEST unexpired
-    /// deadline, keeps the caller's genuine error in front, never stacks
+    /// the caller captured, the landed row keeps the ROW's unexpired
+    /// annotation — the caller's is neither written nor allowed to move the
+    /// deadline — keeps the caller's genuine error in front, never stacks
     /// annotations, and drops an annotation whose deadline has passed — the
     /// first post-pause write clears it. `adopt_pr_monitor` composes the
     /// same way.
@@ -1664,15 +1652,20 @@ mod tests {
         let (row, _) = write_back(&store, &read, Some("HTTP 502")).await;
         assert_eq!(row.last_error, Some(format!("HTTP 502; {t2}")));
 
-        // The caller's capture can also be AHEAD of the row (gate extended,
-        // stamp not landed yet): its later deadline is kept.
+        // A capture AHEAD of the row (a later deadline than the stamp on
+        // it) does not move the row either: an annotation on the row is
+        // no proof it is the pause the caller read, and the extension's own
+        // serialized stamp is what lands a later deadline.
         let t3 = pr_monitor_pause_error(Some(&rfc3339_from_now(3600)));
         let read = row;
         let (row, _) = write_back(&store, &read, Some(&t3)).await;
-        assert_eq!(row.last_error.as_deref(), Some(t3.as_str()));
+        assert_eq!(row.last_error.as_deref(), Some(t2.as_str()));
+        let read = row;
+        let (row, _) = write_back(&store, &read, Some(&format!("HTTP 502; {t3}"))).await;
+        assert_eq!(row.last_error, Some(format!("HTTP 502; {t2}")));
 
         // Once the row's annotation has expired (aged in place: the bulk
-        // stamp is monotonic and would not roll T3 back), a write clears it
+        // stamp is monotonic and would not roll T2 back), a write clears it
         // — with or without a genuine error, and even if the caller still
         // carries the stale annotation.
         set_last_error(&store, &m.monitor_id, Some(&expired)).await;
@@ -1983,8 +1976,8 @@ mod tests {
     /// captures landing at 06:00:01Z onward. None resurrects the pause, a
     /// genuine error captured with it lands alone, and the next successes
     /// stay clean — the row, not the capture, says whether a pause is in
-    /// force. The capture still moves a pause the row DOES carry to a later
-    /// deadline (the stamp it read ahead of).
+    /// force, and until when: a capture naming a later deadline than the
+    /// pause the row DOES carry leaves that pause as stamped.
     #[tokio::test]
     async fn a_stale_pre_lift_capture_landing_after_the_clear_does_not_resurrect_the_pause() {
         async fn write_back(
@@ -2083,9 +2076,10 @@ mod tests {
         assert_eq!(row.agent_id, adopter);
         assert_eq!(row.last_error, None);
 
-        // The capture is still honored where the row DOES carry a pause: a
-        // fresh stamp at T1 with a capture that read the extension to T2
-        // ahead of its stamp lands at T2.
+        // Where the row DOES carry a pause, the capture cannot move it: a
+        // fresh stamp at T1 with a capture naming T2 (an extension read
+        // ahead of its stamp — or a lifted pause, indistinguishable here)
+        // stays at T1 until T2's own stamp lands.
         let t2 = pr_monitor_pause_error(Some("2030-01-01T08:00:00Z"));
         assert_eq!(
             store.annotate_active_pr_monitors_pause(&t1).await.unwrap(),
@@ -2093,6 +2087,12 @@ mod tests {
         );
         let read = store.get_pr_monitor(&m.monitor_id).await.expect("get");
         let row = write_back(&store, &read, Some(&t2), "2030-01-01T06:03:00Z").await;
+        assert_eq!(row.last_error.as_deref(), Some(t1.as_str()));
+        assert_eq!(
+            store.annotate_active_pr_monitors_pause(&t2).await.unwrap(),
+            1
+        );
+        let row = write_back(&store, &row, Some(&t1), "2030-01-01T06:03:01Z").await;
         assert_eq!(row.last_error.as_deref(), Some(t2.as_str()));
     }
 
@@ -2204,6 +2204,143 @@ mod tests {
         assert_eq!(
             errors(&store).await,
             vec![None, Some("HTTP 502".into()), None]
+        );
+    }
+
+    /// intent-hq/intentd#1945 (review r4034060318): an annotation on the
+    /// row is not proof of the SAME pause the caller captured. Pause O
+    /// (08:00) is lifted and cleared, a shorter pause N (07:00) opens and is
+    /// stamped, then a write-back that captured O ahead of the lift lands
+    /// on the now-annotated row with an unchanged guard token — the
+    /// "later deadline wins" rule used to upgrade N to the obsolete O, which
+    /// the lift of N (scoped to N) then left in place. Replayed with the
+    /// production statements across the poll, error, and adoption paths:
+    /// the caller never advances the row's deadline — only the serialized
+    /// bulk stamp does — so the row stays at N, a genuine error captured
+    /// with O lands in front of N, and the lift of N leaves the row bare.
+    #[tokio::test]
+    async fn a_stale_capture_of_a_lifted_pause_cannot_upgrade_a_newer_pause() {
+        async fn write_back(
+            store: &Store,
+            m: &PrMonitor,
+            captured: Option<&str>,
+            write_at: &str,
+        ) -> PrMonitor {
+            assert!(store
+                .update_pr_monitor_poll(
+                    &m.monitor_id,
+                    PrMonitorPollUpdate {
+                        last_snapshot: m.last_snapshot.as_deref(),
+                        baseline_snapshot: m.baseline_snapshot.as_deref(),
+                        pending_changes: &[],
+                        last_polled_at: Some(write_at),
+                        last_error: captured,
+                        updated_at: write_at,
+                        expected_updated_at: &m.updated_at,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write-back"));
+            let row = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+            assert_eq!(row.updated_at, write_at, "the guarded write landed");
+            row
+        }
+
+        let o = pr_monitor_pause_error(Some("2030-01-01T08:00:00Z"));
+        let n = pr_monitor_pause_error(Some("2030-01-01T07:00:00Z"));
+        let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
+        let m = test_monitor(&ws_id, &agent_id, "2030-01-01T05:00:00.000Z");
+        assert!(store.insert_pr_monitor(&m).await.expect("insert"));
+
+        // Pause O is stamped; the in-flight writers read the row under O.
+        assert_eq!(
+            store.annotate_active_pr_monitors_pause(&o).await.unwrap(),
+            1
+        );
+        let pre_lift = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+        assert_eq!(pre_lift.last_error.as_deref(), Some(o.as_str()));
+
+        // O is lifted early and cleared; a shorter pause N opens and is
+        // stamped. Neither moves the guard token.
+        assert_eq!(
+            store
+                .clear_active_pr_monitors_pause(Some(&o))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.annotate_active_pr_monitors_pause(&n).await.unwrap(),
+            1
+        );
+        let stamped = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+        assert_eq!(stamped.last_error.as_deref(), Some(n.as_str()));
+        assert_eq!(stamped.updated_at, pre_lift.updated_at);
+
+        // Poll path: a success that captured O lands — the row stays at N.
+        let row = write_back(&store, &pre_lift, Some(&o), "2030-01-01T06:00:33Z").await;
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some(n.as_str()),
+            "a stale capture of a lifted pause must not advance the row's deadline"
+        );
+
+        // Error path: a genuine error captured with O lands in front of N.
+        let row = write_back(
+            &store,
+            &row,
+            Some(&format!("forge down; {o}")),
+            "2030-01-01T06:00:34Z",
+        )
+        .await;
+        assert_eq!(row.last_error, Some(format!("forge down; {n}")));
+
+        // Adoption path: a re-arm whose capture carried O lands re-parented
+        // and still at N.
+        let adopter = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&test_session(&adopter, &ws_id, &now_iso()))
+            .await
+            .expect("adopter session");
+        let write_at = "2030-01-01T06:00:35Z";
+        assert!(store
+            .adopt_pr_monitor(
+                &m.monitor_id,
+                &agent_id,
+                &adopter,
+                PrMonitorPollUpdate {
+                    last_snapshot: row.last_snapshot.as_deref(),
+                    baseline_snapshot: row.last_snapshot.as_deref(),
+                    pending_changes: &[],
+                    last_polled_at: Some(write_at),
+                    last_error: Some(&o),
+                    updated_at: write_at,
+                    expected_updated_at: &row.updated_at,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("adopt"));
+        let row = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+        assert_eq!(row.agent_id, adopter);
+        assert_eq!(row.last_error.as_deref(), Some(n.as_str()));
+
+        // The lift of N reconciles the row: nothing obsolete is left behind.
+        assert_eq!(
+            store
+                .clear_active_pr_monitors_pause(Some(&n))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_pr_monitor(&m.monitor_id)
+                .await
+                .expect("get")
+                .last_error,
+            None
         );
     }
 

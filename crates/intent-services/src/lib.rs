@@ -4527,37 +4527,16 @@ impl Services {
     }
 
     /// The pause annotation carried as `lastError` by PR monitors while the
-    /// global rate-limit pause is active, naming the pause deadline.
+    /// global rate-limit pause is active, naming the pause deadline. This is
+    /// the error value a rate-limited fetch resolves to (and the cache
+    /// shares with the sibling monitors of the same PR); it is never the
+    /// annotation a write-back LANDS — the store strips any annotation from
+    /// the caller's `last_error` and keeps the row's own
+    /// (`PrMonitorPollUpdate::last_error`): the rows are stamped and cleared
+    /// only by the serialized gate transitions, so a poll's gate read can
+    /// neither strip, resurrect, nor re-extend the pause the row carries.
     pub(crate) fn rate_limit_pause_error(&self) -> String {
         rate_limit::pause_error(self.sweep_rate_limit_paused_until().as_deref())
-    }
-
-    /// The `lastError` a PR monitor write-back carries given `error` — a
-    /// genuine fetch error, or `None` after a successful poll. While the
-    /// gate is closed the current pause annotation is appended
-    /// ([`rate_limit::annotate_pause_error`]): a poll that lands mid-pause
-    /// (in flight when the pause opened, or a sibling's cached fetch) must
-    /// not strip the deadline the row will otherwise sit on unrefreshed for
-    /// the rest of the blackout. With the gate open, `error` passes through
-    /// — the first post-pause poll is what clears the annotation.
-    ///
-    /// This gate read is NOT what the row ends up with on its own: the store
-    /// composes the landed `last_error` against the row's current
-    /// annotation in SQL (`PrMonitorPollUpdate::last_error`), so a pause
-    /// that opens or extends between this read and the guarded write —
-    /// which the bulk stamp cannot fail, as it leaves `updated_at` alone —
-    /// keeps its later deadline instead of being clobbered by this capture,
-    /// and a pause LIFTED between the two (the bulk clear leaves
-    /// `updated_at` alone too) is not resurrected by it: the capture only
-    /// ever moves an annotation the row still carries to a later deadline.
-    pub(crate) fn pr_monitor_last_error(&self, error: Option<&str>) -> Option<String> {
-        match self.sweep_rate_limit_paused_until() {
-            Some(until) => Some(rate_limit::annotate_pause_error(
-                error,
-                &rate_limit::pause_error(Some(&until)),
-            )),
-            None => error.map(str::to_string),
-        }
     }
 
     /// A sweep forge call failed with [`Error::RateLimited`]: pause all
@@ -4656,9 +4635,12 @@ impl Services {
     /// probed, so the lift is skipped and the next tick re-probes — or
     /// waits for the clear to finish and stamps the rows afterwards; and
     /// the clear is scoped to the lifted deadline, so a stamp naming a
-    /// later one is never erased by it. The gate is lifted BEFORE the clear
-    /// so a poll write-back racing the lift reads the gate open and carries
-    /// no annotation of its own.
+    /// later one is never erased by it. A poll write-back racing the lift
+    /// cannot undo it either: write-backs never land an annotation of their
+    /// own, only keep or drop the row's (`PrMonitorPollUpdate::last_error`)
+    /// — so one that read the row under the lifted pause neither
+    /// resurrects it on a cleared row nor re-extends a shorter pause
+    /// stamped since.
     async fn maybe_lift_rate_limit_pause(
         &self,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,

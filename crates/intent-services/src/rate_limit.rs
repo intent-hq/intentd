@@ -73,44 +73,14 @@ pub(crate) fn quota_recovered(remaining: Option<u64>, limit: Option<u64>) -> boo
 
 /// The fixed prefix of the pause annotation carried in a PR monitor's
 /// `lastError` while the gate is closed — the marker by which an earlier
-/// annotation is found and replaced (a deadline extension, a re-stamp), in
-/// Rust ([`annotate_pause_error`]) and in SQL alike. The store owns the
-/// shape: its guarded write-backs compose on it
+/// annotation is found and replaced (a deadline extension, a re-stamp) or
+/// cut off (a lift). The store owns the shape and every write of it: the
+/// bulk stamp and clear are the only statements that put a deadline on a
+/// row, and its guarded write-backs only keep or drop the row's own
 /// (`intent_store::PrMonitorPollUpdate::last_error`).
 pub(crate) use intent_store::{
     pr_monitor_pause_error as pause_error, PR_MONITOR_PAUSE_MARKER as PAUSE_ERROR_MARKER,
 };
-
-/// Separator between a genuine fetch error and the pause annotation
-/// appended to it.
-pub(crate) const PAUSE_ERROR_SEPARATOR: &str = "; ";
-
-/// The `lastError` a monitor's write-back CARRIES while the gate is closed:
-/// `error` (a genuine fetch error, or `None` after a successful poll) with
-/// the current pause annotation appended. An annotation already present in
-/// `error` — from an earlier stamp, or a fetch that itself hit the limit —
-/// is replaced, never repeated. This is the caller's side of the
-/// composition only: the store re-composes the landed value against the
-/// row's current annotation in SQL, so a stamp that overtook this gate read
-/// (a pause opening or extending between the read and the write) keeps its
-/// later deadline regardless of what was captured here — and a clear that
-/// overtook it (the pause lifted between the read and the write) stays
-/// cleared: the row decides whether a pause is in force, this capture can
-/// only move an annotation the row already carries to a later deadline.
-pub(crate) fn annotate_pause_error(error: Option<&str>, pause: &str) -> String {
-    let genuine = error
-        .map(|e| match e.find(PAUSE_ERROR_MARKER) {
-            Some(at) => e[..at]
-                .strip_suffix(PAUSE_ERROR_SEPARATOR)
-                .unwrap_or(&e[..at]),
-            None => e,
-        })
-        .filter(|e| !e.is_empty());
-    match genuine {
-        Some(genuine) => format!("{genuine}{PAUSE_ERROR_SEPARATOR}{pause}"),
-        None => pause.to_string(),
-    }
-}
 
 /// The pause deadline on both clocks: the monotonic instant the gate
 /// compares against, and the wall-clock time surfaced to users and agents
@@ -240,30 +210,15 @@ mod tests {
         assert_eq!(pause_duration(None, 1_000), RATE_LIMIT_FALLBACK_PAUSE);
     }
 
-    /// The annotation composes with a genuine error, replaces an earlier
-    /// annotation (bare or appended) instead of stacking, and stands alone
-    /// after a successful poll or a fetch that itself hit the limit.
+    /// The pause annotation names the deadline behind the fixed marker, and
+    /// is the bare marker without one.
     #[test]
-    fn pause_annotation_composes_and_replaces_without_stacking() {
-        let t1 = pause_error(Some("2026-09-17T02:39:15Z"));
-        let t2 = pause_error(Some("2026-09-17T03:09:15Z"));
+    fn pause_annotation_names_the_deadline_behind_the_marker() {
         assert_eq!(
-            t1,
+            pause_error(Some("2026-09-17T02:39:15Z")),
             "rate limited; PR monitor polling paused until 2026-09-17T02:39:15Z"
         );
         assert_eq!(pause_error(None), PAUSE_ERROR_MARKER);
-
-        assert_eq!(annotate_pause_error(None, &t1), t1);
-        assert_eq!(annotate_pause_error(Some(""), &t1), t1);
-        assert_eq!(annotate_pause_error(Some(&t1), &t2), t2);
-        assert_eq!(
-            annotate_pause_error(Some("forge down"), &t1),
-            format!("forge down; {t1}")
-        );
-        assert_eq!(
-            annotate_pause_error(Some(&format!("forge down; {t1}")), &t2),
-            format!("forge down; {t2}")
-        );
     }
 
     #[test]

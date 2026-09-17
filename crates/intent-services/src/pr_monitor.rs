@@ -2409,13 +2409,10 @@ impl Services {
             Some(base) => serde_json::to_string(base).ok(),
             None => fresh_json.clone(),
         };
-        // A success clears the error — except that while the global
-        // rate-limit gate is closed the row keeps the pause annotation
-        // (this poll was in flight when the pause opened, or rode a sibling's
-        // cached fetch): the next refresh is the post-pause one. The store
-        // re-composes this against the row's current annotation, so a pause
-        // stamped between this gate read and the write-back is kept too.
-        let last_error = self.pr_monitor_last_error(None);
+        // A success clears the genuine error — the store keeps the pause
+        // annotation the row carries while the global rate-limit gate is
+        // closed (this poll was in flight when the pause opened, or rode a
+        // sibling's cached fetch): the first post-pause refresh clears it.
         if !self
             .store
             .update_pr_monitor_poll(
@@ -2427,7 +2424,7 @@ impl Services {
                     pending_since: pending_since.as_deref(),
                     last_change_at: last_change_at.as_deref(),
                     last_polled_at: Some(&now),
-                    last_error: last_error.as_deref(),
+                    last_error: None,
                     updated_at: &now,
                     expected_updated_at: &monitor.updated_at,
                 },
@@ -2446,7 +2443,12 @@ impl Services {
         updated.pending_since = pending_since;
         updated.last_change_at = last_change_at;
         updated.last_polled_at = Some(now.clone());
-        updated.last_error = last_error;
+        // What landed: the store dropped the genuine error and kept the
+        // row's pause annotation — this image names the one the read saw.
+        updated.last_error = monitor.last_error.as_deref().and_then(|e| {
+            e.find(crate::rate_limit::PAUSE_ERROR_MARKER)
+                .map(|at| e[at..].to_string())
+        });
         updated.updated_at = now;
 
         // The FE's `pendingChanges` tracks the NET set: fire on any change
@@ -2693,13 +2695,13 @@ impl Services {
     }
 
     /// Persist a failed poll's error without disturbing the baseline or the
-    /// pending state; while the global rate-limit gate is closed the pause
-    /// annotation rides along ([`Services::pr_monitor_last_error`]), and the
-    /// store keeps a later one already stamped on the row. Best-effort — a
-    /// store failure on the error path is logged, never propagated.
+    /// pending state; the store keeps the pause annotation the row carries
+    /// while the global rate-limit gate is closed (an `error` that is itself
+    /// the pause annotation — [`Services::rate_limit_pause_error`] — lands
+    /// as no genuine error). Best-effort — a store failure on the error path
+    /// is logged, never propagated.
     async fn record_pr_monitor_error(&self, monitor: &PrMonitor, error: &str) {
         let now = now_iso();
-        let last_error = self.pr_monitor_last_error(Some(error));
         if let Err(e) = self
             .store
             .update_pr_monitor_poll(
@@ -2711,7 +2713,7 @@ impl Services {
                     pending_since: monitor.pending_since.as_deref(),
                     last_change_at: monitor.last_change_at.as_deref(),
                     last_polled_at: Some(&now),
-                    last_error: last_error.as_deref(),
+                    last_error: Some(error),
                     updated_at: &now,
                     expected_updated_at: &monitor.updated_at,
                 },
@@ -7913,14 +7915,16 @@ mod tests {
     }
 
     /// The gate-to-SQL schedules: `poll_one_pr_monitor` and
-    /// `record_pr_monitor_error` read the gate in Rust, then issue a guarded
+    /// `record_pr_monitor_error` read the row in Rust, then issue a guarded
     /// UPDATE the bulk stamp cannot fail (it leaves `updated_at` alone). A
-    /// pause that OPENS between the two (gate read open → `None` captured)
-    /// or EXTENDS between the two (T1 captured, row already at T2) must not
-    /// be clobbered by the stale capture. Driven deterministically: the gate
-    /// is held at what the capture saw while the production stamp is landed
-    /// on the row ahead of the write-back — to the UPDATE, indistinguishable
-    /// from the stamp racing in after the read.
+    /// pause that OPENS between the two (the row was read bare) or EXTENDS
+    /// between the two (the row was read at T1, is at T2 by the write) must
+    /// land as the row now has it — the write-back carries no annotation of
+    /// its own and must neither strip nor roll back the row's. Driven
+    /// deterministically: the gate is held at what the read saw while the
+    /// production stamp is landed on the row ahead of the write-back — to
+    /// the UPDATE, indistinguishable from the stamp racing in after the
+    /// read.
     #[tokio::test]
     async fn a_stamp_landing_between_the_gate_read_and_the_write_back_is_kept() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
