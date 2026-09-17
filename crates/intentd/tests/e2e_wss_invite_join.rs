@@ -5,7 +5,10 @@
 //! connects to `/ws`, `principal.me` shows the GitHub identity and
 //! `workspace.get` the collaborator role → the same guest previews a second
 //! workspace's link with `invite.inspect` and joins it with `invite.accept`
-//! on that credential (no device flow) → the owner's `github.connect`
+//! on that credential (no device flow; the presented credential is rotated
+//! out) → a third workspace is joined by gist identity proof:
+//! `invite.challenge` issues a nonce, the mock GitHub serves a gist carrying
+//! it, `invite.prove` mints the credential → the owner's `github.connect`
 //! authorised as a different account is refused (`identity-locked`) while
 //! the guest depends on the primary identity → the owner removes the member →
 //! `workspace.get` is `NotFound` → `principal.revokeSelf` closes the
@@ -15,13 +18,15 @@
 //! pointed at one local mock (`INTENTD_GITHUB_LOGIN_BASE_URI` /
 //! `INTENTD_GITHUB_API_BASE_URI`). The owner's identity comes from a fake
 //! `GITHUB_TOKEN` the mock recognises; the invitee's `GET /user` runs on the
-//! device-flow token the mock mints per flow. Hermetic: no live network, and
-//! the invitee's token is asserted never to reach the daemon's secrets file.
+//! device-flow token the mock mints per flow; the proof gists are scripted
+//! by the test (`GET /gists/{id}`). Hermetic: no live network, and the
+//! invitee's token is asserted never to reach the daemon's secrets file.
 
 #![cfg(unix)]
 
 mod common;
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -252,6 +257,61 @@ async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
     }
 }
 
+/// One `/invite` round-trip that waits out the listener-wide start throttle
+/// (§ step 9): a request refused `invite-flow-busy` is retried until it is
+/// admitted — the bucket restores one token per 5 s — bounded by a deadline.
+/// For the steps whose assertions are about the request itself, not the
+/// throttle.
+async fn admitted_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
+    timeout(Duration::from_secs(90), async {
+        loop {
+            let v = wss_rpc(ws, id, method, params.clone()).await;
+            if v["error"]["data"]["code"] != json!("invite-flow-busy") {
+                return v;
+            }
+            // timing-guard: poll interval (the start throttle refills one token per 5 s)
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{method} (id {id}) was never admitted by the start throttle"))
+}
+
+/// An admitted `invite.challenge` for the link, returning its result.
+async fn challenge(prover: &mut Ws, id: i64, invite_id: &str, secret: &str) -> Value {
+    let v = admitted_rpc(
+        prover,
+        id,
+        "invite.challenge",
+        json!({ "inviteId": invite_id, "secret": secret }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "invite.challenge: {v}");
+    v["result"].clone()
+}
+
+/// An admitted `invite.prove` claiming the `guest` account with `gist_id`,
+/// returning the full envelope.
+async fn prove(
+    prover: &mut Ws,
+    id: i64,
+    invite_id: &str,
+    secret: &str,
+    nonce: &str,
+    gist_id: &str,
+) -> Value {
+    admitted_rpc(
+        prover,
+        id,
+        "invite.prove",
+        json!({
+            "inviteId": invite_id, "secret": secret,
+            "nonce": nonce, "gistId": gist_id, "login": "guest",
+        }),
+    )
+    .await
+}
+
 /// Pump a subscriber until a `workspace:updated` event whose `changes`
 /// satisfy `pred` arrives (bounded).
 async fn await_workspace_updated(ws: &mut Ws, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
@@ -345,19 +405,53 @@ async fn upgrade_status_line(port: u16, cfg: Arc<ClientConfig>, token: &str) -> 
 // ---------------------------------------------------------------------------
 // Mock GitHub: ONE plain-HTTP host serving both the login endpoints
 // (`/login/device/code`, `/login/oauth/access_token`) and the API reads the
-// join needs (`GET /user`, `GET /users/{login}`). Each `/login/device/code`
-// call mints device code `e2e-dc-{n}`; the token poll for flow `n` answers
-// `authorization_pending` until the test sets `grants[n]` to the access
-// token the (mock) user authorised with.
+// join needs (`GET /user`, `GET /users/{login}`, `GET /gists/{id}`). Each
+// `/login/device/code` call mints device code `e2e-dc-{n}`; the token poll
+// for flow `n` answers `authorization_pending` until the test sets
+// `grants[n]` to the access token the (mock) user authorised with. Gists are
+// scripted by the test: `gists[id]` is the `GET /gists/{id}` body (an
+// unknown id is `404`; the id `broken` is always `502`).
 // ---------------------------------------------------------------------------
+
+/// The mock's scripted gists, keyed by gist id.
+type Gists = Arc<Mutex<HashMap<String, Value>>>;
 
 struct MockGithub {
     base_uri: String,
     flows: Arc<AtomicUsize>,
     grants: Arc<Mutex<Vec<Option<&'static str>>>>,
+    gists: Gists,
+    /// Every `GET /gists/{id}` the daemon made, in order.
+    gist_reads: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockGithub {
+    /// Script `GET /gists/{id}`: a gist owned by `owner`, created `created_at`,
+    /// whose `intent-join-proof.txt` (when `proof` is given) starts with
+    /// `proof` — the shape the daemon reads back to verify an identity proof.
+    fn script_gist(&self, id: &str, owner: &str, created_at: &str, proof: Option<&str>) {
+        let mut files = serde_json::Map::new();
+        if let Some(proof) = proof {
+            files.insert(
+                "intent-join-proof.txt".into(),
+                json!({
+                    "filename": "intent-join-proof.txt",
+                    "content": format!("{proof}\nIntent join proof for e2e host\n"),
+                }),
+            );
+        }
+        self.gists.lock().expect("gists").insert(
+            id.to_string(),
+            json!({
+                "id": id,
+                "public": false,
+                "created_at": created_at,
+                "owner": { "login": owner },
+                "files": files,
+            }),
+        );
+    }
+
     /// Authorise device flow `n` as the account behind `token`. The flow
     /// must already have been started (a `/login/device/code` call minted
     /// it), so a stale index is a test bug rather than a silent no-op.
@@ -410,15 +504,22 @@ async fn spawn_mock_github() -> MockGithub {
     let port = listener.local_addr().expect("mock addr").port();
     let flows = Arc::new(AtomicUsize::new(0));
     let grants: Arc<Mutex<Vec<Option<&'static str>>>> = Arc::new(Mutex::new(Vec::new()));
-    let (f, g) = (flows.clone(), grants.clone());
+    let gists: Gists = Arc::new(Mutex::new(HashMap::new()));
+    let gist_reads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (f, g, gi, gr) = (
+        flows.clone(),
+        grants.clone(),
+        gists.clone(),
+        gist_reads.clone(),
+    );
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let (f, g) = (f.clone(), g.clone());
+            let (f, g, gi, gr) = (f.clone(), g.clone(), gi.clone(), gr.clone());
             tokio::spawn(async move {
-                let _ = serve_conn(stream, f, g).await;
+                let _ = serve_conn(stream, f, g, gi, gr).await;
             });
         }
     });
@@ -426,6 +527,8 @@ async fn spawn_mock_github() -> MockGithub {
         base_uri: format!("http://127.0.0.1:{port}"),
         flows,
         grants,
+        gists,
+        gist_reads,
     }
 }
 
@@ -435,6 +538,8 @@ async fn serve_conn(
     mut stream: TcpStream,
     flows: Arc<AtomicUsize>,
     grants: Arc<Mutex<Vec<Option<&'static str>>>>,
+    gists: Gists,
+    gist_reads: Arc<Mutex<Vec<String>>>,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -513,6 +618,16 @@ async fn serve_conn(
             Some(u) => (200, u),
             None => (404, json!({ "message": "Not Found" })),
         }
+    } else if let Some(id) = path_only.strip_prefix("/gists/") {
+        gist_reads.lock().expect("gist reads").push(id.to_string());
+        if id == "broken" {
+            (502, json!({ "message": "Bad Gateway" }))
+        } else {
+            match gists.lock().expect("gists").get(id).cloned() {
+                Some(g) => (200, g),
+                None => (404, json!({ "message": "Not Found" })),
+            }
+        }
     } else {
         (404, json!({ "message": "Not Found" }))
     };
@@ -520,6 +635,7 @@ async fn serve_conn(
     let reason = match status {
         200 => "OK",
         401 => "Unauthorized",
+        502 => "Bad Gateway",
         _ => "Not Found",
     };
     let response = format!(
@@ -833,9 +949,10 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     //     `invite.accept` on the credential minted in 5 — no GitHub call at
     //     all: the mock's flow counter stays where step 5 left it. A bogus
     //     credential is `credential-invalid`. The result is the phase-2
-    //     shape with a fresh credential for the same principal; both
-    //     credentials authenticate, and the owner's subscriber sees the
-    //     membership change on the second workspace.
+    //     shape with a fresh credential for the same principal; the
+    //     presented credential is rotated out (it no longer upgrades, while
+    //     the connection it already opened stays bound), and the owner's
+    //     subscriber sees the membership change on the second workspace.
     let flows_before = mock.flows.load(Ordering::SeqCst);
     let v = wss_rpc(
         &mut owner,
@@ -928,7 +1045,13 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(ev["data"]["workspaceId"], json!(second_ws));
     assert_eq!(ev["data"]["changes"]["members"], json!(true));
 
-    // The fresh credential connects; the earlier one still does too.
+    // The fresh credential connects; the rotated-out one no longer upgrades,
+    // but the connection it already opened is still bound.
+    let line = upgrade_status_line(port, cfg.clone(), &guest_token).await;
+    assert!(
+        line.starts_with("HTTP/1.1 401"),
+        "rotated-out credential upgrade: {line}"
+    );
     let mut guest2 = connect_ws(port, cfg.clone(), &guest_token_2).await;
     let v = wss_rpc(&mut guest2, 70, "principal.me", json!({})).await;
     assert_eq!(v["result"]["id"], json!(guest_id), "{v}");
@@ -947,7 +1070,203 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(
         v["result"]["workspaces"].as_array().map(Vec::len),
         Some(2),
-        "the first credential still lists both workspaces: {v}"
+        "the first connection still lists both workspaces: {v}"
+    );
+
+    // 6c. Gist identity proof: the owner shares a THIRD workspace (pinned to
+    //     the guest). On `/invite` the guest asks `invite.challenge` for a
+    //     nonce (the inspect payload plus `nonce` / `nonceExpiresAt`, no
+    //     device flow), then `invite.prove` names a gist: one the mock
+    //     answers `502` is `github-unreachable` and leaves the nonce usable;
+    //     one owned by another account is `proof-invalid` and spends it
+    //     (the matching gist is then too late on that nonce); a fresh
+    //     challenge plus a gist owned by the guest whose proof file starts
+    //     with the nonce mints a credential — the phase-2 shape for the same
+    //     principal. GitHub was read for the gists and the account, never
+    //     for a device flow.
+    let v = wss_rpc(
+        &mut owner,
+        18,
+        "workspace.create",
+        json!({ "title": "Third E2E" }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "workspace.create #3: {v}");
+    let third_ws = v["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let v = wss_rpc(
+        &mut owner,
+        19,
+        "workspace.invite.create",
+        json!({ "workspaceId": third_ws, "pinLogin": "guest" }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "invite.create #3: {v}");
+    let third_invite = v["result"]["invite"]["id"]
+        .as_str()
+        .expect("invite id")
+        .to_string();
+    let third_secret = v["result"]["secret"].as_str().expect("secret").to_string();
+
+    // Every challenge / prove hashes the secret, so each draws from the
+    // start throttle spent above; the assertions here are about the proof,
+    // so each request waits to be admitted.
+    let mut prover = connect_invite(port, cfg.clone()).await;
+    let r = challenge(&mut prover, 80, &third_invite, &third_secret).await;
+    assert_eq!(r["workspaceId"], json!(third_ws));
+    assert_eq!(r["workspaceTitle"], json!("Third E2E"));
+    assert!(
+        r["hostname"].as_str().is_some_and(|h| !h.is_empty()),
+        "hostname: {r}"
+    );
+    assert!(r.get("flowId").is_none(), "no device flow: {r}");
+    let nonce = r["nonce"].as_str().expect("nonce").to_string();
+    assert_eq!(nonce.len(), 43, "32 bytes base64url unpadded: {nonce}");
+    let expires =
+        chrono::DateTime::parse_from_rfc3339(r["nonceExpiresAt"].as_str().expect("nonceExpiresAt"))
+            .expect("nonceExpiresAt is RFC 3339");
+    let ttl = expires.signed_duration_since(chrono::Utc::now());
+    assert!(
+        ttl > chrono::Duration::minutes(9) && ttl <= chrono::Duration::minutes(10),
+        "nonce TTL ~10 min: {ttl}"
+    );
+
+    let now = chrono::Utc::now().to_rfc3339();
+    mock.script_gist("intruderproof", "intruder", &now, Some(&nonce));
+    mock.script_gist("guestproof", "guest", &now, Some(&nonce));
+
+    let v = prove(
+        &mut prover,
+        81,
+        &third_invite,
+        &third_secret,
+        &nonce,
+        "broken",
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32603), "{v}");
+    assert_eq!(
+        v["error"]["data"]["code"],
+        json!("github-unreachable"),
+        "{v}"
+    );
+    let v = prove(
+        &mut prover,
+        82,
+        &third_invite,
+        &third_secret,
+        &nonce,
+        "intruderproof",
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32602), "{v}");
+    assert_eq!(v["error"]["data"]["code"], json!("proof-invalid"), "{v}");
+    let v = prove(
+        &mut prover,
+        83,
+        &third_invite,
+        &third_secret,
+        &nonce,
+        "guestproof",
+    )
+    .await;
+    assert_eq!(
+        v["error"]["data"]["code"],
+        json!("proof-invalid"),
+        "the nonce was spent by the refused attempt: {v}"
+    );
+
+    let r = challenge(&mut prover, 84, &third_invite, &third_secret).await;
+    let nonce_2 = r["nonce"].as_str().expect("nonce").to_string();
+    assert_ne!(nonce_2, nonce);
+    // A gist that predates its nonce is `proof-invalid` (the `now` above was
+    // taken before this challenge); the one created after it verifies.
+    mock.script_gist("stale", "guest", &now, Some(&nonce_2));
+    let v = prove(
+        &mut prover,
+        87,
+        &third_invite,
+        &third_secret,
+        &nonce_2,
+        "stale",
+    )
+    .await;
+    assert_eq!(v["error"]["data"]["code"], json!("proof-invalid"), "{v}");
+    let r = challenge(&mut prover, 88, &third_invite, &third_secret).await;
+    let nonce_2 = r["nonce"].as_str().expect("nonce").to_string();
+    let after = chrono::Utc::now().to_rfc3339();
+    mock.script_gist("guestproof2", "guest", &after, Some(&nonce_2));
+    let v = prove(
+        &mut prover,
+        85,
+        &third_invite,
+        &third_secret,
+        &nonce_2,
+        "guestproof2",
+    )
+    .await;
+    assert!(v.get("error").is_none(), "invite.prove: {v}");
+    let r = &v["result"];
+    assert_eq!(r["status"], json!("authorized"));
+    assert_eq!(r["principalId"], json!(guest_id));
+    assert_eq!(r["login"], json!("guest"));
+    assert_eq!(r["workspaceId"], json!(third_ws));
+    let guest_token_3 = r["token"].as_str().expect("credential").to_string();
+    assert_eq!(guest_token_3.len(), 64);
+    assert_ne!(guest_token_3, guest_token_2);
+    assert!(r.get("hostname").is_none(), "{r}");
+    assert_eq!(
+        mock.flows.load(Ordering::SeqCst),
+        flows_before,
+        "challenge / prove never started a device flow"
+    );
+    {
+        let reads = mock.gist_reads.lock().expect("gist reads");
+        let distinct: std::collections::BTreeSet<&str> = reads.iter().map(String::as_str).collect();
+        assert_eq!(
+            distinct.into_iter().collect::<Vec<_>>(),
+            ["broken", "guestproof2", "intruderproof", "stale"],
+            "every named gist was read, the too-late one never was: {reads:?}"
+        );
+    }
+    // Spent nonce: the same proof does not join again.
+    let v = prove(
+        &mut prover,
+        86,
+        &third_invite,
+        &third_secret,
+        &nonce_2,
+        "guestproof2",
+    )
+    .await;
+    assert_eq!(v["error"]["data"]["code"], json!("invite-redeemed"), "{v}");
+    drop(prover);
+    let ev = await_workspace_updated(&mut sub, "prove", |c| {
+        c["addedPrincipalId"] == json!(guest_id) && c["memberCount"] == json!(2)
+    })
+    .await;
+    assert_eq!(ev["data"]["workspaceId"], json!(third_ws));
+
+    let mut guest3 = connect_ws(port, cfg.clone(), &guest_token_3).await;
+    let v = wss_rpc(&mut guest3, 72, "principal.me", json!({})).await;
+    assert_eq!(v["result"]["id"], json!(guest_id), "{v}");
+    let v = wss_rpc(
+        &mut guest3,
+        73,
+        "workspace.get",
+        json!({ "workspaceId": third_ws }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "workspace.get #3 as guest: {v}");
+    assert_eq!(v["result"]["workspace"]["myRole"], json!("collaborator"));
+    drop(guest3);
+    let v = wss_rpc(&mut guest, 37, "workspace.list", json!({})).await;
+    assert_eq!(
+        v["result"]["workspaces"].as_array().map(Vec::len),
+        Some(3),
+        "all three workspaces: {v}"
     );
 
     // 6b. Reconnect guard at the OAuth commit boundary: with the guest a
@@ -1009,21 +1328,24 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         "removed member reads: {v}"
     );
     let v = wss_rpc(&mut guest, 34, "workspace.list", json!({})).await;
-    assert_eq!(
-        v["result"]["workspaces"].as_array().map(Vec::len),
-        Some(1),
-        "only the second workspace remains: {v}"
-    );
-    assert_eq!(v["result"]["workspaces"][0]["id"], json!(second_ws), "{v}");
+    let mut remaining: Vec<&str> = v["result"]["workspaces"]
+        .as_array()
+        .map(|ws| ws.iter().filter_map(|w| w["id"].as_str()).collect())
+        .unwrap_or_default();
+    remaining.sort_unstable();
+    let mut expected = vec![second_ws.as_str(), third_ws.as_str()];
+    expected.sort_unstable();
+    assert_eq!(remaining, expected, "the second and third remain: {v}");
 
-    // 8. principal.revokeSelf: both credentials (the device-flow one and the
-    //    one `invite.accept` minted) are revoked, the remaining membership
-    //    (the second workspace) is left, the connection is closed by the
-    //    daemon (policy close), and neither token authenticates an upgrade.
+    // 8. principal.revokeSelf: both live credentials (the one `invite.accept`
+    //    rotated in and the one `invite.prove` minted — the device-flow one
+    //    was rotated out in 6a) are revoked, the remaining memberships (the
+    //    second and third workspaces) are left, the connection is closed by
+    //    the daemon (policy close), and no token authenticates an upgrade.
     let v = wss_rpc(&mut guest, 35, "principal.revokeSelf", json!({})).await;
     assert_eq!(
         v["result"],
-        json!({ "revoked": true, "credentials": 2, "workspaces": 1 }),
+        json!({ "revoked": true, "credentials": 2, "workspaces": 2 }),
         "{v}"
     );
     let closed = timeout(Duration::from_secs(15), async {
@@ -1045,7 +1367,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         Some(CloseCode::Policy),
         "policy close after revokeSelf"
     );
-    for token in [&guest_token, &guest_token_2] {
+    for token in [&guest_token, &guest_token_2, &guest_token_3] {
         let line = upgrade_status_line(port, cfg.clone(), token).await;
         assert!(
             line.starts_with("HTTP/1.1 401"),
@@ -1065,16 +1387,18 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     //    store work. The bucket belongs to the listener, so a reconnect does
     //    not refill it: a fresh connection gets at most the single token a
     //    refill boundary may have restored meanwhile, never a new burst.
+    //    The steps above may have left the bucket empty, so the first start
+    //    waits to be admitted; the nine that follow it within the same
+    //    refill interval cannot all be (at most 8 + 1 tokens exist).
     let mut flood = connect_invite(port, cfg.clone()).await;
     let mut codes = Vec::new();
     for i in 0..10 {
-        let v = wss_rpc(
-            &mut flood,
-            40 + i,
-            "invite.redeem",
-            json!({ "inviteId": invite_id, "secret": format!("guess-{i}") }),
-        )
-        .await;
+        let params = json!({ "inviteId": invite_id, "secret": format!("guess-{i}") });
+        let v = if i == 0 {
+            admitted_rpc(&mut flood, 40, "invite.redeem", params).await
+        } else {
+            wss_rpc(&mut flood, 40 + i, "invite.redeem", params).await
+        };
         codes.push(
             v["error"]["data"]["code"]
                 .as_str()

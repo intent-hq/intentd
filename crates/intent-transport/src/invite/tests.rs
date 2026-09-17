@@ -52,6 +52,14 @@ fn classify_picks_the_invite_methods_only() {
         .expect("classified");
     assert_eq!(accept.method, InviteMethod::Accept);
     assert!(accept.method.on_invite_endpoint());
+    let challenge = classify(&json!({ "jsonrpc": "2.0", "id": 4, "method": "invite.challenge" }))
+        .expect("classified");
+    assert_eq!(challenge.method, InviteMethod::Challenge);
+    assert!(challenge.method.on_invite_endpoint());
+    let prove = classify(&json!({ "jsonrpc": "2.0", "id": 5, "method": "invite.prove" }))
+        .expect("classified");
+    assert_eq!(prove.method, InviteMethod::Prove);
+    assert!(prove.method.on_invite_endpoint());
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "workspace.invite.list" }))
             .is_none()
@@ -144,9 +152,190 @@ impl WorkspaceApi for RedeemStub {
             }
         })
     }
+    fn invite_challenge(
+        &self,
+        invite_id: String,
+        secret: String,
+    ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("challenge:{invite_id}:{secret}"));
+        Box::pin(async move {
+            if secret == GOOD_SECRET {
+                Ok(json!({
+                    "workspaceId": "ws-1",
+                    "workspaceTitle": "Shared",
+                    "nonce": GOOD_NONCE,
+                    "nonceExpiresAt": "2026-01-01T00:10:00Z",
+                }))
+            } else {
+                Err(intent_core::Error::Invite(InviteErrorKind::Expired))
+            }
+        })
+    }
+    fn invite_prove(
+        &self,
+        invite_id: String,
+        secret: String,
+        nonce: String,
+        gist_id: String,
+        login: String,
+    ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+        self.calls.lock().unwrap().push(format!(
+            "prove:{invite_id}:{secret}:{nonce}:{gist_id}:{login}"
+        ));
+        Box::pin(async move {
+            match nonce.as_str() {
+                GOOD_NONCE => Ok(json!({
+                    "status": "authorized",
+                    "token": "fresh",
+                    "principalId": "p-1",
+                    "login": "guest",
+                    "workspaceId": "ws-1",
+                })),
+                "expired" => Err(intent_core::Error::Invite(InviteErrorKind::ProofExpired)),
+                "down" => Err(intent_core::Error::Invite(
+                    InviteErrorKind::GithubUnreachable,
+                )),
+                _ => Err(intent_core::Error::Invite(InviteErrorKind::ProofInvalid)),
+            }
+        })
+    }
 }
 
 const GOOD_CREDENTIAL: &str = "cred";
+const GOOD_NONCE: &str = "nonce-1";
+
+/// `invite.challenge`: `{ inviteId, secret }` reaches the service as-is, the
+/// result carries the inspect payload plus `nonce` / `nonceExpiresAt` and
+/// the host identity (the phase-1 decoration), an invite refusal maps to
+/// `error.data.code`, and a missing param is `-32602` before any service
+/// call.
+#[tokio::test]
+async fn challenge_decorates_like_an_inspect_and_maps_invite_errors() {
+    let stub = Arc::new(RedeemStub {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let api: Arc<dyn WorkspaceApi> = stub.clone();
+
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "invite.challenge",
+        "params": { "inviteId": "inv", "secret": GOOD_SECRET }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_challenge(req, &api).await.unwrap()).unwrap();
+    let result = &frame["result"];
+    assert_eq!(frame["id"], json!(1));
+    assert_eq!(result["workspaceId"], json!("ws-1"), "{frame}");
+    assert_eq!(result["workspaceTitle"], json!("Shared"));
+    assert_eq!(result["nonce"], json!(GOOD_NONCE));
+    assert_eq!(result["nonceExpiresAt"], json!("2026-01-01T00:10:00Z"));
+    assert_eq!(result["hostname"], json!(crate::local_hostname()));
+    assert_eq!(result["prettyHostname"], json!(crate::pretty_hostname()));
+    assert!(result.get("flowId").is_none(), "no device flow: {frame}");
+
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "invite.challenge",
+        "params": { "inviteId": "inv", "secret": "stale" }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_challenge(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["error"]["data"]["code"], json!("invite-expired"));
+    assert_eq!(frame["error"]["code"], json!(-32602));
+
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "invite.challenge",
+        "params": { "secret": GOOD_SECRET }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_challenge(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["error"]["code"], json!(-32602));
+
+    assert_eq!(
+        *stub.calls.lock().unwrap(),
+        vec![
+            format!("challenge:inv:{GOOD_SECRET}"),
+            "challenge:inv:stale".to_string()
+        ],
+        "the missing-param request never reached the service"
+    );
+}
+
+/// `invite.prove`: `{ inviteId, secret, nonce, gistId, login }` reaches the
+/// service as-is and the phase-2 `authorized` shape comes back undecorated;
+/// the three proof refusals surface as `error.data.code` `proof-invalid` /
+/// `proof-expired` / `github-unreachable`; a missing param is `-32602`
+/// before any service call.
+#[tokio::test]
+async fn prove_returns_the_authorized_shape_and_maps_proof_errors() {
+    let stub = Arc::new(RedeemStub {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let api: Arc<dyn WorkspaceApi> = stub.clone();
+    let prove = |id: u64, nonce: &str| {
+        classify(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "invite.prove",
+            "params": {
+                "inviteId": "inv", "secret": GOOD_SECRET, "nonce": nonce,
+                "gistId": "abc123", "login": "guest",
+            }
+        }))
+        .unwrap()
+    };
+
+    let frame: Value =
+        serde_json::from_str(&handle_prove(prove(1, GOOD_NONCE), &api).await.unwrap()).unwrap();
+    assert_eq!(
+        frame["result"],
+        json!({
+            "status": "authorized",
+            "token": "fresh",
+            "principalId": "p-1",
+            "login": "guest",
+            "workspaceId": "ws-1",
+        }),
+        "{frame}"
+    );
+    for (nonce, code, rpc) in [
+        ("bogus", "proof-invalid", -32602),
+        ("expired", "proof-expired", -32602),
+        (
+            "down",
+            "github-unreachable",
+            intent_core::Error::Invite(InviteErrorKind::GithubUnreachable).code(),
+        ),
+    ] {
+        let frame: Value =
+            serde_json::from_str(&handle_prove(prove(2, nonce), &api).await.unwrap()).unwrap();
+        assert_eq!(frame["error"]["data"]["code"], json!(code), "{frame}");
+        assert_eq!(frame["error"]["code"], json!(rpc), "{frame}");
+    }
+
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "invite.prove",
+        "params": { "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE, "login": "guest" }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_prove(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["error"]["code"], json!(-32602));
+    assert!(
+        frame["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("gistId")),
+        "{frame}"
+    );
+
+    assert_eq!(
+        *stub.calls.lock().unwrap(),
+        vec![
+            format!("prove:inv:{GOOD_SECRET}:{GOOD_NONCE}:abc123:guest"),
+            format!("prove:inv:{GOOD_SECRET}:bogus:abc123:guest"),
+            format!("prove:inv:{GOOD_SECRET}:expired:abc123:guest"),
+            format!("prove:inv:{GOOD_SECRET}:down:abc123:guest"),
+        ]
+    );
+}
 
 /// `invite.inspect`: `{ inviteId, secret }` reaches the service as-is, the
 /// result carries the workspace hint plus the host identity (the phase-1
@@ -284,6 +473,17 @@ async fn invite_endpoint_dispatch_routes_by_method() {
             "invite.accept",
             json!({ "inviteId": "inv", "secret": GOOD_SECRET, "credential": GOOD_CREDENTIAL }),
         ),
+        (
+            "invite.challenge",
+            json!({ "inviteId": "inv", "secret": GOOD_SECRET }),
+        ),
+        (
+            "invite.prove",
+            json!({
+                "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE,
+                "gistId": "abc123", "login": "guest",
+            }),
+        ),
     ] {
         let req =
             classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
@@ -298,6 +498,8 @@ async fn invite_endpoint_dispatch_routes_by_method() {
             "wait:flow-1".to_string(),
             format!("inspect:inv:{GOOD_SECRET}"),
             format!("accept:inv:{GOOD_SECRET}:{GOOD_CREDENTIAL}"),
+            format!("challenge:inv:{GOOD_SECRET}"),
+            format!("prove:inv:{GOOD_SECRET}:{GOOD_NONCE}:abc123:guest"),
         ]
     );
     let req = classify(&json!({
@@ -718,10 +920,10 @@ async fn throttled_starts_make_no_upstream_calls_and_waits_pass() {
     assert_eq!(*stub.calls.lock().unwrap(), vec!["wait:flow-1".to_string()]);
 }
 
-/// `invite.inspect` and `invite.accept` hash the secret against the store
-/// like a phase-1 start, so they draw from the same listener-wide bucket:
-/// once the burst is spent they are refused `invite-flow-busy` too, and a
-/// mixed stream of the three shares one budget.
+/// `invite.inspect`, `invite.accept`, `invite.challenge` and `invite.prove`
+/// hash the secret against the store like a phase-1 start, so they draw
+/// from the same listener-wide bucket: once the burst is spent they are
+/// refused `invite-flow-busy` too, and a mixed stream shares one budget.
 #[test]
 fn inspect_and_accept_share_the_start_throttle() {
     let t0 = Instant::now();
@@ -740,7 +942,25 @@ fn inspect_and_accept_share_the_start_throttle() {
         }))
         .unwrap()
     };
+    let challenge = |id: i64| {
+        classify(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "invite.challenge",
+            "params": { "inviteId": "inv", "secret": format!("guess-{id}") }
+        }))
+        .unwrap()
+    };
+    let prove = |id: i64| {
+        classify(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "invite.prove",
+            "params": {
+                "inviteId": "inv", "secret": format!("guess-{id}"), "nonce": "n",
+                "gistId": "g", "login": "guest",
+            }
+        }))
+        .unwrap()
+    };
     assert!(hashes_secret(&inspect(0)) && hashes_secret(&accept(0)));
+    assert!(hashes_secret(&challenge(0)) && hashes_secret(&prove(0)));
     assert!(hashes_secret(&start_req(0)));
     let mut admitted = 0;
     for i in 0..i64::from(INVITE_START_BURST) {
@@ -754,7 +974,13 @@ fn inspect_and_accept_share_the_start_throttle() {
         }
     }
     assert_eq!(admitted, INVITE_START_BURST, "the burst admits any mix");
-    for req in [inspect(100), accept(101), start_req(102)] {
+    for req in [
+        inspect(100),
+        accept(101),
+        start_req(102),
+        challenge(103),
+        prove(104),
+    ] {
         let refused = admit_redeem(&req, &throttle, t0).expect_err("bucket empty");
         let v: Value = serde_json::from_str(&refused.expect("frame")).unwrap();
         assert_eq!(v["error"]["data"]["code"], json!("invite-flow-busy"), "{v}");
