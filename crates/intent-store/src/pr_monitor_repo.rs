@@ -60,15 +60,43 @@ pub const PR_MONITOR_PAUSE_MARKER: &str = "rate limited; PR monitor polling paus
 
 /// The pause annotation naming the pause's RFC 3339 (whole-second, UTC)
 /// deadline — `None` only in the window between the deadline elapsing and
-/// the gate re-opening. Every annotation shares the marker prefix and ends
-/// in the deadline, so two annotations order by deadline as strings; the
-/// write-back SQL relies on that to keep the later one.
+/// the gate re-opening. Every annotation is the marker, `" until "`, then
+/// the deadline; the SQL that composes annotations reads the deadline back
+/// out at that fixed offset ([`pause_deadline_secs_sql`]).
 #[must_use]
 pub fn pr_monitor_pause_error(until: Option<&str>) -> String {
     match until {
-        Some(until) => format!("{PR_MONITOR_PAUSE_MARKER} until {until}"),
+        Some(until) => format!("{PR_MONITOR_PAUSE_MARKER}{PAUSE_UNTIL_SEPARATOR}{until}"),
         None => PR_MONITOR_PAUSE_MARKER.to_string(),
     }
+}
+
+const PAUSE_UNTIL_SEPARATOR: &str = " until ";
+
+/// The SQL expression for the deadline named by the pause `annotation` (an
+/// expression: the marker, [`PAUSE_UNTIL_SEPARATOR`], an RFC 3339 instant),
+/// as whole Unix seconds — `NULL` for an empty expression, a bare-marker
+/// annotation, or an unparsable deadline. Deadlines and the write
+/// timestamps they are compared against are both reduced to whole seconds
+/// here: the annotation's deadline is already whole-second (the gate's
+/// wall-clock deadline with its fraction dropped) while `updated_at`
+/// carries a fraction, so a string comparison mixed the two precisions and
+/// misordered `…00Z` against `…00.500Z`. At whole seconds a deadline equal
+/// to the write's second still stands — the gate may re-open anywhere
+/// inside that second, so the annotation must not clear before it.
+fn pause_deadline_secs_sql(annotation: &str, marker: &str) -> String {
+    let skip = PAUSE_UNTIL_SEPARATOR.len() + 1;
+    instant_secs_sql(&format!("substr({annotation}, length({marker}) + {skip})"))
+}
+
+/// The SQL expression for `instant` (an RFC 3339 UTC expression, any
+/// fraction) as whole Unix seconds — the other side of a
+/// [`pause_deadline_secs_sql`] comparison. The fraction is cut off
+/// textually (`YYYY-MM-DDTHH:MM:SS` is the first 19 bytes) rather than left
+/// to `SQLite`, which rounds sub-millisecond fractions and would carry
+/// `…00.9995Z` into the next second.
+fn instant_secs_sql(instant: &str) -> String {
+    format!("CAST(strftime('%s', substr({instant}, 1, 19)) AS INTEGER)")
 }
 
 /// Everything one poll write-back can change on a monitor row — the named
@@ -100,14 +128,24 @@ pub struct PrMonitorPollUpdate<'a> {
     pub expected_updated_at: &'a str,
 }
 
+/// The SQL expression for the pause annotation the row's CURRENT
+/// `last_error` carries (from the marker to the end), `''` when it carries
+/// none. `marker` is the `?N` placeholder bound to [`PR_MONITOR_PAUSE_MARKER`].
+fn row_pause_sql(marker: &str) -> String {
+    format!(
+        "CASE WHEN instr(COALESCE(last_error, ''), {marker}) > 0 \
+             THEN substr(last_error, instr(last_error, {marker})) ELSE '' END"
+    )
+}
+
 /// The SQL expression for the `last_error` a guarded write-back lands,
 /// composed from the row's CURRENT `last_error` and the caller's `genuine`
 /// (a `?N` placeholder): the caller's value minus any pause annotation it
 /// carries, then `"; "` and the pause annotation naming the LATEST deadline
 /// among the row's and the caller's that is not before `floor` (a `?N`
-/// placeholder bound to the annotation of a pause ending at this write's
-/// `updated_at`). `marker` is the `?N` placeholder bound to
-/// [`PR_MONITOR_PAUSE_MARKER`].
+/// placeholder bound to this write's `updated_at`), compared at whole
+/// seconds ([`pause_deadline_secs_sql`]). `marker` is the `?N` placeholder
+/// bound to [`PR_MONITOR_PAUSE_MARKER`].
 ///
 /// Composed in SQL rather than from a Rust-side capture because the bulk
 /// stamp ([`Store::annotate_active_pr_monitors_pause`]) deliberately leaves
@@ -116,17 +154,22 @@ pub struct PrMonitorPollUpdate<'a> {
 /// able to clobber it. An annotation whose deadline has passed the floor
 /// is dropped — the first post-pause write clears the pause.
 fn pause_preserving_last_error_sql(genuine: &str, marker: &str, floor: &str) -> String {
-    let row_pause = format!(
-        "CASE WHEN instr(COALESCE(last_error, ''), {marker}) > 0 \
-             THEN substr(last_error, instr(last_error, {marker})) ELSE '' END"
-    );
+    let row_pause = row_pause_sql(marker);
     let caller_pause = format!(
         "CASE WHEN instr(COALESCE({genuine}, ''), {marker}) > 0 \
              THEN substr({genuine}, instr({genuine}, {marker})) ELSE '' END"
     );
+    let row_deadline = pause_deadline_secs_sql(&row_pause, marker);
+    let caller_deadline = pause_deadline_secs_sql(&caller_pause, marker);
+    let floor_secs = instant_secs_sql(floor);
+    let kept_row = format!("CASE WHEN {row_deadline} >= {floor_secs} THEN {row_pause} ELSE '' END");
+    let kept_caller =
+        format!("CASE WHEN {caller_deadline} >= {floor_secs} THEN {caller_pause} ELSE '' END");
     let pause = format!(
-        "NULLIF(max(CASE WHEN {row_pause} >= {floor} THEN {row_pause} ELSE '' END, \
-                    CASE WHEN {caller_pause} >= {floor} THEN {caller_pause} ELSE '' END), '')"
+        "CASE WHEN {kept_row} = '' THEN NULLIF({kept_caller}, '') \
+              WHEN {kept_caller} = '' THEN {kept_row} \
+              WHEN {caller_deadline} > {row_deadline} THEN {kept_caller} \
+              ELSE {kept_row} END"
     );
     let caller_genuine = format!(
         "NULLIF(CASE WHEN instr(COALESCE({genuine}, ''), {marker}) > 0 \
@@ -146,7 +189,7 @@ static UPDATE_PR_MONITOR_POLL_SQL: LazyLock<String> = LazyLock::new(|| {
          pending_changes = ?3, pending_since = ?4, last_change_at = ?5, last_polled_at = ?6, \
          last_error = {}, updated_at = ?8 \
          WHERE monitor_id = ?9 AND state = 'active' AND updated_at = ?10",
-        pause_preserving_last_error_sql("?7", "?11", "?12")
+        pause_preserving_last_error_sql("?7", "?11", "?8")
     )
 });
 
@@ -156,7 +199,30 @@ static ADOPT_PR_MONITOR_SQL: LazyLock<String> = LazyLock::new(|| {
          pending_changes = ?4, pending_since = ?5, last_change_at = ?6, last_polled_at = ?7, \
          last_error = {}, updated_at = ?9 \
          WHERE monitor_id = ?10 AND agent_id = ?11 AND state = 'active' AND updated_at = ?12",
-        pause_preserving_last_error_sql("?8", "?13", "?14")
+        pause_preserving_last_error_sql("?8", "?13", "?9")
+    )
+});
+
+/// The bulk stamp ([`Store::annotate_active_pr_monitors_pause`]): `?1` is
+/// the new pause annotation, `?2` the marker. A row whose current
+/// annotation already names a LATER deadline than `?1` is left alone (the
+/// `WHERE` excludes it, so it is not counted either): stamps are issued
+/// from concurrent sweeps and can land out of order, and a delayed earlier
+/// stamp must not roll an extended deadline back. Otherwise an earlier
+/// annotation — bare, or appended to a genuine error — is replaced, a
+/// genuine error gains the annotation, an empty `last_error` becomes it.
+static ANNOTATE_ACTIVE_PR_MONITORS_PAUSE_SQL: LazyLock<String> = LazyLock::new(|| {
+    let row_deadline = pause_deadline_secs_sql(&row_pause_sql("?2"), "?2");
+    let new_deadline = pause_deadline_secs_sql("?1", "?2");
+    format!(
+        "UPDATE pr_monitor SET last_error = CASE \
+             WHEN last_error IS NULL OR last_error = '' THEN ?1 \
+             WHEN instr(last_error, ?2) = 1 THEN ?1 \
+             WHEN instr(last_error, ?2) > 1 \
+                 THEN substr(last_error, 1, instr(last_error, ?2) - 1) || ?1 \
+             ELSE last_error || '; ' || ?1 \
+         END \
+         WHERE state = 'active' AND NOT COALESCE({row_deadline} > {new_deadline}, 0)"
     )
 });
 
@@ -726,7 +792,6 @@ impl Store {
             .bind(&monitor_id.0)
             .bind(update.expected_updated_at)
             .bind(PR_MONITOR_PAUSE_MARKER)
-            .bind(pr_monitor_pause_error(Some(update.updated_at)))
             .execute(self.write_pool())
             .await
             .map_err(|e| {
@@ -743,7 +808,11 @@ impl Store {
     /// `"<error>; <pause>"` — is replaced by `pause`, so re-stamping on a
     /// deadline extension names the new deadline without stacking; a genuine
     /// fetch error already on the row is kept and `pause` appended to it; an
-    /// empty `last_error` becomes `pause`.
+    /// empty `last_error` becomes `pause`. Monotonic: a row already naming a
+    /// deadline LATER than `pause`'s keeps it and is not counted — stamps
+    /// from concurrent sweeps can land out of order, and a delayed earlier
+    /// stamp must not roll an extension back while the gate still holds the
+    /// later deadline.
     ///
     /// Deliberately leaves `updated_at` (the optimistic-concurrency token)
     /// and `last_polled_at` alone: the stamp is an annotation, not a poll, so
@@ -756,23 +825,16 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn annotate_active_pr_monitors_pause(&self, pause: &str) -> Result<u64> {
-        let res = sqlx::query(
-            "UPDATE pr_monitor SET last_error = CASE \
-                 WHEN last_error IS NULL OR last_error = '' THEN ?1 \
-                 WHEN instr(last_error, ?2) = 1 THEN ?1 \
-                 WHEN instr(last_error, ?2) > 1 \
-                     THEN substr(last_error, 1, instr(last_error, ?2) - 1) || ?1 \
-                 ELSE last_error || '; ' || ?1 \
-             END \
-             WHERE state = 'active'",
-        )
-        .bind(pause)
-        .bind(PR_MONITOR_PAUSE_MARKER)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| {
-            intent_core::Error::Internal(format!("annotate active pr monitors pause failed: {e}"))
-        })?;
+        let res = sqlx::query(&ANNOTATE_ACTIVE_PR_MONITORS_PAUSE_SQL)
+            .bind(pause)
+            .bind(PR_MONITOR_PAUSE_MARKER)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!(
+                    "annotate active pr monitors pause failed: {e}"
+                ))
+            })?;
         Ok(res.rows_affected())
     }
 
@@ -812,7 +874,6 @@ impl Store {
             .bind(&from_agent_id.0)
             .bind(update.expected_updated_at)
             .bind(PR_MONITOR_PAUSE_MARKER)
-            .bind(pr_monitor_pause_error(Some(update.updated_at)))
             .execute(self.write_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("adopt pr monitor failed: {e}")))?;
@@ -1539,26 +1600,15 @@ mod tests {
         let (row, _) = write_back(&store, &read, Some(&t3)).await;
         assert_eq!(row.last_error.as_deref(), Some(t3.as_str()));
 
-        // Once the row's annotation has expired, a write clears it — with or
-        // without a genuine error, and even if the caller still carries the
-        // stale annotation.
-        assert_eq!(
-            store
-                .annotate_active_pr_monitors_pause(&expired)
-                .await
-                .unwrap(),
-            1
-        );
+        // Once the row's annotation has expired (aged in place: the bulk
+        // stamp is monotonic and would not roll T3 back), a write clears it
+        // — with or without a genuine error, and even if the caller still
+        // carries the stale annotation.
+        set_last_error(&store, &m.monitor_id, Some(&expired)).await;
         let read = store.get_pr_monitor(&m.monitor_id).await.expect("get");
         let (row, _) = write_back(&store, &read, Some(&expired)).await;
         assert_eq!(row.last_error, None);
-        assert_eq!(
-            store
-                .annotate_active_pr_monitors_pause(&expired)
-                .await
-                .unwrap(),
-            1
-        );
+        set_last_error(&store, &m.monitor_id, Some(&expired)).await;
         let read = row;
         let (row, _) = write_back(&store, &read, Some("forge down")).await;
         assert_eq!(row.last_error.as_deref(), Some("forge down"));
@@ -1595,6 +1645,167 @@ mod tests {
         let re_parented = store.get_pr_monitor(&m.monitor_id).await.expect("get");
         assert_eq!(re_parented.agent_id, adopter);
         assert_eq!(re_parented.last_error.as_deref(), Some(t1.as_str()));
+    }
+
+    /// Set a row's `last_error` in place, moving nothing else — how a test
+    /// ages an annotation past its deadline without a clock.
+    async fn set_last_error(store: &Store, monitor_id: &PrMonitorId, last_error: Option<&str>) {
+        sqlx::query("UPDATE pr_monitor SET last_error = ?1 WHERE monitor_id = ?2")
+            .bind(last_error)
+            .bind(&monitor_id.0)
+            .execute(store.write_pool())
+            .await
+            .expect("set last_error");
+    }
+
+    /// The pause deadline is whole-second while a write's `updated_at`
+    /// carries a fraction: compared as strings, `…06:00:00Z` sorted AFTER
+    /// `…06:00:00.500Z` (`'Z' > '.'`), so an annotation whose deadline had
+    /// passed survived the first post-pause success landing inside the next
+    /// second. Both sides now compare at whole seconds: a write in an
+    /// earlier second or the deadline's own second keeps the annotation
+    /// (the gate may re-open anywhere inside that second, so the pause must
+    /// not clear early), a write in a later second clears it — whatever the
+    /// fraction on either side.
+    #[tokio::test]
+    async fn pause_expiry_compares_deadline_and_write_at_whole_seconds() {
+        let deadline = "2030-01-01T06:00:00Z";
+        let pause = pr_monitor_pause_error(Some(deadline));
+        let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
+        let m = test_monitor(&ws_id, &agent_id, "2030-01-01T05:00:00.000Z");
+        assert!(store.insert_pr_monitor(&m).await.expect("insert"));
+
+        let mut expected_updated_at = m.updated_at.clone();
+        for (write_at, kept) in [
+            ("2030-01-01T05:59:59.999Z", true),
+            ("2030-01-01T06:00:00Z", true),
+            ("2030-01-01T06:00:00.500Z", true),
+            ("2030-01-01T06:00:00.999999Z", true),
+            ("2030-01-01T06:00:01Z", false),
+            ("2030-01-01T06:00:01.000Z", false),
+        ] {
+            set_last_error(&store, &m.monitor_id, Some(&pause)).await;
+            assert!(store
+                .update_pr_monitor_poll(
+                    &m.monitor_id,
+                    PrMonitorPollUpdate {
+                        last_snapshot: m.last_snapshot.as_deref(),
+                        baseline_snapshot: m.baseline_snapshot.as_deref(),
+                        pending_changes: &[],
+                        last_polled_at: Some(write_at),
+                        last_error: None,
+                        updated_at: write_at,
+                        expected_updated_at: &expected_updated_at,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write-back"));
+            let row = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+            assert_eq!(
+                row.last_error.as_deref(),
+                kept.then_some(pause.as_str()),
+                "write at {write_at} against deadline {deadline}"
+            );
+            expected_updated_at = row.updated_at;
+        }
+
+        // The caller's stale capture, expired the same way, clears too.
+        set_last_error(&store, &m.monitor_id, Some(&pause)).await;
+        let write_at = "2030-01-01T06:00:01.250Z";
+        assert!(store
+            .update_pr_monitor_poll(
+                &m.monitor_id,
+                PrMonitorPollUpdate {
+                    last_snapshot: m.last_snapshot.as_deref(),
+                    baseline_snapshot: m.baseline_snapshot.as_deref(),
+                    pending_changes: &[],
+                    last_polled_at: Some(write_at),
+                    last_error: Some(&format!("HTTP 502; {pause}")),
+                    updated_at: write_at,
+                    expected_updated_at: &expected_updated_at,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write-back"));
+        let row = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+        assert_eq!(row.last_error.as_deref(), Some("HTTP 502"));
+    }
+
+    /// Bulk stamps are issued from concurrent sweeps and can land out of
+    /// order: a delayed `stamp(T1)` arriving after `stamp(T2)` must not roll
+    /// the rows back to T1 while the gate still holds T2. The bulk stamp
+    /// keeps the later unexpired deadline — the same "latest wins" rule as
+    /// the guarded write-back — and does not count the rows it leaves alone.
+    #[tokio::test]
+    async fn active_monitors_pause_annotation_keeps_the_later_deadline() {
+        async fn assert_rows(store: &Store, expected: [(&PrMonitor, String); 4]) {
+            for (m, expected) in expected {
+                let read = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+                assert_eq!(read.last_error.as_deref(), Some(expected.as_str()));
+                assert_eq!(
+                    read.updated_at, m.updated_at,
+                    "the guard token is untouched"
+                );
+            }
+        }
+
+        let t1 = pr_monitor_pause_error(Some(&rfc3339_from_now(600)));
+        let t2 = pr_monitor_pause_error(Some(&rfc3339_from_now(1800)));
+        let t3 = pr_monitor_pause_error(Some(&rfc3339_from_now(3600)));
+        let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
+        let ts = now_iso();
+        let empty = test_monitor(&ws_id, &agent_id, &ts);
+        let mut genuine = test_monitor(&ws_id, &agent_id, &ts);
+        genuine.pr_number = 43;
+        genuine.last_error = Some("forge down".to_string());
+        let mut bare = test_monitor(&ws_id, &agent_id, &ts);
+        bare.pr_number = 44;
+        bare.last_error = Some(t1.clone());
+        let mut appended = test_monitor(&ws_id, &agent_id, &ts);
+        appended.pr_number = 45;
+        appended.last_error = Some(format!("HTTP 502; {t1}"));
+        for m in [&empty, &genuine, &bare, &appended] {
+            assert!(store.insert_pr_monitor(m).await.expect("insert"));
+        }
+        let expect_all = |pause: &str| {
+            [
+                (&empty, pause.to_string()),
+                (&genuine, format!("forge down; {pause}")),
+                (&bare, pause.to_string()),
+                (&appended, format!("HTTP 502; {pause}")),
+            ]
+        };
+
+        assert_eq!(
+            store.annotate_active_pr_monitors_pause(&t2).await.unwrap(),
+            4
+        );
+        assert_rows(&store, expect_all(&t2)).await;
+
+        // The delayed earlier stamp is a no-op — nothing rolls back, nothing
+        // is counted.
+        assert_eq!(
+            store.annotate_active_pr_monitors_pause(&t1).await.unwrap(),
+            0
+        );
+        assert_rows(&store, expect_all(&t2)).await;
+
+        // A genuine extension still lands everywhere.
+        assert_eq!(
+            store.annotate_active_pr_monitors_pause(&t3).await.unwrap(),
+            4
+        );
+        assert_rows(&store, expect_all(&t3)).await;
+
+        // Re-stamping the SAME deadline (a later sweep re-reading the gate)
+        // is idempotent — counted, unchanged.
+        assert_eq!(
+            store.annotate_active_pr_monitors_pause(&t3).await.unwrap(),
+            4
+        );
+        assert_rows(&store, expect_all(&t3)).await;
     }
 
     /// The 0089 migration backfills `baseline_snapshot` from `last_snapshot`
