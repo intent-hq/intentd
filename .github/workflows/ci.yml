@@ -1188,7 +1188,10 @@ jobs:
   # without a marker is left untouched — never collapsed to one section)
   # and scripts/notify-fixed-issues.sh (a mention-only reference or an open
   # issue never earns a release comment; a closed issue with a delivered
-  # linked fix PR does). Seconds-long like the other utility jobs, so it
+  # linked fix PR does), plus the stubbed-cargo harness for
+  # scripts/changed-tests.sh (the changed-tests selection the monorepo's
+  # `make test-changed` delegates to, and its --instrumented llvm-cov form;
+  # intent-hq/intentd#1947). Seconds-long like the other utility jobs, so it
   # runs directly on ubuntu-latest.
   release-scripts:
     runs-on: ubuntu-latest
@@ -1202,6 +1205,8 @@ jobs:
         run: ./scripts/test-aggregate-channel-notes.sh
       - name: Test notify-fixed-issues.sh
         run: ./scripts/test-notify-fixed-issues.sh
+      - name: Test changed-tests.sh
+        run: ./scripts/test-changed-tests.sh
 
   # install.ps1's Windows-only paths (intent-hq/intent#3229): the `check`
   # job's install_ps1_owner suite runs the installer's ownership check under
