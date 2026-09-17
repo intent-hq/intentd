@@ -28340,7 +28340,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
-        let paused_until = self.sweep_rate_limit_paused_until();
+        let this = self.clone();
         Box::pin(async move {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             // Cross-repo override (`{ repo: "owner/name" }`) wins over the
@@ -28448,8 +28448,11 @@ impl WorkspaceApi for Services {
             // Presence-detected: while the daemon's global forge rate-limit
             // pause is active, the PR monitors' checklists are not being
             // refreshed — the deadline lets the caller label them stale.
-            // This one-shot read itself is not gated.
-            if let Some(until) = paused_until {
+            // This one-shot read itself is not gated. The gate is sampled
+            // AFTER the awaited forge reads so the snapshot describes the
+            // gate as of its completion: a pause opened or lifted while the
+            // reads were in flight is neither omitted nor retained stale.
+            if let Some(until) = this.sweep_rate_limit_paused_until() {
                 snapshot["pausedUntil"] = serde_json::json!(until);
             }
             Ok(snapshot)

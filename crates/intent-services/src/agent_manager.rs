@@ -1102,8 +1102,9 @@ struct BudgetDenial {
 const PROVISIONAL_AGENT_BYTES: u64 = 660 * 1024 * 1024;
 
 /// How long a spawn queued behind the memory budget sleeps before re-evaluating.
-/// The slot cap's waiter is woken by `deregister`/`mark_idle`, but memory can
-/// fall with no registry event at all (an agent's own child processes exit), so
+/// The slot cap's waiter is woken by `deregister`/`mark_idle`/
+/// `wake_waiter_if_idle`, but memory can fall with no registry event at all
+/// (an agent's own child processes exit), so
 /// the memory path must also re-check on a timer or it would sleep on a wakeup
 /// that never comes.
 const BUDGET_RECHECK: Duration = Duration::from_secs(5);
@@ -1372,21 +1373,54 @@ impl ProcessRegistry {
         }
     }
 
-    /// Mark a process idle (eligible for eviction) and wake a queued spawn so it
-    /// can take the freed slot immediately. When a waiter is resumed, logs + emits
-    /// `agent:process:resumed` via the event callback.
+    /// Test helper: mark a process idle (eligible for eviction) and wake a
+    /// queued spawn in one step — a registered process flipping idle with no
+    /// busy slot in the picture. Production paths never do both here: the
+    /// manager flips with [`Self::mark_idle_slot_held`] while the busy slot is
+    /// still held and wakes from the slot release
+    /// ([`Self::wake_waiter_if_idle`], intent-hq/intent#5253), so one freed
+    /// slot wakes exactly one waiter.
+    #[cfg(test)]
     pub(crate) fn mark_idle(&self, agent_id: &AgentId) {
+        if self.mark_idle_slot_held(agent_id) {
+            self.wake_waiter_if_idle(agent_id);
+        }
+    }
+
+    /// Mark a process idle WITHOUT waking a queued spawn: the caller still
+    /// holds the agent's in-flight busy slot (a prompt worker between
+    /// `run_turn` and its `end_turn`; `interrupt` before its `end_turn`), so a
+    /// waiter woken now could not claim this process yet — it would fail
+    /// `try_claim`, re-queue (a second `agent:process:queued`) and only admit
+    /// on its next timed re-check (intent-hq/intent#5253). The wake happens
+    /// when the slot is released ([`Self::wake_waiter_if_idle`] from the
+    /// manager's slot release), and only then — a flip on an agent holding no
+    /// slot (an interrupt between turns) wakes nobody, since no slot was
+    /// freed. Returns whether the process is registered.
+    pub(crate) fn mark_idle_slot_held(&self, agent_id: &AgentId) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.entries.get_mut(agent_id) {
+            Some(entry) => {
+                entry.is_active = false;
+                entry.last_active_ms = now_ms();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Wake one queued spawn when `agent_id`'s process is registered and idle
+    /// — i.e. it just became claimable as an eviction candidate. Called by the
+    /// manager once the agent's busy slot is released, so the woken waiter's
+    /// claim succeeds in one pass. A process still marked active (a turn's
+    /// slot released before its idle flip) or already deregistered
+    /// (`deregister` woke) wakes nobody. When a waiter is resumed, logs +
+    /// emits `agent:process:resumed` via the event callback.
+    pub(crate) fn wake_waiter_if_idle(&self, agent_id: &AgentId) {
         let resumed_agent = {
             let mut inner = self.inner.lock().unwrap();
-            let existed = match inner.entries.get_mut(agent_id) {
-                Some(entry) => {
-                    entry.is_active = false;
-                    entry.last_active_ms = now_ms();
-                    true
-                }
-                None => false,
-            };
-            if !existed {
+            let idle = inner.entries.get(agent_id).is_some_and(|e| !e.is_active);
+            if !idle {
                 return;
             }
             pop_and_wake_waiter(&mut inner)
@@ -1409,8 +1443,8 @@ impl ProcessRegistry {
 
     /// Log + emit `agent:process:resumed` for a waiter that admitted itself —
     /// on its timed re-check or after an eviction pass — rather than through a
-    /// [`Self::deregister`] / [`Self::mark_idle`] wakeup (those emit it when
-    /// they pop the waiter). `reason` is the label the waiter last queued
+    /// [`Self::deregister`] / [`Self::wake_waiter_if_idle`] wakeup (those emit
+    /// it when they pop the waiter). `reason` is the label the waiter last queued
     /// under; `None` means it never queued, or the wakeup already delivered
     /// the event for this wait, and nothing is emitted.
     fn emit_self_resumed(&self, agent_id: &AgentId, reason: Option<&'static str>) {
@@ -1434,7 +1468,7 @@ impl ProcessRegistry {
     /// emits `agent:process:queued` / `agent:process:evicted` via the event
     /// callback, and `agent:process:resumed` when a waiter that queued is
     /// admitted by its own re-check (a wakeup from [`Self::deregister`] /
-    /// [`Self::mark_idle`] emits it there instead) — every `queued` is
+    /// [`Self::wake_waiter_if_idle`] emits it there instead) — every `queued` is
     /// answered by exactly one `resumed` whichever path admits.
     ///
     /// When an aggregate memory budget is installed (monorepo#2063), being over
@@ -4502,6 +4536,12 @@ impl AgentManager {
     /// `turn_id` is the turn correlation id (monorepo#1022) stamped on the
     /// failure-arm `agent:failed`; bare callers (tests) may pass `None`.
     ///
+    /// The process is marked idle again WITHOUT waking a queued spawn: the
+    /// caller (the prompt worker) still holds the busy slot, so a waiter woken
+    /// here would fail its claim on this process and re-queue; the slot
+    /// release (`release_slot_sync`) performs the wake instead
+    /// (intent-hq/intent#5253).
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the agent is not tracked, and propagates failures from the prompt turn (e.g. `Error::Internal` when `session/prompt` fails).
@@ -4538,7 +4578,7 @@ impl AgentManager {
                 turn_id,
             )
             .await;
-        self.registry.mark_idle(agent_id);
+        self.registry.mark_idle_slot_held(agent_id);
         result
     }
 
@@ -4983,10 +5023,13 @@ impl AgentManager {
             .get(agent_id)
             .cloned()
             .or_else(|| session.as_ref().map(|s| s.workspace_id.clone()));
+        // Mark the process idle (reapable) but keep its handle so it survives
+        // for a follow-up resume. Flip BEFORE the slot release so the release
+        // wakes a queued spawn exactly when a slot was actually freed (#5253):
+        // an interrupt between turns (slot already released by the worker,
+        // whose release already woke) then wakes nobody a second time.
+        self.registry.mark_idle_slot_held(agent_id);
         self.end_turn(agent_id).await;
-        // Mark the process idle (reapable) but keep its handle so it survives for
-        // a follow-up resume.
-        self.registry.mark_idle(agent_id);
         // Emit the single terminal `agent:stream:end` on stop (parity #14): the
         // aborted worker's `run_prompt_turn` no longer reaches its own emit.
         // Unlike the normal-completion emit, the interrupt terminal carries
@@ -5647,21 +5690,32 @@ impl AgentManager {
     /// `list_busy` (both maps mutated under the `busy` lock, busy → `agent_ws`
     /// order). Returns `None` when the agent was not busy, otherwise the
     /// removed `agent_ws` entry.
+    ///
+    /// With the slot released, wakes a queued spawn when the agent's process
+    /// is idle (intent-hq/intent#5253): `run_turn` marks the process idle
+    /// without waking, because a waiter woken while this slot was still held
+    /// would lose its `try_claim` on the process (`busy` is checked first),
+    /// re-queue, and only admit on its next timed re-check. Runs AFTER the
+    /// `busy` guard is dropped — the registry lock is never nested under it.
     #[expect(clippy::option_option)] // outer = was-busy, inner = the removed entry
     fn release_slot_sync(&self, agent_id: &AgentId) -> Option<Option<WorkspaceId>> {
-        let mut busy = self.busy.lock().unwrap();
-        if !busy.remove(agent_id) {
-            return None;
-        }
-        if busy.is_empty() {
-            *self.idle_since.lock().unwrap() = Some(Instant::now());
-        }
-        // Drop a stale auto-unarchive prompt flag with the slot: a claim
-        // whose turn never built a prompt (harness wake turns, a persist
-        // failure releasing before spawn) must not leak the notice into a
-        // later unrelated turn.
-        self.auto_unarchived.lock().unwrap().remove(agent_id);
-        Some(self.agent_ws.lock().unwrap().remove(agent_id))
+        let removed = {
+            let mut busy = self.busy.lock().unwrap();
+            if !busy.remove(agent_id) {
+                return None;
+            }
+            if busy.is_empty() {
+                *self.idle_since.lock().unwrap() = Some(Instant::now());
+            }
+            // Drop a stale auto-unarchive prompt flag with the slot: a claim
+            // whose turn never built a prompt (harness wake turns, a persist
+            // failure releasing before spawn) must not leak the notice into a
+            // later unrelated turn.
+            self.auto_unarchived.lock().unwrap().remove(agent_id);
+            self.agent_ws.lock().unwrap().remove(agent_id)
+        };
+        self.registry.wake_waiter_if_idle(agent_id);
+        Some(removed)
     }
 
     /// Arm the one-shot auto-unarchive prompt flag, but only while the agent
@@ -7735,7 +7789,9 @@ impl AgentManager {
                 .services
                 .run_harness_wake_turn(&mut guard, first, &id, &ws, HARNESS_WAKE_SETTLE)
                 .await;
-            mgr.registry.mark_idle(&id);
+            // Idle without waking a queued spawn: the busy slot is still held
+            // here, so the `end_turn` below performs the wake (#5253).
+            mgr.registry.mark_idle_slot_held(&id);
             drop(guard);
             // Empty-wake recovery (intent-hq/monorepo#3262): a wake turn
             // that finalized with no meaningful content must not be

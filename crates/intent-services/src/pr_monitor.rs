@@ -72,7 +72,9 @@ use intent_core::{
     now_iso, parse_iso, AgentId, AgentStatus, Error, PrMonitor, PrMonitorId, PrMonitorState,
     PullRequestInfo, PullRequestStatus, Result, WorkspaceId,
 };
-use intent_sourcecontrol::{PrState, PullRequest, RateLimitStatus, RepoRef, SourceControl};
+use intent_sourcecontrol::{
+    PrObservation, PrState, PullRequest, RateLimitStatus, RepoRef, SourceControl,
+};
 use intent_store::{NewEvent, PrMonitorListEntry, PrMonitorPollUpdate};
 use serde_json::{json, Value};
 
@@ -632,24 +634,89 @@ fn invalidate_fetch_cache(cache: &PrMonitorFetchCache, key: &PrKey) {
 /// ANY forge read — the load-bearing `get_pr`, a checklist sub-read, or the
 /// comment count — propagates so the sweep pauses the shared gate instead of
 /// persisting a degraded snapshot as a successful poll.
+///
+/// Forge requests per fetch, measured with the stub forge (trait-level
+/// reads; the GitHub HTTP count in parentheses where it differs):
+///
+/// | path | before | after |
+/// |---|---|---|
+/// | happy (host folds the read) | 6 — `get_pr`, `merge_requirements` (GraphQL + branch-rules REST = 2 HTTP), `list_reviews`, `review_decision`, `get_review_threads`, `list_comments` (7 HTTP) | 2 — `pr_observation` (1 GraphQL request, 1 rate-limit point), `branch_rules` |
+/// | host without a folded read | 6 (7 HTTP) | 6 (7 HTTP), unchanged |
+/// | REST fallback (probe + threads down), host without a folded read | 8 | 8, unchanged |
+/// | REST fallback, host with a folded read whose GraphQL is down | 8 | 9 — the failed `pr_observation` attempt, then the 8 |
+/// | cached cheap poll (fingerprint unchanged) | 1 (`get_pr`) | 1 (`pr_observation`) |
 pub(crate) async fn fetch_shared_snapshot(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
 ) -> Result<SharedPrSnapshot> {
+    if let Some(observation) = observe_pr(sc, repo_ref, number).await? {
+        return shared_snapshot_from_observation(sc, repo_ref, number, observation).await;
+    }
     let (pr, read) = pr_ops::fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
     finish_shared_snapshot(sc, repo_ref, number, pr, read).await
 }
 
-/// [`fetch_shared_snapshot`] for a PR the sweep has already read: `get_pr`
-/// is always issued (it is the change detector), but the sub-reads —
-/// merge-requirements probe, reviews, review threads, conversation comments
+/// The host's folded one-round-trip read
+/// ([`SourceControl::pr_observation`]), or `None` when the host has none —
+/// the per-signal reads are then issued instead. A failing folded read
+/// (other than quota exhaustion, which propagates) also yields `None`: the
+/// per-signal path's load-bearing `get_pr` then decides whether the forge
+/// is reachable, so the observation never changes WHICH error a poll fails
+/// with, only how many requests a successful one costs.
+async fn observe_pr(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+) -> Result<Option<PrObservation>> {
+    match sc.pr_observation(repo_ref, number).await {
+        Ok(observation) => Ok(observation),
+        Err(intent_sourcecontrol::Error::RateLimited(detail)) => Err(Error::RateLimited(detail)),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                pr_number = number,
+                "pr monitor: folded PR observation failed, falling back to per-signal reads"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// [`finish_shared_snapshot`] for a folded observation: the checklist is
+/// composed from it (see [`pr_ops::merge_requirements_from_observation`])
+/// and the conversation-comment count it carries needs no further read.
+async fn shared_snapshot_from_observation(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    observation: PrObservation,
+) -> Result<SharedPrSnapshot> {
+    let read =
+        pr_ops::merge_requirements_from_observation(sc, repo_ref, number, &observation).await?;
+    Ok(SharedPrSnapshot {
+        title: observation.pr.title,
+        url: observation.pr.url,
+        head_sha: observation.pr.head_sha,
+        conversation_count: Some(observation.conversation_count),
+        review_comment_count: read.review_comment_count,
+        requirements: read.requirements,
+        ejection_known: read.ejection_known,
+        requirements_complete: read.complete,
+    })
+}
+
+/// [`fetch_shared_snapshot`] for a PR the sweep has already read: the PR
+/// record is always read (it is the change detector — the folded
+/// observation where the host has one, else `get_pr`), but the remaining
+/// reads — branch rules after a folded observation; merge-requirements
+/// probe, reviews, review threads, conversation comments after a `get_pr`
 /// — are skipped when `cache` holds a reusable full fetch for `key` with
 /// the same [`PrFingerprint`] (see [`PrMonitorFetchCacheEntry::reusable`]).
 /// A full fetch replaces the cache entry unless an on-demand fetch
 /// invalidated the slot meanwhile (see [`PrMonitorFetchCacheSlot`]); a
 /// failed one leaves it untouched (the next poll decides again from a fresh
-/// `get_pr`).
+/// read).
 pub(crate) async fn fetch_shared_snapshot_cached(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
@@ -662,10 +729,14 @@ pub(crate) async fn fetch_shared_snapshot_cached(
         .unwrap()
         .get(key)
         .map_or(0, |slot| slot.generation);
-    let pr = sc
-        .get_pr(repo_ref, number)
-        .await
-        .map_err(pr_ops::map_sc_err)?;
+    let observation = observe_pr(sc, repo_ref, number).await?;
+    let pr = match &observation {
+        Some(observation) => observation.pr.clone(),
+        None => sc
+            .get_pr(repo_ref, number)
+            .await
+            .map_err(pr_ops::map_sc_err)?,
+    };
     let fingerprint = PrFingerprint::of(&pr);
     let now = Instant::now();
     let reused = {
@@ -685,7 +756,12 @@ pub(crate) async fn fetch_shared_snapshot_cached(
         );
         return Ok(snapshot);
     }
-    let snapshot = fetch_shared_snapshot_for(sc, repo_ref, number, pr).await?;
+    let snapshot = match observation {
+        Some(observation) => {
+            shared_snapshot_from_observation(sc, repo_ref, number, observation).await?
+        }
+        None => fetch_shared_snapshot_for(sc, repo_ref, number, pr).await?,
+    };
     if fingerprint.detects_changes() {
         let mut cache = cache.lock().unwrap();
         let slot = cache.entry(key.clone()).or_default();
@@ -3476,9 +3552,10 @@ mod tests {
     use intent_sourcecontrol::{
         AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
         IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability,
-        NewPullRequest, Page, PageParams, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus,
-        Repo, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewVerdict, RollupCheck,
-        ScCapabilities, UserIdentity,
+        NewPullRequest, Page, PageParams, PrObservation, PrPatch, PrQuery, PrState, PullRequest,
+        RateLimitStatus, Repo, Review, ReviewComment, ReviewDecision, ReviewThread,
+        ReviewThreadComment, ReviewThreadTally, ReviewVerdict, RollupCheck, ScCapabilities,
+        UserIdentity,
     };
     use intent_store::Store;
 
@@ -3549,11 +3626,49 @@ mod tests {
         /// A real RFC 3339 `updatedAt` for the PR record, overriding the
         /// opaque `rev-N` stand-in when a test needs a comparable timestamp.
         updated_at: Option<String>,
+        /// How `pr_observation` answers; `None` (the default) is a host
+        /// without a folded read, so every existing test keeps exercising
+        /// the per-signal reads.
+        folded: Option<FoldedRead>,
         /// Stands in for the forge's `updatedAt`: bumped by every
         /// [`StubForge::edit`] (as GitHub bumps it on reviews, comments,
         /// threads and pushes), left alone by [`StubForge::edit_quiet`] (as
         /// GitHub leaves it on check-run and merge-queue movement).
         revision: u64,
+    }
+
+    /// The ceiling the GitHub adapter's reads share, mirrored by the stub so
+    /// the two fetch paths can be checked for parity past it: `list_comments`
+    /// is one `per_page=100` page, a thread carries `comments(first: 100)`,
+    /// and the folded `totalCount`s saturate to match (`observed_count`).
+    const FORGE_PAGE_CEILING: usize = 100;
+
+    /// The threads as a read returns them: each carrying at most
+    /// [`FORGE_PAGE_CEILING`] comments.
+    fn thread_page(threads: &[ReviewThread]) -> Vec<ReviewThread> {
+        threads
+            .iter()
+            .map(|t| {
+                let mut t = t.clone();
+                t.comments.truncate(FORGE_PAGE_CEILING);
+                t
+            })
+            .collect()
+    }
+
+    /// The stub's folded `pr_observation` answer, built from the same
+    /// [`ForgeState`] the per-signal reads serve.
+    #[derive(Clone, Copy, Default)]
+    #[expect(clippy::struct_excessive_bools)]
+    struct FoldedRead {
+        /// The observation fails with an ordinary (degrading) error.
+        fail: bool,
+        /// The observation fails with the forge's quota-exhausted error.
+        rate_limited: bool,
+        /// The PR outgrew the reviews window (`reviews: None`).
+        overflow_reviews: bool,
+        /// The PR outgrew the review-threads window (`threads: None`).
+        overflow_threads: bool,
     }
 
     impl Default for ForgeState {
@@ -3589,7 +3704,70 @@ mod tests {
                 rate_limit_limit: None,
                 fail_rate_limit_status: false,
                 updated_at: None,
+                folded: None,
             }
+        }
+    }
+
+    impl ForgeState {
+        /// The PR record `get_pr` and the folded observation both serve.
+        fn pr_record(&self, number: u64) -> PullRequest {
+            PullRequest {
+                number,
+                url: format!("https://github.com/o/r/pull/{number}"),
+                title: "Add thing".into(),
+                body: None,
+                state: self.pr_state,
+                draft: self.draft,
+                source_branch: "feature".into(),
+                target_branch: "main".into(),
+                author: "octocat".into(),
+                mergeable: self.mergeable,
+                mergeable_state: Some(self.mergeable_state.clone()),
+                head_sha: Some(self.head_sha.clone()),
+                created_at: String::new(),
+                updated_at: self
+                    .updated_at
+                    .clone()
+                    .unwrap_or_else(|| format!("rev-{}", self.revision)),
+            }
+        }
+
+        /// The reviews `list_reviews` and the folded observation both serve.
+        fn reviews(&self) -> Vec<Review> {
+            self.approvals
+                .iter()
+                .map(|a| Review {
+                    author: a.clone(),
+                    verdict: ReviewVerdict::Approve,
+                    body: None,
+                    submitted_at: "2026-01-01T00:00:00Z".into(),
+                })
+                .collect()
+        }
+
+        /// The probe signals `merge_requirements` and the folded observation
+        /// both serve — minus the branch rules, which `merge_requirements`
+        /// folds in and the observation leaves to `branch_rules`.
+        fn signals(&self) -> MergeRequirementSignals {
+            MergeRequirementSignals {
+                merge_state_status: Some(self.mergeable_state.to_uppercase()),
+                review_decision: (!self.approvals.is_empty()).then_some(ReviewDecision::Approved),
+                checks: self.checks.clone(),
+                checks_known: true,
+                branch_rules: None,
+                is_in_merge_queue: None,
+                merge_queue_removal: self.merge_queue_removal.clone(),
+            }
+        }
+    }
+
+    /// The base branch's rules every stub read reports.
+    fn stub_branch_rules() -> BranchRules {
+        BranchRules {
+            required_approving_review_count: Some(1),
+            required_conversation_resolution: Some(true),
+            required_status_checks: vec!["build".into()],
         }
     }
 
@@ -3776,25 +3954,7 @@ mod tests {
                     "API rate limit exceeded".into(),
                 ));
             }
-            Ok(PullRequest {
-                number,
-                url: format!("https://github.com/o/r/pull/{number}"),
-                title: "Add thing".into(),
-                body: None,
-                state: s.pr_state,
-                draft: s.draft,
-                source_branch: "feature".into(),
-                target_branch: "main".into(),
-                author: "octocat".into(),
-                mergeable: s.mergeable,
-                mergeable_state: Some(s.mergeable_state.clone()),
-                head_sha: Some(s.head_sha.clone()),
-                created_at: String::new(),
-                updated_at: s
-                    .updated_at
-                    .clone()
-                    .unwrap_or_else(|| format!("rev-{}", s.revision)),
-            })
+            Ok(s.pr_record(number))
         }
         async fn list_prs(
             &self,
@@ -3863,15 +4023,7 @@ mod tests {
                     "reviews down".into(),
                 ));
             }
-            Ok(s.approvals
-                .iter()
-                .map(|a| Review {
-                    author: a.clone(),
-                    verdict: ReviewVerdict::Approve,
-                    body: None,
-                    submitted_at: "2026-01-01T00:00:00Z".into(),
-                })
-                .collect())
+            Ok(s.reviews())
         }
         async fn merge_requirements(
             &self,
@@ -3885,19 +4037,49 @@ mod tests {
                     "probe down".into(),
                 ));
             }
-            Ok(MergeRequirementSignals {
-                merge_state_status: Some(s.mergeable_state.to_uppercase()),
-                review_decision: (!s.approvals.is_empty()).then_some(ReviewDecision::Approved),
-                checks: s.checks.clone(),
-                checks_known: true,
-                branch_rules: Some(BranchRules {
-                    required_approving_review_count: Some(1),
-                    required_conversation_resolution: Some(true),
-                    required_status_checks: vec!["build".into()],
+            let mut signals = s.signals();
+            signals.branch_rules = Some(stub_branch_rules());
+            Ok(signals)
+        }
+        async fn branch_rules(
+            &self,
+            _: &RepoRef,
+            _: &str,
+        ) -> intent_sourcecontrol::Result<BranchRules> {
+            self.count_sub_fetch("branch_rules");
+            Ok(stub_branch_rules())
+        }
+        async fn pr_observation(
+            &self,
+            _: &RepoRef,
+            number: u64,
+        ) -> intent_sourcecontrol::Result<Option<PrObservation>> {
+            let s = self.state.lock().unwrap().clone();
+            let Some(folded) = s.folded else {
+                return Ok(None);
+            };
+            self.count_sub_fetch("pr_observation");
+            if folded.rate_limited {
+                return Err(intent_sourcecontrol::Error::RateLimited(
+                    "API rate limit exceeded".into(),
+                ));
+            }
+            if folded.fail {
+                return Err(intent_sourcecontrol::Error::Api("folded read down".into()));
+            }
+            let (review_comment_count, unresolved) =
+                crate::pr_ops::count_thread_comments(&thread_page(&s.threads));
+            Ok(Some(PrObservation {
+                pr: s.pr_record(number),
+                signals: s.signals(),
+                reviews: (!folded.overflow_reviews).then(|| s.reviews()),
+                threads: (!folded.overflow_threads).then_some(ReviewThreadTally {
+                    review_comment_count,
+                    unresolved,
                 }),
-                is_in_merge_queue: None,
-                merge_queue_removal: s.merge_queue_removal.clone(),
-            })
+                conversation_count: i64::try_from(s.conversation_comments.min(FORGE_PAGE_CEILING))
+                    .unwrap(),
+            }))
         }
         async fn list_comments(
             &self,
@@ -3923,7 +4105,7 @@ mod tests {
                     "comments down".into(),
                 ));
             }
-            Ok((0..n)
+            Ok((0..n.min(FORGE_PAGE_CEILING))
                 .map(|i| Comment {
                     id: i.to_string(),
                     author: "octocat".into(),
@@ -3944,12 +4126,21 @@ mod tests {
         ) -> intent_sourcecontrol::Result<Comment> {
             unsupported("add_comment")
         }
+        async fn review_decision(
+            &self,
+            _: &RepoRef,
+            _: u64,
+        ) -> intent_sourcecontrol::Result<Option<ReviewDecision>> {
+            self.count_sub_fetch("review_decision");
+            Ok(None)
+        }
         async fn list_review_comments(
             &self,
             _: &RepoRef,
             _: u64,
             _: PageParams,
         ) -> intent_sourcecontrol::Result<Page<ReviewComment>> {
+            self.count_sub_fetch("list_review_comments");
             unsupported("list_review_comments")
         }
         async fn reply_to_review_comment(
@@ -3975,7 +4166,7 @@ mod tests {
                 ));
             }
             Ok(Page {
-                items: s.threads.clone(),
+                items: thread_page(&s.threads),
                 next_cursor: None,
             })
         }
@@ -3990,6 +4181,7 @@ mod tests {
             _: &RepoRef,
             _: &str,
         ) -> intent_sourcecontrol::Result<Vec<CheckRun>> {
+            self.count_sub_fetch("check_runs");
             Ok(Vec::new())
         }
         async fn create_issue(
@@ -7104,6 +7296,367 @@ mod tests {
         let slot = guard.get(&key).expect("slot");
         assert!(slot.entry.is_none(), "superseded result not cached");
         assert_eq!(slot.generation, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Forge requests per fetch — the folded observation vs the per-signal
+    // reads (the table on `fetch_shared_snapshot`).
+    // -----------------------------------------------------------------------
+
+    /// Every forge read one full fetch can issue, in the order the fetch
+    /// path tries them.
+    const ALL_FORGE_READS: [&str; 10] = [
+        "pr_observation",
+        "branch_rules",
+        "get_pr",
+        "merge_requirements",
+        "list_reviews",
+        "review_decision",
+        "check_runs",
+        "get_review_threads",
+        "list_review_comments",
+        "list_comments",
+    ];
+
+    /// The reads issued so far, as `method → count`, omitting the zero rows
+    /// so an assertion spells out exactly the reads a path costs.
+    fn forge_reads(forge: &StubForge) -> Vec<(&'static str, usize)> {
+        ALL_FORGE_READS
+            .iter()
+            .map(|m| {
+                let n = if *m == "get_pr" {
+                    forge.fetches()
+                } else {
+                    forge.sub_fetches(m)
+                };
+                (*m, n)
+            })
+            .filter(|(_, n)| *n > 0)
+            .collect()
+    }
+
+    /// A review thread with `comments` placeholder comments.
+    fn thread(id: &str, is_resolved: bool, comments: usize) -> ReviewThread {
+        ReviewThread {
+            id: id.into(),
+            is_resolved,
+            comments: (0..comments)
+                .map(|i| ReviewThreadComment {
+                    id: format!("{id}-c{i}"),
+                    body: "nit".into(),
+                    author: "reviewer".into(),
+                    path: "src/lib.rs".into(),
+                    line: Some(1),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                })
+                .collect(),
+        }
+    }
+
+    /// A PR with every kind of signal populated, so the two paths have
+    /// something to disagree on.
+    fn busy_pr(s: &mut ForgeState) {
+        s.approvals = vec!["reviewer".into()];
+        s.conversation_comments = 3;
+        s.threads = vec![
+            thread("t1", false, 2),
+            thread("t2", true, 1),
+            thread("t3", false, 1),
+        ];
+        s.checks.push(RollupCheck {
+            name: "lint".into(),
+            state: CheckState::Failure,
+            is_required: false,
+            url: None,
+        });
+        s.merge_queue_removal = Some(intent_sourcecontrol::MergeQueueRemoval {
+            at: "2026-08-26T22:26:36Z".into(),
+            reason: Some("failed_checks".into()),
+        });
+    }
+
+    /// A host without a folded read (the per-signal path): the baseline the
+    /// folded read is measured against. Six reads on the happy path — and
+    /// the probe's `None` review decision costs a seventh-read-worthy
+    /// standalone `review_decision` — eight on the REST fallback.
+    #[tokio::test]
+    async fn per_signal_fetch_costs_six_reads_and_the_rest_fallback_eight() {
+        let repo = RepoRef::new("o", "r");
+        let forge = StubForge::new();
+        forge.edit(busy_pr);
+        forge.edit(|s| s.approvals.clear());
+        fetch_shared_snapshot(&forge, &repo, 42)
+            .await
+            .expect("fetch");
+        assert_eq!(
+            forge_reads(&forge),
+            vec![
+                ("get_pr", 1),
+                ("merge_requirements", 1),
+                ("list_reviews", 1),
+                ("review_decision", 1),
+                ("get_review_threads", 1),
+                ("list_comments", 1),
+            ]
+        );
+
+        let forge = StubForge::new();
+        forge.edit(|s| {
+            s.fail_merge_requirements = true;
+            s.fail_get_review_threads = true;
+        });
+        fetch_shared_snapshot(&forge, &repo, 42)
+            .await
+            .expect("fetch");
+        assert_eq!(
+            forge_reads(&forge),
+            vec![
+                ("get_pr", 1),
+                ("merge_requirements", 1),
+                ("list_reviews", 1),
+                ("review_decision", 1),
+                ("check_runs", 1),
+                ("get_review_threads", 1),
+                ("list_review_comments", 1),
+                ("list_comments", 1),
+            ]
+        );
+    }
+
+    /// A host with a folded read: one full fetch is the observation plus
+    /// the branch rules — two reads — and yields the SAME snapshot, byte for
+    /// byte, as the per-signal path composes for the same forge state.
+    #[tokio::test]
+    async fn a_folded_fetch_costs_two_reads_and_matches_the_per_signal_snapshot() {
+        let repo = RepoRef::new("o", "r");
+        let per_signal = StubForge::new();
+        per_signal.edit(busy_pr);
+        let expected = fetch_shared_snapshot(&per_signal, &repo, 42)
+            .await
+            .expect("per-signal fetch");
+
+        let folded = StubForge::new();
+        folded.edit(busy_pr);
+        folded.edit(|s| s.folded = Some(FoldedRead::default()));
+        let snapshot = fetch_shared_snapshot(&folded, &repo, 42)
+            .await
+            .expect("folded fetch");
+        assert_eq!(
+            forge_reads(&folded),
+            vec![("pr_observation", 1), ("branch_rules", 1)]
+        );
+        assert_eq!(
+            serde_json::to_string(&snapshot.materialize(None)).unwrap(),
+            serde_json::to_string(&expected.materialize(None)).unwrap(),
+            "the folded snapshot is byte-identical to the per-signal one"
+        );
+        assert!(snapshot.requirements_complete);
+        assert!(snapshot.ejection_known);
+        assert_eq!(snapshot.conversation_count, Some(3));
+        assert_eq!(snapshot.review_comment_count, 4);
+        assert_eq!(snapshot.requirements.threads.unresolved, Some(2));
+    }
+
+    /// The sweep's cached path on a folded host: the observation IS the
+    /// change detector, so a fingerprint-unchanged poll costs exactly one
+    /// read (as the per-signal `get_pr` did) and a moved fingerprint costs
+    /// the observation plus the branch rules.
+    #[tokio::test]
+    async fn a_folded_cheap_poll_costs_one_read_and_a_full_refetch_two() {
+        let repo = RepoRef::new("o", "r");
+        let forge = StubForge::new();
+        forge.edit(busy_pr);
+        forge.edit(|s| s.folded = Some(FoldedRead::default()));
+        let cache: PrMonitorFetchCache = Arc::default();
+        let key = pr_key_for(&repo, 42);
+        for expected in [
+            vec![("pr_observation", 1), ("branch_rules", 1)],
+            vec![("pr_observation", 2), ("branch_rules", 1)],
+            vec![("pr_observation", 3), ("branch_rules", 1)],
+        ] {
+            fetch_shared_snapshot_cached(&forge, &repo, 42, &cache, &key)
+                .await
+                .expect("fetch");
+            assert_eq!(forge_reads(&forge), expected);
+        }
+        forge.edit(|s| s.conversation_comments += 1);
+        let snapshot = fetch_shared_snapshot_cached(&forge, &repo, 42, &cache, &key)
+            .await
+            .expect("fetch");
+        assert_eq!(
+            forge_reads(&forge),
+            vec![("pr_observation", 4), ("branch_rules", 2)]
+        );
+        assert_eq!(snapshot.conversation_count, Some(4));
+    }
+
+    /// A PR that outgrew the observation's windows falls back to the paged
+    /// reads for THAT piece only, and still composes the per-signal snapshot.
+    #[tokio::test]
+    async fn an_overflowing_observation_pages_only_the_exhausted_window() {
+        let repo = RepoRef::new("o", "r");
+        let per_signal = StubForge::new();
+        per_signal.edit(busy_pr);
+        let expected = fetch_shared_snapshot(&per_signal, &repo, 42)
+            .await
+            .expect("per-signal fetch");
+
+        let forge = StubForge::new();
+        forge.edit(busy_pr);
+        forge.edit(|s| {
+            s.folded = Some(FoldedRead {
+                overflow_reviews: true,
+                ..FoldedRead::default()
+            });
+        });
+        let snapshot = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
+        assert_eq!(
+            forge_reads(&forge),
+            vec![
+                ("pr_observation", 1),
+                ("branch_rules", 1),
+                ("list_reviews", 1),
+            ]
+        );
+        assert_eq!(snapshot.materialize(None), expected.materialize(None));
+
+        let forge = StubForge::new();
+        forge.edit(busy_pr);
+        forge.edit(|s| {
+            s.folded = Some(FoldedRead {
+                overflow_threads: true,
+                ..FoldedRead::default()
+            });
+        });
+        let snapshot = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
+        assert_eq!(
+            forge_reads(&forge),
+            vec![
+                ("pr_observation", 1),
+                ("branch_rules", 1),
+                ("get_review_threads", 1),
+            ]
+        );
+        assert_eq!(snapshot.materialize(None), expected.materialize(None));
+    }
+
+    /// A failing folded read (other than quota exhaustion) falls back to
+    /// the per-signal reads, so a host whose GraphQL is down but whose REST
+    /// answers still gets its snapshot — at the cost of the failed attempt
+    /// on top of the fallback's own reads (nine when GraphQL is entirely
+    /// down); quota exhaustion on the folded read propagates like a
+    /// rate-limited `get_pr` (no further read is issued).
+    #[tokio::test]
+    async fn a_failing_folded_read_falls_back_and_a_rate_limited_one_propagates() {
+        let repo = RepoRef::new("o", "r");
+        let forge = StubForge::new();
+        forge.edit(|s| {
+            s.folded = Some(FoldedRead {
+                fail: true,
+                ..FoldedRead::default()
+            });
+        });
+        fetch_shared_snapshot(&forge, &repo, 42)
+            .await
+            .expect("per-signal fallback");
+        assert_eq!(
+            forge_reads(&forge)[..2],
+            [("pr_observation", 1), ("get_pr", 1)]
+        );
+        assert_eq!(forge.sub_fetches("merge_requirements"), 1);
+
+        // GraphQL entirely down (folded read, probe and threads all fail):
+        // the failed observation attempt precedes the per-signal REST
+        // fallback's eight reads, so this host pays nine, not eight.
+        let forge = StubForge::new();
+        forge.edit(|s| {
+            s.folded = Some(FoldedRead {
+                fail: true,
+                ..FoldedRead::default()
+            });
+            s.fail_merge_requirements = true;
+            s.fail_get_review_threads = true;
+        });
+        fetch_shared_snapshot(&forge, &repo, 42)
+            .await
+            .expect("REST fallback");
+        assert_eq!(
+            forge_reads(&forge),
+            vec![
+                ("pr_observation", 1),
+                ("get_pr", 1),
+                ("merge_requirements", 1),
+                ("list_reviews", 1),
+                ("review_decision", 1),
+                ("check_runs", 1),
+                ("get_review_threads", 1),
+                ("list_review_comments", 1),
+                ("list_comments", 1),
+            ]
+        );
+
+        let forge = StubForge::new();
+        forge.edit(|s| {
+            s.folded = Some(FoldedRead {
+                rate_limited: true,
+                ..FoldedRead::default()
+            });
+        });
+        let err = fetch_shared_snapshot(&forge, &repo, 42)
+            .await
+            .expect_err("quota exhaustion propagates");
+        assert!(matches!(err, Error::RateLimited(_)), "{err:?}");
+        assert_eq!(forge_reads(&forge), vec![("pr_observation", 1)]);
+    }
+
+    /// Count parity past the per-signal ceilings: a PR with more than 100
+    /// conversation comments and more than 100 replies in one thread reports
+    /// the SAME (saturated) counts from the folded read and the per-signal
+    /// fallback, so a transient folded failure on an unchanged PR — folded →
+    /// fallback → folded — composes identical snapshots and the monitor
+    /// records no comment change.
+    #[tokio::test]
+    async fn an_unchanged_pr_past_the_count_ceilings_survives_a_folded_fallback_round_trip() {
+        let repo = RepoRef::new("o", "r");
+        let forge = StubForge::new();
+        forge.edit(busy_pr);
+        forge.edit(|s| {
+            s.conversation_comments = 2426;
+            s.threads = vec![thread("t1", false, 250), thread("t2", true, 1)];
+            s.folded = Some(FoldedRead::default());
+        });
+        let folded = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
+        forge.edit(|s| s.folded.as_mut().unwrap().fail = true);
+        let fallback = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
+        forge.edit(|s| s.folded.as_mut().unwrap().fail = false);
+        let folded_again = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
+        assert_eq!(forge.sub_fetches("pr_observation"), 3);
+        assert_eq!(forge.sub_fetches("list_comments"), 1);
+        assert_eq!(folded.conversation_count, Some(100), "saturated, not 2426");
+        assert_eq!(folded.review_comment_count, 101, "100 + 1, not 251");
+        assert_eq!(fallback.materialize(None), folded.materialize(None));
+        assert_eq!(folded_again.materialize(None), folded.materialize(None));
+
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        forge.edit(|s| {
+            s.conversation_comments = 2426;
+            s.threads = vec![thread("t1", false, 250), thread("t2", true, 1)];
+            s.folded = Some(FoldedRead::default());
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+        svc.poll_pr_monitors().await;
+        forge.edit(|s| s.folded.as_mut().unwrap().fail = true);
+        svc.poll_pr_monitors().await;
+        forge.edit(|s| s.folded.as_mut().unwrap().fail = false);
+        svc.poll_pr_monitors().await;
+        assert!(
+            !svc.pr_monitor_flush(&ws, &monitor.monitor_id)
+                .await
+                .unwrap(),
+            "no comment delta pending after the round trip"
+        );
+        assert!(!owner_messages(&svc, &owner).await.contains("PR monitor"));
     }
 
     /// Cache hygiene: an entry outlives its monitors only until the next

@@ -251,6 +251,86 @@ async fn acquire_queues_until_a_process_goes_idle() {
     assert_eq!(reg.size(), 0);
 }
 
+/// intent-hq/intent#5253: a prompt worker marks its process idle while it
+/// still holds the busy slot — that flip must NOT wake a queued spawn (its
+/// claim would lose to the held slot and re-queue). The wake is owed to the
+/// slot release, which goes through `wake_waiter_if_idle`: a no-op while the
+/// process is still active, a single wakeup once it is idle.
+#[tokio::test]
+async fn slot_held_idle_flip_defers_the_wakeup_to_the_slot_release() {
+    let (events, event_fn) = recording_events();
+    let reg = Arc::new(ProcessRegistry::new(1).with_event_fn(event_fn));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (a, b) = (AgentId::from("a"), AgentId::from("b"));
+    reg.register(a.clone(), recording_kill(a.clone(), log.clone()));
+    reg.mark_active(&a);
+
+    let reg2 = reg.clone();
+    let b2 = b.clone();
+    let acquired = tokio::spawn(async move { reg2.acquire(&b2, claim_all, release_none).await });
+    // Real yields (not a zero-length timeout): the spawned acquire and the
+    // event callbacks only run while this test is parked.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!acquired.is_finished(), "acquire blocks while all active");
+    assert_eq!(
+        events_for(&events, &b),
+        vec![("agent:process:queued".to_string(), "slots".to_string())],
+        "the spawn queued behind the active holder"
+    );
+
+    // A release while the process is still ACTIVE wakes nobody: the process
+    // is not claimable yet, so the wake belongs to whichever release follows
+    // its idle flip.
+    reg.wake_waiter_if_idle(&a);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !acquired.is_finished(),
+        "no wake while the process is active"
+    );
+
+    // The worker's end-of-turn flip: idle, but the slot is still held.
+    assert!(
+        reg.mark_idle_slot_held(&a),
+        "registered process flipped idle"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !acquired.is_finished(),
+        "the slot-held idle flip does not wake the waiter"
+    );
+    assert_eq!(
+        events_for(&events, &b),
+        vec![("agent:process:queued".to_string(), "slots".to_string())],
+        "no resumed before the slot release"
+    );
+
+    // The slot release wakes the waiter, which evicts the idle `a` and admits.
+    reg.wake_waiter_if_idle(&a);
+    timeout(Duration::from_secs(2), acquired)
+        .await
+        .expect("acquire resolves once the slot release wakes it")
+        .expect("task ok");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![a.clone()],
+        "the idle holder is evicted"
+    );
+    assert_eq!(reg.size(), 0);
+    assert_eq!(
+        events_for(&events, &b),
+        vec![
+            ("agent:process:queued".to_string(), "slots".to_string()),
+            ("agent:process:resumed".to_string(), "slots".to_string()),
+        ],
+        "one queued, answered by exactly one resumed"
+    );
+    assert!(
+        !reg.mark_idle_slot_held(&b),
+        "an unregistered process reports not registered"
+    );
+}
+
 /// Tree-memory probe whose reading tests set by hand. Every `set` bumps the
 /// sample id, which is exactly what the real 5 s sampler does. Host headroom
 /// (`available_memory`) is `None` unless a test sets it, so the existing

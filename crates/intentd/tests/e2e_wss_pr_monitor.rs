@@ -156,6 +156,9 @@ struct ForgeState {
     /// the requirements probe takes the REST review-comments fallback (no
     /// per-thread resolution state).
     review_threads_unreadable: bool,
+    /// When set, `get_pr` fails with `RateLimited` (exhausted forge quota),
+    /// so a monitor sweep opens the daemon's global rate-limit pause.
+    rate_limit_get_pr: bool,
 }
 
 impl Default for ForgeState {
@@ -169,6 +172,7 @@ impl Default for ForgeState {
             in_merge_queue: None,
             merge_queue_removal: None,
             review_threads_unreadable: false,
+            rate_limit_get_pr: false,
         }
     }
 }
@@ -251,6 +255,11 @@ impl SourceControl for StubForge {
         let merged = {
             let mut state = self.state.lock().unwrap();
             state.get_pr_calls += 1;
+            if state.rate_limit_get_pr {
+                return Err(intent_sourcecontrol::Error::RateLimited(
+                    "API rate limit exceeded".into(),
+                ));
+            }
             state.merged
         };
         Ok(PullRequest {
@@ -1854,6 +1863,89 @@ async fn merged_pr_completes_the_monitor_but_keeps_it_listed_over_wss() {
     assert_eq!(metadata["prNumber"], 42);
     assert_eq!(metadata["reason"], "completed");
     assert_eq!(metadata["url"], "https://github.com/o/r/pull/42");
+}
+
+/// `pausedUntil` over the wire (PROTOCOL §5.42 presence-detected
+/// convention): while the daemon's global forge rate-limit pause is active,
+/// every ACTIVE row in `prMonitor.list` carries the pause deadline as an
+/// RFC 3339 `pausedUntil` (and the pause `lastError` naming the same
+/// deadline); the key is OMITTED — never `null` — while the gate is open, and
+/// on terminal (completed) rows even while the gate is paused, since their
+/// checklist is final rather than stale.
+#[tokio::test]
+async fn pr_monitor_list_carries_paused_until_over_wss() {
+    let fx = boot().await;
+    // PR 42 merges first, so its monitor is terminal before the pause opens.
+    let completed = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register 42")
+        .0;
+    fx.forge.edit(|s| s.merged = true);
+    fx.services.poll_pr_monitors().await;
+    fx.forge.edit(|s| s.merged = false);
+    let active = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 43)
+        .await
+        .expect("register 43")
+        .0;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let list_params = json!({ "workspaceId": fx.ws_id.as_str() });
+    let row_of = |listed: &Value, monitor_id: &str| -> Value {
+        listed["monitors"]
+            .as_array()
+            .expect("monitors array")
+            .iter()
+            .find(|r| r["monitorId"] == monitor_id)
+            .unwrap_or_else(|| panic!("row for {monitor_id}: {listed}"))
+            .clone()
+    };
+
+    // Gate open: no row names a pause, whatever its state.
+    let listed = wss_rpc(&mut rpc, 1, "prMonitor.list", list_params.clone()).await;
+    assert_eq!(listed["monitors"].as_array().map(Vec::len), Some(2));
+    let row = row_of(&listed, active.monitor_id.as_str());
+    assert_eq!(row["state"], "active");
+    assert!(row.get("pausedUntil").is_none(), "gate open: {row}");
+    assert!(row.get("lastError").is_none(), "gate open: {row}");
+    let row = row_of(&listed, completed.monitor_id.as_str());
+    assert_eq!(row["state"], "completed");
+    assert!(row.get("pausedUntil").is_none(), "gate open: {row}");
+
+    // The next sweep's fetch hits the exhausted quota and opens the pause.
+    fx.forge.edit(|s| s.rate_limit_get_pr = true);
+    fx.services.poll_pr_monitors().await;
+
+    let listed = wss_rpc(&mut rpc, 2, "prMonitor.list", list_params).await;
+    let row = row_of(&listed, active.monitor_id.as_str());
+    assert_eq!(row["state"], "active");
+    let until = row["pausedUntil"]
+        .as_str()
+        .unwrap_or_else(|| panic!("active row carries pausedUntil: {row}"));
+    assert!(
+        intent_core::parse_iso(until).is_some(),
+        "pausedUntil is RFC 3339: {until}"
+    );
+    assert_eq!(
+        row["lastError"],
+        json!(format!(
+            "rate limited; PR monitor polling paused until {until}"
+        )),
+        "the pause lastError names the same deadline: {row}"
+    );
+    let row = row_of(&listed, completed.monitor_id.as_str());
+    assert_eq!(row["state"], "completed");
+    assert!(
+        row.get("pausedUntil").is_none(),
+        "terminal rows never carry pausedUntil, gate paused or not: {row}"
+    );
+    assert!(
+        row.get("lastError").is_none(),
+        "terminal row untouched: {row}"
+    );
 }
 
 /// A merged PR on a LINKED workspace refreshes the persisted PR linkage as
