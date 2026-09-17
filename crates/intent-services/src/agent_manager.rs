@@ -618,6 +618,14 @@ pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
 ///
 /// The recommended default: `agents.memoryBudgetMb` defaults to auto (the
 /// absent key; explicit 0 = off), and boot wiring resolves auto to this value.
+///
+/// The budget alone does not deny a spawn: [`budget_admits`] queues only when
+/// the tree is over budget *and* the host's available memory is below
+/// [`HOST_MEMORY_RESERVE_BYTES`]. The tree the probe sums is resident set
+/// sizes of every daemon descendant — dev servers, test runs, and headless
+/// browsers started through `ws.script` / `host.exec` included, with shared
+/// pages double-counted — so on a large host it crosses this number while
+/// tens of gigabytes are still free.
 #[must_use]
 pub fn recommended_memory_budget_bytes(total_memory_bytes: u64) -> u64 {
     (total_memory_bytes.saturating_sub(8 * GB) / 2).max(4 * GB)
@@ -1016,12 +1024,38 @@ pub trait TreeMemoryProbe: Send + Sync {
     fn agent_samples(&self) -> HashMap<AgentId, u64> {
         HashMap::new()
     }
+
+    /// Host memory available for new allocations (Linux `MemAvailable`), read
+    /// in the same sweep as [`Self::sample`], or `None` when the probe does
+    /// not measure it. `None` keeps the tree-only criterion: the budget denies
+    /// whenever the tree is over budget, as it did before host headroom was
+    /// consulted. The default keeps test fakes minimal.
+    fn available_memory(&self) -> Option<u64> {
+        None
+    }
 }
+
+/// Host headroom the budget defends (monorepo#2063 follow-up). Below this much
+/// available memory the host is genuinely short and an over-budget tree
+/// queues; at or above it the tree total is a measurement artifact of
+/// processes the daemon does not control and the spawn is admitted. Reuses
+/// [`compute_process_cap`]'s 8 GB OS/other-apps reserve plus one provisional
+/// agent's worth so the admitted spawn itself fits inside the reserve.
+pub const HOST_MEMORY_RESERVE_BYTES: u64 = 8 * GB + PROVISIONAL_AGENT_BYTES;
 
 /// An installed aggregate memory budget (monorepo#2063).
 struct MemoryBudget {
     budget_bytes: u64,
     probe: Arc<dyn TreeMemoryProbe>,
+}
+
+/// What [`ProcessRegistry::budget_denies`] saw when it refused a spawn, for
+/// the `queued` log lines: the charged tree bytes and the host headroom
+/// reading (`None` when the probe does not measure it).
+#[derive(Clone, Copy, Debug)]
+struct BudgetDenial {
+    charged: u64,
+    available_memory: Option<u64>,
 }
 
 /// Provisional cost charged against the budget for a spawn that has been
@@ -1072,8 +1106,22 @@ fn charged_bytes(sampled: u64, pending: i64) -> u64 {
 /// registry does not own (one-shot adapter chains, model probes) and, on a busy
 /// host, is simply not something the daemon controls; without this the daemon
 /// could refuse every spawn forever and never make progress.
-fn budget_admits(charged: u64, budget_bytes: u64, live: usize) -> bool {
-    live == 0 || charged < budget_bytes
+///
+/// Otherwise the budget denies only when the tree is over budget **and** the
+/// host is actually short: `available_memory` below
+/// [`HOST_MEMORY_RESERVE_BYTES`]. An over-budget tree with ample host headroom
+/// admits — the tree sums RSS of every descendant, dev servers and test runs
+/// included, and crossed a 63 GB budget with 63 GB still available. `None`
+/// (probe does not measure host memory) keeps the tree-only criterion.
+fn budget_admits(
+    charged: u64,
+    budget_bytes: u64,
+    live: usize,
+    available_memory: Option<u64>,
+) -> bool {
+    live == 0
+        || charged < budget_bytes
+        || available_memory.is_some_and(|available| available >= HOST_MEMORY_RESERVE_BYTES)
 }
 
 impl ProcessRegistry {
@@ -1102,11 +1150,13 @@ impl ProcessRegistry {
     }
 
     /// Consult the budget under the already-held lock, refreshing the pending
-    /// correction when a newer sample has landed. Returns `Some(charged_bytes)`
-    /// when the budget denies this spawn; `None` when it admits — including when
-    /// no budget is installed and when no sample exists yet, so an unconfigured
-    /// or not-yet-sampled daemon behaves exactly as before.
-    fn budget_denies(&self, inner: &mut RegistryInner) -> Option<u64> {
+    /// correction when a newer sample has landed. Returns
+    /// `Some((charged_bytes, available_memory))` when the budget denies this
+    /// spawn; `None` when it admits — including when no budget is installed,
+    /// when no sample exists yet, and when the host still has
+    /// [`HOST_MEMORY_RESERVE_BYTES`] available (see [`budget_admits`]), so an
+    /// unconfigured or not-yet-sampled daemon behaves exactly as before.
+    fn budget_denies(&self, inner: &mut RegistryInner) -> Option<BudgetDenial> {
         let budget = self.memory.get()?;
         let (sampled, seq) = budget.probe.sample()?;
         if inner.budget_sample_seq != Some(seq) {
@@ -1114,7 +1164,17 @@ impl ProcessRegistry {
             inner.budget_pending_bytes = 0;
         }
         let charged = charged_bytes(sampled, inner.budget_pending_bytes);
-        (!budget_admits(charged, budget.budget_bytes, inner.entries.len())).then_some(charged)
+        let available_memory = budget.probe.available_memory();
+        (!budget_admits(
+            charged,
+            budget.budget_bytes,
+            inner.entries.len(),
+            available_memory,
+        ))
+        .then_some(BudgetDenial {
+            charged,
+            available_memory,
+        })
     }
 
     /// Read-only budget visibility for `system.status` (monorepo#2063):
@@ -1402,13 +1462,15 @@ impl ProcessRegistry {
                     inner.wait_queue.retain(|(_, tx, _)| !tx.is_closed());
                     inner.wait_queue.push((agent_id.clone(), tx, reason));
                     let used = inner.entries.len();
-                    if let Some(charged) = over_budget {
+                    if let Some(denial) = over_budget {
                         tracing::info!(
                             agent = %agent_id,
                             used = used,
                             cap = self.cap,
-                            charged_memory_bytes = charged,
+                            charged_memory_bytes = denial.charged,
                             budget_bytes = self.memory.get().map(|b| b.budget_bytes),
+                            host_available_memory_bytes = denial.available_memory,
+                            host_memory_reserve_bytes = HOST_MEMORY_RESERVE_BYTES,
                             "process registry: spawn queued (aggregate memory budget)"
                         );
                     } else {
@@ -1548,7 +1610,7 @@ impl ProcessRegistry {
                 } else {
                     None
                 };
-                if let Some(charged) = over_budget {
+                if let Some(denial) = over_budget {
                     let candidates = if forced_wait {
                         Vec::new()
                     } else {
@@ -1567,8 +1629,10 @@ impl ProcessRegistry {
                             agent = %agent_id,
                             used = used,
                             cap = self.cap,
-                            charged_memory_bytes = charged,
+                            charged_memory_bytes = denial.charged,
                             budget_bytes = self.memory.get().map(|b| b.budget_bytes),
+                            host_available_memory_bytes = denial.available_memory,
+                            host_memory_reserve_bytes = HOST_MEMORY_RESERVE_BYTES,
                             "process registry: turn start queued (aggregate memory budget)"
                         );
                         if let Some(ref f) = self.event_fn {

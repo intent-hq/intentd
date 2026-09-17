@@ -3266,6 +3266,13 @@ struct ChildTreeSample {
     /// Measurement only today — nothing enforces per-agent limits with it.
     /// Behind an `Arc` so `load()` stays a cheap clone.
     agent_bytes: std::sync::Arc<HashMap<AgentId, u64>>,
+    /// Host memory available for new allocations (`sysinfo::System::
+    /// available_memory`, Linux `MemAvailable`), refreshed in the same sweep
+    /// as `memory_bytes` so the spawn budget compares a tree total and the
+    /// host headroom from one instant. `None` when the reading was zero
+    /// (sysinfo's "unknown" on unsupported platforms), which the budget treats
+    /// as "not measured".
+    available_memory_bytes: Option<u64>,
     /// Sweep counter, incremented on every store. Carried inside the sample for
     /// the same reason the other three fields are published together: the spawn
     /// budget (monorepo#2063) uses it to tell a re-measured reading from the one
@@ -3288,7 +3295,13 @@ struct ChildTreeUsage {
 }
 
 impl ChildTreeUsage {
-    fn store(&self, count: usize, memory_bytes: u64, agent_bytes: HashMap<AgentId, u64>) {
+    fn store(
+        &self,
+        count: usize,
+        memory_bytes: u64,
+        agent_bytes: HashMap<AgentId, u64>,
+        available_memory_bytes: Option<u64>,
+    ) {
         let mut guard = self.inner.write().expect("child tree usage lock poisoned");
         let peak_memory_bytes = guard.as_ref().map_or(memory_bytes, |prev| {
             prev.peak_memory_bytes.max(memory_bytes)
@@ -3299,6 +3312,7 @@ impl ChildTreeUsage {
             memory_bytes,
             peak_memory_bytes,
             agent_bytes: std::sync::Arc::new(agent_bytes),
+            available_memory_bytes,
             seq,
         });
     }
@@ -3352,6 +3366,12 @@ impl TreeMemoryProbe for ChildTreeUsage {
         self.load()
             .map(|s| s.agent_bytes.as_ref().clone())
             .unwrap_or_default()
+    }
+
+    fn available_memory(&self) -> Option<u64> {
+        // Host headroom from the same sweep as `sample`, so the budget's
+        // "over budget but the host is not short" decision reads one instant.
+        self.load().and_then(|s| s.available_memory_bytes)
     }
 }
 
@@ -3621,7 +3641,15 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
             };
             let (count, bytes, agent_bytes) = descendant_tree_usage(&sys, pid, &agent_roots);
             if publish {
-                task_usage.store(count, bytes, agent_bytes);
+                // Host headroom is read only on published sweeps: it is the
+                // spawn budget's second input, and the budget only consumes
+                // published samples.
+                sys.refresh_memory();
+                let available = match sys.available_memory() {
+                    0 => None,
+                    bytes => Some(bytes),
+                };
+                task_usage.store(count, bytes, agent_bytes, available);
                 // Stamped from the poll instant, not from here: dating the
                 // baseline from when the sweep *finished* would add its own
                 // ~12 ms to every period and let the published cadence drift.
@@ -9053,7 +9081,7 @@ mod tests {
     fn child_tree_usage_is_none_until_the_first_sample() {
         let usage = ChildTreeUsage::default();
         assert_eq!(usage.load(), None);
-        usage.store(6, 4_294_967_296, HashMap::new());
+        usage.store(6, 4_294_967_296, HashMap::new(), None);
         let sample = usage.load().expect("sampled");
         assert_eq!(sample.count, 6);
         assert_eq!(sample.memory_bytes, 4_294_967_296);
@@ -9073,6 +9101,7 @@ mod tests {
             4,
             1_000,
             HashMap::from([(a.clone(), 700), (b.clone(), 200)]),
+            None,
         );
         let sample = usage.load().expect("sampled");
         assert_eq!(sample.agent_bytes.get(&a), Some(&700));
@@ -9085,7 +9114,7 @@ mod tests {
 
         // The next full sample replaces the buckets wholesale: an agent that
         // exited between sweeps must not linger.
-        usage.store(1, 300, HashMap::from([(b.clone(), 300)]));
+        usage.store(1, 300, HashMap::from([(b.clone(), 300)]), None);
         let next = usage.load().expect("sampled");
         assert_eq!(next.agent_bytes.get(&a), None);
         assert_eq!(next.agent_bytes.get(&b), Some(&300));
@@ -9101,8 +9130,27 @@ mod tests {
         let probe: &dyn TreeMemoryProbe = &usage;
         assert!(probe.agent_samples().is_empty());
         let a = AgentId::from("agent-a");
-        usage.store(2, 900, HashMap::from([(a.clone(), 700)]));
+        usage.store(2, 900, HashMap::from([(a.clone(), 700)]), None);
         assert_eq!(probe.agent_samples().get(&a), Some(&700));
+    }
+
+    /// The probe's `available_memory` serves the host headroom from the same
+    /// sweep as `sample` — `None` before the first sample and when the sweep
+    /// could not read it — so the spawn budget's "over budget but the host is
+    /// not short" decision pairs a tree total with the headroom of one instant.
+    #[test]
+    fn child_tree_usage_probe_serves_available_memory() {
+        let usage = ChildTreeUsage::default();
+        let probe: &dyn TreeMemoryProbe = &usage;
+        assert_eq!(probe.available_memory(), None);
+        usage.store(2, 900, HashMap::new(), Some(63_000_000_000));
+        assert_eq!(probe.available_memory(), Some(63_000_000_000));
+        usage.store(2, 900, HashMap::new(), None);
+        assert_eq!(
+            probe.available_memory(),
+            None,
+            "an unreadable headroom on a later sweep must not serve a stale one"
+        );
     }
 
     /// The peak must survive the tree draining back to baseline — that is the
@@ -9112,9 +9160,9 @@ mod tests {
     #[test]
     fn child_tree_usage_peak_is_a_high_water_mark() {
         let usage = ChildTreeUsage::default();
-        usage.store(4, 1_000_000_000, HashMap::new());
-        usage.store(24, 5_000_000_000, HashMap::new());
-        usage.store(0, 0, HashMap::new());
+        usage.store(4, 1_000_000_000, HashMap::new(), None);
+        usage.store(24, 5_000_000_000, HashMap::new(), None);
+        usage.store(0, 0, HashMap::new(), None);
         let sample = usage.load().expect("sampled");
         assert_eq!(
             (sample.count, sample.memory_bytes, sample.peak_memory_bytes),
@@ -9131,9 +9179,9 @@ mod tests {
     #[test]
     fn child_tree_usage_burst_reading_reaches_the_peak() {
         let usage = ChildTreeUsage::default();
-        usage.store(0, 10_000_000, HashMap::new());
+        usage.store(0, 10_000_000, HashMap::new(), None);
         usage.observe_burst(6_970_000_000);
-        usage.store(0, 10_000_000, HashMap::new());
+        usage.store(0, 10_000_000, HashMap::new(), None);
         let sample = usage.load().expect("sampled");
         assert_eq!(
             sample.peak_memory_bytes, 6_970_000_000,
@@ -9150,7 +9198,7 @@ mod tests {
     #[test]
     fn child_tree_usage_burst_reading_moves_only_the_peak() {
         let usage = ChildTreeUsage::default();
-        usage.store(4, 1_000_000_000, HashMap::new());
+        usage.store(4, 1_000_000_000, HashMap::new(), None);
         let before = usage.load().expect("sampled");
         usage.observe_burst(7_000_000_000);
         let after = usage.load().expect("sampled");
@@ -9203,14 +9251,14 @@ mod tests {
         const A: (usize, u64) = (4, 1_000_000_000);
         const B: (usize, u64) = (24, 5_000_000_000);
         let usage = Arc::new(ChildTreeUsage::default());
-        usage.store(A.0, A.1, HashMap::new());
+        usage.store(A.0, A.1, HashMap::new(), None);
 
         let writer = {
             let usage = usage.clone();
             std::thread::spawn(move || {
                 for i in 0..20_000 {
                     let (count, bytes) = if i % 2 == 0 { A } else { B };
-                    usage.store(count, bytes, HashMap::new());
+                    usage.store(count, bytes, HashMap::new(), None);
                 }
             })
         };

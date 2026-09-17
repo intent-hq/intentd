@@ -25,7 +25,7 @@ use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
     is_cancel_transport_closed, recommended_memory_budget_bytes, resolve_npx_only, resolve_spawn,
     text_prompt, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, ResolvedSpawn,
-    TreeMemoryProbe, DEFAULT_AGENT_TYPE, PROVISIONAL_AGENT_BYTES,
+    TreeMemoryProbe, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES, PROVISIONAL_AGENT_BYTES,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
@@ -250,10 +250,13 @@ async fn acquire_queues_until_a_process_goes_idle() {
 }
 
 /// Tree-memory probe whose reading tests set by hand. Every `set` bumps the
-/// sample id, which is exactly what the real 5 s sampler does.
+/// sample id, which is exactly what the real 5 s sampler does. Host headroom
+/// (`available_memory`) is `None` unless a test sets it, so the existing
+/// budget tests keep exercising the tree-only criterion.
 struct FakeProbe(
     Mutex<(u64, u64)>,
     Mutex<std::collections::HashMap<AgentId, u64>>,
+    Mutex<Option<u64>>,
 );
 
 impl FakeProbe {
@@ -261,7 +264,13 @@ impl FakeProbe {
         Arc::new(Self(
             Mutex::new((bytes, 1)),
             Mutex::new(std::collections::HashMap::new()),
+            Mutex::new(None),
         ))
+    }
+
+    /// Publish a host available-memory reading (`None` = not measured).
+    fn set_available_memory(&self, bytes: Option<u64>) {
+        *self.2.lock().unwrap() = bytes;
     }
 
     /// Publish a freshly measured reading (new sample id → the registry drops
@@ -286,6 +295,10 @@ impl TreeMemoryProbe for FakeProbe {
 
     fn agent_samples(&self) -> std::collections::HashMap<AgentId, u64> {
         self.1.lock().unwrap().clone()
+    }
+
+    fn available_memory(&self) -> Option<u64> {
+        *self.2.lock().unwrap()
     }
 }
 
@@ -334,9 +347,120 @@ fn budget_admits_an_empty_registry_however_fat_the_tree() {
     // Over budget with nothing registered: the tree is one-shot adapters or
     // simply another process the daemon does not own, and refusing forever
     // would wedge the daemon.
-    assert!(budget_admits(u64::MAX, 1_000, 0));
-    assert!(!budget_admits(1_000, 1_000, 1), "at budget denies");
-    assert!(budget_admits(999, 1_000, 1));
+    assert!(budget_admits(u64::MAX, 1_000, 0, None));
+    assert!(!budget_admits(1_000, 1_000, 1, None), "at budget denies");
+    assert!(budget_admits(999, 1_000, 1, None));
+}
+
+/// The host-headroom criterion (spec root cause A): the tree sums RSS of
+/// every daemon descendant and crossed a 63 GB budget on a host with 63 GB
+/// still available. An over-budget tree denies only when the host is
+/// genuinely short — available memory below the reserve.
+#[test]
+fn budget_denies_an_over_budget_tree_only_when_the_host_is_short() {
+    let gb = super::GB;
+    let reserve = HOST_MEMORY_RESERVE_BYTES;
+    // Over budget, ample headroom → admits.
+    assert!(budget_admits(67 * gb, 63 * gb, 13, Some(63 * gb)));
+    assert!(
+        budget_admits(67 * gb, 63 * gb, 13, Some(reserve)),
+        "exactly the reserve is enough"
+    );
+    // Over budget, host short → denies.
+    assert!(!budget_admits(67 * gb, 63 * gb, 13, Some(reserve - 1)));
+    assert!(!budget_admits(67 * gb, 63 * gb, 13, Some(0)));
+    // No headroom reading keeps the tree-only criterion.
+    assert!(!budget_admits(67 * gb, 63 * gb, 13, None));
+    // Under budget admits regardless of headroom; `live == 0` always admits.
+    assert!(budget_admits(gb, 63 * gb, 13, Some(0)));
+    assert!(budget_admits(u64::MAX, 1_000, 0, Some(0)));
+    assert_eq!(reserve, 8 * gb + PROVISIONAL_AGENT_BYTES);
+}
+
+/// Registry-level version of the headroom criterion: with a tree over budget
+/// and the host at/above the reserve, `acquire` and `acquire_turn_start` admit
+/// outright — no eviction, no `agent:process:queued`. Below the reserve both
+/// paths queue exactly as before.
+#[tokio::test]
+async fn over_budget_tree_with_host_headroom_admits_without_queueing() {
+    let gb = super::GB;
+    let events: Arc<Mutex<Vec<(AgentId, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let event_fn: super::ProcessEventFn =
+        Arc::new(move |agent_id, event_type, _used, _cap, reason| {
+            let events = events_clone.clone();
+            let agent_id = agent_id.clone();
+            let event_type = event_type.to_string();
+            let reason = reason.to_string();
+            Box::pin(async move {
+                events.lock().unwrap().push((agent_id, event_type, reason));
+            })
+        });
+
+    // Slots free; the tree is far over budget; the host has 63 GB available.
+    let reg = Arc::new(ProcessRegistry::new(8).with_event_fn(event_fn));
+    let probe = FakeProbe::new(67 * gb);
+    probe.set_available_memory(Some(63 * gb));
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (idle, warm, spawning) = (
+        AgentId::from("idle"),
+        AgentId::from("warm"),
+        AgentId::from("spawning"),
+    );
+    reg.register(idle.clone(), recording_kill(idle.clone(), log.clone()));
+    reg.register(warm.clone(), recording_kill(warm.clone(), log.clone()));
+
+    timeout(
+        Duration::from_millis(200),
+        reg.acquire(&spawning, claim_all, release_none),
+    )
+    .await
+    .expect("over-budget tree with host headroom admits the spawn");
+    timeout(
+        Duration::from_millis(200),
+        reg.acquire_turn_start(&warm, claim_all, release_none),
+    )
+    .await
+    .expect("over-budget tree with host headroom admits the turn start");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(log.lock().unwrap().is_empty(), "nothing was evicted");
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "no queued/evicted events with host headroom: {:?}",
+        events.lock().unwrap()
+    );
+
+    // Same tree, host now genuinely short: the turn start queues on the
+    // budget (the idle process is reclaimed first, then the wait).
+    probe.set_available_memory(Some(HOST_MEMORY_RESERVE_BYTES - 1));
+    let reg2 = reg.clone();
+    let warm2 = warm.clone();
+    let handle = tokio::spawn(async move {
+        reg2.acquire_turn_start(&warm2, claim_all, release_none)
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !handle.is_finished(),
+        "over budget with the host short → the turn waits"
+    );
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(a, e, r)| a == &warm && e == "agent:process:queued" && r == "memory-budget"),
+        "queued on the budget once the host is short: {:?}",
+        events.lock().unwrap()
+    );
+    // Headroom returns: the timed re-check admits the waiter.
+    probe.set_available_memory(Some(63 * gb));
+    timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the waiter re-checks host headroom on its own timer")
+        .expect("task ok");
 }
 
 #[tokio::test]
