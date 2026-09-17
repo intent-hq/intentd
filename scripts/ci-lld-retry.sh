@@ -41,9 +41,15 @@ log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 
 # A genuine diagnostic in the captured output — colour codes stripped, since
-# cargo may emit them under CARGO_TERM_COLOR=always.
+# cargo may emit them under CARGO_TERM_COLOR=always. One awk pass that reads
+# to EOF: a `grep -q` at the end of a pipeline exits early and SIGPIPEs the
+# upstream stages, which under pipefail turns a large mixed log into 141.
 has_genuine_diagnostic() {
-  sed -E 's/\x1b\[[0-9;]*m//g' "$log" | grep -E "$DIAGNOSTIC" | grep -qvE "$LINK_ENVELOPE"
+  awk -v diag="$DIAGNOSTIC" -v envelope="$LINK_ENVELOPE" '
+    { gsub(/\033\[[0-9;]*m/, "") }
+    $0 ~ diag && $0 !~ envelope { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$log"
 }
 
 run_once() {

@@ -138,4 +138,16 @@ run s8 1
 assert_calls s8 1
 assert_not_contains "$tmp/out.s8" "retrying once" s8
 
+echo "scenario 9: a large mixed log (10k lint lines + signature) is still not retried — no SIGPIPE in the diagnostic scan"
+scenario s9
+{
+  echo 101
+  for _ in $(seq 10000); do echo "$lint_line"; done
+  printf '%s\n' "$link_envelope"
+} >"$PLAN/1"
+run s9 101
+assert_calls s9 1
+assert_contains "$tmp/out.s9" "::notice::rust-lld vanished-object signature seen, but the output also carries a genuine rustc/clippy diagnostic" s9
+assert_not_contains "$tmp/out.s9" "retrying once" s9
+
 echo "OK: all scenarios passed"
