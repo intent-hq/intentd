@@ -159,6 +159,8 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "github.connect",
     "github.getReviewThreads",
     "github.getUser",
+    "github.identityProof.create",
+    "github.identityProof.delete",
     "github.issues.get",
     "github.issues.list",
     "github.issues.search",
