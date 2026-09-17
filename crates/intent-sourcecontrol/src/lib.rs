@@ -21,7 +21,7 @@ pub mod token;
 
 use async_trait::async_trait;
 
-pub use device_flow::{DeviceFlow, IdentityFlow, IdentityPollStatus, PollStatus};
+pub use device_flow::{DeviceFlow, PollStatus};
 pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
 pub use model::{

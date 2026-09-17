@@ -492,10 +492,9 @@
 //! `inviteId` / `secret`, the secret exactly once), `workspace.invite.list` /
 //! `workspace.invite.revoke`, `workspace.members.leave`, `principal.revokeSelf`
 //! (closes the caller's own connections), and the unauthenticated `/invite`
-//! WSS endpoint serving `invite.redeem` (`{ inviteId, secret }` → device
-//! codes; `{ flowId }` → the collaborator credential once). Invite refusals
+//! WSS endpoint serving the guest join methods below. Invite refusals
 //! carry `error.data.code` (`invite-expired`, `invite-revoked`,
-//! `invite-redeemed`, `invite-pin-mismatch`, `invite-flow-denied`, …). Also
+//! `invite-redeemed`, `invite-pin-mismatch`, `invite-flow-busy`, …). Also
 //! within 10.3, ephemeral presence (multiplayer w5): `presence.update` /
 //! `note.presence.update` (fast path), `presence.snapshot`, and the
 //! `note.presence.subscribe` / `note.presence.unsubscribe` channel pair.
@@ -524,20 +523,23 @@
 //! spent, and `GET /health` carries the additive `guestConnections`. Also
 //! within 10.3, the returning guest's `/invite` methods (additive):
 //! `invite.inspect` (`{ inviteId, secret }` → `{ workspaceId,
-//! workspaceTitle, hostname, prettyHostname }`, the phase-1 validation with
-//! no device flow) and `invite.accept` (`{ inviteId, secret, credential }`
-//! → the phase-2 `authorized` shape, joining with a per-principal
-//! credential this host already minted; an unknown / revoked credential is
-//! `error.data.code` `credential-invalid`). Also within 10.3, the gist
-//! identity proof's `/invite` methods (additive): `invite.challenge`
-//! (`{ inviteId, secret }` → the `invite.inspect` result plus a single-use
-//! `nonce` and its `nonceExpiresAt`, 10 minutes out) and `invite.prove`
-//! (`{ inviteId, secret, nonce, gistId, login }` → the phase-2 `authorized`
-//! shape once the host has read a gist owned by `login` whose
-//! `intent-join-proof.txt` starts with the nonce and postdates it; the
-//! nonce is spent by the first attempt; `error.data.code` `proof-invalid`
-//! / `proof-expired` / `github-unreachable`). The catalog contains 326
-//! router methods, 57 fast-path methods, and two aliases: 385
+//! workspaceTitle, hostname, prettyHostname }`, the link validation with
+//! no nonce) and `invite.accept` (`{ inviteId, secret, credential }` → the
+//! `authorized` shape `{ status, token, principalId, login, workspaceId }`,
+//! joining with a per-principal credential this host already minted; an
+//! unknown / revoked credential is `error.data.code` `credential-invalid`).
+//! Also within 10.3, the gist identity proof's `/invite` methods
+//! (additive): `invite.challenge` (`{ inviteId, secret }` → the
+//! `invite.inspect` result plus a single-use `nonce` and its
+//! `nonceExpiresAt`, 10 minutes out) and `invite.prove` (`{ inviteId,
+//! secret, nonce, gistId, login }` → the `authorized` shape once the host
+//! has read a gist owned by `login` whose `intent-join-proof.txt` starts
+//! with the nonce and postdates it; the nonce is spent by the first
+//! attempt; `error.data.code` `proof-invalid` / `proof-expired` /
+//! `github-unreachable`). The gist proof replaces the host-side device flow:
+//! `invite.redeem` is no longer served (an `/invite` connection naming it
+//! gets `-32001` like any other non-invite method). The catalog contains
+//! 326 router methods, 56 fast-path methods, and two aliases: 384
 //! client-callable names.
 
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
