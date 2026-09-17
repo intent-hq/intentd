@@ -236,12 +236,28 @@ pub(crate) fn plan_quota_cadence(
 /// ticks every `poll_secs`: `ceil(distinct_prs × poll_secs / effective_secs)`,
 /// never below 1. Equals `distinct_prs` whenever the interval is not
 /// stretched, so small monitor sets keep polling everything due each tick.
+///
+/// Once the interval spaces successive fetches further apart than one tick
+/// (`effective_secs / distinct_prs > poll_secs`), the minimum of one would
+/// let a stale backlog — a restart, a long outage, a quota-stretched
+/// interval — drain one PR per tick and spend the whole planned interval's
+/// worth of requests in a few minutes. So the tick fetches NOTHING while
+/// the newest `lastPolledAt` across the active monitors
+/// (`newest_anchor_age_secs`; `None` = nothing ever polled) is younger than
+/// that spacing: the backlog drains one fetch per spacing, i.e. within the
+/// budget the interval was planned against. The hold is measured from the
+/// stamps, so it survives a restart and needs no spend counter.
 pub(crate) fn pr_monitor_fetches_per_tick(
     distinct_prs: usize,
     poll_secs: u64,
     effective_secs: u64,
+    newest_anchor_age_secs: Option<u64>,
 ) -> usize {
     let effective_secs = effective_secs.max(1);
+    let spacing = effective_secs.div_ceil((distinct_prs as u64).max(1));
+    if spacing > poll_secs && newest_anchor_age_secs.is_some_and(|age| age < spacing) {
+        return 0;
+    }
     (distinct_prs as u64)
         .saturating_mul(poll_secs)
         .div_ceil(effective_secs)
@@ -2513,7 +2529,11 @@ impl Services {
     /// one fetch the tick selects NOTHING: the deferral is decided here,
     /// before the stale-anchor and catch-up rules, so neither an old
     /// `lastPolledAt` nor a catch-up marker spends against an exhausted
-    /// window; both are honoured on the first tick after the reset.
+    /// window; both are honoured on the first tick after the reset. The
+    /// fetch cap is likewise zero while a stretched interval's fetch
+    /// spacing has not elapsed since the newest poll
+    /// ([`pr_monitor_fetches_per_tick`]), so a stale or catch-up backlog
+    /// drains within the planned budget instead of one PR per tick.
     fn select_due_pr_monitors(
         &self,
         monitors: Vec<PrMonitor>,
@@ -2545,7 +2565,7 @@ impl Services {
         let interval = time::Duration::seconds(effective_secs.cast_signed());
         let now = time::OffsetDateTime::now_utc();
         let catch_up = self.pr_monitor_catch_up.lock().unwrap().clone();
-        let candidates = monitors
+        let candidates: Vec<DueCandidate> = monitors
             .into_iter()
             .map(|monitor| DueCandidate {
                 anchor: monitor.last_polled_at.as_deref().and_then(parse_iso),
@@ -2553,11 +2573,21 @@ impl Services {
                 monitor,
             })
             .collect();
+        let newest_anchor_age_secs = candidates
+            .iter()
+            .filter_map(|c| c.anchor)
+            .max()
+            .map(|at| u64::try_from((now - at).whole_seconds()).unwrap_or(0));
         select_due_pr_monitors(
             candidates,
             now,
             interval,
-            pr_monitor_fetches_per_tick(distinct_prs, poll_secs, effective_secs),
+            pr_monitor_fetches_per_tick(
+                distinct_prs,
+                poll_secs,
+                effective_secs,
+                newest_anchor_age_secs,
+            ),
         )
     }
 
@@ -7332,11 +7362,22 @@ mod tests {
         );
 
         // The per-tick fetch cap spreads the stretched set across ticks.
-        assert_eq!(pr_monitor_fetches_per_tick(4, 30, 30), 4);
-        assert_eq!(pr_monitor_fetches_per_tick(10, 30, 72), 5);
-        assert_eq!(pr_monitor_fetches_per_tick(20, 30, 144), 5);
-        assert_eq!(pr_monitor_fetches_per_tick(0, 30, 30), 1);
-        assert_eq!(pr_monitor_fetches_per_tick(1, 30, 1800), 1);
+        // A fetch spacing within one tick never holds, however fresh the
+        // newest poll.
+        assert_eq!(pr_monitor_fetches_per_tick(4, 30, 30, Some(0)), 4);
+        assert_eq!(pr_monitor_fetches_per_tick(10, 30, 72, Some(0)), 5);
+        assert_eq!(pr_monitor_fetches_per_tick(20, 30, 144, Some(0)), 5);
+        assert_eq!(pr_monitor_fetches_per_tick(0, 30, 30, None), 1);
+        // A spacing beyond one tick (1800s / 1 PR; 25,200s / 14 PRs =
+        // 1800s) holds the tick until it has elapsed since the newest poll;
+        // nothing ever polled never holds.
+        assert_eq!(pr_monitor_fetches_per_tick(1, 30, 1800, None), 1);
+        assert_eq!(pr_monitor_fetches_per_tick(1, 30, 1800, Some(1800)), 1);
+        assert_eq!(pr_monitor_fetches_per_tick(1, 30, 1800, Some(1799)), 0);
+        assert_eq!(pr_monitor_fetches_per_tick(14, 30, 25_200, Some(30)), 0);
+        assert_eq!(pr_monitor_fetches_per_tick(14, 30, 25_200, Some(1800)), 1);
+        // A spacing of exactly one tick is the tick itself: no hold.
+        assert_eq!(pr_monitor_fetches_per_tick(3, 30, 90, Some(0)), 1);
     }
 
     /// Quota-window math table: a full window plans nothing beyond the
@@ -8838,6 +8879,62 @@ mod tests {
         fetched.sort_unstable();
         assert_eq!(fetched, vec![1, 2, 3]);
         assert_eq!(marked(), 0, "the catch-up polls cleared the markers");
+    }
+
+    /// A stale backlog drains WITHIN the quota share, not one PR per tick:
+    /// fourteen far-overdue PRs with 6 requests left at 50% and 1800s to
+    /// the reset get one fetch (3 requests) before the reset — the planned
+    /// 25,200s interval spaces successive fetches 1800s apart, so the ticks
+    /// up to the reset fetch exactly one PR however overdue the other
+    /// thirteen are (the per-tick cap alone would drain them one per 30s
+    /// tick: 14 fetches, 42 requests against an allowance of 3). The
+    /// spacing is measured from the newest poll, so the next PR is fetched
+    /// once it has elapsed.
+    #[tokio::test]
+    async fn a_stale_backlog_drains_within_the_quota_share() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitors_max_per_agent(20)
+            .with_pr_monitor_poll_seconds(30)
+            .with_pr_monitor_hourly_request_budget(1500)
+            .with_pr_monitor_quota_share_percent(50);
+        for pr in 1_u64..=14 {
+            let (m, _) = svc
+                .pr_monitor_register(&ws, &owner, "o", "r", pr)
+                .await
+                .expect("register");
+            backdate(&svc, &m.monitor_id, &format!("2020-01-01T00:00:{pr:02}Z")).await;
+        }
+        forge.take_fetched_numbers();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        forge.edit(|s| {
+            s.rate_limit_remaining = Some(6);
+            s.rate_limit_limit = Some(5_000);
+            s.rate_limit_reset_at = Some(now_unix + 1_800);
+        });
+
+        // Sixty ticks 30s apart span the 1800s to the reset.
+        let mut fetched = Vec::new();
+        for tick in 0..60 {
+            if tick > 0 {
+                age_all(&svc, 30).await;
+            }
+            svc.poll_due_pr_monitors().await;
+            fetched.extend(forge.take_fetched_numbers());
+        }
+        assert_eq!(
+            fetched,
+            vec![1],
+            "the share pays for one fetch before the reset, the oldest PR"
+        );
+        // 1800s after that poll the spacing has elapsed: the next-oldest
+        // PR is fetched.
+        age_all(&svc, 30).await;
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(forge.take_fetched_numbers(), vec![2]);
     }
 
     /// The early lift clears the annotation even on a monitor the lifted
