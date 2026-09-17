@@ -642,7 +642,8 @@ fn invalidate_fetch_cache(cache: &PrMonitorFetchCache, key: &PrKey) {
 /// |---|---|---|
 /// | happy (host folds the read) | 6 — `get_pr`, `merge_requirements` (GraphQL + branch-rules REST = 2 HTTP), `list_reviews`, `review_decision`, `get_review_threads`, `list_comments` (7 HTTP) | 2 — `pr_observation` (1 GraphQL request, 1 rate-limit point), `branch_rules` |
 /// | host without a folded read | 6 (7 HTTP) | 6 (7 HTTP), unchanged |
-/// | REST fallback (probe + threads down) | 8 | 8, unchanged |
+/// | REST fallback (probe + threads down), host without a folded read | 8 | 8, unchanged |
+/// | REST fallback, host with a folded read whose GraphQL is down | 8 | 9 — the failed `pr_observation` attempt, then the 8 |
 /// | cached cheap poll (fingerprint unchanged) | 1 (`get_pr`) | 1 (`pr_observation`) |
 pub(crate) async fn fetch_shared_snapshot(
     sc: &dyn SourceControl,
@@ -7541,8 +7542,10 @@ mod tests {
 
     /// A failing folded read (other than quota exhaustion) falls back to
     /// the per-signal reads, so a host whose GraphQL is down but whose REST
-    /// answers still gets its snapshot; quota exhaustion on the folded read
-    /// propagates like a rate-limited `get_pr` (no further read is issued).
+    /// answers still gets its snapshot — at the cost of the failed attempt
+    /// on top of the fallback's own reads (nine when GraphQL is entirely
+    /// down); quota exhaustion on the folded read propagates like a
+    /// rate-limited `get_pr` (no further read is issued).
     #[tokio::test]
     async fn a_failing_folded_read_falls_back_and_a_rate_limited_one_propagates() {
         let repo = RepoRef::new("o", "r");
@@ -7561,6 +7564,36 @@ mod tests {
             [("pr_observation", 1), ("get_pr", 1)]
         );
         assert_eq!(forge.sub_fetches("merge_requirements"), 1);
+
+        // GraphQL entirely down (folded read, probe and threads all fail):
+        // the failed observation attempt precedes the per-signal REST
+        // fallback's eight reads, so this host pays nine, not eight.
+        let forge = StubForge::new();
+        forge.edit(|s| {
+            s.folded = Some(FoldedRead {
+                fail: true,
+                ..FoldedRead::default()
+            });
+            s.fail_merge_requirements = true;
+            s.fail_get_review_threads = true;
+        });
+        fetch_shared_snapshot(&forge, &repo, 42)
+            .await
+            .expect("REST fallback");
+        assert_eq!(
+            forge_reads(&forge),
+            vec![
+                ("pr_observation", 1),
+                ("get_pr", 1),
+                ("merge_requirements", 1),
+                ("list_reviews", 1),
+                ("review_decision", 1),
+                ("check_runs", 1),
+                ("get_review_threads", 1),
+                ("list_review_comments", 1),
+                ("list_comments", 1),
+            ]
+        );
 
         let forge = StubForge::new();
         forge.edit(|s| {
