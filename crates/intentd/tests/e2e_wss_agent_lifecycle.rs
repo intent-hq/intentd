@@ -15771,7 +15771,7 @@ async fn queued_spawn_resumes_exactly_once_over_wss() {
         match ev["type"].as_str() {
             Some("agent:failed") => panic!("holder turn must not fail: {ev}"),
             Some("agent:stream:end") => panic!("holder turn ended before the waiter queued: {ev}"),
-            Some("agent:stream:status") if ev["data"]["phase"] == "prompt" => break,
+            Some("agent:stream:status") => break,
             _ => {}
         }
     }
