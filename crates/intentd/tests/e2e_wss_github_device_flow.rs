@@ -237,15 +237,22 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Mock GitHub login host: plain-HTTP `/login/device/code` +
-// `/login/oauth/access_token`. Answers `authorization_pending` until
-// `authorize` is flipped, then answers every subsequent token poll with the
-// access token (the daemon's poll loop stops after the first Authorized).
+// Mock GitHub host: plain-HTTP `/login/device/code` +
+// `/login/oauth/access_token` (login side — answers `authorization_pending`
+// until `authorize` is flipped, then answers every subsequent token poll with
+// the access token; the daemon's poll loop stops after the first Authorized),
+// plus the API-side `GET /user` / `POST /gists` / `DELETE /gists/{id}` the
+// gist identity proof needs (`GET /user` reports the `gist` scope in
+// `X-OAuth-Scopes` while `gist_scope` is set).
 // ---------------------------------------------------------------------------
+
+/// The gist id the mock mints for every `POST /gists`.
+const GIST_ID: &str = "e2e0000000000000000000000000abcd";
 
 struct MockGithub {
     base_uri: String,
     authorize: Arc<AtomicBool>,
+    gist_scope: Arc<AtomicBool>,
 }
 
 async fn spawn_mock_github() -> MockGithub {
@@ -254,27 +261,35 @@ async fn spawn_mock_github() -> MockGithub {
         .expect("bind mock github");
     let port = listener.local_addr().expect("mock addr").port();
     let authorize = Arc::new(AtomicBool::new(false));
+    let gist_scope = Arc::new(AtomicBool::new(true));
     let flag = authorize.clone();
+    let scope = gist_scope.clone();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
             let flag = flag.clone();
+            let scope = scope.clone();
             tokio::spawn(async move {
-                let _ = serve_conn(stream, flag).await;
+                let _ = serve_conn(stream, flag, scope).await;
             });
         }
     });
     MockGithub {
         base_uri: format!("http://127.0.0.1:{port}"),
         authorize,
+        gist_scope,
     }
 }
 
-/// Minimal HTTP/1.1 handler for the two device-flow endpoints. Reads one
-/// request (headers + content-length body), answers, and closes.
-async fn serve_conn(mut stream: TcpStream, authorize: Arc<AtomicBool>) -> std::io::Result<()> {
+/// Minimal HTTP/1.1 handler for the mocked endpoints. Reads one request
+/// (headers + content-length body), answers, and closes.
+async fn serve_conn(
+    mut stream: TcpStream,
+    authorize: Arc<AtomicBool>,
+    gist_scope: Arc<AtomicBool>,
+) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     let (head_end, body_start) = loop {
@@ -305,7 +320,11 @@ async fn serve_conn(mut stream: TcpStream, authorize: Arc<AtomicBool>) -> std::i
         buf.extend_from_slice(&tmp[..n]);
     }
 
-    let path = head.split_whitespace().nth(1).unwrap_or_default();
+    let mut request_line = head.split_whitespace();
+    let method = request_line.next().unwrap_or_default();
+    let path = request_line.next().unwrap_or_default();
+    let mut status = 200;
+    let mut extra_headers = String::new();
     let body = if path.starts_with("/login/device/code") {
         json!({
             "device_code": "e2e-device-code-opaque",
@@ -319,17 +338,44 @@ async fn serve_conn(mut stream: TcpStream, authorize: Arc<AtomicBool>) -> std::i
             json!({
                 "access_token": ACCESS_TOKEN,
                 "token_type": "bearer",
-                "scope": "repo,read:org,workflow",
+                "scope": "repo,read:org,workflow,gist",
             })
         } else {
             json!({ "error": "authorization_pending" })
         }
+    } else if method == "GET" && path == "/user" {
+        let scopes = if gist_scope.load(Ordering::SeqCst) {
+            "repo, read:org, workflow, gist"
+        } else {
+            "repo, read:org, workflow"
+        };
+        extra_headers = format!("X-OAuth-Scopes: {scopes}\r\n");
+        json!({
+            "login": "octocat",
+            "id": 1,
+            "avatar_url": "https://avatars.githubusercontent.com/u/1",
+            "html_url": "https://github.com/octocat",
+        })
+    } else if method == "POST" && path == "/gists" {
+        status = 201;
+        json!({ "id": GIST_ID, "public": false })
+    } else if method == "DELETE" && path == format!("/gists/{GIST_ID}") {
+        status = 204;
+        Value::Null
+    } else if method == "DELETE" && path.starts_with("/gists/") {
+        status = 404;
+        json!({ "message": "Not Found" })
     } else {
+        status = 404;
         json!({ "error": "not_found" })
     };
-    let payload = body.to_string();
+    let payload = if body.is_null() {
+        String::new()
+    } else {
+        body.to_string()
+    };
     let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} Status\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{extra_headers}connection: close\r\n\r\n{}",
         payload.len(),
         payload
     );
@@ -506,4 +552,120 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
         !on_disk.contains(ACCESS_TOKEN),
         "cancelled flow must not persist a token"
     );
+}
+
+/// Gist identity proof over WSS (`github.identityProof.create` /
+/// `github.identityProof.delete`): with the device-flow token pre-seeded in
+/// the secrets file and the API host pointed at the mock, create returns the
+/// mock's `{ gistId, login }`, delete is idempotent (`{ ok: true }` for a
+/// live AND an unknown gist), a token that lacks the `gist` scope is refused
+/// with `github-scope-missing`, missing params are `-32602`, and once the
+/// token is revoked create is refused with `github-not-connected`.
+#[tokio::test]
+async fn github_identity_proof_create_and_delete_over_wss() {
+    let mock = spawn_mock_github().await;
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let secrets_file = data_dir.join("secrets.json");
+    std::fs::write(
+        &secrets_file,
+        json!({ "sourceControl.github.token": ACCESS_TOKEN }).to_string(),
+    )
+    .expect("seed secrets file");
+    let secrets_s = secrets_file.to_string_lossy().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_SECRETS_FILE", &secrets_s),
+        ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
+        ("INTENTD_GITHUB_API_BASE_URI", &mock.base_uri),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // 1. create → the mock's gist id + the token owner's login, nothing else.
+    let v = wss_rpc(
+        &mut rpc,
+        20,
+        "github.identityProof.create",
+        json!({ "nonce": "n0nce-e2e", "hostLabel": "Host E2E" }),
+    )
+    .await;
+    assert_eq!(v["jsonrpc"], json!("2.0"));
+    assert!(v.get("error").is_none(), "create errored: {v}");
+    assert_eq!(
+        v["result"],
+        json!({ "gistId": GIST_ID, "login": "octocat" }),
+        "create result is exactly {{ gistId, login }}"
+    );
+    // 🔒 Never the token on the wire.
+    assert!(!v.to_string().contains(ACCESS_TOKEN));
+
+    // 2. delete the live gist → { ok: true }.
+    let v = wss_rpc(
+        &mut rpc,
+        21,
+        "github.identityProof.delete",
+        json!({ "gistId": GIST_ID }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "delete errored: {v}");
+    assert_eq!(v["result"], json!({ "ok": true }));
+
+    // 3. delete an unknown gist (mock answers 404) → still { ok: true }.
+    let v = wss_rpc(
+        &mut rpc,
+        22,
+        "github.identityProof.delete",
+        json!({ "gistId": "0000000000000000000000000000dead" }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "idempotent delete errored: {v}");
+    assert_eq!(v["result"], json!({ "ok": true }));
+
+    // 4. missing params → -32602 on both methods (§9).
+    let v = wss_rpc(&mut rpc, 23, "github.identityProof.create", json!({})).await;
+    assert_eq!(v["error"]["code"], json!(-32602), "create: {v}");
+    let v = wss_rpc(&mut rpc, 24, "github.identityProof.delete", json!({})).await;
+    assert_eq!(v["error"]["code"], json!(-32602), "delete: {v}");
+
+    // 5. Token without the `gist` scope → bounded `github-scope-missing`
+    //    (checked before any gist is written; the mock's POST /gists is never
+    //    needed for this branch).
+    mock.gist_scope.store(false, Ordering::SeqCst);
+    let v = wss_rpc(
+        &mut rpc,
+        25,
+        "github.identityProof.create",
+        json!({ "nonce": "n0nce-e2e", "hostLabel": "Host E2E" }),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32603), "scope-missing: {v}");
+    assert_eq!(v["error"]["data"]["code"], json!("github-scope-missing"));
+    mock.gist_scope.store(true, Ordering::SeqCst);
+
+    // 6. revoke drops the stored token → create is `github-not-connected`
+    //    (the env / `gh` fallbacks never count for the proof).
+    let v = wss_rpc(&mut rpc, 26, "github.revoke", json!({})).await;
+    assert_eq!(v["result"]["ok"], json!(true));
+    let v = wss_rpc(
+        &mut rpc,
+        27,
+        "github.identityProof.create",
+        json!({ "nonce": "n0nce-e2e", "hostLabel": "Host E2E" }),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32603), "not-connected: {v}");
+    assert_eq!(v["error"]["data"]["code"], json!("github-not-connected"));
 }

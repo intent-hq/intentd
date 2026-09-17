@@ -155,12 +155,15 @@ fn extract_fastpath_methods() -> HashSet<String> {
 ///
 /// Returning guest (multiplayer w4): +2 fast-path methods on the `/invite`
 /// endpoint (`invite.inspect`, `invite.accept`).
-const EXPECTED_TOTAL_METHODS: usize = 381;
+///
+/// Gist identity proof (guest half): +2 router methods
+/// (`github.identityProof.create`, `github.identityProof.delete`).
+const EXPECTED_TOTAL_METHODS: usize = 383;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 324;
+const EXPECTED_ROUTER_METHODS: usize = 326;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 55;
@@ -604,6 +607,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "github.connect",
     "github.getReviewThreads",
     "github.getUser",
+    "github.identityProof.create",
+    "github.identityProof.delete",
     "github.issues.get",
     "github.issues.list",
     "github.issues.search",
@@ -1143,6 +1148,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "github.connect",
     "github.getReviewThreads",
     "github.getUser",
+    "github.identityProof.create",
+    "github.identityProof.delete",
     "github.issues.get",
     "github.issues.list",
     "github.issues.search",
@@ -1731,6 +1738,11 @@ mod unbound_owner_only_methods {
             ("github.connect", json!({})),
             ("github.getReviewThreads", gh_n.clone()),
             ("github.getUser", json!({})),
+            (
+                "github.identityProof.create",
+                json!({ "nonce": "n", "hostLabel": "h" }),
+            ),
+            ("github.identityProof.delete", json!({ "gistId": "g" })),
             ("github.issues.get", gh_n.clone()),
             ("github.issues.list", gh.clone()),
             ("github.issues.search", gh.clone()),
