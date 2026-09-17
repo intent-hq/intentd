@@ -1439,6 +1439,158 @@ async fn accept_refuses_bad_credentials_closed_invites_and_pins() {
     assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
 }
 
+/// The presented credential is consumed INSIDE the join transaction, not by
+/// the service-side lookup: two `invite.accept` calls on distinct open
+/// invites presenting the same credential, started together, admit exactly
+/// one — the other is `CredentialInvalid`, exactly one new credential is
+/// minted and the guest ends with exactly one active credential; the
+/// loser's invite stays open and admits the guest with the new credential.
+#[tokio::test]
+async fn accept_consumes_the_presented_credential_once_under_contention() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let (guest, token) = f.first_join(&identity("guest", 4242)).await;
+    let (ws_a, inv_a, secret_a) = f.second_workspace_invite().await;
+    let (ws_b, inv_b, secret_b) = f.second_workspace_invite().await;
+
+    let accept = |inv: String, secret: String| {
+        let (services, token) = (f.services.clone(), token.clone());
+        tokio::spawn(async move { services.invite_accept_op(&inv, &secret, &token).await })
+    };
+    let (ra, rb) = tokio::join!(
+        accept(inv_a.clone(), secret_a.clone()),
+        accept(inv_b.clone(), secret_b.clone())
+    );
+    let results = [
+        (ra.expect("task a"), &inv_a, &ws_a, &secret_a),
+        (rb.expect("task b"), &inv_b, &ws_b, &secret_b),
+    ];
+    let (winners, losers): (Vec<_>, Vec<_>) = results.iter().partition(|(r, ..)| r.is_ok());
+    assert_eq!(
+        (winners.len(), losers.len()),
+        (1, 1),
+        "exactly one accept wins: {results:?}"
+    );
+    let (won, _, won_ws, _) = winners[0];
+    let (lost, lost_inv, lost_ws, lost_secret) = losers[0];
+    assert_eq!(invite_kind(lost), InviteErrorKind::CredentialInvalid);
+    let won = won.as_ref().expect("winner");
+    assert_eq!(won["status"], json!("authorized"));
+    let new_token = won["token"].as_str().expect("token").to_string();
+    assert_ne!(new_token, token);
+
+    let active: Vec<_> = f
+        .store
+        .list_principal_credentials(&guest)
+        .await
+        .expect("credentials")
+        .into_iter()
+        .filter(intent_core::PrincipalCredential::is_active)
+        .map(|c| c.token_hash)
+        .collect();
+    assert_eq!(
+        active,
+        vec![hash_secret(&new_token)],
+        "one active credential"
+    );
+    assert_eq!(
+        f.store
+            .get_workspace_member_role(won_ws, &guest)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Collaborator)
+    );
+    assert_eq!(
+        f.store
+            .get_workspace_member_role(lost_ws, &guest)
+            .await
+            .expect("role"),
+        None,
+        "the loser joined nothing"
+    );
+    let lost_row = f
+        .store
+        .get_workspace_invite(lost_inv)
+        .await
+        .expect("get")
+        .expect("row");
+    assert!(lost_row.redeemed_at.is_none(), "loser's invite stays open");
+
+    // The loser retries with the credential the winner minted.
+    let retry = f
+        .services
+        .invite_accept_op(lost_inv, lost_secret, &new_token)
+        .await
+        .expect("retry with the live credential");
+    assert_eq!(retry["status"], json!("authorized"));
+    assert_eq!(
+        f.store
+            .list_principal_credentials(&guest)
+            .await
+            .expect("credentials")
+            .iter()
+            .filter(|c| c.is_active())
+            .count(),
+        1
+    );
+}
+
+/// A revoke landing between the service-side credential lookup and the join
+/// transaction is caught by the in-transaction consume: the join is refused
+/// `CredentialInvalid`, no credential is minted, no membership is added and
+/// the invite stays open.
+#[tokio::test]
+async fn accept_refuses_a_credential_revoked_between_resolve_and_join() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let (guest, token) = f.first_join(&identity("guest", 4242)).await;
+    let (ws2, invite_id, secret) = f.second_workspace_invite().await;
+
+    let (invite, principal) = f
+        .services
+        .invite_accept_resolve(&invite_id, &secret, &token)
+        .await
+        .expect("resolve sees the live credential");
+    assert_eq!(principal.id, guest);
+    assert!(f
+        .store
+        .revoke_principal_credential(&hash_secret(&token))
+        .await
+        .expect("revoke"));
+
+    let r = f
+        .services
+        .commit_invite_join(&invite, &principal, Some(&hash_secret(&token)))
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::CredentialInvalid);
+    assert!(
+        f.store
+            .list_principal_credentials(&guest)
+            .await
+            .expect("credentials")
+            .iter()
+            .all(|c| !c.is_active()),
+        "no credential minted"
+    );
+    assert_eq!(
+        f.store
+            .get_workspace_member_role(&ws2, &guest)
+            .await
+            .expect("role"),
+        None,
+        "no membership added"
+    );
+    assert!(f
+        .store
+        .get_workspace_invite(&invite_id)
+        .await
+        .expect("get")
+        .expect("row")
+        .redeemed_at
+        .is_none());
+    assert_eq!(f.store.count_principals().await.expect("count"), 4);
+}
+
 // --- gist identity proof: invite.challenge / invite.prove -------------------
 
 /// A gist view created "now" (well after any nonce issued in the test),
