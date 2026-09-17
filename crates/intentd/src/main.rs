@@ -14,10 +14,10 @@ use clap::{Parser, Subcommand};
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{AgentId, Config, ServerControl, WorkspaceApi};
 use intent_services::{
-    agent_memory_budget_bytes, default_process_cap, init_adapter_slots, live_adapters,
-    max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes, AgentManager,
-    BusEventSink, EventBus, GitStatusRefresher, PermissionPolicy, Services, TreeMemoryProbe,
-    TreeSample, WatcherRegistry,
+    agent_memory_budget_bytes, default_process_cap, host_total_memory_bytes, init_adapter_slots,
+    live_adapters, max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes,
+    AgentManager, BusEventSink, EventBus, GitStatusRefresher, PermissionPolicy, Services,
+    TreeMemoryProbe, TreeSample, WatcherRegistry,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -1865,12 +1865,10 @@ async fn cmd_serve(
     // agent's subtree was measured from 436 MB idle to 9.6 GB running a test
     // suite. When installed, the budget reads the same descendant-tree sampler
     // `system.status` reports (intentd#1139) and gates new spawns only — see
-    // [`ProcessRegistry::acquire`].
-    let total_memory_bytes = {
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        sys.total_memory()
-    };
+    // [`ProcessRegistry::acquire`]. The RAM reading is the one the settings
+    // catalog derives `agents.memoryBudgetMb`'s `max` / `defaultValue` from, so
+    // what `settings.get` advertises as auto is what gets installed here.
+    let total_memory_bytes = host_total_memory_bytes().unwrap_or(0);
     let recommended_bytes = recommended_memory_budget_bytes(total_memory_bytes);
     let budget_enabled = if let Some(budget_bytes) =
         agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes)

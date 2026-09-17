@@ -171,10 +171,10 @@ pub use config_watcher::ConfigWatcher;
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
-    import_legacy_settings, max_concurrent_adapters, max_concurrent_agents,
-    migrate_active_provider_setting, migrate_default_vocabulary, migrate_quick_action_settings,
-    report_to_parent_debounce_seconds, tool_payload_retention_days, InMemorySecretStore,
-    SecretStore,
+    host_total_memory_bytes, import_legacy_settings, max_concurrent_adapters,
+    max_concurrent_agents, migrate_active_provider_setting, migrate_default_vocabulary,
+    migrate_quick_action_settings, report_to_parent_debounce_seconds, tool_payload_retention_days,
+    InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};

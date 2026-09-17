@@ -1161,6 +1161,35 @@ async fn agent_memory_knobs_over_wss() {
         "advertised max {max} exceeds the config.toml parse bound — settings.update would \
          accept a value the write path then rejects: {entry}",
     );
+    // The advertised default is the budget this daemon actually installed for
+    // the absent key — `system.status` reports it in bytes — not merely some
+    // positive figure. Boot and the catalog must read the same RAM source: a
+    // catalog-side probe that failed where boot's succeeded once advertised
+    // the 4,096 MB floor on a host running a 12,288 MB budget. The default is
+    // also clamped to `max` so it stays writable through the schema it ships
+    // in; on this host that clamp binds only if RAM is under 4 GiB or over
+    // roughly 2 TiB.
+    let status = wss_rpc(&mut ws, 11, "system.status", json!({})).await;
+    assert_success_envelope(&status, 11);
+    let installed_bytes = status["result"]["agentMemoryBudgetBytes"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("auto installs a budget on a fresh install: {status}"));
+    // MiB counts above 2^53 do not occur; loss-free in f64.
+    #[expect(clippy::cast_precision_loss)]
+    let installed_mb = (installed_bytes / (1024 * 1024)) as f64;
+    // Both sides are whole MiB counts, exact in f64.
+    #[expect(clippy::float_cmp)]
+    let matches_installed = default == installed_mb.min(max);
+    assert!(
+        matches_installed,
+        "defaultValue {default} must equal the installed auto budget in MB (agentMemoryBudgetBytes \
+         {installed_bytes} = {installed_mb} MB), clamped to max {max}: {entry}",
+    );
+    assert!(
+        default <= max,
+        "defaultValue {default} above max {max} — the catalog advertises a default its own \
+         schema rejects: {entry}",
+    );
 
     let entry = settings
         .iter()
