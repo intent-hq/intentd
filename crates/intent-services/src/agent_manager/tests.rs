@@ -1123,6 +1123,245 @@ async fn turn_start_gate_events_carry_memory_budget_reason_without_charge() {
     assert_eq!(charged, Some(gb), "turn-start admission charges nothing");
 }
 
+/// `(agent, event_type, reason)` triples recorded by [`recording_events`].
+type RecordedEvents = Arc<Mutex<Vec<(AgentId, String, String)>>>;
+
+/// Event callback that records `(agent, event_type, reason)` triples.
+fn recording_events() -> (RecordedEvents, super::ProcessEventFn) {
+    let events: RecordedEvents = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let event_fn: super::ProcessEventFn =
+        Arc::new(move |agent_id, event_type, _used, _cap, reason| {
+            let events = events_clone.clone();
+            let agent_id = agent_id.clone();
+            let event_type = event_type.to_string();
+            let reason = reason.to_string();
+            Box::pin(async move {
+                events.lock().unwrap().push((agent_id, event_type, reason));
+            })
+        });
+    (events, event_fn)
+}
+
+/// The `(event_type, reason)` pairs recorded for one agent, in order.
+fn events_for(events: &RecordedEvents, agent: &AgentId) -> Vec<(String, String)> {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(a, _, _)| a == agent)
+        .map(|(_, e, r)| (e.clone(), r.clone()))
+        .collect()
+}
+
+/// A spawn queued behind the budget and admitted by its own timed re-check —
+/// no `deregister` / `mark_idle` fires — must still emit exactly one
+/// `agent:process:resumed`, labelled with the reason it parked under. Without
+/// it the FE's "waiting for memory headroom" banner outlives the wait.
+#[tokio::test]
+async fn timed_recheck_admission_emits_resumed_for_a_queued_spawn() {
+    let gb = super::GB;
+    let (events, event_fn) = recording_events();
+    let reg = Arc::new(ProcessRegistry::new(8).with_event_fn(event_fn)); // Slots free.
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (active, spawning) = (AgentId::from("active"), AgentId::from("spawning"));
+    reg.register(active.clone(), recording_kill(active.clone(), log.clone()));
+    reg.mark_active(&active); // Nothing idle to evict → the spawn queues.
+
+    let reg2 = reg.clone();
+    let spawning2 = spawning.clone();
+    let handle =
+        tokio::spawn(async move { reg2.acquire(&spawning2, claim_all, release_none).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !handle.is_finished(),
+        "over budget with nothing to evict → queued"
+    );
+
+    // The tree drains with no registry event: only the timer admits.
+    probe.set(gb);
+    timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the memory waiter re-checks on its own timer")
+        .expect("task ok");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        events_for(&events, &spawning),
+        vec![
+            (
+                "agent:process:queued".to_string(),
+                "memory-budget".to_string()
+            ),
+            (
+                "agent:process:resumed".to_string(),
+                "memory-budget".to_string()
+            ),
+        ],
+        "one queued, answered by exactly one resumed"
+    );
+    assert!(log.lock().unwrap().is_empty(), "nothing evicted");
+}
+
+/// Same contract for the turn-start gate: a warm idle agent whose turn queued
+/// behind the budget gets its `resumed` when the timer admits it.
+#[tokio::test]
+async fn timed_recheck_admission_emits_resumed_for_a_queued_turn_start() {
+    let gb = super::GB;
+    let (events, event_fn) = recording_events();
+    let reg = Arc::new(ProcessRegistry::new(8).with_event_fn(event_fn));
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let warm = AgentId::from("warm");
+    reg.register(warm.clone(), recording_kill(warm.clone(), log.clone())); // No other idle to evict.
+
+    let reg2 = reg.clone();
+    let warm2 = warm.clone();
+    let handle = tokio::spawn(async move {
+        reg2.acquire_turn_start(&warm2, claim_all, release_none)
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !handle.is_finished(),
+        "over budget with nothing to evict → queued"
+    );
+
+    probe.set(gb);
+    timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the turn-start waiter re-checks on its own timer")
+        .expect("task ok");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        events_for(&events, &warm),
+        vec![
+            (
+                "agent:process:queued".to_string(),
+                "memory-budget".to_string()
+            ),
+            (
+                "agent:process:resumed".to_string(),
+                "memory-budget".to_string()
+            ),
+        ],
+        "one queued, answered by exactly one resumed"
+    );
+    assert!(
+        reg.is_registered(&warm),
+        "the gated agent's process survives"
+    );
+}
+
+/// A waiter whose re-check finds an idle process to reclaim — and admits once
+/// that eviction brings the tree under budget — also emits `resumed`: the
+/// eviction pass is just another road to admission for a spawn that queued.
+#[tokio::test]
+async fn evict_then_admit_emits_resumed_for_a_queued_spawn() {
+    let gb = super::GB;
+    let (events, event_fn) = recording_events();
+    let reg = Arc::new(ProcessRegistry::new(8).with_event_fn(event_fn));
+    // Over budget by half a provisional charge: one eviction's credit clears it.
+    let probe = FakeProbe::new(4 * gb + PROVISIONAL_AGENT_BYTES / 2);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (active, idle, spawning) = (
+        AgentId::from("active"),
+        AgentId::from("idle"),
+        AgentId::from("spawning"),
+    );
+    reg.register(active.clone(), recording_kill(active.clone(), log.clone()));
+    reg.mark_active(&active); // Nothing idle yet → the spawn queues.
+
+    let reg2 = reg.clone();
+    let spawning2 = spawning.clone();
+    let handle =
+        tokio::spawn(async move { reg2.acquire(&spawning2, claim_all, release_none).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !handle.is_finished(),
+        "over budget with nothing to evict → queued"
+    );
+
+    // An idle process appears without waking the waiter (`register` pops no
+    // waiter): the timed re-check finds it, evicts it, and admits.
+    reg.register(idle.clone(), recording_kill(idle.clone(), log.clone()));
+    timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the re-check reclaims the idle process and admits")
+        .expect("task ok");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![idle.clone()],
+        "the idle process was reclaimed"
+    );
+    assert_eq!(
+        events_for(&events, &spawning),
+        vec![
+            (
+                "agent:process:queued".to_string(),
+                "memory-budget".to_string()
+            ),
+            (
+                "agent:process:resumed".to_string(),
+                "memory-budget".to_string()
+            ),
+        ],
+        "queued once, resumed exactly once after the eviction pass"
+    );
+    assert_eq!(
+        events_for(&events, &idle),
+        vec![(
+            "agent:process:evicted".to_string(),
+            "memory-budget".to_string()
+        )]
+    );
+}
+
+/// A spawn admitted on its first check never queued, so it emits nothing —
+/// `resumed` is owed only to a waiter that emitted `queued`.
+#[tokio::test]
+async fn immediate_admission_emits_no_process_events() {
+    let gb = super::GB;
+    let (events, event_fn) = recording_events();
+    let reg = Arc::new(ProcessRegistry::new(8).with_event_fn(event_fn));
+    let probe = FakeProbe::new(gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (warm, spawning) = (AgentId::from("warm"), AgentId::from("spawning"));
+    reg.register(warm.clone(), recording_kill(warm.clone(), log.clone()));
+
+    timeout(
+        Duration::from_millis(200),
+        reg.acquire(&spawning, claim_all, release_none),
+    )
+    .await
+    .expect("under budget with a slot free admits immediately");
+    timeout(
+        Duration::from_millis(200),
+        reg.acquire_turn_start(&warm, claim_all, release_none),
+    )
+    .await
+    .expect("under budget admits the warm agent's turn immediately");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "no queued, resumed, or evicted event for an immediate admission"
+    );
+    assert!(log.lock().unwrap().is_empty(), "nothing evicted");
+}
+
 #[tokio::test]
 async fn lifecycle_active_processes_are_not_reaped() {
     let reg = ProcessRegistry::new(8);

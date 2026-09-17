@@ -1366,9 +1366,35 @@ impl ProcessRegistry {
         }
     }
 
+    /// Log + emit `agent:process:resumed` for a waiter that admitted itself —
+    /// on its timed re-check or after an eviction pass — rather than through a
+    /// [`Self::deregister`] / [`Self::mark_idle`] wakeup (those emit it when
+    /// they pop the waiter). `reason` is the label the waiter last queued
+    /// under; `None` means it never queued, or the wakeup already delivered
+    /// the event for this wait, and nothing is emitted.
+    fn emit_self_resumed(&self, agent_id: &AgentId, reason: Option<&'static str>) {
+        let Some(reason) = reason else { return };
+        let used = self.size();
+        tracing::info!(
+            agent = %agent_id,
+            used = used,
+            cap = self.cap,
+            reason = reason,
+            "process registry: queued spawn resumed"
+        );
+        if let Some(ref f) = self.event_fn {
+            let fut = f(agent_id, "agent:process:resumed", used, self.cap, reason);
+            tokio::spawn(fut);
+        }
+    }
+
     /// Ensure a slot is free before spawning: returns immediately under the cap,
     /// otherwise evicts the LRU idle process, or queues until one frees. Logs +
-    /// emits `agent:process:queued` / `agent:process:evicted` via the event callback.
+    /// emits `agent:process:queued` / `agent:process:evicted` via the event
+    /// callback, and `agent:process:resumed` when a waiter that queued is
+    /// admitted by its own re-check (a wakeup from [`Self::deregister`] /
+    /// [`Self::mark_idle`] emits it there instead) — every `queued` is
+    /// answered by exactly one `resumed` whichever path admits.
     ///
     /// When an aggregate memory budget is installed (monorepo#2063), being over
     /// budget denies admission on exactly the same terms as being at the slot
@@ -1418,6 +1444,11 @@ impl ProcessRegistry {
         // them: the next iteration queues as a waiter (timed) instead of
         // re-snapshotting the same unclaimable candidates in a hot loop.
         let mut wait_pass = false;
+        // The reason this waiter last emitted `agent:process:queued` under and
+        // still owes a `resumed` for. Cleared when a `deregister` / `mark_idle`
+        // wakeup lands (that path emits `resumed` as it pops the waiter); an
+        // admission reached any other way emits it via `emit_self_resumed`.
+        let mut owed_resume: Option<&'static str> = None;
         loop {
             enum Action {
                 Slot,
@@ -1485,6 +1516,7 @@ impl ProcessRegistry {
                         let fut = f(agent_id, "agent:process:queued", used, self.cap, reason);
                         tokio::spawn(fut);
                     }
+                    owed_resume = Some(reason);
                     // A claim-contention wait re-checks on a timer too: the
                     // contending sweep may release its claim (re-validation
                     // reject) without any deregister to wake this waiter.
@@ -1492,7 +1524,10 @@ impl ProcessRegistry {
                 }
             };
             match action {
-                Action::Slot => return,
+                Action::Slot => {
+                    self.emit_self_resumed(agent_id, owed_resume);
+                    return;
+                }
                 Action::Evict(candidates, reason) => {
                     let mut evicted_one = false;
                     for (id, kill) in candidates {
@@ -1546,14 +1581,24 @@ impl ProcessRegistry {
                     // same candidates in a hot loop.
                     wait_pass = !evicted_one;
                 }
-                Action::Wait(rx, true) => {
+                Action::Wait(mut rx, true) => {
                     // Memory can fall with no registry event to wake us — an
                     // agent's own children exiting frees the tree without any
                     // process being deregistered — so re-evaluate on a timer.
-                    let _ = tokio::time::timeout(BUDGET_RECHECK, rx).await;
+                    // A wakeup that raced the timer still counts as delivered:
+                    // its sender already emitted `resumed` for this wait.
+                    let woken = match tokio::time::timeout(BUDGET_RECHECK, &mut rx).await {
+                        Ok(received) => received.is_ok(),
+                        Err(_elapsed) => rx.try_recv().is_ok(),
+                    };
+                    if woken {
+                        owed_resume = None;
+                    }
                 }
                 Action::Wait(rx, false) => {
-                    let _ = rx.await;
+                    if rx.await.is_ok() {
+                        owed_resume = None;
+                    }
                 }
             }
         }
@@ -1595,6 +1640,9 @@ impl ProcessRegistry {
         // Same forced-wait handoff as `acquire`: an eviction pass that could
         // claim nothing queues (timed) instead of re-snapshotting hot.
         let mut wait_pass = false;
+        // Same `resumed` bookkeeping as `acquire`: the label this waiter still
+        // owes a `resumed` for, if it queued and no wakeup delivered it.
+        let mut owed_resume: Option<&'static str> = None;
         loop {
             enum Action {
                 Admit,
@@ -1645,6 +1693,7 @@ impl ProcessRegistry {
                             );
                             tokio::spawn(fut);
                         }
+                        owed_resume = Some(REASON_MEMORY_BUDGET);
                         Action::Wait(rx)
                     } else {
                         Action::Evict(candidates)
@@ -1654,7 +1703,10 @@ impl ProcessRegistry {
                 }
             };
             match action {
-                Action::Admit => return,
+                Action::Admit => {
+                    self.emit_self_resumed(agent_id, owed_resume);
+                    return;
+                }
                 Action::Evict(candidates) => {
                     let mut evicted_one = false;
                     for (id, kill) in candidates {
@@ -1701,10 +1753,17 @@ impl ProcessRegistry {
                     }
                     wait_pass = !evicted_one;
                 }
-                Action::Wait(rx) => {
+                Action::Wait(mut rx) => {
                     // Memory can fall with no registry event to wake us (same
                     // as the `acquire` budget wait), so re-evaluate on a timer.
-                    let _ = tokio::time::timeout(BUDGET_RECHECK, rx).await;
+                    // A wakeup that raced the timer still counts as delivered.
+                    let woken = match tokio::time::timeout(BUDGET_RECHECK, &mut rx).await {
+                        Ok(received) => received.is_ok(),
+                        Err(_elapsed) => rx.try_recv().is_ok(),
+                    };
+                    if woken {
+                        owed_resume = None;
+                    }
                 }
             }
         }
