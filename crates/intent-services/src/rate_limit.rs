@@ -52,29 +52,26 @@ pub(crate) fn pause_duration(reset_unix: Option<u64>, now_unix: u64) -> Duration
 /// The fixed prefix of the pause annotation carried in a PR monitor's
 /// `lastError` while the gate is closed — the marker by which an earlier
 /// annotation is found and replaced (a deadline extension, a re-stamp), in
-/// Rust ([`annotate_pause_error`]) and in SQL
-/// (`Store::annotate_active_pr_monitors_pause`) alike.
-pub(crate) const PAUSE_ERROR_MARKER: &str = "rate limited; PR monitor polling paused";
+/// Rust ([`annotate_pause_error`]) and in SQL alike. The store owns the
+/// shape: its guarded write-backs compose on it
+/// (`intent_store::PrMonitorPollUpdate::last_error`).
+pub(crate) use intent_store::{
+    pr_monitor_pause_error as pause_error, PR_MONITOR_PAUSE_MARKER as PAUSE_ERROR_MARKER,
+};
 
 /// Separator between a genuine fetch error and the pause annotation
 /// appended to it.
 pub(crate) const PAUSE_ERROR_SEPARATOR: &str = "; ";
 
-/// The pause annotation naming the gate's RFC 3339 deadline (`None` only in
-/// the window between the deadline elapsing and the gate re-opening).
-pub(crate) fn pause_error(until: Option<&str>) -> String {
-    match until {
-        Some(until) => format!("{PAUSE_ERROR_MARKER} until {until}"),
-        None => PAUSE_ERROR_MARKER.to_string(),
-    }
-}
-
-/// The `lastError` a monitor carries while the gate is closed: `error` (a
-/// genuine fetch error, or `None` after a successful poll) with the current
-/// pause annotation appended. An annotation already present in `error` —
-/// from an earlier stamp, or a fetch that itself hit the limit — is replaced,
-/// never repeated, so the row always names the CURRENT deadline and a
-/// genuine error survives any number of re-stamps.
+/// The `lastError` a monitor's write-back CARRIES while the gate is closed:
+/// `error` (a genuine fetch error, or `None` after a successful poll) with
+/// the current pause annotation appended. An annotation already present in
+/// `error` — from an earlier stamp, or a fetch that itself hit the limit —
+/// is replaced, never repeated. This is the caller's side of the
+/// composition only: the store re-composes the landed value against the
+/// row's current annotation in SQL, so a stamp that overtook this gate read
+/// (a pause opening or extending between the read and the write) keeps its
+/// later deadline regardless of what was captured here.
 pub(crate) fn annotate_pause_error(error: Option<&str>, pause: &str) -> String {
     let genuine = error
         .map(|e| match e.find(PAUSE_ERROR_MARKER) {

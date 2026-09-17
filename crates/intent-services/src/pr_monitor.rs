@@ -2404,7 +2404,9 @@ impl Services {
         // A success clears the error — except that while the global
         // rate-limit gate is closed the row keeps the pause annotation
         // (this poll was in flight when the pause opened, or rode a sibling's
-        // cached fetch): the next refresh is the post-pause one.
+        // cached fetch): the next refresh is the post-pause one. The store
+        // re-composes this against the row's current annotation, so a pause
+        // stamped between this gate read and the write-back is kept too.
         let last_error = self.pr_monitor_last_error(None);
         if !self
             .store
@@ -2684,9 +2686,9 @@ impl Services {
 
     /// Persist a failed poll's error without disturbing the baseline or the
     /// pending state; while the global rate-limit gate is closed the pause
-    /// annotation rides along ([`Services::pr_monitor_last_error`]).
-    /// Best-effort — a store failure on the error path is logged, never
-    /// propagated.
+    /// annotation rides along ([`Services::pr_monitor_last_error`]), and the
+    /// store keeps a later one already stamped on the row. Best-effort — a
+    /// store failure on the error path is logged, never propagated.
     async fn record_pr_monitor_error(&self, monitor: &PrMonitor, error: &str) {
         let now = now_iso();
         let last_error = self.pr_monitor_last_error(Some(error));
@@ -7247,6 +7249,31 @@ mod tests {
         format!("rate limited; PR monitor polling paused until {until}")
     }
 
+    /// Simulate the pause window elapsing without waiting out the minimum
+    /// pause: the gate re-opens, and every active row's pause annotation
+    /// is rewritten to name a deadline in the past — in production the same
+    /// text simply ages past `now`, which is all the store's write-back
+    /// floor looks at when deciding whether an annotation still stands.
+    async fn elapse_pause(svc: &Services) {
+        svc.sweep_rate_limit.clear();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .cast_signed();
+        let elapsed =
+            crate::rate_limit::pause_error(Some(&intent_core::iso_from_unix_secs(now_unix - 60)));
+        sqlx::query(
+            "UPDATE pr_monitor SET last_error = substr(last_error, 1, instr(last_error, ?2) - 1) || ?1 \
+             WHERE state = 'active' AND instr(COALESCE(last_error, ''), ?2) > 0",
+        )
+        .bind(&elapsed)
+        .bind(crate::rate_limit::PAUSE_ERROR_MARKER)
+        .execute(svc.store().write_pool())
+        .await
+        .expect("age the pause annotations");
+    }
+
     /// A forge fetch failing with the quota-exhausted error pauses the
     /// global sweep rate-limit gate (monorepo#2961): the sweep stops
     /// fetching further PRs, EVERY active monitor — the rate-limited PR's
@@ -7347,7 +7374,7 @@ mod tests {
 
         // Pause window over: polling resumes and the first successful poll
         // clears the pause error.
-        svc.sweep_rate_limit.clear();
+        elapse_pause(&svc).await;
         svc.poll_pr_monitors().await;
         let mut fetched = forge.take_fetched_numbers();
         fetched.sort_unstable();
@@ -7420,7 +7447,7 @@ mod tests {
         }
 
         // Pause window over: the skipped PRs are polled on the next sweep.
-        svc.sweep_rate_limit.clear();
+        elapse_pause(&svc).await;
         svc.poll_pr_monitors().await;
         let mut fetched = forge.take_fetched_numbers();
         fetched.sort_unstable();
@@ -7499,7 +7526,7 @@ mod tests {
 
             // Pause window over and quota back: the poll succeeds, clears
             // the pause error and only now records the change.
-            svc.sweep_rate_limit.clear();
+            elapse_pause(&svc).await;
             forge.edit(|s| {
                 s.rate_limit_list_reviews = false;
                 s.rate_limit_list_comments = false;
@@ -7602,7 +7629,7 @@ mod tests {
         // The first post-pause sweep clears the pause on every monitor,
         // completes PR 1's monitor and wakes its owner; `pausedUntil` is
         // gone from the rows.
-        svc.sweep_rate_limit.clear();
+        elapse_pause(&svc).await;
         forge.edit(|s| {
             s.rate_limit_get_pr = false;
             s.pr_state = PrState::Merged;
@@ -7698,7 +7725,7 @@ mod tests {
 
         // Resume: PR 1 still fails, PR 2 answers — each `lastError` is its
         // own fetch's again, with no pause annotation left over.
-        svc.sweep_rate_limit.clear();
+        elapse_pause(&svc).await;
         let state = Arc::clone(&forge.state);
         forge.set_on_get_pr(Some(Box::new(move |number| {
             let mut s = state.lock().unwrap();
@@ -7805,7 +7832,7 @@ mod tests {
         );
 
         // The first post-pause poll clears everything the pause left.
-        svc.sweep_rate_limit.clear();
+        elapse_pause(&svc).await;
         svc.poll_pr_monitors().await;
         let resumed = svc
             .store()
@@ -7817,6 +7844,114 @@ mod tests {
         let row = &listed["monitors"].as_array().unwrap()[0];
         assert!(row.get("pausedUntil").is_none(), "{row}");
         assert!(row.get("lastError").is_none(), "{row}");
+    }
+
+    /// The gate-to-SQL schedules: `poll_one_pr_monitor` and
+    /// `record_pr_monitor_error` read the gate in Rust, then issue a guarded
+    /// UPDATE the bulk stamp cannot fail (it leaves `updated_at` alone). A
+    /// pause that OPENS between the two (gate read open → `None` captured)
+    /// or EXTENDS between the two (T1 captured, row already at T2) must not
+    /// be clobbered by the stale capture. Driven deterministically: the gate
+    /// is held at what the capture saw while the production stamp is landed
+    /// on the row ahead of the write-back — to the UPDATE, indistinguishable
+    /// from the stamp racing in after the read.
+    #[tokio::test]
+    async fn a_stamp_landing_between_the_gate_read_and_the_write_back_is_kept() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let (monitor, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 1)
+            .await
+            .expect("register");
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .cast_signed();
+        let read = |svc: &Services| {
+            let store = svc.store().clone();
+            let id = monitor.monitor_id.clone();
+            async move { store.get_pr_monitor(&id).await.unwrap() }
+        };
+        let pause_at = |secs_from_now: i64| {
+            crate::rate_limit::pause_error(Some(&intent_core::iso_from_unix_secs(
+                now_unix + secs_from_now,
+            )))
+        };
+
+        // Schedule 1 — the pause OPENS after the gate read: the gate is
+        // open (the capture is `None`), the row carries the fresh stamp.
+        let t1 = pause_at(600);
+        let in_flight = read(&svc).await;
+        assert!(svc.sweep_rate_limit_paused_until().is_none());
+        forge.edit(|s| s.conversation_comments = 3);
+        let shared = fetch_shared_snapshot(sc.as_ref(), &monitor.repo(), 1)
+            .await
+            .expect("fetch");
+        assert_eq!(
+            svc.store()
+                .annotate_active_pr_monitors_pause(&t1)
+                .await
+                .unwrap(),
+            1
+        );
+        svc.poll_one_pr_monitor(&in_flight, &shared)
+            .await
+            .expect("the guarded write-back lands");
+        let landed = read(&svc).await;
+        assert_ne!(landed.updated_at, in_flight.updated_at, "the poll landed");
+        assert_eq!(
+            landed.last_error.as_deref(),
+            Some(t1.as_str()),
+            "a `None` captured before the pause opened must not clobber it"
+        );
+        svc.record_pr_monitor_error(&landed, "forge down").await;
+        assert_eq!(
+            read(&svc).await.last_error,
+            Some(format!("forge down; {t1}")),
+            "an error captured before the pause opened composes with it"
+        );
+
+        // Schedule 2 — the pause EXTENDS after the gate read: the gate says
+        // T1 (the capture composes T1), the row already names T2.
+        svc.sweep_rate_limit.pause_for(Duration::from_secs(600));
+        let gate_t1 = expected_pause_error(&svc);
+        assert!(gate_t1 >= t1, "{gate_t1} >= {t1}");
+        let t2 = pause_at(1800);
+        assert!(t2 > gate_t1, "{t2} > {gate_t1}");
+        let in_flight = read(&svc).await;
+        forge.edit(|s| s.conversation_comments = 4);
+        let shared = fetch_shared_snapshot(sc.as_ref(), &monitor.repo(), 1)
+            .await
+            .expect("fetch");
+        assert_eq!(
+            svc.store()
+                .annotate_active_pr_monitors_pause(&t2)
+                .await
+                .unwrap(),
+            1
+        );
+        svc.poll_one_pr_monitor(&in_flight, &shared)
+            .await
+            .expect("the guarded write-back lands");
+        let landed = read(&svc).await;
+        assert_ne!(landed.updated_at, in_flight.updated_at, "the poll landed");
+        assert_eq!(
+            landed.last_error.as_deref(),
+            Some(t2.as_str()),
+            "a T1 captured before the extension must not roll the row back"
+        );
+        svc.record_pr_monitor_error(&landed, "forge down").await;
+        assert_eq!(
+            read(&svc).await.last_error,
+            Some(format!("forge down; {t2}")),
+            "an error composed with T1 lands in front of the row's T2"
+        );
+
+        // The first post-pause poll still clears everything.
+        elapse_pause(&svc).await;
+        svc.poll_pr_monitors().await;
+        assert_eq!(read(&svc).await.last_error, None);
     }
 
     /// A trigger that EXTENDS an active pause re-annotates every active row

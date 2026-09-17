@@ -4532,14 +4532,21 @@ impl Services {
         rate_limit::pause_error(self.sweep_rate_limit_paused_until().as_deref())
     }
 
-    /// The `lastError` to persist for a PR monitor given `error` — a genuine
-    /// fetch error, or `None` after a successful poll. While the gate is
-    /// closed the current pause annotation is appended
+    /// The `lastError` a PR monitor write-back carries given `error` — a
+    /// genuine fetch error, or `None` after a successful poll. While the
+    /// gate is closed the current pause annotation is appended
     /// ([`rate_limit::annotate_pause_error`]): a poll that lands mid-pause
     /// (in flight when the pause opened, or a sibling's cached fetch) must
     /// not strip the deadline the row will otherwise sit on unrefreshed for
     /// the rest of the blackout. With the gate open, `error` passes through
     /// — the first post-pause poll is what clears the annotation.
+    ///
+    /// This gate read is NOT what the row ends up with on its own: the store
+    /// composes the landed `last_error` against the row's current
+    /// annotation in SQL (`PrMonitorPollUpdate::last_error`), so a pause
+    /// that opens or extends between this read and the guarded write —
+    /// which the bulk stamp cannot fail, as it leaves `updated_at` alone —
+    /// keeps its later deadline instead of being clobbered by this capture.
     pub(crate) fn pr_monitor_last_error(&self, error: Option<&str>) -> Option<String> {
         match self.sweep_rate_limit_paused_until() {
             Some(until) => Some(rate_limit::annotate_pause_error(
@@ -4568,8 +4575,9 @@ impl Services {
     /// and a trigger that EXTENDS the deadline re-annotates so every row
     /// names the current deadline — independent of the WARN coalescing. The
     /// annotation leaves the rows' concurrency token alone (see
-    /// [`Store::annotate_active_pr_monitors_pause`]); the first successful
-    /// post-pause poll clears it.
+    /// [`Store::annotate_active_pr_monitors_pause`]) and an in-flight poll's
+    /// write-back composes with it in SQL, whichever lands first; the first
+    /// successful post-pause poll clears it.
     async fn pause_sweeps_for_rate_limit(
         &self,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
@@ -4596,10 +4604,7 @@ impl Services {
         }
         match self
             .store
-            .annotate_active_pr_monitors_pause(
-                &rate_limit::pause_error(until.as_deref()),
-                rate_limit::PAUSE_ERROR_MARKER,
-            )
+            .annotate_active_pr_monitors_pause(&rate_limit::pause_error(until.as_deref()))
             .await
         {
             Ok(stamped) => tracing::debug!(
