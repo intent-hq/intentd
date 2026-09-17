@@ -93,7 +93,10 @@ pub(crate) const PAUSE_ERROR_SEPARATOR: &str = "; ";
 /// composition only: the store re-composes the landed value against the
 /// row's current annotation in SQL, so a stamp that overtook this gate read
 /// (a pause opening or extending between the read and the write) keeps its
-/// later deadline regardless of what was captured here.
+/// later deadline regardless of what was captured here — and a clear that
+/// overtook it (the pause lifted between the read and the write) stays
+/// cleared: the row decides whether a pause is in force, this capture can
+/// only move an annotation the row already carries to a later deadline.
 pub(crate) fn annotate_pause_error(error: Option<&str>, pause: &str) -> String {
     let genuine = error
         .map(|e| match e.find(PAUSE_ERROR_MARKER) {
@@ -120,14 +123,36 @@ struct PauseDeadline {
 }
 
 /// The shared pause state. Interior-mutable so one instance can sit in an
-/// `Arc` across [`crate::Services`] clones; the mutex is only ever held for
-/// a read/compare/store, never across an await.
+/// `Arc` across [`crate::Services`] clones; the `paused_until` mutex is
+/// only ever held for a read/compare/store, never across an await.
+///
+/// `reconcile` serializes a gate TRANSITION with the persisted-annotation
+/// statement that reconciles the PR monitor rows to it — a pause opening
+/// or extending with its bulk stamp, a lift or a boot check with its bulk
+/// clear ([`crate::Services::pause_sweeps_for_rate_limit`],
+/// [`crate::Services::maybe_lift_rate_limit_pause`],
+/// [`crate::Services::rehydrate_pr_monitors`]). Without it the two are
+/// separate operations, and `SQLite`'s single writer only orders the
+/// statements: a lift's clear delayed past a fresh trigger's stamp erased
+/// the new pause while the gate held it (intent-hq/intentd#1945). Held
+/// across the statement's await, so it is the async mutex; never taken by
+/// the per-row write-backs, which the store composes against the row.
 #[derive(Default)]
 pub(crate) struct RateLimitGate {
     paused_until: std::sync::Mutex<Option<PauseDeadline>>,
+    reconcile: tokio::sync::Mutex<()>,
 }
 
 impl RateLimitGate {
+    /// Hold the gate's transition-and-reconciliation critical section: a
+    /// transition ([`Self::pause_for`], [`Self::lift`], or a read that
+    /// decides a clear) and the statement reconciling the rows to it run
+    /// under this guard, so no other transition can slip between them.
+    /// Never held across a forge call — probe first, then lock.
+    pub(crate) async fn reconcile(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.reconcile.lock().await
+    }
+
     fn active_deadline(&self) -> Option<PauseDeadline> {
         let deadline = (*self.paused_until.lock().expect("gate lock"))?;
         (deadline.at > Instant::now()).then_some(deadline)

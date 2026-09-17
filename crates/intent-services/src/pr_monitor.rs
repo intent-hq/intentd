@@ -2744,7 +2744,9 @@ impl Services {
     /// surfaces do not report a pause the new process is not observing;
     /// a still-exhausted quota re-pauses (and re-stamps) on the first poll.
     /// A caller running while the gate IS paused (a transfer import) leaves
-    /// them in place.
+    /// them in place — the check and the clear run under the gate's
+    /// reconcile lock, so a pause opening between the two cannot have its
+    /// fresh stamp erased.
     ///
     /// # Errors
     ///
@@ -2754,8 +2756,11 @@ impl Services {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn rehydrate_pr_monitors(&self) -> Result<usize> {
-        if !self.sweeps_rate_limited() {
-            self.clear_pr_monitor_pause_annotations().await;
+        {
+            let _reconcile = self.sweep_rate_limit.reconcile().await;
+            if !self.sweeps_rate_limited() {
+                self.clear_pr_monitor_pause_annotations(None).await;
+            }
         }
         let monitors = self.store.load_active_pr_monitors().await?;
         let mut resumed = 0;
@@ -7428,7 +7433,11 @@ mod tests {
     /// only at the top of the sweep: when a sibling sweep (PR refresh, git
     /// roots) pauses the gate while this sweep is mid-flight, the PRs not
     /// fetched yet are skipped — no further forge calls, rows untouched —
-    /// while the PR fetched before the pause still completes its poll.
+    /// while the PR fetched before the pause still completes its poll. The
+    /// sibling's transition is simulated bare (no stamp): the poll landing
+    /// on the still-bare row introduces no annotation of its own — the
+    /// stamp is the sibling's, landed right behind its transition under
+    /// the reconcile lock — and composes with it once it lands.
     #[tokio::test]
     async fn a_gate_paused_mid_sweep_by_a_sibling_stops_the_remaining_fetches() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
@@ -7474,9 +7483,8 @@ mod tests {
             "the PR fetched before the pause completes its poll"
         );
         assert_eq!(
-            first.last_error,
-            Some(expected_pause_error(&svc)),
-            "a poll landing while the gate is closed keeps the pause annotation"
+            first.last_error, None,
+            "a poll landing on a row the sibling's stamp has not reached introduces no annotation"
         );
         for (id, previous) in ids[1..].iter().zip(&before[1..]) {
             assert_eq!(
@@ -7485,6 +7493,24 @@ mod tests {
                 "PRs not reached before the pause keep their previous row"
             );
         }
+        // The sibling's stamp lands: every active row, the polled one
+        // included, names the deadline.
+        let pause_error = expected_pause_error(&svc);
+        assert_eq!(
+            svc.store()
+                .annotate_active_pr_monitors_pause(&pause_error)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            svc.store()
+                .get_pr_monitor(&ids[0])
+                .await
+                .unwrap()
+                .last_error,
+            Some(pause_error)
+        );
 
         // Pause window over: the skipped PRs are polled on the next sweep.
         elapse_pause(&svc).await;
@@ -8361,6 +8387,176 @@ mod tests {
                 Some(persisted),
             ]
         );
+    }
+
+    /// intent-hq/intentd#1945 (review r4033765063): a write-back that read
+    /// the gate closed BEFORE an early lift lands after the lift's clear —
+    /// the clear moves no guard token — carrying the lifted, unexpired
+    /// annotation. It must not resurrect it: the row was cleared, so the
+    /// landed `lastError` is empty (a genuine error lands alone), and the
+    /// next sweep stays clean. Driven deterministically like
+    /// [`a_stamp_landing_between_the_gate_read_and_the_write_back_is_kept`]:
+    /// the gate is held at what the capture saw while the production clear
+    /// is landed ahead of the write-back — to the UPDATE, indistinguishable
+    /// from the lift racing in after the gate read.
+    #[tokio::test]
+    async fn a_stale_pre_lift_capture_landing_after_the_clear_introduces_no_pause() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let (monitor, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 1)
+            .await
+            .expect("register");
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        forge.edit(|s| s.rate_limit_reset_at = Some(now_unix + 3600));
+        svc.pause_sweeps_for_rate_limit(&sc, "quota").await;
+        let pause_error = expected_pause_error(&svc);
+        let read = |svc: &Services| {
+            let store = svc.store().clone();
+            let id = monitor.monitor_id.clone();
+            async move { store.get_pr_monitor(&id).await.unwrap() }
+        };
+
+        // The row image a sweep read mid-pause, and the fetch it completed.
+        let in_flight = read(&svc).await;
+        assert_eq!(in_flight.last_error.as_deref(), Some(pause_error.as_str()));
+        forge.edit(|s| s.conversation_comments = 3);
+        let shared = fetch_shared_snapshot(sc.as_ref(), &monitor.repo(), 1)
+            .await
+            .expect("fetch");
+
+        // The lift's reconciliation lands first; the write-back still
+        // captures the closed gate.
+        assert_eq!(
+            svc.store()
+                .clear_active_pr_monitors_pause(Some(&pause_error))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            svc.sweeps_rate_limited(),
+            "the capture reads the gate closed"
+        );
+        svc.poll_one_pr_monitor(&in_flight, &shared)
+            .await
+            .expect("the guarded write-back lands");
+        let landed = read(&svc).await;
+        assert_ne!(landed.updated_at, in_flight.updated_at, "the poll landed");
+        assert_ne!(landed.last_snapshot, in_flight.last_snapshot);
+        assert_eq!(
+            landed.last_error, None,
+            "the stale capture does not resurrect the cleared pause"
+        );
+
+        // A genuine error captured with the stale annotation lands alone.
+        svc.record_pr_monitor_error(&landed, "forge down").await;
+        assert_eq!(read(&svc).await.last_error.as_deref(), Some("forge down"));
+
+        // The gate is open (the lift the clear belonged to); the next sweep
+        // finds nothing to clear and reports no pause.
+        assert!(svc.sweep_rate_limit.lift());
+        svc.poll_pr_monitors().await;
+        assert_eq!(read(&svc).await.last_error, None);
+        let listed = svc.pr_monitor_list_op(&ws, Some(&owner)).await.unwrap();
+        let row = &listed["monitors"].as_array().unwrap()[0];
+        assert!(row.get("pausedUntil").is_none(), "{row}");
+        assert!(row.get("lastError").is_none(), "{row}");
+    }
+
+    /// intent-hq/intentd#1945 (review r4033765051): a gate transition and
+    /// the statement reconciling the rows to it are one critical section
+    /// ([`crate::rate_limit::RateLimitGate::reconcile`]). A trigger's
+    /// pause + stamp, a lift's lift + clear, and boot's check + clear each
+    /// wait for a held section as a whole — the gate does not move and no
+    /// row changes until it is released — so a lift's clear can no longer
+    /// land between a fresh trigger's transition and its stamp (nor the
+    /// reverse), the schedule in which the delayed clear erased the new
+    /// pause while the gate held it.
+    #[tokio::test]
+    async fn gate_transitions_and_their_reconciliation_serialize_on_the_gate() {
+        async fn settle() {
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let (monitor, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 1)
+            .await
+            .expect("register");
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        forge.edit(|s| s.rate_limit_reset_at = Some(now_unix + 3600));
+        let last_error = |svc: &Services| {
+            let store = svc.store().clone();
+            let id = monitor.monitor_id.clone();
+            async move { store.get_pr_monitor(&id).await.unwrap().last_error }
+        };
+
+        // A trigger: neither the gate nor the row moves while the section
+        // is held; both move once it is released.
+        let held = svc.sweep_rate_limit.reconcile().await;
+        let trigger = tokio::spawn({
+            let (svc, sc) = (svc.clone(), sc.clone());
+            async move { svc.pause_sweeps_for_rate_limit(&sc, "quota").await }
+        });
+        settle().await;
+        assert!(!trigger.is_finished(), "the trigger waits for the section");
+        assert!(
+            svc.sweep_rate_limit_paused_until().is_none(),
+            "the gate does not move under a held section"
+        );
+        assert_eq!(last_error(&svc).await, None, "nor is a stamp landed");
+        drop(held);
+        trigger.await.unwrap();
+        let pause_error = expected_pause_error(&svc);
+        assert_eq!(last_error(&svc).await, Some(pause_error.clone()));
+
+        // A lift: the probe runs, then the lift + clear wait for the section.
+        forge.edit(|s| {
+            s.rate_limit_remaining = Some(5_000);
+            s.rate_limit_limit = Some(5_000);
+        });
+        let held = svc.sweep_rate_limit.reconcile().await;
+        let lift = tokio::spawn({
+            let (svc, sc) = (svc.clone(), sc.clone());
+            async move { svc.maybe_lift_rate_limit_pause(&sc).await }
+        });
+        settle().await;
+        assert!(!lift.is_finished(), "the lift waits for the section");
+        assert!(svc.sweeps_rate_limited(), "the gate stays closed");
+        assert_eq!(last_error(&svc).await, Some(pause_error.clone()));
+        drop(held);
+        assert!(lift.await.unwrap(), "the pause lifted");
+        assert!(!svc.sweeps_rate_limited());
+        assert_eq!(last_error(&svc).await, None);
+
+        // Boot's check + clear wait too.
+        assert_eq!(
+            svc.store()
+                .annotate_active_pr_monitors_pause(&pause_error)
+                .await
+                .unwrap(),
+            1
+        );
+        let held = svc.sweep_rate_limit.reconcile().await;
+        let boot = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.rehydrate_pr_monitors().await }
+        });
+        settle().await;
+        assert!(!boot.is_finished(), "rehydration waits for the section");
+        assert_eq!(last_error(&svc).await, Some(pause_error.clone()));
+        drop(held);
+        assert_eq!(boot.await.unwrap().unwrap(), 1);
+        assert_eq!(last_error(&svc).await, None);
     }
 
     /// Sibling monitors on one PR count once toward the effective interval
