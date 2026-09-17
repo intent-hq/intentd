@@ -139,9 +139,9 @@ pub enum Error {
     /// key off machine-readably (multiplayer w4): the invite is unknown /
     /// expired / revoked / already redeemed, the pinned GitHub login does not
     /// match the authorizing account, the owner has no GitHub identity to
-    /// invite from, or the identity-only device flow was denied / expired /
-    /// is not known. Surfaces as `-32602` (`-32603` for the daemon-side
-    /// conditions) with `error.data = { code: kind.as_str() }`.
+    /// invite from, or the gist identity proof did not check out. Surfaces
+    /// as `-32602` (`-32603` for the daemon-side conditions) with
+    /// `error.data = { code: kind.as_str() }`.
     #[error("{}", .0.message())]
     Invite(InviteErrorKind),
 
@@ -219,16 +219,9 @@ pub enum InviteErrorKind {
     /// The primary user's GitHub identity cannot change while other
     /// principals or open invites exist (reconnect guard).
     IdentityLocked,
-    /// The invitee denied the identity-only device flow.
-    FlowDenied,
-    /// The identity-only device flow's codes expired before authorization.
-    FlowExpired,
-    /// Polling the identity-only device flow failed repeatedly.
-    FlowError,
-    /// No identity-only device flow has this id (or its result was already
-    /// collected).
-    FlowNotFound,
-    /// Too many identity-only device flows are in flight; retry later.
+    /// Too many unauthenticated invite requests are in flight (the
+    /// transport's admission budget or the outstanding-nonce cap); retry
+    /// later.
     FlowBusy,
     /// The workspace's guest cap (`sharing.maxGuestsPerWorkspace`) is spent
     /// by its collaborators plus open invites; no further invite is minted.
@@ -237,7 +230,7 @@ pub enum InviteErrorKind {
     /// is refused and the invite stays open.
     WorkspaceFull,
     /// The `credential` an `invite.accept` presented is unknown to this host
-    /// or was revoked; the guest must redeem through the device flow.
+    /// or was revoked; the guest must join through the gist identity proof.
     CredentialInvalid,
     /// The gist an `invite.prove` named does not prove the claimed login:
     /// unknown gist, another owner, no proof file or a first line that is
@@ -265,10 +258,6 @@ impl InviteErrorKind {
             InviteErrorKind::PinUnknown => "invite-pin-unknown",
             InviteErrorKind::GithubIdentityRequired => "github-identity-required",
             InviteErrorKind::IdentityLocked => "primary-identity-locked",
-            InviteErrorKind::FlowDenied => "invite-flow-denied",
-            InviteErrorKind::FlowExpired => "invite-flow-expired",
-            InviteErrorKind::FlowError => "invite-flow-error",
-            InviteErrorKind::FlowNotFound => "invite-flow-not-found",
             InviteErrorKind::FlowBusy => "invite-flow-busy",
             InviteErrorKind::GuestLimit => "guest-limit",
             InviteErrorKind::WorkspaceFull => "workspace-full",
@@ -301,14 +290,8 @@ impl InviteErrorKind {
                 "unsupported: the primary GitHub identity cannot change while other \
                  principals or open invites exist"
             }
-            InviteErrorKind::FlowDenied => "invalid params: the GitHub authorization was denied",
-            InviteErrorKind::FlowExpired => {
-                "invalid params: the GitHub device code expired before authorization"
-            }
-            InviteErrorKind::FlowError => "internal error: polling the GitHub device flow failed",
-            InviteErrorKind::FlowNotFound => "invalid params: unknown invite flow",
             InviteErrorKind::FlowBusy => {
-                "internal error: too many invite redemptions in flight; retry shortly"
+                "internal error: too many invite requests in flight; retry shortly"
             }
             InviteErrorKind::GuestLimit => {
                 "invalid params: this workspace has reached its guest limit (collaborators \
@@ -320,7 +303,7 @@ impl InviteErrorKind {
             }
             InviteErrorKind::CredentialInvalid => {
                 "invalid params: the credential is unknown to this host or was revoked; \
-                 redeem the invite through GitHub instead"
+                 join through the GitHub identity proof instead"
             }
             InviteErrorKind::ProofInvalid => {
                 "invalid params: the gist does not prove the claimed GitHub identity for \
@@ -345,9 +328,6 @@ impl InviteErrorKind {
             | InviteErrorKind::Redeemed
             | InviteErrorKind::PinMismatch
             | InviteErrorKind::PinUnknown
-            | InviteErrorKind::FlowDenied
-            | InviteErrorKind::FlowExpired
-            | InviteErrorKind::FlowNotFound
             | InviteErrorKind::GuestLimit
             | InviteErrorKind::WorkspaceFull
             | InviteErrorKind::CredentialInvalid
@@ -355,7 +335,6 @@ impl InviteErrorKind {
             | InviteErrorKind::ProofExpired => -32602,
             InviteErrorKind::GithubIdentityRequired
             | InviteErrorKind::IdentityLocked
-            | InviteErrorKind::FlowError
             | InviteErrorKind::FlowBusy
             | InviteErrorKind::GithubUnreachable => -32603,
         }

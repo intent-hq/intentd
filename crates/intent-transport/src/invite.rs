@@ -1,4 +1,4 @@
-//! Invite links and the identity-only join (multiplayer w4).
+//! Invite links and the guest join (multiplayer w4).
 //!
 //! Two fast paths share this module:
 //!
@@ -9,24 +9,20 @@
 //!   plus `inviteId` and `secret`. It needs the listener's own pairing
 //!   snapshot ([`ServerPairingInfo`]), which the JSON-RPC router has no
 //!   access to — hence a fast path, like `pairing.getInfo`.
-//! - `invite.redeem` — served on the unauthenticated `/invite` endpoint
-//!   ([`crate::ws`]). Two phases on one method name: `{ inviteId, secret }`
-//!   starts the identity-only GitHub device flow and returns the user code;
-//!   `{ flowId }` waits for the grant and returns the collaborator
-//!   credential exactly once.
+//! - `invite.challenge` / `invite.prove` — served on the unauthenticated
+//!   `/invite` endpoint ([`crate::ws`]): the gist identity proof, for a
+//!   guest whose GitHub session lives in its own Intent app (the host never
+//!   runs a device flow for it): `{ inviteId, secret }` previews the link
+//!   and issues a short-lived nonce; `{ inviteId, secret, nonce, gistId,
+//!   login }` joins once the host has read a gist owned by `login` whose
+//!   proof file starts with that nonce, returning the collaborator
+//!   credential exactly once in the `authorized` shape.
 //! - `invite.inspect` / `invite.accept` — the other two `/invite` methods,
 //!   for a guest that already holds a credential for this host:
-//!   `{ inviteId, secret }` previews the link (same validation as a redeem
-//!   start, no device flow) and `{ inviteId, secret, credential }` joins
-//!   with that credential as proof of identity, answering the phase-2
-//!   `authorized` shape.
-//! - `invite.challenge` / `invite.prove` — the gist identity proof, for a
-//!   guest whose GitHub session lives in its own Intent app (no device flow
-//!   on the host): `{ inviteId, secret }` previews the link and issues a
-//!   short-lived nonce; `{ inviteId, secret, nonce, gistId, login }` joins
-//!   once the host has read a gist owned by `login` whose proof file starts
-//!   with that nonce, answering the phase-2 `authorized` shape. Nothing
-//!   else is reachable through `/invite`.
+//!   `{ inviteId, secret }` previews the link (same validation as a
+//!   challenge, no nonce) and `{ inviteId, secret, credential }` joins with
+//!   that credential as proof of identity, answering the same `authorized`
+//!   shape. Nothing else is reachable through `/invite`.
 
 use std::fmt::Write as _;
 use std::future::Future;
@@ -52,7 +48,7 @@ pub(crate) const INVITE_PAYLOAD_VERSION: u32 = 1;
 
 /// Human message paired with the `-32001` an `/invite` connection gets for
 /// any method other than the invite methods.
-pub(crate) const INVITE_ENDPOINT_ONLY_MESSAGE: &str = "the /invite endpoint serves invite.redeem, invite.inspect, invite.accept, invite.challenge and invite.prove only";
+pub(crate) const INVITE_ENDPOINT_ONLY_MESSAGE: &str = "the /invite endpoint serves invite.inspect, invite.accept, invite.challenge and invite.prove only";
 
 /// Build the invite link:
 /// `intent://invite?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&inviteId=<id>&secret=<s>[&tc=<addr>]`.
@@ -87,7 +83,6 @@ pub(crate) fn build_invite_uri(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InviteMethod {
     Create,
-    Redeem,
     Inspect,
     Accept,
     Challenge,
@@ -126,7 +121,6 @@ pub(crate) fn classify(value: &Value) -> Option<InviteRequest> {
     }
     let method = match method {
         "workspace.invite.create" => InviteMethod::Create,
-        "invite.redeem" => InviteMethod::Redeem,
         "invite.inspect" => InviteMethod::Inspect,
         "invite.accept" => InviteMethod::Accept,
         "invite.challenge" => InviteMethod::Challenge,
@@ -174,10 +168,10 @@ pub(crate) fn refuse_busy(req: &InviteRequest) -> Option<String> {
     respond(req, Err(Error::Invite(InviteErrorKind::FlowBusy)))
 }
 
-/// Phase-1 `invite.redeem` starts the listener admits in one burst before
-/// the throttle engages. Legitimate use is one start per invitee (a retry or
-/// two at most); the burst keeps a handful of near-simultaneous joins from
-/// tripping it.
+/// Secret-hashing `/invite` requests the listener admits in one burst before
+/// the throttle engages. Legitimate use is a challenge and a prove per
+/// invitee (a retry or two at most); the burst keeps a handful of
+/// near-simultaneous joins from tripping it.
 pub(crate) const INVITE_START_BURST: u32 = 8;
 
 /// One start token is restored per this interval once the burst is spent
@@ -185,14 +179,12 @@ pub(crate) const INVITE_START_BURST: u32 = 8;
 pub(crate) const INVITE_START_REFILL: Duration = Duration::from_secs(5);
 
 /// Listener-wide token bucket over the `/invite` requests that hash a
-/// secret against the store — phase-1 `invite.redeem` starts (which also
-/// open an upstream device flow), `invite.inspect`, `invite.accept`,
+/// secret against the store — `invite.inspect`, `invite.accept`,
 /// `invite.challenge` and `invite.prove` (which also reads GitHub).
 /// The per-connection in-flight quota bounds concurrency only; this bounds
-/// the *rate*, so a peer cannot enumerate links or churn device flows by
+/// the *rate*, so a peer cannot enumerate links or churn nonces by
 /// serialising attempts or reconnecting: the bucket lives on the listener,
-/// not the connection. Phase-2 waits (`{ flowId }`) are not counted — they
-/// read a flow the start already paid for.
+/// not the connection.
 #[derive(Debug)]
 pub(crate) struct RedeemThrottle {
     tokens: u32,
@@ -236,19 +228,11 @@ pub(crate) fn new_redeem_throttle() -> SharedRedeemThrottle {
     Arc::new(Mutex::new(RedeemThrottle::new(Instant::now())))
 }
 
-/// True for a phase-1 `invite.redeem` (`{ inviteId, secret }`): no
-/// non-empty `flowId`. Mirrors the dispatch in [`handle_redeem`].
-pub(crate) fn is_redeem_start(req: &InviteRequest) -> bool {
-    !matches!(opt_str_param(&req.params, "flowId"), Ok(Some(f)) if !f.trim().is_empty())
-}
-
 /// True for the `/invite` requests the [`RedeemThrottle`] counts: every
-/// request that hashes a secret against the store — a phase-1
-/// `invite.redeem`, an `invite.inspect`, an `invite.accept`, an
-/// `invite.challenge`, an `invite.prove`.
+/// request that hashes a secret against the store — an `invite.inspect`, an
+/// `invite.accept`, an `invite.challenge`, an `invite.prove`.
 pub(crate) fn hashes_secret(req: &InviteRequest) -> bool {
     match req.method {
-        InviteMethod::Redeem => is_redeem_start(req),
         InviteMethod::Inspect
         | InviteMethod::Accept
         | InviteMethod::Challenge
@@ -470,41 +454,6 @@ pub(crate) fn host_identity(
         })
 }
 
-/// Handle a classified `invite.redeem` on the `/invite` endpoint. Phase 1
-/// (`{ inviteId, secret }`) starts the identity-only device flow and extends
-/// the service result with the host's `hostname` / `prettyHostname` (`host`,
-/// the same cached identity `system.status` / `server.pairingInfo` report —
-/// see [`host_identity`]) so the guest's consent prompt can name the machine
-/// before the authenticated connect; phase 2 (`{ flowId }`) blocks until the
-/// grant settles (the caller runs this on a detached task so heartbeats keep
-/// flowing) and yields the credential once.
-pub(crate) async fn handle_redeem(
-    req: InviteRequest,
-    api: &Arc<dyn WorkspaceApi>,
-    host: HostEnvironment,
-) -> Option<String> {
-    let result = redeem_json(&req.params, api, host).await;
-    respond(&req, result)
-}
-
-async fn redeem_json(
-    params: &Value,
-    api: &Arc<dyn WorkspaceApi>,
-    host: HostEnvironment,
-) -> Result<Value> {
-    match opt_str_param(params, "flowId")? {
-        Some(flow_id) if !flow_id.trim().is_empty() => {
-            api.invite_redeem_wait(flow_id.trim().to_string()).await
-        }
-        _ => {
-            let invite_id = str_param(params, "inviteId")?;
-            let secret = str_param(params, "secret")?;
-            let result = api.invite_redeem_start(invite_id, secret).await?;
-            with_host_identity(result, "invite.redeem start", host)
-        }
-    }
-}
-
 /// Stamp a service result with the host's `hostname` / `prettyHostname`
 /// from `host` (the cached identity `system.status` / `server.pairingInfo`
 /// report — see [`host_identity`]), so the guest's consent prompt can name
@@ -521,7 +470,7 @@ fn with_host_identity(mut result: Value, what: &str, host: HostEnvironment) -> R
 /// Handle a classified `invite.inspect` on the `/invite` endpoint: params
 /// `{ inviteId, secret }` → the service result `{ workspaceId,
 /// workspaceTitle }` extended with the host's `hostname` / `prettyHostname`
-/// exactly like a phase-1 `invite.redeem`, without starting a device flow.
+/// exactly like an `invite.challenge`, without issuing a nonce.
 pub(crate) async fn handle_inspect(
     req: InviteRequest,
     api: &Arc<dyn WorkspaceApi>,
@@ -543,7 +492,7 @@ async fn inspect_json(
 }
 
 /// Handle a classified `invite.accept` on the `/invite` endpoint: params
-/// `{ inviteId, secret, credential }` → the phase-2 `authorized` shape
+/// `{ inviteId, secret, credential }` → the `authorized` shape
 /// `{ status, token, principalId, login, workspaceId }` as the service
 /// answers it (no host identity: the client already saw it on inspect).
 pub(crate) async fn handle_accept(
@@ -586,8 +535,9 @@ async fn challenge_json(
 }
 
 /// Handle a classified `invite.prove` on the `/invite` endpoint: params
-/// `{ inviteId, secret, nonce, gistId, login }` → the phase-2 `authorized`
-/// shape as the service answers it (no host identity: the client already
+/// `{ inviteId, secret, nonce, gistId, login }` → the `authorized` shape
+/// `{ status, token, principalId, login, workspaceId }` as the service
+/// answers it (no host identity: the client already
 /// saw it on the challenge).
 pub(crate) async fn handle_prove(
     req: InviteRequest,
@@ -616,7 +566,6 @@ pub(crate) async fn handle_invite_endpoint(
     host: HostEnvironment,
 ) -> Option<String> {
     match req.method {
-        InviteMethod::Redeem => handle_redeem(req, api, host).await,
         InviteMethod::Inspect => handle_inspect(req, api, host).await,
         InviteMethod::Accept => handle_accept(req, api).await,
         InviteMethod::Challenge => handle_challenge(req, api, host).await,

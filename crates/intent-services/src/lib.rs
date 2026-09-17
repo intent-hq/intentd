@@ -979,12 +979,6 @@ pub struct Services {
     /// minting (multiplayer w4): see
     /// [`principal_ops::IdentityTransitionLock`]. Shared across clones.
     identity_transition: principal_ops::IdentityTransitionLock,
-    /// In-flight identity-only device flows started by `invite.redeem`
-    /// (multiplayer w4), keyed by flow id; shared across clones.
-    invite_flows: invite_ops::InviteFlowState,
-    /// Admission permits for those flows (`MAX_INFLIGHT_INVITE_FLOWS`),
-    /// taken before the upstream device-code request.
-    invite_flow_permits: invite_ops::InviteFlowPermits,
     /// Outstanding `invite.challenge` nonces awaiting their `invite.prove`
     /// (gist identity proof), keyed by nonce; shared across clones.
     invite_nonces: invite_ops::InviteNonceState,
@@ -997,9 +991,9 @@ pub struct Services {
     /// Ephemeral workspace / note presence table (multiplayer w5), shared
     /// with the caret coalescer's trailing-flush tasks.
     presence: Arc<presence::PresenceRegistry>,
-    /// Test-only override for the GitHub API base the identity-only flow's
-    /// `GET /user` talks to (`None` → `$INTENTD_GITHUB_API_BASE_URI` →
-    /// api.github.com).
+    /// Test-only override for the GitHub API base the invite identity reads
+    /// (`invite.prove`, the primary's `GET /user` refresh) talk to (`None` →
+    /// `$INTENTD_GITHUB_API_BASE_URI` → api.github.com).
     github_api_base_uri: Option<String>,
     /// Shared cache + offload gates for git-derived aggregates that are still
     /// computed on demand (`diffSummary` for explicit callers, `CoW` support
@@ -1367,8 +1361,6 @@ impl Services {
             github_login_base_uri: None,
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
-            invite_flows: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            invite_flow_permits: invite_ops::new_flow_permits(),
             invite_nonces: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             invite_nonce_permits: invite_ops::new_nonce_permits(),
             principal_revocations: tokio::sync::broadcast::channel(
@@ -1563,9 +1555,9 @@ impl Services {
         self
     }
 
-    /// Override the GitHub API base the identity-only invite flow's
-    /// `GET /user` talks to (multiplayer w4 test seam). Production wiring
-    /// keeps `None` (env override → api.github.com).
+    /// Override the GitHub API base the invite identity reads talk to
+    /// (multiplayer w4 test seam). Production wiring keeps `None` (env
+    /// override → api.github.com).
     #[must_use]
     pub fn with_github_api_base_uri(mut self, base_uri: impl Into<String>) -> Self {
         self.github_api_base_uri = Some(base_uri.into());
@@ -30592,7 +30584,7 @@ impl WorkspaceApi for Services {
         })
     }
 
-    // Invites + identity-only join (multiplayer w4) — see `invite_ops`.
+    // Invites + join (multiplayer w4) — see `invite_ops`.
 
     fn workspace_members_leave(
         &self,
@@ -30694,18 +30686,6 @@ impl WorkspaceApi for Services {
             self.workspace_invite_revoke_op(&workspace_id, &invite_id)
                 .await
         })
-    }
-
-    fn invite_redeem_start(
-        &self,
-        invite_id: String,
-        secret: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.invite_redeem_start_op(&invite_id, &secret).await })
-    }
-
-    fn invite_redeem_wait(&self, flow_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.invite_redeem_wait_op(&flow_id).await })
     }
 
     fn invite_inspect(
