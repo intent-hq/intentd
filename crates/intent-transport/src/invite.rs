@@ -403,7 +403,10 @@ async fn create_json(
 }
 
 /// Handle a classified `invite.redeem` on the `/invite` endpoint. Phase 1
-/// (`{ inviteId, secret }`) starts the identity-only device flow; phase 2
+/// (`{ inviteId, secret }`) starts the identity-only device flow and extends
+/// the service result with the host's `hostname` / `prettyHostname` (same
+/// sources as `system.status` / `server.pairingInfo`) so the guest's consent
+/// prompt can name the machine before the authenticated connect; phase 2
 /// (`{ flowId }`) blocks until the grant settles (the caller runs this on a
 /// detached task so heartbeats keep flowing) and yields the credential once.
 pub(crate) async fn handle_redeem(
@@ -422,7 +425,13 @@ async fn redeem_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Valu
         _ => {
             let invite_id = str_param(params, "inviteId")?;
             let secret = str_param(params, "secret")?;
-            api.invite_redeem_start(invite_id, secret).await
+            let mut result = api.invite_redeem_start(invite_id, secret).await?;
+            let obj = result.as_object_mut().ok_or_else(|| {
+                Error::Internal("invite.redeem start result is not an object".to_string())
+            })?;
+            obj.insert("hostname".into(), crate::local_hostname().into());
+            obj.insert("prettyHostname".into(), crate::pretty_hostname().into());
+            Ok(result)
         }
     }
 }

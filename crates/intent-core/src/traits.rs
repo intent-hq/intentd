@@ -4639,8 +4639,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// `invite.redeem` phase 1 (multiplayer w4, unauthenticated `/invite`
     /// endpoint): validate `(invite_id, secret)` and start an identity-only
     /// GitHub device flow → `{ flowId, userCode, verificationUri, expiresIn,
-    /// interval, workspaceId, workspaceTitle }`. The access token the flow
-    /// yields is used once for `GET /user` and never persisted.
+    /// interval, workspaceId, workspaceTitle }`. The `/invite` transport
+    /// extends this with the host's `hostname` / `prettyHostname` (same
+    /// sources as `system.status`) so the guest's consent prompt can name
+    /// the machine. The access token the flow yields is used once for
+    /// `GET /user` and never persisted.
     fn invite_redeem_start(
         &self,
         invite_id: String,
