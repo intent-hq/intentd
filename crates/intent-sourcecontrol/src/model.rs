@@ -389,6 +389,19 @@ pub struct AuthStatus {
     pub scopes: Vec<String>,
 }
 
+/// The host's REST core quota as reported by its quota-free probe
+/// ([`crate::SourceControl::rate_limit_status`]); every field is `None`
+/// when the host lacks the signal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateLimitStatus {
+    /// When the quota window resets, as a unix timestamp (seconds).
+    pub reset_at: Option<u64>,
+    /// Requests left in the current window.
+    pub remaining: Option<u64>,
+    /// The window's full request quota.
+    pub limit: Option<u64>,
+}
+
 /// Capabilities a concrete host may or may not support (FE gates UI on these).
 // One bool per independent capability; the flat shape IS the wire contract.
 #[expect(clippy::struct_excessive_bools)]

@@ -2153,7 +2153,9 @@ impl Services {
     ///
     /// The sweep honours the global forge rate-limit gate shared with the
     /// PR-refresh and git-root sweeps (monorepo#2961): while the gate is
-    /// paused the tick is skipped before any forge call (no `lastError`
+    /// paused the tick spends one quota-free `rate_limit` probe
+    /// ([`Services::maybe_lift_rate_limit_pause`]) and, unless that lifts
+    /// the pause early, is skipped before any forge call (no `lastError`
     /// churn; catch-up markers survive for the post-pause sweep), and a
     /// fetch that fails with [`Error::RateLimited`] opens the pause — which
     /// annotates `lastError` with the pause on every active monitor, this
@@ -2166,8 +2168,14 @@ impl Services {
     /// stops this sweep's remaining fetches too.
     async fn sweep_pr_monitors(&self, skip_fresh: bool) {
         if self.sweeps_rate_limited() {
-            tracing::debug!("pr monitor sweep: forge rate limit pause active; skipping tick");
-            return;
+            let lifted = match pr_ops::resolve_source_control(self.source_control.clone()).await {
+                Ok(sc) => self.maybe_lift_rate_limit_pause(&sc).await,
+                Err(_) => false,
+            };
+            if !lifted {
+                tracing::debug!("pr monitor sweep: forge rate limit pause active; skipping tick");
+                return;
+            }
         }
         let monitors = match self.store.load_active_pr_monitors().await {
             Ok(monitors) => monitors,
@@ -2729,6 +2737,15 @@ impl Services {
     /// as-is BEFORE that first poll — a wake awaiting delivery at upgrade
     /// time is never dropped. Returns the number of resumed monitors.
     ///
+    /// A rate-limit pause annotation persisted by the previous process
+    /// (monorepo#2961) outlives the in-memory gate it described: with the
+    /// gate open — always, at boot — the stale annotations are cleared
+    /// first ([`Services::clear_pr_monitor_pause_annotations`]), so the
+    /// surfaces do not report a pause the new process is not observing;
+    /// a still-exhausted quota re-pauses (and re-stamps) on the first poll.
+    /// A caller running while the gate IS paused (a transfer import) leaves
+    /// them in place.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if loading the persisted monitors, an owner status lookup, or re-emitting pending changes fails.
@@ -2737,6 +2754,9 @@ impl Services {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn rehydrate_pr_monitors(&self) -> Result<usize> {
+        if !self.sweeps_rate_limited() {
+            self.clear_pr_monitor_pause_annotations().await;
+        }
         let monitors = self.store.load_active_pr_monitors().await?;
         let mut resumed = 0;
         for mut monitor in monitors {
@@ -3172,9 +3192,9 @@ mod tests {
     use intent_sourcecontrol::{
         AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
         IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability,
-        NewPullRequest, Page, PageParams, PrPatch, PrQuery, PrState, PullRequest, Repo, Review,
-        ReviewComment, ReviewDecision, ReviewThread, ReviewVerdict, RollupCheck, ScCapabilities,
-        UserIdentity,
+        NewPullRequest, Page, PageParams, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus,
+        Repo, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewVerdict, RollupCheck,
+        ScCapabilities, UserIdentity,
     };
     use intent_store::Store;
 
@@ -3234,8 +3254,14 @@ mod tests {
         /// PR number whose `get_pr` pends forever (hung-connection regression).
         hang_get_pr: Option<u64>,
         /// The forge-reported quota reset (unix seconds) answered by
-        /// `rate_limit_reset_at`; `None` is the host-without-signal default.
+        /// `rate_limit_status`; `None` is the host-without-signal default.
         rate_limit_reset_at: Option<u64>,
+        /// The `remaining` / `limit` answered by `rate_limit_status`;
+        /// `None` is the host-without-signal default (no early lift).
+        rate_limit_remaining: Option<u64>,
+        rate_limit_limit: Option<u64>,
+        /// `rate_limit_status` itself fails (the free probe erroring).
+        fail_rate_limit_status: bool,
         /// A real RFC 3339 `updatedAt` for the PR record, overriding the
         /// opaque `rev-N` stand-in when a test needs a comparable timestamp.
         updated_at: Option<String>,
@@ -3275,6 +3301,9 @@ mod tests {
                 rate_limit_list_comments: false,
                 hang_get_pr: None,
                 rate_limit_reset_at: None,
+                rate_limit_remaining: None,
+                rate_limit_limit: None,
+                fail_rate_limit_status: false,
                 updated_at: None,
             }
         }
@@ -3423,8 +3452,19 @@ mod tests {
         ) -> intent_sourcecontrol::Result<PullRequest> {
             unsupported("create_pr")
         }
-        async fn rate_limit_reset_at(&self) -> intent_sourcecontrol::Result<Option<u64>> {
-            Ok(self.state.lock().unwrap().rate_limit_reset_at)
+        async fn rate_limit_status(&self) -> intent_sourcecontrol::Result<RateLimitStatus> {
+            self.count_sub_fetch("rate_limit_status");
+            let s = self.state.lock().unwrap();
+            if s.fail_rate_limit_status {
+                return Err(intent_sourcecontrol::Error::Api(
+                    "rate_limit probe down".into(),
+                ));
+            }
+            Ok(RateLimitStatus {
+                reset_at: s.rate_limit_reset_at,
+                remaining: s.rate_limit_remaining,
+                limit: s.rate_limit_limit,
+            })
         }
         async fn get_pr(
             &self,
@@ -7255,7 +7295,7 @@ mod tests {
     /// text simply ages past `now`, which is all the store's write-back
     /// floor looks at when deciding whether an annotation still stands.
     async fn elapse_pause(svc: &Services) {
-        svc.sweep_rate_limit.clear();
+        svc.sweep_rate_limit.lift();
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -8051,6 +8091,276 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(terminal.last_error.as_deref(), Some("old failure"));
+    }
+
+    /// While paused, each sweep tick spends exactly one quota-free
+    /// `rate_limit` probe and lifts the gate EARLY — before the `reset +
+    /// margin` deadline — once the probe reports the quota recovered
+    /// (`remaining ≥ max(500, 10% of limit)`): the lifted tick polls right
+    /// away, and the pause annotation every active monitor carried (which
+    /// the guarded write-back would otherwise keep until its now-stale
+    /// deadline aged out) is cleared, so `pausedUntil` / the pause
+    /// `lastError` stop being reported. A failing probe, a host without
+    /// the signal, or a quota still below the floor keep the deadline: no
+    /// forge fetch, rows untouched.
+    #[tokio::test]
+    async fn a_paused_sweep_probes_once_per_tick_and_lifts_early_once_the_quota_recovered() {
+        async fn errors(svc: &Services, ids: &[PrMonitorId]) -> Vec<Option<String>> {
+            let mut out = Vec::new();
+            for id in ids {
+                out.push(svc.store().get_pr_monitor(id).await.unwrap().last_error);
+            }
+            out
+        }
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitor_poll_seconds(30)
+            .with_pr_monitor_hourly_request_budget(1500);
+        let (ws2, sibling) = sibling_workspace(&svc, "agent-prmon-sibling").await;
+        let mut ids = Vec::new();
+        for (pr, ws, who) in [(1_u64, &ws, &owner), (2, &ws2, &sibling), (3, &ws, &owner)] {
+            let (m, _) = svc
+                .pr_monitor_register(ws, who, "o", "r", pr)
+                .await
+                .expect("register");
+            backdate(&svc, &m.monitor_id, &format!("2020-01-01T00:00:0{pr}Z")).await;
+            ids.push(m.monitor_id);
+        }
+        forge.take_fetched_numbers();
+        let probes = || forge.sub_fetches("rate_limit_status");
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // The window opens an hour out; the trigger's own probe reads the
+        // reset (probe #1) and every active row is stamped.
+        forge.edit(|s| {
+            s.rate_limit_get_pr = true;
+            s.rate_limit_reset_at = Some(now_unix + 3600);
+        });
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(forge.take_fetched_numbers(), vec![1]);
+        assert!(svc.sweeps_rate_limited(), "the gate is paused");
+        assert_eq!(probes(), 1);
+        let pause_error = expected_pause_error(&svc);
+        let deadline = svc.sweep_rate_limit_paused_until().unwrap();
+        assert_eq!(
+            errors(&svc, &ids).await,
+            vec![Some(pause_error.clone()); 3],
+            "every active monitor names the deadline"
+        );
+        // The forge would answer again; only the probe decides when.
+        forge.edit(|s| s.rate_limit_get_pr = false);
+
+        // No `remaining` signal: one probe, deadline kept, no fetch.
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(probes(), 2, "a paused tick spends exactly one probe");
+        assert!(forge.take_fetched_numbers().is_empty());
+        assert_eq!(svc.sweep_rate_limit_paused_until().unwrap(), deadline);
+
+        // The probe itself failing: deadline kept, no fetch.
+        forge.edit(|s| s.fail_rate_limit_status = true);
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(probes(), 3);
+        assert!(forge.take_fetched_numbers().is_empty());
+        assert!(svc.sweeps_rate_limited());
+
+        // Quota reported but below the floor (499 < max(500, 10% of 5000)).
+        forge.edit(|s| {
+            s.fail_rate_limit_status = false;
+            s.rate_limit_remaining = Some(499);
+            s.rate_limit_limit = Some(5_000);
+        });
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(probes(), 4);
+        assert!(forge.take_fetched_numbers().is_empty());
+        assert_eq!(svc.sweep_rate_limit_paused_until().unwrap(), deadline);
+        assert_eq!(
+            errors(&svc, &ids).await,
+            vec![Some(pause_error.clone()); 3],
+            "the rows are untouched while the deadline stands"
+        );
+
+        // The evidence case: a full window while the deadline is still an
+        // hour out → the gate lifts, this very tick polls every monitor,
+        // and the persisted annotations are gone.
+        forge.edit(|s| s.rate_limit_remaining = Some(5_000));
+        svc.poll_pr_monitors().await;
+        assert_eq!(probes(), 5);
+        assert!(
+            svc.sweep_rate_limit_paused_until().is_none(),
+            "the pause lifted before its deadline"
+        );
+        let mut fetched = forge.take_fetched_numbers();
+        fetched.sort_unstable();
+        assert_eq!(fetched, vec![1, 2, 3], "the lifted tick polls right away");
+        assert_eq!(errors(&svc, &ids).await, vec![None, None, None]);
+        for (ws, who) in [(&ws, &owner), (&ws2, &sibling)] {
+            let listed = svc.pr_monitor_list_op(ws, Some(who)).await.unwrap();
+            for row in listed["monitors"].as_array().unwrap() {
+                assert!(row.get("pausedUntil").is_none(), "{row}");
+                assert!(row.get("lastError").is_none(), "{row}");
+            }
+        }
+
+        // An open gate spends no probes: the next tick just polls.
+        svc.poll_pr_monitors().await;
+        assert_eq!(probes(), 5);
+        assert_eq!(forge.take_fetched_numbers().len(), 3);
+    }
+
+    /// The early lift clears the annotation even on a monitor the lifted
+    /// tick does NOT poll (not due yet): the reconciliation is the bulk
+    /// clear, not a side effect of the post-lift poll — and a genuine
+    /// error the row carried in front of the annotation survives it.
+    #[tokio::test]
+    async fn an_early_lift_clears_the_annotation_on_monitors_it_does_not_poll() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitor_poll_seconds(3600)
+            .with_pr_monitor_hourly_request_budget(1500);
+        let (fresh, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 1)
+            .await
+            .expect("register");
+        let (failing, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 2)
+            .await
+            .expect("register");
+        svc.record_pr_monitor_error(&failing, "forge down").await;
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        forge.edit(|s| s.rate_limit_reset_at = Some(now_unix + 3600));
+        svc.pause_sweeps_for_rate_limit(&sc, "quota").await;
+        let pause_error = expected_pause_error(&svc);
+        let stamped = svc.store().get_pr_monitor(&fresh.monitor_id).await.unwrap();
+        assert_eq!(stamped.last_error.as_deref(), Some(pause_error.as_str()));
+        forge.take_fetched_numbers();
+
+        // Both rows were polled at registration and the cadence is an hour:
+        // the lifted due-sweep has nothing due, yet the annotations go.
+        forge.edit(|s| {
+            s.rate_limit_remaining = Some(5_000);
+            s.rate_limit_limit = Some(5_000);
+        });
+        svc.poll_due_pr_monitors().await;
+        assert!(svc.sweep_rate_limit_paused_until().is_none());
+        assert!(forge.take_fetched_numbers().is_empty(), "nothing was due");
+        let cleared = svc.store().get_pr_monitor(&fresh.monitor_id).await.unwrap();
+        assert_eq!(cleared.last_error, None);
+        assert_eq!(
+            cleared.last_polled_at, stamped.last_polled_at,
+            "the clear is not a poll"
+        );
+        assert_eq!(
+            cleared.updated_at, stamped.updated_at,
+            "the guard token is untouched"
+        );
+        let kept = svc
+            .store()
+            .get_pr_monitor(&failing.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(kept.last_error.as_deref(), Some("forge down"));
+    }
+
+    /// A pause annotation persisted by the previous process outlives the
+    /// in-memory gate: boot rehydration, running with an open gate, clears
+    /// it from every active row (a genuine error in front survives, a
+    /// terminal row is untouched), so the surfaces do not report a pause
+    /// the new process is not observing. Rehydration while the gate IS
+    /// paused (a transfer import mid-pause) leaves the annotations alone.
+    #[tokio::test]
+    async fn rehydration_clears_a_persisted_pause_annotation_when_the_gate_is_open() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let (clean, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 1)
+            .await
+            .expect("register");
+        let (failing, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 2)
+            .await
+            .expect("register");
+        svc.record_pr_monitor_error(&failing, "forge down").await;
+        let mut completed = clean.clone();
+        completed.monitor_id = PrMonitorId::new();
+        completed.pr_number = 3;
+        completed.state = PrMonitorState::Completed;
+        // The previous process stamped a deadline still an hour out.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .cast_signed();
+        let persisted =
+            crate::rate_limit::pause_error(Some(&intent_core::iso_from_unix_secs(now_unix + 3600)));
+        completed.last_error = Some(persisted.clone());
+        assert!(svc.store().insert_pr_monitor(&completed).await.unwrap());
+        assert_eq!(
+            svc.store()
+                .annotate_active_pr_monitors_pause(&persisted)
+                .await
+                .unwrap(),
+            2
+        );
+        let errors = |svc: &Services| {
+            let ids = [
+                clean.monitor_id.clone(),
+                failing.monitor_id.clone(),
+                completed.monitor_id.clone(),
+            ];
+            let svc = svc.clone();
+            async move {
+                let mut out = Vec::new();
+                for id in &ids {
+                    out.push(svc.store().get_pr_monitor(id).await.unwrap().last_error);
+                }
+                out
+            }
+        };
+        assert_eq!(
+            errors(&svc).await,
+            vec![
+                Some(persisted.clone()),
+                Some(format!("forge down; {persisted}")),
+                Some(persisted.clone()),
+            ]
+        );
+
+        // The new process boots with an open gate.
+        assert!(svc.sweep_rate_limit_paused_until().is_none());
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 2);
+        assert_eq!(
+            errors(&svc).await,
+            vec![
+                None,
+                Some("forge down".to_string()),
+                Some(persisted.clone())
+            ]
+        );
+        let listed = svc.pr_monitor_list_op(&ws, Some(&owner)).await.unwrap();
+        for row in listed["monitors"].as_array().unwrap() {
+            assert!(row.get("pausedUntil").is_none(), "{row}");
+        }
+
+        // Rehydrating while the gate is paused keeps the stamps in place.
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        forge.edit(|s| s.rate_limit_reset_at = Some(now_unix.cast_unsigned() + 3600));
+        svc.pause_sweeps_for_rate_limit(&sc, "quota").await;
+        let pause_error = expected_pause_error(&svc);
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 2);
+        assert_eq!(
+            errors(&svc).await,
+            vec![
+                Some(pause_error.clone()),
+                Some(format!("forge down; {pause_error}")),
+                Some(persisted),
+            ]
+        );
     }
 
     /// Sibling monitors on one PR count once toward the effective interval

@@ -226,6 +226,16 @@ static ANNOTATE_ACTIVE_PR_MONITORS_PAUSE_SQL: LazyLock<String> = LazyLock::new(|
     )
 });
 
+/// The bulk clear ([`Store::clear_active_pr_monitors_pause`]): `?1` is the
+/// marker. The annotation — from the marker to the end — is cut off every
+/// active row's `last_error`, whatever deadline it names: a bare annotation
+/// leaves `NULL`, an appended one leaves the genuine error in front (its
+/// `"; "` separator trimmed). Rows carrying no annotation are not touched
+/// (and not counted).
+const CLEAR_ACTIVE_PR_MONITORS_PAUSE_SQL: &str = "UPDATE pr_monitor \
+     SET last_error = NULLIF(rtrim(substr(last_error, 1, instr(last_error, ?1) - 1), '; '), '') \
+     WHERE state = 'active' AND instr(COALESCE(last_error, ''), ?1) > 0";
+
 /// The narrow projection of one non-cancelled monitor row consumed by the
 /// `workspace.list` / `workspace.subscribe` seq-0 PR merge: the identity /
 /// lifecycle columns plus the handful of scalar fields the list decoration
@@ -834,6 +844,34 @@ impl Store {
                 intent_core::Error::Internal(format!(
                     "annotate active pr monitors pause failed: {e}"
                 ))
+            })?;
+        Ok(res.rows_affected())
+    }
+
+    /// Strip the rate-limit pause annotation ([`pr_monitor_pause_error`])
+    /// from `last_error` on EVERY active monitor across all workspaces — the
+    /// inverse of [`Store::annotate_active_pr_monitors_pause`], for when the
+    /// pause is no longer in force BEFORE the deadline the annotations name:
+    /// the gate lifted early because the quota recovered, or the daemon
+    /// restarted with an open gate while the rows still name a deadline
+    /// persisted by the previous process. The guarded write-backs keep an
+    /// unexpired annotation on purpose, so without this clear the surfaces
+    /// would report a pause until the stale deadline aged out. A bare
+    /// annotation leaves `NULL`, one appended to a genuine error leaves the
+    /// error; rows without an annotation, and terminal rows, are untouched.
+    /// Like the stamp, leaves `updated_at` and `last_polled_at` alone.
+    /// Returns the number of rows cleared.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_active_pr_monitors_pause(&self) -> Result<u64> {
+        let res = sqlx::query(CLEAR_ACTIVE_PR_MONITORS_PAUSE_SQL)
+            .bind(PR_MONITOR_PAUSE_MARKER)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("clear active pr monitors pause failed: {e}"))
             })?;
         Ok(res.rows_affected())
     }
@@ -1806,6 +1844,88 @@ mod tests {
             4
         );
         assert_rows(&store, expect_all(&t3)).await;
+    }
+
+    /// The bulk clear strips an UNEXPIRED annotation — which the guarded
+    /// write-back would otherwise keep until its deadline aged out — from
+    /// every active row: a bare annotation leaves `NULL`, an appended one
+    /// leaves the genuine error; rows without an annotation, and terminal
+    /// rows, are neither touched nor counted, and no row's guard token or
+    /// `lastPolledAt` moves.
+    #[tokio::test]
+    async fn clearing_the_pause_strips_unexpired_annotations_from_active_rows_only() {
+        let t1 = pr_monitor_pause_error(Some(&rfc3339_from_now(1800)));
+        let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
+        let ts = now_iso();
+        let mut bare = test_monitor(&ws_id, &agent_id, &ts);
+        bare.last_error = Some(t1.clone());
+        let mut appended = test_monitor(&ws_id, &agent_id, &ts);
+        appended.pr_number = 43;
+        appended.last_error = Some(format!("HTTP 502; {t1}"));
+        let mut genuine = test_monitor(&ws_id, &agent_id, &ts);
+        genuine.pr_number = 44;
+        genuine.last_error = Some("forge down".to_string());
+        let empty = {
+            let mut m = test_monitor(&ws_id, &agent_id, &ts);
+            m.pr_number = 45;
+            m
+        };
+        let mut completed = test_monitor(&ws_id, &agent_id, &ts);
+        completed.pr_number = 46;
+        completed.state = PrMonitorState::Completed;
+        completed.last_error = Some(t1.clone());
+        for m in [&bare, &appended, &genuine, &empty, &completed] {
+            assert!(store.insert_pr_monitor(m).await.expect("insert"));
+        }
+
+        assert_eq!(store.clear_active_pr_monitors_pause().await.unwrap(), 2);
+        for (m, expected) in [
+            (&bare, None),
+            (&appended, Some("HTTP 502")),
+            (&genuine, Some("forge down")),
+            (&empty, None),
+            (&completed, Some(t1.as_str())),
+        ] {
+            let read = store.get_pr_monitor(&m.monitor_id).await.expect("get");
+            assert_eq!(read.last_error.as_deref(), expected, "PR {}", m.pr_number);
+            assert_eq!(
+                read.updated_at, m.updated_at,
+                "the guard token is untouched"
+            );
+            assert_eq!(
+                read.last_polled_at, m.last_polled_at,
+                "the clear is not a poll"
+            );
+        }
+
+        // Nothing left to clear: a repeat is a counted no-op of zero.
+        assert_eq!(store.clear_active_pr_monitors_pause().await.unwrap(), 0);
+
+        // A poll write-back that read the row before the clear still lands
+        // (the clear moved no guard token), and with the row's annotation
+        // gone the first success leaves `lastError` empty.
+        let write_at = now_iso();
+        assert!(store
+            .update_pr_monitor_poll(
+                &appended.monitor_id,
+                PrMonitorPollUpdate {
+                    last_snapshot: appended.last_snapshot.as_deref(),
+                    baseline_snapshot: appended.baseline_snapshot.as_deref(),
+                    pending_changes: &[],
+                    last_polled_at: Some(&write_at),
+                    last_error: None,
+                    updated_at: &write_at,
+                    expected_updated_at: &appended.updated_at,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write-back"));
+        let read = store
+            .get_pr_monitor(&appended.monitor_id)
+            .await
+            .expect("get");
+        assert_eq!(read.last_error, None);
     }
 
     /// The 0089 migration backfills `baseline_snapshot` from `last_snapshot`

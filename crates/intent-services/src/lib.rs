@@ -4583,7 +4583,11 @@ impl Services {
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
         detail: &str,
     ) {
-        let reset_unix = sc.rate_limit_reset_at().await.ok().flatten();
+        let reset_unix = sc
+            .rate_limit_status()
+            .await
+            .ok()
+            .and_then(|status| status.reset_at);
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -4615,6 +4619,87 @@ impl Services {
             Err(e) => tracing::warn!(
                 error = %e,
                 "forge rate limit hit: failed to record the pause on active pr monitors"
+            ),
+        }
+    }
+
+    /// While the gate is paused, re-probe the forge's quota-free
+    /// `rate_limit` endpoint and lift the pause early once the quota has
+    /// recovered ([`rate_limit::quota_recovered`]: a reported `remaining`
+    /// at or above `max(500, 10% of limit)`), instead of sitting out the
+    /// full `reset + margin` blackout — the reported reset is the window's
+    /// nominal turnover, and the quota is routinely back well before it.
+    /// Called once at the top of each forge-touching sweep tick, so a
+    /// paused tick costs at most one (free) probe. A probe failure, a host
+    /// without the signal, or a quota still below the floor keeps the
+    /// existing deadline — no behavior change from the fixed window.
+    ///
+    /// Returns `true` when this call lifted the pause: one INFO is logged
+    /// and the pause annotation every active PR monitor carries
+    /// ([`Self::pause_sweeps_for_rate_limit`]) is cleared
+    /// ([`Store::clear_active_pr_monitors_pause`]) — the guarded
+    /// write-backs deliberately keep an annotation whose deadline has not
+    /// passed, so without the clear `ws.pr.monitors` / `ws.pr.snapshot`
+    /// would keep reporting a pause no longer in force until the stale
+    /// deadline aged out. The gate is lifted BEFORE the clear so a poll
+    /// write-back racing the lift reads the gate open and carries no
+    /// annotation of its own.
+    async fn maybe_lift_rate_limit_pause(
+        &self,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) -> bool {
+        let Some(until) = self.sweep_rate_limit_paused_until() else {
+            return false;
+        };
+        let status = match sc.rate_limit_status().await {
+            Ok(status) => status,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    until,
+                    "forge rate limit pause: quota probe failed; keeping the deadline"
+                );
+                return false;
+            }
+        };
+        if !rate_limit::quota_recovered(status.remaining, status.limit) {
+            tracing::debug!(
+                remaining = status.remaining,
+                limit = status.limit,
+                until,
+                "forge rate limit pause: quota not recovered; keeping the deadline"
+            );
+            return false;
+        }
+        if !self.sweep_rate_limit.lift() {
+            return false;
+        }
+        tracing::info!(
+            remaining = status.remaining,
+            limit = status.limit,
+            until,
+            "forge quota recovered: lifting the sweep rate-limit pause early"
+        );
+        self.clear_pr_monitor_pause_annotations().await;
+        true
+    }
+
+    /// Strip the persisted pause annotation from every active PR monitor
+    /// ([`Store::clear_active_pr_monitors_pause`]) once the in-memory gate
+    /// is open before the deadline those annotations name — an early lift
+    /// ([`Self::maybe_lift_rate_limit_pause`]) or a daemon restart
+    /// ([`Services::rehydrate_pr_monitors`]). Fail-soft: a store error is
+    /// logged, the sweep goes on and the first successful poll after the
+    /// stale deadline clears each row on its own.
+    pub(crate) async fn clear_pr_monitor_pause_annotations(&self) {
+        match self.store.clear_active_pr_monitors_pause().await {
+            Ok(cleared) => tracing::debug!(
+                cleared,
+                "forge rate limit pause lifted: cleared the pause from active pr monitors"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "forge rate limit pause lifted: failed to clear the pause from active pr monitors"
             ),
         }
     }
@@ -5204,6 +5289,11 @@ impl Services {
                 None
             }
         };
+        // A paused tick spends its one free quota probe here: the pause
+        // lifts early once the quota has recovered (monorepo#2961).
+        if let Some(sc) = sc.as_ref() {
+            self.maybe_lift_rate_limit_pause(sc).await;
+        }
         for ws in workspaces {
             // STAB-3 fix: refresh all workspaces (discovery + update), not just
             // those already linked. `refresh_workspace_pr_with_sc` skips

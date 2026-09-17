@@ -27,8 +27,9 @@ pub use model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Review, ReviewComment, ReviewDecision,
-    ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+    PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review, ReviewComment,
+    ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, ScCapabilities,
+    UserIdentity,
 };
 pub use registry::{GithubSettings, SourceControlRegistry, SourceControlSettings};
 pub use token::TokenSource;
@@ -51,14 +52,16 @@ pub trait SourceControl: Send + Sync {
     /// Auth / connectivity probe (used by `settings`/`doctor`).
     async fn check_auth(&self) -> Result<AuthStatus>;
 
-    /// When the host's REST core quota resets, as a unix timestamp (seconds),
-    /// queried after a call failed with [`Error::RateLimited`] so background
-    /// sweeps can pause until the window turns over (monorepo#2961). GitHub's
+    /// The host's REST core quota — when it resets (unix seconds), how many
+    /// requests remain, and the window's limit — queried after a call
+    /// failed with [`Error::RateLimited`] so background sweeps can pause
+    /// until the window turns over, and re-probed while paused so the pause
+    /// lifts early once the quota has recovered (monorepo#2961). GitHub's
     /// `GET /rate_limit` is free (does not count against the quota). Hosts
-    /// without the signal return `Ok(None)` (the default) and callers fall
-    /// back to a fixed pause.
-    async fn rate_limit_reset_at(&self) -> Result<Option<u64>> {
-        Ok(None)
+    /// without the signal return the all-`None` default and callers fall
+    /// back to a fixed pause that runs its full window.
+    async fn rate_limit_status(&self) -> Result<RateLimitStatus> {
+        Ok(RateLimitStatus::default())
     }
 
     /// Authenticated user identity (`GET /user`). Backs `github.getUser`.

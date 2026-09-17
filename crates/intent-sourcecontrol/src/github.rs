@@ -19,8 +19,9 @@ use crate::model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Review, ReviewComment, ReviewDecision,
-    ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+    PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review, ReviewComment,
+    ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, ScCapabilities,
+    UserIdentity,
 };
 use crate::SourceControl;
 
@@ -1140,11 +1141,19 @@ impl SourceControl for GitHubSourceControl {
         }
     }
 
-    async fn rate_limit_reset_at(&self) -> Result<Option<u64>> {
+    async fn rate_limit_status(&self) -> Result<RateLimitStatus> {
         // `GET /rate_limit` is quota-free, so it stays usable while the core
         // quota is exhausted (monorepo#2961).
         let v: Value = self.client.get("/rate_limit", None::<&()>).await?;
-        Ok(v.pointer("/resources/core/reset").and_then(Value::as_u64))
+        let core = |field: &str| {
+            v.pointer(&format!("/resources/core/{field}"))
+                .and_then(Value::as_u64)
+        };
+        Ok(RateLimitStatus {
+            reset_at: core("reset"),
+            remaining: core("remaining"),
+            limit: core("limit"),
+        })
     }
 
     async fn get_user(&self) -> Result<UserIdentity> {
