@@ -71,7 +71,7 @@ pub(crate) const MAX_INVITE_CONNECTIONS: usize = 32;
 /// slot to answer into, so no task ever blocks on a full queue.
 pub(crate) const MAX_INFLIGHT_INVITE_REQUESTS: usize = 4;
 
-/// Inbound message cap on `/invite`: an `invite.redeem` envelope is a few
+/// Inbound message cap on `/invite`: an `invite.prove` envelope is a few
 /// hundred bytes; anything larger is an anonymous peer wasting memory.
 pub(crate) const MAX_INVITE_MESSAGE_BYTES: usize = 16 * 1024;
 
@@ -799,8 +799,8 @@ impl WsInner {
         // `/invite` (multiplayer w4): the ONE unauthenticated endpoint. It
         // has no bearer token by construction — the invitee holds only the
         // link — so it skips credential resolution and gets a dedicated loop
-        // that serves `invite.redeem` / `invite.inspect` / `invite.accept`
-        // / `invite.challenge` / `invite.prove` and nothing else. Bounded: the accept
+        // that serves `invite.inspect` / `invite.accept` / `invite.challenge`
+        // / `invite.prove` and nothing else. Bounded: the accept
         // is refused with 503 once `MAX_INVITE_CONNECTIONS` permits are held;
         // the permit is taken atomically here, before the `101`, and rides
         // with the connection task so an aborted (heartbeat-reaped) task
@@ -1052,19 +1052,19 @@ impl WsInner {
     }
 
     /// Drive one `/invite` connection (multiplayer w4). No caller is bound
-    /// and nothing but `invite.redeem` / `invite.inspect` / `invite.accept`
-    /// / `invite.challenge` / `invite.prove`
+    /// and nothing but `invite.inspect` / `invite.accept` /
+    /// `invite.challenge` / `invite.prove`
     /// is served: every other frame that carries an id is answered
     /// `-32001`, and the `events.`/subscription fast paths, the router and
     /// the reverse channel are never reached. Each request runs on its own
-    /// task (a redeem phase 2 blocks for up to the device-code lifetime) so
-    /// pings keep flowing and the reaper never
+    /// task (an `invite.prove` blocks on GitHub reads) so pings keep flowing
+    /// and the reaper never
     /// mistakes a waiting invitee for a dead peer — but that work is bounded
     /// per connection: at most [`MAX_INFLIGHT_INVITE_REQUESTS`] tasks, each
     /// holding a pre-reserved response slot (so none ever waits to send), all
     /// owned by a [`JoinSet`] that aborts them when the connection ends.
-    /// Every request that hashes a secret (a phase-1 start, an inspect, an
-    /// accept) additionally passes the listener-wide
+    /// Every request that hashes a secret (an inspect, an accept, a
+    /// challenge, a prove) additionally passes the listener-wide
     /// [`crate::invite::RedeemThrottle`] before any store or upstream work.
     /// Frames the loop answers itself (parse errors, throttle and non-invite
     /// refusals) go straight to the sink and never contend for those slots.
@@ -1145,7 +1145,7 @@ impl WsInner {
                         break;
                     }
                 }
-                // Reap finished redeem tasks so the set never accumulates
+                // Reap finished request tasks so the set never accumulates
                 // results across a long-lived connection.
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
                 cmd = cmd_rx.recv() => match cmd {
@@ -1167,7 +1167,7 @@ impl WsInner {
                 }
             }
         }
-        // Dropping the set aborts every redeem still in flight for this
+        // Dropping the set aborts every request still in flight for this
         // peer (the reaper's task abort drops it too).
         tasks.abort_all();
         let _ = sink.close().await;

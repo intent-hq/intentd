@@ -4634,51 +4634,15 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `invite.redeem` phase 1 (multiplayer w4, unauthenticated `/invite`
-    /// endpoint): validate `(invite_id, secret)` and start an identity-only
-    /// GitHub device flow → `{ flowId, userCode, verificationUri, expiresIn,
-    /// interval, workspaceId, workspaceTitle }`. The `/invite` transport
-    /// extends this with the host's `hostname` / `prettyHostname` (same
-    /// sources as `system.status`) so the guest's consent prompt can name
-    /// the machine. The access token the flow yields is used once for
-    /// `GET /user` and never persisted.
-    fn invite_redeem_start(
-        &self,
-        invite_id: String,
-        secret: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (invite_id, secret);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::invite_redeem_start not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `invite.redeem` phase 2 (multiplayer w4): wait for the flow started by
-    /// [`Self::invite_redeem_start`] to settle → `{ status: "authorized",
-    /// token, principalId, login, workspaceId }` exactly once (the flow is
-    /// forgotten after the result is collected), or the terminal
-    /// [`crate::InviteErrorKind`] error (denied / expired / pin mismatch /
-    /// invite closed meanwhile).
-    fn invite_redeem_wait(&self, flow_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = flow_id;
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::invite_redeem_wait not implemented".to_string(),
-            ))
-        })
-    }
-
     /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
-    /// endpoint): validate `(invite_id, secret)` exactly as
-    /// [`Self::invite_redeem_start`] does — same [`crate::InviteErrorKind`]
-    /// refusals for an unknown / expired / revoked / redeemed link — and
-    /// answer `{ workspaceId, workspaceTitle }` **without** starting a device
-    /// flow: no flow slot is taken and GitHub is never contacted. The
-    /// `/invite` transport extends the result with the host's `hostname` /
-    /// `prettyHostname`, so a client can show the consent prompt before it
-    /// decides between `invite.accept` and `invite.redeem`.
+    /// endpoint): validate `(invite_id, secret)` — the
+    /// [`crate::InviteErrorKind`] refusals for an unknown / expired /
+    /// revoked / redeemed link — and answer `{ workspaceId, workspaceTitle }`
+    /// without touching GitHub or issuing a nonce. The `/invite` transport
+    /// extends the result with the host's `hostname` / `prettyHostname`
+    /// (same sources as `system.status`), so a client can show the consent
+    /// prompt before it decides between `invite.accept` and
+    /// `invite.challenge` / `invite.prove`.
     fn invite_inspect(
         &self,
         invite_id: String,
@@ -4694,14 +4658,14 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `invite.accept` (multiplayer w4, unauthenticated `/invite` endpoint):
     /// the returning guest's join. `credential` is a per-principal bearer
-    /// credential this host minted earlier (another workspace's redeem);
+    /// credential this host minted earlier (another workspace's join);
     /// its hash resolves the principal like the `/ws` bearer gate does —
     /// unknown or revoked is [`crate::InviteErrorKind::CredentialInvalid`]
     /// (`credential-invalid`). The invite is then validated like
-    /// [`Self::invite_redeem_start`], a pin is checked against the
+    /// [`Self::invite_inspect`], a pin is checked against the
     /// principal's stored `github_user_id` (`invite-pin-mismatch`), and the
     /// join commits with the stored identity (no GitHub call, no profile
-    /// refresh) → the [`Self::invite_redeem_wait`] shape
+    /// refresh) → the [`Self::invite_prove`] shape
     /// `{ status: "authorized", token, principalId, login, workspaceId }`
     /// with a fresh credential.
     fn invite_accept(
@@ -4723,10 +4687,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// [`Self::invite_inspect`] and issue a single-use nonce bound to the
     /// invite → `{ workspaceId, workspaceTitle, nonce, nonceExpiresAt }`.
     /// The nonce is 32 random bytes (base64url, unpadded), lives 10 minutes
-    /// and is consumed by the first [`Self::invite_prove`] that names it. No
-    /// device flow is started and GitHub is never contacted. The `/invite`
-    /// transport extends the result with the host's `hostname` /
-    /// `prettyHostname`.
+    /// and is consumed by the first [`Self::invite_prove`] that names it.
+    /// GitHub is never contacted. The `/invite` transport extends the result
+    /// with the host's `hostname` / `prettyHostname`.
     fn invite_challenge(
         &self,
         invite_id: String,
@@ -4746,9 +4709,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// requires the owner login to equal `login` (case-insensitively), the
     /// file `intent-join-proof.txt` to start with the nonce and the gist to
     /// have been created no earlier than the nonce was issued; then resolves
-    /// `GET /users/{login}` and commits the join exactly like the device
-    /// flow → `{ status: "authorized", token, principalId, login,
-    /// workspaceId }`. Refusals: [`crate::InviteErrorKind::ProofInvalid`]
+    /// `GET /users/{login}` and commits the join → `{ status: "authorized",
+    /// token, principalId, login, workspaceId }`. Refusals:
+    /// [`crate::InviteErrorKind::ProofInvalid`]
     /// (any mismatch, an unknown gist, or a nonce not issued for this invite
     /// / already consumed), [`crate::InviteErrorKind::ProofExpired`],
     /// [`crate::InviteErrorKind::GithubUnreachable`]; a closed invite, a pin
