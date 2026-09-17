@@ -1226,10 +1226,15 @@ jobs:
     name: install-ps1 (${{ matrix.shell }})
     runs-on: windows-latest
     timeout-minutes: 15
+    # The matrix context is not available in a step-level `shell:` (the
+    # workflow fails validation with "Unrecognized named-value: 'matrix'"),
+    # but it is in the job-level run default.
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v7
       - name: Pester (${{ matrix.shell }})
-        shell: ${{ matrix.shell }}
         run: |
           $ErrorActionPreference = 'Stop'
           $PSVersionTable.PSVersion
