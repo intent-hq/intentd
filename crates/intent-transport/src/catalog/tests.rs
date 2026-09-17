@@ -158,7 +158,10 @@ fn extract_fastpath_methods() -> HashSet<String> {
 ///
 /// Gist identity proof (guest half): +2 router methods
 /// (`github.identityProof.create`, `github.identityProof.delete`).
-const EXPECTED_TOTAL_METHODS: usize = 383;
+///
+/// Gist identity proof (host half): +2 fast-path methods on the `/invite`
+/// endpoint (`invite.challenge`, `invite.prove`).
+const EXPECTED_TOTAL_METHODS: usize = 385;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
@@ -166,7 +169,7 @@ const EXPECTED_TOTAL_METHODS: usize = 383;
 const EXPECTED_ROUTER_METHODS: usize = 326;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 55;
+const EXPECTED_FASTPATH_METHODS: usize = 57;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;
@@ -654,7 +657,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.status",
     "host.toolAvailability",
     "invite.accept",
+    "invite.challenge",
     "invite.inspect",
+    "invite.prove",
     "invite.redeem",
     "linear.authStatus",
     "linear.createIssue",
@@ -1192,7 +1197,9 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.providerDiscovery",
     "host.providerTestPrompt",
     "invite.accept",
+    "invite.challenge",
     "invite.inspect",
+    "invite.prove",
     "invite.redeem",
     "linear.authStatus",
     "linear.createIssue",
@@ -1530,7 +1537,8 @@ fn reverse_methods_are_never_on_the_collaborator_allowlist() {
 ///
 /// The remaining refused methods — the connection-task fast paths (`host.*`,
 /// `browser.*`, `forward.*`, `system.*`, `pairing.*`, `server.*`,
-/// `providers.setup.*`, `invite.redeem` / `invite.inspect` / `invite.accept`)
+/// `providers.setup.*`, `invite.redeem` / `invite.inspect` / `invite.accept`
+/// / `invite.challenge` / `invite.prove`)
 /// and the subscription channels — have
 /// no `WorkspaceApi` method to gate; they are protected only by the
 /// transport allowlist in `conn::process_frame` (`-32003`) and stay out of
