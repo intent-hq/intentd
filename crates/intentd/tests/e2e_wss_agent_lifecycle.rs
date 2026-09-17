@@ -15648,6 +15648,7 @@ async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
     );
 }
 
+/// Scratch (coverage-changed positive path): trivial doc edit only.
 /// A queued admission is observable on the real wire exactly once: with the
 /// slot cap pinned to one (`agents.maxConcurrent = 1`, budget off) and one
 /// agent mid-turn, a second agent's first turn parks its spawn — the wire
