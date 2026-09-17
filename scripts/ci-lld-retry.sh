@@ -16,7 +16,11 @@
 # processes, disk state) and retries exactly once. Any other failure — a
 # genuine lint, a compile error, a different linker error — propagates
 # immediately with the original exit code, so the wrapper never hides a real
-# red.
+# red. That includes a mixed run: a workspace Clippy pass can report a lint
+# in one crate alongside the vanished-object error in another, and the lint
+# alone decides — any rustc/clippy `error:` diagnostic in the output other
+# than the linker-failure envelope (`linking with … failed`, `could not
+# compile`, `aborting due to`) makes the failure genuine, no retry.
 #
 # Usage: ci-lld-retry.sh CMD [ARGS...]
 # The command's output is streamed unchanged (stderr merged into stdout, as
@@ -26,9 +30,21 @@ set -euo pipefail
 [ $# -ge 1 ] || { echo "usage: $0 CMD [ARGS...]" >&2; exit 2; }
 
 SIGNATURE='rust-lld: error: cannot open .* No such file or directory'
+# rustc / clippy diagnostics start the line with `error:` or `error[E0xxx]:`;
+# the rust-lld line does not (`rust-lld: error:`). The linker-failure
+# envelope rustc and cargo print around a failed link is the only `error:`
+# the retried path may contain.
+DIAGNOSTIC='^error(\[E[0-9]+\])?: '
+LINK_ENVELOPE='^error: (linking with .* failed|could not compile |aborting due to )'
 
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
+
+# A genuine diagnostic in the captured output — colour codes stripped, since
+# cargo may emit them under CARGO_TERM_COLOR=always.
+has_genuine_diagnostic() {
+  sed -E 's/\x1b\[[0-9;]*m//g' "$log" | grep -E "$DIAGNOSTIC" | grep -qvE "$LINK_ENVELOPE"
+}
 
 run_once() {
   local rc
@@ -77,6 +93,12 @@ run_once "$@" || rc=$?
 
 if ! grep -qE "$SIGNATURE" "$log"; then
   # Not the vanished-object signature: a real failure, fail fast.
+  exit "$rc"
+fi
+if has_genuine_diagnostic; then
+  # The signature alongside a real lint / compile error: the real error
+  # decides, and a retry would only hide it behind a second run.
+  echo "::notice::rust-lld vanished-object signature seen, but the output also carries a genuine rustc/clippy diagnostic — not retrying (intent-hq/intent#5256)"
   exit "$rc"
 fi
 

@@ -274,25 +274,30 @@ jobs:
           # scripts/ci-target-slot.sh purge-candidates (path allowlist,
           # own-dir / own-slot skip, `.in-use` marker, recursive activity
           # check; oldest top-level mtime first — intent-hq/intent#5256);
-          # this loop only deletes until the need is met. `|| true` on rm
-          # tolerates another slot's preflight racing us to the same
-          # candidate, and the process substitution keeps a producer cut
-          # short by `break` from failing the step.
+          # this loop only deletes until the need is met. The producer runs
+          # ahead of this loop, so a candidate it buffered may have been
+          # marked by a job that started while earlier dirs were being
+          # deleted: is-purgeable repeats the marker + activity check
+          # immediately before each rm. `|| true` on rm tolerates another
+          # slot's preflight racing us to the same candidate, and the
+          # process substitution keeps a producer cut short by `break` from
+          # failing the step.
           evict_until_free() {
-            local verb="$1" dir
-            shift
+            local verb="$1" quiet_min="$2" dir
+            shift 2
             while IFS= read -r dir; do
+              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
               echo "$verb: $dir"
               rm -rf -- "$dir" || true
               # `if`, not `[ ] && break`: a function returns its loop's last
               # status, and a final unmet check would abort the step here.
               if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target "$@")
+            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
           }
           # Stale tier: nothing inside touched within 2 days (-mmin gives a
           # strict 48 h window; -mtime rounds to whole days).
           echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning --quiet-min 2880 --skip-dir "$own_dir"
+          evict_until_free pruning 2880 --skip-dir "$own_dir"
           # Escalation tier: under heavy churn everything on the volume can
           # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
           # stale pass nothing to prune — LRU-evict idle ci-target dirs
@@ -310,7 +315,7 @@ jobs:
           # check, and the own-slot skip covers every dir this slot may use.
           if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
             echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting --quiet-min 15 --skip-slot "$RUNNER_NAME"
+            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
           fi
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
@@ -732,22 +737,24 @@ jobs:
           echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
           [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
           # Same two tiers as the `check` job's preflight (see its comment):
-          # selection in scripts/ci-target-slot.sh purge-candidates, this
-          # loop only deletes until the need is met.
+          # selection in scripts/ci-target-slot.sh purge-candidates, a live
+          # is-purgeable recheck before each rm, this loop only deletes
+          # until the need is met.
           evict_until_free() {
-            local verb="$1" dir
-            shift
+            local verb="$1" quiet_min="$2" dir
+            shift 2
             while IFS= read -r dir; do
+              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
               echo "$verb: $dir"
               rm -rf -- "$dir" || true
               if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target "$@")
+            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
           }
           echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning --quiet-min 2880 --skip-dir "$own_dir"
+          evict_until_free pruning 2880 --skip-dir "$own_dir"
           if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
             echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting --quiet-min 15 --skip-slot "$RUNNER_NAME"
+            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
           fi
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
@@ -908,22 +915,24 @@ jobs:
           echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
           [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
           # Same two tiers as the `check` job's preflight (see its comment):
-          # selection in scripts/ci-target-slot.sh purge-candidates, this
-          # loop only deletes until the need is met.
+          # selection in scripts/ci-target-slot.sh purge-candidates, a live
+          # is-purgeable recheck before each rm, this loop only deletes
+          # until the need is met.
           evict_until_free() {
-            local verb="$1" dir
-            shift
+            local verb="$1" quiet_min="$2" dir
+            shift 2
             while IFS= read -r dir; do
+              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
               echo "$verb: $dir"
               rm -rf -- "$dir" || true
               if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target "$@")
+            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
           }
           echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning --quiet-min 2880 --skip-dir "$own_dir"
+          evict_until_free pruning 2880 --skip-dir "$own_dir"
           if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
             echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting --quiet-min 15 --skip-slot "$RUNNER_NAME"
+            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
           fi
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then

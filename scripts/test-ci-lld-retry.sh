@@ -4,7 +4,8 @@
 # scripted through files in a scratch dir, and asserts the retry is exactly
 # as narrow as intended — the rust-lld vanished-object signature earns one
 # retry with diagnostics, a genuine lint failure fails fast with its own
-# exit code, and a signature that persists is retried once, not forever.
+# exit code, a signature that persists is retried once, not forever, and a
+# mixed run (genuine lint alongside the signature) is not retried at all.
 #
 # Run directly: ./scripts/test-ci-lld-retry.sh
 set -euo pipefail
@@ -35,7 +36,18 @@ EOF
 chmod +x "$tmp/fake-cargo"
 
 signature_line="rust-lld: error: cannot open $tmp/objs/intent_core-3f1a.rcgu.o: No such file or directory"
+# What rustc and cargo print around a failed link, as in run 35200715354
+# (the backticks are rustc's own quoting, meant literally).
+# shellcheck disable=SC2016
+link_envelope=$(printf '%s\n' \
+  'error: linking with `cc` failed: exit status: 1' \
+  '  |' \
+  '  = note: some arguments are omitted' \
+  "  = note: $signature_line" \
+  'error: could not compile `intent-core` (lib) due to 1 previous error' \
+  'error: aborting due to 1 previous error')
 lint_line="error: this looks like a lint (clippy::needless_return)"
+compile_error_line=$'\e[1m\e[31merror[E0425]\e[0m\e[1m: cannot find value `nope` in this scope\e[0m'
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_contains() { grep -q -F -- "$2" "$1" || fail "$3: expected output to contain: $2"; }
@@ -62,9 +74,9 @@ run s1 0
 assert_calls s1 1
 assert_not_contains "$tmp/out.s1" "retrying once" s1
 
-echo "scenario 2: the vanished-object signature is retried exactly once and recovers"
+echo "scenario 2: the vanished-object signature (with the linker envelope) is retried exactly once and recovers"
 scenario s2
-printf '1\n%s\n' "$signature_line" >"$PLAN/1"
+printf '1\n%s\n' "$link_envelope" >"$PLAN/1"
 touch "$tmp/objs/neighbour.o"
 run s2 0
 assert_calls s2 2
@@ -108,5 +120,22 @@ printf '101\n%s\n' "$lint_line" >"$PLAN/2"
 run s6 101
 assert_calls s6 2
 assert_contains "$tmp/out.s6" "$lint_line" s6
+
+echo "scenario 7: a genuine lint alongside the signature in the same run is not retried; first exit code wins"
+scenario s7
+printf '101\n%s\n%s\n' "$lint_line" "$link_envelope" >"$PLAN/1"
+run s7 101
+assert_calls s7 1
+assert_contains "$tmp/out.s7" "$lint_line" s7
+assert_contains "$tmp/out.s7" "::notice::rust-lld vanished-object signature seen, but the output also carries a genuine rustc/clippy diagnostic" s7
+assert_not_contains "$tmp/out.s7" "retrying once" s7
+assert_not_contains "$tmp/out.s7" "diagnostics (intent-hq/intent#5256)" s7
+
+echo "scenario 8: a coloured error[E0xxx] compile diagnostic alongside the signature is not retried"
+scenario s8
+printf '1\n%s\n%s\n' "$compile_error_line" "$link_envelope" >"$PLAN/1"
+run s8 1
+assert_calls s8 1
+assert_not_contains "$tmp/out.s8" "retrying once" s8
 
 echo "OK: all scenarios passed"

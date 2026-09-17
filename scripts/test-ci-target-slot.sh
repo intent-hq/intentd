@@ -5,7 +5,9 @@
 # fresh `.in-use` marker is never a candidate (even when nothing else inside
 # it looks active), an unmarked idle dir is, an expired marker no longer
 # protects, the own dir / own slot are skipped, the recursive activity check
-# still shields unmarked live dirs, and mark/unmark round-trip.
+# still shields unmarked live dirs, mark/unmark round-trip, and the
+# consumer's is-purgeable recheck stops a candidate marked after selection
+# from being deleted.
 #
 # Run directly: ./scripts/test-ci-target-slot.sh
 set -euo pipefail
@@ -104,5 +106,32 @@ assert_eq "$(candidates --quiet-min 15)" "$older $newer" s6
 "$script" purge-candidates "$root" 2>/dev/null && fail "s6: --quiet-min must be required"
 "$script" purge-candidates "$root" --quiet-min 0 2>/dev/null && fail "s6: --quiet-min 0 must be rejected"
 "$script" purge-candidates relative/root --quiet-min 15 2>/dev/null && fail "s6: relative ROOT must be rejected"
+
+echo "scenario 7: is-purgeable is the consumer's live recheck — a candidate marked after selection is not deleted"
+rm -rf "$root"
+first=$(mkslot slot1 check 9000)
+second=$(mkslot slot2 check 5000)
+"$script" is-purgeable "$second" --quiet-min 15 2>/dev/null || fail "s7: an idle unmarked dir must be purgeable"
+"$script" is-purgeable "$tmp/nowhere" --quiet-min 15 2>"$tmp/skips" && fail "s7: a missing dir must not be purgeable"
+assert_skip "skipping (gone): $tmp/nowhere" s7-gone
+"$script" is-purgeable "$second" 2>/dev/null && fail "s7: --quiet-min must be required"
+# The ci.yml preflight loop shape: the producer has already emitted both
+# candidates when the loop starts; a job marks the second one while the
+# first is being deleted. Without the recheck the second dir is deleted too.
+deleted=()
+while IFS= read -r dir; do
+  "$script" is-purgeable "$dir" --quiet-min 15 2>>"$tmp/skips" || continue
+  deleted+=("$dir")
+  rm -rf -- "$dir"
+  "$script" mark "$second" >/dev/null
+done < <("$script" purge-candidates "$root" --quiet-min 15 2>/dev/null)
+assert_eq "${deleted[*]}" "$first" s7-race
+assert_skip "skipping (in use, .in-use < 240min): $second" s7-race
+[ -f "$second/debug/deps/a.o" ] || fail "s7: the dir marked mid-loop must survive"
+# The recheck also honours late activity, not just the marker.
+"$script" unmark "$second" >/dev/null
+touch "$second/debug/deps/a.o"
+"$script" is-purgeable "$second" --quiet-min 15 2>"$tmp/skips" && fail "s7: a dir active since selection must not be purgeable"
+assert_skip "skipping (active <15min): $second" s7-active
 
 echo "OK: all scenarios passed"
