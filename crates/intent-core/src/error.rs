@@ -185,6 +185,9 @@ pub enum InviteErrorKind {
     /// The workspace's collaborators already reach the guest cap; the join
     /// is refused and the invite stays open.
     WorkspaceFull,
+    /// The `credential` an `invite.accept` presented is unknown to this host
+    /// or was revoked; the guest must redeem through the device flow.
+    CredentialInvalid,
 }
 
 impl InviteErrorKind {
@@ -207,6 +210,7 @@ impl InviteErrorKind {
             InviteErrorKind::FlowBusy => "invite-flow-busy",
             InviteErrorKind::GuestLimit => "guest-limit",
             InviteErrorKind::WorkspaceFull => "workspace-full",
+            InviteErrorKind::CredentialInvalid => "credential-invalid",
         }
     }
 
@@ -249,6 +253,10 @@ impl InviteErrorKind {
                 "invalid params: this workspace has reached its guest limit; ask the owner \
                  to make room"
             }
+            InviteErrorKind::CredentialInvalid => {
+                "invalid params: the credential is unknown to this host or was revoked; \
+                 redeem the invite through GitHub instead"
+            }
         }
     }
 
@@ -266,7 +274,8 @@ impl InviteErrorKind {
             | InviteErrorKind::FlowExpired
             | InviteErrorKind::FlowNotFound
             | InviteErrorKind::GuestLimit
-            | InviteErrorKind::WorkspaceFull => -32602,
+            | InviteErrorKind::WorkspaceFull
+            | InviteErrorKind::CredentialInvalid => -32602,
             InviteErrorKind::GithubIdentityRequired
             | InviteErrorKind::IdentityLocked
             | InviteErrorKind::FlowError

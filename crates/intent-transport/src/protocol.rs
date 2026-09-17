@@ -492,7 +492,7 @@
 //! `inviteId` / `secret`, the secret exactly once), `workspace.invite.list` /
 //! `workspace.invite.revoke`, `workspace.members.leave`, `principal.revokeSelf`
 //! (closes the caller's own connections), and the unauthenticated `/invite`
-//! WSS endpoint serving only `invite.redeem` (`{ inviteId, secret }` → device
+//! WSS endpoint serving `invite.redeem` (`{ inviteId, secret }` → device
 //! codes; `{ flowId }` → the collaborator credential once). Invite refusals
 //! carry `error.data.code` (`invite-expired`, `invite-revoked`,
 //! `invite-redeemed`, `invite-pin-mismatch`, `invite-flow-denied`, …). Also
@@ -521,9 +521,16 @@
 //! `workspace.members.list` carries the additive `guestCount` / `guestLimit`;
 //! a per-principal credential's `/ws` upgrade is refused with `503` while
 //! `sharing.maxGuestConnections` / `sharing.maxConnectionsPerGuest` are
-//! spent, and `GET /health` carries the additive `guestConnections`. The
-//! catalog contains 324 router methods, 53 fast-path methods, and two
-//! aliases: 379 client-callable names.
+//! spent, and `GET /health` carries the additive `guestConnections`. Also
+//! within 10.3, the returning guest's `/invite` methods (additive):
+//! `invite.inspect` (`{ inviteId, secret }` → `{ workspaceId,
+//! workspaceTitle, hostname, prettyHostname }`, the phase-1 validation with
+//! no device flow) and `invite.accept` (`{ inviteId, secret, credential }`
+//! → the phase-2 `authorized` shape, joining with a per-principal
+//! credential this host already minted; an unknown / revoked credential is
+//! `error.data.code` `credential-invalid`). The catalog contains 324 router
+//! methods, 55 fast-path methods, and two aliases: 381 client-callable
+//! names.
 
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
 //! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release
