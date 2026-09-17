@@ -22,12 +22,13 @@ mod common;
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use intentd_test_support::GuardedChild;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
@@ -55,7 +56,7 @@ const INTRUDER_ID: u64 = 300;
 const USER_CODE: &str = "JOIN-0001";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
@@ -98,7 +99,7 @@ esac
     path
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -108,9 +109,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     )
     .expect("seed config.toml with server.tunnel.enabled");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env_remove("GH_TOKEN")
@@ -119,7 +119,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -128,6 +128,7 @@ async fn await_uds(socket: &Path) -> bool {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
             }
+            // timing-guard: poll interval
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
