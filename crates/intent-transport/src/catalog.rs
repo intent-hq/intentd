@@ -435,7 +435,6 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "invite.challenge",
     "invite.inspect",
     "invite.prove",
-    "invite.redeem",
     "note.presence.update",
     "pairing.getInfo",
     "presence.update",
