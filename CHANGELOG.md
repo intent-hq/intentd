@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.69] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(agent-manager)* Gate memory budget on host headroom and emit resumed on timed admission ([#1947](https://github.com/intent-hq/intentd/pull/1947))
+
+
 ## [0.9.68] - 2026-09-17
 
 ### 🧪 Testing
