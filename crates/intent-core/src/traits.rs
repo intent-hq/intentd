@@ -4356,6 +4356,42 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.identityProof.create`: publish a host-issued `nonce` in a
+    /// **secret gist** created with the stored GitHub token (guest half of
+    /// the gist identity-proof join flow) → `{ gistId, login }`. Refused
+    /// with `Error::IdentityProof` (`github-not-connected` when no token is
+    /// stored or GitHub rejects it, `github-scope-missing` when the token
+    /// lacks the `gist` scope, `github-unreachable` on transport failure).
+    /// Owner-client only. Never returns the token.
+    fn github_identity_proof_create(
+        &self,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (nonce, host_label);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_identity_proof_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.identityProof.delete`: delete a proof gist created by
+    /// `github.identityProof.create` → `{ ok: true }`. Idempotent (an
+    /// already-deleted gist is `ok`); same bounded `Error::IdentityProof`
+    /// codes as create. Owner-client only.
+    fn github_identity_proof_delete(
+        &self,
+        gist_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = gist_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_identity_proof_delete not implemented".to_string(),
+            ))
+        })
+    }
+
     // ========================================================================
     // principal.* (multiplayer w1)
     // ========================================================================

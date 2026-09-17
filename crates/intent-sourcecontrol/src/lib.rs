@@ -14,6 +14,7 @@ pub mod device_flow;
 pub mod error;
 pub mod gh_sync;
 pub mod github;
+pub mod identity_proof;
 pub mod model;
 pub mod registry;
 pub mod token;

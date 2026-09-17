@@ -30378,6 +30378,60 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn github_identity_proof_create(
+        &self,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Guest half of the gist identity-proof join flow: the proof gist is
+        // made with the STORED device-flow token only (never the env / `gh`
+        // fallbacks), against the same API host the reconnect guard uses.
+        // 🔒 The token stays server-side; only `{ gistId, login }` crosses.
+        let secrets = self.secrets.clone();
+        let api_base = invite_ops::resolve_api_base_uri(self.github_api_base_uri.as_deref());
+        Box::pin(async move {
+            Self::require_administrator("github.identityProof.create")?;
+            let nonce = github_auth_ops::proof_line_param("nonce", &nonce)?;
+            let host_label = github_auth_ops::proof_line_param("hostLabel", &host_label)?;
+            let token = github_auth_ops::load_stored_token(&secrets).await?;
+            let gist = intent_sourcecontrol::identity_proof::create_proof_gist(
+                &token,
+                api_base.as_deref(),
+                &nonce,
+                &host_label,
+            )
+            .await
+            .map_err(github_auth_ops::map_identity_proof_err)?;
+            Ok(serde_json::json!({ "gistId": gist.gist_id, "login": gist.login }))
+        })
+    }
+
+    fn github_identity_proof_delete(
+        &self,
+        gist_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let secrets = self.secrets.clone();
+        let api_base = invite_ops::resolve_api_base_uri(self.github_api_base_uri.as_deref());
+        Box::pin(async move {
+            Self::require_administrator("github.identityProof.delete")?;
+            let gist_id = gist_id.trim();
+            if gist_id.is_empty() || !gist_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Err(Error::InvalidParams(
+                    "gistId must be a non-empty alphanumeric gist id".to_string(),
+                ));
+            }
+            let token = github_auth_ops::load_stored_token(&secrets).await?;
+            intent_sourcecontrol::identity_proof::delete_proof_gist(
+                &token,
+                api_base.as_deref(),
+                gist_id,
+            )
+            .await
+            .map_err(github_auth_ops::map_identity_proof_err)?;
+            Ok(serde_json::json!({ "ok": true }))
+        })
+    }
+
     // ========================================================================
     // principal.* (multiplayer w1) — see `principal_ops`.
     // ========================================================================
