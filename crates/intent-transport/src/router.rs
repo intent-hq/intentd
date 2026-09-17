@@ -180,6 +180,15 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": kind.as_str() })),
         },
+        // Gist identity-proof refusal (guest half): `-32603` with the stable
+        // `data.code` (`github-not-connected` / `github-scope-missing` /
+        // `github-unreachable`) so the join flow can route "sign in" vs
+        // "retry" without matching on prose.
+        ref e @ Error::IdentityProof(kind) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": kind.as_str() })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -3016,6 +3025,27 @@ async fn dispatch(
             let limit = opt_int(params, "limit");
             let r = api
                 .github_users_search(query, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `github.identityProof.*` (gist identity-proof join flow, guest
+        // half): the local daemon publishes a host-issued nonce in a secret
+        // gist made with the stored token; owner-client only, the token
+        // never crosses the wire.
+        "github.identityProof.create" => {
+            let nonce = require_str_param(params, "nonce")?;
+            let host_label = require_str_param(params, "hostLabel")?;
+            let r = api
+                .github_identity_proof_create(nonce, host_label)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.identityProof.delete" => {
+            let gist_id = require_str_param(params, "gistId")?;
+            let r = api
+                .github_identity_proof_delete(gist_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

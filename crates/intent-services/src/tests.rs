@@ -17513,6 +17513,188 @@ pub(crate) mod pr {
         assert_eq!(r["ok"], true);
     }
 
+    /// `error.data.code` an identity-proof refusal would carry on the wire.
+    fn identity_proof_code(err: &intent_core::Error) -> &'static str {
+        match err {
+            intent_core::Error::IdentityProof(kind) => kind.as_str(),
+            other => panic!("expected an identity-proof refusal, got {other:?}"),
+        }
+    }
+
+    /// Loopback GitHub API stub for the identity-proof glue: `GET /user`
+    /// reports `scopes` (header omitted when `None`) and `login`, `POST
+    /// /gists` answers `gist_id`, `DELETE /gists/{gist_id}` is 204 and any
+    /// other gist 404. Returns its base URI.
+    async fn spawn_gist_api(scopes: Option<&'static str>, gist_id: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+                        let Some(head_end) = head_end else { continue };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                        let want = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= head_end + 4 + want {
+                            break;
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let line = head.lines().next().unwrap_or_default();
+                    let (status, extra, body) = if line.starts_with("GET /user ") {
+                        let extra = scopes
+                            .map(|s| format!("X-OAuth-Scopes: {s}\r\n"))
+                            .unwrap_or_default();
+                        (200, extra, r#"{"login":"octocat","id":1}"#.to_string())
+                    } else if line.starts_with("POST /gists ") {
+                        (201, String::new(), format!(r#"{{"id":"{gist_id}"}}"#))
+                    } else if line.starts_with(&format!("DELETE /gists/{gist_id} ")) {
+                        (204, String::new(), String::new())
+                    } else if line.starts_with("DELETE /gists/") {
+                        (404, String::new(), r#"{"message":"Not Found"}"#.to_string())
+                    } else {
+                        (
+                            500,
+                            String::new(),
+                            r#"{"message":"unexpected"}"#.to_string(),
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} Status\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        base
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_create_without_a_stored_token_is_not_connected() {
+        let (_t, svc) = github_svc().await;
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        let svc = svc.with_secret_store(mem);
+        let err = svc
+            .github_identity_proof_create("nonce-1".into(), "Studio".into())
+            .await
+            .expect_err("no token stored");
+        assert_eq!(identity_proof_code(&err), "github-not-connected");
+        assert_eq!(err.code(), -32603);
+        let err = svc
+            .github_identity_proof_delete("abc".into())
+            .await
+            .expect_err("no token stored");
+        assert_eq!(identity_proof_code(&err), "github-not-connected");
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_create_validates_params_before_the_token() {
+        let (_t, svc) = github_svc().await;
+        let svc = svc.with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+        for (nonce, label) in [("", "h"), ("n", " "), ("a\nb", "h"), ("n", "x\ny")] {
+            let err = svc
+                .github_identity_proof_create(nonce.into(), label.into())
+                .await
+                .expect_err("invalid params");
+            assert!(
+                matches!(err, intent_core::Error::InvalidParams(_)),
+                "{nonce:?}/{label:?}: {err:?}"
+            );
+        }
+        for gist_id in ["", "../x", "abc def"] {
+            let err = svc
+                .github_identity_proof_delete(gist_id.into())
+                .await
+                .expect_err("invalid gist id");
+            assert!(
+                matches!(err, intent_core::Error::InvalidParams(_)),
+                "{gist_id:?}: {err:?}"
+            );
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_create_and_delete_with_the_stored_token() {
+        let (_t, svc) = github_svc().await;
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_stored")
+            .expect("seed token");
+        let base = spawn_gist_api(Some("repo, read:org, workflow, gist"), "g1").await;
+        let svc = svc.with_secret_store(mem).with_github_api_base_uri(base);
+        let v = svc
+            .github_identity_proof_create(" nonce-1 ".into(), "Studio".into())
+            .await
+            .expect("create proof gist");
+        assert_eq!(v, serde_json::json!({ "gistId": "g1", "login": "octocat" }));
+        let v = svc
+            .github_identity_proof_delete("g1".into())
+            .await
+            .expect("delete proof gist");
+        assert_eq!(v, serde_json::json!({ "ok": true }));
+        // Idempotent: an already-deleted gist (404) is still `ok`.
+        let v = svc
+            .github_identity_proof_delete("gone".into())
+            .await
+            .expect("delete missing gist");
+        assert_eq!(v, serde_json::json!({ "ok": true }));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_create_without_gist_scope_is_scope_missing() {
+        let (_t, svc) = github_svc().await;
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_stored")
+            .expect("seed token");
+        let base = spawn_gist_api(Some("repo, read:org, workflow"), "g1").await;
+        let svc = svc.with_secret_store(mem).with_github_api_base_uri(base);
+        let err = svc
+            .github_identity_proof_create("nonce-1".into(), "Studio".into())
+            .await
+            .expect_err("scope missing");
+        assert_eq!(identity_proof_code(&err), "github-scope-missing");
+        assert_eq!(err.code(), -32603);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_create_against_a_dead_host_is_unreachable() {
+        let (_t, svc) = github_svc().await;
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_stored")
+            .expect("seed token");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let base = format!("http://{}", listener.local_addr().expect("address"));
+        drop(listener);
+        let svc = svc.with_secret_store(mem).with_github_api_base_uri(base);
+        let err = svc
+            .github_identity_proof_create("nonce-1".into(), "Studio".into())
+            .await
+            .expect_err("unreachable");
+        assert_eq!(identity_proof_code(&err), "github-unreachable");
+    }
+
     #[intent_test_macros::daemon_test]
     async fn status_shape_is_parity_exact() {
         let (_t, svc, ws) = setup(false, true).await;
