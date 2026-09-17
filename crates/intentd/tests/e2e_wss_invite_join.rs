@@ -684,6 +684,14 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(r["interval"], json!(1));
     assert_eq!(r["workspaceId"], json!(ws_id));
     assert_eq!(r["workspaceTitle"], json!("Invite E2E"));
+    assert!(
+        r["hostname"].as_str().is_some_and(|h| !h.is_empty()),
+        "hostname: {r}"
+    );
+    assert!(
+        r["prettyHostname"].as_str().is_some_and(|h| !h.is_empty()),
+        "prettyHostname: {r}"
+    );
     assert!(r.get("deviceCode").is_none());
 
     // 4. The WRONG GitHub account authorises → pin mismatch; the invite stays
