@@ -3195,7 +3195,8 @@ mod tests {
         assert_eq!(memory_budget_default_mb_for(None), 4_096.0);
 
         // The wired-up form agrees with the injectable one and with the byte
-        // figure boot installs on this host.
+        // figure boot installs on this host — clamped to the catalog max, as
+        // the advertised default is (a sub-4 GiB or >~2 TiB host binds it).
         let detected = host_total_memory_bytes();
         assert_eq!(
             memory_budget_default_mb(),
@@ -3210,7 +3211,7 @@ mod tests {
         );
         assert_eq!(
             memory_budget_default_mb(),
-            (installed / (1024 * 1024)) as f64
+            ((installed / (1024 * 1024)) as f64).min(memory_budget_max_mb_for(detected))
         );
         assert!(memory_budget_default_mb() > 0.0);
     }
