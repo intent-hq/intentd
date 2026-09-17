@@ -46,8 +46,11 @@ const SLOW_DOWN_BUMP_SECS: u64 = 5;
 const SECRET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default scopes requested by the device flow (§spec: PR/issue/review work,
-/// org-repo listing, and workflow-file pushes).
-pub const DEFAULT_SCOPES: &[&str] = &["repo", "read:org", "workflow"];
+/// org-repo listing, workflow-file pushes, and the secret proof gist of the
+/// gist identity-proof join flow — [`crate::identity_proof`]). Tokens granted
+/// before `gist` was added keep working; they only need a re-authorization
+/// when the user first joins a workspace as a guest.
+pub const DEFAULT_SCOPES: &[&str] = &["repo", "read:org", "workflow", "gist"];
 
 /// User-facing half of the device-flow start response. Deliberately excludes
 /// the secret `device_code` (which stays inside [`DeviceFlow`]) so this shape
@@ -715,7 +718,8 @@ mod tests {
 
     #[test]
     fn default_scopes_and_client_id_match_the_registered_oauth_app() {
-        assert_eq!(DEFAULT_SCOPES, &["repo", "read:org", "workflow"]);
+        assert_eq!(DEFAULT_SCOPES, &["repo", "read:org", "workflow", "gist"]);
+        assert!(DEFAULT_SCOPES.contains(&crate::identity_proof::REQUIRED_SCOPE));
         assert_eq!(DEFAULT_OAUTH_CLIENT_ID, "Ov23li8bvmPsd4B4pW38");
     }
 }

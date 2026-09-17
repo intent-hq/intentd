@@ -62,6 +62,12 @@ impl GitHubSourceControl {
         Ok(Self { client })
     }
 
+    /// The underlying octocrab client (token + base URI + timeouts), for
+    /// crate-internal callers outside the [`SourceControl`] surface.
+    pub(crate) fn client(&self) -> &octocrab::Octocrab {
+        &self.client
+    }
+
     fn repo_path(repo: &RepoRef, suffix: &str) -> String {
         format!("/repos/{}/{}{}", repo.owner, repo.name, suffix)
     }
