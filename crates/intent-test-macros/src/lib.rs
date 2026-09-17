@@ -20,12 +20,21 @@ use proc_macro::{Delimiter, Group, Ident, Punct, Spacing, Span, TokenStream, Tok
 /// function (`#[should_panic]`, `#[ignore]`, `#[expect(..)]`) are kept, and a
 /// declared return type is preserved so `?` keeps inferring inside the body.
 ///
+/// The body future is `Box::pin`ned so the wrapping adds no second copy of
+/// the (debug-build, unoptimised) test state to the runtime's `block_on`
+/// stack frame — a large direct-call test otherwise overflows the test
+/// thread's stack.
+///
 /// The expansion is
 ///
 /// ```ignore
 /// #[tokio::test(<args>)]
 /// async fn name() -> Ret {
-///     let out: Ret = ::intent_core::with_caller(::intent_core::Caller::Daemon, async move { <body> }).await;
+///     let out: Ret = ::intent_core::with_caller(
+///         ::intent_core::Caller::Daemon,
+///         ::std::boxed::Box::pin(async move { <body> }),
+///     )
+///     .await;
 ///     out
 /// }
 /// ```
@@ -86,18 +95,25 @@ fn tokio_test_attribute(args: TokenStream) -> TokenStream {
     attr
 }
 
-/// `let out: Ret = ::intent_core::with_caller(::intent_core::Caller::Daemon, async move { body }).await; out`
+/// `let out: Ret = ::intent_core::with_caller(::intent_core::Caller::Daemon, ::std::boxed::Box::pin(async move { body })).await; out`
 /// — or the bare awaited scope for a unit-returning test.
 fn bound_body(body: TokenStream, return_type: Option<Vec<TokenTree>>) -> TokenStream {
     let mut call: TokenStream = "::intent_core::with_caller".parse().expect("static path");
     let mut call_args: TokenStream = "::intent_core::Caller::Daemon,"
         .parse()
         .expect("static path");
-    call_args.extend([
+    let mut boxed: TokenStream = "::std::boxed::Box::pin".parse().expect("static path");
+    let mut body_future = TokenStream::new();
+    body_future.extend([
         TokenTree::Ident(Ident::new("async", Span::call_site())),
         TokenTree::Ident(Ident::new("move", Span::call_site())),
         TokenTree::Group(Group::new(Delimiter::Brace, body)),
     ]);
+    boxed.extend([TokenTree::Group(Group::new(
+        Delimiter::Parenthesis,
+        body_future,
+    ))]);
+    call_args.extend(boxed);
     call.extend([TokenTree::Group(Group::new(
         Delimiter::Parenthesis,
         call_args,
