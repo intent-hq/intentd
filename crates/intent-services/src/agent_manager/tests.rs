@@ -25,7 +25,8 @@ use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
     is_cancel_transport_closed, recommended_memory_budget_bytes, resolve_npx_only, resolve_spawn,
     text_prompt, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, ResolvedSpawn,
-    TreeMemoryProbe, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES, PROVISIONAL_AGENT_BYTES,
+    TreeMemoryProbe, TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES,
+    PROVISIONAL_AGENT_BYTES,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
@@ -254,31 +255,33 @@ async fn acquire_queues_until_a_process_goes_idle() {
 /// (`available_memory`) is `None` unless a test sets it, so the existing
 /// budget tests keep exercising the tree-only criterion.
 struct FakeProbe(
-    Mutex<(u64, u64)>,
+    Mutex<TreeSample>,
     Mutex<std::collections::HashMap<AgentId, u64>>,
-    Mutex<Option<u64>>,
 );
 
 impl FakeProbe {
     fn new(bytes: u64) -> Arc<Self> {
         Arc::new(Self(
-            Mutex::new((bytes, 1)),
+            Mutex::new(TreeSample {
+                memory_bytes: bytes,
+                seq: 1,
+                available_memory: None,
+            }),
             Mutex::new(std::collections::HashMap::new()),
-            Mutex::new(None),
         ))
     }
 
     /// Publish a host available-memory reading (`None` = not measured).
     fn set_available_memory(&self, bytes: Option<u64>) {
-        *self.2.lock().unwrap() = bytes;
+        self.0.lock().unwrap().available_memory = bytes;
     }
 
     /// Publish a freshly measured reading (new sample id → the registry drops
     /// the provisional correction it accumulated against the previous one).
     fn set(&self, bytes: u64) {
         let mut guard = self.0.lock().unwrap();
-        guard.0 = bytes;
-        guard.1 += 1;
+        guard.memory_bytes = bytes;
+        guard.seq += 1;
     }
 
     /// Publish per-agent attribution buckets (monorepo#2063 Phase A) alongside
@@ -289,16 +292,12 @@ impl FakeProbe {
 }
 
 impl TreeMemoryProbe for FakeProbe {
-    fn sample(&self) -> Option<(u64, u64)> {
+    fn sample(&self) -> Option<TreeSample> {
         Some(*self.0.lock().unwrap())
     }
 
     fn agent_samples(&self) -> std::collections::HashMap<AgentId, u64> {
         self.1.lock().unwrap().clone()
-    }
-
-    fn available_memory(&self) -> Option<u64> {
-        *self.2.lock().unwrap()
     }
 }
 
@@ -307,8 +306,38 @@ impl TreeMemoryProbe for FakeProbe {
 struct NeverSampled;
 
 impl TreeMemoryProbe for NeverSampled {
-    fn sample(&self) -> Option<(u64, u64)> {
+    fn sample(&self) -> Option<TreeSample> {
         None
+    }
+}
+
+/// A probe that serves a scripted sequence of sweeps, advancing one sweep
+/// per `sample()` call. Models a sampler `store()` landing between two reads:
+/// if admission read the tree total and the host headroom through separate
+/// calls, the second call would already see the next sweep.
+struct SweepingProbe(
+    Mutex<std::vec::IntoIter<TreeSample>>,
+    Mutex<Option<TreeSample>>,
+);
+
+impl SweepingProbe {
+    fn new(sweeps: Vec<TreeSample>) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(sweeps.into_iter()), Mutex::new(None)))
+    }
+
+    /// Sweeps not yet served.
+    fn remaining(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+}
+
+impl TreeMemoryProbe for SweepingProbe {
+    fn sample(&self) -> Option<TreeSample> {
+        let mut last = self.1.lock().unwrap();
+        if let Some(next) = self.0.lock().unwrap().next() {
+            *last = Some(next);
+        }
+        *last
     }
 }
 
@@ -461,6 +490,81 @@ async fn over_budget_tree_with_host_headroom_admits_without_queueing() {
         .await
         .expect("the waiter re-checks host headroom on its own timer")
         .expect("task ok");
+}
+
+/// One admission decision reads exactly one sweep. Two consecutive sweeps
+/// that each admit on their own — over budget with ample headroom, then under
+/// budget with the host short — must both admit; pairing the first sweep's
+/// tree total with the second's headroom would deny and evict the idle tree.
+/// The scripted probe advances a sweep per `sample()` call, so a decision
+/// that consulted the probe twice would straddle the boundary.
+#[tokio::test]
+async fn admission_reads_tree_bytes_and_host_headroom_from_one_sweep() {
+    let gb = super::GB;
+    let events: Arc<Mutex<Vec<(AgentId, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let event_fn: super::ProcessEventFn =
+        Arc::new(move |agent_id, event_type, _used, _cap, reason| {
+            let events = events_clone.clone();
+            let agent_id = agent_id.clone();
+            let event_type = event_type.to_string();
+            let reason = reason.to_string();
+            Box::pin(async move {
+                events.lock().unwrap().push((agent_id, event_type, reason));
+            })
+        });
+
+    let reg = Arc::new(ProcessRegistry::new(8).with_event_fn(event_fn));
+    let probe = SweepingProbe::new(vec![
+        TreeSample {
+            memory_bytes: 67 * gb,
+            seq: 1,
+            available_memory: Some(63 * gb),
+        },
+        TreeSample {
+            memory_bytes: gb,
+            seq: 2,
+            available_memory: Some(HOST_MEMORY_RESERVE_BYTES - 1),
+        },
+    ]);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (idle, first, second) = (
+        AgentId::from("idle"),
+        AgentId::from("first"),
+        AgentId::from("second"),
+    );
+    reg.register(idle.clone(), recording_kill(idle.clone(), log.clone()));
+
+    timeout(
+        Duration::from_millis(200),
+        reg.acquire(&first, claim_all, release_none),
+    )
+    .await
+    .expect("sweep 1: over budget with host headroom admits");
+    assert_eq!(probe.remaining(), 1, "one decision consumed one sweep");
+    reg.register(first.clone(), recording_kill(first.clone(), log.clone()));
+
+    timeout(
+        Duration::from_millis(200),
+        reg.acquire(&second, claim_all, release_none),
+    )
+    .await
+    .expect("sweep 2: under budget admits regardless of host headroom");
+    assert_eq!(
+        probe.remaining(),
+        0,
+        "the second decision consumed the next sweep"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(log.lock().unwrap().is_empty(), "nothing was evicted");
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "no queued/evicted events when each sweep admits on its own: {:?}",
+        events.lock().unwrap()
+    );
 }
 
 #[tokio::test]

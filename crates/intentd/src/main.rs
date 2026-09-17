@@ -17,7 +17,7 @@ use intent_services::{
     agent_memory_budget_bytes, default_process_cap, init_adapter_slots, live_adapters,
     max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes, AgentManager,
     BusEventSink, EventBus, GitStatusRefresher, PermissionPolicy, Services, TreeMemoryProbe,
-    WatcherRegistry,
+    TreeSample, WatcherRegistry,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -3354,10 +3354,15 @@ impl ChildTreeUsage {
 }
 
 impl TreeMemoryProbe for ChildTreeUsage {
-    fn sample(&self) -> Option<(u64, u64)> {
-        // One read of the whole sample: the bytes and the sequence number that
-        // identifies them come from the same sweep by construction.
-        self.load().map(|s| (s.memory_bytes, s.seq))
+    fn sample(&self) -> Option<TreeSample> {
+        // One `load()` of the whole sample: the bytes, the sequence number
+        // that identifies them and the host headroom come from the same sweep
+        // by construction — a `store()` cannot land between them.
+        self.load().map(|s| TreeSample {
+            memory_bytes: s.memory_bytes,
+            seq: s.seq,
+            available_memory: s.available_memory_bytes,
+        })
     }
 
     fn agent_samples(&self) -> HashMap<AgentId, u64> {
@@ -3366,12 +3371,6 @@ impl TreeMemoryProbe for ChildTreeUsage {
         self.load()
             .map(|s| s.agent_bytes.as_ref().clone())
             .unwrap_or_default()
-    }
-
-    fn available_memory(&self) -> Option<u64> {
-        // Host headroom from the same sweep as `sample`, so the budget's
-        // "over budget but the host is not short" decision reads one instant.
-        self.load().and_then(|s| s.available_memory_bytes)
     }
 }
 
@@ -9134,21 +9133,35 @@ mod tests {
         assert_eq!(probe.agent_samples().get(&a), Some(&700));
     }
 
-    /// The probe's `available_memory` serves the host headroom from the same
-    /// sweep as `sample` — `None` before the first sample and when the sweep
-    /// could not read it — so the spawn budget's "over budget but the host is
-    /// not short" decision pairs a tree total with the headroom of one instant.
+    /// The probe's `sample` serves the tree total, its sequence number and
+    /// the host headroom as one value from one sweep — `None` before the
+    /// first sample, `available_memory: None` when the sweep could not read
+    /// it — so the spawn budget's "over budget but the host is not short"
+    /// decision pairs a tree total with the headroom of the same instant. A
+    /// `store()` between two admissions replaces all three together; no
+    /// second read exists for it to land between.
     #[test]
-    fn child_tree_usage_probe_serves_available_memory() {
+    fn child_tree_usage_probe_serves_one_sample_per_sweep() {
         let usage = ChildTreeUsage::default();
         let probe: &dyn TreeMemoryProbe = &usage;
-        assert_eq!(probe.available_memory(), None);
+        assert_eq!(probe.sample(), None);
         usage.store(2, 900, HashMap::new(), Some(63_000_000_000));
-        assert_eq!(probe.available_memory(), Some(63_000_000_000));
-        usage.store(2, 900, HashMap::new(), None);
         assert_eq!(
-            probe.available_memory(),
-            None,
+            probe.sample(),
+            Some(TreeSample {
+                memory_bytes: 900,
+                seq: 1,
+                available_memory: Some(63_000_000_000),
+            })
+        );
+        usage.store(3, 1_200, HashMap::new(), None);
+        assert_eq!(
+            probe.sample(),
+            Some(TreeSample {
+                memory_bytes: 1_200,
+                seq: 2,
+                available_memory: None,
+            }),
             "an unreadable headroom on a later sweep must not serve a stale one"
         );
     }

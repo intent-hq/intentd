@@ -1503,7 +1503,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         SettingDefinition {
             path: "agents.memoryBudgetMb",
             label: "Agent memory budget (MB)",
-            description: "Aggregate resident memory the daemon's whole child-process tree may use before it reclaims: new agent spawns queue behind idle-process eviction, and a background sweep drains idle agents largest-first while over budget (absent = auto, the RAM-derived budget advertised as this setting's default; 0 = off; nothing running is ever killed; changes apply on daemon restart)",
+            description: "Aggregate resident memory of the daemon's whole child-process tree. The budget reclaims only when two conditions hold at once: the tree is over budget AND the host's available memory is below 8 GiB plus one provisional agent (~660 MB); then new agent spawns queue behind idle-process eviction and a background sweep drains idle agents largest-first. An over-budget tree on a host with more available memory than that is left alone, whatever the budget value. When available memory cannot be sampled the budget is strict: over budget alone reclaims (absent = auto, the RAM-derived budget advertised as this setting's default; 0 = off; nothing running is ever killed; changes apply on daemon restart)",
             category: "agents",
             ty: SettingType::Number {
                 min: Some(0.0),

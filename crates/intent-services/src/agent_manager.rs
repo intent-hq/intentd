@@ -1005,17 +1005,35 @@ impl BusEventSink {
     }
 }
 
+/// One sweep of the daemon's descendant tree as the spawn budget consumes it
+/// (monorepo#2063). Published as a single value so an admission decision
+/// reads the tree total, the sample id that identifies it, and the host
+/// headroom measured alongside it from the same instant — three separate
+/// reads could straddle a sweep and pair a byte total from one sample with
+/// the headroom of the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeSample {
+    /// Resident bytes across the whole descendant tree.
+    pub memory_bytes: u64,
+    /// Monotonic sample id. Lets the registry tell a fresh reading from a
+    /// repeat of the one it already corrected for; it only has to change when
+    /// the bytes are re-measured, and never has to mean anything else.
+    pub seq: u64,
+    /// Host memory available for new allocations (Linux `MemAvailable`) in
+    /// the same sweep, or `None` when the probe does not measure it. `None`
+    /// keeps the tree-only criterion: the budget denies whenever the tree is
+    /// over budget, as it did before host headroom was consulted.
+    pub available_memory: Option<u64>,
+}
+
 /// Source of the daemon's aggregate descendant-tree memory, implemented by the
 /// composition root's `system.status` sampler (intentd#1139) and by fakes in
 /// tests.
 pub trait TreeMemoryProbe: Send + Sync {
-    /// `(resident bytes across the whole descendant tree, monotonic sample id)`,
-    /// or `None` before the first sample lands.
-    ///
-    /// The sample id lets the registry tell a fresh reading from a repeat of the
-    /// one it already corrected for; it only has to change when the bytes are
-    /// re-measured, and never has to mean anything else.
-    fn sample(&self) -> Option<(u64, u64)>;
+    /// The latest sweep, or `None` before the first sample lands. One call
+    /// returns everything an admission decision needs, so the registry never
+    /// has to reconcile fields read across a sweep boundary.
+    fn sample(&self) -> Option<TreeSample>;
 
     /// Per-agent attribution of the same tree: resident bytes bucketed by
     /// nearest registered agent root, from the same sweep as [`Self::sample`]
@@ -1023,15 +1041,6 @@ pub trait TreeMemoryProbe: Send + Sync {
     /// probes that don't attribute (the default keeps test fakes minimal).
     fn agent_samples(&self) -> HashMap<AgentId, u64> {
         HashMap::new()
-    }
-
-    /// Host memory available for new allocations (Linux `MemAvailable`), read
-    /// in the same sweep as [`Self::sample`], or `None` when the probe does
-    /// not measure it. `None` keeps the tree-only criterion: the budget denies
-    /// whenever the tree is over budget, as it did before host headroom was
-    /// consulted. The default keeps test fakes minimal.
-    fn available_memory(&self) -> Option<u64> {
-        None
     }
 }
 
@@ -1156,15 +1165,22 @@ impl ProcessRegistry {
     /// when no sample exists yet, and when the host still has
     /// [`HOST_MEMORY_RESERVE_BYTES`] available (see [`budget_admits`]), so an
     /// unconfigured or not-yet-sampled daemon behaves exactly as before.
+    ///
+    /// The probe is read exactly once: tree bytes, sample id and host headroom
+    /// come out of one [`TreeSample`], so a sweep landing mid-decision cannot
+    /// pair an over-budget total from one sample with the headroom of the next.
     fn budget_denies(&self, inner: &mut RegistryInner) -> Option<BudgetDenial> {
         let budget = self.memory.get()?;
-        let (sampled, seq) = budget.probe.sample()?;
+        let TreeSample {
+            memory_bytes: sampled,
+            seq,
+            available_memory,
+        } = budget.probe.sample()?;
         if inner.budget_sample_seq != Some(seq) {
             inner.budget_sample_seq = Some(seq);
             inner.budget_pending_bytes = 0;
         }
         let charged = charged_bytes(sampled, inner.budget_pending_bytes);
-        let available_memory = budget.probe.available_memory();
         (!budget_admits(
             charged,
             budget.budget_bytes,
@@ -1195,11 +1211,11 @@ impl ProcessRegistry {
     pub fn budget_status(&self) -> Option<(u64, Option<u64>, u64)> {
         let budget = self.memory.get()?;
         let inner = self.inner.lock().unwrap();
-        let charged = budget.probe.sample().map(|(sampled, seq)| {
-            if inner.budget_sample_seq == Some(seq) {
-                charged_bytes(sampled, inner.budget_pending_bytes)
+        let charged = budget.probe.sample().map(|s| {
+            if inner.budget_sample_seq == Some(s.seq) {
+                charged_bytes(s.memory_bytes, inner.budget_pending_bytes)
             } else {
-                sampled
+                s.memory_bytes
             }
         });
         let queued = inner

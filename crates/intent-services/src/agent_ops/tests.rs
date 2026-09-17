@@ -15955,14 +15955,18 @@ async fn diagnostics_reports_conversation_bytes_and_large_conversation_risk() {
 async fn diagnostics_reports_subtree_memory_bytes() {
     struct FixedProbe(HashMap<AgentId, u64>);
     impl TreeMemoryProbe for FixedProbe {
-        fn sample(&self) -> Option<(u64, u64)> {
-            Some((self.0.values().sum(), 1))
+        fn sample(&self) -> Option<TreeSample> {
+            Some(TreeSample {
+                memory_bytes: self.0.values().sum(),
+                seq: 1,
+                available_memory: None,
+            })
         }
         fn agent_samples(&self) -> HashMap<AgentId, u64> {
             self.0.clone()
         }
     }
-    use crate::agent_manager::TreeMemoryProbe;
+    use crate::agent_manager::{TreeMemoryProbe, TreeSample};
     use std::collections::HashMap;
 
     let (_t, svc, ws, bus) = setup_with_bus().await;

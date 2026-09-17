@@ -680,10 +680,13 @@ pub struct AgentsSettings {
     /// on system RAM; changes apply on daemon restart; max 200).
     pub max_concurrent: u32,
     /// `agents.memoryBudgetMb` — aggregate resident-memory budget for the
-    /// daemon's whole child-process tree, above which new agent spawns queue
-    /// behind idle-process eviction instead of starting immediately and the
-    /// periodic reap sweep drains idle agents largest-first without waiting
-    /// for a spawn or the idle TTL (monorepo#2063 level 2). Absent
+    /// daemon's whole child-process tree. It reclaims only while the tree is
+    /// over budget *and* the host's available memory is below 8 GiB plus one
+    /// provisional agent: then new agent spawns queue behind idle-process
+    /// eviction instead of starting immediately and the periodic reap sweep
+    /// drains idle agents largest-first without waiting for a spawn or the
+    /// idle TTL (monorepo#2063 level 2); when available memory cannot be
+    /// sampled, over budget alone reclaims. Absent
     /// (`None`, the default) = auto (budget derived from system RAM); explicit
     /// `0` = off — preserved because config files written before the auto
     /// default carried a literal `memoryBudgetMb = 0` meaning off, and per the
@@ -1680,25 +1683,33 @@ level = "info"
 # idle, up to 9.6 GB running a test suite), so slot count does not predict
 # memory -- idleReapMinutes and memoryBudgetMb are the memory bounds.
 maxConcurrent = 0
-# Agent memory budget (MB) -- aggregate resident memory the daemon's whole
-# child-process tree may use before it reclaims: new agent spawns queue behind
-# idle-process eviction, and a background sweep drains idle agents
-# largest-first while over budget (nothing running is ever killed; changes
-# apply on daemon restart).
+# Agent memory budget (MB) -- aggregate resident memory of the daemon's whole
+# child-process tree. The budget reclaims only when two conditions hold at
+# once: the tree is over budget AND the host's available memory is below
+# 8 GiB plus one provisional agent (~660 MB). Then new agent spawns queue
+# behind idle-process eviction, and a background sweep drains idle agents
+# largest-first (nothing running is ever killed; changes apply on daemon
+# restart). An over-budget tree on a host with more available memory than
+# that is left alone, whatever the budget value -- the tree sums resident
+# set sizes of every descendant (dev servers, test runs, headless browsers
+# included, shared pages double-counted), so a small budget on a large host
+# is crossed while tens of gigabytes are still free. When available memory
+# cannot be sampled the budget is strict: over budget alone reclaims.
 # Absent (the default, as in this file) = auto: the daemon picks the budget
 # ((RAM - 8 GB) / 2, min 4 GB). Explicit 0 = off, always. Upgrade note:
 # config files written before this key defaulted to auto carry a literal
 # `memoryBudgetMb = 0`, which stays off -- delete the line to opt into
 # auto. A positive value is the budget in MB (max 1024000). A soft
-# admission gate rather than a ceiling: measured transient overshoot of
-# 65-105% and steady state ~16% over, so budget for roughly 2x the configured
-# value as the transient. The overshoot is a fixed offset, not proportional
-# to demand -- at 1500 MB a 20-agent burst peaked the same as an 8-agent one
-# (3.06 vs 3.09 GB) where the same 20-agent burst unbounded reached 12.37 GB.
-# That 2x rule sizes the admission transient for a burst of comparable
-# agents; the gate runs at spawn only, so an already-admitted agent whose own
-# workload grows (a test suite) is never re-checked and can carry the tree
-# past the budget by itself.
+# admission gate rather than a ceiling: under the strict (host short)
+# policy the measured transient overshoot was 65-105% and steady state ~16%
+# over, so budget for roughly 2x the configured value as the transient. The
+# overshoot is a fixed offset, not proportional to demand -- at 1500 MB a
+# 20-agent burst peaked the same as an 8-agent one (3.06 vs 3.09 GB) where
+# the same 20-agent burst unbounded reached 12.37 GB. That 2x rule sizes
+# the admission transient for a burst of comparable agents; the gate runs
+# at spawn only, so an already-admitted agent whose own workload grows (a
+# test suite) is never re-checked and can carry the tree past the budget by
+# itself.
 # memoryBudgetMb = 8192
 # ACP Node heap limit (MB) -- V8 --max-old-space-size cap injected via
 # NODE_OPTIONS into Node/Electron ACP provider processes (1024-65536; applies
