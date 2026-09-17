@@ -4759,6 +4759,59 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `invite.challenge` (gist identity-proof join, unauthenticated
+    /// `/invite` endpoint): validate `(invite_id, secret)` exactly like
+    /// [`Self::invite_inspect`] and issue a single-use nonce bound to the
+    /// invite → `{ workspaceId, workspaceTitle, nonce, nonceExpiresAt }`.
+    /// The nonce is 32 random bytes (base64url, unpadded), lives 10 minutes
+    /// and is consumed by the first [`Self::invite_prove`] that names it. No
+    /// device flow is started and GitHub is never contacted. The `/invite`
+    /// transport extends the result with the host's `hostname` /
+    /// `prettyHostname`.
+    fn invite_challenge(
+        &self,
+        invite_id: String,
+        secret: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::invite_challenge not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `invite.prove` (gist identity-proof join, unauthenticated `/invite`
+    /// endpoint): the guest published `nonce` in a gist under its own
+    /// account and names it. The host reads `GET /gists/{gist_id}` and
+    /// requires the owner login to equal `login` (case-insensitively), the
+    /// file `intent-join-proof.txt` to start with the nonce and the gist to
+    /// have been created no earlier than the nonce was issued; then resolves
+    /// `GET /users/{login}` and commits the join exactly like the device
+    /// flow → `{ status: "authorized", token, principalId, login,
+    /// workspaceId }`. Refusals: [`crate::InviteErrorKind::ProofInvalid`]
+    /// (any mismatch, an unknown gist, or a nonce not issued for this invite
+    /// / already consumed), [`crate::InviteErrorKind::ProofExpired`],
+    /// [`crate::InviteErrorKind::GithubUnreachable`]; a closed invite, a pin
+    /// mismatch and a full workspace answer their existing kinds. The nonce
+    /// is consumed by the first attempt that reaches the verification,
+    /// except when GitHub was unreachable (the guest may retry).
+    fn invite_prove(
+        &self,
+        invite_id: String,
+        secret: String,
+        nonce: String,
+        gist_id: String,
+        login: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret, nonce, gist_id, login);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::invite_prove not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Transport seam: the daemon's primary principal, bound to UDS
     /// connections and to the legacy file bearer token at WSS upgrade.
     /// Errors when the composition root has no principal store (test stubs);

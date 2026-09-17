@@ -1251,7 +1251,9 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
             .expect("role"),
         Some(WorkspaceRole::Collaborator)
     );
-    for token in [&first_token, &second_token] {
+    // The presented credential is rotated out in the join transaction: the
+    // guest leaves with exactly one active credential for this host.
+    for (token, active) in [(&first_token, false), (&second_token, true)] {
         let cred = f
             .store
             .lookup_principal_credential(&hash_secret(token))
@@ -1259,8 +1261,18 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
             .expect("lookup")
             .expect("credential row");
         assert_eq!(cred.principal_id, guest);
-        assert!(cred.is_active(), "both credentials stay active");
+        assert_eq!(cred.is_active(), active, "rotation: {token}");
     }
+    assert_eq!(
+        f.store
+            .list_principal_credentials(&guest)
+            .await
+            .expect("credentials")
+            .iter()
+            .filter(|c| c.is_active())
+            .count(),
+        1
+    );
     let invite = f
         .store
         .get_workspace_invite(&invite_id)
@@ -1292,12 +1304,24 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
     // owner + the demoted primary + the guest
     assert_eq!(ev.data["changes"]["memberCount"], json!(3));
 
-    // Single use, like the device-flow join.
+    // Single use, like the device-flow join (with the live credential; the
+    // rotated-out one is refused before the invite is even looked at).
     let again = f
+        .services
+        .invite_accept_op(&invite_id, &secret, &second_token)
+        .await;
+    assert_eq!(invite_kind(&again), InviteErrorKind::Redeemed);
+    let stale = f
         .services
         .invite_accept_op(&invite_id, &secret, &first_token)
         .await;
-    assert_eq!(invite_kind(&again), InviteErrorKind::Redeemed);
+    assert_eq!(invite_kind(&stale), InviteErrorKind::CredentialInvalid);
+
+    // `revokeSelf` sees the one active credential the rotation left.
+    let revoked = with_caller(wire(&guest), f.services.principal_revoke_self_op())
+        .await
+        .expect("revoke self");
+    assert_eq!(revoked["credentials"], json!(1), "{revoked}");
 }
 
 /// `invite.accept` refusals: an unknown or revoked credential is
@@ -1413,6 +1437,513 @@ async fn accept_refuses_bad_credentials_closed_invites_and_pins() {
         .invite_accept_op(&invite_id, &secret, "fresh")
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
+}
+
+// --- gist identity proof: invite.challenge / invite.prove -------------------
+
+/// A gist view created "now" (well after any nonce issued in the test),
+/// owned by `owner` and carrying `first_line` as the proof file's first line.
+fn gist(owner: &str, first_line: Option<&str>) -> ProofGistView {
+    ProofGistView {
+        owner_login: owner.to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        proof_first_line: first_line.map(str::to_string),
+    }
+}
+
+/// The fixture with a scripted forge: `guest` (id 4242) and `other` (id
+/// 5555) resolve by login; the proof gists are the caller's.
+fn with_forge(f: &mut Fixture, gists: Vec<(&str, std::result::Result<ProofGistView, String>)>) {
+    let mut forge = StubForge::default();
+    for (login, id) in [("guest", 4242), ("other", 5555)] {
+        forge
+            .users_by_login
+            .insert(login.to_string(), identity(login, id));
+    }
+    for (id, view) in gists {
+        forge.proof_gists.insert(id.to_string(), view);
+    }
+    f.services = f.services.clone().with_source_control(Arc::new(forge));
+}
+
+fn nonce_of(challenge: &Value) -> String {
+    challenge["nonce"].as_str().expect("nonce").to_string()
+}
+
+/// `invite.challenge` answers the inspect payload plus a fresh nonce bound to
+/// the invite: 32 random bytes as unpadded base64url, expiring in
+/// `NONCE_TTL`, distinct per call, with no flow slot taken and the forge
+/// never contacted. A closed invite is its kind and issues nothing.
+#[tokio::test]
+async fn challenge_issues_a_nonce_without_a_flow() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let (invite_id, secret) = (
+        id_of(&created),
+        created["secret"].as_str().unwrap().to_string(),
+    );
+
+    let before = now_iso();
+    let a = f
+        .services
+        .invite_challenge_op(&invite_id, &secret)
+        .await
+        .expect("challenge");
+    let b = f
+        .services
+        .invite_challenge_op(&invite_id, &secret)
+        .await
+        .expect("challenge");
+    assert_eq!(a["workspaceId"], json!(f.ws.0));
+    assert_eq!(a["workspaceTitle"], json!("WS"));
+    assert!(a.get("hostname").is_none(), "decoration is the transport's");
+    assert!(a.get("flowId").is_none() && a.get("userCode").is_none());
+    let nonce = nonce_of(&a);
+    assert_eq!(nonce.len(), 43, "32 bytes base64url unpadded: {nonce}");
+    assert!(nonce
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    assert_ne!(nonce, nonce_of(&b));
+    let expires = a["nonceExpiresAt"].as_str().expect("nonceExpiresAt");
+    assert!(expires > before.as_str(), "{expires} > {before}");
+    assert!(expires < iso_after(NONCE_TTL.as_secs() + 5).as_str());
+    {
+        let nonces = f.services.invite_nonces.lock().await;
+        assert_eq!(nonces.len(), 2);
+        assert!(nonces.values().all(|s| s.invite_id == invite_id));
+    }
+    assert!(f.services.invite_flows.lock().await.is_empty());
+    assert_eq!(
+        f.services.invite_flow_permits.available_permits(),
+        MAX_INFLIGHT_INVITE_FLOWS
+    );
+
+    let r = f.services.invite_challenge_op(&invite_id, "wrong").await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
+    f.store
+        .revoke_workspace_invite(&invite_id)
+        .await
+        .expect("revoke");
+    let r = f.services.invite_challenge_op(&invite_id, &secret).await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
+    assert_eq!(f.services.invite_nonces.lock().await.len(), 2);
+}
+
+/// One invite may hold at most `MAX_NONCES_PER_INVITE` outstanding nonces
+/// (`FlowBusy` past it); expired ones are purged on the next challenge and
+/// return their permits.
+#[tokio::test]
+async fn challenge_bounds_outstanding_nonces_per_invite() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let (invite_id, secret) = (
+        id_of(&created),
+        created["secret"].as_str().unwrap().to_string(),
+    );
+    for _ in 0..MAX_NONCES_PER_INVITE {
+        f.services
+            .invite_challenge_op(&invite_id, &secret)
+            .await
+            .expect("challenge");
+    }
+    let r = f.services.invite_challenge_op(&invite_id, &secret).await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::FlowBusy);
+    assert_eq!(
+        f.services.invite_nonce_permits.available_permits(),
+        MAX_OUTSTANDING_NONCES - MAX_NONCES_PER_INVITE
+    );
+    // Another invite is not affected by this one's bound.
+    let (_, other_id, other_secret) = f.second_workspace_invite().await;
+    f.services
+        .invite_challenge_op(&other_id, &other_secret)
+        .await
+        .expect("other invite still challenges");
+
+    // Age every nonce past its lifetime: the next challenge purges them.
+    for slot in f.services.invite_nonces.lock().await.values_mut() {
+        slot.expires_at = Instant::now() - Duration::from_secs(1);
+    }
+    f.services
+        .invite_challenge_op(&invite_id, &secret)
+        .await
+        .expect("challenge after purge");
+    assert_eq!(f.services.invite_nonces.lock().await.len(), 1);
+    assert_eq!(
+        f.services.invite_nonce_permits.available_permits(),
+        MAX_OUTSTANDING_NONCES - 1
+    );
+}
+
+/// The happy path: a gist owned by the claimed login (case-insensitively),
+/// whose proof file starts with the nonce and which postdates the nonce,
+/// mints the principal, membership and credential exactly like the device
+/// flow, consumes the nonce and publishes the member event. The gist is
+/// read exactly once.
+#[tokio::test]
+async fn prove_joins_on_a_matching_gist_and_consumes_the_nonce() {
+    let tmp = TempDb::new();
+    let mut f = fixture(&tmp).await;
+    let bus = crate::events::EventBus::new(f.store.clone());
+    f.services = f.services.with_event_bus(bus.clone());
+    let created = f.create_invite(None).await;
+    let (invite_id, secret) = (
+        id_of(&created),
+        created["secret"].as_str().unwrap().to_string(),
+    );
+    let challenge = f
+        .services
+        .invite_challenge_op(&invite_id, &secret)
+        .await
+        .expect("challenge");
+    let nonce = nonce_of(&challenge);
+    with_forge(&mut f, vec![("g1", Ok(gist("Guest", Some(&nonce))))]);
+    let mut events = bus.subscribe(crate::events::SubscriptionFilter {
+        event_types: vec!["workspace:updated".into()],
+        workspace_id: Some(f.ws.0.clone()),
+        ..Default::default()
+    });
+
+    let r = f
+        .services
+        .invite_prove_op(&invite_id, &secret, &nonce, "g1", "guest")
+        .await
+        .expect("prove");
+    assert_eq!(r["status"], json!("authorized"));
+    assert_eq!(r["login"], json!("guest"));
+    assert_eq!(r["workspaceId"], json!(f.ws.0));
+    let token = r["token"].as_str().expect("token");
+    assert_eq!(token.len(), 64);
+    let guest = PrincipalId(r["principalId"].as_str().expect("pid").to_string());
+    assert_eq!(
+        f.store
+            .get_workspace_member_role(&f.ws, &guest)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Collaborator)
+    );
+    let cred = f
+        .store
+        .lookup_principal_credential(&hash_secret(token))
+        .await
+        .expect("lookup")
+        .expect("credential row");
+    assert_eq!(cred.principal_id, guest);
+    let row = f.store.get_principal(&guest).await.expect("principal");
+    assert_eq!(row.github_user_id, Some(4242));
+    assert_eq!(row.login.as_deref(), Some("guest"));
+    assert_eq!(row.display_name.as_deref(), Some("guest name"));
+    assert!(f.services.invite_nonces.lock().await.is_empty(), "consumed");
+    assert_eq!(
+        f.services.invite_nonce_permits.available_permits(),
+        MAX_OUTSTANDING_NONCES
+    );
+    assert!(f.services.invite_flows.lock().await.is_empty());
+    let invite = f
+        .store
+        .get_workspace_invite(&invite_id)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(invite.redeemed_by_principal_id, Some(guest.clone()));
+
+    let batch = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("event in time")
+        .expect("event batch");
+    assert!(
+        batch
+            .iter()
+            .any(|e| e.data["changes"]["addedPrincipalId"] == json!(guest.0)),
+        "member event: {batch:?}"
+    );
+
+    // Spent nonce: the same proof does not join again.
+    let again = f
+        .services
+        .invite_prove_op(&invite_id, &secret, &nonce, "g1", "guest")
+        .await;
+    assert_eq!(invite_kind(&again), InviteErrorKind::Redeemed);
+}
+
+/// Every `ProofInvalid` branch: a gist of another owner, a missing proof
+/// file, a first line that is not the nonce, a gist created before the
+/// nonce, an unknown gist, a nonce this host never issued, a nonce issued
+/// for another invite, a login GitHub does not know — and each attempt
+/// consumes the nonce it named (a later, otherwise-valid proof on the same
+/// nonce is refused too). Nothing joins; the invite stays open.
+#[tokio::test]
+async fn prove_refuses_mismatched_gists_and_spends_the_nonce() {
+    let tmp = TempDb::new();
+    let mut f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let (invite_id, secret) = (
+        id_of(&created),
+        created["secret"].as_str().unwrap().to_string(),
+    );
+    let (_, other_invite, other_secret) = f.second_workspace_invite().await;
+    let challenge = |f: &Fixture, id: &str, s: &str| {
+        let (services, id, s) = (f.services.clone(), id.to_string(), s.to_string());
+        async move {
+            nonce_of(
+                &services
+                    .invite_challenge_op(&id, &s)
+                    .await
+                    .expect("challenge"),
+            )
+        }
+    };
+    let n = challenge(&f, &invite_id, &secret).await;
+    let stale = ProofGistView {
+        owner_login: "guest".to_string(),
+        created_at: "2020-01-01T00:00:00Z".to_string(),
+        proof_first_line: Some(n.clone()),
+    };
+    with_forge(
+        &mut f,
+        vec![
+            ("wrongowner", Ok(gist("other", Some(&n)))),
+            ("nofile", Ok(gist("guest", None))),
+            ("wrongline", Ok(gist("guest", Some("not-the-nonce")))),
+            ("stale", Ok(stale)),
+            ("ok", Ok(gist("guest", Some(&n)))),
+            ("unknownlogin", Ok(gist("nobody", Some(&n)))),
+        ],
+    );
+    let prove = |f: &Fixture, nonce: &str, gist_id: &str, login: &str| {
+        let services = f.services.clone();
+        let (invite_id, secret) = (invite_id.clone(), secret.clone());
+        let (nonce, gist_id, login) = (nonce.to_string(), gist_id.to_string(), login.to_string());
+        async move {
+            services
+                .invite_prove_op(&invite_id, &secret, &nonce, &gist_id, &login)
+                .await
+        }
+    };
+
+    for (gist_id, login) in [
+        ("wrongowner", "guest"),
+        ("nofile", "guest"),
+        ("wrongline", "guest"),
+        ("stale", "guest"),
+        ("missing", "guest"),
+        ("unknownlogin", "nobody"),
+    ] {
+        let n = challenge(&f, &invite_id, &secret).await;
+        let r = prove(&f, &n, gist_id, login).await;
+        assert_eq!(invite_kind(&r), InviteErrorKind::ProofInvalid, "{gist_id}");
+        // The nonce is spent by the attempt: a matching gist is now too late.
+        let again = prove(&f, &n, "ok", "guest").await;
+        assert_eq!(
+            invite_kind(&again),
+            InviteErrorKind::ProofInvalid,
+            "{gist_id} retry"
+        );
+    }
+    // Never issued / issued for another invite.
+    let r = prove(&f, "never-issued", "ok", "guest").await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::ProofInvalid);
+    let foreign = challenge(&f, &other_invite, &other_secret).await;
+    let r = prove(&f, &foreign, "ok", "guest").await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::ProofInvalid);
+    // A closed invite is its kind, checked before the nonce is touched.
+    let n2 = challenge(&f, &invite_id, &secret).await;
+    with_forge(&mut f, vec![("ok2", Ok(gist("guest", Some(&n2))))]);
+    let r = prove(&f, &n2, "ok2", "guest").await.map(|_| ());
+    assert!(r.is_ok(), "{r:?}");
+    let r = prove(&f, &n, "ok", "guest").await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::Redeemed);
+    // Malformed claims are refused up front.
+    let r = prove(&f, &n, "ok", "not a login!").await;
+    assert!(matches!(r, Err(Error::InvalidParams(_))), "{r:?}");
+    let r = prove(&f, &n, "../x", "guest").await;
+    assert!(matches!(r, Err(Error::InvalidParams(_))), "{r:?}");
+    // Only `n` is left: refusals before the nonce lookup (closed invite,
+    // malformed claim) leave it outstanding until its TTL.
+    let nonces = f.services.invite_nonces.lock().await;
+    assert_eq!(nonces.keys().collect::<Vec<_>>(), vec![&n]);
+}
+
+/// An expired nonce is `ProofExpired` (and spent); GitHub failing is
+/// `GithubUnreachable` and puts the nonce back so the guest can retry.
+#[tokio::test]
+async fn prove_reports_expiry_and_unreachable_github() {
+    let tmp = TempDb::new();
+    let mut f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let (invite_id, secret) = (
+        id_of(&created),
+        created["secret"].as_str().unwrap().to_string(),
+    );
+    let n = nonce_of(
+        &f.services
+            .invite_challenge_op(&invite_id, &secret)
+            .await
+            .expect("challenge"),
+    );
+    with_forge(
+        &mut f,
+        vec![
+            ("ok", Ok(gist("guest", Some(&n)))),
+            ("down", Err("bad gateway".to_string())),
+        ],
+    );
+
+    // Unreachable: the nonce survives for a retry with the same proof.
+    let r = f
+        .services
+        .invite_prove_op(&invite_id, &secret, &n, "down", "guest")
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GithubUnreachable);
+    assert_eq!(f.services.invite_nonces.lock().await.len(), 1);
+    // Unreachable on the account lookup as well (unscripted login →
+    // `Unsupported` stands in for a transport failure).
+    let mut forge = StubForge::default();
+    forge
+        .proof_gists
+        .insert("ok".into(), Ok(gist("guest", Some(&n))));
+    f.services = f.services.clone().with_source_control(Arc::new(forge));
+    let r = f
+        .services
+        .invite_prove_op(&invite_id, &secret, &n, "ok", "guest")
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GithubUnreachable);
+    assert_eq!(f.services.invite_nonces.lock().await.len(), 1);
+    with_forge(&mut f, vec![("ok", Ok(gist("guest", Some(&n))))]);
+
+    // Expired: spent, and no forge call is made.
+    for slot in f.services.invite_nonces.lock().await.values_mut() {
+        slot.expires_at = Instant::now() - Duration::from_secs(1);
+    }
+    let r = f
+        .services
+        .invite_prove_op(&invite_id, &secret, &n, "ok", "guest")
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::ProofExpired);
+    assert!(f.services.invite_nonces.lock().await.is_empty());
+    let r = f
+        .services
+        .invite_prove_op(&invite_id, &secret, &n, "ok", "guest")
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::ProofInvalid, "spent");
+    assert!(
+        f.store
+            .get_workspace_invite(&invite_id)
+            .await
+            .expect("get")
+            .expect("row")
+            .redeemed_at
+            .is_none(),
+        "the invite stays open"
+    );
+}
+
+/// A pinned invite still enforces its pin on the proven account, and the
+/// pin is checked against `GET /users/{login}`'s id, not the claim.
+#[tokio::test]
+async fn prove_enforces_the_pin_on_the_proven_account() {
+    let tmp = TempDb::new();
+    let mut f = fixture(&tmp).await;
+    with_forge(&mut f, vec![]);
+    let created = with_caller(
+        wire(&f.owner),
+        f.services
+            .workspace_invite_create_op(&f.ws, Some("other".into()), None),
+    )
+    .await
+    .expect("pinned invite");
+    let (invite_id, secret) = (
+        id_of(&created),
+        created["secret"].as_str().unwrap().to_string(),
+    );
+    let n = nonce_of(
+        &f.services
+            .invite_challenge_op(&invite_id, &secret)
+            .await
+            .expect("challenge"),
+    );
+    with_forge(&mut f, vec![("g", Ok(gist("guest", Some(&n))))]);
+    let r = f
+        .services
+        .invite_prove_op(&invite_id, &secret, &n, "g", "guest")
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::PinMismatch);
+}
+
+/// Under concurrent `invite.prove` attempts on one nonce exactly one reaches
+/// the verification (and joins); every other one is refused — `ProofInvalid`
+/// when it lost the nonce race, `Redeemed` when it arrived after the join.
+#[tokio::test]
+async fn prove_consumes_the_nonce_exactly_once_under_concurrency() {
+    let tmp = TempDb::new();
+    let mut f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let (invite_id, secret) = (
+        id_of(&created),
+        created["secret"].as_str().unwrap().to_string(),
+    );
+    let n = nonce_of(
+        &f.services
+            .invite_challenge_op(&invite_id, &secret)
+            .await
+            .expect("challenge"),
+    );
+    let mut forge = StubForge::default();
+    forge
+        .users_by_login
+        .insert("guest".into(), identity("guest", 4242));
+    forge
+        .proof_gists
+        .insert("g".into(), Ok(gist("guest", Some(&n))));
+    let forge = Arc::new(forge);
+    f.services = f.services.clone().with_source_control(forge.clone());
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let services = f.services.clone();
+        let (invite_id, secret, n) = (invite_id.clone(), secret.clone(), n.clone());
+        handles.push(tokio::spawn(async move {
+            services
+                .invite_prove_op(&invite_id, &secret, &n, "g", "guest")
+                .await
+        }));
+    }
+    let (mut joined, mut refused) = (0, 0);
+    for h in handles {
+        match h.await.expect("task") {
+            Ok(v) => {
+                assert_eq!(v["status"], json!("authorized"));
+                joined += 1;
+            }
+            Err(Error::Invite(InviteErrorKind::ProofInvalid | InviteErrorKind::Redeemed)) => {
+                refused += 1;
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+    assert_eq!((joined, refused), (1, 15));
+    assert_eq!(
+        forge.seen_proof_gists.lock().unwrap().len(),
+        1,
+        "the gist is read by the one attempt that held the nonce"
+    );
+}
+
+#[test]
+fn proof_time_and_login_rules() {
+    let issued = SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_500);
+    assert!(
+        gist_created_after("2023-11-14T22:13:20Z", issued),
+        "same second"
+    );
+    assert!(gist_created_after("2023-11-14T22:13:21Z", issued));
+    assert!(!gist_created_after("2023-11-14T22:13:19Z", issued));
+    assert!(!gist_created_after("yesterday", issued));
+    assert!(valid_login("octocat") && valid_login("a-b-1"));
+    assert!(!valid_login("") && !valid_login("a/b") && !valid_login(&"x".repeat(40)));
+    assert_eq!(random_nonce().len(), 43);
+    assert_ne!(random_nonce(), random_nonce());
 }
 
 // --- guest caps ------------------------------------------------------------

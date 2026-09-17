@@ -19,7 +19,14 @@
 //!   `{ inviteId, secret }` previews the link (same validation as a redeem
 //!   start, no device flow) and `{ inviteId, secret, credential }` joins
 //!   with that credential as proof of identity, answering the phase-2
-//!   `authorized` shape. Nothing else is reachable through `/invite`.
+//!   `authorized` shape.
+//! - `invite.challenge` / `invite.prove` — the gist identity proof, for a
+//!   guest whose GitHub session lives in its own Intent app (no device flow
+//!   on the host): `{ inviteId, secret }` previews the link and issues a
+//!   short-lived nonce; `{ inviteId, secret, nonce, gistId, login }` joins
+//!   once the host has read a gist owned by `login` whose proof file starts
+//!   with that nonce, answering the phase-2 `authorized` shape. Nothing
+//!   else is reachable through `/invite`.
 
 use std::fmt::Write as _;
 use std::future::Future;
@@ -45,8 +52,7 @@ pub(crate) const INVITE_PAYLOAD_VERSION: u32 = 1;
 
 /// Human message paired with the `-32001` an `/invite` connection gets for
 /// any method other than the invite methods.
-pub(crate) const INVITE_ENDPOINT_ONLY_MESSAGE: &str =
-    "the /invite endpoint serves invite.redeem, invite.inspect and invite.accept only";
+pub(crate) const INVITE_ENDPOINT_ONLY_MESSAGE: &str = "the /invite endpoint serves invite.redeem, invite.inspect, invite.accept, invite.challenge and invite.prove only";
 
 /// Build the invite link:
 /// `intent://invite?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&inviteId=<id>&secret=<s>[&tc=<addr>]`.
@@ -84,6 +90,8 @@ pub(crate) enum InviteMethod {
     Redeem,
     Inspect,
     Accept,
+    Challenge,
+    Prove,
 }
 
 impl InviteMethod {
@@ -121,6 +129,8 @@ pub(crate) fn classify(value: &Value) -> Option<InviteRequest> {
         "invite.redeem" => InviteMethod::Redeem,
         "invite.inspect" => InviteMethod::Inspect,
         "invite.accept" => InviteMethod::Accept,
+        "invite.challenge" => InviteMethod::Challenge,
+        "invite.prove" => InviteMethod::Prove,
         _ => return None,
     };
     Some(InviteRequest {
@@ -176,7 +186,8 @@ pub(crate) const INVITE_START_REFILL: Duration = Duration::from_secs(5);
 
 /// Listener-wide token bucket over the `/invite` requests that hash a
 /// secret against the store — phase-1 `invite.redeem` starts (which also
-/// open an upstream device flow), `invite.inspect` and `invite.accept`.
+/// open an upstream device flow), `invite.inspect`, `invite.accept`,
+/// `invite.challenge` and `invite.prove` (which also reads GitHub).
 /// The per-connection in-flight quota bounds concurrency only; this bounds
 /// the *rate*, so a peer cannot enumerate links or churn device flows by
 /// serialising attempts or reconnecting: the bucket lives on the listener,
@@ -233,11 +244,15 @@ pub(crate) fn is_redeem_start(req: &InviteRequest) -> bool {
 
 /// True for the `/invite` requests the [`RedeemThrottle`] counts: every
 /// request that hashes a secret against the store — a phase-1
-/// `invite.redeem`, an `invite.inspect`, an `invite.accept`.
+/// `invite.redeem`, an `invite.inspect`, an `invite.accept`, an
+/// `invite.challenge`, an `invite.prove`.
 pub(crate) fn hashes_secret(req: &InviteRequest) -> bool {
     match req.method {
         InviteMethod::Redeem => is_redeem_start(req),
-        InviteMethod::Inspect | InviteMethod::Accept => true,
+        InviteMethod::Inspect
+        | InviteMethod::Accept
+        | InviteMethod::Challenge
+        | InviteMethod::Prove => true,
         InviteMethod::Create => false,
     }
 }
@@ -546,6 +561,52 @@ async fn accept_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Valu
     api.invite_accept(invite_id, secret, credential).await
 }
 
+/// Handle a classified `invite.challenge` on the `/invite` endpoint: params
+/// `{ inviteId, secret }` → the `invite.inspect` result plus `{ nonce,
+/// nonceExpiresAt }`, extended with the host's `hostname` /
+/// `prettyHostname` like an inspect.
+pub(crate) async fn handle_challenge(
+    req: InviteRequest,
+    api: &Arc<dyn WorkspaceApi>,
+    host: HostEnvironment,
+) -> Option<String> {
+    let result = challenge_json(&req.params, api, host).await;
+    respond(&req, result)
+}
+
+async fn challenge_json(
+    params: &Value,
+    api: &Arc<dyn WorkspaceApi>,
+    host: HostEnvironment,
+) -> Result<Value> {
+    let invite_id = str_param(params, "inviteId")?;
+    let secret = str_param(params, "secret")?;
+    let result = api.invite_challenge(invite_id, secret).await?;
+    with_host_identity(result, "invite.challenge", host)
+}
+
+/// Handle a classified `invite.prove` on the `/invite` endpoint: params
+/// `{ inviteId, secret, nonce, gistId, login }` → the phase-2 `authorized`
+/// shape as the service answers it (no host identity: the client already
+/// saw it on the challenge).
+pub(crate) async fn handle_prove(
+    req: InviteRequest,
+    api: &Arc<dyn WorkspaceApi>,
+) -> Option<String> {
+    let result = prove_json(&req.params, api).await;
+    respond(&req, result)
+}
+
+async fn prove_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Value> {
+    let invite_id = str_param(params, "inviteId")?;
+    let secret = str_param(params, "secret")?;
+    let nonce = str_param(params, "nonce")?;
+    let gist_id = str_param(params, "gistId")?;
+    let login = str_param(params, "login")?;
+    api.invite_prove(invite_id, secret, nonce, gist_id, login)
+        .await
+}
+
 /// Handle any classified `/invite` request
 /// ([`InviteMethod::on_invite_endpoint`]); `workspace.invite.create` is
 /// refused like every other non-invite method there.
@@ -558,6 +619,8 @@ pub(crate) async fn handle_invite_endpoint(
         InviteMethod::Redeem => handle_redeem(req, api, host).await,
         InviteMethod::Inspect => handle_inspect(req, api, host).await,
         InviteMethod::Accept => handle_accept(req, api).await,
+        InviteMethod::Challenge => handle_challenge(req, api, host).await,
+        InviteMethod::Prove => handle_prove(req, api).await,
         InviteMethod::Create => req
             .id_present
             .then(|| error_frame(&req.id_echo, -32001, INVITE_ENDPOINT_ONLY_MESSAGE)),

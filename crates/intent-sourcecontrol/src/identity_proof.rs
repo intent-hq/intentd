@@ -19,6 +19,10 @@
 //! exactly one file named [`PROOF_FILE_NAME`] — so the RPC can never be
 //! turned against the account's other gists
 //! ([`IdentityProofError::NotProofGist`]).
+//!
+//! The host half reads the gist back through
+//! [`crate::SourceControl::get_proof_gist`] → [`ProofGistView`]; the
+//! comparison against the issued nonce is the service layer's.
 
 use serde_json::{json, Value};
 
@@ -39,6 +43,54 @@ const OAUTH_SCOPES_HEADER: &str = "x-oauth-scopes";
 pub struct ProofGist {
     pub gist_id: String,
     pub login: String,
+}
+
+/// What the host reads back from `GET /gists/{id}` to verify a proof: the
+/// owner's login, the gist's `created_at` (RFC 3339, as GitHub reports it)
+/// and the trimmed first line of [`PROOF_FILE_NAME`] — `None` when the gist
+/// carries no such file (or its content is absent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofGistView {
+    pub owner_login: String,
+    pub created_at: String,
+    pub proof_first_line: Option<String>,
+}
+
+/// Project a `GET /gists/{id}` body onto a [`ProofGistView`].
+///
+/// # Errors
+///
+/// [`Error::Decode`] when the body carries no `owner.login` or `created_at`
+/// (an anonymous gist can never prove an identity).
+pub fn proof_gist_view(gist: &Value) -> crate::Result<ProofGistView> {
+    let owner_login = gist
+        .pointer("/owner/login")
+        .and_then(Value::as_str)
+        .filter(|l| !l.is_empty())
+        .ok_or_else(|| Error::Decode("GET /gists/{id} response missing `owner.login`".to_string()))?
+        .to_string();
+    let created_at = gist
+        .get("created_at")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| Error::Decode("GET /gists/{id} response missing `created_at`".to_string()))?
+        .to_string();
+    let proof_first_line = gist
+        .pointer(&format!("/files/{PROOF_FILE_NAME}/content"))
+        .and_then(Value::as_str)
+        .map(|content| {
+            content
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        });
+    Ok(ProofGistView {
+        owner_login,
+        created_at,
+        proof_first_line,
+    })
 }
 
 /// Failure modes of the proof-gist operations, split so the service layer
@@ -668,5 +720,117 @@ mod tests {
             matches!(err, IdentityProofError::Unauthorized(_)),
             "{err:?}"
         );
+    }
+
+    // --- host side: GET /gists/{id} → ProofGistView ------------------------
+
+    fn gist_body(owner: &str, content: Option<&str>) -> Value {
+        let mut files = json!({});
+        if let Some(content) = content {
+            files[PROOF_FILE_NAME] = json!({ "filename": PROOF_FILE_NAME, "content": content });
+        }
+        json!({
+            "id": "abc123",
+            "public": false,
+            "created_at": "2026-09-17T14:00:00Z",
+            "owner": { "login": owner, "id": 7 },
+            "files": files,
+        })
+    }
+
+    #[test]
+    fn proof_gist_view_projects_owner_created_at_and_first_line() {
+        let view = proof_gist_view(&gist_body("Octocat", Some(&proof_content("n0nce", "h"))))
+            .expect("view");
+        assert_eq!(
+            view,
+            ProofGistView {
+                owner_login: "Octocat".to_string(),
+                created_at: "2026-09-17T14:00:00Z".to_string(),
+                proof_first_line: Some("n0nce".to_string()),
+            }
+        );
+        let no_file = proof_gist_view(&gist_body("octocat", None)).expect("view");
+        assert_eq!(no_file.proof_first_line, None);
+        let padded =
+            proof_gist_view(&gist_body("octocat", Some("  n0nce \r\nrest"))).expect("view");
+        assert_eq!(padded.proof_first_line.as_deref(), Some("n0nce"));
+        let empty = proof_gist_view(&gist_body("octocat", Some(""))).expect("view");
+        assert_eq!(empty.proof_first_line.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn proof_gist_view_requires_an_owner_and_created_at() {
+        let anonymous = json!({ "id": "x", "created_at": "2026-09-17T14:00:00Z", "files": {} });
+        assert!(matches!(proof_gist_view(&anonymous), Err(Error::Decode(_))));
+        let undated = json!({ "id": "x", "owner": { "login": "o" }, "files": {} });
+        assert!(matches!(proof_gist_view(&undated), Err(Error::Decode(_))));
+    }
+
+    #[tokio::test]
+    async fn get_proof_gist_reads_with_and_without_a_token() {
+        use crate::SourceControl as _;
+        let (base, seen) = spawn_mock(|line| match line {
+            "GET /gists/abc123" => json_answer(
+                200,
+                &gist_body("octocat", Some(&proof_content("n0nce", "h"))),
+            ),
+            "GET /gists/missing" => json_answer(404, &json!({ "message": "Not Found" })),
+            "GET /gists/broken" => json_answer(502, &json!({ "message": "Bad Gateway" })),
+            other => json_answer(500, &json!({ "message": format!("unexpected {other}") })),
+        })
+        .await;
+        let with_token = GitHubSourceControl::new("tok", Some(&base)).expect("client");
+        let anonymous = GitHubSourceControl::anonymous(Some(&base)).expect("client");
+        for sc in [&with_token, &anonymous] {
+            let view = sc.get_proof_gist("abc123").await.expect("view");
+            assert_eq!(view.owner_login, "octocat");
+            assert_eq!(view.proof_first_line.as_deref(), Some("n0nce"));
+            assert!(matches!(
+                sc.get_proof_gist("missing").await,
+                Err(Error::NotFound(_))
+            ));
+            assert!(matches!(
+                sc.get_proof_gist("broken").await,
+                Err(Error::Api(_))
+            ));
+            // Never reaches the wire: a non-alphanumeric id is not a gist id.
+            assert!(matches!(
+                sc.get_proof_gist("../user").await,
+                Err(Error::NotFound(_))
+            ));
+            assert!(matches!(
+                sc.get_proof_gist("").await,
+                Err(Error::NotFound(_))
+            ));
+        }
+        // octocrab retries a 5xx on its own; only the *set* of paths is
+        // asserted (never the rejected ids).
+        let seen = seen.lock().unwrap();
+        let paths: std::collections::BTreeSet<&str> =
+            seen.iter().map(|(line, _)| line.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "GET /gists/abc123",
+                "GET /gists/missing",
+                "GET /gists/broken"
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_proof_gist_against_a_dead_host_is_an_api_error() {
+        use crate::SourceControl as _;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        drop(listener);
+        let sc = GitHubSourceControl::anonymous(Some(&base)).expect("client");
+        assert!(matches!(
+            sc.get_proof_gist("abc123").await,
+            Err(Error::Api(_))
+        ));
     }
 }

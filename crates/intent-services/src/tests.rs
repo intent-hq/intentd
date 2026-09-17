@@ -16200,6 +16200,19 @@ pub(crate) mod pr {
         /// or missing token), exercising the invite-create live auth gate
         /// (multiplayer w4).
         unauthenticated: bool,
+        /// Accounts `get_user_by_login` knows (keyed by lowercase login);
+        /// any other login is `NotFound`. Empty → the trait default
+        /// (`Unsupported`), so unrelated tests keep their behaviour.
+        pub(crate) users_by_login: std::collections::HashMap<String, UserIdentity>,
+        /// What `get_proof_gist` answers per gist id: `Ok(view)` or the
+        /// scripted error (`Err("not-found")` → `NotFound`, anything else →
+        /// `Api`). An unknown id is `NotFound`. Exercises `invite.prove`.
+        pub(crate) proof_gists: std::collections::HashMap<
+            String,
+            std::result::Result<intent_sourcecontrol::identity_proof::ProofGistView, String>,
+        >,
+        /// Every gist id handed to `get_proof_gist`, in call order.
+        pub(crate) seen_proof_gists: std::sync::Mutex<Vec<String>>,
     }
 
     impl StubForge {
@@ -16287,6 +16300,32 @@ pub(crate) mod pr {
                 avatar_url: Some("https://avatars.example/u/1".into()),
                 html_url: Some("https://github.com/octocat".into()),
             })
+        }
+        async fn get_user_by_login(&self, login: &str) -> ScResult<UserIdentity> {
+            if self.users_by_login.is_empty() {
+                return Err(ScError::Unsupported("no scripted accounts".into()));
+            }
+            self.users_by_login
+                .get(&login.to_ascii_lowercase())
+                .cloned()
+                .ok_or_else(|| ScError::NotFound(format!("github user {login:?}")))
+        }
+        async fn get_proof_gist(
+            &self,
+            gist_id: &str,
+        ) -> ScResult<intent_sourcecontrol::identity_proof::ProofGistView> {
+            self.seen_proof_gists
+                .lock()
+                .unwrap()
+                .push(gist_id.to_string());
+            match self.proof_gists.get(gist_id) {
+                Some(Ok(view)) => Ok(view.clone()),
+                Some(Err(kind)) if kind == "not-found" => {
+                    Err(ScError::NotFound(format!("gist {gist_id:?}")))
+                }
+                Some(Err(kind)) => Err(ScError::Api(format!("502: {kind}"))),
+                None => Err(ScError::NotFound(format!("gist {gist_id:?}"))),
+            }
         }
         async fn search_users(&self, query: &str, limit: u8) -> ScResult<Vec<UserIdentity>> {
             self.seen_user_searches
