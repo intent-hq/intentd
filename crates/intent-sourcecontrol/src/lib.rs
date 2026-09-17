@@ -86,6 +86,16 @@ pub trait SourceControl: Send + Sync {
         )))
     }
 
+    /// The host-side read of a guest's identity-proof gist
+    /// (`GET /gists/{gist_id}`), projected onto what the verification needs
+    /// ([`identity_proof::ProofGistView`]). [`Error::NotFound`] when no gist
+    /// has that id. Backs `invite.prove`.
+    async fn get_proof_gist(&self, gist_id: &str) -> Result<identity_proof::ProofGistView> {
+        Err(Error::Unsupported(format!(
+            "gist lookup is not supported by this provider (gist {gist_id:?})"
+        )))
+    }
+
     // --- Repositories ---
 
     /// List repositories the authenticated user has access to, one §5.5 page at

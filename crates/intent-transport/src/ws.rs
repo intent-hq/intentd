@@ -800,7 +800,7 @@ impl WsInner {
         // has no bearer token by construction — the invitee holds only the
         // link — so it skips credential resolution and gets a dedicated loop
         // that serves `invite.redeem` / `invite.inspect` / `invite.accept`
-        // and nothing else. Bounded: the accept
+        // / `invite.challenge` / `invite.prove` and nothing else. Bounded: the accept
         // is refused with 503 once `MAX_INVITE_CONNECTIONS` permits are held;
         // the permit is taken atomically here, before the `101`, and rides
         // with the connection task so an aborted (heartbeat-reaped) task
@@ -1053,6 +1053,7 @@ impl WsInner {
 
     /// Drive one `/invite` connection (multiplayer w4). No caller is bound
     /// and nothing but `invite.redeem` / `invite.inspect` / `invite.accept`
+    /// / `invite.challenge` / `invite.prove`
     /// is served: every other frame that carries an id is answered
     /// `-32001`, and the `events.`/subscription fast paths, the router and
     /// the reverse channel are never reached. Each request runs on its own
