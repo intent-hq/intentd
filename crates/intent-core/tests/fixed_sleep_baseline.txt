@@ -62,6 +62,7 @@ crates/intentd/tests/e2e_wss_hook_mcp_tools.rs 2
 crates/intentd/tests/e2e_wss_host.rs 2
 crates/intentd/tests/e2e_wss_host_credential_env.rs 1
 crates/intentd/tests/e2e_wss_interrupted_agents.rs 2
+crates/intentd/tests/e2e_wss_invite_join.rs 1
 crates/intentd/tests/e2e_wss_last_activity.rs 2
 crates/intentd/tests/e2e_wss_legacy_import.rs 1
 crates/intentd/tests/e2e_wss_mcp_oauth_refresh.rs 1
