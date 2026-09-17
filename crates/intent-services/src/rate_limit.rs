@@ -49,6 +49,47 @@ pub(crate) fn pause_duration(reset_unix: Option<u64>, now_unix: u64) -> Duration
     base.clamp(RATE_LIMIT_MIN_PAUSE, RATE_LIMIT_MAX_PAUSE)
 }
 
+/// The fixed prefix of the pause annotation carried in a PR monitor's
+/// `lastError` while the gate is closed — the marker by which an earlier
+/// annotation is found and replaced (a deadline extension, a re-stamp), in
+/// Rust ([`annotate_pause_error`]) and in SQL
+/// (`Store::annotate_active_pr_monitors_pause`) alike.
+pub(crate) const PAUSE_ERROR_MARKER: &str = "rate limited; PR monitor polling paused";
+
+/// Separator between a genuine fetch error and the pause annotation
+/// appended to it.
+pub(crate) const PAUSE_ERROR_SEPARATOR: &str = "; ";
+
+/// The pause annotation naming the gate's RFC 3339 deadline (`None` only in
+/// the window between the deadline elapsing and the gate re-opening).
+pub(crate) fn pause_error(until: Option<&str>) -> String {
+    match until {
+        Some(until) => format!("{PAUSE_ERROR_MARKER} until {until}"),
+        None => PAUSE_ERROR_MARKER.to_string(),
+    }
+}
+
+/// The `lastError` a monitor carries while the gate is closed: `error` (a
+/// genuine fetch error, or `None` after a successful poll) with the current
+/// pause annotation appended. An annotation already present in `error` —
+/// from an earlier stamp, or a fetch that itself hit the limit — is replaced,
+/// never repeated, so the row always names the CURRENT deadline and a
+/// genuine error survives any number of re-stamps.
+pub(crate) fn annotate_pause_error(error: Option<&str>, pause: &str) -> String {
+    let genuine = error
+        .map(|e| match e.find(PAUSE_ERROR_MARKER) {
+            Some(at) => e[..at]
+                .strip_suffix(PAUSE_ERROR_SEPARATOR)
+                .unwrap_or(&e[..at]),
+            None => e,
+        })
+        .filter(|e| !e.is_empty());
+    match genuine {
+        Some(genuine) => format!("{genuine}{PAUSE_ERROR_SEPARATOR}{pause}"),
+        None => pause.to_string(),
+    }
+}
+
 /// The pause deadline on both clocks: the monotonic instant the gate
 /// compares against, and the wall-clock time surfaced to users and agents
 /// (`pausedUntil`, the pause `lastError`) — captured once at pause time so
@@ -146,6 +187,32 @@ mod tests {
     #[test]
     fn pause_duration_falls_back_without_a_reset() {
         assert_eq!(pause_duration(None, 1_000), RATE_LIMIT_FALLBACK_PAUSE);
+    }
+
+    /// The annotation composes with a genuine error, replaces an earlier
+    /// annotation (bare or appended) instead of stacking, and stands alone
+    /// after a successful poll or a fetch that itself hit the limit.
+    #[test]
+    fn pause_annotation_composes_and_replaces_without_stacking() {
+        let t1 = pause_error(Some("2026-09-17T02:39:15Z"));
+        let t2 = pause_error(Some("2026-09-17T03:09:15Z"));
+        assert_eq!(
+            t1,
+            "rate limited; PR monitor polling paused until 2026-09-17T02:39:15Z"
+        );
+        assert_eq!(pause_error(None), PAUSE_ERROR_MARKER);
+
+        assert_eq!(annotate_pause_error(None, &t1), t1);
+        assert_eq!(annotate_pause_error(Some(""), &t1), t1);
+        assert_eq!(annotate_pause_error(Some(&t1), &t2), t2);
+        assert_eq!(
+            annotate_pause_error(Some("forge down"), &t1),
+            format!("forge down; {t1}")
+        );
+        assert_eq!(
+            annotate_pause_error(Some(&format!("forge down; {t1}")), &t2),
+            format!("forge down; {t2}")
+        );
     }
 
     #[test]

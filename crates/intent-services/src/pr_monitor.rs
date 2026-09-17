@@ -2156,9 +2156,10 @@ impl Services {
     /// paused the tick is skipped before any forge call (no `lastError`
     /// churn; catch-up markers survive for the post-pause sweep), and a
     /// fetch that fails with [`Error::RateLimited`] opens the pause — which
-    /// stamps the pause `lastError` on every active monitor, this sweep's
-    /// and every other workspace's alike — and stops fetching further PRs
-    /// in this sweep; monitors not yet reached keep their baseline and
+    /// annotates `lastError` with the pause on every active monitor, this
+    /// sweep's and every other workspace's alike, keeping any genuine error
+    /// a monitor recorded earlier in the tick — and stops fetching further
+    /// PRs in this sweep; monitors not yet reached keep their baseline and
     /// `lastPolledAt`. The shared gate is re-consulted
     /// before EVERY vacant-cache fetch, not just at the top of the sweep, so
     /// a pause opened mid-sweep by a sibling sweep (PR refresh, git roots)
@@ -2400,6 +2401,11 @@ impl Services {
             Some(base) => serde_json::to_string(base).ok(),
             None => fresh_json.clone(),
         };
+        // A success clears the error — except that while the global
+        // rate-limit gate is closed the row keeps the pause annotation
+        // (this poll was in flight when the pause opened, or rode a sibling's
+        // cached fetch): the next refresh is the post-pause one.
+        let last_error = self.pr_monitor_last_error(None);
         if !self
             .store
             .update_pr_monitor_poll(
@@ -2411,7 +2417,7 @@ impl Services {
                     pending_since: pending_since.as_deref(),
                     last_change_at: last_change_at.as_deref(),
                     last_polled_at: Some(&now),
-                    last_error: None,
+                    last_error: last_error.as_deref(),
                     updated_at: &now,
                     expected_updated_at: &monitor.updated_at,
                 },
@@ -2430,7 +2436,7 @@ impl Services {
         updated.pending_since = pending_since;
         updated.last_change_at = last_change_at;
         updated.last_polled_at = Some(now.clone());
-        updated.last_error = None;
+        updated.last_error = last_error;
         updated.updated_at = now;
 
         // The FE's `pendingChanges` tracks the NET set: fire on any change
@@ -2677,10 +2683,13 @@ impl Services {
     }
 
     /// Persist a failed poll's error without disturbing the baseline or the
-    /// pending state. Best-effort — a store failure on the error path is
-    /// logged, never propagated.
+    /// pending state; while the global rate-limit gate is closed the pause
+    /// annotation rides along ([`Services::pr_monitor_last_error`]).
+    /// Best-effort — a store failure on the error path is logged, never
+    /// propagated.
     async fn record_pr_monitor_error(&self, monitor: &PrMonitor, error: &str) {
         let now = now_iso();
+        let last_error = self.pr_monitor_last_error(Some(error));
         if let Err(e) = self
             .store
             .update_pr_monitor_poll(
@@ -2692,7 +2701,7 @@ impl Services {
                     pending_since: monitor.pending_since.as_deref(),
                     last_change_at: monitor.last_change_at.as_deref(),
                     last_polled_at: Some(&now),
-                    last_error: Some(error),
+                    last_error: last_error.as_deref(),
                     updated_at: &now,
                     expected_updated_at: &monitor.updated_at,
                 },
@@ -3222,6 +3231,9 @@ mod tests {
         rate_limit_list_comments: bool,
         /// PR number whose `get_pr` pends forever (hung-connection regression).
         hang_get_pr: Option<u64>,
+        /// The forge-reported quota reset (unix seconds) answered by
+        /// `rate_limit_reset_at`; `None` is the host-without-signal default.
+        rate_limit_reset_at: Option<u64>,
         /// A real RFC 3339 `updatedAt` for the PR record, overriding the
         /// opaque `rev-N` stand-in when a test needs a comparable timestamp.
         updated_at: Option<String>,
@@ -3260,6 +3272,7 @@ mod tests {
                 rate_limit_list_reviews: false,
                 rate_limit_list_comments: false,
                 hang_get_pr: None,
+                rate_limit_reset_at: None,
                 updated_at: None,
             }
         }
@@ -3407,6 +3420,9 @@ mod tests {
             _: NewPullRequest,
         ) -> intent_sourcecontrol::Result<PullRequest> {
             unsupported("create_pr")
+        }
+        async fn rate_limit_reset_at(&self) -> intent_sourcecontrol::Result<Option<u64>> {
+            Ok(self.state.lock().unwrap().rate_limit_reset_at)
         }
         async fn get_pr(
             &self,
@@ -7390,7 +7406,11 @@ mod tests {
             first.last_polled_at, before[0].last_polled_at,
             "the PR fetched before the pause completes its poll"
         );
-        assert_eq!(first.last_error, None);
+        assert_eq!(
+            first.last_error,
+            Some(expected_pause_error(&svc)),
+            "a poll landing while the gate is closed keeps the pause annotation"
+        );
         for (id, previous) in ids[1..].iter().zip(&before[1..]) {
             assert_eq!(
                 &svc.store().get_pr_monitor(id).await.unwrap(),
@@ -7607,6 +7627,295 @@ mod tests {
         let row = &listed["monitors"].as_array().unwrap()[0];
         assert!(row.get("pausedUntil").is_none(), "{row}");
         assert!(row.get("lastError").is_none(), "{row}");
+    }
+
+    /// A pause opened mid-sweep must not hide a genuine fetch error from the
+    /// same tick: PR 1 fails with an ordinary forge error, then PR 2's fetch
+    /// hits the quota and opens the pause. PR 1's row keeps its error with
+    /// the pause appended, PR 2's carries the bare pause, the paused ticks
+    /// touch neither, and after resume each `lastError` follows its own
+    /// fetch again — PR 1 still failing keeps only the genuine error, PR 2
+    /// succeeding clears.
+    #[tokio::test]
+    async fn a_pause_opened_mid_sweep_preserves_a_genuine_fetch_error_from_that_tick() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitor_poll_seconds(30)
+            .with_pr_monitor_hourly_request_budget(1500);
+        let (first, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 1)
+            .await
+            .expect("register");
+        let (second, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 2)
+            .await
+            .expect("register");
+        backdate(&svc, &first.monitor_id, "2020-01-01T00:00:01Z").await;
+        backdate(&svc, &second.monitor_id, "2020-01-01T00:00:02Z").await;
+        forge.take_fetched_numbers();
+
+        // PR 1 answers "forge down"; PR 2 answers with the exhausted quota.
+        let state = Arc::clone(&forge.state);
+        forge.set_on_get_pr(Some(Box::new(move |number| {
+            let mut s = state.lock().unwrap();
+            s.fail_get_pr = number == 1;
+            s.rate_limit_get_pr = number == 2;
+        })));
+        svc.poll_due_pr_monitors().await;
+        forge.set_on_get_pr(None);
+        assert_eq!(forge.take_fetched_numbers(), vec![1, 2]);
+        assert!(svc.sweep_rate_limit.paused_remaining().is_some());
+
+        let pause_error = expected_pause_error(&svc);
+        let failed = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        let annotated = failed.last_error.clone().expect("PR 1 recorded its error");
+        let genuine = annotated
+            .strip_suffix(&format!("; {pause_error}"))
+            .unwrap_or_else(|| panic!("the pause is appended to the genuine error: {annotated}"));
+        assert!(genuine.contains("forge down"), "{genuine}");
+        assert!(!genuine.contains("rate limited"), "{genuine}");
+        let paused = svc
+            .store()
+            .get_pr_monitor(&second.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(paused.last_error.as_deref(), Some(pause_error.as_str()));
+
+        // Paused ticks fetch nothing and leave both rows as they are.
+        svc.poll_pr_monitors().await;
+        assert!(forge.take_fetched_numbers().is_empty());
+        assert_eq!(
+            svc.store().get_pr_monitor(&first.monitor_id).await.unwrap(),
+            failed
+        );
+        assert_eq!(
+            svc.store()
+                .get_pr_monitor(&second.monitor_id)
+                .await
+                .unwrap(),
+            paused
+        );
+
+        // Resume: PR 1 still fails, PR 2 answers — each `lastError` is its
+        // own fetch's again, with no pause annotation left over.
+        svc.sweep_rate_limit.clear();
+        let state = Arc::clone(&forge.state);
+        forge.set_on_get_pr(Some(Box::new(move |number| {
+            let mut s = state.lock().unwrap();
+            s.fail_get_pr = number == 1;
+            s.rate_limit_get_pr = false;
+        })));
+        svc.poll_pr_monitors().await;
+        forge.set_on_get_pr(None);
+        let mut fetched = forge.take_fetched_numbers();
+        fetched.sort_unstable();
+        assert_eq!(fetched, vec![1, 2]);
+        assert_eq!(
+            svc.store()
+                .get_pr_monitor(&first.monitor_id)
+                .await
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some(genuine),
+            "the genuine error stands on its own merits after resume"
+        );
+        assert_eq!(
+            svc.store()
+                .get_pr_monitor(&second.monitor_id)
+                .await
+                .unwrap()
+                .last_error,
+            None
+        );
+    }
+
+    /// An in-flight poll must not strip the pause: the production stamp
+    /// ([`Services::pause_sweeps_for_rate_limit`], as the PR-refresh sweep
+    /// calls it) leaves the guard token alone, so a poll that read the row
+    /// before the stamp still lands — and lands WITH the pause annotation
+    /// while the gate is closed, so `lastError` and `pausedUntil` both name
+    /// the deadline until the first post-pause poll. A genuine error
+    /// recorded mid-pause composes the same way.
+    #[tokio::test]
+    async fn an_in_flight_poll_landing_mid_pause_keeps_the_annotation() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let (monitor, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 1)
+            .await
+            .expect("register");
+        // The row image a sweep read, and the fetch it completed, before the
+        // pause opened.
+        let in_flight = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        forge.edit(|s| s.conversation_comments = 3);
+        let shared = fetch_shared_snapshot(sc.as_ref(), &monitor.repo(), 1)
+            .await
+            .expect("fetch");
+
+        // Another sweep's forge call trips the limit: the pause opens and is
+        // stamped on the row without moving its guard token.
+        svc.pause_sweeps_for_rate_limit(&sc, "API rate limit exceeded")
+            .await;
+        let pause_error = expected_pause_error(&svc);
+        let paused_until = svc.sweep_rate_limit_paused_until().unwrap();
+        let stamped = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(stamped.last_error.as_deref(), Some(pause_error.as_str()));
+        assert_eq!(stamped.updated_at, in_flight.updated_at);
+
+        // The in-flight write-back lands against the pre-stamp image — and
+        // keeps the annotation, since the gate is still closed.
+        svc.poll_one_pr_monitor(&in_flight, &shared)
+            .await
+            .expect("the guarded write-back lands");
+        let landed = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_ne!(landed.updated_at, in_flight.updated_at, "the poll landed");
+        assert_ne!(landed.last_snapshot, in_flight.last_snapshot);
+        assert_eq!(
+            landed.last_error.as_deref(),
+            Some(pause_error.as_str()),
+            "a success mid-pause does not strip the pause"
+        );
+        let listed = svc.pr_monitor_list_op(&ws, Some(&owner)).await.unwrap();
+        let row = &listed["monitors"].as_array().unwrap()[0];
+        assert_eq!(row["pausedUntil"], json!(paused_until));
+        assert_eq!(row["lastError"], json!(pause_error));
+
+        // A genuine error recorded mid-pause keeps the annotation too.
+        svc.record_pr_monitor_error(&landed, "forge down").await;
+        assert_eq!(
+            svc.store()
+                .get_pr_monitor(&monitor.monitor_id)
+                .await
+                .unwrap()
+                .last_error,
+            Some(format!("forge down; {pause_error}"))
+        );
+
+        // The first post-pause poll clears everything the pause left.
+        svc.sweep_rate_limit.clear();
+        svc.poll_pr_monitors().await;
+        let resumed = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(resumed.last_error, None);
+        let listed = svc.pr_monitor_list_op(&ws, Some(&owner)).await.unwrap();
+        let row = &listed["monitors"].as_array().unwrap()[0];
+        assert!(row.get("pausedUntil").is_none(), "{row}");
+        assert!(row.get("lastError").is_none(), "{row}");
+    }
+
+    /// A trigger that EXTENDS an active pause re-annotates every active row
+    /// with the new deadline (the WARN stays coalesced to the opening
+    /// trigger): no row keeps naming a deadline `pausedUntil` has moved past.
+    /// A genuine error survives the re-stamp, a trigger that does not move
+    /// the deadline leaves the rows alone, and terminal rows are never
+    /// touched.
+    #[tokio::test]
+    async fn an_extended_pause_re_stamps_every_active_monitor_with_the_new_deadline() {
+        async fn errors(
+            svc: &Services,
+            first: &PrMonitorId,
+            second: &PrMonitorId,
+        ) -> (Option<String>, Option<String>) {
+            (
+                svc.store().get_pr_monitor(first).await.unwrap().last_error,
+                svc.store().get_pr_monitor(second).await.unwrap().last_error,
+            )
+        }
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let (ws2, sibling) = sibling_workspace(&svc, "agent-prmon-sibling").await;
+        let (first, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 1)
+            .await
+            .expect("register");
+        let (second, _) = svc
+            .pr_monitor_register(&ws2, &sibling, "o", "r", 2)
+            .await
+            .expect("register");
+        let mut completed = first.clone();
+        completed.monitor_id = PrMonitorId::new();
+        completed.pr_number = 3;
+        completed.state = PrMonitorState::Completed;
+        completed.last_error = Some("old failure".into());
+        assert!(svc.store().insert_pr_monitor(&completed).await.unwrap());
+        // PR 1 carries a genuine error from before the pause.
+        svc.record_pr_monitor_error(&first, "forge down").await;
+
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ids = (&first.monitor_id, &second.monitor_id);
+
+        // The window opens at T1.
+        forge.edit(|s| s.rate_limit_reset_at = Some(now_unix + 600));
+        svc.pause_sweeps_for_rate_limit(&sc, "quota").await;
+        let t1 = svc.sweep_rate_limit_paused_until().unwrap();
+        let pause_t1 = expected_pause_error(&svc);
+        assert_eq!(
+            errors(&svc, ids.0, ids.1).await,
+            (
+                Some(format!("forge down; {pause_t1}")),
+                Some(pause_t1.clone())
+            )
+        );
+
+        // A later reset extends the window to T2: every active row is
+        // re-annotated with T2, the genuine error still in front.
+        forge.edit(|s| s.rate_limit_reset_at = Some(now_unix + 1800));
+        svc.pause_sweeps_for_rate_limit(&sc, "quota").await;
+        let t2 = svc.sweep_rate_limit_paused_until().unwrap();
+        assert!(t2 > t1, "{t2} > {t1}");
+        let pause_t2 = expected_pause_error(&svc);
+        assert_eq!(
+            errors(&svc, ids.0, ids.1).await,
+            (
+                Some(format!("forge down; {pause_t2}")),
+                Some(pause_t2.clone())
+            )
+        );
+        for (ws, who) in [(&ws, &owner), (&ws2, &sibling)] {
+            let listed = svc.pr_monitor_list_op(ws, Some(who)).await.unwrap();
+            for row in listed["monitors"].as_array().unwrap() {
+                if row["state"] == json!("active") {
+                    assert_eq!(row["pausedUntil"], json!(t2), "{row}");
+                } else {
+                    assert!(row.get("pausedUntil").is_none(), "{row}");
+                }
+            }
+        }
+
+        // An earlier reset does not move the deadline: nothing is re-stamped.
+        forge.edit(|s| s.rate_limit_reset_at = Some(now_unix + 300));
+        svc.pause_sweeps_for_rate_limit(&sc, "quota").await;
+        assert_eq!(svc.sweep_rate_limit_paused_until().unwrap(), t2);
+        assert_eq!(
+            errors(&svc, ids.0, ids.1).await,
+            (Some(format!("forge down; {pause_t2}")), Some(pause_t2))
+        );
+
+        let terminal = svc
+            .store()
+            .get_pr_monitor(&completed.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(terminal.last_error.as_deref(), Some("old failure"));
     }
 
     /// Sibling monitors on one PR count once toward the effective interval
