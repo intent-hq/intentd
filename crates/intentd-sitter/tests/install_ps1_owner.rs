@@ -16,9 +16,10 @@
 //! reviewing install.ps1, not a substitute: a run without `pwsh` proves
 //! nothing. CI therefore provisions pwsh and sets `INTENTD_CI_EXPECT_PWSH`,
 //! under which a missing PowerShell fails the suite instead of skipping it
-//! (see `pwsh()`). Everything in install.ps1 that needs Windows itself — Scheduled
-//! Task registration, and the startup wait that polls the task's log — remains
-//! unexercised by any test and can still regress silently.
+//! (see `pwsh()`). The parts of install.ps1 that need Windows itself — Scheduled
+//! Task registration, and the startup wait that polls the task's log — are
+//! covered by `scripts/install.ps1.Tests.ps1` (Pester, same marked-region
+//! extraction), which CI runs on a Windows runner (the `install-ps1` job).
 
 #![cfg(unix)]
 
