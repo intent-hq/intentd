@@ -3636,6 +3636,25 @@ mod tests {
         revision: u64,
     }
 
+    /// The ceiling the GitHub adapter's reads share, mirrored by the stub so
+    /// the two fetch paths can be checked for parity past it: `list_comments`
+    /// is one `per_page=100` page, a thread carries `comments(first: 100)`,
+    /// and the folded `totalCount`s saturate to match (`observed_count`).
+    const FORGE_PAGE_CEILING: usize = 100;
+
+    /// The threads as a read returns them: each carrying at most
+    /// [`FORGE_PAGE_CEILING`] comments.
+    fn thread_page(threads: &[ReviewThread]) -> Vec<ReviewThread> {
+        threads
+            .iter()
+            .map(|t| {
+                let mut t = t.clone();
+                t.comments.truncate(FORGE_PAGE_CEILING);
+                t
+            })
+            .collect()
+    }
+
     /// The stub's folded `pr_observation` answer, built from the same
     /// [`ForgeState`] the per-signal reads serve.
     #[derive(Clone, Copy, Default)]
@@ -4048,7 +4067,7 @@ mod tests {
                 return Err(intent_sourcecontrol::Error::Api("folded read down".into()));
             }
             let (review_comment_count, unresolved) =
-                crate::pr_ops::count_thread_comments(&s.threads);
+                crate::pr_ops::count_thread_comments(&thread_page(&s.threads));
             Ok(Some(PrObservation {
                 pr: s.pr_record(number),
                 signals: s.signals(),
@@ -4057,7 +4076,8 @@ mod tests {
                     review_comment_count,
                     unresolved,
                 }),
-                conversation_count: i64::try_from(s.conversation_comments).unwrap(),
+                conversation_count: i64::try_from(s.conversation_comments.min(FORGE_PAGE_CEILING))
+                    .unwrap(),
             }))
         }
         async fn list_comments(
@@ -4084,7 +4104,7 @@ mod tests {
                     "comments down".into(),
                 ));
             }
-            Ok((0..n)
+            Ok((0..n.min(FORGE_PAGE_CEILING))
                 .map(|i| Comment {
                     id: i.to_string(),
                     author: "octocat".into(),
@@ -4145,7 +4165,7 @@ mod tests {
                 ));
             }
             Ok(Page {
-                items: s.threads.clone(),
+                items: thread_page(&s.threads),
                 next_cursor: None,
             })
         }
@@ -7554,6 +7574,56 @@ mod tests {
             .expect_err("quota exhaustion propagates");
         assert!(matches!(err, Error::RateLimited(_)), "{err:?}");
         assert_eq!(forge_reads(&forge), vec![("pr_observation", 1)]);
+    }
+
+    /// Count parity past the per-signal ceilings: a PR with more than 100
+    /// conversation comments and more than 100 replies in one thread reports
+    /// the SAME (saturated) counts from the folded read and the per-signal
+    /// fallback, so a transient folded failure on an unchanged PR — folded →
+    /// fallback → folded — composes identical snapshots and the monitor
+    /// records no comment change.
+    #[tokio::test]
+    async fn an_unchanged_pr_past_the_count_ceilings_survives_a_folded_fallback_round_trip() {
+        let repo = RepoRef::new("o", "r");
+        let forge = StubForge::new();
+        forge.edit(busy_pr);
+        forge.edit(|s| {
+            s.conversation_comments = 2426;
+            s.threads = vec![thread("t1", false, 250), thread("t2", true, 1)];
+            s.folded = Some(FoldedRead::default());
+        });
+        let folded = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
+        forge.edit(|s| s.folded.as_mut().unwrap().fail = true);
+        let fallback = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
+        forge.edit(|s| s.folded.as_mut().unwrap().fail = false);
+        let folded_again = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
+        assert_eq!(forge.sub_fetches("pr_observation"), 3);
+        assert_eq!(forge.sub_fetches("list_comments"), 1);
+        assert_eq!(folded.conversation_count, Some(100), "saturated, not 2426");
+        assert_eq!(folded.review_comment_count, 101, "100 + 1, not 251");
+        assert_eq!(fallback.materialize(None), folded.materialize(None));
+        assert_eq!(folded_again.materialize(None), folded.materialize(None));
+
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        forge.edit(|s| {
+            s.conversation_comments = 2426;
+            s.threads = vec![thread("t1", false, 250), thread("t2", true, 1)];
+            s.folded = Some(FoldedRead::default());
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+        svc.poll_pr_monitors().await;
+        forge.edit(|s| s.folded.as_mut().unwrap().fail = true);
+        svc.poll_pr_monitors().await;
+        forge.edit(|s| s.folded.as_mut().unwrap().fail = false);
+        svc.poll_pr_monitors().await;
+        assert!(
+            !svc.pr_monitor_flush(&ws, &monitor.monitor_id)
+                .await
+                .unwrap(),
+            "no comment delta pending after the round trip"
+        );
+        assert!(!owner_messages(&svc, &owner).await.contains("PR monitor"));
     }
 
     /// Cache hygiene: an entry outlives its monitors only until the next
