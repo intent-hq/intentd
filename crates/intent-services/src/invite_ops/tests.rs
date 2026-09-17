@@ -1108,6 +1108,313 @@ async fn complete_join_enforces_the_pin_by_account_id() {
     assert_eq!(joined["login"], json!("renamed-login"));
 }
 
+// --- returning guest: invite.inspect / invite.accept -----------------------
+
+impl Fixture {
+    /// A second workspace owned by the same owner, with one open invite on
+    /// it — the link a returning guest inspects / accepts.
+    async fn second_workspace_invite(&self) -> (WorkspaceId, String, String) {
+        let ws = WorkspaceId::new();
+        let mut row = workspace(&ws);
+        row.title = "Second".to_string();
+        self.store.insert_workspace(&row).await.expect("ws2");
+        self.store
+            .set_workspace_member_role(&ws, &self.primary, WorkspaceRole::Collaborator)
+            .await
+            .expect("demote primary on ws2");
+        self.store
+            .add_workspace_member(&ws, &self.owner, WorkspaceRole::Owner)
+            .await
+            .expect("owner of ws2");
+        let created = with_caller(
+            wire(&self.owner),
+            self.services.workspace_invite_create_op(&ws, None, None),
+        )
+        .await
+        .expect("create invite on ws2");
+        let secret = created["secret"].as_str().expect("secret").to_string();
+        (ws, id_of(&created), secret)
+    }
+
+    /// The device-flow join of `identity` on a fresh invite of the fixture
+    /// workspace: the returning guest's first credential.
+    async fn first_join(&self, user: &UserIdentity) -> (PrincipalId, String) {
+        let created = self.create_invite(None).await;
+        let joined = self
+            .services
+            .complete_invite_join(&id_of(&created), user)
+            .await
+            .expect("first join");
+        (
+            PrincipalId(joined["principalId"].as_str().expect("pid").to_string()),
+            joined["token"].as_str().expect("token").to_string(),
+        )
+    }
+}
+
+/// `invite.inspect` answers the workspace hint for an open link with the
+/// same refusals as a redeem start — and takes no flow permit, so a
+/// daemon whose flow capacity is fully spent still answers it.
+#[tokio::test]
+async fn inspect_previews_an_open_invite_without_a_flow() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let (ws2, invite_id, secret) = f.second_workspace_invite().await;
+
+    let permits_before = f.services.invite_flow_permits.available_permits();
+    let r = f
+        .services
+        .invite_inspect_op(&invite_id, &secret)
+        .await
+        .expect("inspect");
+    assert_eq!(
+        r,
+        json!({ "workspaceId": ws2.0, "workspaceTitle": "Second" }),
+        "{r}"
+    );
+    assert_eq!(
+        f.services.invite_flow_permits.available_permits(),
+        permits_before,
+        "inspect never touches the flow permits"
+    );
+    assert!(f.services.invite_flows.lock().await.is_empty());
+
+    // Spent flow capacity does not affect inspect.
+    let _all: Vec<_> = (0..permits_before)
+        .map(|_| {
+            f.services
+                .invite_flow_permits
+                .clone()
+                .try_acquire_owned()
+                .expect("permit")
+        })
+        .collect();
+    assert_eq!(f.services.invite_flow_permits.available_permits(), 0);
+    f.services
+        .invite_inspect_op(&invite_id, &secret)
+        .await
+        .expect("inspect with no flow capacity");
+
+    // Same refusals as a redeem start; the invite stays open throughout.
+    let r = f.services.invite_inspect_op("missing", &secret).await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
+    let r = f.services.invite_inspect_op(&invite_id, "wrong").await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
+    f.store
+        .revoke_workspace_invite(&invite_id)
+        .await
+        .expect("revoke");
+    let r = f.services.invite_inspect_op(&invite_id, &secret).await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
+}
+
+/// `invite.accept` with the credential a prior redeem minted: the same
+/// principal joins the second workspace as a collaborator, a fresh
+/// credential comes back (the earlier one is untouched), the invite is
+/// redeemed by that principal, the stored profile is not refreshed, no
+/// forge is consulted and the member event names the principal.
+#[tokio::test]
+async fn accept_joins_a_returning_guest_with_its_credential() {
+    let tmp = TempDb::new();
+    let mut f = fixture(&tmp).await;
+    let bus = crate::events::EventBus::new(f.store.clone());
+    f.services = f.services.with_event_bus(bus.clone());
+    let (guest, first_token) = f.first_join(&identity("guest", 4242)).await;
+    let (ws2, invite_id, secret) = f.second_workspace_invite().await;
+    let mut events = bus.subscribe(crate::events::SubscriptionFilter {
+        event_types: vec!["workspace:updated".into()],
+        workspace_id: Some(ws2.0.clone()),
+        ..Default::default()
+    });
+
+    let r = f
+        .services
+        .invite_accept_op(&invite_id, &secret, &first_token)
+        .await
+        .expect("accept");
+    assert_eq!(r["status"], json!("authorized"));
+    assert_eq!(r["principalId"], json!(guest.0));
+    assert_eq!(r["login"], json!("guest"));
+    assert_eq!(r["workspaceId"], json!(ws2.0));
+    let second_token = r["token"].as_str().expect("token").to_string();
+    assert_eq!(second_token.len(), 64);
+    assert_ne!(second_token, first_token);
+    assert!(
+        r.get("hostname").is_none(),
+        "decoration is the transport's: {r}"
+    );
+
+    assert_eq!(
+        f.store
+            .get_workspace_member_role(&ws2, &guest)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Collaborator)
+    );
+    for token in [&first_token, &second_token] {
+        let cred = f
+            .store
+            .lookup_principal_credential(&hash_secret(token))
+            .await
+            .expect("lookup")
+            .expect("credential row");
+        assert_eq!(cred.principal_id, guest);
+        assert!(cred.is_active(), "both credentials stay active");
+    }
+    let invite = f
+        .store
+        .get_workspace_invite(&invite_id)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(invite.redeemed_by_principal_id, Some(guest.clone()));
+    let row = f.store.get_principal(&guest).await.expect("principal");
+    assert_eq!(row.github_user_id, Some(4242));
+    assert_eq!(row.login.as_deref(), Some("guest"));
+    assert_eq!(
+        f.store.count_principals().await.expect("count"),
+        4,
+        "no new principal row"
+    );
+    assert!(f.services.invite_flows.lock().await.is_empty());
+
+    let batch = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("event in time")
+        .expect("event batch");
+    let ev = batch
+        .iter()
+        .find(|e| e.data["changes"]["addedPrincipalId"] == json!(guest.0))
+        .unwrap_or_else(|| panic!("member event: {batch:?}"));
+    assert_eq!(ev.event_type, "workspace:updated");
+    assert_eq!(ev.data["workspaceId"], json!(ws2.0));
+    assert_eq!(ev.data["changes"]["members"], json!(true));
+    // owner + the demoted primary + the guest
+    assert_eq!(ev.data["changes"]["memberCount"], json!(3));
+
+    // Single use, like the device-flow join.
+    let again = f
+        .services
+        .invite_accept_op(&invite_id, &secret, &first_token)
+        .await;
+    assert_eq!(invite_kind(&again), InviteErrorKind::Redeemed);
+}
+
+/// `invite.accept` refusals: an unknown or revoked credential is
+/// `CredentialInvalid` (checked before the invite, so a bad credential on a
+/// bad link is still `CredentialInvalid`); a credential of a principal
+/// without a GitHub identity is refused the same way; a wrong secret is
+/// `NotFound`; a closed invite is its kind; a pin to another account is
+/// `PinMismatch`. None of them writes anything: the invite stays open.
+#[tokio::test]
+async fn accept_refuses_bad_credentials_closed_invites_and_pins() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let (guest, token) = f.first_join(&identity("guest", 4242)).await;
+    let (ws2, invite_id, secret) = f.second_workspace_invite().await;
+
+    let r = f
+        .services
+        .invite_accept_op(&invite_id, &secret, "not-a-credential")
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::CredentialInvalid);
+    let r = f
+        .services
+        .invite_accept_op("missing", "wrong", "not-a-credential")
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::CredentialInvalid);
+
+    // A principal with no GitHub identity cannot join by invite.
+    let anonymous = principal("anon", None);
+    f.store.upsert_principal(&anonymous).await.expect("anon");
+    f.store
+        .insert_principal_credential(&anonymous.id, &hash_secret("anon-token"))
+        .await
+        .expect("anon credential");
+    let r = f
+        .services
+        .invite_accept_op(&invite_id, &secret, "anon-token")
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::CredentialInvalid);
+
+    let r = f
+        .services
+        .invite_accept_op(&invite_id, "wrong", &token)
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
+
+    // Pinned to another account: the stored github_user_id decides.
+    let mut pinned = f
+        .store
+        .get_workspace_invite(&invite_id)
+        .await
+        .expect("get")
+        .expect("row");
+    pinned.id = "pinned".to_string();
+    pinned.secret_hash = hash_secret("pinned-secret");
+    pinned.pin_github_user_id = Some(5555);
+    pinned.pin_login = Some("someone-else".to_string());
+    f.store
+        .insert_workspace_invite(&pinned)
+        .await
+        .expect("insert pinned");
+    let r = f
+        .services
+        .invite_accept_op("pinned", "pinned-secret", &token)
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::PinMismatch);
+    assert!(f
+        .store
+        .get_workspace_invite("pinned")
+        .await
+        .expect("get")
+        .expect("row")
+        .redeemed_at
+        .is_none());
+
+    // Revoked credential: the token that joined once no longer identifies.
+    f.store
+        .revoke_all_principal_credentials(&guest)
+        .await
+        .expect("revoke credentials");
+    let r = f
+        .services
+        .invite_accept_op(&invite_id, &secret, &token)
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::CredentialInvalid);
+    assert_eq!(
+        f.store
+            .get_workspace_member_role(&ws2, &guest)
+            .await
+            .expect("role"),
+        None,
+        "nothing joined"
+    );
+    assert!(f
+        .store
+        .get_workspace_invite(&invite_id)
+        .await
+        .expect("get")
+        .expect("row")
+        .redeemed_at
+        .is_none());
+
+    // Closed invite with a (fresh) valid credential.
+    f.store
+        .insert_principal_credential(&guest, &hash_secret("fresh"))
+        .await
+        .expect("fresh credential");
+    f.store
+        .revoke_workspace_invite(&invite_id)
+        .await
+        .expect("revoke invite");
+    let r = f
+        .services
+        .invite_accept_op(&invite_id, &secret, "fresh")
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
+}
+
 // --- guest caps ------------------------------------------------------------
 
 /// The fixture wired to a settings registry with

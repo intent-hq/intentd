@@ -1,7 +1,8 @@
 //! Workspace invite links and the identity-only device-flow join
 //! (multiplayer w4): `workspace.invite.create` / `.list` / `.revoke` on the
-//! owner side, `invite.redeem` (start + wait) on the unauthenticated
-//! `/invite` side, plus `workspace.members.leave` / `principal.revokeSelf`.
+//! owner side, `invite.redeem` (start + wait), `invite.inspect` and
+//! `invite.accept` on the unauthenticated `/invite` side, plus
+//! `workspace.members.leave` / `principal.revokeSelf`.
 //!
 //! An invite is a single-use, expiring `(id, secret)` pair; redemption
 //! matches the hex SHA-256 of the secret, and the plaintext is kept only so
@@ -15,6 +16,13 @@
 //! The joined principal is minted (or reused, keyed by `github_user_id`),
 //! added as a `collaborator`, and issued a fresh per-principal credential
 //! that is returned exactly once.
+//!
+//! A guest that already holds such a credential for this host skips the
+//! device flow on later invites: `invite.inspect` previews the link (same
+//! validation, no flow) and `invite.accept` joins with the credential as
+//! proof of identity — the principal it resolves to is the one whose GitHub
+//! account was proven by its own earlier grant, so the join commits with the
+//! stored identity and GitHub is never contacted.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,7 +30,7 @@ use std::time::Duration;
 
 use intent_core::{
     current_caller, iso_ms_from_now, now_iso, Caller, Error, InviteErrorKind, InviteLinkEnvelope,
-    Principal, PrincipalId, Result, WorkspaceId, WorkspaceInvite, WorkspaceRole,
+    Principal, PrincipalId, Result, Workspace, WorkspaceId, WorkspaceInvite, WorkspaceRole,
 };
 use intent_sourcecontrol::{IdentityFlow, IdentityPollStatus, UserIdentity};
 use intent_store::InviteJoinOutcome;
@@ -523,13 +531,15 @@ pub(crate) fn resolve_api_base_uri(override_uri: Option<&str>) -> Option<String>
 }
 
 impl Services {
-    /// `invite.redeem` phase 1: see
-    /// [`intent_core::WorkspaceApi::invite_redeem_start`].
-    pub(crate) async fn invite_redeem_start_op(
+    /// The open invite `(invite_id, secret)` names and its workspace — the
+    /// validation every `/invite` method starts with. A wrong id and a
+    /// wrong secret are the same [`InviteErrorKind::NotFound`]; a closed
+    /// invite is its [`closed_kind`].
+    async fn open_invite(
         &self,
         invite_id: &str,
         secret: &str,
-    ) -> Result<Value> {
+    ) -> Result<(WorkspaceInvite, Workspace)> {
         let invite = match self.store.get_workspace_invite(invite_id).await? {
             Some(invite) if hashes_match(&invite.secret_hash, &hash_secret(secret)) => invite,
             _ => return Err(Error::Invite(InviteErrorKind::NotFound)),
@@ -542,6 +552,59 @@ impl Services {
             .get_workspace(&invite.workspace_id)
             .await
             .map_err(|_| Error::Invite(InviteErrorKind::NotFound))?;
+        Ok((invite, ws))
+    }
+
+    /// `invite.inspect`: see [`intent_core::WorkspaceApi::invite_inspect`].
+    /// Reads only — no flow slot, no permit, no upstream call.
+    pub(crate) async fn invite_inspect_op(&self, invite_id: &str, secret: &str) -> Result<Value> {
+        let (invite, ws) = self.open_invite(invite_id, secret).await?;
+        Ok(json!({
+            "workspaceId": invite.workspace_id,
+            "workspaceTitle": ws.title,
+        }))
+    }
+
+    /// `invite.accept`: see [`intent_core::WorkspaceApi::invite_accept`].
+    pub(crate) async fn invite_accept_op(
+        &self,
+        invite_id: &str,
+        secret: &str,
+        credential: &str,
+    ) -> Result<Value> {
+        // The credential is the proof of identity: the same active-only
+        // resolve the `/ws` bearer gate runs, so a revoked one is refused
+        // here exactly as it would be at upgrade.
+        let principal_id = self
+            .store
+            .resolve_active_principal_credential(&hash_secret(credential))
+            .await?
+            .ok_or(Error::Invite(InviteErrorKind::CredentialInvalid))?;
+        let principal = self.store.get_principal(&principal_id).await?;
+        // Only a GitHub-verified guest can join by invite (the join is keyed
+        // by `github_user_id`); a credential bound to any other principal
+        // does not identify one.
+        let Some(github_user_id) = principal.github_user_id else {
+            return Err(Error::Invite(InviteErrorKind::CredentialInvalid));
+        };
+        let (invite, _) = self.open_invite(invite_id, secret).await?;
+        if invite
+            .pin_github_user_id
+            .is_some_and(|pinned| pinned != github_user_id)
+        {
+            return Err(Error::Invite(InviteErrorKind::PinMismatch));
+        }
+        self.commit_invite_join(&invite, &principal).await
+    }
+
+    /// `invite.redeem` phase 1: see
+    /// [`intent_core::WorkspaceApi::invite_redeem_start`].
+    pub(crate) async fn invite_redeem_start_op(
+        &self,
+        invite_id: &str,
+        secret: &str,
+    ) -> Result<Value> {
+        let (invite, ws) = self.open_invite(invite_id, secret).await?;
 
         // Reserve the flow's capacity before the upstream device-code
         // request: purge collectable slots (returning their permits), then
@@ -714,13 +777,9 @@ impl Services {
         }
     }
 
-    /// The join itself, once the invitee's GitHub identity is proven:
-    /// re-check the invite (pin, still open), then — in one store
-    /// transaction ([`intent_store::Store::join_workspace_by_invite`]) —
-    /// mint or reuse the principal keyed by `github_user_id`, redeem the
-    /// invite (the conditional UPDATE is the single-use guard), add the
-    /// `collaborator` membership and record a fresh per-principal
-    /// credential. The event is published only after the commit.
+    /// The device-flow join, once the invitee's GitHub identity is proven:
+    /// re-check the invite (pin, still open), map the resolved account onto
+    /// a fresh principal row and commit through [`Self::commit_invite_join`].
     async fn complete_invite_join(&self, invite_id: &str, user: &UserIdentity) -> Result<Value> {
         let github_user_id = user
             .id
@@ -751,13 +810,29 @@ impl Services {
             updated_at: now_iso(),
         };
         apply_identity(&mut identity, user);
+        self.commit_invite_join(&invite, &identity).await
+    }
+
+    /// The join shared by the device flow and `invite.accept`: in one store
+    /// transaction ([`intent_store::Store::join_workspace_by_invite`]) mint
+    /// or reuse the principal keyed by `identity.github_user_id`, redeem the
+    /// invite (the conditional UPDATE is the single-use guard), add the
+    /// `collaborator` membership and record a fresh per-principal
+    /// credential. The event is published only after the commit; the
+    /// credential is returned exactly once, in the `authorized` result.
+    async fn commit_invite_join(
+        &self,
+        invite: &WorkspaceInvite,
+        identity: &Principal,
+    ) -> Result<Value> {
+        let invite_id = invite.id.as_str();
         let token = random_hex_secret();
         let principal = match self
             .store
             .join_workspace_by_invite(
                 invite_id,
                 &invite.workspace_id,
-                &identity,
+                identity,
                 &hash_secret(&token),
                 self.max_guests_per_workspace(),
             )

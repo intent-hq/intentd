@@ -64,8 +64,8 @@ pub(crate) const INVITE_PATH: &str = "/invite";
 /// its task lives (returned on any exit, including a heartbeat abort).
 pub(crate) const MAX_INVITE_CONNECTIONS: usize = 32;
 
-/// Concurrent `invite.redeem` requests one `/invite` connection may have in
-/// flight (a well-behaved client needs two: a start and its wait). Excess
+/// Concurrent invite requests one `/invite` connection may have in flight
+/// (a well-behaved client needs two: a start and its wait). Excess
 /// requests are refused with `flow-busy` immediately instead of spawning
 /// work; the response queue is sized so every admitted request always has a
 /// slot to answer into, so no task ever blocks on a full queue.
@@ -426,8 +426,8 @@ pub(crate) struct WsInner {
     /// ([`MAX_INVITE_CONNECTIONS`]); a permit is acquired before the `101`
     /// and travels with the connection task.
     pub invite_permits: Arc<Semaphore>,
-    /// Listener-wide rate limit over phase-1 `invite.redeem` starts
-    /// ([`crate::invite::RedeemThrottle`]); shared by every `/invite`
+    /// Listener-wide rate limit over the `/invite` requests that hash a
+    /// secret ([`crate::invite::RedeemThrottle`]); shared by every `/invite`
     /// connection so a reconnect never resets it.
     pub redeem_throttle: crate::invite::SharedRedeemThrottle,
     /// Guest connection admission ([`GuestConnectionLimits`]): seats are
@@ -799,7 +799,8 @@ impl WsInner {
         // `/invite` (multiplayer w4): the ONE unauthenticated endpoint. It
         // has no bearer token by construction — the invitee holds only the
         // link — so it skips credential resolution and gets a dedicated loop
-        // that serves `invite.redeem` and nothing else. Bounded: the accept
+        // that serves `invite.redeem` / `invite.inspect` / `invite.accept`
+        // and nothing else. Bounded: the accept
         // is refused with 503 once `MAX_INVITE_CONNECTIONS` permits are held;
         // the permit is taken atomically here, before the `101`, and rides
         // with the connection task so an aborted (heartbeat-reaped) task
@@ -1051,16 +1052,18 @@ impl WsInner {
     }
 
     /// Drive one `/invite` connection (multiplayer w4). No caller is bound
-    /// and nothing but `invite.redeem` is served: every other frame that
-    /// carries an id is answered `-32001`, and the `events.`/subscription
-    /// fast paths, the router and the reverse channel are never reached. Each
-    /// `invite.redeem` runs on its own task (phase 2 blocks for up to the
-    /// device-code lifetime) so pings keep flowing and the reaper never
+    /// and nothing but `invite.redeem` / `invite.inspect` / `invite.accept`
+    /// is served: every other frame that carries an id is answered
+    /// `-32001`, and the `events.`/subscription fast paths, the router and
+    /// the reverse channel are never reached. Each request runs on its own
+    /// task (a redeem phase 2 blocks for up to the device-code lifetime) so
+    /// pings keep flowing and the reaper never
     /// mistakes a waiting invitee for a dead peer — but that work is bounded
     /// per connection: at most [`MAX_INFLIGHT_INVITE_REQUESTS`] tasks, each
     /// holding a pre-reserved response slot (so none ever waits to send), all
     /// owned by a [`JoinSet`] that aborts them when the connection ends.
-    /// Phase-1 starts additionally pass the listener-wide
+    /// Every request that hashes a secret (a phase-1 start, an inspect, an
+    /// accept) additionally passes the listener-wide
     /// [`crate::invite::RedeemThrottle`] before any store or upstream work.
     /// Frames the loop answers itself (parse errors, throttle and non-invite
     /// refusals) go straight to the sink and never contend for those slots.
@@ -1087,7 +1090,7 @@ impl WsInner {
                             continue;
                         };
                         match crate::invite::classify(&value) {
-                            Some(req) if req.method == crate::invite::InviteMethod::Redeem => {
+                            Some(req) if req.method.on_invite_endpoint() => {
                                 if let Err(refusal) = crate::invite::admit_redeem(
                                     &req, &self.redeem_throttle, Instant::now())
                                 {
@@ -1113,7 +1116,9 @@ impl WsInner {
                                 let api = self.api.clone();
                                 tasks.spawn(async move {
                                     let _permit = permit;
-                                    if let Some(frame) = crate::invite::handle_redeem(req, &api).await {
+                                    if let Some(frame) =
+                                        crate::invite::handle_invite_endpoint(req, &api).await
+                                    {
                                         slot.send(frame);
                                     }
                                 });

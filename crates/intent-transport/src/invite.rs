@@ -9,11 +9,17 @@
 //!   plus `inviteId` and `secret`. It needs the listener's own pairing
 //!   snapshot ([`ServerPairingInfo`]), which the JSON-RPC router has no
 //!   access to — hence a fast path, like `pairing.getInfo`.
-//! - `invite.redeem` — the ONLY method served on the unauthenticated
-//!   `/invite` endpoint ([`crate::ws`]). Two phases on one method name:
-//!   `{ inviteId, secret }` starts the identity-only GitHub device flow and
-//!   returns the user code; `{ flowId }` waits for the grant and returns the
-//!   collaborator credential exactly once.
+//! - `invite.redeem` — served on the unauthenticated `/invite` endpoint
+//!   ([`crate::ws`]). Two phases on one method name: `{ inviteId, secret }`
+//!   starts the identity-only GitHub device flow and returns the user code;
+//!   `{ flowId }` waits for the grant and returns the collaborator
+//!   credential exactly once.
+//! - `invite.inspect` / `invite.accept` — the other two `/invite` methods,
+//!   for a guest that already holds a credential for this host:
+//!   `{ inviteId, secret }` previews the link (same validation as a redeem
+//!   start, no device flow) and `{ inviteId, secret, credential }` joins
+//!   with that credential as proof of identity, answering the phase-2
+//!   `authorized` shape. Nothing else is reachable through `/invite`.
 
 use std::fmt::Write as _;
 use std::future::Future;
@@ -36,9 +42,9 @@ use intent_core::{
 pub(crate) const INVITE_PAYLOAD_VERSION: u32 = 1;
 
 /// Human message paired with the `-32001` an `/invite` connection gets for
-/// any method other than `invite.redeem`.
+/// any method other than the invite methods.
 pub(crate) const INVITE_ENDPOINT_ONLY_MESSAGE: &str =
-    "the /invite endpoint serves invite.redeem only";
+    "the /invite endpoint serves invite.redeem, invite.inspect and invite.accept only";
 
 /// Build the invite link:
 /// `intent://invite?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&inviteId=<id>&secret=<s>[&tc=<addr>]`.
@@ -69,11 +75,21 @@ pub(crate) fn build_invite_uri(
     uri
 }
 
-/// Which of the two invite fast paths a frame names.
+/// Which invite fast path a frame names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InviteMethod {
     Create,
     Redeem,
+    Inspect,
+    Accept,
+}
+
+impl InviteMethod {
+    /// Served on the unauthenticated `/invite` endpoint (everything but
+    /// `workspace.invite.create`, which needs an authenticated owner).
+    pub(crate) fn on_invite_endpoint(self) -> bool {
+        !matches!(self, InviteMethod::Create)
+    }
 }
 
 /// A classified invite request awaiting handling by the connection task.
@@ -101,6 +117,8 @@ pub(crate) fn classify(value: &Value) -> Option<InviteRequest> {
     let method = match method {
         "workspace.invite.create" => InviteMethod::Create,
         "invite.redeem" => InviteMethod::Redeem,
+        "invite.inspect" => InviteMethod::Inspect,
+        "invite.accept" => InviteMethod::Accept,
         _ => return None,
     };
     Some(InviteRequest {
@@ -136,9 +154,10 @@ fn respond(req: &InviteRequest, result: Result<Value>) -> Option<String> {
     })
 }
 
-/// Refuse an `invite.redeem` the connection will not run because it already
-/// has its per-connection quota of requests in flight (`flow-busy`, same
-/// code the daemon-wide flow cap answers with). `None` for a notification.
+/// Refuse an `/invite` request the connection will not run because it
+/// already has its per-connection quota of requests in flight (`flow-busy`,
+/// same code the daemon-wide flow cap answers with). `None` for a
+/// notification.
 pub(crate) fn refuse_busy(req: &InviteRequest) -> Option<String> {
     respond(req, Err(Error::Invite(InviteErrorKind::FlowBusy)))
 }
@@ -153,13 +172,14 @@ pub(crate) const INVITE_START_BURST: u32 = 8;
 /// (a sustained 12 attempts per minute across every `/invite` peer).
 pub(crate) const INVITE_START_REFILL: Duration = Duration::from_secs(5);
 
-/// Listener-wide token bucket over phase-1 `invite.redeem` starts — the
-/// requests that hash the secret against the store and open an upstream
-/// device flow. The per-connection in-flight quota bounds concurrency
-/// only; this bounds the *rate*, so a peer cannot enumerate links or churn
-/// device flows by serialising attempts or reconnecting: the bucket lives
-/// on the listener, not the connection. Phase-2 waits (`{ flowId }`) are
-/// not counted — they read a flow the start already paid for.
+/// Listener-wide token bucket over the `/invite` requests that hash a
+/// secret against the store — phase-1 `invite.redeem` starts (which also
+/// open an upstream device flow), `invite.inspect` and `invite.accept`.
+/// The per-connection in-flight quota bounds concurrency only; this bounds
+/// the *rate*, so a peer cannot enumerate links or churn device flows by
+/// serialising attempts or reconnecting: the bucket lives on the listener,
+/// not the connection. Phase-2 waits (`{ flowId }`) are not counted — they
+/// read a flow the start already paid for.
 #[derive(Debug)]
 pub(crate) struct RedeemThrottle {
     tokens: u32,
@@ -209,7 +229,18 @@ pub(crate) fn is_redeem_start(req: &InviteRequest) -> bool {
     !matches!(opt_str_param(&req.params, "flowId"), Ok(Some(f)) if !f.trim().is_empty())
 }
 
-/// Apply the start throttle to a classified `invite.redeem` *before* any
+/// True for the `/invite` requests the [`RedeemThrottle`] counts: every
+/// request that hashes a secret against the store — a phase-1
+/// `invite.redeem`, an `invite.inspect`, an `invite.accept`.
+pub(crate) fn hashes_secret(req: &InviteRequest) -> bool {
+    match req.method {
+        InviteMethod::Redeem => is_redeem_start(req),
+        InviteMethod::Inspect | InviteMethod::Accept => true,
+        InviteMethod::Create => false,
+    }
+}
+
+/// Apply the start throttle to a classified `/invite` request *before* any
 /// store or upstream work: `Some(frame)` is the `flow-busy` refusal to send
 /// instead of running the request (`None` also for a throttled
 /// notification, which is simply dropped); `Ok(())` admits it.
@@ -218,7 +249,7 @@ pub(crate) fn admit_redeem(
     throttle: &SharedRedeemThrottle,
     now: Instant,
 ) -> std::result::Result<(), Option<String>> {
-    if !is_redeem_start(req) {
+    if !hashes_secret(req) {
         return Ok(());
     }
     let admitted = throttle
@@ -425,19 +456,81 @@ async fn redeem_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Valu
         _ => {
             let invite_id = str_param(params, "inviteId")?;
             let secret = str_param(params, "secret")?;
-            let mut result = api.invite_redeem_start(invite_id, secret).await?;
-            let obj = result.as_object_mut().ok_or_else(|| {
-                Error::Internal("invite.redeem start result is not an object".to_string())
-            })?;
-            obj.insert("hostname".into(), crate::local_hostname().into());
-            obj.insert("prettyHostname".into(), crate::pretty_hostname().into());
-            Ok(result)
+            let result = api.invite_redeem_start(invite_id, secret).await?;
+            with_host_identity(result, "invite.redeem start")
         }
     }
 }
 
-/// The frame an `/invite` connection gets for any method other than
-/// `invite.redeem`: `-32001` (the endpoint is unauthenticated, so nothing
+/// Stamp a service result with the host's `hostname` / `prettyHostname`
+/// (same sources as `system.status` / `server.pairingInfo`), so the guest's
+/// consent prompt can name the machine before the authenticated connect.
+fn with_host_identity(mut result: Value, what: &str) -> Result<Value> {
+    let obj = result
+        .as_object_mut()
+        .ok_or_else(|| Error::Internal(format!("{what} result is not an object")))?;
+    obj.insert("hostname".into(), crate::local_hostname().into());
+    obj.insert("prettyHostname".into(), crate::pretty_hostname().into());
+    Ok(result)
+}
+
+/// Handle a classified `invite.inspect` on the `/invite` endpoint: params
+/// `{ inviteId, secret }` → the service result `{ workspaceId,
+/// workspaceTitle }` extended with the host's `hostname` / `prettyHostname`
+/// exactly like a phase-1 `invite.redeem`, without starting a device flow.
+pub(crate) async fn handle_inspect(
+    req: InviteRequest,
+    api: &Arc<dyn WorkspaceApi>,
+) -> Option<String> {
+    let result = inspect_json(&req.params, api).await;
+    respond(&req, result)
+}
+
+async fn inspect_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Value> {
+    let invite_id = str_param(params, "inviteId")?;
+    let secret = str_param(params, "secret")?;
+    let result = api.invite_inspect(invite_id, secret).await?;
+    with_host_identity(result, "invite.inspect")
+}
+
+/// Handle a classified `invite.accept` on the `/invite` endpoint: params
+/// `{ inviteId, secret, credential }` → the phase-2 `authorized` shape
+/// `{ status, token, principalId, login, workspaceId }` as the service
+/// answers it (no host identity: the client already saw it on inspect).
+pub(crate) async fn handle_accept(
+    req: InviteRequest,
+    api: &Arc<dyn WorkspaceApi>,
+) -> Option<String> {
+    let result = accept_json(&req.params, api).await;
+    respond(&req, result)
+}
+
+async fn accept_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Value> {
+    let invite_id = str_param(params, "inviteId")?;
+    let secret = str_param(params, "secret")?;
+    let credential = str_param(params, "credential")?;
+    api.invite_accept(invite_id, secret, credential).await
+}
+
+/// Handle any classified `/invite` request
+/// ([`InviteMethod::on_invite_endpoint`]); `workspace.invite.create` is
+/// refused like every other non-invite method there.
+pub(crate) async fn handle_invite_endpoint(
+    req: InviteRequest,
+    api: &Arc<dyn WorkspaceApi>,
+) -> Option<String> {
+    match req.method {
+        InviteMethod::Redeem => handle_redeem(req, api).await,
+        InviteMethod::Inspect => handle_inspect(req, api).await,
+        InviteMethod::Accept => handle_accept(req, api).await,
+        InviteMethod::Create => req
+            .id_present
+            .then(|| error_frame(&req.id_echo, -32001, INVITE_ENDPOINT_ONLY_MESSAGE)),
+    }
+}
+
+/// The frame an `/invite` connection gets for any method other than the
+/// invite methods: `-32001` (the endpoint is unauthenticated, so nothing
 /// else is reachable through it). `None` for a notification.
 pub(crate) fn refuse_non_invite(value: &Value) -> Option<String> {
     let obj = value.as_object()?;
