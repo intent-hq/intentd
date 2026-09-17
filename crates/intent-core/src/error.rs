@@ -144,6 +144,57 @@ pub enum Error {
     /// conditions) with `error.data = { code: kind.as_str() }`.
     #[error("{}", .0.message())]
     Invite(InviteErrorKind),
+
+    /// A guest-side gist identity-proof operation
+    /// (`github.identityProof.create` / `github.identityProof.delete`) was
+    /// refused for a reason the client must key off machine-readably: no
+    /// GitHub token is stored, the stored token lacks the `gist` scope, or
+    /// GitHub could not be reached. Surfaces as `-32603` with
+    /// `error.data = { code: kind.as_str() }`.
+    #[error("{}", .0.message())]
+    IdentityProof(IdentityProofErrorKind),
+}
+
+/// Machine-readable reason a gist identity-proof operation was refused,
+/// surfaced on the wire as `error.data.code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityProofErrorKind {
+    /// No GitHub token is stored (`github.connect` never completed, or the
+    /// token was revoked / rejected by GitHub).
+    NotConnected,
+    /// The stored token lacks the `gist` OAuth scope; the user must
+    /// re-authorize (`github.connect`) to grant it.
+    ScopeMissing,
+    /// GitHub could not be reached.
+    Unreachable,
+}
+
+impl IdentityProofErrorKind {
+    /// Stable wire identifier for this kind (`error.data.code`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdentityProofErrorKind::NotConnected => "github-not-connected",
+            IdentityProofErrorKind::ScopeMissing => "github-scope-missing",
+            IdentityProofErrorKind::Unreachable => "github-unreachable",
+        }
+    }
+
+    /// Human-readable message for this kind.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            IdentityProofErrorKind::NotConnected => {
+                "internal error: GitHub is not connected — sign in (github.connect) before \
+                 proving your identity"
+            }
+            IdentityProofErrorKind::ScopeMissing => {
+                "internal error: the stored GitHub token lacks the `gist` scope — sign in again \
+                 (github.connect) to grant it"
+            }
+            IdentityProofErrorKind::Unreachable => "internal error: GitHub could not be reached",
+        }
+    }
 }
 
 /// Machine-readable reason an invite / join operation was refused, surfaced
@@ -357,6 +408,7 @@ impl Error {
             | Error::WarmInFlight { .. }
             | Error::AdapterBusy { .. }
             | Error::RateLimited(_)
+            | Error::IdentityProof(_)
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,
