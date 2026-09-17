@@ -1748,7 +1748,9 @@ impl SourceControl for GitHubSourceControl {
 
         // The base branch's rules are a separate REST read whose endpoint may
         // be unreadable (older GHES, a token without the scope); that degrades
-        // to `None` instead of failing the probe.
+        // to `None` instead of failing the probe. Quota exhaustion is the one
+        // exception: it propagates so the caller pauses instead of persisting
+        // a degraded checklist as a successful poll (intent-hq/intent#5281).
         let base = data
             .pointer("/repository/pullRequest/baseRefName")
             .and_then(Value::as_str)
@@ -1756,6 +1758,7 @@ impl SourceControl for GitHubSourceControl {
         if let Some(base) = base {
             signals.branch_rules = match self.branch_rules(repo, base).await {
                 Ok(rules) => Some(rules),
+                Err(e @ Error::RateLimited(_)) => return Err(e),
                 Err(e) => {
                     tracing::debug!(
                         error = %e,

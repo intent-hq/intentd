@@ -684,6 +684,84 @@ async fn merge_requirements_parses_merge_queue_removal_event() {
     assert_eq!(signals.merge_queue_removal, None, "never ejected");
 }
 
+/// One mock host for the merge-requirements probe: the GraphQL read succeeds
+/// with a PR on base `main`, and the nested REST `branch_rules` read
+/// (`GET /repos/{owner}/{repo}/rules/branches/main`) answers `rules`.
+fn merge_requirements_host_with_branch_rules(rules: (u16, String)) -> Responder {
+    Arc::new(move |request: &str| {
+        if request_target(request).starts_with("/repos/intent-hq/intentd/rules/branches/") {
+            return rules.clone();
+        }
+        (
+            200,
+            json!({
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "mergeStateStatus": "CLEAN",
+                            "isInMergeQueue": false,
+                            "timelineItems": { "nodes": [] },
+                            "reviewDecision": "APPROVED",
+                            "baseRefName": "main",
+                            "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
+                                "contexts": { "nodes": [] }
+                            } } }] }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+    })
+}
+
+/// Quota exhaustion on the nested `branch_rules` REST read is NOT a degradable
+/// error: it must propagate as [`Error::RateLimited`] so the PR monitor opens
+/// the shared forge rate-limit pause like it does for every other read in the
+/// poll, instead of persisting a `rulesKnown: false` checklist as a successful
+/// poll (intent-hq/intent#5281).
+#[tokio::test]
+async fn merge_requirements_propagates_rate_limited_branch_rules_read() {
+    let mock = spawn_mock_with(merge_requirements_host_with_branch_rules((
+        403,
+        json!({ "message": "API rate limit exceeded for user ID 526899." }).to_string(),
+    )))
+    .await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+        .expect("build github client");
+
+    let err = sc
+        .merge_requirements(&RepoRef::new("intent-hq", "intentd"), 928)
+        .await
+        .expect_err("a rate-limited branch_rules read must fail the probe");
+    assert!(
+        matches!(&err, Error::RateLimited(msg) if msg.contains("API rate limit exceeded")),
+        "expected RateLimited carrying GitHub's message: {err:?}"
+    );
+}
+
+/// Every other `branch_rules` failure (older GHES without the endpoint, a
+/// token without the scope) keeps degrading: the probe succeeds with
+/// `branch_rules: None` (`rulesKnown: false` on the checklist).
+#[tokio::test]
+async fn merge_requirements_degrades_branch_rules_on_non_rate_limit_error() {
+    let mock = spawn_mock_with(merge_requirements_host_with_branch_rules((
+        404,
+        json!({ "message": "Not Found" }).to_string(),
+    )))
+    .await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+        .expect("build github client");
+
+    let signals = sc
+        .merge_requirements(&RepoRef::new("intent-hq", "intentd"), 928)
+        .await
+        .expect("an unreadable branch_rules endpoint degrades, not fails");
+    assert_eq!(signals.branch_rules, None, "rules degrade to unknown");
+    assert_eq!(signals.merge_state_status.as_deref(), Some("CLEAN"));
+    assert!(signals.checks_known, "the probe's other signals survive");
+}
+
 // ---------------------------------------------------------------------------
 // Folded PR observation: count parity with the per-signal reads it replaces.
 // ---------------------------------------------------------------------------
