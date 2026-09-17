@@ -39,15 +39,16 @@ use crate::config::{
     DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS, DEFAULT_HOOKS_MAX_PER_AGENT,
     DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS, DEFAULT_MAX_TOP_LEVEL_AGENTS,
     DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
-    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
-    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
-    DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, DEFAULT_UPDATES_CHECK_ON_IDLE,
-    DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, DEFAULT_UPDATES_IDLE_GRACE_SECONDS,
-    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
-    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
-    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
-    MAX_CONCURRENT_ADAPTERS_LIMIT, MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
-    MIN_UPDATES_IDLE_GRACE_SECONDS, TOOL_PAYLOAD_RETENTION_DAYS_MAX,
+    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
+    DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
+    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
+    DEFAULT_UPDATES_CHECK_ON_IDLE, DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+    DEFAULT_UPDATES_IDLE_GRACE_SECONDS, DEFAULT_WAKE_RESUME_ENABLED,
+    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
+    DEFAULT_WORKSPACE_API_TOON_OUTPUT, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
+    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN, MAX_CONCURRENT_ADAPTERS_LIMIT,
+    MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, MIN_UPDATES_IDLE_GRACE_SECONDS,
+    TOOL_PAYLOAD_RETENTION_DAYS_MAX,
 };
 use crate::error::{Error, Result};
 
@@ -1025,6 +1026,13 @@ pub struct PrMonitorSettings {
     /// request is counted or blocked against it (config-file key; not
     /// exposed in the Settings UI).
     pub hourly_request_budget: u64,
+    /// `prMonitor.quotaSharePercent` — the share of the forge's REMAINING
+    /// quota (read once per tick from its quota-free `rate_limit` probe)
+    /// the loop may plan to spend before the window resets. Stretches the
+    /// per-PR interval ahead of exhaustion; a host without the signal
+    /// falls back to the hourly-budget model alone (config-file key; not
+    /// exposed in the Settings UI).
+    pub quota_share_percent: u64,
 }
 
 impl Default for PrMonitorSettings {
@@ -1033,6 +1041,7 @@ impl Default for PrMonitorSettings {
             debounce_seconds: DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
             poll_seconds: DEFAULT_PR_MONITOR_POLL_SECONDS,
             hourly_request_budget: DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            quota_share_percent: DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
         }
     }
 }
@@ -1841,6 +1850,13 @@ pollSeconds = 30
 # exceeds it; requests are not counted or blocked against it (minimum 60,
 # maximum 5000).
 hourlyRequestBudget = 1500
+# PR monitor quota share percent -- the share of the forge's REMAINING core
+# quota (read once per tick from its quota-free rate_limit probe) the loop
+# may plan to spend before the window resets; the per-PR interval stretches
+# ahead of exhaustion so the monitor slows down before the rate-limit pause
+# has to stop it. A host without the signal uses the hourly budget alone
+# (minimum 1, maximum 100).
+quotaSharePercent = 50
 
 [updates]
 # Check for updates when idle -- ask the sitter (via SIGUSR2) to check for
@@ -2724,6 +2740,10 @@ mod tests {
             parsed.pr_monitor.hourly_request_budget,
             DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET
         );
+        assert_eq!(
+            parsed.pr_monitor.quota_share_percent,
+            DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT
+        );
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[prMonitor]"));
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
         assert_eq!(templated.pr_monitor, parsed.pr_monitor);
@@ -3001,13 +3021,14 @@ mod tests {
     #[test]
     fn pr_monitor_explicit_override_parses() {
         let parsed = SettingsFile::parse_str(
-            "[agentFeatures]\nprMonitor = false\n\n[prMonitor]\ndebounceSeconds = 15\npollSeconds = 90\nhourlyRequestBudget = 500\n",
+            "[agentFeatures]\nprMonitor = false\n\n[prMonitor]\ndebounceSeconds = 15\npollSeconds = 90\nhourlyRequestBudget = 500\nquotaSharePercent = 25\n",
         )
         .expect("override parses");
         assert!(!parsed.agent_features.pr_monitor);
         assert_eq!(parsed.pr_monitor.debounce_seconds, 15);
         assert_eq!(parsed.pr_monitor.poll_seconds, 90);
         assert_eq!(parsed.pr_monitor.hourly_request_budget, 500);
+        assert_eq!(parsed.pr_monitor.quota_share_percent, 25);
     }
 
     #[test]

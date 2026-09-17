@@ -1082,6 +1082,12 @@ pub struct Services {
     /// from the settings registry; values outside [floor, ceiling] are
     /// clamped at read time.
     pr_monitor_hourly_request_budget: Option<u64>,
+    /// Explicit override for the share of the forge's remaining quota the
+    /// PR-monitor loop may plan to spend before the window resets. `None`
+    /// — the production wiring — reads `prMonitor.quotaSharePercent` live
+    /// from the settings registry; values outside [floor, ceiling] are
+    /// clamped at read time.
+    pr_monitor_quota_share_percent: Option<u64>,
     /// The last effective per-PR poll interval (seconds) the monitor loop
     /// logged, so a cadence change is logged once — never per tick. Shared
     /// across clones.
@@ -1325,6 +1331,7 @@ impl Services {
             pr_monitor_fetch_cache: Arc::new(Mutex::new(HashMap::new())),
             pr_monitor_poll_seconds: None,
             pr_monitor_hourly_request_budget: None,
+            pr_monitor_quota_share_percent: None,
             pr_monitor_logged_interval: Arc::new(Mutex::new(None)),
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
@@ -1356,6 +1363,16 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_pr_monitor_hourly_request_budget(mut self, budget: u64) -> Self {
         self.pr_monitor_hourly_request_budget = Some(budget);
+        self
+    }
+
+    /// Pin the share of the remaining forge quota the PR-monitor loop may
+    /// plan to spend, bypassing the live `prMonitor.quotaSharePercent`
+    /// setting (test wiring). Values outside [floor, ceiling] are clamped
+    /// when read.
+    #[cfg(test)]
+    pub(crate) fn with_pr_monitor_quota_share_percent(mut self, percent: u64) -> Self {
+        self.pr_monitor_quota_share_percent = Some(percent);
         self
     }
 
@@ -4621,9 +4638,11 @@ impl Services {
     /// without the signal, or a quota still below the floor keeps the
     /// existing deadline — no behavior change from the fixed window.
     ///
-    /// Returns `true` when this call lifted the pause: one INFO is logged
-    /// and the pause annotation every active PR monitor carries
-    /// ([`Self::pause_sweeps_for_rate_limit`]) is cleared
+    /// Returns the probe's status when this call lifted the pause (so the
+    /// caller can plan its cadence on it without a second probe —
+    /// [`Services::pr_monitor_quota_status`]) and `None` otherwise. On a
+    /// lift one INFO is logged and the pause annotation every active PR
+    /// monitor carries ([`Self::pause_sweeps_for_rate_limit`]) is cleared
     /// ([`Store::clear_active_pr_monitors_pause`]) — the guarded
     /// write-backs deliberately keep an annotation whose deadline has not
     /// passed, so without the clear `ws.pr.monitors` / `ws.pr.snapshot`
@@ -4644,10 +4663,8 @@ impl Services {
     async fn maybe_lift_rate_limit_pause(
         &self,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
-    ) -> bool {
-        let Some(until) = self.sweep_rate_limit_paused_until() else {
-            return false;
-        };
+    ) -> Option<intent_sourcecontrol::RateLimitStatus> {
+        let until = self.sweep_rate_limit_paused_until()?;
         let status = match sc.rate_limit_status().await {
             Ok(status) => status,
             Err(e) => {
@@ -4656,7 +4673,7 @@ impl Services {
                     until,
                     "forge rate limit pause: quota probe failed; keeping the deadline"
                 );
-                return false;
+                return None;
             }
         };
         if !rate_limit::quota_recovered(status.remaining, status.limit) {
@@ -4666,7 +4683,7 @@ impl Services {
                 until,
                 "forge rate limit pause: quota not recovered; keeping the deadline"
             );
-            return false;
+            return None;
         }
         let _reconcile = self.sweep_rate_limit.reconcile().await;
         if self.sweep_rate_limit_paused_until().as_deref() != Some(until.as_str()) {
@@ -4675,10 +4692,10 @@ impl Services {
                 now = ?self.sweep_rate_limit_paused_until(),
                 "forge rate limit pause: the window moved during the probe; not lifting"
             );
-            return false;
+            return None;
         }
         if !self.sweep_rate_limit.lift() {
-            return false;
+            return None;
         }
         tracing::info!(
             remaining = status.remaining,
@@ -4688,7 +4705,7 @@ impl Services {
         );
         self.clear_pr_monitor_pause_annotations(Some(&rate_limit::pause_error(Some(&until))))
             .await;
-        true
+        Some(status)
     }
 
     /// Strip the persisted pause annotation from every active PR monitor

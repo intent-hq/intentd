@@ -1794,6 +1794,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(5_000.0),
             1_500.0,
         ),
+        number(
+            "prMonitor.quotaSharePercent",
+            "PR monitor quota share percent",
+            "Share of the forge's REMAINING core quota (read once per tick from its quota-free rate_limit probe) the centralized loop may plan to spend before the window resets — the per-PR interval stretches above the hourly-budget cadence once PRs × 3 × secondsToReset would exceed that share of the remaining quota, so the monitor slows down before the shared rate-limit pause has to stop it; never below pollSeconds. A host without the signal uses the hourly budget alone (minimum 1, maximum 100)",
+            "prMonitor",
+            Some(1.0),
+            Some(100.0),
+            50.0,
+        ),
         boolean(
             "updates.checkOnIdle",
             "Check for updates when idle",
@@ -4316,10 +4325,11 @@ mod tests {
         );
     }
 
-    /// `[prMonitor]` exposes three TOML-backed numbers: `debounceSeconds`
-    /// (default 60, floor 10), `pollSeconds` (default 30, floor 10) and
-    /// `hourlyRequestBudget` (default 1500, floor 60, max 5000) — the latter
-    /// two are config-file keys the Settings UI does not surface. All
+    /// `[prMonitor]` exposes four TOML-backed numbers: `debounceSeconds`
+    /// (default 60, floor 10), `pollSeconds` (default 30, floor 10),
+    /// `hourlyRequestBudget` (default 1500, floor 60, max 5000) and
+    /// `quotaSharePercent` (default 50, floor 1, max 100) — the latter
+    /// three are config-file keys the Settings UI does not surface. All
     /// round-trip through the registry-wired service and reject sub-floor
     /// values.
     #[tokio::test]
@@ -4328,6 +4338,7 @@ mod tests {
             ("prMonitor.debounceSeconds", 60.0, 10.0),
             ("prMonitor.pollSeconds", 30.0, 10.0),
             ("prMonitor.hourlyRequestBudget", 1500.0, 60.0),
+            ("prMonitor.quotaSharePercent", 50.0, 1.0),
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");
@@ -4353,6 +4364,16 @@ mod tests {
             ),
             "hourlyRequestBudget caps at 5000"
         );
+        assert!(
+            matches!(
+                find_definition("prMonitor.quotaSharePercent").unwrap().ty,
+                SettingType::Number {
+                    max: Some(100.0),
+                    ..
+                }
+            ),
+            "quotaSharePercent caps at 100"
+        );
         // The catalog range and the read-time clamp constants must agree.
         assert_eq!(
             intent_core::config::MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
@@ -4366,6 +4387,12 @@ mod tests {
             intent_core::config::DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
             1500
         );
+        assert_eq!(intent_core::config::MIN_PR_MONITOR_QUOTA_SHARE_PERCENT, 1);
+        assert_eq!(intent_core::config::MAX_PR_MONITOR_QUOTA_SHARE_PERCENT, 100);
+        assert_eq!(
+            intent_core::config::DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
+            50
+        );
 
         let tag = uuid::Uuid::new_v4();
         let tmp = std::env::temp_dir().join(format!("intentd-settings-prmon-{tag}.db"));
@@ -4377,20 +4404,21 @@ mod tests {
         let secrets = AsyncSecretStore::new(secrets);
         let svc = SettingsService::new(&store, &secrets, Some(&registry));
 
-        for (path, default) in [
-            ("prMonitor.debounceSeconds", 60.0),
-            ("prMonitor.pollSeconds", 30.0),
-            ("prMonitor.hourlyRequestBudget", 1500.0),
+        for (path, default, updated, rejected) in [
+            ("prMonitor.debounceSeconds", 60.0, 120, 5),
+            ("prMonitor.pollSeconds", 30.0, 120, 5),
+            ("prMonitor.hourlyRequestBudget", 1500.0, 120, 5),
+            ("prMonitor.quotaSharePercent", 50.0, 25, 0),
         ] {
             let got = svc.get(path).await.expect("get");
             assert_eq!(got["value"], json!(default), "{path} default");
             assert_eq!(got["origin"], json!("default"), "{path} origin");
 
-            svc.update(&json!([{ "path": path, "value": 120 }]))
+            svc.update(&json!([{ "path": path, "value": updated }]))
                 .await
                 .expect("update");
             let got = svc.get(path).await.expect("get");
-            assert_eq!(got["value"], json!(120.0), "{path} updated");
+            assert_eq!(got["value"], json!(f64::from(updated)), "{path} updated");
             assert_eq!(got["origin"], json!("file"), "{path} origin");
             assert_eq!(
                 store.get_setting(path).await.expect("read settings table"),
@@ -4400,7 +4428,7 @@ mod tests {
 
             // Sub-floor values reject before anything is written.
             let err = svc
-                .update(&json!([{ "path": path, "value": 5 }]))
+                .update(&json!([{ "path": path, "value": rejected }]))
                 .await
                 .expect_err("sub-floor value must reject");
             assert!(matches!(err, Error::InvalidParams(_)), "{err}");

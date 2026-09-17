@@ -574,12 +574,14 @@ async fn settings_round_trip_redaction_validation_and_event() {
         assert!(e.get("sensitive").is_none(), "{path}");
     }
 
-    // `[prMonitor]` — three non-secret TOML-backed numbers: the two interval
-    // knobs (floor 10) and the hourly request budget (floor 60, max 5000).
+    // `[prMonitor]` — four non-secret TOML-backed numbers: the two interval
+    // knobs (floor 10), the hourly request budget (floor 60, max 5000) and
+    // the remaining-quota share (floor 1, max 100).
     for (path, default, min, max) in [
         ("prMonitor.debounceSeconds", 60.0, 10.0, 86_400.0),
         ("prMonitor.pollSeconds", 30.0, 10.0, 3_600.0),
         ("prMonitor.hourlyRequestBudget", 1500.0, 60.0, 5_000.0),
+        ("prMonitor.quotaSharePercent", 50.0, 1.0, 100.0),
     ] {
         let e = entry(&list, path);
         assert_eq!(e["type"], "number", "{path}");
