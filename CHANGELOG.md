@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.72] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(sourcecontrol)* Propagate RateLimited from the nested branch_rules read ([#1966](https://github.com/intent-hq/intentd/pull/1966))
+
+### 📚 Documentation
+
+- *(tests)* Describe the merged interrupt slot-release ordering in the WSS queued-spawn e2e ([#1961](https://github.com/intent-hq/intentd/pull/1961))
+
+
 ## [0.9.71] - 2026-09-17
 
 ### 🚀 Features
