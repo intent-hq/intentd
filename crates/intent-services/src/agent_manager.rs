@@ -745,20 +745,47 @@ struct RegistryInner {
     budget_pending_bytes: i64,
 }
 
-fn pop_waiter(
-    inner: &mut RegistryInner,
-) -> Option<(AgentId, tokio::sync::oneshot::Sender<()>, &'static str)> {
+/// Pop the first live waiter and deliver its wakeup while still holding the
+/// registry lock; returns the woken agent and the reason it queued under so
+/// the caller can emit `agent:process:resumed` for it.
+///
+/// The pop and the send are one locked step on purpose: a timed waiter whose
+/// re-check elapsed decides under the same lock whether a wakeup reached it
+/// (see the `stale_rx` handling in [`ProcessRegistry::acquire`]), so exactly
+/// one side — this sender or the waiter itself — emits `resumed`. Sending
+/// after the lock was released would leave a window where the waiter sees no
+/// wakeup, retires its receiver, and admits itself while this side also emits.
+fn pop_and_wake_waiter(inner: &mut RegistryInner) -> Option<(AgentId, &'static str)> {
     // Skip senders whose receiver is gone. A memory-budget waiter re-queues
     // after each [`BUDGET_RECHECK`] and an abandoned `acquire` future drops its
     // receiver outright, so handing the wakeup to a dead entry would consume it
-    // and starve a waiter that is still listening.
+    // and starve a waiter that is still listening. A send that still fails
+    // (the receiver dropped between the `is_closed` check and here) is an
+    // abandoned waiter too: skip it rather than announce a `resumed` nobody
+    // is waiting on.
     while !inner.wait_queue.is_empty() {
-        let waiter = inner.wait_queue.remove(0);
-        if !waiter.1.is_closed() {
-            return Some(waiter);
+        let (agent_id, tx, reason) = inner.wait_queue.remove(0);
+        if !tx.is_closed() && tx.send(()).is_ok() {
+            return Some((agent_id, reason));
         }
     }
     None
+}
+
+/// Settle a timed waiter's receiver after its re-check elapsed; returns true
+/// when a wakeup had already been delivered to it.
+///
+/// Must run while holding the registry lock, the same lock under which
+/// [`pop_and_wake_waiter`] pops and sends. A delivered value means the sender
+/// popped this entry and owns the `resumed` emit; otherwise the entry is still
+/// queued, and dropping the receiver here retires it (`is_closed`) before any
+/// later pop could wake an entry nobody is listening on — so the waiter's own
+/// admission is the single `resumed` for this wait.
+fn settle_stale_waiter(rx: Option<tokio::sync::oneshot::Receiver<()>>) -> bool {
+    match rx {
+        Some(mut rx) => rx.try_recv().is_ok(),
+        None => false,
+    }
 }
 
 /// Idle entries ordered least-recently-used first — the eviction candidate
@@ -1317,10 +1344,9 @@ impl ProcessRegistry {
             // provisional cost back so a spawn queued behind the budget is not
             // held off for up to a full sample period by memory already freed.
             self.budget_adjust(&mut inner, -1);
-            pop_waiter(&mut inner)
+            pop_and_wake_waiter(&mut inner)
         };
-        if let Some((resumed_id, tx, reason)) = resumed_agent {
-            let _ = tx.send(());
+        if let Some((resumed_id, reason)) = resumed_agent {
             let used = self.size();
             tracing::info!(
                 agent = %resumed_id,
@@ -1363,10 +1389,9 @@ impl ProcessRegistry {
             if !existed {
                 return;
             }
-            pop_waiter(&mut inner)
+            pop_and_wake_waiter(&mut inner)
         };
-        if let Some((resumed_id, tx, reason)) = resumed_agent {
-            let _ = tx.send(());
+        if let Some((resumed_id, reason)) = resumed_agent {
             let used = self.size();
             tracing::info!(
                 agent = %resumed_id,
@@ -1465,6 +1490,11 @@ impl ProcessRegistry {
         // wakeup lands (that path emits `resumed` as it pops the waiter); an
         // admission reached any other way emits it via `emit_self_resumed`.
         let mut owed_resume: Option<&'static str> = None;
+        // The receiver of a timed wait whose re-check elapsed. It is settled
+        // under the registry lock on the next pass (see below) rather than
+        // where the timeout fired, so the decision "did a wakeup reach me?"
+        // cannot interleave with a `pop_and_wake_waiter` on another thread.
+        let mut stale_rx: Option<tokio::sync::oneshot::Receiver<()>> = None;
         loop {
             enum Action {
                 Slot,
@@ -1481,6 +1511,9 @@ impl ProcessRegistry {
             let forced_wait = std::mem::take(&mut wait_pass);
             let action = {
                 let mut inner = self.inner.lock().unwrap();
+                if settle_stale_waiter(stale_rx.take()) {
+                    owed_resume = None;
+                }
                 let over_budget = self.budget_denies(&mut inner);
                 // Which admission constraint is binding right now. When both
                 // bind at once, the budget wins the label — matching the log
@@ -1601,14 +1634,18 @@ impl ProcessRegistry {
                     // Memory can fall with no registry event to wake us — an
                     // agent's own children exiting frees the tree without any
                     // process being deregistered — so re-evaluate on a timer.
-                    // A wakeup that raced the timer still counts as delivered:
-                    // its sender already emitted `resumed` for this wait.
-                    let woken = match tokio::time::timeout(BUDGET_RECHECK, &mut rx).await {
-                        Ok(received) => received.is_ok(),
-                        Err(_elapsed) => rx.try_recv().is_ok(),
-                    };
-                    if woken {
-                        owed_resume = None;
+                    // On timeout the receiver is kept and settled under the
+                    // lock on the next pass: a wakeup that raced the timer
+                    // still counts as delivered (its sender emitted `resumed`),
+                    // and otherwise the entry is retired before any pop can
+                    // hand it a wakeup we would no longer be listening for.
+                    match tokio::time::timeout(BUDGET_RECHECK, &mut rx).await {
+                        Ok(received) => {
+                            if received.is_ok() {
+                                owed_resume = None;
+                            }
+                        }
+                        Err(_elapsed) => stale_rx = Some(rx),
                     }
                 }
                 Action::Wait(rx, false) => {
@@ -1659,6 +1696,8 @@ impl ProcessRegistry {
         // Same `resumed` bookkeeping as `acquire`: the label this waiter still
         // owes a `resumed` for, if it queued and no wakeup delivered it.
         let mut owed_resume: Option<&'static str> = None;
+        // Same lock-settled timeout handoff as `acquire`.
+        let mut stale_rx: Option<tokio::sync::oneshot::Receiver<()>> = None;
         loop {
             enum Action {
                 Admit,
@@ -1668,6 +1707,9 @@ impl ProcessRegistry {
             let forced_wait = std::mem::take(&mut wait_pass);
             let action = {
                 let mut inner = self.inner.lock().unwrap();
+                if settle_stale_waiter(stale_rx.take()) {
+                    owed_resume = None;
+                }
                 let idle_here = matches!(inner.entries.get(agent_id), Some(e) if !e.is_active);
                 let over_budget = if idle_here {
                     self.budget_denies(&mut inner)
@@ -1772,13 +1814,15 @@ impl ProcessRegistry {
                 Action::Wait(mut rx) => {
                     // Memory can fall with no registry event to wake us (same
                     // as the `acquire` budget wait), so re-evaluate on a timer.
-                    // A wakeup that raced the timer still counts as delivered.
-                    let woken = match tokio::time::timeout(BUDGET_RECHECK, &mut rx).await {
-                        Ok(received) => received.is_ok(),
-                        Err(_elapsed) => rx.try_recv().is_ok(),
-                    };
-                    if woken {
-                        owed_resume = None;
+                    // On timeout the receiver is settled under the lock on the
+                    // next pass, exactly as in `acquire`.
+                    match tokio::time::timeout(BUDGET_RECHECK, &mut rx).await {
+                        Ok(received) => {
+                            if received.is_ok() {
+                                owed_resume = None;
+                            }
+                        }
+                        Err(_elapsed) => stale_rx = Some(rx),
                     }
                 }
             }

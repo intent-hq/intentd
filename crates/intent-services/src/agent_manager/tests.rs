@@ -23,10 +23,11 @@ use tokio::time::{timeout, Duration};
 
 use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
-    is_cancel_transport_closed, recommended_memory_budget_bytes, resolve_npx_only, resolve_spawn,
-    text_prompt, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, ResolvedSpawn,
-    TreeMemoryProbe, TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES,
-    PROVISIONAL_AGENT_BYTES,
+    is_cancel_transport_closed, pop_and_wake_waiter, recommended_memory_budget_bytes,
+    resolve_npx_only, resolve_spawn, settle_stale_waiter, text_prompt, AgentHandle, AgentManager,
+    BusEventSink, KillFn, ProcessRegistry, RegistryInner, ResolvedSpawn, TreeMemoryProbe,
+    TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES, PROVISIONAL_AGENT_BYTES,
+    REASON_MEMORY_BUDGET, REASON_SLOTS,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
@@ -1464,6 +1465,309 @@ async fn immediate_admission_emits_no_process_events() {
         "no queued, resumed, or evicted event for an immediate admission"
     );
     assert!(log.lock().unwrap().is_empty(), "nothing evicted");
+}
+
+/// The timeout/wakeup handshake, pinned at the lock level. A timed waiter
+/// whose re-check elapsed settles its receiver under the registry lock — the
+/// same lock a pop sends under — so exactly two orderings exist and each
+/// gives exactly one side the `resumed`:
+/// - the wakeup landed first: the pop reported the waiter (its caller owns
+///   the emit) and settling reports the wakeup as delivered, so the waiter's
+///   own admission emits nothing;
+/// - the waiter settled first: nothing was delivered, settling retires the
+///   receiver, and a later pop skips the dead entry instead of waking it, so
+///   the waiter's own admission is the single `resumed`.
+#[test]
+fn stale_waiter_settlement_gives_exactly_one_side_the_resumed() {
+    let mut inner = RegistryInner::default();
+
+    // Wakeup before the settle: the sender side owns the emit.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    inner
+        .wait_queue
+        .push((AgentId::from("early"), tx, REASON_MEMORY_BUDGET));
+    assert_eq!(
+        pop_and_wake_waiter(&mut inner),
+        Some((AgentId::from("early"), REASON_MEMORY_BUDGET)),
+        "the pop delivered the wakeup and reports the waiter to emit for"
+    );
+    assert!(
+        settle_stale_waiter(Some(rx)),
+        "settling after the send sees the delivered wakeup"
+    );
+
+    // Settle before any wakeup: the waiter owns the emit and the entry dies.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    inner
+        .wait_queue
+        .push((AgentId::from("late"), tx, REASON_SLOTS));
+    assert!(
+        !settle_stale_waiter(Some(rx)),
+        "nothing delivered yet: the waiter keeps its owed resumed"
+    );
+    assert_eq!(
+        pop_and_wake_waiter(&mut inner),
+        None,
+        "a late pop skips the retired entry rather than emitting for it"
+    );
+    assert!(
+        inner.wait_queue.is_empty(),
+        "the retired entry left the queue"
+    );
+
+    assert!(
+        !settle_stale_waiter(None),
+        "a wait that never timed out has nothing to settle"
+    );
+}
+
+/// A pop never hands the wakeup to a dead entry: a retired or abandoned
+/// receiver at the head is skipped and the next live waiter gets it. A send
+/// that fails is treated the same way — no `resumed` is reported for a waiter
+/// nobody is listening on.
+#[test]
+fn pop_skips_dead_waiters_and_wakes_the_next_live_one() {
+    let mut inner = RegistryInner::default();
+    let (dead_tx, dead_rx) = tokio::sync::oneshot::channel();
+    inner
+        .wait_queue
+        .push((AgentId::from("dead"), dead_tx, REASON_SLOTS));
+    let (live_tx, mut live_rx) = tokio::sync::oneshot::channel();
+    inner
+        .wait_queue
+        .push((AgentId::from("live"), live_tx, REASON_SLOTS));
+    drop(dead_rx);
+
+    assert_eq!(
+        pop_and_wake_waiter(&mut inner),
+        Some((AgentId::from("live"), REASON_SLOTS)),
+        "the dead head is skipped; the live waiter is the one resumed"
+    );
+    assert!(
+        live_rx.try_recv().is_ok(),
+        "the wakeup reached the live waiter"
+    );
+    assert!(inner.wait_queue.is_empty());
+    assert_eq!(
+        pop_and_wake_waiter(&mut inner),
+        None,
+        "nothing left to wake"
+    );
+}
+
+/// A wakeup that lands while a memory-budget spawn's re-check timer is still
+/// pending is sender-owned: `deregister` pops the waiter and emits the
+/// `resumed`; the waiter sees the delivered wakeup and admits without a
+/// second one. Paused time keeps the timer from firing on its own.
+#[tokio::test(start_paused = true)]
+async fn wakeup_during_the_timed_wait_is_the_single_resumed_for_a_queued_spawn() {
+    let gb = super::GB;
+    let (events, event_fn) = recording_events();
+    let reg = Arc::new(ProcessRegistry::new(8).with_event_fn(event_fn));
+    // Over budget by half a provisional charge: one release's credit clears it.
+    let probe = FakeProbe::new(4 * gb + PROVISIONAL_AGENT_BYTES / 2);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (active, spawning) = (AgentId::from("active"), AgentId::from("spawning"));
+    reg.register(active.clone(), recording_kill(active.clone(), log.clone()));
+    reg.mark_active(&active); // Nothing idle to evict → the spawn queues.
+
+    let reg2 = reg.clone();
+    let spawning2 = spawning.clone();
+    let handle =
+        tokio::spawn(async move { reg2.acquire(&spawning2, claim_all, release_none).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!handle.is_finished(), "over budget → queued");
+
+    // The active process exits before the timer: its release credits the
+    // budget and its `deregister` wakes (and emits for) the waiter.
+    assert!(reg.deregister(&active));
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("the wakeup admits the waiter without waiting for the timer")
+        .expect("task ok");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        events_for(&events, &spawning),
+        vec![
+            (
+                "agent:process:queued".to_string(),
+                "memory-budget".to_string()
+            ),
+            (
+                "agent:process:resumed".to_string(),
+                "memory-budget".to_string()
+            ),
+        ],
+        "one queued, answered by exactly one sender-owned resumed"
+    );
+    assert!(log.lock().unwrap().is_empty(), "nothing evicted");
+}
+
+/// Same sender-owned wakeup for the turn-start gate: a warm idle agent whose
+/// turn queued behind the budget gets exactly one `resumed` when another
+/// process's `deregister` wakes it before its timer fires.
+#[tokio::test(start_paused = true)]
+async fn wakeup_during_the_timed_wait_is_the_single_resumed_for_a_queued_turn_start() {
+    let gb = super::GB;
+    let (events, event_fn) = recording_events();
+    let reg = Arc::new(ProcessRegistry::new(8).with_event_fn(event_fn));
+    let probe = FakeProbe::new(4 * gb + PROVISIONAL_AGENT_BYTES / 2);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (active, warm) = (AgentId::from("active"), AgentId::from("warm"));
+    reg.register(active.clone(), recording_kill(active.clone(), log.clone()));
+    reg.mark_active(&active);
+    // The gate never evicts its own process, and nothing else is idle.
+    reg.register(warm.clone(), recording_kill(warm.clone(), log.clone()));
+
+    let reg2 = reg.clone();
+    let warm2 = warm.clone();
+    let handle = tokio::spawn(async move {
+        reg2.acquire_turn_start(&warm2, claim_all, release_none)
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!handle.is_finished(), "over budget → queued");
+
+    assert!(reg.deregister(&active));
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("the wakeup admits the turn without waiting for the timer")
+        .expect("task ok");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        events_for(&events, &warm),
+        vec![
+            (
+                "agent:process:queued".to_string(),
+                "memory-budget".to_string()
+            ),
+            (
+                "agent:process:resumed".to_string(),
+                "memory-budget".to_string()
+            ),
+        ],
+        "one queued, answered by exactly one sender-owned resumed"
+    );
+    assert!(log.lock().unwrap().is_empty(), "nothing evicted");
+    assert!(
+        reg.is_registered(&warm),
+        "the gated agent's process survives"
+    );
+}
+
+/// A wakeup that arrives after the waiter admitted itself on its timer must
+/// not emit: the timed re-check retired the waiter's entry under the lock
+/// when it settled, so the later `deregister` / `mark_idle` pop finds no live
+/// waiter — the waiter's own `resumed` stays the only one for this wait.
+#[tokio::test(start_paused = true)]
+async fn late_wakeup_after_a_self_admitted_spawn_emits_no_second_resumed() {
+    let gb = super::GB;
+    let (events, event_fn) = recording_events();
+    let reg = Arc::new(ProcessRegistry::new(8).with_event_fn(event_fn));
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (active, spawning) = (AgentId::from("active"), AgentId::from("spawning"));
+    reg.register(active.clone(), recording_kill(active.clone(), log.clone()));
+    reg.mark_active(&active);
+
+    let reg2 = reg.clone();
+    let spawning2 = spawning.clone();
+    let handle =
+        tokio::spawn(async move { reg2.acquire(&spawning2, claim_all, release_none).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!handle.is_finished(), "over budget → queued");
+
+    // The tree drains with no registry event: only the timer admits, and the
+    // waiter emits its own `resumed`.
+    probe.set(gb);
+    timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the memory waiter re-checks on its own timer")
+        .expect("task ok");
+
+    // Late wakeups from both pop paths: the retired entry is skipped.
+    reg.mark_idle(&active);
+    assert!(reg.deregister(&active));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        events_for(&events, &spawning),
+        vec![
+            (
+                "agent:process:queued".to_string(),
+                "memory-budget".to_string()
+            ),
+            (
+                "agent:process:resumed".to_string(),
+                "memory-budget".to_string()
+            ),
+        ],
+        "the waiter's own resumed is the only one; late wakeups add nothing"
+    );
+    assert!(log.lock().unwrap().is_empty(), "nothing evicted");
+}
+
+/// Same late-wakeup contract for the turn-start gate.
+#[tokio::test(start_paused = true)]
+async fn late_wakeup_after_a_self_admitted_turn_start_emits_no_second_resumed() {
+    let gb = super::GB;
+    let (events, event_fn) = recording_events();
+    let reg = Arc::new(ProcessRegistry::new(8).with_event_fn(event_fn));
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (active, warm) = (AgentId::from("active"), AgentId::from("warm"));
+    reg.register(active.clone(), recording_kill(active.clone(), log.clone()));
+    reg.mark_active(&active);
+    reg.register(warm.clone(), recording_kill(warm.clone(), log.clone()));
+
+    let reg2 = reg.clone();
+    let warm2 = warm.clone();
+    let handle = tokio::spawn(async move {
+        reg2.acquire_turn_start(&warm2, claim_all, release_none)
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!handle.is_finished(), "over budget → queued");
+
+    probe.set(gb);
+    timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the turn-start waiter re-checks on its own timer")
+        .expect("task ok");
+
+    reg.mark_idle(&active);
+    assert!(reg.deregister(&active));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        events_for(&events, &warm),
+        vec![
+            (
+                "agent:process:queued".to_string(),
+                "memory-budget".to_string()
+            ),
+            (
+                "agent:process:resumed".to_string(),
+                "memory-budget".to_string()
+            ),
+        ],
+        "the waiter's own resumed is the only one; late wakeups add nothing"
+    );
+    assert!(log.lock().unwrap().is_empty(), "nothing evicted");
+    assert!(
+        reg.is_registered(&warm),
+        "the gated agent's process survives"
+    );
 }
 
 #[tokio::test]
