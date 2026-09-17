@@ -900,6 +900,12 @@ impl Store {
     /// all — and, under `BEGIN IMMEDIATE`, two concurrent joins cannot both
     /// pass the cap check and overshoot it.
     ///
+    /// `rotate_from_hash` is the credential a returning guest presented as
+    /// its proof of identity (`invite.accept`): it is revoked in the same
+    /// transaction that records the new one, so the guest never holds two
+    /// active credentials for this host. Only a still-active row of the
+    /// joining principal is flipped; an unknown or foreign hash is ignored.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails (including
@@ -911,6 +917,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         identity: &Principal,
         credential_hash: &str,
+        rotate_from_hash: Option<&str>,
         max_guests: u32,
     ) -> Result<InviteJoinOutcome> {
         let github_user_id = identity
@@ -1054,6 +1061,20 @@ impl Store {
             .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("invite join insert credential failed: {e}")))?;
+            if let Some(previous) = rotate_from_hash {
+                sqlx::query(
+                    "UPDATE principal_credential SET revoked_at = ? \
+                     WHERE token_hash = ? AND principal_id = ? AND revoked_at IS NULL",
+                )
+                .bind(&now)
+                .bind(previous)
+                .bind(&principal.id.0)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("invite join rotate credential failed: {e}"))
+                })?;
+            }
             Ok(InviteJoinOutcome::Joined(principal))
         }
         .await;

@@ -8961,6 +8961,7 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
                     &ws,
                     &guest_identity(github_user_id),
                     &format!("cred-{invite}-{github_user_id}"),
+                    None,
                     cap,
                 )
                 .await
@@ -9056,5 +9057,137 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
             open_invites: 7,
         },
         "refused joins leave their invites open"
+    );
+}
+
+/// A join that names `rotate_from_hash` revokes that credential in the same
+/// transaction as the new one lands — only when it is an active credential
+/// of the joining principal: a foreign hash is left alone, and a refused
+/// join (closed invite) revokes nothing.
+#[tokio::test]
+async fn join_workspace_by_invite_rotates_the_presented_credential() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, other) = (WorkspaceId::new(), WorkspaceId::new());
+    for id in [&ws, &other] {
+        store
+            .insert_workspace(&sample_workspace(id, "Rotating", false))
+            .await
+            .expect("insert ws");
+    }
+    let primary = store.get_primary_principal().await.expect("primary").id;
+    for id in ["first", "second", "third", "closed"] {
+        store
+            .insert_workspace_invite(&guest_invite(id, &ws, &primary))
+            .await
+            .expect("insert invite");
+    }
+    store
+        .insert_workspace_invite(&guest_invite("elsewhere", &other, &primary))
+        .await
+        .expect("insert invite");
+
+    let join = |invite: &str, github_user_id: i64, cred: &str, rotate: Option<&str>| {
+        let (store, invite, cred) = (store.clone(), invite.to_string(), cred.to_string());
+        let rotate = rotate.map(str::to_string);
+        let ws = ws.clone();
+        async move {
+            store
+                .join_workspace_by_invite(
+                    &invite,
+                    &ws,
+                    &guest_identity(github_user_id),
+                    &cred,
+                    rotate.as_deref(),
+                    8,
+                )
+                .await
+                .expect("join")
+        }
+    };
+    let is_active = |hash: &str| {
+        let (store, hash) = (store.clone(), hash.to_string());
+        async move {
+            store
+                .lookup_principal_credential(&hash)
+                .await
+                .expect("lookup")
+                .expect("credential row")
+                .is_active()
+        }
+    };
+
+    // First join: nothing to rotate from.
+    let crate::InviteJoinOutcome::Joined(guest) = join("first", 1, "cred-a", None).await else {
+        panic!("first join");
+    };
+    // Another account's credential, to prove a foreign hash is untouched.
+    let crate::InviteJoinOutcome::Joined(_) = store
+        .join_workspace_by_invite(
+            "elsewhere",
+            &other,
+            &guest_identity(2),
+            "cred-foreign",
+            None,
+            8,
+        )
+        .await
+        .expect("join")
+    else {
+        panic!("foreign join");
+    };
+
+    // Returning join presenting `cred-a`: `cred-b` lands and `cred-a` flips
+    // in one transaction.
+    let crate::InviteJoinOutcome::Joined(again) = join("second", 1, "cred-b", Some("cred-a")).await
+    else {
+        panic!("second join");
+    };
+    assert_eq!(again.id, guest.id);
+    assert!(!is_active("cred-a").await, "presented credential revoked");
+    assert!(is_active("cred-b").await, "fresh credential active");
+    assert_eq!(
+        store
+            .list_principal_credentials(&guest.id)
+            .await
+            .expect("list")
+            .iter()
+            .filter(|c| c.is_active())
+            .count(),
+        1,
+        "exactly one active credential after the rotation"
+    );
+
+    // A hash of another principal is not this guest's to revoke.
+    let crate::InviteJoinOutcome::Joined(_) =
+        join("third", 1, "cred-c", Some("cred-foreign")).await
+    else {
+        panic!("third join");
+    };
+    assert!(
+        is_active("cred-foreign").await,
+        "foreign credential untouched"
+    );
+    assert!(is_active("cred-c").await);
+
+    // A refused join rotates nothing.
+    assert!(store
+        .revoke_workspace_invite("closed")
+        .await
+        .expect("revoke"));
+    assert_eq!(
+        join("closed", 1, "cred-d", Some("cred-c")).await,
+        crate::InviteJoinOutcome::Closed
+    );
+    assert!(
+        is_active("cred-c").await,
+        "refused join keeps the credential"
+    );
+    assert_eq!(
+        store
+            .lookup_principal_credential("cred-d")
+            .await
+            .expect("lookup"),
+        None
     );
 }

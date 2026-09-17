@@ -239,6 +239,17 @@ pub enum InviteErrorKind {
     /// The `credential` an `invite.accept` presented is unknown to this host
     /// or was revoked; the guest must redeem through the device flow.
     CredentialInvalid,
+    /// The gist an `invite.prove` named does not prove the claimed login:
+    /// unknown gist, another owner, no proof file or a first line that is
+    /// not the nonce, a gist created before the nonce was issued, or a
+    /// nonce this host never issued for the invite (or already consumed).
+    ProofInvalid,
+    /// The nonce an `invite.prove` presented was issued but its 10-minute
+    /// lifetime passed; the guest must start over with `invite.challenge`.
+    ProofExpired,
+    /// GitHub could not be reached (or answered a server error) while
+    /// verifying the proof gist; the nonce stays valid for a retry.
+    GithubUnreachable,
 }
 
 impl InviteErrorKind {
@@ -262,6 +273,9 @@ impl InviteErrorKind {
             InviteErrorKind::GuestLimit => "guest-limit",
             InviteErrorKind::WorkspaceFull => "workspace-full",
             InviteErrorKind::CredentialInvalid => "credential-invalid",
+            InviteErrorKind::ProofInvalid => "proof-invalid",
+            InviteErrorKind::ProofExpired => "proof-expired",
+            InviteErrorKind::GithubUnreachable => "github-unreachable",
         }
     }
 
@@ -308,6 +322,16 @@ impl InviteErrorKind {
                 "invalid params: the credential is unknown to this host or was revoked; \
                  redeem the invite through GitHub instead"
             }
+            InviteErrorKind::ProofInvalid => {
+                "invalid params: the gist does not prove the claimed GitHub identity for \
+                 this invite"
+            }
+            InviteErrorKind::ProofExpired => {
+                "invalid params: the identity-proof nonce expired; request a new challenge"
+            }
+            InviteErrorKind::GithubUnreachable => {
+                "internal error: GitHub could not be reached to verify the identity proof"
+            }
         }
     }
 
@@ -326,11 +350,14 @@ impl InviteErrorKind {
             | InviteErrorKind::FlowNotFound
             | InviteErrorKind::GuestLimit
             | InviteErrorKind::WorkspaceFull
-            | InviteErrorKind::CredentialInvalid => -32602,
+            | InviteErrorKind::CredentialInvalid
+            | InviteErrorKind::ProofInvalid
+            | InviteErrorKind::ProofExpired => -32602,
             InviteErrorKind::GithubIdentityRequired
             | InviteErrorKind::IdentityLocked
             | InviteErrorKind::FlowError
-            | InviteErrorKind::FlowBusy => -32603,
+            | InviteErrorKind::FlowBusy
+            | InviteErrorKind::GithubUnreachable => -32603,
         }
     }
 }
