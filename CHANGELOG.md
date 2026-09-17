@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.71] - 2026-09-17
+
+### 🚀 Features
+
+- *(pr-monitor)* Stretch the sweep cadence on the remaining forge quota ([#1948](https://github.com/intent-hq/intentd/pull/1948))
+
+### 🐛 Bug Fixes
+
+- *(agent-manager)* Release the busy slot before waking a queued process-slot waiter ([#1952](https://github.com/intent-hq/intentd/pull/1952))
+- *(pr-monitor)* Sample pausedUntil after snapshot reads and cover it over WSS ([#1954](https://github.com/intent-hq/intentd/pull/1954))
+
+### ⚡ Performance
+
+- *(pr-monitor)* Fold one PR poll into a single GraphQL observation ([#1949](https://github.com/intent-hq/intentd/pull/1949))
+
+
 ## [0.9.70] - 2026-09-17
 
 ### 🐛 Bug Fixes
