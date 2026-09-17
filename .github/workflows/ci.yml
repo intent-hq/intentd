@@ -245,11 +245,15 @@ jobs:
       # is met — the same rails as tinybox-prune.yml's LRU pass, ordered
       # like the emergency purge that recovered both incidents (intentd
       # run 32447747968): by the dir's own top-level mtime, not the
-      # prune's recursive last-activity key. Rails in both tiers: never
-      # anything outside /raid/ci-target (shared caches like ~/.cargo and
-      # ~/.rustup are untouched), never a dir this job may use, and
-      # recursive-mtime freshness/activity checks so a dir a live job is
-      # writing to is not deleted.
+      # prune's recursive last-activity key. Rails in both tiers (selection
+      # lives in scripts/ci-target-slot.sh purge-candidates, shared with
+      # its tests): never anything outside /raid/ci-target (shared caches
+      # like ~/.cargo and ~/.rustup are untouched), never a dir this job
+      # may use, never a dir carrying a fresh `.in-use` marker (written by
+      # every tinybox job's CARGO_TARGET_DIR step and released at job end —
+      # intent-hq/intent#5256; a quiet compile phase can no longer make a
+      # live dir look idle), and recursive-mtime freshness/activity checks
+      # so an unmarked dir a live job is writing to is not deleted either.
       # Fails with an actionable message if space is still short.
       # Thresholds: 10 GiB here (small target dir with debuginfo off),
       # 30 GiB for the instrumented coverage jobs. Exact no-op on burst
@@ -266,22 +270,29 @@ jobs:
           free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
           echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
           [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
+          # Candidate selection for both tiers lives in
+          # scripts/ci-target-slot.sh purge-candidates (path allowlist,
+          # own-dir / own-slot skip, `.in-use` marker, recursive activity
+          # check; oldest top-level mtime first — intent-hq/intent#5256);
+          # this loop only deletes until the need is met. `|| true` on rm
+          # tolerates another slot's preflight racing us to the same
+          # candidate, and the process substitution keeps a producer cut
+          # short by `break` from failing the step.
+          evict_until_free() {
+            local verb="$1" dir
+            shift
+            while IFS= read -r dir; do
+              echo "$verb: $dir"
+              rm -rf -- "$dir" || true
+              # `if`, not `[ ] && break`: a function returns its loop's last
+              # status, and a final unmet check would abort the step here.
+              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
+            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target "$@")
+          }
+          # Stale tier: nothing inside touched within 2 days (-mmin gives a
+          # strict 48 h window; -mtime rounds to whole days).
           echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          while IFS= read -r entry; do
-            dir="${entry#* }"
-            case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
-            [ "$dir" = "$own_dir" ] && continue
-            # Re-check recursively: only prune if nothing inside was touched
-            # within 2 days (a running job keeps its target dir fresh).
-            # -mmin gives a strict 48 h window (-mtime rounds to whole days);
-            # `|| true` keeps a dir vanishing mid-check (find) or another
-            # slot's preflight racing us to the same deletion (rm) from
-            # failing the job.
-            [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
-            echo "pruning: $dir"
-            rm -rf -- "$dir" || true
-            [ "$(free_gib)" -ge "$NEED_GIB" ] && break
-          done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          evict_until_free pruning --quiet-min 2880 --skip-dir "$own_dir"
           # Escalation tier: under heavy churn everything on the volume can
           # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
           # stale pass nothing to prune — LRU-evict idle ci-target dirs
@@ -294,24 +305,12 @@ jobs:
           # an idle warm cache and the ordering stays cheap for a per-job
           # step. Concurrent preflights on other slots are safe: target
           # dirs are warm caches (eviction costs a rebuild, not
-          # correctness), a live job's dir is shielded by the recursive
-          # 15-minute activity check (a job actively writing keeps its
-          # target dir fresh — though a >15 min quiet phase can look idle,
-          # a bounded risk: one retryable job failure, no data loss), the
-          # own-slot skip covers every dir this slot may use, and `|| true`
-          # on rm tolerates another slot's preflight racing us to the same
-          # candidate.
+          # correctness), a live job's dir is shielded by its `.in-use`
+          # marker and, failing that, the recursive 15-minute activity
+          # check, and the own-slot skip covers every dir this slot may use.
           if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
             echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            while IFS= read -r entry; do
-              dir="${entry#* }"
-              case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
-              case "$dir" in */"$RUNNER_NAME"/*) echo "skipping (own slot): $dir"; continue ;; esac
-              [ -n "$(find "$dir" -mmin -15 -print -quit 2>/dev/null || true)" ] && { echo "skipping (active <15min): $dir"; continue; }
-              echo "evicting: $dir"
-              rm -rf -- "$dir" || true
-              [ "$(free_gib)" -ge "$NEED_GIB" ] && break
-            done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n)
+            evict_until_free evicting --quiet-min 15 --skip-slot "$RUNNER_NAME"
           fi
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
@@ -350,9 +349,17 @@ jobs:
       # Trade-off: up to 8 per-slot copies of each job's target dir;
       # tinybox-prune.yml prunes /raid/ci-target on a schedule and the
       # preflight above is the emergency backstop.
+      # Also marks the dir in use (scripts/ci-target-slot.sh mark;
+      # intent-hq/intent#5256): every cleaner — the preflight above on other
+      # slots, tinybox-prune.yml — skips a dir with a fresh `.in-use`
+      # marker, so a quiet compile phase can no longer make a live dir look
+      # idle. Released by the job's last step.
       - name: Point CARGO_TARGET_DIR outside the work dir
         if: needs.route.outputs.linux_burst != 'true'
-        run: echo "CARGO_TARGET_DIR=/raid/ci-target/intentd/$RUNNER_NAME/check" >> "$GITHUB_ENV"
+        run: |
+          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/check"
+          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
+          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -372,8 +379,17 @@ jobs:
           shared-key: gh-burst-check
       - name: Format check
         run: cargo fmt --check
+      # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on the
+      # tinybox slots rust-lld has failed to open objects rustc had just
+      # written under this job's own target dir (merge-queue run
+      # 35200715354 — red in 6 s, queue entry ejected). The wrapper retries
+      # exactly once, only on the `rust-lld: error: cannot open ... No such
+      # file or directory` signature, after printing host diagnostics
+      # (listing of the vanished object's dir, live cargo/rustc processes);
+      # every other failure — a genuine lint above all — propagates
+      # unchanged, so it never hides a real red.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: ./scripts/ci-lld-retry.sh cargo clippy --workspace --all-targets -- -D warnings
       # Source lints: every `crates/*/tests/*_lint.rs` integration test is a
       # source-scanning lint and is selected by the `--test` glob, so a new
       # lint needs no wiring here. Each lint's rationale lives in its module
@@ -468,6 +484,15 @@ jobs:
         env:
           INTENTD_CI_EXPECT_PWSH: 1
         run: cargo test -p intentd-sitter --test install_ps1_owner
+      # Release the `.in-use` marker the CARGO_TARGET_DIR step wrote
+      # (intent-hq/intent#5256). `always()` so a failed or cancelled job
+      # does not leave a live marker behind; a runner that dies mid-job
+      # leaves one that expires on its own after 4 h (see
+      # scripts/ci-target-slot.sh). Skipped on burst runners, where
+      # CARGO_TARGET_DIR is never set.
+      - name: Release per-slot target dir
+        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
+        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
   # Release-PR fast path (intent-hq/monorepo#1374): release-plz PRs change
   # only version strings + changelog, so the compiled code is identical to
@@ -706,52 +731,23 @@ jobs:
           free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
           echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
           [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
+          # Same two tiers as the `check` job's preflight (see its comment):
+          # selection in scripts/ci-target-slot.sh purge-candidates, this
+          # loop only deletes until the need is met.
+          evict_until_free() {
+            local verb="$1" dir
+            shift
+            while IFS= read -r dir; do
+              echo "$verb: $dir"
+              rm -rf -- "$dir" || true
+              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
+            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target "$@")
+          }
           echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          while IFS= read -r entry; do
-            dir="${entry#* }"
-            case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
-            [ "$dir" = "$own_dir" ] && continue
-            # Re-check recursively: only prune if nothing inside was touched
-            # within 2 days (a running job keeps its target dir fresh).
-            # -mmin gives a strict 48 h window (-mtime rounds to whole days);
-            # `|| true` keeps a dir vanishing mid-check (find) or another
-            # slot's preflight racing us to the same deletion (rm) from
-            # failing the job.
-            [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
-            echo "pruning: $dir"
-            rm -rf -- "$dir" || true
-            [ "$(free_gib)" -ge "$NEED_GIB" ] && break
-          done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
-          # Escalation tier: under heavy churn everything on the volume can
-          # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
-          # stale pass nothing to prune — LRU-evict idle ci-target dirs
-          # until this job's need is met. Ordering key: the dir's own
-          # top-level mtime, matching the emergency purge — not
-          # tinybox-prune.yml's recursive last-activity scan. Cargo rarely
-          # touches the top level after creation, so this approximates
-          # creation order and a recently-used-but-idle dir can be evicted
-          # before a colder one; acceptable here, since every candidate is
-          # an idle warm cache and the ordering stays cheap for a per-job
-          # step. Concurrent preflights on other slots are safe: target
-          # dirs are warm caches (eviction costs a rebuild, not
-          # correctness), a live job's dir is shielded by the recursive
-          # 15-minute activity check (a job actively writing keeps its
-          # target dir fresh — though a >15 min quiet phase can look idle,
-          # a bounded risk: one retryable job failure, no data loss), the
-          # own-slot skip covers every dir this slot may use, and `|| true`
-          # on rm tolerates another slot's preflight racing us to the same
-          # candidate.
+          evict_until_free pruning --quiet-min 2880 --skip-dir "$own_dir"
           if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
             echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            while IFS= read -r entry; do
-              dir="${entry#* }"
-              case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
-              case "$dir" in */"$RUNNER_NAME"/*) echo "skipping (own slot): $dir"; continue ;; esac
-              [ -n "$(find "$dir" -mmin -15 -print -quit 2>/dev/null || true)" ] && { echo "skipping (active <15min): $dir"; continue; }
-              echo "evicting: $dir"
-              rm -rf -- "$dir" || true
-              [ "$(free_gib)" -ge "$NEED_GIB" ] && break
-            done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n)
+            evict_until_free evicting --quiet-min 15 --skip-slot "$RUNNER_NAME"
           fi
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
@@ -776,9 +772,14 @@ jobs:
       # The $RUNNER_NAME key is a correctness requirement here, not just
       # lock avoidance: that same clean means two coverage jobs on different
       # slots sharing a dir would delete each other's artifacts mid-run.
+      # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
+      # step (intent-hq/intent#5256); released by the job's last step.
       - name: Point CARGO_TARGET_DIR outside the work dir
         if: needs.route.outputs.linux_burst != 'true'
-        run: echo "CARGO_TARGET_DIR=/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e" >> "$GITHUB_ENV"
+        run: |
+          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e"
+          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
+          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -860,6 +861,11 @@ jobs:
           path: lcov.info
           if-no-files-found: warn
           retention-days: 3
+      # Release the `.in-use` marker — see the `check` job's last step
+      # (intent-hq/intent#5256).
+      - name: Release per-slot target dir
+        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
+        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
   coverage-all:
     # merge_group-ONLY — same gating and rationale as coverage-e2e (see its
@@ -901,52 +907,23 @@ jobs:
           free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
           echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
           [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
+          # Same two tiers as the `check` job's preflight (see its comment):
+          # selection in scripts/ci-target-slot.sh purge-candidates, this
+          # loop only deletes until the need is met.
+          evict_until_free() {
+            local verb="$1" dir
+            shift
+            while IFS= read -r dir; do
+              echo "$verb: $dir"
+              rm -rf -- "$dir" || true
+              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
+            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target "$@")
+          }
           echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          while IFS= read -r entry; do
-            dir="${entry#* }"
-            case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
-            [ "$dir" = "$own_dir" ] && continue
-            # Re-check recursively: only prune if nothing inside was touched
-            # within 2 days (a running job keeps its target dir fresh).
-            # -mmin gives a strict 48 h window (-mtime rounds to whole days);
-            # `|| true` keeps a dir vanishing mid-check (find) or another
-            # slot's preflight racing us to the same deletion (rm) from
-            # failing the job.
-            [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
-            echo "pruning: $dir"
-            rm -rf -- "$dir" || true
-            [ "$(free_gib)" -ge "$NEED_GIB" ] && break
-          done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
-          # Escalation tier: under heavy churn everything on the volume can
-          # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
-          # stale pass nothing to prune — LRU-evict idle ci-target dirs
-          # until this job's need is met. Ordering key: the dir's own
-          # top-level mtime, matching the emergency purge — not
-          # tinybox-prune.yml's recursive last-activity scan. Cargo rarely
-          # touches the top level after creation, so this approximates
-          # creation order and a recently-used-but-idle dir can be evicted
-          # before a colder one; acceptable here, since every candidate is
-          # an idle warm cache and the ordering stays cheap for a per-job
-          # step. Concurrent preflights on other slots are safe: target
-          # dirs are warm caches (eviction costs a rebuild, not
-          # correctness), a live job's dir is shielded by the recursive
-          # 15-minute activity check (a job actively writing keeps its
-          # target dir fresh — though a >15 min quiet phase can look idle,
-          # a bounded risk: one retryable job failure, no data loss), the
-          # own-slot skip covers every dir this slot may use, and `|| true`
-          # on rm tolerates another slot's preflight racing us to the same
-          # candidate.
+          evict_until_free pruning --quiet-min 2880 --skip-dir "$own_dir"
           if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
             echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            while IFS= read -r entry; do
-              dir="${entry#* }"
-              case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
-              case "$dir" in */"$RUNNER_NAME"/*) echo "skipping (own slot): $dir"; continue ;; esac
-              [ -n "$(find "$dir" -mmin -15 -print -quit 2>/dev/null || true)" ] && { echo "skipping (active <15min): $dir"; continue; }
-              echo "evicting: $dir"
-              rm -rf -- "$dir" || true
-              [ "$(free_gib)" -ge "$NEED_GIB" ] && break
-            done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n)
+            evict_until_free evicting --quiet-min 15 --skip-slot "$RUNNER_NAME"
           fi
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
@@ -980,9 +957,14 @@ jobs:
       # The $RUNNER_NAME key is a correctness requirement here, not just
       # lock avoidance: that same clean means two coverage jobs on different
       # slots sharing a dir would delete each other's artifacts mid-run.
+      # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
+      # step (intent-hq/intent#5256); released by the job's last step.
       - name: Point CARGO_TARGET_DIR outside the work dir
         if: needs.route.outputs.linux_burst != 'true'
-        run: echo "CARGO_TARGET_DIR=/raid/ci-target/intentd/$RUNNER_NAME/coverage-all" >> "$GITHUB_ENV"
+        run: |
+          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-all"
+          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
+          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -1051,6 +1033,11 @@ jobs:
           path: lcov.info
           if-no-files-found: warn
           retention-days: 3
+      # Release the `.in-use` marker — see the `check` job's last step
+      # (intent-hq/intent#5256).
+      - name: Release per-slot target dir
+        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
+        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
   pr-title:
     runs-on: ubuntu-latest
@@ -1188,8 +1175,12 @@ jobs:
   # without a marker is left untouched — never collapsed to one section)
   # and scripts/notify-fixed-issues.sh (a mention-only reference or an open
   # issue never earns a release comment; a closed issue with a delivered
-  # linked fix PR does). Seconds-long like the other utility jobs, so it
-  # runs directly on ubuntu-latest.
+  # linked fix PR does), plus the tinybox CI helpers
+  # (intent-hq/intent#5256): scripts/ci-lld-retry.sh (the rust-lld
+  # vanished-object signature earns exactly one retry; a genuine lint fails
+  # fast) and scripts/ci-target-slot.sh (a dir with a fresh `.in-use` marker
+  # is never a purge candidate; an unmarked idle one is). Seconds-long like
+  # the other utility jobs, so it runs directly on ubuntu-latest.
   release-scripts:
     runs-on: ubuntu-latest
     # Runs on push and same-repo PRs; skipped on fork PRs (see the
@@ -1202,6 +1193,10 @@ jobs:
         run: ./scripts/test-aggregate-channel-notes.sh
       - name: Test notify-fixed-issues.sh
         run: ./scripts/test-notify-fixed-issues.sh
+      - name: Test ci-lld-retry.sh
+        run: ./scripts/test-ci-lld-retry.sh
+      - name: Test ci-target-slot.sh
+        run: ./scripts/test-ci-target-slot.sh
 
   # install.ps1's Windows-only paths (intent-hq/intent#3229): the `check`
   # job's install_ps1_owner suite runs the installer's ownership check under
