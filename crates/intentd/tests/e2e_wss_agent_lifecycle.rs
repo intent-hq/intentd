@@ -15742,9 +15742,15 @@ async fn queued_spawn_resumes_exactly_once_over_wss() {
         .to_string();
 
     // The holder's first turn spawns its child (lazy spawn) and takes the
-    // only slot. Its turn-startup `agent:stream:status` is published after
-    // the registry marks the process active, so once it is on the wire the
-    // slot is verifiably held and nothing is idle to evict.
+    // only slot. Wait for the `phase: "prompt"` turn-startup
+    // `agent:stream:status` specifically: it is published inside the prompt
+    // turn, after the spawned child is registered and the process marked
+    // active, so once it is on the wire the slot is verifiably held and
+    // nothing is idle to evict. The earlier `launch` / `init` /
+    // `session-create` hints precede registration — admission counts
+    // registered processes only, so a waiter sent on one of those still
+    // finds the cap unoccupied and runs concurrently (that window is wide
+    // enough under coverage instrumentation to lose the race every time).
     let sent = wss_rpc(
         &mut rpc,
         12,
@@ -15765,7 +15771,7 @@ async fn queued_spawn_resumes_exactly_once_over_wss() {
         match ev["type"].as_str() {
             Some("agent:failed") => panic!("holder turn must not fail: {ev}"),
             Some("agent:stream:end") => panic!("holder turn ended before the waiter queued: {ev}"),
-            Some("agent:stream:status") => break,
+            Some("agent:stream:status") if ev["data"]["phase"] == "prompt" => break,
             _ => {}
         }
     }
