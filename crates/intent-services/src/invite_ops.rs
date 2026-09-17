@@ -687,6 +687,29 @@ impl Services {
         secret: &str,
         credential: &str,
     ) -> Result<Value> {
+        let (invite, principal) = self
+            .invite_accept_resolve(invite_id, secret, credential)
+            .await?;
+        // The presented credential is validated again and rotated out inside
+        // the join transaction (exactly one active row must flip, or the
+        // join is refused `CredentialInvalid`): the guest leaves with exactly
+        // one active credential for this host, and of two concurrent accepts
+        // presenting the same credential exactly one mints.
+        self.commit_invite_join(&invite, &principal, Some(&hash_secret(credential)))
+            .await
+    }
+
+    /// The pre-transaction half of `invite.accept`: name the principal the
+    /// credential identifies and the open invite, and enforce the pin. The
+    /// active-credential check here is advisory — it gives the early, cheap
+    /// refusal and the `github_user_id` the pin needs — the authoritative
+    /// check is the rotate inside the join transaction.
+    async fn invite_accept_resolve(
+        &self,
+        invite_id: &str,
+        secret: &str,
+        credential: &str,
+    ) -> Result<(WorkspaceInvite, Principal)> {
         // The credential is the proof of identity: the same active-only
         // resolve the `/ws` bearer gate runs, so a revoked one is refused
         // here exactly as it would be at upgrade.
@@ -709,10 +732,7 @@ impl Services {
         {
             return Err(Error::Invite(InviteErrorKind::PinMismatch));
         }
-        // The presented credential is rotated out in the join transaction:
-        // the guest leaves with exactly one active credential for this host.
-        self.commit_invite_join(&invite, &principal, Some(&hash_secret(credential)))
-            .await
+        Ok((invite, principal))
     }
 
     /// `invite.challenge`: see
@@ -1063,10 +1083,13 @@ impl Services {
     /// ([`intent_store::Store::join_workspace_by_invite`]) mint or reuse the
     /// principal keyed by `identity.github_user_id`, redeem the invite (the
     /// conditional UPDATE is the single-use guard), add the `collaborator`
-    /// membership, record a fresh per-principal credential and revoke
+    /// membership, record a fresh per-principal credential and consume
     /// `rotate_from_hash` (the credential an `invite.accept` presented) when
-    /// given. The event is published only after the commit; the credential
-    /// is returned exactly once, in the `authorized` result.
+    /// given — a hash that is not exactly one active credential of the
+    /// joining principal at that moment refuses the whole join as
+    /// [`InviteErrorKind::CredentialInvalid`] with nothing written. The
+    /// event is published only after the commit; the credential is returned
+    /// exactly once, in the `authorized` result.
     async fn commit_invite_join(
         &self,
         invite: &WorkspaceInvite,
@@ -1099,6 +1122,9 @@ impl Services {
             }
             InviteJoinOutcome::WorkspaceFull => {
                 return Err(Error::Invite(InviteErrorKind::WorkspaceFull));
+            }
+            InviteJoinOutcome::CredentialInvalid => {
+                return Err(Error::Invite(InviteErrorKind::CredentialInvalid));
             }
         };
         let member_count = self.member_count(&invite.workspace_id).await?;
