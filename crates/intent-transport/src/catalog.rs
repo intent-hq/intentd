@@ -385,7 +385,7 @@ pub(crate) fn canonical_method(method: &str) -> &str {
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 53 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 55 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
 /// `pairing.rs`, `server.rs`, `invite.rs`, `presence.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
@@ -430,6 +430,8 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "host.providerTestPrompt",
     "host.status",
     "host.toolAvailability",
+    "invite.accept",
+    "invite.inspect",
     "invite.redeem",
     "note.presence.update",
     "pairing.getInfo",

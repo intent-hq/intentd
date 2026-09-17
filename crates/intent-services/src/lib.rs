@@ -30647,6 +30647,26 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.invite_redeem_wait_op(&flow_id).await })
     }
 
+    fn invite_inspect(
+        &self,
+        invite_id: String,
+        secret: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.invite_inspect_op(&invite_id, &secret).await })
+    }
+
+    fn invite_accept(
+        &self,
+        invite_id: String,
+        secret: String,
+        credential: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.invite_accept_op(&invite_id, &secret, &credential)
+                .await
+        })
+    }
+
     fn primary_principal_id(&self) -> BoxFuture<'_, Result<intent_core::PrincipalId>> {
         let store = self.store.clone();
         Box::pin(async move { Ok(store.get_primary_principal().await?.id) })
