@@ -479,8 +479,9 @@ pub(crate) async fn process_frame(
         // into the `intent://invite` link with this listener's own pairing
         // envelope (hosts / port / fingerprint, never the bearer token), so it
         // runs here where the pairing provider is in reach. Not local-only:
-        // a remote owner mints links too. `invite.redeem` is NOT served on
-        // authenticated connections — only on the `/invite` endpoint.
+        // a remote owner mints links too. The other `invite.*` methods are
+        // NOT served on authenticated connections — only on the `/invite`
+        // endpoint.
         if let Some(req) = crate::invite::classify(value) {
             if req.method == crate::invite::InviteMethod::Create {
                 let frame = panic_guard::guard_frame(

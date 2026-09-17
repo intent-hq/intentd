@@ -1,14 +1,15 @@
 //! WSS end-to-end for invite links and the identity-only join (multiplayer
-//! w4): `workspace.invite.create` (pinned to a login) → the invitee redeems
-//! over the unauthenticated `/invite` endpoint → a pin mismatch is refused →
-//! the pinned account joins and receives its own credential → that credential
-//! connects to `/ws`, `principal.me` shows the GitHub identity and
-//! `workspace.get` the collaborator role → the same guest previews a second
-//! workspace's link with `invite.inspect` and joins it with `invite.accept`
-//! on that credential (no device flow; the presented credential is rotated
-//! out) → a third workspace is joined by gist identity proof:
+//! w4): `workspace.invite.create` (pinned to a login) → the invitee joins by
+//! gist identity proof over the unauthenticated `/invite` endpoint:
 //! `invite.challenge` issues a nonce, the mock GitHub serves a gist carrying
-//! it, `invite.prove` mints the credential → the owner's `github.connect`
+//! it, `invite.prove` verifies it → a proof by the wrong account is refused
+//! (`invite-pin-mismatch`) → the pinned account proves and receives its own
+//! credential → that credential connects to `/ws`, `principal.me` shows the
+//! GitHub identity and `workspace.get` the collaborator role → the same
+//! guest previews a second workspace's link with `invite.inspect` and joins
+//! it with `invite.accept` on that credential (no GitHub call; the presented
+//! credential is rotated out) → a third workspace is joined by gist proof
+//! again, exercising every proof refusal → the owner's `github.connect`
 //! authorised as a different account is refused (`identity-locked`) while
 //! the guest depends on the primary identity → the owner removes the member →
 //! `workspace.get` is `NotFound` → `principal.revokeSelf` closes the
@@ -17,10 +18,11 @@
 //! Boots a real `intentd serve` whose GitHub login host AND API host are
 //! pointed at one local mock (`INTENTD_GITHUB_LOGIN_BASE_URI` /
 //! `INTENTD_GITHUB_API_BASE_URI`). The owner's identity comes from a fake
-//! `GITHUB_TOKEN` the mock recognises; the invitee's `GET /user` runs on the
-//! device-flow token the mock mints per flow; the proof gists are scripted
-//! by the test (`GET /gists/{id}`). Hermetic: no live network, and the
-//! invitee's token is asserted never to reach the daemon's secrets file.
+//! `GITHUB_TOKEN` the mock recognises; the owner's `github.connect` runs the
+//! mock's device flow; the invitee never authenticates to GitHub — the proof
+//! gists and the accounts they name are scripted by the test
+//! (`GET /gists/{id}`, `GET /users/{login}`). Hermetic: no live network, and
+//! no guest token exists to leak into the daemon's secrets file.
 
 #![cfg(unix)]
 
@@ -53,9 +55,9 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 
 /// Tokens the mock GitHub recognises on `GET /user`, and the accounts they
 /// resolve to. The owner's is handed to the daemon as `GITHUB_TOKEN`; the
-/// other two are minted by the mock's device flow, one per redemption.
+/// intruder's is minted by the mock's device flow for the owner's
+/// `github.connect` in step 6b.
 const OWNER_TOKEN: &str = "gho_e2e_owner_token";
-const GUEST_TOKEN: &str = "gho_e2e_guest_token";
 const INTRUDER_TOKEN: &str = "gho_e2e_intruder_token";
 const OWNER_ID: u64 = 100;
 const GUEST_ID: u64 = 200;
@@ -290,7 +292,7 @@ async fn challenge(prover: &mut Ws, id: i64, invite_id: &str, secret: &str) -> V
     v["result"].clone()
 }
 
-/// An admitted `invite.prove` claiming the `guest` account with `gist_id`,
+/// An admitted `invite.prove` claiming the `login` account with `gist_id`,
 /// returning the full envelope.
 async fn prove(
     prover: &mut Ws,
@@ -299,6 +301,7 @@ async fn prove(
     secret: &str,
     nonce: &str,
     gist_id: &str,
+    login: &str,
 ) -> Value {
     admitted_rpc(
         prover,
@@ -306,7 +309,7 @@ async fn prove(
         "invite.prove",
         json!({
             "inviteId": invite_id, "secret": secret,
-            "nonce": nonce, "gistId": gist_id, "login": "guest",
+            "nonce": nonce, "gistId": gist_id, "login": login,
         }),
     )
     .await
@@ -403,9 +406,10 @@ async fn upgrade_status_line(port: u16, cfg: Arc<ClientConfig>, token: &str) -> 
 }
 
 // ---------------------------------------------------------------------------
-// Mock GitHub: ONE plain-HTTP host serving both the login endpoints
-// (`/login/device/code`, `/login/oauth/access_token`) and the API reads the
-// join needs (`GET /user`, `GET /users/{login}`, `GET /gists/{id}`). Each
+// Mock GitHub: ONE plain-HTTP host serving both the login endpoints the
+// owner's `github.connect` uses (`/login/device/code`,
+// `/login/oauth/access_token`) and the API reads the join needs
+// (`GET /user`, `GET /users/{login}`, `GET /gists/{id}`). Each
 // `/login/device/code` call mints device code `e2e-dc-{n}`; the token poll
 // for flow `n` answers `authorization_pending` until the test sets
 // `grants[n]` to the access token the (mock) user authorised with. Gists are
@@ -482,7 +486,6 @@ fn user_json(login: &str, id: u64) -> Value {
 fn user_for_token(token: &str) -> Option<Value> {
     match token {
         OWNER_TOKEN => Some(user_json("owner", OWNER_ID)),
-        GUEST_TOKEN => Some(user_json("guest", GUEST_ID)),
         INTRUDER_TOKEN => Some(user_json("intruder", INTRUDER_ID)),
         _ => None,
     }
@@ -769,9 +772,11 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         "the secret rides only inside url: {listed}"
     );
 
-    // 3. The unauthenticated /invite endpoint: nothing but invite.redeem is
-    //    reachable, a wrong secret is `invite-not-found`, and a good link
-    //    starts the identity-only device flow (mock codes + workspace hint).
+    // 3. The unauthenticated /invite endpoint: nothing but the invite
+    //    methods is reachable (the retired `invite.redeem` included), a
+    //    wrong secret is `invite-not-found`, and a good link answers
+    //    `invite.challenge` with the workspace hint plus a nonce — no device
+    //    flow is started.
     let mut invitee = connect_invite(port, cfg.clone()).await;
     let v = wss_rpc(&mut invitee, 20, "workspace.list", json!({})).await;
     assert_eq!(v["error"]["code"], json!(-32001), "{v}");
@@ -779,27 +784,20 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         &mut invitee,
         21,
         "invite.redeem",
+        json!({ "inviteId": invite_id, "secret": secret }),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32001), "retired method: {v}");
+    let v = wss_rpc(
+        &mut invitee,
+        22,
+        "invite.challenge",
         json!({ "inviteId": invite_id, "secret": "not-the-secret" }),
     )
     .await;
     assert_eq!(v["error"]["code"], json!(-32602), "{v}");
     assert_eq!(v["error"]["data"]["code"], json!("invite-not-found"), "{v}");
-    let v = wss_rpc(
-        &mut invitee,
-        22,
-        "invite.redeem",
-        json!({ "inviteId": invite_id, "secret": secret }),
-    )
-    .await;
-    assert!(v.get("error").is_none(), "redeem start: {v}");
-    let r = &v["result"];
-    let flow_0 = r["flowId"].as_str().expect("flowId").to_string();
-    assert_eq!(r["userCode"], json!(USER_CODE));
-    assert_eq!(
-        r["verificationUri"],
-        json!("https://github.com/login/device")
-    );
-    assert_eq!(r["interval"], json!(1));
+    let r = challenge(&mut invitee, 23, &invite_id, &secret).await;
     assert_eq!(r["workspaceId"], json!(ws_id));
     assert_eq!(r["workspaceTitle"], json!("Invite E2E"));
     assert!(
@@ -810,16 +808,26 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         r["prettyHostname"].as_str().is_some_and(|h| !h.is_empty()),
         "prettyHostname: {r}"
     );
-    assert!(r.get("deviceCode").is_none());
+    assert!(r.get("flowId").is_none(), "no device flow: {r}");
+    assert!(r.get("userCode").is_none(), "no device flow: {r}");
+    assert!(r.get("verificationUri").is_none(), "no device flow: {r}");
+    let join_nonce = r["nonce"].as_str().expect("nonce").to_string();
+    assert_eq!(mock.flows.load(Ordering::SeqCst), 0, "no device flow");
 
-    // 4. The WRONG GitHub account authorises → pin mismatch; the invite stays
-    //    open and no principal / credential was minted for the intruder.
-    mock.authorize(0, INTRUDER_TOKEN);
-    let v = wss_rpc(
+    // 4. The WRONG GitHub account proves (its own gist carries the nonce) →
+    //    pin mismatch; the nonce is spent, the invite stays open and no
+    //    principal / credential was minted for the intruder.
+    let now = chrono::Utc::now().to_rfc3339();
+    mock.script_gist("intruderjoin", "intruder", &now, Some(&join_nonce));
+    mock.script_gist("guestjoin", "guest", &now, Some(&join_nonce));
+    let v = prove(
         &mut invitee,
-        23,
-        "invite.redeem",
-        json!({ "flowId": flow_0 }),
+        24,
+        &invite_id,
+        &secret,
+        &join_nonce,
+        "intruderjoin",
+        "intruder",
     )
     .await;
     assert_eq!(v["error"]["code"], json!(-32602), "{v}");
@@ -828,49 +836,46 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         json!("invite-pin-mismatch"),
         "{v}"
     );
-    let v = wss_rpc(
+    let v = prove(
         &mut invitee,
-        24,
-        "invite.redeem",
-        json!({ "flowId": flow_0 }),
+        25,
+        &invite_id,
+        &secret,
+        &join_nonce,
+        "guestjoin",
+        "guest",
     )
     .await;
     assert_eq!(
         v["error"]["data"]["code"],
-        json!("invite-flow-not-found"),
-        "{v}"
+        json!("proof-invalid"),
+        "the nonce was spent by the refused attempt: {v}"
     );
 
-    // 5. The pinned account authorises → the join: a credential (returned
-    //    once), the principal, the workspace; the GitHub access token itself
-    //    never crosses the wire.
-    let v = wss_rpc(
+    // 5. The pinned account proves on a fresh nonce → the join: a credential
+    //    (returned once), the principal, the workspace.
+    let r = challenge(&mut invitee, 26, &invite_id, &secret).await;
+    let join_nonce_2 = r["nonce"].as_str().expect("nonce").to_string();
+    assert_ne!(join_nonce_2, join_nonce);
+    let after = chrono::Utc::now().to_rfc3339();
+    mock.script_gist("guestjoin2", "guest", &after, Some(&join_nonce_2));
+    let v = prove(
         &mut invitee,
-        25,
-        "invite.redeem",
-        json!({ "inviteId": invite_id, "secret": secret }),
+        27,
+        &invite_id,
+        &secret,
+        &join_nonce_2,
+        "guestjoin2",
+        "guest",
     )
     .await;
-    assert!(v.get("error").is_none(), "redeem restart: {v}");
-    let flow_1 = v["result"]["flowId"].as_str().expect("flowId").to_string();
-    assert_ne!(flow_1, flow_0);
-    mock.authorize(1, GUEST_TOKEN);
-    let v = wss_rpc(
-        &mut invitee,
-        26,
-        "invite.redeem",
-        json!({ "flowId": flow_1 }),
-    )
-    .await;
-    assert!(v.get("error").is_none(), "redeem wait: {v}");
+    assert!(v.get("error").is_none(), "invite.prove: {v}");
     let r = &v["result"];
     assert_eq!(r["status"], json!("authorized"));
     assert_eq!(r["login"], json!("guest"));
     assert_eq!(r["workspaceId"], json!(ws_id));
     let guest_token = r["token"].as_str().expect("credential").to_string();
     assert_eq!(guest_token.len(), 64);
-    assert_ne!(guest_token, GUEST_TOKEN);
-    assert!(!v.to_string().contains(GUEST_TOKEN), "{v}");
     let guest_id = r["principalId"].as_str().expect("principalId").to_string();
 
     // The owner's subscriber saw the membership change with the new count.
@@ -883,29 +888,20 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(ev["data"]["changes"]["memberCount"], json!(2));
 
     // Single use: the same link is now `invite-redeemed`.
-    let v = wss_rpc(
+    let v = admitted_rpc(
         &mut invitee,
-        27,
-        "invite.redeem",
+        28,
+        "invite.challenge",
         json!({ "inviteId": invite_id, "secret": secret }),
     )
     .await;
     assert_eq!(v["error"]["data"]["code"], json!("invite-redeemed"), "{v}");
     drop(invitee);
-
-    // 🔒 The invitee's GitHub token was spent on one GET /user and dropped:
-    //    it is nowhere in the daemon's secrets file (which may not exist at
-    //    all — nothing was stored).
-    if let Ok(secrets) = std::fs::read_to_string(&secrets_file) {
-        assert!(
-            !secrets.contains(GUEST_TOKEN),
-            "guest token persisted: {secrets}"
-        );
-        assert!(
-            !secrets.contains(INTRUDER_TOKEN),
-            "intruder token persisted: {secrets}"
-        );
-    }
+    assert_eq!(
+        mock.flows.load(Ordering::SeqCst),
+        0,
+        "the join never started a device flow"
+    );
 
     // 6. The collaborator credential connects to /ws: principal.me shows the
     //    GitHub identity and workspace.get the collaborator role.
@@ -980,8 +976,11 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         .to_string();
     let second_secret = v["result"]["secret"].as_str().expect("secret").to_string();
 
+    // Every `/invite` request hashes the secret, so each draws from the
+    // throttle the join above spent; the assertions here are about the
+    // requests, so each waits to be admitted.
     let mut returning = connect_invite(port, cfg.clone()).await;
-    let v = wss_rpc(
+    let v = admitted_rpc(
         &mut returning,
         60,
         "invite.inspect",
@@ -1002,7 +1001,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     );
     assert!(r.get("flowId").is_none(), "no device flow: {r}");
     assert!(r.get("userCode").is_none(), "no device flow: {r}");
-    let v = wss_rpc(
+    let v = admitted_rpc(
         &mut returning,
         61,
         "invite.accept",
@@ -1015,7 +1014,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         json!("credential-invalid"),
         "{v}"
     );
-    let v = wss_rpc(
+    let v = admitted_rpc(
         &mut returning,
         62,
         "invite.accept",
@@ -1144,6 +1143,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         &third_secret,
         &nonce,
         "broken",
+        "guest",
     )
     .await;
     assert_eq!(v["error"]["code"], json!(-32603), "{v}");
@@ -1159,6 +1159,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         &third_secret,
         &nonce,
         "intruderproof",
+        "guest",
     )
     .await;
     assert_eq!(v["error"]["code"], json!(-32602), "{v}");
@@ -1170,6 +1171,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         &third_secret,
         &nonce,
         "guestproof",
+        "guest",
     )
     .await;
     assert_eq!(
@@ -1194,6 +1196,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         &third_secret,
         &nonce_2,
         "stale",
+        "guest",
     )
     .await;
     assert_eq!(v["error"]["data"]["code"], json!("proof-invalid"), "{v}");
@@ -1208,6 +1211,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         &third_secret,
         &nonce_2,
         "guestproof2",
+        "guest",
     )
     .await;
     assert!(v.get("error").is_none(), "invite.prove: {v}");
@@ -1230,8 +1234,15 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         let distinct: std::collections::BTreeSet<&str> = reads.iter().map(String::as_str).collect();
         assert_eq!(
             distinct.into_iter().collect::<Vec<_>>(),
-            ["broken", "guestproof2", "intruderproof", "stale"],
-            "every named gist was read, the too-late one never was: {reads:?}"
+            [
+                "broken",
+                "guestjoin2",
+                "guestproof2",
+                "intruderjoin",
+                "intruderproof",
+                "stale",
+            ],
+            "every named gist was read, the too-late ones never were: {reads:?}"
         );
     }
     // Spent nonce: the same proof does not join again.
@@ -1242,6 +1253,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         &third_secret,
         &nonce_2,
         "guestproof2",
+        "guest",
     )
     .await;
     assert_eq!(v["error"]["data"]["code"], json!("invite-redeemed"), "{v}");
@@ -1290,7 +1302,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     let v = wss_rpc(&mut owner, 14, "github.connect", json!({})).await;
     assert!(v.get("error").is_none(), "github.connect: {v}");
     assert_eq!(v["result"]["userCode"], json!(USER_CODE));
-    mock.authorize(2, INTRUDER_TOKEN);
+    mock.authorize(0, INTRUDER_TOKEN);
     let ev = await_auth_changed(&mut auth_sub, "identity-locked").await;
     assert_eq!(ev["data"]["status"], json!("identity-locked"));
     if let Ok(secrets) = std::fs::read_to_string(&secrets_file) {
@@ -1341,8 +1353,8 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(remaining, expected, "the second and third remain: {v}");
 
     // 8. principal.revokeSelf: both live credentials (the one `invite.accept`
-    //    rotated in and the one `invite.prove` minted — the device-flow one
-    //    was rotated out in 6a) are revoked, the remaining memberships (the
+    //    rotated in and the one `invite.prove` minted in 6c — the one minted
+    //    in 5 was rotated out in 6a) are revoked, the remaining memberships (the
     //    second and third workspaces) are left, the connection is closed by
     //    the daemon (policy close), and no token authenticates an upgrade.
     let v = wss_rpc(&mut guest, 35, "principal.revokeSelf", json!({})).await;
@@ -1383,14 +1395,14 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(v["result"]["isAdministrator"], json!(true));
     assert_eq!(v["result"]["login"], json!("owner"));
 
-    // 9. Redemption is rate-limited across time, not just in flight: a
-    //    serial stream of bad-link starts is answered `invite-not-found`
+    // 9. Secret guessing is rate-limited across time, not just in flight: a
+    //    serial stream of bad-link challenges is answered `invite-not-found`
     //    (the store was consulted) until the listener-wide burst (8, one
     //    token back per 5 s) is spent, then `invite-flow-busy` before any
     //    store work. The bucket belongs to the listener, so a reconnect does
     //    not refill it: a fresh connection gets at most the single token a
     //    refill boundary may have restored meanwhile, never a new burst.
-    //    The steps above may have left the bucket empty, so the first start
+    //    The steps above may have left the bucket empty, so the first request
     //    waits to be admitted; the nine that follow it within the same
     //    refill interval cannot all be (at most 8 + 1 tokens exist).
     let mut flood = connect_invite(port, cfg.clone()).await;
@@ -1398,9 +1410,9 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     for i in 0..10 {
         let params = json!({ "inviteId": invite_id, "secret": format!("guess-{i}") });
         let v = if i == 0 {
-            admitted_rpc(&mut flood, 40, "invite.redeem", params).await
+            admitted_rpc(&mut flood, 40, "invite.challenge", params).await
         } else {
-            wss_rpc(&mut flood, 40 + i, "invite.redeem", params).await
+            wss_rpc(&mut flood, 40 + i, "invite.challenge", params).await
         };
         codes.push(
             v["error"]["data"]["code"]
@@ -1418,7 +1430,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         let v = wss_rpc(
             &mut again,
             50 + i,
-            "invite.redeem",
+            "invite.challenge",
             json!({ "inviteId": invite_id, "secret": format!("again-{i}") }),
         )
         .await;
@@ -1432,19 +1444,5 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     assert_eq!(
         after[1], "invite-flow-busy",
         "reconnect did not refill the bucket: {after:?}"
-    );
-    // A phase-2 wait is not subject to the throttle (an unknown flow is
-    // still answered from the flow table, not refused as busy).
-    let v = wss_rpc(
-        &mut again,
-        52,
-        "invite.redeem",
-        json!({ "flowId": "no-such-flow" }),
-    )
-    .await;
-    assert_eq!(
-        v["error"]["data"]["code"],
-        json!("invite-flow-not-found"),
-        "{v}"
     );
 }
