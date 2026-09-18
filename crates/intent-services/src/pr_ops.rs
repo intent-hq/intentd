@@ -17,8 +17,8 @@ use intent_core::{parse_iso, Error, PullRequestInfo, PullRequestStatus, Result, 
 use intent_sourcecontrol::{
     CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrObservation,
     PrQuery, PrState, PullRequest, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread,
-    ReviewThreadComment, ReviewVerdict, RollupCheck, SourceControl, SourceControlRegistry,
-    SourceControlSettings,
+    ReviewThreadComment, ReviewVerdict, RollupCheck, RollupCheckKind, SourceControl,
+    SourceControlRegistry, SourceControlSettings,
 };
 use time::OffsetDateTime;
 
@@ -894,10 +894,57 @@ fn check_status_word(state: CheckState) -> &'static str {
 /// One run of a named check, before the checklist collapses same-name runs.
 struct CheckRunSignal {
     name: String,
+    kind: RollupCheckKind,
     state: CheckState,
     required: bool,
     url: Option<String>,
     started_at: Option<OffsetDateTime>,
+}
+
+/// What the checklist holds for one check name: the live check run (several
+/// attempts collapse onto one, see [`live_key`]) and, separately, the legacy
+/// commit status posted under the same context name. The two are independent
+/// evidence — GitHub requires BOTH to pass when their shared name is required
+/// — so a run never supersedes a status, nor a status a run.
+#[derive(Default)]
+struct NameEvidence {
+    run: Option<CheckRunSignal>,
+    status: Option<CheckRunSignal>,
+}
+
+impl NameEvidence {
+    fn slot(&mut self, kind: RollupCheckKind) -> &mut Option<CheckRunSignal> {
+        match kind {
+            RollupCheckKind::CheckRun => &mut self.run,
+            RollupCheckKind::StatusContext => &mut self.status,
+        }
+    }
+
+    /// The outcome the checklist reports for the name: the worse of its
+    /// independent live outcomes (failed over pending over passed), the run
+    /// on a tie so it supplies the link.
+    fn reported(&self) -> &CheckRunSignal {
+        [self.run.as_ref(), self.status.as_ref()]
+            .into_iter()
+            .flatten()
+            .reduce(|held, next| {
+                if outcome_severity(next.state) > outcome_severity(held.state) {
+                    next
+                } else {
+                    held
+                }
+            })
+            .expect("a name is only slotted by a run")
+    }
+}
+
+/// How far a check outcome is from letting the PR merge.
+fn outcome_severity(state: CheckState) -> u8 {
+    match check_status_word(state) {
+        "failed" => 2,
+        "pending" => 1,
+        _ => 0,
+    }
 }
 
 /// Last resort among same-name runs with equal (or equally unknown) starts:
@@ -915,17 +962,17 @@ fn check_state_rank(state: CheckState) -> u8 {
 }
 
 /// The liveness key of one run of a named check: the greatest key among a
-/// name's runs is the live one. A single lexicographic key — not a pairwise
-/// rule that switches criteria on missing data — so the maximum, and with it
-/// the checklist, is the same for every order the host lists the runs in.
+/// name's runs of the same [`RollupCheckKind`] is the live one. A single
+/// lexicographic key — not a pairwise rule that switches criteria on missing
+/// data — so the maximum, and with it the checklist, is the same for every
+/// order the host lists the runs in.
 ///
 /// 1. In-flight beats completed: a re-run in progress (even one the host has
 ///    not stamped a start on yet) makes the check pending.
 /// 2. The later start wins — a re-run, or the run that superseded a
 ///    `concurrency`-cancelled duplicate (intent-hq/intent#5372). A run with
-///    no reported start (legacy commit statuses, hosts that omit it) sorts
-///    below every timed run: an unknown start is never evidence of being
-///    newer.
+///    no reported start (a host that omits it) sorts below every timed run:
+///    an unknown start is never evidence of being newer.
 /// 3. [`check_state_rank`] settles equal or equally unknown starts.
 fn live_key(run: &CheckRunSignal) -> (bool, Option<OffsetDateTime>, u8) {
     (
@@ -944,30 +991,34 @@ fn supersedes(candidate: &CheckRunSignal, held: &CheckRunSignal) -> bool {
 /// One checklist entry per check name. A head that carries several runs of
 /// the same check (a concurrency-cancelled duplicate beside the live run, a
 /// re-run beside its predecessor) is collapsed onto the run with the greatest
-/// [`live_key`]; the first occurrence keeps its position, and the name is
-/// required when any of its runs is.
+/// [`live_key`]; a legacy commit status under the same name is kept beside
+/// the live run and the entry reports the worse of the two
+/// ([`NameEvidence::reported`]). The first occurrence keeps its position, and
+/// the name is required when any of its runs is.
 fn dedupe_checks(runs: impl IntoIterator<Item = CheckRunSignal>) -> Vec<MergeRequirementCheck> {
     let mut slots: HashMap<String, usize> = HashMap::new();
-    let mut kept: Vec<CheckRunSignal> = Vec::new();
+    let mut kept: Vec<(String, bool, NameEvidence)> = Vec::new();
     for run in runs {
-        if let Some(&i) = slots.get(&run.name) {
-            let held = &mut kept[i];
-            let required = held.required | run.required;
-            if supersedes(&run, held) {
-                *held = run;
-            }
-            held.required = required;
-        } else {
-            slots.insert(run.name.clone(), kept.len());
-            kept.push(run);
+        let i = *slots.entry(run.name.clone()).or_insert_with(|| {
+            kept.push((run.name.clone(), false, NameEvidence::default()));
+            kept.len() - 1
+        });
+        let (_, required, evidence) = &mut kept[i];
+        *required |= run.required;
+        let slot = evidence.slot(run.kind);
+        if slot.as_ref().is_none_or(|held| supersedes(&run, held)) {
+            *slot = Some(run);
         }
     }
     kept.into_iter()
-        .map(|run| MergeRequirementCheck {
-            name: run.name,
-            status: check_status_word(run.state).to_string(),
-            required: run.required,
-            url: run.url,
+        .map(|(name, required, evidence)| {
+            let live = evidence.reported();
+            MergeRequirementCheck {
+                name,
+                status: check_status_word(live.state).to_string(),
+                required,
+                url: live.url.clone(),
+            }
         })
         .collect()
 }
@@ -1008,6 +1059,7 @@ pub(crate) fn merge_requirements(
     let items: Vec<MergeRequirementCheck> = match rollup {
         Some(checks) => dedupe_checks(checks.iter().map(|c| CheckRunSignal {
             name: c.name.clone(),
+            kind: c.kind,
             state: c.state,
             required: c.is_required,
             url: c.url.clone(),
@@ -1015,6 +1067,7 @@ pub(crate) fn merge_requirements(
         })),
         None => dedupe_checks(fallback_runs.iter().map(|r| CheckRunSignal {
             name: r.name.clone(),
+            kind: RollupCheckKind::CheckRun,
             state: r.state,
             required: false,
             url: r.url.clone(),
@@ -1909,6 +1962,7 @@ mod tests {
     fn rollup(name: &str, state: CheckState, required: bool) -> RollupCheck {
         RollupCheck {
             name: name.into(),
+            kind: RollupCheckKind::CheckRun,
             state,
             is_required: required,
             url: None,
@@ -2137,9 +2191,9 @@ mod tests {
             assert_eq!(req.checks.failing_required, vec!["test".to_string()]);
         }
 
-        // Without start times (legacy statuses, hosts that omit them) the
-        // state decides: a failure over a success, an in-flight run over any
-        // completed twin, and a cancelled run only when it is alone.
+        // Without start times (a host that omits them) the state decides: a
+        // failure over a success, an in-flight run over any completed twin,
+        // and a cancelled run only when it is alone.
         let untimed = |name: &str, state: CheckState| rollup(name, state, true);
         for order in [
             vec![
@@ -2174,12 +2228,12 @@ mod tests {
         );
         assert_eq!(req.checks.pending_required, vec!["e2e".to_string()]);
 
-        // Mixed evidence — two timed runs plus an untimed legacy status under
-        // one name — must reduce to the same answer in every one of the six
-        // orders: the reduction is a single total order, not a pairwise rule
-        // that switches criteria on missing data. The latest timed run wins;
-        // an untimed run never outranks a timed one. An in-flight run with
-        // no start stamped yet still wins outright.
+        // Mixed evidence — two timed runs plus an untimed run under one name
+        // — must reduce to the same answer in every one of the six orders:
+        // the reduction is a single total order, not a pairwise rule that
+        // switches criteria on missing data. The latest timed run wins; an
+        // untimed run never outranks a timed one. An in-flight run with no
+        // start stamped yet still wins outright.
         let mixed = [
             dup("gate", CheckState::Failure),
             live("gate", CheckState::Success),
@@ -2260,6 +2314,114 @@ mod tests {
                 req.checks.items[0].url.as_deref(),
                 Some("https://ci/live/build")
             );
+        }
+    }
+
+    /// A legacy commit status posted under a check run's name is independent
+    /// evidence, not an older attempt of the run: GitHub requires both to
+    /// pass when the shared name is required. Deduping the run's attempts
+    /// must never let a timed success hide the status's failure (or vice
+    /// versa), in either order; the entry reports the worse of the two.
+    #[test]
+    fn merge_requirements_keeps_a_same_name_legacy_status_beside_the_live_run() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let signals = |checks: Vec<RollupCheck>| MergeRequirementSignals {
+            merge_state_status: Some("CLEAN".into()),
+            checks,
+            checks_known: true,
+            ..Default::default()
+        };
+        let run = |state: CheckState, started_at: &str| RollupCheck {
+            url: Some(format!("https://ci/run/{started_at}")),
+            started_at: Some(started_at.into()),
+            ..rollup("build", state, true)
+        };
+        let status = |state: CheckState| RollupCheck {
+            kind: RollupCheckKind::StatusContext,
+            url: Some("https://ci/status".into()),
+            ..rollup("build", state, true)
+        };
+        let both_orders = |a: RollupCheck, b: RollupCheck| [vec![a.clone(), b.clone()], vec![b, a]];
+        let live = "2026-09-18T11:32:04Z";
+        let dup = "2026-09-18T11:08:02Z";
+
+        // Timed success + failing status: failed, required, the status's link.
+        for order in both_orders(run(CheckState::Success, live), status(CheckState::Failure)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1, "{:?}", req.checks.items);
+            assert_eq!(
+                (req.checks.passed, req.checks.failed, req.checks.pending),
+                (0, 1, 0),
+                "{:?}",
+                req.checks.items
+            );
+            assert_eq!(req.checks.failing_required, vec!["build".to_string()]);
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/status")
+            );
+        }
+        // Failing run + passing status is just as blocked, with the run's link.
+        for order in both_orders(run(CheckState::Failure, live), status(CheckState::Success)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!((req.checks.passed, req.checks.failed), (0, 1));
+            assert_eq!(req.checks.failing_required, vec!["build".to_string()]);
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/run/2026-09-18T11:32:04Z")
+            );
+        }
+        // A status still pending holds the name pending; an in-flight run
+        // beside a failed status is still a failure.
+        for order in both_orders(run(CheckState::Success, live), status(CheckState::Pending)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!((req.checks.passed, req.checks.pending), (0, 1));
+            assert_eq!(req.checks.pending_required, vec!["build".to_string()]);
+        }
+        for order in both_orders(run(CheckState::Pending, live), status(CheckState::Failure)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!((req.checks.failed, req.checks.pending), (1, 0));
+        }
+        // Both green: one passed entry, the run's link.
+        for order in both_orders(run(CheckState::Success, live), status(CheckState::Success)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1);
+            assert_eq!((req.checks.passed, req.checks.failed), (1, 0));
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/run/2026-09-18T11:32:04Z")
+            );
+        }
+        // The cancelled duplicate still collapses onto the live run when a
+        // status shares the name, and the status's failure still counts.
+        let triple = [
+            run(CheckState::Failure, dup),
+            run(CheckState::Success, live),
+            status(CheckState::Success),
+        ];
+        let blocked = [
+            run(CheckState::Failure, dup),
+            run(CheckState::Success, live),
+            status(CheckState::Failure),
+        ];
+        for perm in PERMUTATIONS_OF_THREE {
+            let order: Vec<RollupCheck> = perm.iter().map(|&i| triple[i].clone()).collect();
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.total, req.checks.passed, req.checks.failed),
+                (1, 1, 0),
+                "{perm:?}: {:?}",
+                req.checks.items
+            );
+            let order: Vec<RollupCheck> = perm.iter().map(|&i| blocked[i].clone()).collect();
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.total, req.checks.passed, req.checks.failed),
+                (1, 0, 1),
+                "{perm:?}: {:?}",
+                req.checks.items
+            );
+            assert_eq!(req.checks.failing_required, vec!["build".to_string()]);
         }
     }
 

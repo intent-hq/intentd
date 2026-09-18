@@ -21,7 +21,7 @@ use crate::model::{
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
     PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
     ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
-    ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+    ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
 use crate::SourceControl;
 
@@ -1260,6 +1260,7 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            kind: RollupCheckKind::StatusContext,
             state: derive_status_context_state(
                 value
                     .get("state")
@@ -1286,6 +1287,7 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                kind: RollupCheckKind::CheckRun,
                 state: derive_check_state(&status, conclusion.as_deref()),
                 is_required,
                 url: text("detailsUrl"),
@@ -2550,6 +2552,7 @@ mod tests {
         assert!(check.is_required);
         assert_eq!(check.url.as_deref(), Some("https://ci/run/1"));
         assert_eq!(check.started_at.as_deref(), Some("2026-09-18T11:32:04Z"));
+        assert_eq!(check.kind, RollupCheckKind::CheckRun);
 
         // An in-flight check-run is pending regardless of conclusion.
         let pending = map_rollup_context(&json!({
@@ -2573,8 +2576,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(status.name, "ci/legacy");
+        assert_eq!(status.kind, RollupCheckKind::StatusContext);
         assert_eq!(status.state, CheckState::Failure);
         assert!(status.is_required);
+        assert_eq!(status.started_at, None);
 
         // Unknown union members are skipped rather than mis-mapped.
         assert!(map_rollup_context(&json!({ "__typename": "Something" })).is_none());
@@ -2626,6 +2631,7 @@ mod tests {
             review_decision: Some(ReviewDecision::ReviewRequired),
             checks: vec![RollupCheck {
                 name: "build".into(),
+                kind: RollupCheckKind::CheckRun,
                 state: CheckState::Pending,
                 is_required: true,
                 url: None,

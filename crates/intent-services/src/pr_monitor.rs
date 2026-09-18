@@ -3554,8 +3554,8 @@ mod tests {
         IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability,
         NewPullRequest, Page, PageParams, PrObservation, PrPatch, PrQuery, PrState, PullRequest,
         RateLimitStatus, Repo, Review, ReviewComment, ReviewDecision, ReviewThread,
-        ReviewThreadComment, ReviewThreadTally, ReviewVerdict, RollupCheck, ScCapabilities,
-        UserIdentity,
+        ReviewThreadComment, ReviewThreadTally, ReviewVerdict, RollupCheck, RollupCheckKind,
+        ScCapabilities, UserIdentity,
     };
     use intent_store::Store;
 
@@ -3685,6 +3685,7 @@ mod tests {
                 threads: vec![],
                 checks: vec![RollupCheck {
                     name: "build".into(),
+                    kind: RollupCheckKind::CheckRun,
                     state: CheckState::Pending,
                     is_required: true,
                     url: None,
@@ -5129,18 +5130,26 @@ mod tests {
     /// `completed/success` run AND an earlier `concurrency`-cancelled
     /// duplicate of the same workflow (whose gate job reports a genuine
     /// `failure`) lists every check name twice in the rollup — plus, here, an
-    /// untimed legacy status under the gate's name. The same forge data poll
-    /// after poll, in whichever order the host happens to list the nodes
-    /// each time, must be a quiet poll — no `passed → failed` burst, nothing
-    /// pending, no wake — and the checklist reports each name once as passed.
+    /// untimed run and a green legacy commit status under the gate's name.
+    /// The same forge data poll after poll, in whichever order the host
+    /// happens to list the nodes each time, must be a quiet poll — no
+    /// `passed → failed` burst, nothing pending, no wake — and the checklist
+    /// reports each name once as passed. The legacy status is independent
+    /// evidence, though: when it turns red the gate reports `passed → failed`
+    /// exactly once, however the live run's twins are ordered.
     #[tokio::test]
     async fn a_concurrency_cancelled_duplicate_run_does_not_flap_the_checks() {
         let run = |name: &str, state: CheckState, started_at: Option<&str>| RollupCheck {
             name: name.into(),
+            kind: RollupCheckKind::CheckRun,
             state,
             is_required: name == "CI Gate",
             url: None,
             started_at: started_at.map(String::from),
+        };
+        let status = |state: CheckState| RollupCheck {
+            kind: RollupCheckKind::StatusContext,
+            ..run("CI Gate", state, None)
         };
         let cancelled_first = vec![
             run("CI Gate", CheckState::Failure, Some("2026-09-18T11:08:02Z")),
@@ -5148,6 +5157,7 @@ mod tests {
             run("CI Gate", CheckState::Success, Some("2026-09-18T11:32:04Z")),
             run("route", CheckState::Success, Some("2026-09-18T11:32:04Z")),
             run("CI Gate", CheckState::Failure, None),
+            status(CheckState::Success),
         ];
         let cancelled_last = cancelled_first.iter().rev().cloned().collect::<Vec<_>>();
         let assert_one_passed_each = |checks: &pr_ops::MergeRequirementsChecks| {
@@ -5165,10 +5175,18 @@ mod tests {
             .expect("register");
         assert_one_passed_each(&requirements.checks);
 
-        // Same data, then reordered, then back: every poll is quiet.
+        // Same data, then reordered, then back: every poll is quiet. The
+        // edits bump the PR's fingerprint so each poll is a FULL fetch that
+        // re-reduces the rollup rather than reusing the cached checklist.
         for checks in [&cancelled_first, &cancelled_last, &cancelled_first] {
-            forge.edit_quiet(|s| s.checks = checks.clone());
+            let probes_before = forge.sub_fetches("merge_requirements");
+            forge.edit(|s| s.checks = checks.clone());
             svc.poll_pr_monitors().await;
+            assert_eq!(
+                forge.sub_fetches("merge_requirements"),
+                probes_before + 1,
+                "the poll re-read the rollup"
+            );
             let row = svc
                 .store()
                 .get_pr_monitor(&monitor.monitor_id)
@@ -5187,6 +5205,58 @@ mod tests {
         let text = owner_messages(&svc, &owner).await;
         assert!(!text.contains("passed → failed"), "{text}");
         assert!(!text.contains("pr_monitor_wake"), "no wake: {text}");
+
+        // The legacy status turns red: a real change, reported once, and the
+        // live run's success no longer hides it in either twin order.
+        let mut red = cancelled_last.clone();
+        red.retain(|c| c.kind != RollupCheckKind::StatusContext);
+        red.insert(0, status(CheckState::Failure));
+        forge.edit(|s| s.checks = red.clone());
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let snapshot: PrMonitorSnapshot =
+            serde_json::from_str(row.last_snapshot.as_deref().expect("snapshot")).unwrap();
+        let checks = &snapshot.requirements.checks;
+        assert_eq!(
+            (checks.total, checks.passed, checks.failed),
+            (2, 1, 1),
+            "{checks:?}"
+        );
+        assert_eq!(checks.failing_required, vec!["CI Gate".to_string()]);
+        let text = owner_messages(&svc, &owner).await;
+        let reported = row
+            .pending_changes
+            .iter()
+            .filter(|c| c.as_str() == "check CI Gate: passed → failed")
+            .count()
+            + text.matches("check CI Gate: passed → failed").count();
+        assert_eq!(reported, 1, "{:?}\n{text}", row.pending_changes);
+
+        red.reverse();
+        forge.edit(|s| s.checks = red.clone());
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let snapshot: PrMonitorSnapshot =
+            serde_json::from_str(row.last_snapshot.as_deref().expect("snapshot")).unwrap();
+        let checks = &snapshot.requirements.checks;
+        assert_eq!((checks.passed, checks.failed), (1, 1), "{checks:?}");
+        let text = owner_messages(&svc, &owner).await;
+        assert!(!text.contains("failed → passed"), "{text}");
+        assert!(
+            !row.pending_changes
+                .iter()
+                .any(|c| c.contains("CI Gate: failed")),
+            "{:?}",
+            row.pending_changes
+        );
     }
 
     #[tokio::test]
@@ -7430,6 +7500,7 @@ mod tests {
         ];
         s.checks.push(RollupCheck {
             name: "lint".into(),
+            kind: RollupCheckKind::CheckRun,
             state: CheckState::Failure,
             is_required: false,
             url: None,

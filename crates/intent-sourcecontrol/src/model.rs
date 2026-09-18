@@ -425,11 +425,18 @@ pub struct ScCapabilities {
 /// One entry of the forge's status-check rollup for a pull request, carrying
 /// the per-check "is this required to merge?" flag GitHub only exposes through
 /// GraphQL (`statusCheckRollup.contexts` → `isRequired(pullRequestNumber:)`).
-/// Both check-runs and legacy commit statuses collapse onto this shape.
+/// Both check-runs and legacy commit statuses collapse onto this shape;
+/// [`RollupCheck::kind`] tells them apart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RollupCheck {
     pub name: String,
+    /// Which kind of rollup node this is. A legacy commit status posted under
+    /// a check run's name is independent evidence, not another attempt of
+    /// that run: GitHub requires both to pass when their shared name is
+    /// required.
+    #[serde(default)]
+    pub kind: RollupCheckKind,
     pub state: CheckState,
     /// Whether the host reports this check as required for merging. `false`
     /// when the host says so *and* when the signal is unavailable — callers
@@ -444,6 +451,17 @@ pub struct RollupCheck {
     /// check's state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
+}
+
+/// The kind of node a [`RollupCheck`] was mapped from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollupCheckKind {
+    /// A check run (GraphQL `CheckRun`, REST `/check-runs`).
+    #[default]
+    CheckRun,
+    /// A legacy commit status (GraphQL `StatusContext`, REST `/statuses`).
+    StatusContext,
 }
 
 /// Merge-relevant branch rules for a pull request's base branch (GitHub
