@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.79] - 2026-09-18
+
+### 🚀 Features
+
+- *(agent)* Per-agent notificationsMuted flag with workspace rollup exclusion ([#1984](https://github.com/intent-hq/intentd/pull/1984))
+
+
 ## [0.9.78] - 2026-09-18
 
 ### 🐛 Bug Fixes
