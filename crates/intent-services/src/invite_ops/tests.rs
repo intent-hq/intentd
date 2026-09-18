@@ -431,6 +431,7 @@ async fn identity_switch_rechecks_the_lock_after_a_concurrent_mint() {
         redeemed_at: None,
         redeemed_by_principal_id: None,
         revoked_at: None,
+        redemption_count: 0,
     };
     store
         .insert_workspace_invite(&invite)
@@ -771,6 +772,7 @@ async fn invite_list_rebuilds_the_link_from_the_stored_secret() {
         redeemed_at: None,
         redeemed_by_principal_id: None,
         revoked_at: None,
+        redemption_count: 0,
     };
     f.store
         .insert_workspace_invite(&legacy)
@@ -943,8 +945,11 @@ async fn open_invite_refuses_closed_or_unknown_invites() {
 
 /// The join: a fresh principal keyed by the GitHub account id, a
 /// collaborator membership, one active credential whose hash resolves to the
-/// principal, the invite redeemed by it — and the same link cannot be
-/// redeemed twice. A returning account reuses its principal row.
+/// principal, the invite redeemed by it — and, the link being unpinned and
+/// so reusable, it stays open: the same account re-joins idempotently (no
+/// second membership, not counted), a second account joins as another
+/// collaborator, and only revocation closes it. A returning account reuses
+/// its principal row.
 #[tokio::test]
 async fn complete_join_mints_principal_membership_and_credential_once() {
     let tmp = TempDb::new();
@@ -990,23 +995,140 @@ async fn complete_join_mints_principal_membership_and_credential_once() {
         .expect("row");
     assert!(invite.redeemed_at.is_some());
     assert_eq!(invite.redeemed_by_principal_id, Some(guest.clone()));
+    assert!(invite.is_reusable());
+    assert_eq!(invite.redemption_count, 1);
+    assert!(
+        invite.is_open_at(&now_iso()),
+        "an unpinned invite is reusable"
+    );
 
+    // Idempotent re-join of the same account: same principal, a fresh
+    // credential, no second membership, not counted as a redemption.
     let again = f
         .services
-        .complete_invite_join(&id, &identity("guest", 4242))
-        .await;
-    assert_eq!(invite_kind(&again), InviteErrorKind::Redeemed);
-
-    let second = f.create_invite(None).await;
-    let joined = f
-        .services
-        .complete_invite_join(&id_of(&second), &identity("guest-renamed", 4242))
+        .complete_invite_join(&id, &identity("guest-renamed", 4242))
         .await
-        .expect("second join");
-    assert_eq!(joined["principalId"], json!(guest.0));
+        .expect("re-join");
+    assert_eq!(again["principalId"], json!(guest.0));
+    let again_token = again["token"].as_str().expect("token");
+    assert_ne!(again_token, token);
     let row = f.store.get_principal(&guest).await.expect("principal");
     assert_eq!(row.login.as_deref(), Some("guest-renamed"));
     assert_eq!(f.store.count_principals().await.expect("count"), 4);
+    assert_eq!(
+        f.store
+            .get_workspace_invite(&id)
+            .await
+            .expect("get")
+            .expect("row")
+            .redemption_count,
+        1
+    );
+
+    // A second account redeems the same link: another collaborator.
+    let other = f
+        .services
+        .complete_invite_join(&id, &identity("other", 4343))
+        .await
+        .expect("second account joins");
+    let other = PrincipalId(other["principalId"].as_str().expect("pid").to_string());
+    assert_ne!(other, guest);
+    assert_eq!(
+        f.store
+            .get_workspace_member_role(&f.ws, &other)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Collaborator)
+    );
+    assert_eq!(f.store.count_principals().await.expect("count"), 5);
+    let invite = f
+        .store
+        .get_workspace_invite(&id)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(invite.redemption_count, 2);
+    assert_eq!(invite.redeemed_by_principal_id, Some(other));
+    assert!(invite.is_open_at(&now_iso()));
+
+    // Revocation is what closes it.
+    f.store.revoke_workspace_invite(&id).await.expect("revoke");
+    let third = f
+        .services
+        .complete_invite_join(&id, &identity("late", 4444))
+        .await;
+    assert_eq!(invite_kind(&third), InviteErrorKind::Revoked);
+    assert_eq!(f.store.count_principals().await.expect("count"), 5);
+}
+
+/// A pinned invite is single-use: its one redemption closes it, and a
+/// re-join by the pinned account is `Redeemed`.
+#[tokio::test]
+async fn complete_join_closes_a_pinned_invite_on_its_redemption() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let mut pinned = f
+        .store
+        .get_workspace_invite(&id_of(&created))
+        .await
+        .expect("get")
+        .expect("row");
+    pinned.id = "pinned".to_string();
+    pinned.secret_hash = hash_secret("pinned-secret");
+    pinned.pin_github_user_id = Some(5555);
+    pinned.pin_login = Some("pinned-login".to_string());
+    f.store
+        .insert_workspace_invite(&pinned)
+        .await
+        .expect("insert pinned");
+    assert!(!pinned.is_reusable());
+
+    f.services
+        .complete_invite_join("pinned", &identity("pinned-login", 5555))
+        .await
+        .expect("pinned account joins");
+    let row = f
+        .store
+        .get_workspace_invite("pinned")
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(row.redemption_count, 1);
+    assert!(!row.is_open_at(&now_iso()));
+    let again = f
+        .services
+        .complete_invite_join("pinned", &identity("pinned-login", 5555))
+        .await;
+    assert_eq!(invite_kind(&again), InviteErrorKind::Redeemed);
+    let r = f
+        .services
+        .invite_inspect_op("pinned", "pinned-secret")
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::Redeemed);
+}
+
+/// An expired reusable invite refuses a further redemption even though it
+/// was never closed by its earlier ones.
+#[tokio::test]
+async fn complete_join_refuses_an_expired_reusable_invite() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let id = id_of(&f.create_invite(None).await);
+    f.services
+        .complete_invite_join(&id, &identity("first", 1))
+        .await
+        .expect("first join");
+    sqlx::query("UPDATE workspace_invite SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+        .bind(&id)
+        .execute(f.store.write_pool())
+        .await
+        .expect("expire");
+    let r = f
+        .services
+        .complete_invite_join(&id, &identity("second", 2))
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::Expired);
 }
 
 /// A pinned invite admits only the pinned account id (the login may have
@@ -1250,20 +1372,34 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
     // owner + the demoted primary + the guest
     assert_eq!(ev.data["changes"]["memberCount"], json!(3));
 
-    // Single use, like the first-time join (with the live credential; the
-    // rotated-out one is refused before the invite is even looked at).
-    let again = f
-        .services
-        .invite_accept_op(&invite_id, &secret, &second_token)
-        .await;
-    assert_eq!(invite_kind(&again), InviteErrorKind::Redeemed);
+    // The rotated-out credential is refused before the invite is even
+    // looked at; the live one re-joins the reusable link idempotently (one
+    // more rotation, still a single membership).
     let stale = f
         .services
         .invite_accept_op(&invite_id, &secret, &first_token)
         .await;
     assert_eq!(invite_kind(&stale), InviteErrorKind::CredentialInvalid);
+    let again = f
+        .services
+        .invite_accept_op(&invite_id, &secret, &second_token)
+        .await
+        .expect("re-join a reusable link");
+    assert_eq!(again["principalId"], json!(guest.0));
+    let third_token = again["token"].as_str().expect("token").to_string();
+    assert_ne!(third_token, second_token);
+    assert_eq!(
+        f.store
+            .get_workspace_invite(&invite_id)
+            .await
+            .expect("get")
+            .expect("row")
+            .redemption_count,
+        1,
+        "a member's re-join is not a counted redemption"
+    );
 
-    // `revokeSelf` sees the one active credential the rotation left.
+    // `revokeSelf` sees the one active credential the rotations left.
     let revoked = with_caller(wire(&guest), f.services.principal_revoke_self_op())
         .await
         .expect("revoke self");
@@ -1754,12 +1890,13 @@ async fn prove_joins_on_a_matching_gist_and_consumes_the_nonce() {
         "member event: {batch:?}"
     );
 
-    // Spent nonce: the same proof does not join again.
+    // Spent nonce: the same proof does not join again (the unpinned invite
+    // itself is still open, so the refusal is the nonce's).
     let again = f
         .services
         .invite_prove_op(&invite_id, &secret, &nonce, "g1", "guest")
         .await;
-    assert_eq!(invite_kind(&again), InviteErrorKind::Redeemed);
+    assert_eq!(invite_kind(&again), InviteErrorKind::ProofInvalid);
 }
 
 /// Every `ProofInvalid` branch: a gist of another owner, a missing proof
@@ -1855,13 +1992,18 @@ async fn prove_refuses_mismatched_gists_and_spends_the_nonce() {
     let foreign = challenge(&f, &other_invite, &other_secret).await;
     let r = prove(&f, &foreign, "ok", "guest").await;
     assert_eq!(invite_kind(&r), InviteErrorKind::ProofInvalid);
-    // A closed invite is its kind, checked before the nonce is touched.
+    // A closed invite is its kind, checked before the nonce is touched (a
+    // join does not close the unpinned invite, revocation does).
     let n2 = challenge(&f, &invite_id, &secret).await;
     with_forge(&mut f, vec![("ok2", Ok(gist("guest", Some(&n2))))]);
     let r = prove(&f, &n2, "ok2", "guest").await.map(|_| ());
     assert!(r.is_ok(), "{r:?}");
+    f.store
+        .revoke_workspace_invite(&invite_id)
+        .await
+        .expect("revoke");
     let r = prove(&f, &n, "ok", "guest").await;
-    assert_eq!(invite_kind(&r), InviteErrorKind::Redeemed);
+    assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
     // Malformed claims are refused up front.
     let r = prove(&f, &n, "ok", "not a login!").await;
     assert!(matches!(r, Err(Error::InvalidParams(_))), "{r:?}");
@@ -2268,7 +2410,8 @@ async fn invite_create_refuses_at_the_guest_limit() {
 /// transaction: an open invite minted under a higher cap is `WorkspaceFull`
 /// once the cap drops to the seated count — nothing is written and the
 /// invite stays open — an account that is already a member re-joins without
-/// a seat, and the same invite admits a newcomer once the cap is raised.
+/// a seat, and the same (reusable) invite admits a newcomer once the cap is
+/// raised.
 #[tokio::test]
 async fn complete_join_refuses_a_full_workspace_and_keeps_the_invite_open() {
     let tmp = TempDb::new();
@@ -2300,18 +2443,28 @@ async fn complete_join_refuses_a_full_workspace_and_keeps_the_invite_open() {
     assert_eq!(rejoined["principalId"], json!(f.collaborator.0));
 
     set_cap(&registry, 3);
-    let id = id_of(&f.create_invite(None).await);
     let joined = f
         .services
         .complete_invite_join(&id, &identity("newcomer", 7001))
         .await
         .expect("join once the cap is raised");
     assert_eq!(joined["login"], json!("newcomer"));
-    assert_eq!(guest_summary(&f).await, (3, 3));
+    // Three collaborators plus the still-open reusable invite.
+    assert_eq!(guest_summary(&f).await, (4, 3));
+    assert_eq!(
+        invite_kind(
+            &f.services
+                .complete_invite_join(&id, &identity("late", 7002))
+                .await
+        ),
+        InviteErrorKind::WorkspaceFull,
+        "the cap is enforced on every redemption"
+    );
 }
 
 /// Concurrent joins on distinct open invites for the last seat: exactly one
-/// commits, the rest are `WorkspaceFull` with their invites still open.
+/// commits, the rest are `WorkspaceFull` with their invites still open (and
+/// so is the winner's, being reusable).
 #[tokio::test]
 async fn concurrent_joins_cannot_overshoot_the_guest_cap() {
     let tmp = TempDb::new();
@@ -2349,10 +2502,10 @@ async fn concurrent_joins_cannot_overshoot_the_guest_cap() {
             .await
             .expect("list")
             .len(),
-        2,
-        "refused joins leave their invites open"
+        3,
+        "refused joins leave their invites open; the reusable winner stays open too"
     );
-    assert_eq!(guest_summary(&f).await, (5, 3));
+    assert_eq!(guest_summary(&f).await, (6, 3));
 }
 
 // --- leave / revokeSelf ----------------------------------------------------

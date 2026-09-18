@@ -4612,13 +4612,14 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `workspace.invite.create` (multiplayer w4), service half: mint a
-    /// single-use invite for `workspace_id` → `{ invite, secret }`. The
-    /// plaintext `secret` is persisted next to its hash (migration `0128`)
-    /// so the owner can copy the link again later, but it never serialises
-    /// as a field: this result carries it exactly once, and afterwards it
-    /// reaches the wire only inside the rebuilt `url` of
-    /// `workspace_invite_list`. Owner-only.
+    /// `workspace.invite.create` (multiplayer w4), service half: mint an
+    /// invite for `workspace_id` → `{ invite, secret }`. Unpinned, the invite
+    /// is reusable until it expires or is revoked; pinned, it is single-use
+    /// (`invite.reusable` on the wire). The plaintext `secret` is persisted
+    /// next to its hash (migration `0128`) so the owner can copy the link
+    /// again later, but it never serialises as a field: this result carries
+    /// it exactly once, and afterwards it reaches the wire only inside the
+    /// rebuilt `url` of `workspace_invite_list`. Owner-only.
     /// Refused with `InviteErrorKind::GithubIdentityRequired` unless the
     /// owner's GitHub identity is linked; `pin_login` (a GitHub login) is
     /// resolved to its account id and stored as the pin
@@ -4678,7 +4679,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
     /// endpoint): validate `(invite_id, secret)` — the
     /// [`crate::InviteErrorKind`] refusals for an unknown / expired /
-    /// revoked / redeemed link — and answer `{ workspaceId, workspaceTitle }`
+    /// revoked / (pinned and) redeemed link — and answer `{ workspaceId, workspaceTitle }`
     /// without touching GitHub or issuing a nonce. The `/invite` transport
     /// extends the result with the host's `hostname` / `prettyHostname`
     /// (same sources as `system.status`), so a client can show the consent
