@@ -408,7 +408,8 @@ pub struct WorkspaceMembership {
     pub my_role: Option<WorkspaceRole>,
     /// Number of `workspace_member` rows (the owner counts).
     pub member_count: u64,
-    /// Open invitations (not redeemed, not revoked, not expired) awaiting
+    /// Open invitations (not revoked, not expired, and — pinned ones — not
+    /// redeemed; a reusable one stays open across redemptions) awaiting
     /// acceptance (multiplayer w4).
     pub open_invite_count: u64,
 }
@@ -5214,14 +5215,22 @@ impl PrincipalCredential {
     }
 }
 
-/// One `workspace_invite` row (multiplayer w4): a single-use, expiring link
-/// an owner minted so one person can join a workspace as a collaborator.
-/// Redemption matches the link secret against `secret_hash` (hex SHA-256);
-/// the plaintext `secret` is kept alongside (migration `0128`, `None` on
-/// older rows) only so the owner can copy the link again — it never
-/// serialises, reaching the wire solely inside a rebuilt `url`. An
-/// optional pin restricts redemption to one GitHub account, entered as a
-/// login but stored and compared as the stable `pin_github_user_id`.
+/// One `workspace_invite` row (multiplayer w4): an expiring link an owner
+/// minted so people can join a workspace as collaborators. Redemption
+/// matches the link secret against `secret_hash` (hex SHA-256); the
+/// plaintext `secret` is kept alongside (migration `0128`, `None` on older
+/// rows) only so the owner can copy the link again — it never serialises,
+/// reaching the wire solely inside a rebuilt `url`. An optional pin
+/// restricts redemption to one GitHub account, entered as a login but
+/// stored and compared as the stable `pin_github_user_id`.
+///
+/// Reuse is derived from the pin (migration `0129`): an **unpinned** invite
+/// is [`reusable`](Self::is_reusable) — any number of distinct accounts may
+/// redeem it until it expires or is revoked — while a **pinned** invite
+/// closes on its single redemption. `redeemed_at` /
+/// `redeemed_by_principal_id` name the *last* redemption and
+/// `redemption_count` the memberships the link created (a member re-joining
+/// through the same link is idempotent and not counted again).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceInvite {
@@ -5244,14 +5253,27 @@ pub struct WorkspaceInvite {
     pub redeemed_by_principal_id: Option<PrincipalId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<String>,
+    /// Memberships this link created so far.
+    #[serde(default)]
+    pub redemption_count: u64,
 }
 
 impl WorkspaceInvite {
+    /// Whether the invite stays open across redemptions: `true` when
+    /// unpinned, `false` when pinned to one GitHub account (single-use).
+    #[must_use]
+    pub fn is_reusable(&self) -> bool {
+        self.pin_github_user_id.is_none()
+    }
+
     /// Whether the invite can still be redeemed at `now` (ISO-8601 UTC,
-    /// compared lexically like every other timestamp column).
+    /// compared lexically like every other timestamp column): not revoked,
+    /// not expired, and — for a pinned, single-use invite — not yet redeemed.
     #[must_use]
     pub fn is_open_at(&self, now: &str) -> bool {
-        self.redeemed_at.is_none() && self.revoked_at.is_none() && self.expires_at.as_str() > now
+        (self.is_reusable() || self.redeemed_at.is_none())
+            && self.revoked_at.is_none()
+            && self.expires_at.as_str() > now
     }
 }
 
