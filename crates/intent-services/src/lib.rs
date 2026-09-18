@@ -28066,7 +28066,7 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
-        message: String,
+        mut message: String,
         priority: Option<String>,
         message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -28074,6 +28074,10 @@ impl WorkspaceApi for Services {
             self.require_member(&workspace_id).await?;
             let message_metadata =
                 crate::principal_ops::stamp_principal_attribution(message_metadata)?;
+            // Collaborator sender preamble (multiplayer): content-level
+            // counterpart of the stamp, collaborator members only.
+            self.annotate_collaborator_sender(&workspace_id, &mut message)
+                .await?;
             self.agent_send_to_task_op(
                 workspace_id,
                 task_note_id,
@@ -28089,7 +28093,7 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
-        content: String,
+        mut content: String,
         message_id: Option<String>,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
@@ -28113,6 +28117,15 @@ impl WorkspaceApi for Services {
             } else {
                 crate::principal_ops::strip_principal_attribution(message_metadata)
             };
+            // Collaborator sender preamble (multiplayer): the content-level
+            // counterpart of the stamp, applied once here so the runtime
+            // path and the store-only fallback persist what the model sees.
+            // Same gate as the stamp — only a user-origin send is a person
+            // speaking; the owner's content stays byte-identical.
+            if origin.is_user() {
+                self.annotate_collaborator_sender(&workspace_id, &mut content)
+                    .await?;
+            }
             // Attachment-reference validation (PROTOCOL §5.5) up front: the
             // runtime-manager path below never reaches
             // `agent_send_message_op`'s check.
@@ -28248,7 +28261,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         message_id: String,
-        content: String,
+        mut content: String,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
         model: Option<String>,
@@ -28259,6 +28272,10 @@ impl WorkspaceApi for Services {
             if let Some(model) = model.as_deref() {
                 reject_compound_model("model", model)?;
             }
+            // Collaborator sender preamble (multiplayer): the edited message
+            // is a fresh human-authored row by the editor.
+            self.annotate_collaborator_sender(&workspace_id, &mut content)
+                .await?;
             // Attachment-reference validation (PROTOCOL §5.5), same seam as
             // agent.sendMessage — before any state change.
             crate::agent_ops::validate_file_blocks(
@@ -28328,7 +28345,7 @@ impl WorkspaceApi for Services {
     fn agent_queue_message(
         &self,
         agent_id: AgentId,
-        content: String,
+        mut content: String,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
         message_metadata: Option<serde_json::Value>,
@@ -28340,6 +28357,10 @@ impl WorkspaceApi for Services {
             // carry it.
             let message_metadata =
                 crate::principal_ops::stamp_principal_attribution(message_metadata)?;
+            // Collaborator sender preamble (multiplayer): captured on the
+            // entry's content, so the drain persists what the model sees.
+            self.annotate_collaborator_sender_for_agent(&agent_id, &mut content)
+                .await?;
             self.agent_queue_message_op(
                 agent_id,
                 content,
@@ -28705,7 +28726,7 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
-        context_message: String,
+        mut context_message: String,
         mut input: intent_core::AgentWakeOrCreateInput,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
@@ -28720,6 +28741,10 @@ impl WorkspaceApi for Services {
             // message, whichever branch (wake / queue / create) carries it.
             input.message_metadata =
                 crate::principal_ops::stamp_principal_attribution(input.message_metadata)?;
+            // Collaborator sender preamble (multiplayer) on the same
+            // context message, every branch alike.
+            self.annotate_collaborator_sender(&workspace_id, &mut context_message)
+                .await?;
             self.agent_wake_or_create_op(workspace_id, task_note_id, context_message, input)
                 .await
         })

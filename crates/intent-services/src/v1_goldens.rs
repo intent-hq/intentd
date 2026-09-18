@@ -202,6 +202,54 @@ fn golden_a2a_sender_note() {
     }
 }
 
+/// The collaborator sender preamble (multiplayer) is a single plain-prose
+/// line naming the sender and their guest role: login + display name, then
+/// login alone, then display name alone, then the principal id. Control
+/// characters in either name collapse to spaces so a hostile profile
+/// cannot inject a second line.
+#[test]
+fn golden_collaborator_sender_preamble() {
+    let harness = crate::harness::latest();
+    assert_eq!(
+        harness.collaborator_sender_preamble(Some("octocat"), Some("The Octocat"), "p-1"),
+        "Message from @octocat (The Octocat), a collaborator (guest) of this workspace — not \
+         the workspace owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(Some("octocat"), None, "p-1"),
+        "Message from @octocat, a collaborator (guest) of this workspace — not the workspace \
+         owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(None, Some("The Octocat"), "p-1"),
+        "Message from The Octocat, a collaborator (guest) of this workspace — not the \
+         workspace owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(None, None, "p-1"),
+        "Message from principal p-1, a collaborator (guest) of this workspace — not the \
+         workspace owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(Some("evil\nlogin"), Some("  \n"), "p-1"),
+        "Message from @evil login, a collaborator (guest) of this workspace — not the \
+         workspace owner."
+    );
+    for preamble in [
+        harness.collaborator_sender_preamble(Some("octocat"), Some("The Octocat"), "p-1"),
+        harness.collaborator_sender_preamble(None, None, "p-1"),
+    ] {
+        assert!(
+            preamble.starts_with(crate::harness::v1::COLLABORATOR_SENDER_PREAMBLE_PREFIX),
+            "preamble must start with the stable prefix: {preamble}"
+        );
+        assert!(
+            !preamble.contains('\n'),
+            "preamble must be single-line: {preamble}"
+        );
+    }
+}
+
 // Deliberately redundant with the byte-exact table in
 // `agent_manager::tests` (queue-note context there); kept here so the
 // H0 baseline is self-contained. Update both together.
