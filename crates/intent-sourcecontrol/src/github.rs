@@ -583,6 +583,7 @@ pub(crate) fn map_check_run(value: Value) -> Result<CheckRun> {
             c.conclusion.as_deref(),
         ),
         url: c.html_url.or(c.details_url),
+        started_at: c.started_at,
     })
 }
 
@@ -816,6 +817,7 @@ mod dto {
         pub conclusion: Option<String>,
         pub html_url: Option<String>,
         pub details_url: Option<String>,
+        pub started_at: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -2224,12 +2226,19 @@ mod tests {
             "name": "build",
             "status": "completed",
             "conclusion": "failure",
+            "started_at": "2026-09-18T11:08:02Z",
             "details_url": "https://ci/run/1"
         }))
         .unwrap();
         assert_eq!(cr.name, "build");
         assert_eq!(cr.state, CheckState::Failure);
         assert_eq!(cr.url.as_deref(), Some("https://ci/run/1"));
+        assert_eq!(cr.started_at.as_deref(), Some("2026-09-18T11:08:02Z"));
+        // Internal tie-break signal only: the wire shape stays `{ name, state, url? }`.
+        assert!(serde_json::to_value(&cr)
+            .unwrap()
+            .get("startedAt")
+            .is_none());
     }
 
     #[test]

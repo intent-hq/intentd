@@ -321,6 +321,12 @@ pub struct CheckRun {
     pub name: String,
     pub state: CheckState,
     pub url: Option<String>,
+    /// When the run started (REST `started_at`, RFC 3339), used only to pick
+    /// the live run among same-name twins on a head (see
+    /// [`RollupCheck::started_at`]). Daemon-internal: never serialized, so
+    /// the documented `CheckRun` wire shape is unchanged.
+    #[serde(skip)]
+    pub started_at: Option<String>,
 }
 
 /// An issue (PRs excluded; gated by capabilities).

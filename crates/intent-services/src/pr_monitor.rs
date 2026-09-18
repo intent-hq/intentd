@@ -5128,48 +5128,46 @@ mod tests {
     /// Regression (intent-hq/intent#5372): a head carrying a live
     /// `completed/success` run AND an earlier `concurrency`-cancelled
     /// duplicate of the same workflow (whose gate job reports a genuine
-    /// `failure`) lists every check name twice in the rollup. Identical
-    /// forge data poll after poll must be a quiet poll — no `passed →
-    /// failed` burst, nothing pending, no wake — and the checklist reports
-    /// each name once as passed, whichever order the host lists the twins.
+    /// `failure`) lists every check name twice in the rollup — plus, here, an
+    /// untimed legacy status under the gate's name. The same forge data poll
+    /// after poll, in whichever order the host happens to list the nodes
+    /// each time, must be a quiet poll — no `passed → failed` burst, nothing
+    /// pending, no wake — and the checklist reports each name once as passed.
     #[tokio::test]
     async fn a_concurrency_cancelled_duplicate_run_does_not_flap_the_checks() {
-        let run = |name: &str, state: CheckState, started_at: &str| RollupCheck {
+        let run = |name: &str, state: CheckState, started_at: Option<&str>| RollupCheck {
             name: name.into(),
             state,
             is_required: name == "CI Gate",
             url: None,
-            started_at: Some(started_at.into()),
+            started_at: started_at.map(String::from),
         };
         let cancelled_first = vec![
-            run("CI Gate", CheckState::Failure, "2026-09-18T11:08:02Z"),
-            run("route", CheckState::Cancelled, "2026-09-18T11:08:02Z"),
-            run("CI Gate", CheckState::Success, "2026-09-18T11:32:04Z"),
-            run("route", CheckState::Success, "2026-09-18T11:32:04Z"),
+            run("CI Gate", CheckState::Failure, Some("2026-09-18T11:08:02Z")),
+            run("route", CheckState::Cancelled, Some("2026-09-18T11:08:02Z")),
+            run("CI Gate", CheckState::Success, Some("2026-09-18T11:32:04Z")),
+            run("route", CheckState::Success, Some("2026-09-18T11:32:04Z")),
+            run("CI Gate", CheckState::Failure, None),
         ];
         let cancelled_last = cancelled_first.iter().rev().cloned().collect::<Vec<_>>();
-        for checks in [cancelled_first, cancelled_last] {
-            let (_db, _root, svc, forge, ws, owner) = setup().await;
-            let svc = svc.with_pr_monitor_debounce_seconds(0);
-            forge.edit_quiet(|s| s.checks = checks.clone());
-            let (monitor, requirements) = svc
-                .pr_monitor_register(&ws, &owner, "o", "r", 42)
-                .await
-                .expect("register");
-            assert_eq!(requirements.checks.total, 2, "{:?}", requirements.checks);
-            assert_eq!(
-                (requirements.checks.passed, requirements.checks.failed),
-                (2, 0),
-                "{:?}",
-                requirements.checks
-            );
-            assert!(
-                requirements.checks.failing_required.is_empty(),
-                "{:?}",
-                requirements.checks
-            );
+        let assert_one_passed_each = |checks: &pr_ops::MergeRequirementsChecks| {
+            assert_eq!(checks.total, 2, "{checks:?}");
+            assert_eq!((checks.passed, checks.failed), (2, 0), "{checks:?}");
+            assert!(checks.failing_required.is_empty(), "{checks:?}");
+        };
 
-            svc.poll_pr_monitors().await;
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(0);
+        forge.edit_quiet(|s| s.checks = cancelled_first.clone());
+        let (monitor, requirements) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 42)
+            .await
+            .expect("register");
+        assert_one_passed_each(&requirements.checks);
+
+        // Same data, then reordered, then back: every poll is quiet.
+        for checks in [&cancelled_first, &cancelled_last, &cancelled_first] {
+            forge.edit_quiet(|s| s.checks = checks.clone());
             svc.poll_pr_monitors().await;
             let row = svc
                 .store()
@@ -5182,10 +5180,13 @@ mod tests {
                 row.pending_changes
             );
             assert!(row.last_change_at.is_none(), "{row:?}");
-            let text = owner_messages(&svc, &owner).await;
-            assert!(!text.contains("passed → failed"), "{text}");
-            assert!(!text.contains("pr_monitor_wake"), "no wake: {text}");
+            let snapshot: PrMonitorSnapshot =
+                serde_json::from_str(row.last_snapshot.as_deref().expect("snapshot")).unwrap();
+            assert_one_passed_each(&snapshot.requirements.checks);
         }
+        let text = owner_messages(&svc, &owner).await;
+        assert!(!text.contains("passed → failed"), "{text}");
+        assert!(!text.contains("pr_monitor_wake"), "no wake: {text}");
     }
 
     #[tokio::test]

@@ -15883,16 +15883,19 @@ mod pr {
                     name: "build".into(),
                     state: CheckState::Success,
                     url: None,
+                    started_at: None,
                 },
                 CheckRun {
                     name: "test".into(),
                     state: CheckState::Failure,
                     url: None,
+                    started_at: None,
                 },
                 CheckRun {
                     name: "lint".into(),
                     state: CheckState::Pending,
                     url: None,
+                    started_at: None,
                 },
             ])
         }
