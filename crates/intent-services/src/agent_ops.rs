@@ -8922,9 +8922,15 @@ impl Services {
         // so the preamble heads the first message. The task-note fallback is
         // note content, not the caller's text, and stays byte-identical; the
         // helper is a no-op for owner / administrator / agent / absent callers.
+        // The same caller-supplied text also carries the caller's principal
+        // stamp (`fromPrincipalId`, exactly what the `agent.sendMessage` front
+        // door stamps) so the served row's author resolves to the sender, not
+        // the workspace owner; the note-content fallback is left unstamped.
+        let mut message_metadata = None;
         if let Some(text) = message.as_mut() {
             self.annotate_collaborator_sender(&workspace_id, text)
                 .await?;
+            message_metadata = crate::principal_ops::stamp_principal_attribution(None)?;
         }
         // Load the linked task note whenever the delegation names one: the
         // note's title/body feeds the message fallback, the child name
@@ -9370,12 +9376,15 @@ impl Services {
                             workspace_id,
                             message,
                             None,
-                            crate::agent_manager::TurnOptions::default(),
+                            crate::agent_manager::TurnOptions {
+                                message_metadata: message_metadata.clone(),
+                                ..Default::default()
+                            },
                         )
                         .await
                 }
                 None => {
-                    self.agent_send_message_op(child, message, None, None, None, None)
+                    self.agent_send_message_op(child, message, None, None, None, message_metadata)
                         .await
                 }
             };
