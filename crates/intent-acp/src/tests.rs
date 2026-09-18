@@ -482,6 +482,68 @@ async fn stderr_capture_written_to_daily_log_file() {
     agent.kill().await.ok();
 }
 
+/// intent-hq/intent#4971: a bare provider command that is not on `PATH`
+/// (nothing resolved a provider binary, no npx fallback) fails with the typed
+/// [`AcpError::ProviderNotFound`] naming the bare-command tier — not an
+/// unclassified `Spawn("…: No such file or directory")`.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_classifies_missing_bare_command() {
+    use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+
+    let base = *intent_providers::find_provider("auggie").unwrap();
+    let provider = intent_providers::ProviderConfig {
+        command: "intentd-no-such-provider-command-4971",
+        base_args: &[],
+        ..base
+    };
+    let opts = SpawnOptions::new(&provider);
+    assert_eq!(opts.launch_target().0, LaunchMode::BareCommand);
+    let err = spawn_provider(&opts, ConnectionHooks::default())
+        .err()
+        .expect("missing bare command must fail to spawn");
+    assert!(
+        matches!(
+            &err,
+            AcpError::ProviderNotFound { command, launch: LaunchMode::BareCommand }
+                if command == "intentd-no-such-provider-command-4971"
+        ),
+        "expected ProviderNotFound(BareCommand), got {err:?}"
+    );
+    let rendered = err.to_string();
+    assert!(rendered.contains("bare command"), "{rendered}");
+    assert!(rendered.contains("providers.paths"), "{rendered}");
+}
+
+/// The resolved-binary tier is classified separately: an override / discovered
+/// path that no longer exists reports `ResolvedBinary`, not the bare command.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_classifies_missing_resolved_binary() {
+    use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+
+    let tmp = test_temp_dir("intent-acp-missing-bin-");
+    let missing = tmp.path().join("vanished-acp");
+    let provider = *intent_providers::find_provider("auggie").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.provider_binary = Some(&missing);
+    assert_eq!(opts.launch_target().0, LaunchMode::ResolvedBinary);
+    let err = spawn_provider(&opts, ConnectionHooks::default())
+        .err()
+        .expect("missing resolved binary must fail to spawn");
+    assert!(
+        matches!(
+            &err,
+            AcpError::ProviderNotFound { command, launch: LaunchMode::ResolvedBinary }
+                if *command == missing.display().to_string()
+        ),
+        "expected ProviderNotFound(ResolvedBinary), got {err:?}"
+    );
+    assert!(!err.to_string().contains("bare command"), "{err}");
+}
+
 /// Concatenate every daily capture file under `dir` (empty when the dir does
 /// not exist yet). Rotation-proof like the daily-log test above.
 async fn read_capture_dir(dir: &std::path::Path) -> String {
@@ -3597,6 +3659,22 @@ mod error_tests {
             (
                 AcpError::Spawn("pipe".into()),
                 "failed to spawn provider: pipe",
+            ),
+            (
+                AcpError::ProviderNotFound {
+                    command: "antigravity-acp".into(),
+                    launch: crate::spawn::LaunchMode::BareCommand,
+                },
+                "provider executable not found: `antigravity-acp` (bare command; no \
+                 providers.paths override or discovered binary resolved, so it was looked up \
+                 on the daemon PATH)",
+            ),
+            (
+                AcpError::ProviderNotFound {
+                    command: "/opt/x/bin/acp".into(),
+                    launch: crate::spawn::LaunchMode::ResolvedBinary,
+                },
+                "provider executable not found: `/opt/x/bin/acp` (resolved provider binary)",
             ),
             (AcpError::Transport("eof".into()), "transport closed: eof"),
             (AcpError::Timeout("foo".into()), "request `foo` timed out"),

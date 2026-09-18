@@ -3,6 +3,8 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::spawn::LaunchMode;
+
 /// Stable Display prefix of [`AcpError::PromptIdleTimeout`]. The service layer
 /// flattens prompt errors to strings at its wrap boundary
 /// (`session/prompt failed: …`), so downstream classification is
@@ -68,6 +70,20 @@ pub enum AcpError {
     /// The provider process could not be spawned or its pipes were missing.
     #[error("failed to spawn provider: {0}")]
     Spawn(String),
+
+    /// The program `spawn_provider` launched does not exist (`ENOENT`).
+    /// Structurally distinct from [`AcpError::Spawn`] so a missing **bare**
+    /// command — nothing resolved a provider binary and the `PATH` lookup
+    /// failed — is told apart from a resolved binary path that vanished (or
+    /// whose shebang interpreter / working directory is missing)
+    /// (intent-hq/intent#4971). `command` is the program as launched.
+    #[error("provider executable not found: `{command}` ({launch})")]
+    ProviderNotFound {
+        /// The program passed to the OS spawn.
+        command: String,
+        /// The launch tier that selected `command`.
+        launch: LaunchMode,
+    },
 
     /// The transport (writer/reader task or pipe) is closed or broke.
     #[error("transport closed: {0}")]

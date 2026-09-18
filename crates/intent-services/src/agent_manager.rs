@@ -8400,6 +8400,33 @@ impl AgentManager {
                 .await?;
             resolved.unsloth_endpoint = Some(endpoint);
         }
+        // Bare-command launch is the last-resort tier: nothing resolved a
+        // provider binary (no honored `providers.paths` override, no
+        // discovered install) and there is no npx fallback, so
+        // `spawn_provider` execs `provider.command` and relies on the daemon
+        // PATH. Record the tier and whether an override was configured at
+        // this moment, so a resulting `ProviderNotFound` failure is
+        // attributable from the daemon log alone — a missing effective
+        // override versus a rejected one (which `resolve_explicit_path`
+        // already warns about) (intent-hq/intent#4971). The mock provider
+        // always launches bare `node`.
+        if resolved.provider_binary.is_none()
+            && resolved.npx_fallback_binary.is_none()
+            && resolved.provider.id != "mock"
+        {
+            let override_configured = read_provider_path_setting(
+                &settings,
+                resolved.provider.primary_binary_provider_id(),
+            )
+            .is_some();
+            tracing::warn!(
+                agent_id = %agent_id,
+                provider_id = resolved.provider.id,
+                command = resolved.provider.command,
+                override_configured,
+                "no provider binary resolved; launching the bare command from the daemon PATH"
+            );
+        }
         let mut opts = SpawnOptions::new(&resolved.provider);
         opts.cwd = Some(&resolved.cwd);
         opts.model = resolved.model.as_deref();
@@ -15644,6 +15671,25 @@ mod retry_tests {
         let err =
             Error::Internal("provider auggie missing required env ANTHROPIC_API_KEY".to_string());
         assert!(!is_retryable_spawn_error(&err));
+    }
+
+    /// intent-hq/intent#4971: the typed bare-command ENOENT from
+    /// `spawn_provider` is a resolution failure, not a transient handshake
+    /// fault — retrying the same missing command cannot succeed, and the
+    /// classified text survives the `create_agent` wrap so `agent:failed`
+    /// names the launch tier instead of a raw OS error.
+    #[test]
+    fn provider_not_found_is_not_retryable_and_keeps_its_classification() {
+        let spawn = intent_acp::AcpError::ProviderNotFound {
+            command: "antigravity-acp".to_string(),
+            launch: intent_acp::LaunchMode::BareCommand,
+        };
+        let err = Error::Internal(format!("spawn provider failed: {spawn}"));
+        assert!(!is_retryable_spawn_error(&err));
+        let text = err.to_string();
+        assert!(text.contains("provider executable not found"), "{text}");
+        assert!(text.contains("bare command"), "{text}");
+        assert!(!text.contains("No such file"), "{text}");
     }
 
     #[test]

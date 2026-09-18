@@ -83,6 +83,24 @@ impl<'a> SpawnOptions<'a> {
             && self.npx_fallback_package.is_some()
     }
 
+    /// The launch tier this spawn will use and the program it execs:
+    /// `provider_binary` > npx fallback (both fields) > bare `provider.command`.
+    /// Single decision point shared by [`build_command`] and the spawn-failure
+    /// attribution in [`spawn_provider`].
+    #[must_use]
+    pub fn launch_target(&self) -> (LaunchMode, &'a std::ffi::OsStr) {
+        if let Some(p) = self.provider_binary {
+            (LaunchMode::ResolvedBinary, p.as_os_str())
+        } else if let (true, Some(npx)) = (self.via_npx(), self.npx_fallback_binary) {
+            (LaunchMode::NpxFallback, npx.as_os_str())
+        } else {
+            (
+                LaunchMode::BareCommand,
+                std::ffi::OsStr::new(self.provider.command),
+            )
+        }
+    }
+
     /// Construct options for a provider with all optional inputs unset.
     #[must_use]
     pub fn new(provider: &'a ProviderConfig) -> Self {
@@ -103,6 +121,35 @@ impl<'a> SpawnOptions<'a> {
             npx_fallback_package: None,
             node_max_old_space_mb: None,
         }
+    }
+}
+
+/// Which launch tier [`SpawnOptions::launch_target`] selected. Carried by
+/// [`AcpError::ProviderNotFound`] so a missing **bare** command (nothing
+/// resolved a provider binary and the `PATH` lookup failed) is told apart
+/// from a resolved binary path that vanished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// `provider_binary` — an explicit `providers.paths` override or a
+    /// discovered install — is exec'd directly.
+    ResolvedBinary,
+    /// No resolved binary; the provider's pinned npx package runs via npx.
+    NpxFallback,
+    /// No resolved binary and no npx fallback: the bare `provider.command`
+    /// is exec'd and resolution is left to the enriched `PATH`.
+    BareCommand,
+}
+
+impl std::fmt::Display for LaunchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ResolvedBinary => "resolved provider binary",
+            Self::NpxFallback => "npx fallback binary",
+            Self::BareCommand => {
+                "bare command; no providers.paths override or discovered binary resolved, \
+                 so it was looked up on the daemon PATH"
+            }
+        })
     }
 }
 
@@ -190,13 +237,7 @@ fn build_command_with_captured_env(
     let args = build_args(opts);
 
     // Decide which binary to spawn: provider_binary > npx_fallback (both fields) > provider.command
-    let command = if let Some(p) = opts.provider_binary {
-        p.as_os_str()
-    } else if let (true, Some(npx)) = (opts.via_npx(), opts.npx_fallback_binary) {
-        npx.as_os_str()
-    } else {
-        std::ffi::OsStr::new(opts.provider.command)
-    };
+    let (_, command) = opts.launch_target();
 
     let mut cmd = Command::new(command);
     cmd.args(&args);
@@ -339,16 +380,24 @@ impl SpawnedAgent {
 ///
 /// # Errors
 ///
-/// Returns [`AcpError::Spawn`] if the provider process cannot be started or its stdio pipes cannot be taken.
+/// Returns [`AcpError::ProviderNotFound`] when the launched program does not
+/// exist (`ENOENT`), naming the launch tier that was missing, and
+/// [`AcpError::Spawn`] for every other spawn failure or when the stdio pipes
+/// cannot be taken.
 pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
     let mut cmd = build_command(opts);
-    let command_name = opts.provider_binary.map_or_else(
-        || opts.provider.command.to_string(),
-        |p| p.display().to_string(),
-    );
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AcpError::Spawn(format!("{command_name}: {e}")))?;
+    let (launch, target) = opts.launch_target();
+    let command_name = target.to_string_lossy().into_owned();
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AcpError::ProviderNotFound {
+                command: command_name.clone(),
+                launch,
+            }
+        } else {
+            AcpError::Spawn(format!("{command_name}: {e}"))
+        }
+    })?;
     let stdin = child
         .stdin
         .take()

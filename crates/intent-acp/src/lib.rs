@@ -57,7 +57,7 @@ pub use permission::{
     PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
 };
 pub use session::{MappedToolCall, MappedUpdate};
-pub use spawn::{spawn_provider, SpawnOptions};
+pub use spawn::{spawn_provider, LaunchMode, SpawnOptions};
 pub use terminal::{TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo};
 pub use tool_restrictions::{
     get_native_tools_to_remove, get_tool_denylist_for_agent_type, get_tools_to_remove,
