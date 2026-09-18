@@ -199,6 +199,30 @@ pub(crate) fn prepend_collaborator_preamble(content: &mut String, preamble: &str
     *content = format!("{annotated_head}{content}");
 }
 
+/// [`prepend_collaborator_preamble`] over a transcript row's `content`
+/// `Value` (`agent.appendMessage`): a string is annotated in place; a
+/// content-block array is annotated on its first `type: "text"` block, or
+/// gains a leading text block carrying just the preamble when it has none
+/// (image / file-only rows) so the model still sees the sender. Any other
+/// shape carries no text the daemon can annotate and is left unchanged.
+pub(crate) fn prepend_collaborator_preamble_value(content: &mut Value, preamble: &str) {
+    match content {
+        Value::String(text) => prepend_collaborator_preamble(text, preamble),
+        Value::Array(blocks) => {
+            let first_text = blocks.iter_mut().find_map(|block| {
+                (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| block.get_mut("text"))
+                    .flatten()
+            });
+            match first_text {
+                Some(Value::String(text)) => prepend_collaborator_preamble(text, preamble),
+                _ => blocks.insert(0, json!({ "type": "text", "text": preamble })),
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `true` when the bound caller is a per-principal (collaborator-class)
 /// wire connection — the only caller class that can carry the
 /// collaborator sender preamble. Cheap pre-check so the owner / agent /
@@ -297,6 +321,23 @@ impl Services {
             .await?
         {
             prepend_collaborator_preamble(content, &preamble);
+        }
+        Ok(())
+    }
+
+    /// [`Self::annotate_collaborator_sender_for_agent`] over a transcript
+    /// row's `content` `Value` (`agent.appendMessage`, `user` rows), see
+    /// [`prepend_collaborator_preamble_value`] for the per-shape rule.
+    pub(crate) async fn annotate_collaborator_sender_value_for_agent(
+        &self,
+        agent_id: &intent_core::AgentId,
+        content: &mut Value,
+    ) -> Result<()> {
+        if let Some(preamble) = self
+            .collaborator_sender_preamble_for_agent(agent_id)
+            .await?
+        {
+            prepend_collaborator_preamble_value(content, &preamble);
         }
         Ok(())
     }

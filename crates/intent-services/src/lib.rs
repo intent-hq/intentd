@@ -27890,15 +27890,19 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         _workspace_id: Option<WorkspaceId>,
         role: String,
-        content: serde_json::Value,
+        mut content: serde_json::Value,
         metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
             // Principal stamp (multiplayer w2): a `user` row appended by a
             // wire caller is human-authored; any other role only has a
-            // client-supplied stamp stripped.
+            // client-supplied stamp stripped. A `user` row is model-facing
+            // on the next turn, so a collaborator's also carries the sender
+            // preamble (content-level counterpart of the stamp).
             let metadata = if role == "user" {
+                self.annotate_collaborator_sender_value_for_agent(&agent_id, &mut content)
+                    .await?;
                 crate::principal_ops::stamp_principal_attribution(metadata)?
             } else {
                 crate::principal_ops::strip_principal_attribution(metadata)
