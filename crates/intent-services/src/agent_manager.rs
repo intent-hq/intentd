@@ -7360,17 +7360,40 @@ impl AgentManager {
     /// without killing the child, threading a zero-output turn's preempted
     /// user message into `options.prepend_*` for combined delivery
     /// (monorepo#1014). A no-op when the agent is idle, or during turn
-    /// startup (no live handle / `acpSessionId` yet) where the keep-alive
-    /// interrupt would fall back to the `stop` kill path — the caller's send
-    /// then queues behind the starting turn instead.
+    /// startup (no live-turn slot registered yet: spawn / `initialize` /
+    /// `session/new` / `session/load`, including the relaunch of an evicted
+    /// child) where the keep-alive interrupt would have nothing to cancel —
+    /// the caller's send then queues behind the starting turn instead.
     async fn preempt_busy_turn(self: &Arc<Self>, agent_id: &AgentId, options: &mut TurnOptions) {
         if !self.is_busy(agent_id) {
             return;
         }
-        // Preempt only when a cancellable turn is live (handle +
-        // `acpSessionId`); during turn startup the keep-alive interrupt
-        // would fall back to the `stop` kill path, so skip it and let
-        // the caller queue behind the starting turn instead.
+        // Preempt only when a cancellable turn is live: the live-turn slot
+        // is registered by `run_prompt_turn` immediately before
+        // `session/prompt`, so its absence IS the startup window. A handle +
+        // stored `acpSessionId` check is not enough (intent-hq/intent#5380):
+        // a relaunching agent has the fresh child's handle installed before
+        // `start_session` resumes it, and the evicted process's
+        // `acpSessionId` is preserved for that resume, so the startup window
+        // read as cancellable and `interrupt_inner` emitted a bare interrupt
+        // `agent:stream:end` (no `messageId`) for a turn that was never in
+        // flight. Skip it and let the caller queue behind the starting turn.
+        //
+        // STAB-114: the same slot read tells whether the current turn has
+        // produced zero output (no assistant content chunks) BEFORE we
+        // cancel. Use the live-turn slot (not persisted transcript) to detect
+        // zero output: assistant rows are only persisted at turn END, so an
+        // interrupted mid-stream turn would incorrectly look like zero output
+        // if we checked the transcript. The LiveTurn.blocks are assistant
+        // blocks by construction (see Transcript::snapshot_blocks), so
+        // non-empty means output exists.
+        let Some(has_output) = self
+            .services
+            .live_turn(agent_id)
+            .map(|live| !live.blocks.is_empty())
+        else {
+            return;
+        };
         let cancellable = self.contains(agent_id)
             && self
                 .services
@@ -7383,17 +7406,6 @@ impl AgentManager {
         if !cancellable {
             return;
         }
-        // STAB-114: Check if the current turn has produced zero output
-        // (no assistant content chunks) BEFORE we cancel. Use the live-turn
-        // slot (not persisted transcript) to detect zero output: assistant
-        // rows are only persisted at turn END, so an interrupted mid-stream
-        // turn would incorrectly look like zero output if we checked the
-        // transcript. The LiveTurn.blocks are assistant blocks by construction
-        // (see Transcript::snapshot_blocks), so non-empty means output exists.
-        let has_output = self
-            .services
-            .live_turn(agent_id)
-            .is_some_and(|live| !live.blocks.is_empty());
 
         // Sender attribution for the interrupted row / `stream:end` payload:
         // a user-origin delivery is `{ kind: "user" }`; an agent-to-agent
@@ -14294,7 +14306,7 @@ mod dead_child_respawn_tests {
     /// Insert a fresh agent session on provider `mock` with a cached acp
     /// session id (the provider is immutable once set, so it must be seeded
     /// at insert time, not patched onto `manager_with`'s default agent).
-    async fn seed_mock_session(mgr: &AgentManager, agent_id: &AgentId, acp: &str) {
+    pub(super) async fn seed_mock_session(mgr: &AgentManager, agent_id: &AgentId, acp: &str) {
         let mut s = session(agent_id, &WorkspaceId::from("ws-1"), None);
         s.provider = Some("mock".to_string());
         s.acp_session_id = Some(acp.to_string());
@@ -14477,6 +14489,84 @@ mod dead_child_respawn_tests {
             "only the mapping drops out; the handle awaits the exit watcher"
         );
         mgr.stop(&agent_id).await;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod startup_preempt_tests {
+    //! Regression for intent-hq/intent#5380: an interrupt-priority delivery
+    //! landing in a relaunching agent's turn-startup window must not preempt.
+    //! After an eviction the persisted `acpSessionId` still names the
+    //! previous process's session, and `create_agent` installs the fresh
+    //! child's handle BEFORE `start_session` resumes it — so a handle +
+    //! stored id check read the startup window as a cancellable turn even
+    //! though no live-turn slot exists, and `interrupt_inner` emitted a bare
+    //! interrupt `agent:stream:end` (no `messageId`) for nothing.
+
+    use super::dead_child_respawn_tests::{install_fake_handle, seed_mock_session};
+    use super::role_reminder_tests::manager_with;
+    use super::tests::EnvGuard;
+    use super::*;
+    use intent_core::events::AGENT_STREAM_END;
+
+    #[tokio::test]
+    async fn preempt_skips_relaunch_startup_window_without_live_turn() {
+        let _env = EnvGuard::apply(&[("MOCK_AGENT_KILLS_ON_INTERRUPT", None)]);
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = Arc::new(mgr);
+        let ws = WorkspaceId::from("ws-1");
+        let agent_id = AgentId::from("agent-5380-relaunch");
+        // The previous (evicted) process's session id is what the store holds.
+        seed_mock_session(&mgr, &agent_id, "acp-previous-process").await;
+        // Relaunch window: the turn worker owns the busy slot and the fresh
+        // child's handle is installed, but `start_session` has not resumed
+        // the session yet — no live-turn slot has been registered.
+        assert!(
+            mgr.try_begin(&agent_id, &ws).await,
+            "worker claims the slot"
+        );
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+        assert!(mgr.services.live_turn(&agent_id).is_none());
+
+        let mut options = TurnOptions {
+            interrupt_priority: true,
+            ..TurnOptions::default()
+        };
+        mgr.preempt_busy_turn(&agent_id, &mut options).await;
+
+        assert!(
+            mgr.is_busy(&agent_id),
+            "the starting turn keeps its slot; the interrupt queues behind it"
+        );
+        let ends = mgr
+            .services
+            .store
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![AGENT_STREAM_END.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query agent:stream:end events");
+        assert!(
+            ends.is_empty(),
+            "no bare interrupt terminal for a turn that was never in flight: {ends:?}"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .expect("read transcript");
+        assert!(
+            messages.is_empty(),
+            "no interrupted marker row persisted: {messages:?}"
+        );
+        assert!(
+            mgr.contains(&agent_id),
+            "the relaunching child's handle is left alone"
+        );
+        mgr.end_turn(&agent_id).await;
     }
 }
 

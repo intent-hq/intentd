@@ -8593,8 +8593,12 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
         .set_acp_session_id(&ws, &id, "acp-int-send")
         .await
         .unwrap();
-    // Claim the in-flight slot so the send sees a busy (mid-turn) agent.
+    // Claim the in-flight slot and register the live-turn slot so the send
+    // sees a busy (mid-turn) agent past `session/prompt` — without the live
+    // slot the busy agent is still in its startup window and the preemption
+    // is skipped (intent-hq/intent#5380).
     assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services.set_live_turn(&id, "msg-int-send", Vec::new());
 
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let result = mgr
@@ -9918,8 +9922,10 @@ async fn send_queued_message_now_preempts_busy_turn_without_kill() {
         .await
         .expect("queue");
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
-    // Claim the in-flight slot so the send sees a busy (mid-turn) agent.
+    // Claim the in-flight slot and register the live-turn slot so the send
+    // sees a busy (mid-turn) agent past `session/prompt` (intent-hq/intent#5380).
     assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services.set_live_turn(&id, "msg-sqmn-busy", Vec::new());
 
     let result = mgr
         .send_queued_message_now(id.clone(), ws.clone(), entry_id.clone())
@@ -10446,8 +10452,11 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
         .set_acp_session_id(&ws, &id, "acp-int-noidle")
         .await
         .unwrap();
-    // Claim the in-flight slot so the send preempts a busy (mid-turn) agent.
+    // Claim the in-flight slot and register the live-turn slot so the send
+    // preempts a busy (mid-turn) agent past `session/prompt` (intent-hq/intent#5380).
     assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .set_live_turn(&id, "msg-int-noidle", Vec::new());
 
     // Prime intent-core's process-wide login-shell PATH capture (OnceLock;
     // on Unix the first use spawns `$SHELL -ilc`, up to 5s — a no-op
@@ -10593,8 +10602,10 @@ async fn duplicate_interrupt_send_same_message_id_preempts_once() {
         .set_acp_session_id(&ws, &id, "acp-int-dup")
         .await
         .unwrap();
-    // Claim the in-flight slot so the first delivery preempts a busy turn.
+    // Claim the in-flight slot and register the live-turn slot so the first
+    // delivery preempts a busy turn past `session/prompt` (intent-hq/intent#5380).
     assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services.set_live_turn(&id, "msg-int-dup", Vec::new());
 
     let first = mgr
         .interrupt_send_message(

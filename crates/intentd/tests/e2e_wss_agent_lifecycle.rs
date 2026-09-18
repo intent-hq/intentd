@@ -2390,6 +2390,29 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
          agent:idle (reason: interrupted) on the wire"
     );
 
+    // The turn-2 `stream:end` lands BEFORE the worker releases the in-flight
+    // slot (`end_turn`); an interrupt-priority send in that teardown window
+    // is busy-with-no-live-turn and queues behind the finishing turn rather
+    // than preempting a turn that already completed (intent-hq/intent#5380).
+    // Wait for the idle status flip — published only after the slot release
+    // — so the send below meets a genuinely idle agent.
+    let mut saw_idle_status = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:status-changed"
+            && ev["data"]["agentId"].as_str() == Some(agent_id.as_str())
+            && ev["data"]["isActive"] == json!(false)
+        {
+            saw_idle_status = true;
+            break;
+        }
+    }
+    assert!(
+        saw_idle_status,
+        "the interrupt turn's end_turn published the idle status flip"
+    );
+
     // Idle fall-through + liveness: another interrupt-priority send now behaves
     // like a plain send and the SAME child answers turn=3 — the agent survived
     // both interrupts (never killed, never failed, never restarted).
