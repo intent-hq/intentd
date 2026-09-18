@@ -891,6 +891,71 @@ fn check_status_word(state: CheckState) -> &'static str {
     }
 }
 
+/// One run of a named check, before the checklist collapses same-name runs.
+struct CheckRunSignal {
+    name: String,
+    state: CheckState,
+    required: bool,
+    url: Option<String>,
+    started_at: Option<OffsetDateTime>,
+}
+
+/// Tie-break between same-name runs whose start order is unknown: an
+/// in-flight re-run over any completed outcome, a real failure over a
+/// success, and a `cancelled` run last — a `concurrency`-cancelled duplicate
+/// must never shadow the run that actually completed.
+fn check_state_rank(state: CheckState) -> u8 {
+    match state {
+        CheckState::Pending => 4,
+        CheckState::Failure => 3,
+        CheckState::Success => 2,
+        CheckState::Neutral => 1,
+        CheckState::Cancelled => 0,
+    }
+}
+
+/// Whether `candidate` is the live run of its name over `held`: the later
+/// start wins (a re-run, or the run that superseded a `concurrency`-cancelled
+/// duplicate — intent-hq/intent#5372), and [`check_state_rank`] decides when
+/// the starts are equal or unreported. Ties keep `held`.
+fn supersedes(candidate: &CheckRunSignal, held: &CheckRunSignal) -> bool {
+    match (candidate.started_at, held.started_at) {
+        (Some(c), Some(h)) if c != h => c > h,
+        _ => check_state_rank(candidate.state) > check_state_rank(held.state),
+    }
+}
+
+/// One checklist entry per check name. A head that carries several runs of
+/// the same check (a concurrency-cancelled duplicate beside the live run, a
+/// re-run beside its predecessor) is collapsed onto the live run per
+/// [`supersedes`]; the first occurrence keeps its position, and the name is
+/// required when any of its runs is.
+fn dedupe_checks(runs: impl IntoIterator<Item = CheckRunSignal>) -> Vec<MergeRequirementCheck> {
+    let mut slots: HashMap<String, usize> = HashMap::new();
+    let mut kept: Vec<CheckRunSignal> = Vec::new();
+    for run in runs {
+        if let Some(&i) = slots.get(&run.name) {
+            let held = &mut kept[i];
+            let required = held.required | run.required;
+            if supersedes(&run, held) {
+                *held = run;
+            }
+            held.required = required;
+        } else {
+            slots.insert(run.name.clone(), kept.len());
+            kept.push(run);
+        }
+    }
+    kept.into_iter()
+        .map(|run| MergeRequirementCheck {
+            name: run.name,
+            status: check_status_word(run.state).to_string(),
+            required: run.required,
+            url: run.url,
+        })
+        .collect()
+}
+
 /// Compose the merge-requirements checklist (§ task 1) from a PR snapshot, the
 /// host's merge-requirement signals, the aggregated reviews, and the
 /// unresolved-thread count (`None` when the resolution state was unreadable).
@@ -925,24 +990,20 @@ pub(crate) fn merge_requirements(
         .filter(|s| s.checks_known)
         .map(|s| s.checks.as_slice());
     let items: Vec<MergeRequirementCheck> = match rollup {
-        Some(checks) => checks
-            .iter()
-            .map(|c| MergeRequirementCheck {
-                name: c.name.clone(),
-                status: check_status_word(c.state).to_string(),
-                required: c.is_required,
-                url: c.url.clone(),
-            })
-            .collect(),
-        None => fallback_runs
-            .iter()
-            .map(|r| MergeRequirementCheck {
-                name: r.name.clone(),
-                status: check_status_word(r.state).to_string(),
-                required: false,
-                url: r.url.clone(),
-            })
-            .collect(),
+        Some(checks) => dedupe_checks(checks.iter().map(|c| CheckRunSignal {
+            name: c.name.clone(),
+            state: c.state,
+            required: c.is_required,
+            url: c.url.clone(),
+            started_at: c.started_at.as_deref().and_then(parse_iso),
+        })),
+        None => dedupe_checks(fallback_runs.iter().map(|r| CheckRunSignal {
+            name: r.name.clone(),
+            state: r.state,
+            required: false,
+            url: r.url.clone(),
+            started_at: None,
+        })),
     };
     let tally = |word: &str| {
         i64::try_from(items.iter().filter(|c| c.status == word).count()).expect("value fits in i64")
@@ -1835,6 +1896,7 @@ mod tests {
             state,
             is_required: required,
             url: None,
+            started_at: None,
         }
     }
 
@@ -1975,6 +2037,145 @@ mod tests {
         assert_eq!(req.checks.total, 2);
         assert!(!req.checks.required_known);
         assert_eq!(req.merge_state_status.as_deref(), Some("UNSTABLE"));
+    }
+
+    /// Regression (intent-hq/intent#5372): a head carrying two runs of the
+    /// same workflow — the live `completed/success` run and an earlier
+    /// `concurrency`-cancelled duplicate whose gate job reports a genuine
+    /// `failure` — reports ONE `passed` entry per check name, whichever
+    /// order the host lists the nodes in: the latest-started run is the
+    /// live one, so the tally never counts the superseded twin and never
+    /// depends on rollup order. Without start times a genuine failure
+    /// still wins over a same-name success, an in-flight re-run over any
+    /// completed outcome, and a cancelled run over nothing.
+    #[test]
+    fn merge_requirements_dedupes_same_name_checks_by_live_outcome() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let signals = |checks: Vec<RollupCheck>| MergeRequirementSignals {
+            merge_state_status: Some("CLEAN".into()),
+            checks,
+            checks_known: true,
+            ..Default::default()
+        };
+        // The superseding run started 24 minutes after the duplicate.
+        let live = |name: &str, state: CheckState| RollupCheck {
+            url: Some(format!("https://ci/live/{name}")),
+            started_at: Some("2026-09-18T11:32:04Z".into()),
+            ..rollup(name, state, true)
+        };
+        let dup = |name: &str, state: CheckState| RollupCheck {
+            url: Some(format!("https://ci/dup/{name}")),
+            started_at: Some("2026-09-18T11:08:02Z".into()),
+            ..rollup(name, state, true)
+        };
+
+        let cancelled_first = vec![
+            dup("CI Gate", CheckState::Failure),
+            dup("route", CheckState::Cancelled),
+            live("CI Gate", CheckState::Success),
+            live("route", CheckState::Success),
+        ];
+        let cancelled_last = cancelled_first.iter().rev().cloned().collect::<Vec<_>>();
+        for order in [cancelled_first, cancelled_last] {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 2, "{:?}", req.checks.items);
+            assert_eq!(
+                (req.checks.passed, req.checks.failed, req.checks.pending),
+                (2, 0, 0),
+                "{:?}",
+                req.checks.items
+            );
+            assert!(req.checks.failing_required.is_empty(), "{:?}", req.checks);
+            let gate = req
+                .checks
+                .items
+                .iter()
+                .find(|c| c.name == "CI Gate")
+                .expect("one CI Gate entry");
+            assert_eq!(gate.status, "passed");
+            assert!(gate.required);
+            assert_eq!(gate.url.as_deref(), Some("https://ci/live/CI Gate"));
+        }
+
+        // A later re-run that failed IS the live outcome, whichever side it
+        // is listed on — the latest start decides, not the friendlier state.
+        let rerun = |name: &str, state: CheckState| RollupCheck {
+            started_at: Some("2026-09-18T12:00:00Z".into()),
+            ..rollup(name, state, true)
+        };
+        for order in [
+            vec![
+                live("test", CheckState::Success),
+                rerun("test", CheckState::Failure),
+            ],
+            vec![
+                rerun("test", CheckState::Failure),
+                live("test", CheckState::Success),
+            ],
+        ] {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1);
+            assert_eq!((req.checks.passed, req.checks.failed), (0, 1));
+            assert_eq!(req.checks.failing_required, vec!["test".to_string()]);
+        }
+
+        // Without start times (legacy statuses, hosts that omit them) the
+        // state decides: a failure over a success, an in-flight run over any
+        // completed twin, and a cancelled run only when it is alone.
+        let untimed = |name: &str, state: CheckState| rollup(name, state, true);
+        for order in [
+            vec![
+                untimed("lint", CheckState::Success),
+                untimed("lint", CheckState::Failure),
+            ],
+            vec![
+                untimed("lint", CheckState::Failure),
+                untimed("lint", CheckState::Success),
+            ],
+        ] {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!((req.checks.passed, req.checks.failed), (0, 1));
+        }
+        let req = merge_requirements(
+            &p,
+            Some(&signals(vec![
+                untimed("e2e", CheckState::Failure),
+                untimed("e2e", CheckState::Pending),
+                untimed("docs", CheckState::Cancelled),
+                untimed("docs", CheckState::Success),
+            ])),
+            &[],
+            &agg(0, 0),
+            Some(0),
+        );
+        assert_eq!(
+            (req.checks.passed, req.checks.failed, req.checks.pending),
+            (1, 0, 1),
+            "{:?}",
+            req.checks.items
+        );
+        assert_eq!(req.checks.pending_required, vec!["e2e".to_string()]);
+
+        // The REST check-runs fallback dedupes the same way.
+        let runs = vec![
+            CheckRun {
+                name: "build".into(),
+                state: CheckState::Cancelled,
+                url: None,
+            },
+            CheckRun {
+                name: "build".into(),
+                state: CheckState::Success,
+                url: Some("https://ci/live/build".into()),
+            },
+        ];
+        let req = merge_requirements(&p, None, &runs, &agg(0, 0), Some(0));
+        assert_eq!(req.checks.total, 1);
+        assert_eq!((req.checks.passed, req.checks.failed), (1, 0));
+        assert_eq!(
+            req.checks.items[0].url.as_deref(),
+            Some("https://ci/live/build")
+        );
     }
 
     #[test]

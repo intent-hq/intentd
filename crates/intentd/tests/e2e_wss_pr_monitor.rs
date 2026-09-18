@@ -342,6 +342,7 @@ impl SourceControl for StubForge {
                     state: *state,
                     is_required: *required,
                     url: None,
+                    started_at: None,
                 })
                 .collect(),
             checks_known: true,

@@ -901,6 +901,7 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
                     name
                     status
                     conclusion
+                    startedAt
                     detailsUrl
                     isRequired(pullRequestNumber: $prNumber)
                   }
@@ -1010,6 +1011,7 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!) {
                     name
                     status
                     conclusion
+                    startedAt
                     detailsUrl
                     isRequired(pullRequestNumber: $prNumber)
                   }
@@ -1248,7 +1250,7 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
         .get("isRequired")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let url = |key: &str| value.get(key).and_then(Value::as_str).map(String::from);
+    let text = |key: &str| value.get(key).and_then(Value::as_str).map(String::from);
     match value.get("__typename").and_then(Value::as_str) {
         Some("StatusContext") => Some(RollupCheck {
             name: value
@@ -1263,7 +1265,8 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
                     .unwrap_or_default(),
             ),
             is_required,
-            url: url("targetUrl"),
+            url: text("targetUrl"),
+            started_at: None,
         }),
         Some("CheckRun") => {
             let status = value
@@ -1283,7 +1286,8 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
                     .to_string(),
                 state: derive_check_state(&status, conclusion.as_deref()),
                 is_required,
-                url: url("detailsUrl"),
+                url: text("detailsUrl"),
+                started_at: text("startedAt"),
             })
         }
         _ => None,
@@ -2527,6 +2531,7 @@ mod tests {
             "name": "build",
             "status": "COMPLETED",
             "conclusion": "SUCCESS",
+            "startedAt": "2026-09-18T11:32:04Z",
             "detailsUrl": "https://ci/run/1",
             "isRequired": true
         }))
@@ -2535,6 +2540,7 @@ mod tests {
         assert_eq!(check.state, CheckState::Success);
         assert!(check.is_required);
         assert_eq!(check.url.as_deref(), Some("https://ci/run/1"));
+        assert_eq!(check.started_at.as_deref(), Some("2026-09-18T11:32:04Z"));
 
         // An in-flight check-run is pending regardless of conclusion.
         let pending = map_rollup_context(&json!({
@@ -2547,6 +2553,7 @@ mod tests {
         .unwrap();
         assert_eq!(pending.state, CheckState::Pending);
         assert!(!pending.is_required);
+        assert_eq!(pending.started_at, None);
 
         let status = map_rollup_context(&json!({
             "__typename": "StatusContext",
@@ -2613,6 +2620,7 @@ mod tests {
                 state: CheckState::Pending,
                 is_required: true,
                 url: None,
+                started_at: None,
             }],
             checks_known: true,
             branch_rules: Some(BranchRules {

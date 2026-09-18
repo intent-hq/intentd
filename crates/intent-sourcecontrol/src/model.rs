@@ -430,6 +430,14 @@ pub struct RollupCheck {
     /// that need the distinction consult [`MergeRequirementSignals`].
     pub is_required: bool,
     pub url: Option<String>,
+    /// When the check-run started (GraphQL `CheckRun.startedAt`, RFC 3339).
+    /// `None` for legacy commit statuses and hosts that do not report it.
+    /// A head that carries several runs of the same check (a re-run, or a
+    /// `concurrency`-cancelled duplicate beside the live run) is resolved
+    /// onto the latest start, matching how the host reports the required
+    /// check's state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
 }
 
 /// Merge-relevant branch rules for a pull request's base branch (GitHub

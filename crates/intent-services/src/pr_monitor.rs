@@ -3688,6 +3688,7 @@ mod tests {
                     state: CheckState::Pending,
                     is_required: true,
                     url: None,
+                    started_at: None,
                 }],
                 merge_queue_removal: None,
                 fail_get_pr: false,
@@ -5122,6 +5123,69 @@ mod tests {
         assert!(second.pending_changes.is_empty());
         assert_ne!(second.last_snapshot, first.last_snapshot, "baseline moved");
         assert_eq!(svc.pr_monitors_for_agent(&owner).await.unwrap().len(), 1);
+    }
+
+    /// Regression (intent-hq/intent#5372): a head carrying a live
+    /// `completed/success` run AND an earlier `concurrency`-cancelled
+    /// duplicate of the same workflow (whose gate job reports a genuine
+    /// `failure`) lists every check name twice in the rollup. Identical
+    /// forge data poll after poll must be a quiet poll — no `passed →
+    /// failed` burst, nothing pending, no wake — and the checklist reports
+    /// each name once as passed, whichever order the host lists the twins.
+    #[tokio::test]
+    async fn a_concurrency_cancelled_duplicate_run_does_not_flap_the_checks() {
+        let run = |name: &str, state: CheckState, started_at: &str| RollupCheck {
+            name: name.into(),
+            state,
+            is_required: name == "CI Gate",
+            url: None,
+            started_at: Some(started_at.into()),
+        };
+        let cancelled_first = vec![
+            run("CI Gate", CheckState::Failure, "2026-09-18T11:08:02Z"),
+            run("route", CheckState::Cancelled, "2026-09-18T11:08:02Z"),
+            run("CI Gate", CheckState::Success, "2026-09-18T11:32:04Z"),
+            run("route", CheckState::Success, "2026-09-18T11:32:04Z"),
+        ];
+        let cancelled_last = cancelled_first.iter().rev().cloned().collect::<Vec<_>>();
+        for checks in [cancelled_first, cancelled_last] {
+            let (_db, _root, svc, forge, ws, owner) = setup().await;
+            let svc = svc.with_pr_monitor_debounce_seconds(0);
+            forge.edit_quiet(|s| s.checks = checks.clone());
+            let (monitor, requirements) = svc
+                .pr_monitor_register(&ws, &owner, "o", "r", 42)
+                .await
+                .expect("register");
+            assert_eq!(requirements.checks.total, 2, "{:?}", requirements.checks);
+            assert_eq!(
+                (requirements.checks.passed, requirements.checks.failed),
+                (2, 0),
+                "{:?}",
+                requirements.checks
+            );
+            assert!(
+                requirements.checks.failing_required.is_empty(),
+                "{:?}",
+                requirements.checks
+            );
+
+            svc.poll_pr_monitors().await;
+            svc.poll_pr_monitors().await;
+            let row = svc
+                .store()
+                .get_pr_monitor(&monitor.monitor_id)
+                .await
+                .unwrap();
+            assert!(
+                row.pending_changes.is_empty(),
+                "identical forge data must be a quiet poll: {:?}",
+                row.pending_changes
+            );
+            assert!(row.last_change_at.is_none(), "{row:?}");
+            let text = owner_messages(&svc, &owner).await;
+            assert!(!text.contains("passed → failed"), "{text}");
+            assert!(!text.contains("pr_monitor_wake"), "no wake: {text}");
+        }
     }
 
     #[tokio::test]
@@ -7368,6 +7432,7 @@ mod tests {
             state: CheckState::Failure,
             is_required: false,
             url: None,
+            started_at: None,
         });
         s.merge_queue_removal = Some(intent_sourcecontrol::MergeQueueRemoval {
             at: "2026-08-26T22:26:36Z".into(),
