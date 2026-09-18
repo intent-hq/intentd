@@ -30509,13 +30509,18 @@ impl WorkspaceApi for Services {
         })
     }
 
-    /// `hook.list`: hooks in a workspace, optionally one agent's.
+    /// `hook.list`: hooks in a workspace, optionally one agent's; active
+    /// only by default, retired rows as a light projection on request.
     fn hook_list(
         &self,
         workspace_id: WorkspaceId,
         agent_id: Option<AgentId>,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.hook_list_op(&workspace_id, agent_id.as_ref()).await })
+        Box::pin(async move {
+            self.hook_list_op(&workspace_id, agent_id.as_ref(), include_retired)
+                .await
+        })
     }
 
     /// `hook.get` (MCP-only): one hook row (including `code`) by id, active

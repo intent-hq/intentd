@@ -2119,7 +2119,7 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":12,"method":"hook.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":12,"method":"hook.list","params":{{"workspaceId":"{ws_id}","includeRetired":true}}}}"#
         ),
     )
     .await;

@@ -486,12 +486,16 @@ async fn hook_lifecycle_over_wss() {
     );
     // Retired-hook recovery: `ws.hook.get` on the dispatcher AFTER it retired
     // must return the full row — original `code` included — through the real
-    // prelude → ACP callback → service → store route.
+    // prelude → ACP callback → service → store route. The retired row is only
+    // listed with `includeRetired: true`, and then WITHOUT `code` (the light
+    // projection) — `ws.hook.get` is the recovery path.
     let get_retired_js = format!(
-        "const hooks = await ws.hook.list(); \
+        "const hooks = await ws.hook.list({{ includeRetired: true }}); \
          const retired = hooks.find(h => h.name === 'dispatcher'); \
          const row = await ws.hook.get(retired.hookId); \
          const out = ['getState=' + row.state]; \
+         out.push('listCodeOmitted=' + (retired.code === undefined)); \
+         out.push('listedByDefault=' + (await ws.hook.list()).some(h => h.name === 'dispatcher')); \
          out.push('codeMatch=' + (row.code === {code})); \
          out.push('idMatch=' + (row.hookId === retired.hookId)); \
          return out.join(' ');",
@@ -862,24 +866,47 @@ async fn hook_lifecycle_over_wss() {
         "agent.get serves waitingOnHooks for the hook-owning agent: {got}"
     );
 
-    // FE read: hook.list reports both hooks with the wire `{ hooks }` shape.
+    // FE read: a bare hook.list is ACTIVE-only (intent-hq/intent#5307) — the
+    // retired dispatcher is absent and the watcher row is the full shape,
+    // `code` included.
     let listed = wss_rpc(&mut rpc, 201, "hook.list", json!({ "workspaceId": ws_id })).await;
     let hooks = listed["hooks"].as_array().expect("hooks array");
-    assert_eq!(hooks.len(), 2, "dispatcher + watcher listed: {listed}");
-    let watcher = hooks
-        .iter()
-        .find(|h| h["hookId"] == json!(watcher_id))
-        .unwrap_or_else(|| panic!("watcher in hook.list: {listed}"));
+    assert_eq!(hooks.len(), 1, "active watcher only by default: {listed}");
+    let watcher = &hooks[0];
+    assert_eq!(watcher["hookId"], json!(watcher_id));
     assert_eq!(watcher["name"], "watcher");
     assert_eq!(watcher["state"], "scheduled");
     assert_eq!(watcher["delayMs"], 60_000);
     assert_eq!(watcher["agentId"], json!(agent_id));
     assert_eq!(watcher["runCount"], 1, "validation run counted: {watcher}");
+    assert!(
+        watcher["code"].is_string(),
+        "active rows keep `code`: {watcher}"
+    );
+    // `includeRetired: true` reports both hooks; the retired dispatcher is
+    // the light projection (no code / lastState / lastLogs).
+    let listed = wss_rpc(
+        &mut rpc,
+        209,
+        "hook.list",
+        json!({ "workspaceId": ws_id, "includeRetired": true }),
+    )
+    .await;
+    let hooks = listed["hooks"].as_array().expect("hooks array");
+    assert_eq!(hooks.len(), 2, "dispatcher + watcher listed: {listed}");
     let dispatcher = hooks
         .iter()
         .find(|h| h["name"] == json!("dispatcher"))
         .unwrap_or_else(|| panic!("dispatcher in hook.list: {listed}"));
     assert_eq!(dispatcher["state"], "dispatched");
+    assert_eq!(dispatcher["agentId"], json!(agent_id));
+    for heavy in ["code", "lastState", "lastLogs"] {
+        assert_eq!(
+            dispatcher.get(heavy),
+            None,
+            "retired row omits `{heavy}`: {dispatcher}"
+        );
+    }
     // A one-shot hook's sole fire is still counted: `dispatchCount` means
     // "fires so far" for every hook, not just perpetual ones.
     assert_eq!(dispatcher["dispatchCount"], 1, "{dispatcher}");
@@ -896,9 +923,15 @@ async fn hook_lifecycle_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    for (i, needle) in ["getState=dispatched", "codeMatch=true", "idMatch=true"]
-        .into_iter()
-        .enumerate()
+    for (i, needle) in [
+        "getState=dispatched",
+        "listCodeOmitted=true",
+        "listedByDefault=false",
+        "codeMatch=true",
+        "idMatch=true",
+    ]
+    .into_iter()
+    .enumerate()
     {
         await_conversation_contains(
             &mut rpc,
@@ -1219,7 +1252,13 @@ async fn hook_lifecycle_over_wss() {
         "[Background hook \\\"counter\\\"] counted 2",
     )
     .await;
-    let listed = wss_rpc(&mut rpc, 630, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        630,
+        "hook.list",
+        json!({ "workspaceId": ws_id, "includeRetired": true }),
+    )
+    .await;
     let counter = listed["hooks"]
         .as_array()
         .expect("hooks array")
@@ -1293,8 +1332,15 @@ async fn hook_lifecycle_over_wss() {
     assert_eq!(expired["data"]["hookId"], json!(ttl_id));
     assert_eq!(expired["data"]["agentId"], json!(agent_id));
 
-    // Terminal in hook.list; runNow on an expired hook is -32602.
-    let listed = wss_rpc(&mut rpc, 702, "hook.list", json!({ "workspaceId": ws_id })).await;
+    // Terminal in hook.list (retired rows need `includeRetired`); runNow on
+    // an expired hook is -32602.
+    let listed = wss_rpc(
+        &mut rpc,
+        702,
+        "hook.list",
+        json!({ "workspaceId": ws_id, "includeRetired": true }),
+    )
+    .await;
     let ttl_hook = listed["hooks"]
         .as_array()
         .expect("hooks array")
@@ -1556,7 +1602,13 @@ async fn hook_lifecycle_over_wss() {
     assert_eq!(expired["data"]["hookId"], json!(timer_id));
     assert_eq!(expired["data"]["state"], "expired", "{expired}");
     let timer_row = find(
-        &wss_rpc(&mut rpc, 930, "hook.list", json!({ "workspaceId": ws_id })).await,
+        &wss_rpc(
+            &mut rpc,
+            930,
+            "hook.list",
+            json!({ "workspaceId": ws_id, "includeRetired": true }),
+        )
+        .await,
         &timer_id,
     );
     assert_eq!(timer_row["state"], "expired", "{timer_row}");

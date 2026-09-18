@@ -513,7 +513,12 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     let fetched = wss_rpc(&mut rpc, "workspace.get", json!({ "workspaceId": ws_id })).await;
     assert_eq!(fetched["workspace"]["archived"], json!(true));
     assert_eq!(fetched["workspace"]["status"], json!("Archived"));
-    let listed = wss_rpc(&mut rpc, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        "hook.list",
+        json!({ "workspaceId": ws_id, "includeRetired": true }),
+    )
+    .await;
     let row = listed["hooks"]
         .as_array()
         .expect("hooks array")
