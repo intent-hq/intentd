@@ -2337,6 +2337,117 @@ mod task_delta_re_read {
     }
 }
 
+// --- workspace_delta — the virtual Chief workspace never rides a delta -----
+
+mod workspace_delta_chief {
+    use super::*;
+    use intent_core::{
+        chief_workspace, BoxFuture, Result, Workspace, WorkspaceApi, WorkspaceId,
+        CHIEF_WORKSPACE_ID,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `get_workspace` answers EVERY id (Chief included, mirroring the
+    /// services' synthesized Chief shape) and counts its calls, so a test can
+    /// prove the Chief guard short-circuits before the re-read.
+    struct AnyWorkspaceApi {
+        reads: AtomicUsize,
+    }
+
+    impl WorkspaceApi for AnyWorkspaceApi {
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(Workspace {
+                    id,
+                    ..chief_workspace()
+                })
+            })
+        }
+    }
+
+    fn workspace_event(event_type: &str, workspace_id: &str, data_id: Option<&str>) -> Event {
+        Event {
+            id: "evt-1".into(),
+            event_type: event_type.to_string(),
+            timestamp: now_iso(),
+            workspace_id: WorkspaceId::from(workspace_id),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data: match data_id {
+                Some(id) => json!({ "workspaceId": id }),
+                None => json!({}),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn chief_scoped_events_map_to_no_delta_without_a_re_read() {
+        // `workspace.list` and the seq-0 snapshot filter `__chief__` at the
+        // store; the delta path must agree or a Chief-scoped status event
+        // upserts the virtual workspace into subscribed clients' lists.
+        let api = AnyWorkspaceApi {
+            reads: AtomicUsize::new(0),
+        };
+        for event_type in [
+            WORKSPACE_CREATED,
+            WORKSPACE_UPDATED,
+            WORKSPACE_DELETED,
+            WORKSPACE_ACTIVITY_CHANGED,
+            WORKSPACE_ATTENTION_CHANGED,
+            WORKSPACE_DISPLAY_STATUS_CHANGED,
+            WORKSPACE_WAITING_CHANGED,
+            PR_LINKED,
+            PR_UPDATED,
+            PR_UNLINKED,
+        ] {
+            // Id resolved from `data.workspaceId` …
+            let from_data = workspace_event(event_type, "w", Some(CHIEF_WORKSPACE_ID));
+            assert!(
+                workspace_delta(&api, &from_data).await.is_none(),
+                "{event_type} with data.workspaceId=__chief__ must map to no delta"
+            );
+            // … and from the event's own `workspaceId` fallback.
+            let from_event = workspace_event(event_type, CHIEF_WORKSPACE_ID, None);
+            assert!(
+                workspace_delta(&api, &from_event).await.is_none(),
+                "{event_type} scoped to __chief__ must map to no delta"
+            );
+        }
+        assert_eq!(
+            api.reads.load(Ordering::SeqCst),
+            0,
+            "the Chief guard must short-circuit before the get_workspace re-read"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_workspace_events_still_map_to_deltas() {
+        let api = AnyWorkspaceApi {
+            reads: AtomicUsize::new(0),
+        };
+        let d = workspace_delta(&api, &workspace_event(WORKSPACE_UPDATED, "w", Some("w")))
+            .await
+            .expect("real workspace update maps to a delta");
+        assert_eq!(d["updated"][0]["id"], "w", "delta: {d}");
+        let d = workspace_delta(&api, &workspace_event(WORKSPACE_CREATED, "w", None))
+            .await
+            .expect("real workspace create maps to a delta");
+        assert_eq!(d["added"][0]["id"], "w", "delta: {d}");
+        let d = workspace_delta(&api, &workspace_event(WORKSPACE_DELETED, "w", None))
+            .await
+            .expect("real workspace delete maps to a delta");
+        assert_eq!(d["removedIds"][0], "w", "delta: {d}");
+        assert_eq!(api.reads.load(Ordering::SeqCst), 2);
+    }
+}
+
 // --- chat_snapshot bounded seq-0 read (monorepo#958 regression) ------------
 
 mod chat_snapshot_bounded {

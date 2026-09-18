@@ -3035,6 +3035,96 @@ async fn workspace_subscribe_snapshot_includes_archived_over_wss() {
     );
 }
 
+/// End-to-end regression: the virtual Chief of Staff workspace (`__chief__`)
+/// never rides a `workspace.subscribe` delta. `workspace.list` and the seq-0
+/// snapshot filter it at the store, but the delta path re-reads the event's
+/// workspace via `workspace.get` — which synthesizes Chief — so a Chief-scoped
+/// `workspace:updated` used to push `updated: [<chief>]` and clients that
+/// upsert unknown ids (iOS/visionOS) grew a "Chief of Staff" row. A control
+/// update on a real workspace must still arrive as the very next delta
+/// (seq 1: nothing was emitted for Chief in between).
+#[tokio::test]
+async fn workspace_subscribe_deltas_never_carry_chief_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Real WS", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let real_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("real workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(&mut sub, 1, "workspace.subscribe", json!({})).await;
+    let sub_id = sub_res["subscriptionId"]
+        .as_str()
+        .expect("subscriptionId")
+        .to_string();
+    let push = next_subscription_push(&mut sub, 10).await;
+    assert_eq!(push["kind"], json!("snapshot"), "push: {push}");
+    let snap = push["snapshot"].as_array().expect("snapshot array");
+    assert!(
+        !snap
+            .iter()
+            .any(|e| e["id"] == json!(intent_core::CHIEF_WORKSPACE_ID)),
+        "seq-0 snapshot must not surface Chief: {snap:?}"
+    );
+
+    // Chief-scoped `workspace:updated` (the update is a virtual no-op that
+    // still publishes the event), then a control update on the real workspace.
+    let resp = uds_rpc(
+        &socket,
+        3,
+        "workspace.update",
+        json!({ "workspaceId": intent_core::CHIEF_WORKSPACE_ID, "statusMessage": "hello" }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["workspace"]["id"],
+        json!(intent_core::CHIEF_WORKSPACE_ID),
+        "workspace.update on Chief: {resp}"
+    );
+    uds_rpc(
+        &socket,
+        4,
+        "workspace.update",
+        json!({ "workspaceId": real_id, "statusMessage": "control" }),
+    )
+    .await;
+
+    let delta = next_subscription_push(&mut sub, 10).await;
+    assert_eq!(delta["subscriptionId"], sub_id.as_str(), "delta: {delta}");
+    assert_eq!(delta["kind"], json!("delta"), "delta: {delta}");
+    assert_eq!(
+        delta["seq"],
+        json!(1),
+        "the Chief-scoped event must not have consumed a delta seq: {delta}"
+    );
+    let updated = delta["delta"]["updated"].as_array().expect("updated array");
+    assert!(
+        !updated
+            .iter()
+            .any(|e| e["id"] == json!(intent_core::CHIEF_WORKSPACE_ID)),
+        "workspace deltas must never carry Chief: {delta}"
+    );
+    assert_eq!(
+        updated[0]["id"],
+        json!(real_id),
+        "control update on the real workspace still arrives: {delta}"
+    );
+    assert_eq!(
+        updated[0]["statusMessage"],
+        json!("control"),
+        "control delta carries the re-read workspace: {delta}"
+    );
+}
+
 /// End-to-end `task.setRelations` over WSS (docs/protocol/methods/notes-tasks.md §5.4): relation writes
 /// round-trip `dependsOn`/`conflictsWith` (echoed normalized in the result and
 /// visible in `task.getMyTask` / `task.list` with the computed

@@ -1992,19 +1992,26 @@ pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option
 /// is global, so the id comes from `data.workspaceId` (falling back to the
 /// event's `workspaceId`). `workspace:created` → `added`, `workspace:deleted` →
 /// `removedIds`, every other status/PR event → `updated`.
+///
+/// The virtual Chief of Staff workspace (`__chief__`) never rides a delta:
+/// `workspace.list` and the seq-0 snapshot filter it at the store, and
+/// `workspace.get` synthesizes it, so without this guard a Chief-scoped status
+/// event would upsert Chief into subscribed clients' lists.
 pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
-    let workspace_id = event
-        .data
-        .get("workspaceId")
-        .and_then(Value::as_str)
-        .map_or_else(|| event.workspace_id.as_str().to_string(), str::to_string);
+    let workspace_id = WorkspaceId::from(
+        event
+            .data
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .map_or_else(|| event.workspace_id.as_str().to_string(), str::to_string),
+    );
+    if workspace_id.is_chief() {
+        return None;
+    }
     match event.event_type.as_str() {
-        WORKSPACE_DELETED => Some(json!({ "removedIds": [workspace_id] })),
+        WORKSPACE_DELETED => Some(json!({ "removedIds": [workspace_id.as_str()] })),
         WORKSPACE_CREATED => {
-            let ws = api
-                .get_workspace(WorkspaceId::from(workspace_id))
-                .await
-                .ok()?;
+            let ws = api.get_workspace(workspace_id).await.ok()?;
             Some(json!({ "added": [serde_json::to_value(ws).ok()?] }))
         }
         WORKSPACE_UPDATED
@@ -2015,10 +2022,7 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
         | PR_LINKED
         | PR_UPDATED
         | PR_UNLINKED => {
-            let ws = api
-                .get_workspace(WorkspaceId::from(workspace_id))
-                .await
-                .ok()?;
+            let ws = api.get_workspace(workspace_id).await.ok()?;
             Some(json!({ "updated": [serde_json::to_value(ws).ok()?] }))
         }
         _ => None,
