@@ -489,11 +489,16 @@ pub(crate) async fn flush_prepared<F, Fut>(
 /// this to "acquire connection failed: pool timed out …"), or `SQLite`
 /// reported the database busy/locked (a cross-process writer holding the
 /// lock past `busy_timeout`). Everything else (constraint violations,
-/// payload serialization failures, I/O errors) is permanent and fails the
-/// batch immediately. String matching is the only classification available:
-/// `insert_events` flattens every failure into `Error::Internal(String)`.
+/// payload serialization failures, I/O errors, and an acquire on a *closed*
+/// pool — daemon shutdown, which no amount of waiting recovers from) is
+/// permanent and fails the batch immediately. String matching is the only
+/// classification available: `insert_events` flattens every failure into
+/// `Error::Internal(String)`.
 pub(crate) fn is_transient_insert_error(e: &Error) -> bool {
     let msg = e.to_string();
+    if msg.contains("closed pool") {
+        return false;
+    }
     msg.contains("acquire connection failed")
         || msg.contains("pool timed out")
         || msg.contains("database is locked")

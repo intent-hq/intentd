@@ -834,6 +834,17 @@ fn transient_classification_matches_insert_events_wording() {
     let permanent =
         intent_core::Error::Internal("insert failed: UNIQUE constraint failed: event.id".into());
     assert!(!super::bus::is_transient_insert_error(&permanent));
+    // A closed pool (daemon shutdown) shares the `acquire connection failed`
+    // prefix but never recovers; retrying it for the full deadline would stall
+    // every pending publisher instead of failing them promptly.
+    let closed = intent_core::Error::Internal(format!(
+        "acquire connection failed: {}",
+        sqlx::Error::PoolClosed
+    ));
+    assert!(
+        !super::bus::is_transient_insert_error(&closed),
+        "closed-pool acquire failure must classify as permanent: {closed}"
+    );
 }
 
 /// Regression (monorepo#2673): a transient acquire failure must not drop the
