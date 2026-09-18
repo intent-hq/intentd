@@ -9050,6 +9050,9 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
             crate::InviteJoinOutcome::CredentialInvalid => {
                 panic!("a join without a presented credential refused one")
             }
+            crate::InviteJoinOutcome::OwnerSelfJoin => {
+                panic!("a guest account was taken for the primary principal")
+            }
         }
     }
     assert_eq!((joined, full), (1, 7));
@@ -9060,6 +9063,81 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
             open_invites: 7,
         },
         "refused joins leave their invites open"
+    );
+}
+
+/// The owner's own GitHub account resolves to the primary principal: the
+/// join is refused `OwnerSelfJoin` inside the transaction, so the primary
+/// row gains no per-principal credential, no collaborator membership, and
+/// the invite stays open — a guest window bound to the owner's account can
+/// never exist.
+#[tokio::test]
+async fn join_workspace_by_invite_refuses_the_primary_principals_account() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Own", false))
+        .await
+        .expect("insert ws");
+    let mut primary = store.get_primary_principal().await.expect("primary");
+    primary.github_user_id = Some(7);
+    primary.login = Some("host-owner".into());
+    store
+        .upsert_principal(&primary)
+        .await
+        .expect("seed identity");
+    store
+        .insert_workspace_invite(&guest_invite("self", &ws, &primary.id))
+        .await
+        .expect("insert invite");
+    let before = store.count_principals().await.expect("count");
+
+    let outcome = store
+        .join_workspace_by_invite("self", &ws, &guest_identity(7), "cred-self", None, 8)
+        .await
+        .expect("join");
+    assert_eq!(outcome, crate::InviteJoinOutcome::OwnerSelfJoin);
+
+    assert_eq!(store.count_principals().await.expect("count"), before);
+    assert!(
+        store
+            .list_principal_credentials(&primary.id)
+            .await
+            .expect("credentials")
+            .is_empty(),
+        "the primary principal never holds a per-principal credential"
+    );
+    assert_eq!(
+        store
+            .lookup_principal_credential("cred-self")
+            .await
+            .expect("lookup"),
+        None
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws, &primary.id)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Owner),
+        "the owner seat is untouched"
+    );
+    assert!(
+        store
+            .get_workspace_invite("self")
+            .await
+            .expect("get")
+            .expect("row")
+            .redeemed_at
+            .is_none(),
+        "a refused join leaves the invite open"
+    );
+    let refreshed = store.get_primary_principal().await.expect("primary");
+    assert_eq!(
+        refreshed.login.as_deref(),
+        Some("host-owner"),
+        "profile not rewritten"
     );
 }
 
