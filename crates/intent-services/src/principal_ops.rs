@@ -102,8 +102,12 @@ pub(crate) fn principal_attribution_name(principal: &Principal) -> String {
 /// rejected with `InvalidParams` (the same rule `agent.queueMessage` and
 /// `userAppMessageId` already apply) — a human send must never be credited
 /// to the workspace fallback because its metadata had the wrong shape.
-/// Metadata only — the content is never annotated, so prompts stay
-/// byte-identical.
+/// Metadata only — this stamp never touches the content. The one content
+/// annotation a human message receives is the collaborator sender preamble
+/// ([`Services::annotate_collaborator_sender`]), applied beside the stamp
+/// at the same entry points and only when the bound wire caller is a
+/// `collaborator` member of the target workspace; the owner's (and every
+/// UDS / legacy-token) prompt stays byte-identical.
 pub(crate) fn stamp_principal_attribution(
     message_metadata: Option<Value>,
 ) -> Result<Option<Value>> {
@@ -176,6 +180,125 @@ pub(crate) fn strip_principal_attribution(message_metadata: Option<Value>) -> Op
             Some(Value::Object(obj))
         }
         other => other,
+    }
+}
+
+/// Prepend `preamble` (+ blank line) to a collaborator's message content.
+/// Idempotency is **exact-match**, like the A2A header
+/// (`agent_ops::annotate_sender_attribution`): the caller rebuilds the
+/// preamble from the bound principal's row and this skips only when the
+/// content already starts with exactly that preamble + blank line, so the
+/// layered front doors (`agent.editAndRegenerate` → `agent_send_message_op`)
+/// annotate once and a caller-authored lookalike first line never
+/// suppresses the genuine preamble.
+pub(crate) fn prepend_collaborator_preamble(content: &mut String, preamble: &str) {
+    let annotated_head = format!("{preamble}\n\n");
+    if content.starts_with(&annotated_head) {
+        return;
+    }
+    *content = format!("{annotated_head}{content}");
+}
+
+/// `true` when the bound caller is a per-principal (collaborator-class)
+/// wire connection — the only caller class that can carry the
+/// collaborator sender preamble. Cheap pre-check so the owner / agent /
+/// daemon paths never pay a store read for it.
+fn is_collaborator_class_caller() -> bool {
+    matches!(
+        current_caller(),
+        Some(Caller::Wire {
+            is_administrator: false,
+            ..
+        })
+    )
+}
+
+impl Services {
+    /// The collaborator sender preamble for a human message into
+    /// `workspace_id` (multiplayer): `Some(text)` only when the bound caller
+    /// is a per-principal wire connection whose membership role there is
+    /// `collaborator`. The owner (any role `owner`, the administrator, UDS
+    /// and legacy-token callers), agents, the daemon and an absent caller
+    /// get `None`. The text is
+    /// [`crate::harness::Harness::collaborator_sender_preamble`] rendered
+    /// from the principal row's `login` / `display_name` (a vanished row
+    /// falls back to the principal id).
+    pub(crate) async fn collaborator_sender_preamble(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<String>> {
+        let Some(Caller::Wire {
+            principal_id,
+            is_administrator: false,
+        }) = current_caller()
+        else {
+            return Ok(None);
+        };
+        let role = self
+            .store
+            .get_workspace_member_role(workspace_id, &principal_id)
+            .await?;
+        if role != Some(intent_core::WorkspaceRole::Collaborator) {
+            return Ok(None);
+        }
+        let (login, display_name) = match self.store.get_principal(&principal_id).await {
+            Ok(principal) => (principal.login, principal.display_name),
+            Err(Error::NotFound(_)) => (None, None),
+            Err(e) => return Err(e),
+        };
+        Ok(Some(crate::harness::latest().collaborator_sender_preamble(
+            login.as_deref(),
+            display_name.as_deref(),
+            &principal_id.0,
+        )))
+    }
+
+    /// Prepend the collaborator sender preamble to `content` when
+    /// [`Self::collaborator_sender_preamble`] yields one for `workspace_id`;
+    /// a no-op (content byte-identical) otherwise. Applied at every
+    /// human-authored entry point BEFORE the payload is persisted or
+    /// enqueued, beside [`stamp_principal_attribution`], so direct persists,
+    /// queue entries and their drain all carry the same content the model
+    /// sees.
+    pub(crate) async fn annotate_collaborator_sender(
+        &self,
+        workspace_id: &WorkspaceId,
+        content: &mut String,
+    ) -> Result<()> {
+        if let Some(preamble) = self.collaborator_sender_preamble(workspace_id).await? {
+            prepend_collaborator_preamble(content, &preamble);
+        }
+        Ok(())
+    }
+
+    /// [`Self::collaborator_sender_preamble`] keyed by the target agent
+    /// (`agent.queueMessage`, `agent.editQueuedMessage`): resolves the
+    /// agent's workspace with one metadata-only read, collaborator-class
+    /// callers only.
+    pub(crate) async fn collaborator_sender_preamble_for_agent(
+        &self,
+        agent_id: &intent_core::AgentId,
+    ) -> Result<Option<String>> {
+        if !is_collaborator_class_caller() {
+            return Ok(None);
+        }
+        let workspace_id = self.agent_workspace(agent_id).await?;
+        self.collaborator_sender_preamble(&workspace_id).await
+    }
+
+    /// [`Self::annotate_collaborator_sender`] keyed by the target agent.
+    pub(crate) async fn annotate_collaborator_sender_for_agent(
+        &self,
+        agent_id: &intent_core::AgentId,
+        content: &mut String,
+    ) -> Result<()> {
+        if let Some(preamble) = self
+            .collaborator_sender_preamble_for_agent(agent_id)
+            .await?
+        {
+            prepend_collaborator_preamble(content, &preamble);
+        }
+        Ok(())
     }
 }
 
