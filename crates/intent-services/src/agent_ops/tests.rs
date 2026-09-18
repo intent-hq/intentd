@@ -14210,25 +14210,41 @@ async fn collaborator_sender_preamble_on_append_message_user_rows() {
         ]),
         "collaborator user row (blocks) annotates the first text block"
     );
-    // Text-less block array: a leading text block carries the preamble.
+    // Text-less block array: a leading text block carries the preamble in
+    // its canonical `{preamble}\n\n` shape.
+    let image_only = json!([{ "type": "image", "data": "AAAA", "mimeType": "image/png" }]);
+    let image_only_annotated = json!([
+        { "type": "text", "text": annotated("") },
+        { "type": "image", "data": "AAAA", "mimeType": "image/png" },
+    ]);
     assert_eq!(
-        append(
-            Some(wire(&guest)),
-            "user",
-            json!([{ "type": "image", "data": "AAAA", "mimeType": "image/png" }]),
-        )
-        .await,
-        json!([
-            { "type": "text", "text": preamble },
-            { "type": "image", "data": "AAAA", "mimeType": "image/png" },
-        ]),
+        append(Some(wire(&guest)), "user", image_only.clone()).await,
+        image_only_annotated,
         "collaborator user row without text gains a leading preamble block"
     );
-    // Idempotent: an already-annotated body is not annotated twice.
+    // Idempotent: an already-annotated body is not annotated twice — a
+    // string, and a second pass over the leading block a text-less / empty
+    // array gained (the block must be recognised as already applied).
     assert_eq!(
         append(Some(wire(&guest)), "user", json!(annotated("again"))).await,
         json!(annotated("again")),
         "exact-match idempotency"
+    );
+    assert_eq!(
+        append(Some(wire(&guest)), "user", image_only_annotated.clone()).await,
+        image_only_annotated,
+        "second pass over a text-less array's leading block is a no-op"
+    );
+    let empty_annotated = json!([{ "type": "text", "text": annotated("") }]);
+    assert_eq!(
+        append(Some(wire(&guest)), "user", json!([])).await,
+        empty_annotated,
+        "an empty array gains the canonical leading block"
+    );
+    assert_eq!(
+        append(Some(wire(&guest)), "user", empty_annotated.clone()).await,
+        empty_annotated,
+        "second pass over an empty array's leading block is a no-op"
     );
 
     // Byte-identical controls: non-user roles by the collaborator; user rows
