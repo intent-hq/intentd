@@ -142,6 +142,39 @@ pub(crate) fn allow_file_submodules() {
     });
 }
 
+/// Install a temporary *global* git config setting `remote.origin.prune = true`
+/// (the developer setting behind intent-hq/intent#5326) so that both the `git`
+/// CLI and libgit2 inherit it, without ever touching the real `~/.gitconfig`.
+///
+/// Process-global, like [`allow_file_submodules`]: it repoints `HOME` at the
+/// temp dir (the CLI resolves `~/.gitconfig` from `HOME` on every spawn) and
+/// libgit2's global config search path (libgit2 caches its search paths on
+/// first use, so `HOME` alone would not reach a repository opened earlier).
+/// Safe under nextest, which runs one test per process; call it before the
+/// test creates any repository. The returned dir holds the config and is
+/// removed on drop, so keep it alive for the test's duration.
+pub(crate) fn install_global_remote_prune_config() -> TempDir {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("intent-git-global-prune-{nanos}-{n}"));
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(
+        path.join(".gitconfig"),
+        "[remote \"origin\"]\n\tprune = true\n",
+    )
+    .unwrap();
+    std::env::set_var("HOME", &path);
+    // SAFETY: libgit2 option; the process is single-test under nextest and
+    // the path outlives every repository the test opens (guard returned).
+    unsafe {
+        git2::opts::set_search_path(git2::ConfigLevel::Global, &path).unwrap();
+    }
+    TempDir { path }
+}
+
 /// Register `child_worktree` (an existing repo with at least one commit) as a
 /// submodule of `worktree` at the worktree-relative path `sub_rel`, then
 /// commit the resulting gitlink + `.gitmodules` — a real submodule fixture

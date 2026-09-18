@@ -33,7 +33,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use git2::Repository;
+use git2::{ConfigLevel, ErrorCode, Repository};
 use intent_core::{Error, GitRemoteUrl, RepoRef, Result};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -1265,6 +1265,72 @@ pub(crate) enum OriginTarget<'a> {
     Remove,
 }
 
+/// Remove remote `name` from `repo`, editing only the repository's own
+/// (local) config. libgit2's `remote_delete` walks `remote.<name>.*` across
+/// every config level but deletes from the repository level, so an entry
+/// inherited from the global config — a developer's
+/// `remote.origin.prune = true` — fails the whole removal with "could not
+/// find key" (intent-hq/intent#5326). This mirrors its effect (remote-tracking
+/// refs, `branch.*.remote` / `branch.*.merge` pairs naming the remote, then
+/// every `remote.<name>.*` key) scoped to the local level, leaving inherited
+/// entries untouched.
+pub(crate) fn remove_remote_local_only(repo: &Repository, name: &str) -> Result<()> {
+    let ref_names: Vec<String> = repo
+        .references_glob(&format!("refs/remotes/{name}/*"))
+        .map_err(map_git_err)?
+        .filter_map(|r| r.ok().and_then(|r| r.name().ok().map(str::to_owned)))
+        .collect();
+    for ref_name in ref_names {
+        repo.find_reference(&ref_name)
+            .map_err(map_git_err)?
+            .delete()
+            .map_err(map_git_err)?;
+    }
+
+    let mut local = repo
+        .config()
+        .map_err(map_git_err)?
+        .open_level(ConfigLevel::Local)
+        .map_err(map_git_err)?;
+    let remote_prefix = format!("remote.{name}.");
+    let mut remote_keys: Vec<String> = Vec::new();
+    let mut branch_sections: Vec<String> = Vec::new();
+    {
+        let mut entries = local.entries(None).map_err(map_git_err)?;
+        while let Some(entry) = entries.next() {
+            let entry = entry.map_err(map_git_err)?;
+            let Ok(key) = entry.name() else {
+                continue;
+            };
+            if key.starts_with(&remote_prefix) {
+                if !remote_keys.iter().any(|k| k == key) {
+                    remote_keys.push(key.to_owned());
+                }
+            } else if let Some(section) = key
+                .strip_prefix("branch.")
+                .and_then(|k| k.strip_suffix(".remote"))
+            {
+                if entry.value().is_ok_and(|v| v == name) {
+                    branch_sections.push(section.to_owned());
+                }
+            }
+        }
+    }
+    for section in branch_sections {
+        for key in ["remote", "merge"] {
+            if let Err(e) = local.remove(&format!("branch.{section}.{key}")) {
+                if e.code() != ErrorCode::NotFound {
+                    return Err(map_git_err(e));
+                }
+            }
+        }
+    }
+    for key in remote_keys {
+        local.remove_multivar(&key, ".*").map_err(map_git_err)?;
+    }
+    Ok(())
+}
+
 /// Shared body of the standalone plain-clone provisioners: local `git clone`
 /// of `source_path`, overlay of the source's remote-tracking refs, branch +
 /// checkout + hard reset, then `origin` retargeted per `origin`. The origin
@@ -1301,11 +1367,15 @@ pub(crate) fn provision_plain_clone_checkout(
     (|| {
         // The local clone only maps the source's refs/heads/* into
         // refs/remotes/origin/*; overlay the source's own remote-tracking refs
-        // so every upstream branch resolves as a base ref.
+        // so every upstream branch resolves as a base ref. `--no-prune`
+        // because an inherited `remote.origin.prune` / `fetch.prune` would
+        // otherwise delete every copied ref the source does not itself carry
+        // under refs/remotes/origin/* (intent-hq/intent#5326).
         run_git(
             checkout_path,
             &[
                 "fetch",
+                "--no-prune",
                 "origin",
                 "+refs/remotes/origin/*:refs/remotes/origin/*",
             ],
@@ -1317,7 +1387,7 @@ pub(crate) fn provision_plain_clone_checkout(
         let repo = Repository::open(checkout_path).map_err(map_git_err)?;
         match origin {
             OriginTarget::Url(url) => repo.remote_set_url("origin", url).map_err(map_git_err)?,
-            OriginTarget::Remove => repo.remote_delete("origin").map_err(map_git_err)?,
+            OriginTarget::Remove => remove_remote_local_only(&repo, "origin")?,
         }
         Ok(sha)
     })()
