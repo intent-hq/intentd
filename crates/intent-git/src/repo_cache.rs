@@ -33,7 +33,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use git2::{ConfigLevel, ErrorCode, Repository};
+use git2::{ConfigLevel, Direction, ErrorCode, Repository};
 use intent_core::{Error, GitRemoteUrl, RepoRef, Result};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -1270,16 +1270,36 @@ pub(crate) enum OriginTarget<'a> {
 /// every config level but deletes from the repository level, so an entry
 /// inherited from the global config — a developer's
 /// `remote.origin.prune = true` — fails the whole removal with "could not
-/// find key" (intent-hq/intent#5326). This mirrors its effect (remote-tracking
-/// refs, `branch.*.remote` / `branch.*.merge` pairs naming the remote, then
-/// every `remote.<name>.*` key) scoped to the local level, leaving inherited
-/// entries untouched.
+/// find key" (intent-hq/intent#5326). This mirrors its effect scoped to the
+/// local level, leaving inherited entries untouched: every ref matching the
+/// destination of one of the remote's configured fetch refspecs
+/// (`remote.<name>.fetch`, as `git_remote_delete` does — falling back to
+/// `refs/remotes/<name>/*` only when no fetch refspec is configured), the
+/// `branch.*.remote` / `branch.*.merge` pairs naming the remote, then every
+/// `remote.<name>.*` key.
 pub(crate) fn remove_remote_local_only(repo: &Repository, name: &str) -> Result<()> {
-    let ref_names: Vec<String> = repo
-        .references_glob(&format!("refs/remotes/{name}/*"))
-        .map_err(map_git_err)?
-        .filter_map(|r| r.ok().and_then(|r| r.name().ok().map(str::to_owned)))
+    let remote = match repo.find_remote(name) {
+        Ok(remote) => Some(remote),
+        Err(e) if e.code() == ErrorCode::NotFound => None,
+        Err(e) => return Err(map_git_err(e)),
+    };
+    let fetch_specs: Vec<git2::Refspec<'_>> = remote
+        .iter()
+        .flat_map(git2::Remote::refspecs)
+        .filter(|spec| spec.direction() == Direction::Fetch)
         .collect();
+    let ref_names: Vec<String> = if fetch_specs.is_empty() {
+        repo.references_glob(&format!("refs/remotes/{name}/*"))
+            .map_err(map_git_err)?
+            .filter_map(|r| r.ok().and_then(|r| r.name().ok().map(str::to_owned)))
+            .collect()
+    } else {
+        repo.references()
+            .map_err(map_git_err)?
+            .filter_map(|r| r.ok().and_then(|r| r.name().ok().map(str::to_owned)))
+            .filter(|ref_name| fetch_specs.iter().any(|spec| spec.dst_matches(ref_name)))
+            .collect()
+    };
     for ref_name in ref_names {
         repo.find_reference(&ref_name)
             .map_err(map_git_err)?
@@ -3762,6 +3782,111 @@ mod tests {
             !is_fresh(&cache_path, CACHE_FRESH_TTL_DEFAULT),
             "a failed ensure must not mark the slot fresh"
         );
+    }
+
+    /// [`remove_remote_local_only`] deletes the refs matching the remote's
+    /// configured fetch-refspec destinations, as `git_remote_delete` does —
+    /// not a fixed `refs/remotes/<name>/*` glob. With
+    /// `+refs/heads/*:refs/remotes/upstream/*`, the refs under `upstream/`
+    /// go, while a ref under another remote's namespace and a stale one under
+    /// `refs/remotes/origin/` (outside the configured destination) both stay.
+    #[test]
+    fn remove_remote_local_only_follows_fetch_refspec_destinations() {
+        let repo_dir = init_repo("rmremote-refspec");
+        commit_file(repo_dir.path(), "a.txt", "one\n");
+        let repo = Repository::open(repo_dir.path()).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.remote_with_fetch(
+            "origin",
+            "https://example.invalid/acme/widget.git",
+            "+refs/heads/*:refs/remotes/upstream/*",
+        )
+        .unwrap();
+        for name in [
+            "refs/remotes/upstream/main",
+            "refs/remotes/upstream/feature",
+            "refs/remotes/other/main",
+            "refs/remotes/origin/stale",
+        ] {
+            repo.reference(name, head, false, "test").unwrap();
+        }
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("branch.main.remote", "origin").unwrap();
+            config
+                .set_str("branch.main.merge", "refs/heads/main")
+                .unwrap();
+        }
+
+        remove_remote_local_only(&repo, "origin").unwrap();
+
+        assert!(repo.find_reference("refs/remotes/upstream/main").is_err());
+        assert!(repo
+            .find_reference("refs/remotes/upstream/feature")
+            .is_err());
+        assert!(
+            repo.find_reference("refs/remotes/other/main").is_ok(),
+            "a ref outside the remote's fetch destination must survive"
+        );
+        assert!(
+            repo.find_reference("refs/remotes/origin/stale").is_ok(),
+            "only refs matching a configured fetch destination are deleted"
+        );
+        assert!(repo.find_remote("origin").is_err());
+        let local = git2::Config::open(&repo_dir.path().join(".git").join("config")).unwrap();
+        for key in [
+            "remote.origin.url",
+            "remote.origin.fetch",
+            "branch.main.remote",
+            "branch.main.merge",
+        ] {
+            assert!(
+                local.get_string(key).is_err(),
+                "{key} must be removed from the local config"
+            );
+        }
+    }
+
+    /// [`remove_remote_local_only`] falls back to `refs/remotes/<name>/*` only
+    /// when the remote has no fetch refspec configured (a bare
+    /// `remote.<name>.url`), still leaving other remotes' refs intact.
+    #[test]
+    fn remove_remote_local_only_falls_back_to_remote_namespace_without_refspec() {
+        let repo_dir = init_repo("rmremote-norefspec");
+        commit_file(repo_dir.path(), "a.txt", "one\n");
+        let repo = Repository::open(repo_dir.path()).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.config()
+            .unwrap()
+            .set_str(
+                "remote.origin.url",
+                "https://example.invalid/acme/widget.git",
+            )
+            .unwrap();
+        assert_eq!(
+            repo.find_remote("origin").unwrap().refspecs().count(),
+            0,
+            "fixture must configure origin without a fetch refspec"
+        );
+        for name in [
+            "refs/remotes/origin/main",
+            "refs/remotes/origin/feature",
+            "refs/remotes/other/main",
+        ] {
+            repo.reference(name, head, false, "test").unwrap();
+        }
+
+        remove_remote_local_only(&repo, "origin").unwrap();
+
+        assert!(repo.find_reference("refs/remotes/origin/main").is_err());
+        assert!(repo.find_reference("refs/remotes/origin/feature").is_err());
+        assert!(
+            repo.find_reference("refs/remotes/other/main").is_ok(),
+            "another remote's ref must survive the fallback"
+        );
+        assert!(repo.find_remote("origin").is_err());
+        let local = git2::Config::open(&repo_dir.path().join(".git").join("config")).unwrap();
+        assert!(local.get_string("remote.origin.url").is_err());
     }
 
     /// [`parse_fresh_ttl`] handles the env shapes: unset/garbage fall back to
