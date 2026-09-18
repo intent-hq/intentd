@@ -1283,13 +1283,23 @@ pub(crate) fn remove_remote_local_only(repo: &Repository, name: &str) -> Result<
         Err(e) if e.code() == ErrorCode::NotFound => None,
         Err(e) => return Err(map_git_err(e)),
     };
-    let mut dst_patterns: Vec<Vec<u8>> = remote
-        .iter()
-        .flat_map(git2::Remote::refspecs)
-        .filter(|spec| spec.direction() == Direction::Fetch)
-        .map(|spec| spec.dst_bytes().to_vec())
-        .collect();
-    if dst_patterns.is_empty() {
+    // A configured fetch refspec may have no destination (`refs/heads/main`,
+    // `refs/heads/main:`, or a negative `^refs/heads/x`): it stores nothing
+    // locally, so it matches no ref — and, being configured, it also rules
+    // out the `refs/remotes/<name>/*` fallback. `Refspec::dst_bytes` unwraps a
+    // NULL destination, so read the destination from the refspec text instead.
+    let mut has_fetch_refspec = false;
+    let mut dst_patterns: Vec<Vec<u8>> = Vec::new();
+    for spec in remote.iter().flat_map(git2::Remote::refspecs) {
+        if spec.direction() != Direction::Fetch {
+            continue;
+        }
+        has_fetch_refspec = true;
+        if let Some(dst) = fetch_refspec_dst(spec.bytes()) {
+            dst_patterns.push(dst.to_vec());
+        }
+    }
+    if !has_fetch_refspec {
         dst_patterns.push(format!("refs/remotes/{name}/*").into_bytes());
     }
     // Match and delete on the raw name bytes: a ref name need not be UTF-8,
@@ -1350,6 +1360,18 @@ pub(crate) fn remove_remote_local_only(repo: &Repository, name: &str) -> Result<
         local.remove_multivar(&key, ".*").map_err(map_git_err)?;
     }
     Ok(())
+}
+
+/// The destination side of a fetch refspec `spec`, or `None` when it has no
+/// destination — mirroring `git_refspec__parse` for the fetch direction: an
+/// optional leading `+`, the right side is what follows the *last* `:`, and a
+/// missing or empty right side leaves the destination unset (a negative
+/// `^…` refspec has no right side at all).
+fn fetch_refspec_dst(spec: &[u8]) -> Option<&[u8]> {
+    let spec = spec.strip_prefix(b"+").unwrap_or(spec);
+    let colon = spec.iter().rposition(|&b| b == b':')?;
+    let dst = &spec[colon + 1..];
+    (!dst.is_empty()).then_some(dst)
 }
 
 /// Whether a refspec destination `pattern` matches the reference `name`, on
@@ -3943,6 +3965,88 @@ mod tests {
         assert!(refspec_pattern_matches(infix, b"refs/remotes/up-mirror"));
         assert!(!refspec_pattern_matches(infix, b"refs/remotes/upstream"));
         assert!(!refspec_pattern_matches(infix, b"refs/remotes/u-mirror"));
+    }
+
+    /// [`fetch_refspec_dst`] follows libgit2's fetch-direction parse: the
+    /// destination is what follows the last `:` after an optional `+`, and a
+    /// missing or empty right side means no destination (as does a negative
+    /// `^…` refspec, which has no right side).
+    #[test]
+    fn fetch_refspec_dst_follows_libgit2_fetch_parse() {
+        assert_eq!(
+            fetch_refspec_dst(b"+refs/heads/*:refs/remotes/origin/*"),
+            Some(&b"refs/remotes/origin/*"[..])
+        );
+        assert_eq!(
+            fetch_refspec_dst(b"refs/heads/main:refs/remotes/origin/main"),
+            Some(&b"refs/remotes/origin/main"[..])
+        );
+        assert_eq!(
+            fetch_refspec_dst(b"refs/heads/a:b:refs/remotes/origin/c"),
+            Some(&b"refs/remotes/origin/c"[..])
+        );
+        assert_eq!(fetch_refspec_dst(b"refs/heads/main"), None);
+        assert_eq!(fetch_refspec_dst(b"+refs/heads/main"), None);
+        assert_eq!(fetch_refspec_dst(b"refs/heads/main:"), None);
+        assert_eq!(fetch_refspec_dst(b"^refs/heads/main"), None);
+        assert_eq!(fetch_refspec_dst(b"^refs/heads/*"), None);
+    }
+
+    /// A configured fetch refspec without a destination (source-only, empty
+    /// destination, or negative) stores nothing locally, so it must match no
+    /// ref — and, being configured, must not trigger the
+    /// `refs/remotes/<name>/*` fallback either. `Refspec::dst_bytes` panics on
+    /// such a refspec; [`remove_remote_local_only`] must still succeed, leave
+    /// every ref intact, and drop the local `remote.<name>.*` config.
+    #[test]
+    fn remove_remote_local_only_tolerates_fetch_refspecs_without_destination() {
+        for (label, fetch_specs) in [
+            ("source-only", &["refs/heads/main"][..]),
+            ("empty-destination", &["refs/heads/main:"][..]),
+            ("negative-only", &["^refs/heads/main"][..]),
+            (
+                "mixed-with-negative-glob",
+                &["refs/heads/main", "^refs/heads/*", "refs/heads/topic:"][..],
+            ),
+        ] {
+            let repo_dir = init_repo("rmremote-nodst");
+            commit_file(repo_dir.path(), "a.txt", "one\n");
+            let repo = Repository::open(repo_dir.path()).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            let (first, rest) = fetch_specs.split_first().unwrap();
+            repo.remote_with_fetch("origin", "https://example.invalid/acme/widget.git", first)
+                .unwrap();
+            for spec in rest {
+                repo.remote_add_fetch("origin", spec).unwrap();
+            }
+            assert_eq!(
+                repo.find_remote("origin").unwrap().refspecs().count(),
+                fetch_specs.len(),
+                "{label}: fixture must configure every fetch refspec"
+            );
+            for name in ["refs/remotes/origin/main", "refs/remotes/other/main"] {
+                repo.reference(name, head, false, "test").unwrap();
+            }
+
+            remove_remote_local_only(&repo, "origin")
+                .unwrap_or_else(|e| panic!("{label}: removal must succeed: {e}"));
+
+            assert!(
+                repo.find_reference("refs/remotes/origin/main").is_ok(),
+                "{label}: a configured destination-less refspec must not trigger the namespace fallback"
+            );
+            assert!(
+                repo.find_reference("refs/remotes/other/main").is_ok(),
+                "{label}: an unrelated ref must survive"
+            );
+            assert!(
+                repo.find_remote("origin").is_err(),
+                "{label}: remote must be gone"
+            );
+            let local = git2::Config::open(&repo_dir.path().join(".git").join("config")).unwrap();
+            assert!(local.get_string("remote.origin.url").is_err(), "{label}");
+            assert!(local.get_string("remote.origin.fetch").is_err(), "{label}");
+        }
     }
 
     /// [`remove_remote_local_only`] must not skip a remote-tracking ref whose
