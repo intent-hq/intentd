@@ -505,11 +505,11 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
 /// `catalog/tests.rs` freezes the refused remainder so a new method must be
 /// classified explicitly.
 pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
-    ("agent.appendMessage", "Steer: appends a row to a workspace agent conversation; the caller's principal is stamped on user rows. Workspace-scoped, no host reach."),
+    ("agent.appendMessage", "Steer: appends a row to a workspace agent conversation; the caller's principal is stamped on user rows and, for a collaborator member, a user row's content carries the sender preamble (other roles byte-identical). Workspace-scoped, no host reach."),
     ("agent.cancelSubscriptions", "Steer: cancels an agent's own event subscriptions / delegation groups. Agent-scoped bookkeeping, no host reach."),
     ("agent.dismissQuestions", "Steer: dismisses an agent's pending structured questions. Agent-scoped state only."),
     ("agent.editAndRegenerate", "Steer: edits a user message and regenerates from it; the edited content carries the collaborator sender preamble. Conversation write, workspace-scoped."),
-    ("agent.editQueuedMessage", "Steer: edits a queued message; a collaborator's edit of a human-authored entry carries the sender preamble. Queue write, agent-scoped."),
+    ("agent.editQueuedMessage", "Steer: edits a queued message; a collaborator's edit of a human-authored entry carries the sender preamble. Intentional exception: a collaborator's edit of an agent-authored (A2A / automatic) entry is NOT preambled — its sender stays the originating agent's header and the edit is recorded by the principal stamp. Queue write, agent-scoped."),
     ("agent.get", "Read: one agent record. Workspace-scoped."),
     ("agent.getConversation", "Read: an agent's transcript page. Workspace-scoped; tool bodies are the agent's own output."),
     ("agent.getMessageBlock", "Read: one full content block of a transcript message. Same scope as getConversation."),
