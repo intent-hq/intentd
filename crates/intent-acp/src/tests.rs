@@ -544,6 +544,143 @@ async fn spawn_provider_classifies_missing_resolved_binary() {
     assert!(!err.to_string().contains("bare command"), "{err}");
 }
 
+/// `ENOENT` from a missing working directory is not a missing provider: the
+/// program exists, so the error stays `Spawn` and names the directory.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_keeps_missing_cwd_enoent_as_spawn() {
+    use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+
+    let tmp = test_temp_dir("intent-acp-missing-cwd-");
+    let gone = tmp.path().join("deleted-workspace");
+    let sh = std::path::Path::new("/bin/sh");
+    let provider = *intent_providers::find_provider("auggie").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.provider_binary = Some(sh);
+    opts.cwd = Some(&gone);
+    assert_eq!(opts.launch_target().0, LaunchMode::ResolvedBinary);
+    let err = spawn_provider(&opts, ConnectionHooks::default())
+        .err()
+        .expect("missing cwd must fail to spawn");
+    match &err {
+        AcpError::Spawn(msg) => {
+            assert!(msg.contains("working directory"), "{msg}");
+            assert!(msg.contains(&gone.display().to_string()), "{msg}");
+        }
+        other => panic!("expected Spawn for a missing cwd, got {other:?}"),
+    }
+}
+
+/// `ENOENT` from an executable whose shebang interpreter is missing is not a
+/// missing provider either — the program itself exists.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_keeps_missing_interpreter_enoent_as_spawn() {
+    use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = test_temp_dir("intent-acp-missing-interp-");
+    let script = tmp.path().join("acp-with-missing-interpreter");
+    std::fs::write(&script, "#!/nonexistent/intentd-4971-interpreter\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let provider = *intent_providers::find_provider("auggie").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.provider_binary = Some(&script);
+    assert_eq!(opts.launch_target().0, LaunchMode::ResolvedBinary);
+    let err = spawn_provider(&opts, ConnectionHooks::default())
+        .err()
+        .expect("missing interpreter must fail to spawn");
+    match &err {
+        AcpError::Spawn(msg) => assert!(msg.contains("the program exists"), "{msg}"),
+        other => panic!("expected Spawn for a missing interpreter, got {other:?}"),
+    }
+}
+
+/// A bare command given as a relative path (`./x`) is resolved against the
+/// child's working directory, not the daemon's: when it exists there and fails
+/// with `ENOENT` for another reason (missing shebang interpreter) it is not
+/// `ProviderNotFound`.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_relative_bare_command_present_in_cwd_is_not_provider_not_found() {
+    use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = test_temp_dir("intent-acp-bare-relative-");
+    let script = tmp.path().join("intentd-4971-bare-present");
+    std::fs::write(&script, "#!/nonexistent/intentd-4971-interpreter\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let provider = *intent_providers::find_provider("auggie").unwrap();
+    let provider = intent_providers::ProviderConfig {
+        command: "./intentd-4971-bare-present",
+        base_args: &[],
+        ..provider
+    };
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(tmp.path());
+    assert_eq!(opts.launch_target().0, LaunchMode::BareCommand);
+    let err = spawn_provider(&opts, ConnectionHooks::default())
+        .err()
+        .expect("missing interpreter must fail to spawn");
+    match &err {
+        AcpError::Spawn(msg) => assert!(msg.contains("the program exists"), "{msg}"),
+        other => panic!("expected Spawn for a present relative bare command, got {other:?}"),
+    }
+}
+
+/// The bare-command `PATH` search of `classify_not_found` walks the child's
+/// enhanced `PATH`: a command present there (`sh`) is "program exists" and a
+/// name absent from every directory is `ProviderNotFound`.
+#[cfg(unix)]
+#[test]
+fn classify_not_found_searches_the_child_path_for_bare_commands() {
+    use crate::spawn::{classify_not_found, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+
+    let enoent = std::io::Error::from(std::io::ErrorKind::NotFound);
+    let base = *intent_providers::find_provider("auggie").unwrap();
+
+    let present = intent_providers::ProviderConfig {
+        command: "sh",
+        ..base
+    };
+    let opts = SpawnOptions::new(&present);
+    let (launch, target) = opts.launch_target();
+    assert_eq!(launch, LaunchMode::BareCommand);
+    let err = classify_not_found(&opts, launch, target, "sh", &enoent);
+    match &err {
+        AcpError::Spawn(msg) => assert!(msg.contains("the program exists"), "{msg}"),
+        other => panic!("expected Spawn for a bare command on PATH, got {other:?}"),
+    }
+
+    let absent = intent_providers::ProviderConfig {
+        command: "intentd-no-such-provider-command-4971",
+        ..base
+    };
+    let opts = SpawnOptions::new(&absent);
+    let (launch, target) = opts.launch_target();
+    let err = classify_not_found(
+        &opts,
+        launch,
+        target,
+        "intentd-no-such-provider-command-4971",
+        &enoent,
+    );
+    assert!(
+        matches!(
+            err,
+            AcpError::ProviderNotFound {
+                launch: LaunchMode::BareCommand,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
 /// Concatenate every daily capture file under `dir` (empty when the dir does
 /// not exist yet). Rotation-proof like the daily-log test above.
 async fn read_capture_dir(dir: &std::path::Path) -> String {

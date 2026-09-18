@@ -101,6 +101,18 @@ impl<'a> SpawnOptions<'a> {
         }
     }
 
+    /// The binary whose parent dir enriches the child's `PATH`
+    /// (`provider_binary`, else the npx binary when a package is pinned).
+    fn path_enrichment_binary(&self) -> Option<&'a Path> {
+        self.provider_binary.or_else(|| {
+            if self.npx_fallback_package.is_some() {
+                self.npx_fallback_binary
+            } else {
+                None
+            }
+        })
+    }
+
     /// Construct options for a provider with all optional inputs unset.
     #[must_use]
     pub fn new(provider: &'a ProviderConfig) -> Self {
@@ -293,14 +305,7 @@ fn build_command_with_captured_env(
 
     // Enhanced PATH must include the binary's parent dir so dependencies resolve
     // (e.g., when spawning npx, node must be findable)
-    let path_binary = opts.provider_binary.or_else(|| {
-        if opts.npx_fallback_package.is_some() {
-            opts.npx_fallback_binary
-        } else {
-            None
-        }
-    });
-    cmd.env("PATH", enhanced_path(path_binary));
+    cmd.env("PATH", enhanced_path(opts.path_enrichment_binary()));
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -380,8 +385,9 @@ impl SpawnedAgent {
 ///
 /// # Errors
 ///
-/// Returns [`AcpError::ProviderNotFound`] when the launched program does not
-/// exist (`ENOENT`), naming the launch tier that was missing, and
+/// Returns [`AcpError::ProviderNotFound`] when the spawn failed with `ENOENT`
+/// and the launched program is established to be missing (see
+/// [`classify_not_found`]), naming the launch tier that was missing, and
 /// [`AcpError::Spawn`] for every other spawn failure or when the stdio pipes
 /// cannot be taken.
 pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
@@ -390,10 +396,7 @@ pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<
     let command_name = target.to_string_lossy().into_owned();
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            AcpError::ProviderNotFound {
-                command: command_name.clone(),
-                launch,
-            }
+            classify_not_found(opts, launch, target, &command_name, &e)
         } else {
             AcpError::Spawn(format!("{command_name}: {e}"))
         }
@@ -412,6 +415,53 @@ pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<
         .map(|s| Box::new(s) as Box<dyn AsyncRead + Unpin + Send>);
     let connection = Connection::new(stdin, stdout, stderr, hooks);
     Ok(SpawnedAgent { child, connection })
+}
+
+/// Attribute a spawn `ENOENT`. The kernel returns `ENOENT` for more than a
+/// missing program — a missing `cwd` and a script whose shebang interpreter is
+/// absent surface identically — so [`AcpError::ProviderNotFound`] is reserved
+/// for the case where the program is established to be missing: a resolved
+/// path (or a bare command containing a path separator) that does not exist,
+/// or a bare command that no directory of the child's `PATH` (the same
+/// [`enhanced_path`] `build_command` sets) contains. Every other `ENOENT`
+/// stays an [`AcpError::Spawn`] carrying the original error plus the
+/// established fact (missing working directory, or "program exists").
+pub(crate) fn classify_not_found(
+    opts: &SpawnOptions,
+    launch: LaunchMode,
+    target: &std::ffi::OsStr,
+    command_name: &str,
+    e: &std::io::Error,
+) -> AcpError {
+    if let Some(cwd) = opts.cwd.filter(|cwd| !cwd.is_dir()) {
+        return AcpError::Spawn(format!(
+            "{command_name}: {e} (working directory `{}` does not exist)",
+            cwd.display()
+        ));
+    }
+    let program = Path::new(target);
+    let program_exists = if launch != LaunchMode::BareCommand || program.components().count() > 1 {
+        // A relative program path is exec'd after the chdir, so it resolves
+        // against the child's working directory.
+        match opts.cwd {
+            Some(cwd) if program.is_relative() => cwd.join(program).exists(),
+            _ => program.exists(),
+        }
+    } else {
+        std::env::split_paths(&enhanced_path(opts.path_enrichment_binary()))
+            .any(|dir| dir.join(program).exists())
+    };
+    if program_exists {
+        AcpError::Spawn(format!(
+            "{command_name}: {e} (the program exists; ENOENT from a missing shebang \
+             interpreter or dynamic loader)"
+        ))
+    } else {
+        AcpError::ProviderNotFound {
+            command: command_name.to_string(),
+            launch,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -71,12 +71,15 @@ pub enum AcpError {
     #[error("failed to spawn provider: {0}")]
     Spawn(String),
 
-    /// The program `spawn_provider` launched does not exist (`ENOENT`).
-    /// Structurally distinct from [`AcpError::Spawn`] so a missing **bare**
-    /// command — nothing resolved a provider binary and the `PATH` lookup
-    /// failed — is told apart from a resolved binary path that vanished (or
-    /// whose shebang interpreter / working directory is missing)
-    /// (intent-hq/intent#4971). `command` is the program as launched.
+    /// The program `spawn_provider` launched is established to be missing:
+    /// the spawn failed with `ENOENT` and the program does not exist at its
+    /// resolved path / in any directory of the child's `PATH`. Structurally
+    /// distinct from [`AcpError::Spawn`] so a missing **bare** command —
+    /// nothing resolved a provider binary and the `PATH` lookup failed — is
+    /// told apart from a resolved binary path that vanished
+    /// (intent-hq/intent#4971). An `ENOENT` whose program exists (missing
+    /// working directory or shebang interpreter) stays [`AcpError::Spawn`].
+    /// `command` is the program as launched.
     #[error("provider executable not found: `{command}` ({launch})")]
     ProviderNotFound {
         /// The program passed to the OS spawn.
