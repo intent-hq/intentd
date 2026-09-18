@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.77] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(events)* Give the bus writer a wall-clock retry budget so bulk workspace.delete never drops a batch ([#1980](https://github.com/intent-hq/intentd/pull/1980))
+
+### ⚙️ Miscellaneous Tasks
+
+- Isolate pwsh startup cache in install.ps1 guard tests ([#1982](https://github.com/intent-hq/intentd/pull/1982))
+
+
 ## [0.9.76] - 2026-09-18
 
 ### 🐛 Bug Fixes
