@@ -6404,8 +6404,15 @@ async fn wss_presence_typing_sources_and_snapshot() {
 /// resolved `author` per user row: the stamp, else the workspace's legacy
 /// author, else its owner (pre-multiplayer rows). Assistant rows carry no
 /// author; a non-user role never gets a stamp.
+///
+/// Multiplayer sender preamble: the collaborator's `agent.sendMessage` /
+/// `agent.queueMessage` content is persisted (and served) with the daemon's
+/// single-line preamble naming the guest above the text, while the owner's
+/// `agent.sendMessage` content stays byte-identical.
 #[intent_test_macros::daemon_test]
 async fn wss_user_messages_stamp_principal_and_serve_author() {
+    const GUEST_PREAMBLE: &str = "Message from @guest (Guest User), a collaborator (guest) of \
+                                  this workspace — not the workspace owner.";
     use intent_core::{Principal, PrincipalId, WorkspaceRole};
 
     async fn next_event(
@@ -6648,8 +6655,49 @@ async fn wss_user_messages_stamp_principal_and_serve_author() {
     assert_eq!(guest_row["author"]["principalId"], guest.id.0);
     assert_eq!(guest_row["author"]["login"], "guest");
     assert_eq!(guest_row["author"]["displayName"], "Guest User");
+    assert_eq!(
+        guest_row["contentBlocks"][0]["text"],
+        format!("{GUEST_PREAMBLE}\n\nhello from guest"),
+        "the collaborator's persisted content starts with the sender preamble: {guest_row}"
+    );
+    assert_eq!(
+        guest_row["contentBlocks"].as_array().map(Vec::len),
+        Some(1),
+        "{guest_row}"
+    );
     let owner_row = find(&appended_id);
     assert_eq!(owner_row["author"]["principalId"], primary.id.0);
+    let owner_sent = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"agent.sendMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","content":"hello from owner"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        owner_sent["result"]["success"], true,
+        "owner send: {owner_sent}"
+    );
+    let owner_sent_row = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":12,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let owner_sent_row = owner_sent_row["result"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["id"] == owner_sent["result"]["messageId"])
+        .unwrap_or_else(|| panic!("owner send row: {owner_sent_row}"))
+        .clone();
+    assert_eq!(
+        owner_sent_row["contentBlocks"][0]["text"], "hello from owner",
+        "the owner's content stays byte-identical (no preamble): {owner_sent_row}"
+    );
     assert!(
         messages
             .iter()
@@ -6713,11 +6761,16 @@ async fn wss_user_messages_stamp_principal_and_serve_author() {
         .as_array()
         .expect("queue array")
         .iter()
-        .find(|q| q["content"] == "queued by guest")
+        .find(|q| q["messageMetadata"]["fromPrincipalId"] == guest.id.0)
         .unwrap_or_else(|| panic!("queued entry: {queue}"));
     assert_eq!(
         entry["messageMetadata"]["fromPrincipalId"], guest.id.0,
         "queue entry carries the caller's stamp: {entry}"
+    );
+    assert_eq!(
+        entry["content"],
+        format!("{GUEST_PREAMBLE}\n\nqueued by guest"),
+        "the queue entry captures the sender preamble on its content: {entry}"
     );
 
     srv.ws.stop().await;
