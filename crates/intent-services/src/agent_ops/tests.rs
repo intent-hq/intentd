@@ -14488,7 +14488,7 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
 /// caller.
 #[intent_test_macros::daemon_test]
 async fn collaborator_sender_preamble_on_delegate_free_text() {
-    use intent_core::{with_caller, Caller, Principal, PrincipalId};
+    use intent_core::{with_caller, Caller, ConversationProjection, Principal, PrincipalId};
 
     let (_t, svc, ws) = setup().await;
     let owner = svc
@@ -14525,7 +14525,9 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
         &guest.0,
     );
     let annotated = |text: &str| format!("{preamble}\n\n{text}");
-    let first_user_text = |svc: &Services, out: &serde_json::Value| {
+    // The child's first user row: its text, its persisted principal stamp,
+    // and the author the conversation read serves for it.
+    let first_user_row = |svc: &Services, out: &serde_json::Value| {
         let svc = svc.clone();
         let child = AgentId::from(out["agentId"].as_str().expect("agentId"));
         async move {
@@ -14538,12 +14540,42 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
                 .into_iter()
                 .find(|m| m.role == "user")
                 .unwrap_or_else(|| panic!("child {child} has a first user row"));
-            crate::search_ops::message_text(&row.content)
+            let stamp = row
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("fromPrincipalId"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let page = svc
+                .agent_get_conversation_op(
+                    child.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(ConversationProjection::Slim),
+                    false,
+                )
+                .await
+                .expect("child conversation");
+            let served = page["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .find(|m| m["id"] == row.id)
+                .unwrap_or_else(|| panic!("child {child} serves row {}", row.id));
+            (
+                crate::search_ops::message_text(&row.content),
+                stamp,
+                served["author"]["principalId"].as_str().map(str::to_string),
+            )
         }
     };
-
     // agentInstructions by the collaborator (no note): delivered verbatim
-    // otherwise, so the preamble is the whole difference.
+    // otherwise, so the preamble is the whole difference — and the row is
+    // stamped with (and served as authored by) the collaborator, not the
+    // workspace owner the resolver falls back to for unstamped rows.
     let out = with_caller(wire(&guest), async {
         svc.agent_delegate(
             ws.clone(),
@@ -14557,10 +14589,21 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
     })
     .await
     .expect("delegate agentInstructions");
+    let (text, stamp, author) = first_user_row(&svc, &out).await;
     assert_eq!(
-        first_user_text(&svc, &out).await,
+        text,
         annotated("do the thing"),
         "collaborator agentInstructions carry the preamble"
+    );
+    assert_eq!(
+        stamp.as_deref(),
+        Some(guest.0.as_str()),
+        "collaborator agentInstructions persist the collaborator's stamp"
+    );
+    assert_eq!(
+        author.as_deref(),
+        Some(guest.0.as_str()),
+        "the served author is the collaborator, not the workspace owner"
     );
 
     // taskText by the collaborator (no note): same free-text source.
@@ -14577,10 +14620,21 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
     })
     .await
     .expect("delegate taskText");
+    let (text, stamp, author) = first_user_row(&svc, &out).await;
     assert_eq!(
-        first_user_text(&svc, &out).await,
+        text,
         annotated("tick the box"),
         "collaborator taskText carries the preamble"
+    );
+    assert_eq!(
+        stamp.as_deref(),
+        Some(guest.0.as_str()),
+        "collaborator taskText persists the collaborator's stamp"
+    );
+    assert_eq!(
+        author.as_deref(),
+        Some(guest.0.as_str()),
+        "the served taskText author is the collaborator"
     );
     assert_eq!(
         out["name"], "tick the box",
@@ -14604,14 +14658,25 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
     })
     .await
     .expect("delegate agentInstructions + taskNoteId");
+    let (text, stamp, author) = first_user_row(&svc, &out).await;
     assert_eq!(
-        first_user_text(&svc, &out).await,
+        text,
         crate::harness::latest().delegation_first_message(
             Some(&annotated("with note")),
             "delegate preamble",
             &note_id.0,
         ),
         "the preamble sits above the caller's text, inside the TASK-C wrapper"
+    );
+    assert_eq!(
+        stamp.as_deref(),
+        Some(guest.0.as_str()),
+        "the wrapped free text keeps the collaborator's stamp"
+    );
+    assert_eq!(
+        author.as_deref(),
+        Some(guest.0.as_str()),
+        "the wrapped free text is served as the collaborator's"
     );
 
     // Task-note fallback (no free text): the note's content is not the
@@ -14630,8 +14695,9 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
     })
     .await
     .expect("delegate taskNoteId");
+    let (text, stamp, author) = first_user_row(&svc, &out).await;
     assert_eq!(
-        first_user_text(&svc, &out).await,
+        text,
         crate::harness::latest().delegation_first_message(
             Some("delegate fallback body"),
             "delegate fallback",
@@ -14639,9 +14705,20 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
         ),
         "the task-note fallback gains no preamble"
     );
+    assert_eq!(
+        stamp, None,
+        "the task-note fallback is note content and carries no principal stamp"
+    );
+    assert_eq!(
+        author.as_deref(),
+        Some(owner.0.as_str()),
+        "an unstamped fallback row keeps resolving to the workspace owner"
+    );
 
     // Byte-identical controls on free text: owner role, administrator,
-    // absent (UDS / legacy-token) caller, agent caller.
+    // absent (UDS / legacy-token) caller, agent caller. The stamp follows
+    // the `agent.sendMessage` rule (bound wire principal stamped, agents and
+    // absent callers not); every control is served as the owner.
     let admin = Caller::Wire {
         principal_id: owner.clone(),
         is_administrator: true,
@@ -14649,11 +14726,11 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
     let peer = Caller::Agent {
         agent_id: AgentId::from("agent-peer"),
     };
-    for (label, caller) in [
-        ("owner role", Some(wire(&owner))),
-        ("administrator", Some(admin)),
-        ("absent caller", None),
-        ("agent caller", Some(peer)),
+    for (label, caller, expected_stamp) in [
+        ("owner role", Some(wire(&owner)), Some(owner.0.clone())),
+        ("administrator", Some(admin), Some(owner.0.clone())),
+        ("absent caller", None, None),
+        ("agent caller", Some(peer), None),
     ] {
         let text = format!("control {label}");
         let delegate = svc.agent_delegate(
@@ -14669,10 +14746,19 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
             None => delegate.await,
         }
         .unwrap_or_else(|e| panic!("{label}: delegate: {e:?}"));
+        let (served_text, stamp, author) = first_user_row(&svc, &out).await;
         assert_eq!(
-            first_user_text(&svc, &out).await,
-            text,
+            served_text, text,
             "{label}: agentInstructions must stay byte-identical"
+        );
+        assert_eq!(
+            stamp, expected_stamp,
+            "{label}: the delegate row carries the sendMessage stamp"
+        );
+        assert_eq!(
+            author.as_deref(),
+            Some(owner.0.as_str()),
+            "{label}: the delegate row is served as the owner"
         );
     }
 }
