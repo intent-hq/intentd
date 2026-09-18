@@ -42064,6 +42064,16 @@ mod bulk_delete_pool_pressure {
     fn inaccessible_repository_detach_still_warns() {
         use std::os::unix::fs::PermissionsExt;
 
+        /// Restores the guard dir's permissions on drop — including during
+        /// unwinding — so the tempdir sweep can traverse it after a failed
+        /// assertion.
+        struct RestorePerms(std::path::PathBuf);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
         if unsafe { libc::geteuid() } == 0 {
             // Root bypasses permission checks, so the PermissionDenied seam
             // cannot be produced; skip.
@@ -42077,6 +42087,7 @@ mod bulk_delete_pool_pressure {
         let worktree = root.path().join("ws-1").join("repo");
         std::fs::set_permissions(&guard_dir, std::fs::Permissions::from_mode(0o000))
             .expect("chmod guard");
+        let _restore = RestorePerms(guard_dir.clone());
         assert_eq!(
             repo.try_exists().unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied,
@@ -42087,10 +42098,6 @@ mod bulk_delete_pool_pressure {
         let guard = crate::test_tracing::set_capture_default(capture.clone());
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
-
-        // Restore permissions so the tempdir can be cleaned up.
-        std::fs::set_permissions(&guard_dir, std::fs::Permissions::from_mode(0o755))
-            .expect("restore guard");
 
         assert!(trash.is_none(), "nothing detached");
         let loud = capture.at_or_above(tracing::Level::WARN);
