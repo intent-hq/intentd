@@ -243,6 +243,11 @@ pub enum InviteErrorKind {
     /// GitHub could not be reached (or answered a server error) while
     /// verifying the proof gist; the nonce stays valid for a retry.
     GithubUnreachable,
+    /// The proven (or credential-bound) GitHub account is the host owner's
+    /// own — the primary principal. The owner cannot join its own host as a
+    /// guest: no per-principal credential is ever minted for the primary
+    /// row, and the invite stays open.
+    OwnerSelfJoin,
 }
 
 impl InviteErrorKind {
@@ -265,6 +270,7 @@ impl InviteErrorKind {
             InviteErrorKind::ProofInvalid => "proof-invalid",
             InviteErrorKind::ProofExpired => "proof-expired",
             InviteErrorKind::GithubUnreachable => "github-unreachable",
+            InviteErrorKind::OwnerSelfJoin => "owner-self-join",
         }
     }
 
@@ -315,6 +321,10 @@ impl InviteErrorKind {
             InviteErrorKind::GithubUnreachable => {
                 "internal error: GitHub could not be reached to verify the identity proof"
             }
+            InviteErrorKind::OwnerSelfJoin => {
+                "invalid params: this GitHub account owns the host; open it from your \
+                 paired daemons instead of joining as a guest"
+            }
         }
     }
 
@@ -332,7 +342,8 @@ impl InviteErrorKind {
             | InviteErrorKind::WorkspaceFull
             | InviteErrorKind::CredentialInvalid
             | InviteErrorKind::ProofInvalid
-            | InviteErrorKind::ProofExpired => -32602,
+            | InviteErrorKind::ProofExpired
+            | InviteErrorKind::OwnerSelfJoin => -32602,
             InviteErrorKind::GithubIdentityRequired
             | InviteErrorKind::IdentityLocked
             | InviteErrorKind::FlowBusy

@@ -532,7 +532,10 @@
 //! has read a gist owned by `login` whose `intent-join-proof.txt` starts
 //! with the nonce and postdates it; the nonce is spent by the first
 //! attempt; `error.data.code` `proof-invalid` / `proof-expired` /
-//! `github-unreachable`). The gist proof replaces the host-side device flow:
+//! `github-unreachable`). Both joins refuse the host owner's own account
+//! with `error.data.code` `owner-self-join` (-32602): the primary
+//! principal never receives a per-principal credential, and the invite
+//! stays open. The gist proof replaces the host-side device flow:
 //! `invite.redeem` is no longer served (an `/invite` connection naming it
 //! gets `-32001` like any other non-invite method). The catalog contains
 //! 326 router methods, 56 fast-path methods, and two aliases: 384
