@@ -19515,7 +19515,7 @@ impl WorkspaceApi for Services {
                                     if let Some(w) = &wrapper_path {
                                         let _ = tokio::fs::remove_file(w).await;
                                     }
-                                    (true, exit.ok().map(|e| e.exit_code))
+                                    (true, exit.ok().filter(|e| e.observed).map(|e| e.exit_code))
                                 }
                                 Err(e) => {
                                     tracing::warn!(

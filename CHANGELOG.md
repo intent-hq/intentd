@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.67] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Make the saved-script terminal state total so lost processes reach exited ([#1942](https://github.com/intent-hq/intentd/pull/1942))
+
+
 ## [0.9.66] - 2026-09-16
 
 ### 🧪 Testing
