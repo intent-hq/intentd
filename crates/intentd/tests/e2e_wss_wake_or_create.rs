@@ -1390,6 +1390,9 @@ async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
     let woke = wss_rpc(&mut rpc, 10, "agent.wakeOrCreate", wake_params).await;
     assert_eq!(woke["ok"], true, "owner wakeOrCreate: {woke}");
     let agent_id = woke["agentId"].as_str().expect("agentId").to_string();
+    // The OWNER enqueued the kickoff, so no collaborator sender preamble is
+    // prepended: the requeue keeps the enqueue-time content verbatim.
+    let kickoff_content = json!("guest kickoff");
 
     // Wait for the terminal failure and for the `agent:queue:updated` that
     // announces the requeued kickoff.
@@ -1407,7 +1410,7 @@ async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
         if event["type"] == "agent:queue:updated"
             && event["data"]["queue"]
                 .as_array()
-                .is_some_and(|q| q.iter().any(|m| m["content"] == "guest kickoff"))
+                .is_some_and(|q| q.iter().any(|m| m["content"] == kickoff_content))
         {
             requeue_event = Some(event["data"].clone());
         }
@@ -1428,7 +1431,7 @@ async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
     let parked = queue["queue"].as_array().expect("queue array");
     let kickoff = parked
         .iter()
-        .find(|m| m["content"] == "guest kickoff")
+        .find(|m| m["content"] == kickoff_content)
         .unwrap_or_else(|| panic!("requeued kickoff on the queue: {queue}"));
     assert_eq!(
         kickoff["messageMetadata"]["fromPrincipalId"],
@@ -1451,7 +1454,7 @@ async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
         .as_array()
         .expect("queue array")
         .iter()
-        .find(|m| m["content"] == "guest kickoff")
+        .find(|m| m["content"] == kickoff_content)
         .unwrap_or_else(|| panic!("requeued kickoff in agent:queue:updated: {queue_event}"));
     assert_eq!(
         announced["messageMetadata"]["fromPrincipalId"],
@@ -1553,7 +1556,7 @@ async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
         if event["type"] == "agent:queue:updated"
             && event["data"]["queue"]
                 .as_array()
-                .is_some_and(|q| q.iter().any(|m| m["content"] == "guest kickoff"))
+                .is_some_and(|q| q.iter().any(|m| m["content"] == kickoff_content))
         {
             second_requeue = Some(event["data"].clone());
         }
@@ -1567,7 +1570,7 @@ async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
         .as_array()
         .expect("queue array")
         .iter()
-        .find(|m| m["content"] == "guest kickoff")
+        .find(|m| m["content"] == kickoff_content)
         .expect("kickoff in the second requeue");
     assert_eq!(
         redriven["messageMetadata"]["fromPrincipalId"],
@@ -1588,7 +1591,7 @@ async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
         .as_array()
         .expect("queue array")
         .iter()
-        .find(|m| m["content"] == "guest kickoff")
+        .find(|m| m["content"] == kickoff_content)
         .unwrap_or_else(|| panic!("kickoff requeued after the retry: {queue_after_retry}"));
     assert_eq!(
         kickoff_after_retry["messageMetadata"]["fromPrincipalId"],
