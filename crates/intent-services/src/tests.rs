@@ -42055,6 +42055,52 @@ mod bulk_delete_pool_pressure {
         );
     }
 
+    /// Only a confirmed absence is quiet. A repository that is present but
+    /// unreadable (`try_exists` → `PermissionDenied`, standing in for EIO on
+    /// a flaky mount) must still reach the detach attempt and keep its WARN,
+    /// or a real failure would be silently swallowed.
+    #[cfg(unix)]
+    #[test]
+    fn inaccessible_repository_detach_still_warns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            // Root bypasses permission checks, so the PermissionDenied seam
+            // cannot be produced; skip.
+            return;
+        }
+
+        let root = WorkspacesRoot::new();
+        let guard_dir = root.path().join("guard");
+        let repo = guard_dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("present repo");
+        let worktree = root.path().join("ws-1").join("repo");
+        std::fs::set_permissions(&guard_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod guard");
+        assert_eq!(
+            repo.try_exists().unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "seam must produce a non-NotFound stat error"
+        );
+
+        let capture = LevelCapture::default();
+        let guard = crate::test_tracing::set_capture_default(capture.clone());
+        let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
+        drop(guard);
+
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(&guard_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore guard");
+
+        assert!(trash.is_none(), "nothing detached");
+        let loud = capture.at_or_above(tracing::Level::WARN);
+        assert!(
+            loud.iter()
+                .any(|line| line.contains("failed to detach git worktree")),
+            "inaccessible repository must keep the detach WARN: {loud:?}"
+        );
+    }
+
     /// Concurrent deletes (checkouts present and absent) while the bus keeps
     /// publishing: every delete succeeds, every publish resolves `Ok` (no
     /// dropped batch), and the writer never logs a drop.
