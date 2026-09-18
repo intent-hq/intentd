@@ -4282,6 +4282,49 @@ pub struct Hook {
     pub dispatch_count: i64,
 }
 
+/// The LIGHT `hook.list` projection of a retired hook: every [`Hook`] field
+/// except the heavy `code`, `lastLogs` and `lastState` blobs, which the store
+/// never hydrates for terminal rows (intent-hq/intent#5307). `hook.get`
+/// remains the full-row recovery path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookSummary {
+    pub hook_id: HookId,
+    pub workspace_id: WorkspaceId,
+    pub agent_id: AgentId,
+    pub name: String,
+    pub delay_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_at: Option<String>,
+    pub state: HookState,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<String>,
+    pub run_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub perpetual: bool,
+    #[serde(default)]
+    pub dispatch_count: i64,
+}
+
+/// One `hook.list` row, oldest first: an ACTIVE (`scheduled`/`running`)
+/// hook is the full [`Hook`]; a RETIRED hook is the light [`HookSummary`].
+/// Serialized untagged, so the wire shape is the row itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HookListRow {
+    Active(Hook),
+    Retired(HookSummary),
+}
+
 /// Lifecycle state of a PR monitor. `active` is the only live state
 /// (rehydrated into the poll loop at boot); `completed` (the PR merged or
 /// closed) and `cancelled` are terminal. Completed rows are RETAINED and stay

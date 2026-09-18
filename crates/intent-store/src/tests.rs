@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use intent_core::{
     events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientHostInfo,
     ClientId, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType,
-    Error, EventActor, Hook, HookId, HookState, Note, NoteId, NoteMetadata, NoteVersionAuthor,
-    NoteVisibility, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
+    Error, EventActor, Hook, HookId, HookListRow, HookState, Note, NoteId, NoteMetadata,
+    NoteVersionAuthor, NoteVisibility, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -7274,6 +7274,87 @@ async fn hook_list_filters_by_workspace_and_agent() {
         .await
         .expect("list none");
     assert!(empty.is_empty());
+}
+
+/// `list_hook_rows` (the `hook.list` read) filters by state in SQL — active
+/// rows only by default — and hydrates the heavy `code` / `last_logs` /
+/// `last_state` columns only for active rows: with `include_retired` the
+/// terminal rows come back as the light `HookSummary`, oldest first among
+/// the full rows, scoped to the workspace and optionally one agent.
+#[tokio::test]
+async fn hook_list_rows_filters_state_in_sql_and_lightens_retired() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+    let (ws_other, agent_other) = seed_hook_owner(&store).await;
+
+    let mut done = sample_hook(&HookId("hook-done".into()), &ws, &agent, "done");
+    done.state = HookState::Dispatched;
+    done.created_at = "2026-01-01T00:00:00Z".to_string();
+    done.last_logs = Some("fired".to_string());
+    done.last_state = Some("{\"n\":1}".to_string());
+    done.last_error = Some("boom".to_string());
+    done.run_count = 3;
+    done.dispatch_count = 1;
+    let mut sched = sample_hook(&HookId("hook-sched".into()), &ws, &agent, "sched");
+    sched.created_at = "2026-01-01T00:00:01Z".to_string();
+    sched.last_state = Some("{\"n\":2}".to_string());
+    let mut other_agent = sample_hook(&HookId("hook-other".into()), &ws, &agent_other, "peer");
+    other_agent.created_at = "2026-01-01T00:00:02Z".to_string();
+    let other_ws = sample_hook(&HookId("hook-ws-b".into()), &ws_other, &agent_other, "b");
+    for h in [&done, &sched, &other_agent, &other_ws] {
+        store.insert_hook(h).await.expect("insert hook");
+    }
+
+    let active = store
+        .list_hook_rows(&ws, None, false)
+        .await
+        .expect("active rows");
+    assert_eq!(
+        active,
+        vec![
+            HookListRow::Active(sched.clone()),
+            HookListRow::Active(other_agent.clone())
+        ]
+    );
+
+    let active_mine = store
+        .list_hook_rows(&ws, Some(&agent), false)
+        .await
+        .expect("active rows for agent");
+    assert_eq!(active_mine, vec![HookListRow::Active(sched.clone())]);
+
+    let all_mine = store
+        .list_hook_rows(&ws, Some(&agent), true)
+        .await
+        .expect("all rows for agent");
+    assert_eq!(all_mine.len(), 2, "{all_mine:?}");
+    match &all_mine[0] {
+        HookListRow::Retired(light) => {
+            assert_eq!(light.hook_id, done.hook_id);
+            assert_eq!(light.state, HookState::Dispatched);
+            assert_eq!(light.name, "done");
+            assert_eq!(light.last_error.as_deref(), Some("boom"));
+            assert_eq!(light.run_count, 3);
+            assert_eq!(light.dispatch_count, 1);
+            assert_eq!(light.created_at, done.created_at);
+            let wire = json!(light);
+            for heavy in ["code", "lastLogs", "lastState"] {
+                assert!(
+                    wire.get(heavy).is_none(),
+                    "light row carries {heavy}: {wire}"
+                );
+            }
+        }
+        other @ HookListRow::Active(_) => panic!("retired row expected first, got {other:?}"),
+    }
+    assert_eq!(all_mine[1], HookListRow::Active(sched.clone()));
+
+    let none = store
+        .list_hook_rows(&ws, Some(&AgentId("agent-none".to_string())), true)
+        .await
+        .expect("no rows");
+    assert!(none.is_empty());
 }
 
 /// `count_active_hooks_by_agent` counts only `scheduled`/`running` rows for

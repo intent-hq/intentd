@@ -1107,39 +1107,22 @@ impl Services {
     /// (`scheduled`/`running`) hooks are listed, as full rows (the FE chip
     /// row reads `code` for its expanded view). With `include_retired`, the
     /// terminal rows (`dispatched`/`evicted`/`cancelled`/`expired`) are
-    /// appended as a LIGHT projection — `code`, `lastState` and `lastLogs`
-    /// omitted — so a long-lived workspace's retired history never inflates
-    /// the frame (intent-hq/intent#5307); `hook.get` remains the full-row
-    /// recovery path.
+    /// listed too, as a LIGHT projection — `code`, `lastState` and
+    /// `lastLogs` omitted — so a long-lived workspace's retired history never
+    /// inflates the frame (intent-hq/intent#5307); `hook.get` remains the
+    /// full-row recovery path. The state filter and the projection are
+    /// applied in SQL ([`Store::list_hook_rows`]), so the handler is
+    /// O(rows returned) and never hydrates a retired row's blobs.
     pub(crate) async fn hook_list_op(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: Option<&AgentId>,
         include_retired: bool,
     ) -> Result<Value> {
-        let hooks = match agent_id {
-            Some(a) => self.store.list_hooks_by_agent(a).await?,
-            None => self.store.list_hooks_by_workspace(workspace_id).await?,
-        };
-        let hooks: Vec<Value> = hooks
-            .into_iter()
-            .filter(|h| &h.workspace_id == workspace_id)
-            .filter_map(|h| {
-                if matches!(h.state, HookState::Scheduled | HookState::Running) {
-                    return Some(json!(h));
-                }
-                if !include_retired {
-                    return None;
-                }
-                let mut row = json!(h);
-                if let Some(obj) = row.as_object_mut() {
-                    obj.remove("code");
-                    obj.remove("lastState");
-                    obj.remove("lastLogs");
-                }
-                Some(row)
-            })
-            .collect();
+        let hooks = self
+            .store
+            .list_hook_rows(workspace_id, agent_id, include_retired)
+            .await?;
         Ok(json!({ "hooks": hooks }))
     }
 
