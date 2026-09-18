@@ -1094,6 +1094,29 @@ struct BudgetDenial {
     available_memory: Option<u64>,
 }
 
+/// What [`AgentManager::interrupt_inner`] did. `preempted` is `false` only on
+/// the `PreemptedByMessage` path when the live-slot pin found no turn to cut
+/// short (intent-hq/intent#5380): nothing was aborted, cancelled, released or
+/// emitted, and `interrupted_row_id` is `None`.
+#[derive(Debug)]
+struct InterruptOutcome {
+    agent_found: bool,
+    preempted: bool,
+    interrupted_row_id: Option<String>,
+}
+
+impl InterruptOutcome {
+    /// The kill-path fallback (no handle / no `acpSessionId`): `stop` ran, so
+    /// whatever turn there was is gone, and no marker row was appended.
+    fn killed(agent_found: bool) -> Self {
+        Self {
+            agent_found,
+            preempted: true,
+            interrupted_row_id: None,
+        }
+    }
+}
+
 /// Provisional cost charged against the budget for a spawn that has been
 /// admitted but is not yet visible in a tree sample (and credited back when a
 /// process is deregistered). The measured median idle agent subtree is ~660 MB
@@ -4775,7 +4798,7 @@ impl AgentManager {
     pub async fn interrupt(&self, agent_id: &AgentId) -> bool {
         self.interrupt_inner(agent_id, InterruptReason::UserStop, None)
             .await
-            .0
+            .agent_found
     }
 
     /// Shared body of [`AgentManager::interrupt`], parameterized on the
@@ -4791,9 +4814,21 @@ impl AgentManager {
     /// passes `UserStop` so STAB-28 behavior (watches fire on interrupt) is
     /// preserved. `agent:stream:end` is emitted unconditionally in both paths.
     ///
-    /// Returns `(agent_found, interrupted_row_message_id)` — the second field
-    /// names the interrupted assistant row this call persisted (`None` when
-    /// no live-turn slot was open or the call fell back to the kill path), so
+    /// The `PreemptedByMessage` decision is made HERE, atomically with the
+    /// live-slot pin (intent-hq/intent#5380): the caller's own eligibility
+    /// read is an unpinned snapshot taken several awaits earlier, and a turn
+    /// can complete in that gap (the worker clears the unpinned slot and
+    /// emits its normal `stream:end`). When the pin finds no slot on the
+    /// preemption path there is nothing to cut short — the call returns with
+    /// `preempted: false` before aborting, cancelling, releasing the slot or
+    /// emitting anything, and the follow-up message queues behind the turn
+    /// that is starting or finishing. The plain `UserStop` path keeps its
+    /// bare interrupt terminal in that state: a pre-first-token stop relies
+    /// on it to close the spinner (PROTOCOL §7.2).
+    ///
+    /// The returned [`InterruptOutcome::interrupted_row_id`] names the
+    /// interrupted assistant row this call persisted (`None` when no
+    /// live-turn slot was open or the call fell back to the kill path), so
     /// `preempt_busy_turn` can exclude that row from its combined-delivery
     /// re-queue check.
     async fn interrupt_inner(
@@ -4801,7 +4836,7 @@ impl AgentManager {
         agent_id: &AgentId,
         reason: InterruptReason,
         interrupted_by: Option<InterruptedBy>,
-    ) -> (bool, Option<String>) {
+    ) -> InterruptOutcome {
         let suppress_idle_emit = reason == InterruptReason::PreemptedByMessage;
         // The live connection is the interrupt capability; grab it WITHOUT
         // removing the handle so the child stays alive for resume.
@@ -4814,7 +4849,7 @@ impl AgentManager {
         let Some(conn) = conn else {
             // No live session to interrupt → keep-alive is a no-op; fall back to
             // the hard kill path (itself a no-op when the agent is already gone).
-            return (self.stop_with_redelivery_arm(agent_id, reason).await, None);
+            return InterruptOutcome::killed(self.stop_with_redelivery_arm(agent_id, reason).await);
         };
         // Resolve the persisted session for the workspace (terminal event) + the
         // `acpSessionId` to cancel. Without an `acpSessionId` there is no
@@ -4822,7 +4857,7 @@ impl AgentManager {
         let session = self.services.store.get_agent_session(agent_id).await.ok();
         let acp_session_id = session.as_ref().and_then(|s| s.acp_session_id.clone());
         let Some(acp_session_id) = acp_session_id else {
-            return (self.stop_with_redelivery_arm(agent_id, reason).await, None);
+            return InterruptOutcome::killed(self.stop_with_redelivery_arm(agent_id, reason).await);
         };
         // Pin the live-turn slot BEFORE aborting the worker: the abort drops
         // the worker future and with it the LiveTurnGuard, so an UNPINNED slot
@@ -4833,7 +4868,20 @@ impl AgentManager {
         // (monorepo#2110). The busy flag is snapshotted alongside (before
         // `end_turn` below releases it) for the zero-output stop-redelivery
         // arm at the bottom of this method.
-        self.services.pin_live_turn(agent_id);
+        let pinned = self.services.pin_live_turn(agent_id);
+        if !pinned && reason == InterruptReason::PreemptedByMessage {
+            // Nothing to cut short at the pin: the turn `preempt_busy_turn`
+            // saw live has completed in the awaits since (or it never
+            // started — relaunch startup window). Its worker owns the busy
+            // slot and its own terminal emit; aborting it here would only
+            // produce a bare interrupt `agent:stream:end` (no `messageId`)
+            // for a turn that already ended (intent-hq/intent#5380).
+            return InterruptOutcome {
+                agent_found: true,
+                preempted: false,
+                interrupted_row_id: None,
+            };
+        }
         let turn_in_flight = self.is_busy(agent_id);
         // Abort the in-flight worker so it stops draining the turn/queue; the
         // child is kept alive (unlike `stop`, which also kills the child).
@@ -5197,7 +5245,11 @@ impl AgentManager {
                     .await;
             }
         }
-        (true, interrupted_message_id)
+        InterruptOutcome {
+            agent_found: true,
+            preempted: true,
+            interrupted_row_id: interrupted_message_id,
+        }
     }
 
     /// Derive the zero-output stop-redelivery payload (intent-hq/monorepo#1757)
@@ -7378,6 +7430,8 @@ impl AgentManager {
         // read as cancellable and `interrupt_inner` emitted a bare interrupt
         // `agent:stream:end` (no `messageId`) for a turn that was never in
         // flight. Skip it and let the caller queue behind the starting turn.
+        // This read is the early exit only: the decisive check is the pin
+        // inside `interrupt_inner`, made with no await in between.
         //
         // STAB-114: the same slot read tells whether the current turn has
         // produced zero output (no assistant content chunks) BEFORE we
@@ -7436,14 +7490,23 @@ impl AgentManager {
         // settled" to the parent here. The returned row id names the
         // interrupted marker row this preemption just persisted (empty
         // blocks on the zero-output path), excluded from the progress
-        // check below.
-        let (_, interrupted_row_id) = self
+        // check below. The slot read above is an UNPINNED snapshot and the
+        // session lookup awaited since: a turn that completed in that gap
+        // leaves nothing to preempt at `interrupt_inner`'s pin, which then
+        // returns `preempted: false` having emitted nothing — the message
+        // queues behind that turn's own end, and the completed turn's
+        // message was delivered, so no combined re-delivery either.
+        let outcome = self
             .interrupt_inner(
                 agent_id,
                 InterruptReason::PreemptedByMessage,
                 interrupted_by,
             )
             .await;
+        if !outcome.preempted {
+            return;
+        }
+        let interrupted_row_id = outcome.interrupted_row_id;
 
         if !has_output {
             // Zero-output condition: the provider dropped the preempted
@@ -14567,6 +14630,111 @@ mod startup_preempt_tests {
             "the relaunching child's handle is left alone"
         );
         mgr.end_turn(&agent_id).await;
+    }
+
+    /// Teardown boundary: `preempt_busy_turn` snapshots the live slot and
+    /// then awaits the session lookups before `interrupt_inner` pins, so a
+    /// turn can complete (worker clears the slot, emits its own normal
+    /// `stream:end`) in that gap. The preemption decision must therefore be
+    /// made atomically with the pin: a `PreemptedByMessage` interrupt whose
+    /// pin finds no slot returns without aborting, cancelling or emitting —
+    /// the state below is exactly what the pin sees after such a completion.
+    #[tokio::test]
+    async fn preempt_interrupt_without_slot_at_pin_emits_nothing() {
+        let _env = EnvGuard::apply(&[("MOCK_AGENT_KILLS_ON_INTERRUPT", None)]);
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = Arc::new(mgr);
+        let ws = WorkspaceId::from("ws-1");
+        let agent_id = AgentId::from("agent-5380-teardown");
+        seed_mock_session(&mgr, &agent_id, "acp-live").await;
+        assert!(
+            mgr.try_begin(&agent_id, &ws).await,
+            "worker still owns the busy slot until its end_turn"
+        );
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+        // The turn was live when the eligibility check ran, then completed:
+        // the worker's normal turn end cleared the unpinned slot.
+        mgr.services.set_live_turn(&agent_id, "msg-done", vec![]);
+        mgr.services.clear_unpinned_live_turn(&agent_id);
+        assert!(mgr.services.live_turn(&agent_id).is_none());
+
+        let outcome = mgr
+            .interrupt_inner(&agent_id, InterruptReason::PreemptedByMessage, None)
+            .await;
+
+        assert!(outcome.agent_found);
+        assert!(!outcome.preempted, "nothing to preempt at the pin");
+        assert!(outcome.interrupted_row_id.is_none());
+        assert!(
+            mgr.is_busy(&agent_id),
+            "the finishing turn's slot is left to its own end_turn"
+        );
+        assert!(mgr.contains(&agent_id), "the handle is left alone");
+        let ends = mgr
+            .services
+            .store
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![AGENT_STREAM_END.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query agent:stream:end events");
+        assert!(
+            ends.is_empty(),
+            "no bare interrupt terminal after the turn already ended: {ends:?}"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .expect("read transcript");
+        assert!(
+            messages.is_empty(),
+            "no interrupted marker row persisted: {messages:?}"
+        );
+        mgr.end_turn(&agent_id).await;
+    }
+
+    /// The same no-slot state on the plain `agent.stop` path keeps its bare
+    /// interrupt terminal: a pre-first-token stop relies on it to close the
+    /// spinner (PROTOCOL §7.2), and it is not a preemption.
+    #[tokio::test]
+    async fn user_stop_without_slot_keeps_bare_terminal() {
+        let _env = EnvGuard::apply(&[("MOCK_AGENT_KILLS_ON_INTERRUPT", None)]);
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = Arc::new(mgr);
+        let ws = WorkspaceId::from("ws-1");
+        let agent_id = AgentId::from("agent-5380-user-stop");
+        seed_mock_session(&mgr, &agent_id, "acp-live").await;
+        assert!(mgr.try_begin(&agent_id, &ws).await);
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+        assert!(mgr.services.live_turn(&agent_id).is_none());
+
+        let outcome = mgr
+            .interrupt_inner(&agent_id, InterruptReason::UserStop, None)
+            .await;
+
+        assert!(outcome.agent_found);
+        assert!(outcome.preempted);
+        assert!(!mgr.is_busy(&agent_id), "the stop released the slot");
+        let ends = mgr
+            .services
+            .store
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![AGENT_STREAM_END.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query agent:stream:end events");
+        assert_eq!(ends.len(), 1, "one bare terminal: {ends:?}");
+        assert_eq!(
+            ends[0].data.get("interruptReason").and_then(Value::as_str),
+            Some("user_stop")
+        );
+        assert!(ends[0].data.get("messageId").is_none());
     }
 }
 

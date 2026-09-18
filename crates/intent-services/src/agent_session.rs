@@ -1939,28 +1939,35 @@ impl Services {
     ///
     /// Callers are exactly the three teardown paths (keep-alive interrupt,
     /// hard stop, graceful shutdown), which pin immediately BEFORE aborting
-    /// the worker and flush AFTER it. Deliberately returns NOTHING (monorepo#2110):
-    /// the flush re-reads the slot — which the pin guarantees is still there,
-    /// against both the [`LiveTurnGuard`] drop and a normal turn end (see
-    /// [`clear_unpinned_live_turn`](Self::clear_unpinned_live_turn)) — so a
-    /// `session/update` processed in the pin→abort gap is persisted rather than
-    /// trimmed off a stale pre-abort clone. A no-op when no turn is in flight;
-    /// the flush's `None` says so on its own. Pinning is idempotent and never
-    /// outlives the turn: the next turn's [`begin_live_turn`](Self::begin_live_turn)
-    /// replaces the slot wholesale.
-    pub(crate) fn pin_live_turn(&self, agent_id: &AgentId) {
-        if let Ok(mut slots) = self.live_turns.lock() {
-            if let Some(slot) = slots.get_mut(agent_id) {
-                slot.flush_pending = true;
-                // A fresh pin means a fresh flush attempt is in flight, so an
-                // earlier give-up no longer describes this slot: re-pinning a
-                // slot a previous flush abandoned (a later teardown, e.g.
-                // shutdown, reaching the same stranded content) gives it a real
-                // second chance at persisting, and must not leave it looking
-                // abandoned to `try_begin` in the meantime.
-                slot.flush_failed = false;
-            }
-        }
+    /// the worker and flush AFTER it. Deliberately returns no slot CONTENT
+    /// (monorepo#2110): the flush re-reads the slot — which the pin guarantees
+    /// is still there, against both the [`LiveTurnGuard`] drop and a normal
+    /// turn end (see [`clear_unpinned_live_turn`](Self::clear_unpinned_live_turn))
+    /// — so a `session/update` processed in the pin→abort gap is persisted
+    /// rather than trimmed off a stale pre-abort clone. Returns whether a slot
+    /// was there to pin: `false` means no turn is in flight at this instant
+    /// (the flush's `None` then agrees), which is the ONE read a caller may
+    /// base an "is there a turn to cut short?" decision on — an unpinned
+    /// `live_turn` snapshot taken before an await can be cleared by a normal
+    /// turn end in that await (intent-hq/intent#5380). Pinning is idempotent
+    /// and never outlives the turn: the next turn's
+    /// [`begin_live_turn`](Self::begin_live_turn) replaces the slot wholesale.
+    pub(crate) fn pin_live_turn(&self, agent_id: &AgentId) -> bool {
+        let Ok(mut slots) = self.live_turns.lock() else {
+            return false;
+        };
+        let Some(slot) = slots.get_mut(agent_id) else {
+            return false;
+        };
+        slot.flush_pending = true;
+        // A fresh pin means a fresh flush attempt is in flight, so an
+        // earlier give-up no longer describes this slot: re-pinning a
+        // slot a previous flush abandoned (a later teardown, e.g.
+        // shutdown, reaching the same stranded content) gives it a real
+        // second chance at persisting, and must not leave it looking
+        // abandoned to `try_begin` in the meantime.
+        slot.flush_failed = false;
+        true
     }
 
     /// Read just the text of the live-turn slot's `type: "text"` blocks
