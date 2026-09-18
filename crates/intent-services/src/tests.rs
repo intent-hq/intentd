@@ -38733,9 +38733,8 @@ mod turn_end_unread_gate {
             !should_raise_turn_end_unread(&h.services, &agent_id).await,
             "a muted agent must not raise the turn-end blue dot"
         );
-        s.notifications_muted = false;
         h.store
-            .update_agent_session(&h.ws, &s)
+            .set_agent_notifications_muted(&h.ws, &agent_id, false, &now_iso())
             .await
             .expect("unmute session");
         assert!(

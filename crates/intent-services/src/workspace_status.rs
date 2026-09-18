@@ -3616,15 +3616,20 @@ mod workspace_needs_attention {
             (&questions, |s| s.needs_attention),
         ];
         for (session, expect) in cases {
-            let mut toggled = session.clone();
-            toggled.notifications_muted = false;
-            svc.store.update_agent_session(&ws, &toggled).await.unwrap();
+            let ts = intent_core::now_iso();
+            svc.store
+                .set_agent_notifications_muted(&ws, &session.id, false, &ts)
+                .await
+                .unwrap();
             assert!(
                 expect(&signals(&svc, &ws).await),
                 "unmuting {} surfaces its signal again",
                 session.id.0
             );
-            svc.store.update_agent_session(&ws, session).await.unwrap();
+            svc.store
+                .set_agent_notifications_muted(&ws, &session.id, true, &ts)
+                .await
+                .unwrap();
         }
     }
 

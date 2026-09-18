@@ -5450,6 +5450,21 @@ impl Services {
         self.store
             .update_agent_session(&workspace_id, &session)
             .await?;
+        // `notifications_muted` is excluded from the full-row write above
+        // (its only post-insert mutator is this scoped UPDATE), so a
+        // concurrent `agent.update` on unrelated fields — or a long-lived
+        // in-memory session persisted at turn end — can never revert the
+        // user's toggle. Same-value writes are a store-level no-op.
+        if obj.contains_key("notificationsMuted") {
+            self.store
+                .set_agent_notifications_muted(
+                    &workspace_id,
+                    &agent_id,
+                    session.notifications_muted,
+                    &session.updated_at,
+                )
+                .await?;
+        }
         // The stored model changed, so any persisted display resolution now
         // names the wrong model — clear it, same anti-staleness contract as
         // `agent.setModel` (the next session open re-resolves). Best-effort:

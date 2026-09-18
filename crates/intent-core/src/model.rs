@@ -2698,6 +2698,39 @@ pub fn note_list_slim_row(mut note: Note) -> serde_json::Value {
 /// enough for its one-line render.
 pub const AGENT_LIST_PREVIEW_BUDGET_BYTES: usize = 400;
 
+/// Per-session fields an agent must never learn about. `notificationsMuted`
+/// is a user-facing notification preference served on the wire [`AgentLite`]
+/// / [`AgentSession`] and stamped on persisted `agent:updated` / `agent:idle`
+/// / `agent:attention-requested` payloads — an agent reading its own or a
+/// sibling's mute state (directly, through event history, or through the
+/// `event_notification` metadata of a completion / subscription wake) would
+/// let it condition behavior on whether the user is watching. Scrubbed with
+/// [`strip_agent_hidden_fields`] at every agent-facing boundary: the MCP
+/// `ws.agent.*` / `ws.event.*` results and the per-event `data` copied into
+/// parent-wake message metadata.
+pub const AGENT_HIDDEN_FIELDS: &[&str] = &["notificationsMuted"];
+
+/// Recursively remove [`AGENT_HIDDEN_FIELDS`] from `value` (however deeply
+/// nested in objects or arrays).
+pub fn strip_agent_hidden_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            for key in AGENT_HIDDEN_FIELDS {
+                obj.remove(*key);
+            }
+            for v in obj.values_mut() {
+                strip_agent_hidden_fields(v);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                strip_agent_hidden_fields(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Metadata key under which the client-supplied `userAppMessageId` is
 /// persisted on the `agent_message.metadata` JSON (PROTOCOL §5.5). Shared by
 /// the router (which folds the top-level param into `messageMetadata`) and

@@ -9046,6 +9046,12 @@ impl Services {
 /// unique `eventTypes` (order-preserving), and a compact per-event array
 /// carrying only `id`, `type`, `data`, `timestamp`, `actor`. Feeds
 /// `EventWakeupBanner` so it can render a real count / label / per-agent cards.
+///
+/// The wake is delivered INTO the parent agent's transcript, so each event's
+/// `data` is scrubbed of [`intent_core::model::AGENT_HIDDEN_FIELDS`] first:
+/// the published `agent:idle` carries the child's `notificationsMuted` stamp
+/// for notification clients, and copying it verbatim here would hand a
+/// watching agent the user's mute preference despite the MCP-side scrub.
 fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut event_types: Vec<String> = Vec::new();
@@ -9057,10 +9063,12 @@ fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
     let events_json: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {
+            let mut data = e.data.clone();
+            intent_core::model::strip_agent_hidden_fields(&mut data);
             serde_json::json!({
                 "id": e.id,
                 "type": e.event_type,
-                "data": e.data,
+                "data": data,
                 "timestamp": e.timestamp,
                 "actor": e.actor,
             })
@@ -9086,6 +9094,64 @@ fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
         }
     }
     metadata
+}
+
+#[cfg(test)]
+mod event_notification_metadata_tests {
+    use super::build_event_notification_metadata;
+    use intent_core::{ActorType, Event, EventActor, WorkspaceId};
+    use serde_json::json;
+
+    /// The per-event `data` copied into a parent wake's metadata drops the
+    /// child's `notificationsMuted` stamp (an agent must not learn the user's
+    /// mute preference through a completion / subscription wake) while every
+    /// other key — including the stall lift — is preserved.
+    #[test]
+    fn build_event_notification_metadata_scrubs_agent_hidden_fields() {
+        let event = Event {
+            id: "evt-1".to_string(),
+            workspace_id: WorkspaceId("ws-1".to_string()),
+            timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+            event_type: intent_core::events::AGENT_IDLE.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::Agent,
+                id: Some("agent-child".to_string()),
+                name: Some("Child".to_string()),
+                email: None,
+                model: None,
+                metadata: None,
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({
+                "agentId": "agent-child",
+                "status": "idle",
+                "isBackground": false,
+                "notificationsMuted": true,
+                "stallSuspected": true,
+                "taskStatus": "in_progress",
+            }),
+        };
+        let metadata = build_event_notification_metadata(&[&event]);
+        assert_eq!(metadata["eventCount"], json!(1));
+        assert_eq!(metadata["stallSuspected"], json!(true));
+        assert_eq!(
+            metadata["events"][0]["data"],
+            json!({
+                "agentId": "agent-child",
+                "status": "idle",
+                "isBackground": false,
+                "stallSuspected": true,
+                "taskStatus": "in_progress",
+            })
+        );
+        assert!(
+            event.data.get("notificationsMuted").is_some(),
+            "the published event itself keeps the stamp for notification clients"
+        );
+    }
 }
 
 /// Fold a retracted held report wake's metadata into a terminal wake's

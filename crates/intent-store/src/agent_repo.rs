@@ -1921,6 +1921,10 @@ impl Store {
         // persisted here cannot wipe freshly discovered levels.
         // Those two attention writers are
         // the only post-insert mutators of the attention columns.
+        // `notifications_muted` (0123) is excluded for the same reason: it is
+        // a user toggle whose only post-insert mutator is
+        // `set_agent_notifications_muted`, so a concurrent or long-lived
+        // in-memory session persisted here can never revert the user's mute.
         let rows = sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
@@ -1928,7 +1932,7 @@ impl Store {
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, file_blocks=?, \
              is_background=?, metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, \
-             stop_reason=?, stop_reason_timestamp=?, reasoning_effort=?, notifications_muted=? \
+             stop_reason=?, stop_reason_timestamp=?, reasoning_effort=? \
              WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -1960,7 +1964,6 @@ impl Store {
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
         .bind(&s.reasoning_effort)
-        .bind(i64::from(s.notifications_muted))
         .bind(&s.id.0)
         .bind(&workspace_id.0)
         .execute(self.write_pool())
@@ -1971,6 +1974,57 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
         Ok(())
+    }
+
+    /// Set the session's `notifications_muted` flag (0123) — the store side
+    /// of `agent.update { notificationsMuted }`. Returns `true` when the
+    /// stored value actually changed; an already-matching flag is a no-op
+    /// (no write, no `updated_at` bump). The ONLY post-insert mutator of the
+    /// column: the full-row [`Store::update_agent_session`] deliberately
+    /// excludes it so a concurrent `agent.update` on unrelated fields, or a
+    /// long-lived in-memory session persisted at turn end, can never revert
+    /// the user's toggle. Scoped to `workspace_id` (defense-in-depth).
+    /// `NotFound` if the session is absent or the workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn set_agent_notifications_muted(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        muted: bool,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET notifications_muted=?, updated_at=? \
+             WHERE id=? AND workspace_id=? AND notifications_muted != ?",
+        )
+        .bind(i64::from(muted))
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(i64::from(muted))
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set notifications muted failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            let exists = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM agent_session WHERE id=? AND workspace_id=?",
+            )
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("verify agent session failed: {e}")))?;
+            if exists.is_none() {
+                return Err(Error::NotFound(format!("agent session {id}")));
+            }
+            // Session exists with the identical flag — the common case.
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Persist a model switch (`agent.setModel`): a narrow write of `model`,
@@ -5621,12 +5675,77 @@ mod tests {
         agent: &AgentId,
         muted: bool,
     ) {
-        let mut session = store.get_agent_session(agent).await.expect("load session");
-        session.notifications_muted = muted;
         store
-            .update_agent_session(ws, &session)
+            .set_agent_notifications_muted(ws, agent, muted, &intent_core::now_iso())
             .await
             .expect("persist notifications_muted");
+    }
+
+    /// `set_agent_notifications_muted` is the only writer of the column: it
+    /// reports whether the flag changed (a same-value write is a no-op), and a
+    /// stale full-row `update_agent_session` carrying the pre-toggle flag
+    /// leaves the persisted mute untouched.
+    #[tokio::test]
+    async fn notifications_muted_survives_stale_full_row_update() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws = WorkspaceId("ws-muted-race".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-muted-race".to_string());
+        seed_unread_top_level_session(&store, &ws, &agent, &ts).await;
+
+        let stale = store.get_agent_session(&agent).await.expect("load session");
+        assert!(!stale.notifications_muted);
+
+        assert!(store
+            .set_agent_notifications_muted(&ws, &agent, true, &ts)
+            .await
+            .expect("mute"));
+        assert!(
+            !store
+                .set_agent_notifications_muted(&ws, &agent, true, &ts)
+                .await
+                .expect("mute again"),
+            "same-value write is a no-op"
+        );
+
+        // A concurrent writer persisting the session it loaded BEFORE the
+        // toggle (still `notifications_muted: false`) must not revert it.
+        store
+            .update_agent_session(&ws, &stale)
+            .await
+            .expect("stale full-row update");
+        let after = store.get_agent_session(&agent).await.expect("reload");
+        assert!(
+            after.notifications_muted,
+            "full-row update must not clobber notifications_muted"
+        );
+
+        assert!(store
+            .set_agent_notifications_muted(&ws, &agent, false, &ts)
+            .await
+            .expect("unmute"));
+        assert!(
+            !store
+                .get_agent_session(&agent)
+                .await
+                .expect("reload")
+                .notifications_muted
+        );
+        assert!(matches!(
+            store
+                .set_agent_notifications_muted(
+                    &ws,
+                    &AgentId("agent-missing".to_string()),
+                    true,
+                    &ts
+                )
+                .await,
+            Err(Error::NotFound(_))
+        ));
     }
 
     /// A muted session (`notifications_muted = 1`) never counts as unread:
