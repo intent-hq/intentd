@@ -14476,6 +14476,205 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
     );
 }
 
+/// Multiplayer — `agent.delegate` is a human-authored front door too when
+/// the caller supplies the child's first message: a collaborator's
+/// `agentInstructions` / `taskText` reach the child's model with the sender
+/// preamble at the top (ahead of the TASK-C task-note wrapper when a note is
+/// linked); the task-note fallback is note content, not the caller's text,
+/// and stays byte-identical, as does every free-text delegation by the
+/// owner-role wire caller, the administrator, an absent caller and an agent
+/// caller.
+#[intent_test_macros::daemon_test]
+async fn collaborator_sender_preamble_on_delegate_free_text() {
+    use intent_core::{with_caller, Caller, Principal, PrincipalId};
+
+    let (_t, svc, ws) = setup().await;
+    let owner = svc
+        .store()
+        .get_workspace_owner_principal_id(&ws)
+        .await
+        .expect("owner lookup")
+        .expect("workspace owner");
+    let guest = PrincipalId::new();
+    svc.store()
+        .upsert_principal(&Principal {
+            id: guest.clone(),
+            github_user_id: None,
+            login: Some("octocat".into()),
+            display_name: Some("The Octocat".into()),
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("principal");
+    svc.store()
+        .add_workspace_member(&ws, &guest, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .expect("guest membership");
+    let wire = |p: &PrincipalId| Caller::Wire {
+        principal_id: p.clone(),
+        is_administrator: false,
+    };
+    let preamble = crate::harness::latest().collaborator_sender_preamble(
+        Some("octocat"),
+        Some("The Octocat"),
+        &guest.0,
+    );
+    let annotated = |text: &str| format!("{preamble}\n\n{text}");
+    let first_user_text = |svc: &Services, out: &serde_json::Value| {
+        let svc = svc.clone();
+        let child = AgentId::from(out["agentId"].as_str().expect("agentId"));
+        async move {
+            let row = svc
+                .store()
+                .get_agent_session(&child)
+                .await
+                .expect("child session")
+                .messages
+                .into_iter()
+                .find(|m| m.role == "user")
+                .unwrap_or_else(|| panic!("child {child} has a first user row"));
+            crate::search_ops::message_text(&row.content)
+        }
+    };
+
+    // agentInstructions by the collaborator (no note): delivered verbatim
+    // otherwise, so the preamble is the whole difference.
+    let out = with_caller(wire(&guest), async {
+        svc.agent_delegate(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("delegate agentInstructions");
+    assert_eq!(
+        first_user_text(&svc, &out).await,
+        annotated("do the thing"),
+        "collaborator agentInstructions carry the preamble"
+    );
+
+    // taskText by the collaborator (no note): same free-text source.
+    let out = with_caller(wire(&guest), async {
+        svc.agent_delegate(
+            ws.clone(),
+            AgentDelegateInput {
+                task_text: Some("tick the box".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("delegate taskText");
+    assert_eq!(
+        first_user_text(&svc, &out).await,
+        annotated("tick the box"),
+        "collaborator taskText carries the preamble"
+    );
+    assert_eq!(
+        out["name"], "tick the box",
+        "the child's task-derived name stays unannotated: {out}"
+    );
+
+    // agentInstructions + linked task note: the preamble heads the message,
+    // ahead of the TASK-C task-note wrapper.
+    let note_id = seed_task(&svc, &ws, "delegate preamble").await;
+    let out = with_caller(wire(&guest), async {
+        svc.agent_delegate(
+            ws.clone(),
+            AgentDelegateInput {
+                task_note_id: Some(note_id.clone()),
+                agent_instructions: Some("with note".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("delegate agentInstructions + taskNoteId");
+    assert_eq!(
+        first_user_text(&svc, &out).await,
+        crate::harness::latest().delegation_first_message(
+            Some(&annotated("with note")),
+            "delegate preamble",
+            &note_id.0,
+        ),
+        "the preamble sits above the caller's text, inside the TASK-C wrapper"
+    );
+
+    // Task-note fallback (no free text): the note's content is not the
+    // caller's text and stays byte-identical.
+    let fallback_note = seed_task(&svc, &ws, "delegate fallback").await;
+    let out = with_caller(wire(&guest), async {
+        svc.agent_delegate(
+            ws.clone(),
+            AgentDelegateInput {
+                task_note_id: Some(fallback_note.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("delegate taskNoteId");
+    assert_eq!(
+        first_user_text(&svc, &out).await,
+        crate::harness::latest().delegation_first_message(
+            Some("delegate fallback body"),
+            "delegate fallback",
+            &fallback_note.0,
+        ),
+        "the task-note fallback gains no preamble"
+    );
+
+    // Byte-identical controls on free text: owner role, administrator,
+    // absent (UDS / legacy-token) caller, agent caller.
+    let admin = Caller::Wire {
+        principal_id: owner.clone(),
+        is_administrator: true,
+    };
+    let peer = Caller::Agent {
+        agent_id: AgentId::from("agent-peer"),
+    };
+    for (label, caller) in [
+        ("owner role", Some(wire(&owner))),
+        ("administrator", Some(admin)),
+        ("absent caller", None),
+        ("agent caller", Some(peer)),
+    ] {
+        let text = format!("control {label}");
+        let delegate = svc.agent_delegate(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some(text.clone()),
+                ..Default::default()
+            },
+            None,
+        );
+        let out = match caller {
+            Some(caller) => with_caller(caller, delegate).await,
+            None => delegate.await,
+        }
+        .unwrap_or_else(|e| panic!("{label}: delegate: {e:?}"));
+        assert_eq!(
+            first_user_text(&svc, &out).await,
+            text,
+            "{label}: agentInstructions must stay byte-identical"
+        );
+    }
+}
+
 /// Multiplayer w2: a non-object `messageMetadata` cannot carry the principal
 /// stamp, so every user-origin entry point rejects it as `InvalidParams`
 /// instead of persisting an unattributed human message (which would be

@@ -8967,6 +8967,17 @@ impl Services {
             .as_deref()
             .and_then(first_nonempty)
             .or_else(|| task_text_msg.clone());
+        // Collaborator sender preamble (multiplayer): `agentInstructions` /
+        // `taskText` are caller-supplied free text that reaches the child's
+        // model verbatim, so a collaborator's text is annotated like every
+        // other human-authored front door — BEFORE the TASK-C wrapper below,
+        // so the preamble heads the first message. The task-note fallback is
+        // note content, not the caller's text, and stays byte-identical; the
+        // helper is a no-op for owner / administrator / agent / absent callers.
+        if let Some(text) = message.as_mut() {
+            self.annotate_collaborator_sender(&workspace_id, text)
+                .await?;
+        }
         // Load the linked task note whenever the delegation names one: the
         // note's title/body feeds the message fallback, the child name
         // derivation, and the TASK-C reference preamble that prefixes the
