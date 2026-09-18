@@ -681,6 +681,72 @@ fn classify_not_found_searches_the_child_path_for_bare_commands() {
     );
 }
 
+/// A relative `PATH` entry (`bin`) is resolved by the exec against the
+/// child's working directory, not the daemon's: a child-local `bin/<cmd>` that
+/// exists but fails with `ENOENT` (missing shebang interpreter) is "program
+/// exists", not `ProviderNotFound` — and is `ProviderNotFound` once no `cwd`
+/// makes that entry resolve there.
+#[cfg(unix)]
+#[test]
+fn classify_not_found_resolves_relative_path_entries_against_child_cwd() {
+    use crate::spawn::{classify_not_found_with_path, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = test_temp_dir("intent-acp-relative-path-entry-");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("intentd-4971-child-local");
+    std::fs::write(&script, "#!/nonexistent/intentd-4971-interpreter\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let enoent = std::io::Error::from(std::io::ErrorKind::NotFound);
+    let base = *intent_providers::find_provider("auggie").unwrap();
+    let provider = intent_providers::ProviderConfig {
+        command: "intentd-4971-child-local",
+        ..base
+    };
+    let child_path = std::ffi::OsStr::new("bin");
+
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(tmp.path());
+    let (launch, target) = opts.launch_target();
+    assert_eq!(launch, LaunchMode::BareCommand);
+    let err = classify_not_found_with_path(
+        &opts,
+        launch,
+        target,
+        "intentd-4971-child-local",
+        &enoent,
+        child_path,
+    );
+    match &err {
+        AcpError::Spawn(msg) => assert!(msg.contains("the program exists"), "{msg}"),
+        other => panic!("expected Spawn for a child-local bin/ command, got {other:?}"),
+    }
+
+    let opts = SpawnOptions::new(&provider);
+    let (launch, target) = opts.launch_target();
+    let err = classify_not_found_with_path(
+        &opts,
+        launch,
+        target,
+        "intentd-4971-child-local",
+        &enoent,
+        child_path,
+    );
+    assert!(
+        matches!(
+            err,
+            AcpError::ProviderNotFound {
+                launch: LaunchMode::BareCommand,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
 /// Concatenate every daily capture file under `dir` (empty when the dir does
 /// not exist yet). Rotation-proof like the daily-log test above.
 async fn read_capture_dir(dir: &std::path::Path) -> String {

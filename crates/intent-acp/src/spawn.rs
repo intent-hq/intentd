@@ -433,6 +433,20 @@ pub(crate) fn classify_not_found(
     command_name: &str,
     e: &std::io::Error,
 ) -> AcpError {
+    let child_path = enhanced_path(opts.path_enrichment_binary());
+    classify_not_found_with_path(opts, launch, target, command_name, e, child_path.as_ref())
+}
+
+/// [`classify_not_found`] with the child's `PATH` injected (test seam — avoids
+/// mutating the process-global `PATH` in parallel tests).
+pub(crate) fn classify_not_found_with_path(
+    opts: &SpawnOptions,
+    launch: LaunchMode,
+    target: &std::ffi::OsStr,
+    command_name: &str,
+    e: &std::io::Error,
+    child_path: &std::ffi::OsStr,
+) -> AcpError {
     if let Some(cwd) = opts.cwd.filter(|cwd| !cwd.is_dir()) {
         return AcpError::Spawn(format!(
             "{command_name}: {e} (working directory `{}` does not exist)",
@@ -440,16 +454,16 @@ pub(crate) fn classify_not_found(
         ));
     }
     let program = Path::new(target);
+    // The exec happens after the chdir, so a relative program path — and a
+    // relative `PATH` entry — resolves against the child's working directory.
+    let in_child_cwd = |p: &Path| match opts.cwd {
+        Some(cwd) if p.is_relative() => cwd.join(p).exists(),
+        _ => p.exists(),
+    };
     let program_exists = if launch != LaunchMode::BareCommand || program.components().count() > 1 {
-        // A relative program path is exec'd after the chdir, so it resolves
-        // against the child's working directory.
-        match opts.cwd {
-            Some(cwd) if program.is_relative() => cwd.join(program).exists(),
-            _ => program.exists(),
-        }
+        in_child_cwd(program)
     } else {
-        std::env::split_paths(&enhanced_path(opts.path_enrichment_binary()))
-            .any(|dir| dir.join(program).exists())
+        std::env::split_paths(child_path).any(|dir| in_child_cwd(&dir.join(program)))
     };
     if program_exists {
         AcpError::Spawn(format!(
