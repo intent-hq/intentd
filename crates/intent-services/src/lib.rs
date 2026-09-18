@@ -11578,16 +11578,31 @@ fn cleanup_workspace_worktree_locked(
     branch_auto_generated: bool,
 ) -> Option<PathBuf> {
     let checked_out = intent_git::worktree::worktree_branch(worktree);
-    let trash = match intent_git::worktree::detach_worktree(repo, worktree) {
-        Ok(trash) => trash,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                worktree = %worktree.display(),
-                "failed to detach git worktree"
-            );
-            None
+    // An already-absent repository (retried delete, swept repo cache,
+    // orphaned row) is an expected state, not a failure: there is no
+    // registration to prune and nothing to rename, and the workspace-dir
+    // sweep after this phase still removes whatever is left on disk. Only a
+    // present repository that fails to detach is WARN-worthy
+    // (intent-hq/intent#5337).
+    let trash = if repo.exists() {
+        match intent_git::worktree::detach_worktree(repo, worktree) {
+            Ok(trash) => trash,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    worktree = %worktree.display(),
+                    "failed to detach git worktree"
+                );
+                None
+            }
         }
+    } else {
+        tracing::debug!(
+            repo = %repo.display(),
+            worktree = %worktree.display(),
+            "workspace.delete: repository already absent; skipping worktree detach"
+        );
+        None
     };
     // The provisioned layout is `<root>/<workspaceId>/<repo-slug>` alongside
     // the daemon-written `<root>/<workspaceId>/.workspace/` metadata dir.

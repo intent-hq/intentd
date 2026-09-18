@@ -54,20 +54,33 @@ const WRITER_CHANNEL_CAPACITY: usize = 512;
 /// Max events drained per batch by the writer task (to bound transaction size).
 const WRITER_BATCH_SIZE: usize = 64;
 
-/// Total attempts for a batch insert that fails transiently (write-pool
-/// acquire timeout / `SQLITE_BUSY` under contention — the write pool has
-/// `max_connections=1`, so bursts serialize at `pool.acquire()`). Because the
-/// bus is append-then-broadcast, a failed batch is lost for live subscribers
-/// too (monorepo#2673), so transient contention is worth a couple of retries
-/// before declaring the batch dead. Permanent failures (constraint
-/// violations, serialization errors) never retry.
-pub(crate) const INSERT_RETRY_MAX_ATTEMPTS: u32 = 3;
+/// Wall-clock retry budget for a batch insert that fails transiently
+/// (write-pool acquire timeout / `SQLITE_BUSY` under contention — the write
+/// pool has `max_connections=1`, so bursts serialize at `pool.acquire()`).
+/// Because the bus is append-then-broadcast, a failed batch is lost for live
+/// subscribers too (monorepo#2673), so the budget must outlast any ordinary
+/// foreground burst. A fixed 3-attempt budget did not (intent-hq/intent#5337):
+/// a bulk `workspace.delete` (31 in ~2 min) kept the pool saturated for well
+/// over 30s, each attempt waited out the 10s acquire timeout — and, because a
+/// timed-out waiter forfeits its FIFO slot and re-queues behind every
+/// steady-flow writer, the bus starved while the deletes kept flowing — and
+/// a batch was dropped. Two minutes covers such a burst with margin; the
+/// bound still exists so a wedged database cannot stall the writer forever.
+/// Permanent failures (constraint violations, serialization errors) never
+/// retry.
+pub(crate) const INSERT_RETRY_DEADLINE: Duration = Duration::from_secs(120);
 
-/// Base backoff between insert retry attempts; attempt N sleeps N times this
-/// (25ms, then 50ms). Short on purpose: the contention observed in practice
-/// clears in tens of milliseconds, and while retrying the writer task is not
-/// draining its channel, so publishers feel backpressure sooner.
-const INSERT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
+/// Base backoff between insert retry attempts; attempt N sleeps
+/// `2^(N-1)` times this, capped at [`INSERT_RETRY_BACKOFF_CAP`]. Short on
+/// purpose: momentary contention clears in tens of milliseconds, and while
+/// retrying the writer task is not draining its channel, so publishers feel
+/// backpressure sooner.
+const INSERT_RETRY_BACKOFF: Duration = Duration::from_millis(25);
+
+/// Per-sleep cap on the exponential retry backoff, so a long starvation
+/// re-probes the pool at least once a second on top of each attempt's own
+/// acquire wait.
+const INSERT_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(1);
 
 /// Byte cap on the persisted `data_json` of `agent:tool:call` events. Payloads
 /// at or under the cap persist verbatim; larger ones have their free-form
@@ -372,20 +385,27 @@ async fn flush_batch<F, Fut>(
 /// Insert-retry + resolve/broadcast core of [`flush_batch`], generic over the
 /// insert operation so tests can inject failures (monorepo#2673).
 ///
-/// Transient insert failures ([`is_transient_insert_error`]) retry up to
-/// [`INSERT_RETRY_MAX_ATTEMPTS`] total attempts with a short linear backoff
-/// ([`INSERT_RETRY_BACKOFF`]); permanent failures fail immediately. On final
-/// failure the batch is dropped for live subscribers too (append-then-
-/// broadcast: no durable append → no broadcast), so the drop is logged at
-/// error level with the event count and types before the publishers'
-/// oneshots resolve with the error.
+/// Transient insert failures ([`is_transient_insert_error`]) retry with a
+/// capped exponential backoff ([`INSERT_RETRY_BACKOFF`] doubling up to
+/// [`INSERT_RETRY_BACKOFF_CAP`]) for as long as the first attempt is less
+/// than [`INSERT_RETRY_DEADLINE`] ago; permanent failures fail immediately.
+/// On final failure the batch is dropped for live subscribers too
+/// (append-then-broadcast: no durable append → no broadcast), so the drop is
+/// logged at error level with the event count and types before the
+/// publishers' oneshots resolve with the error.
 ///
-/// Worst-case stall: the backoff sleeps are small, but each attempt can
-/// itself block for the write pool's acquire timeout (10s) or `SQLite`'s
-/// `busy_timeout` (5s) on `BEGIN IMMEDIATE`, so a hard stall costs up to
-/// roughly 3× today's single-attempt bound per batch before the drop —
-/// accepted for monorepo#2673, where observed contention clears in tens of
-/// milliseconds.
+/// Worst-case stall: each attempt can itself block for the write pool's
+/// acquire timeout (10s) or `SQLite`'s `busy_timeout` (5s) on
+/// `BEGIN IMMEDIATE`, so a wedged database stalls the writer (and, through
+/// the oneshots and the bounded writer channel, its publishers) for the
+/// deadline plus at most one further attempt before the drop. That stall is
+/// the deliberate trade (intent-hq/intent#5337): the previous 3-attempt
+/// budget (~30s) was shorter than an ordinary bulk `workspace.delete`'s pool
+/// saturation and lost events; a dedicated bus connection was rejected
+/// because it only moves the same wait onto `SQLite`'s 5s `busy_timeout`
+/// (still exhausted by a 30s+ saturation) while reintroducing the in-process
+/// writer-vs-writer busy contention the single-connection write pool exists
+/// to eliminate.
 ///
 /// Retrying a batch insert cannot duplicate events: event ids are minted
 /// INSIDE `insert_events` per call, and its rollback guard unwinds failed
@@ -401,18 +421,25 @@ pub(crate) async fn flush_prepared<F, Fut>(
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
 {
+    let started = tokio::time::Instant::now();
     let mut attempt = 1u32;
     let result = loop {
         match insert().await {
             Ok(stored) => break Ok(stored),
-            Err(e) if attempt < INSERT_RETRY_MAX_ATTEMPTS && is_transient_insert_error(&e) => {
+            Err(e)
+                if started.elapsed() < INSERT_RETRY_DEADLINE && is_transient_insert_error(&e) =>
+            {
                 tracing::warn!(
                     attempt,
+                    elapsed = ?started.elapsed(),
                     events = pending.len(),
                     error = %e,
                     "transient event batch insert failure; retrying"
                 );
-                tokio::time::sleep(INSERT_RETRY_BACKOFF * attempt).await;
+                let backoff = INSERT_RETRY_BACKOFF
+                    .saturating_mul(1u32 << (attempt - 1).min(16))
+                    .min(INSERT_RETRY_BACKOFF_CAP);
+                tokio::time::sleep(backoff).await;
                 attempt += 1;
             }
             Err(e) => break Err(e),

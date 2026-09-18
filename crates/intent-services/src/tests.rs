@@ -41970,6 +41970,188 @@ mod delete_grace_window {
     }
 }
 
+/// Bulk `workspace.delete` vs. the event bus (intent-hq/intent#5337): a burst
+/// of deletes — some checkouts still on disk, some already gone — must not
+/// make the bus drop a batch, and an already-absent repository must not WARN
+/// from the detach step.
+mod bulk_delete_pool_pressure {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{now_iso, WorkspaceApi, WorkspaceId};
+    use intent_store::{NewEvent, Store};
+
+    use super::{workspace, TempDb, WorkspacesRoot};
+    use crate::{cleanup_workspace_worktree_locked, system_actor, EventBus, Services};
+
+    /// Thread-local `tracing` capture of `(level, message + fields)`.
+    #[derive(Clone, Default)]
+    struct LevelCapture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl LevelCapture {
+        fn at_or_above(&self, level: tracing::Level) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(l, _)| *l <= level)
+                .map(|(_, line)| line.clone())
+                .collect()
+        }
+    }
+
+    impl tracing::Subscriber for LevelCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, "{}={value:?} ", field.name());
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The observed log signature: the repository behind the worktree was
+    /// already gone (`Repository::open` → "failed to resolve path … No such
+    /// file or directory"), so there is nothing to detach. That is an
+    /// expected state on a retried/orphaned delete, not a WARN-worthy failure.
+    #[test]
+    fn absent_repository_detach_does_not_warn() {
+        let root = WorkspacesRoot::new();
+        let repo = root.path().join("gone-repo");
+        let worktree = root.path().join("ws-1").join("gone-repo");
+        assert!(!repo.exists() && !worktree.exists());
+
+        let capture = LevelCapture::default();
+        let guard = crate::test_tracing::set_capture_default(capture.clone());
+        let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
+        drop(guard);
+
+        assert!(trash.is_none(), "nothing to detach");
+        let loud = capture.at_or_above(tracing::Level::WARN);
+        assert!(
+            loud.is_empty(),
+            "absent repository must not log at WARN or above: {loud:?}"
+        );
+    }
+
+    /// Concurrent deletes (checkouts present and absent) while the bus keeps
+    /// publishing: every delete succeeds, every publish resolves `Ok` (no
+    /// dropped batch), and the writer never logs a drop.
+    #[tokio::test]
+    async fn concurrent_deletes_do_not_drop_event_batches() {
+        const DELETES: usize = 12;
+        const PUBLISHES: usize = 200;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = WorkspacesRoot::new();
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+
+        let missing_repo = root.path().join("missing-repo");
+        let mut ids = Vec::new();
+        for i in 0..DELETES {
+            let id = WorkspaceId::new();
+            let checkout = root.path().join(id.as_str()).join("missing-repo");
+            if i % 2 == 0 {
+                std::fs::create_dir_all(&checkout).expect("present checkout");
+            }
+            let mut ws = workspace(&id);
+            ws.repository_path = Some(missing_repo.to_string_lossy().into_owned());
+            ws.worktree_path = Some(checkout.to_string_lossy().into_owned());
+            store.insert_workspace(&ws).await.expect("insert");
+            ids.push(id);
+        }
+        let live = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&live))
+            .await
+            .expect("live workspace");
+
+        let capture = LevelCapture::default();
+        let guard = crate::test_tracing::set_capture_default(capture.clone());
+
+        let publisher = {
+            let bus = bus.clone();
+            let live = live.clone();
+            tokio::spawn(async move {
+                let mut failures = Vec::new();
+                for i in 0..PUBLISHES {
+                    let ev = NewEvent {
+                        workspace_id: live.clone(),
+                        timestamp: now_iso(),
+                        event_type: "note:updated".to_string(),
+                        actor: system_actor(),
+                        session_id: None,
+                        correlation_id: None,
+                        parent_event_id: None,
+                        metadata: None,
+                        data: serde_json::json!({ "i": i }),
+                    };
+                    if let Err(e) = bus.publish(&ev).await {
+                        failures.push(e.to_string());
+                    }
+                    tokio::task::yield_now().await;
+                }
+                failures
+            })
+        };
+        let mut deletes = tokio::task::JoinSet::new();
+        for id in &ids {
+            let svc = svc.clone();
+            let id = id.clone();
+            deletes.spawn(async move { (id.clone(), svc.delete_workspace(id).await) });
+        }
+        let mut done = 0;
+        while let Some(joined) = deletes.join_next().await {
+            let (id, res) = joined.expect("delete task");
+            res.unwrap_or_else(|e| panic!("delete {id} failed: {e}"));
+            done += 1;
+        }
+        assert_eq!(done, DELETES);
+        let failures = publisher.await.expect("publisher task");
+        assert!(failures.is_empty(), "publishes failed: {failures:?}");
+        drop(guard);
+
+        let errors = capture.at_or_above(tracing::Level::ERROR);
+        assert!(
+            !errors.iter().any(|l| l.contains("dropping batch")),
+            "bus dropped a batch under bulk delete: {errors:?}"
+        );
+        for id in &ids {
+            assert!(
+                matches!(
+                    svc.get_workspace(id.clone()).await,
+                    Err(intent_core::Error::NotFound(_))
+                ),
+                "{id} deleted"
+            );
+        }
+    }
+}
+
 /// Agent delete grace window (§5.5): `agent_schedule_delete_op` /
 /// `agent_cancel_delete_op` semantics — schedule→commit, schedule→cancel,
 /// cancel-after-commit race, `pendingDeleteAt` projections, the agent keeps
