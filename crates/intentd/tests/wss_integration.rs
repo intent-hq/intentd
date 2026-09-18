@@ -4574,12 +4574,32 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
         .await;
     let queue = before["result"]["queue"].as_array().expect("queue");
     assert_eq!(queue.len(), 3, "{before}");
+    // A collaborator's entry carries the sender preamble above its text
+    // (multiplayer); the owner's is the bare text. Match on the body.
+    let body_of = |q: &Value| -> String {
+        let content = q["content"].as_str().expect("content");
+        content
+            .rsplit_once("\n\n")
+            .map_or(content, |(_, body)| body)
+            .to_string()
+    };
     let stamp_of = |content: &str, queue: &[Value]| {
         queue
             .iter()
-            .find(|q| q["content"] == content)
+            .find(|q| body_of(q) == content)
             .map(|q| q["messageMetadata"]["fromPrincipalId"].clone())
     };
+    for q in queue {
+        let preambled = q["content"]
+            .as_str()
+            .expect("content")
+            .starts_with("Message from @guest");
+        assert_eq!(
+            preambled,
+            body_of(q) != "from owner",
+            "only the collaborators' entries carry the sender preamble: {q}"
+        );
+    }
     assert_eq!(
         stamp_of("from owner", queue),
         Some(json!(primary.id.0)),
@@ -4655,11 +4675,11 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     .await
     .expect("agent:queue:updated after removal");
     assert_eq!(echo["data"]["agentId"], agent_id.as_str(), "{echo}");
-    let echoed: Vec<&str> = echo["data"]["queue"]
+    let echoed: Vec<String> = echo["data"]["queue"]
         .as_array()
         .expect("queue")
         .iter()
-        .map(|q| q["content"].as_str().expect("content"))
+        .map(body_of)
         .collect();
     assert_eq!(echoed, vec!["from owner", "from staying"], "{echo}");
 
@@ -4675,7 +4695,7 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     let queue = after["result"]["queue"].as_array().expect("queue");
     assert_eq!(queue.len(), 2, "{after}");
     assert!(
-        queue.iter().all(|q| q["content"] != "from leaving"),
+        queue.iter().all(|q| body_of(q) != "from leaving"),
         "removed member's entry must be gone: {after}"
     );
     assert_eq!(
@@ -4690,7 +4710,7 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     );
     let owner_entry = queue
         .iter()
-        .find(|q| q["content"] == "from owner")
+        .find(|q| body_of(q) == "from owner")
         .expect("owner entry");
     assert_eq!(
         owner_entry["author"]["principalId"], primary.id.0,
@@ -4698,7 +4718,7 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     );
     let staying_entry = queue
         .iter()
-        .find(|q| q["content"] == "from staying")
+        .find(|q| body_of(q) == "from staying")
         .expect("staying entry");
     // Both guests share the `guest` login, so the resolved author is pinned
     // by principal id: the staying member's, not the removed one's.
