@@ -6208,7 +6208,7 @@ impl Services {
         &self,
         agent_id: AgentId,
         message_id: String,
-        content: String,
+        mut content: String,
         editing: Option<bool>,
     ) -> Result<Value> {
         // Principal stamp (multiplayer w2): an edit by a wire caller makes
@@ -6222,6 +6222,16 @@ impl Services {
             intent_core::current_caller(),
             Some(intent_core::Caller::Wire { .. })
         );
+        // Collaborator sender preamble (multiplayer): the editor's, on the
+        // same human-authored entries the restamp re-attributes. Resolved
+        // (one store read, collaborator callers only) BEFORE the queue lock
+        // is taken; applied to the replacement content below.
+        let preamble = if restamp {
+            self.collaborator_sender_preamble_for_agent(&agent_id)
+                .await?
+        } else {
+            None
+        };
         let (edited, was_editing, now_editing) = {
             let mut guard = self
                 .agent_queues
@@ -6252,6 +6262,9 @@ impl Services {
             } else {
                 None
             };
+            if let Some(preamble) = preamble.as_deref().filter(|_| human_authored) {
+                crate::principal_ops::prepend_collaborator_preamble(&mut content, preamble);
+            }
             queue[position].content = content;
             if let Some(metadata) = restamped {
                 queue[position].message_metadata = metadata;

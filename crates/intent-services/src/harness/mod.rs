@@ -188,6 +188,17 @@ pub(crate) trait Harness: Send + Sync {
     /// prepended to agent-origin (A2A) sends; an absent `name` renders
     /// `[MESSAGE FROM AGENT ({agent_id})]`.
     fn a2a_sender_note(&self, name: Option<&str>, agent_id: &str) -> String;
+    /// `Message from @{login} ({display_name}), a collaborator (guest) of
+    /// this workspace — not the workspace owner.` sender preamble prepended
+    /// to a human message sent by a collaborator principal (multiplayer).
+    /// Falls back to the login alone, then the display name alone, then
+    /// `principal {principal_id}`.
+    fn collaborator_sender_preamble(
+        &self,
+        login: Option<&str>,
+        display_name: Option<&str>,
+        principal_id: &str,
+    ) -> String;
     /// Human-readable wait for [`Harness::dequeue_wait_note`]: `Ns` under a
     /// minute, then `Nm Ss`, then `Nh Mm`; negative waits clamp to `0s`.
     fn wait_duration(&self, secs: i64) -> String;

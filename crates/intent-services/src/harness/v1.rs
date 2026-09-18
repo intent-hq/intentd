@@ -88,6 +88,28 @@ pub(crate) const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message wa
 #[cfg(test)]
 pub(crate) const A2A_SENDER_NOTE_PREFIX: &str = "[MESSAGE FROM AGENT";
 
+/// Stable prefix of [`Harness::collaborator_sender_preamble`], asserted by
+/// the goldens. Like [`A2A_SENDER_NOTE_PREFIX`] it is NOT the annotation
+/// skip condition: the guard rebuilds the exact preamble from the bound
+/// caller's principal row and compares byte-for-byte.
+#[cfg(test)]
+pub(crate) const COLLABORATOR_SENDER_PREAMBLE_PREFIX: &str = "Message from ";
+
+/// Collapse control characters in a caller-visible display string to single
+/// spaces and drop a string that sanitizes to empty, so a hostile name
+/// cannot inject header-like lines into a single-line note.
+fn single_line_name(name: Option<&str>) -> Option<String> {
+    name.map(|n| {
+        n.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+    .filter(|n| !n.is_empty())
+}
+
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict
 /// wakes.
 pub(crate) const HOOK_WAKE_LOGS_CAP: usize = 2048;
@@ -447,20 +469,30 @@ impl Harness for V1 {
         // it): collapse newlines/control chars in the display name to
         // single spaces so a hostile agent name cannot inject header-like
         // lines, and drop a name that sanitizes to empty.
-        let name = name
-            .map(|n| {
-                n.chars()
-                    .map(|c| if c.is_control() { ' ' } else { c })
-                    .collect::<String>()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .filter(|n| !n.is_empty());
-        match name {
+        match single_line_name(name) {
             Some(name) => format!("[MESSAGE FROM AGENT {name} ({agent_id})]"),
             None => format!("[MESSAGE FROM AGENT ({agent_id})]"),
         }
+    }
+
+    fn collaborator_sender_preamble(
+        &self,
+        login: Option<&str>,
+        display_name: Option<&str>,
+        principal_id: &str,
+    ) -> String {
+        // Single-line for the same reasons as `a2a_sender_note`: the
+        // exact-match idempotency guard keys on it and a client may strip
+        // it with a single-line pattern.
+        let who = match (single_line_name(login), single_line_name(display_name)) {
+            (Some(login), Some(name)) => format!("@{login} ({name})"),
+            (Some(login), None) => format!("@{login}"),
+            (None, Some(name)) => name,
+            (None, None) => format!("principal {principal_id}"),
+        };
+        format!(
+            "Message from {who}, a collaborator (guest) of this workspace — not the workspace owner."
+        )
     }
 
     fn wait_duration(&self, secs: i64) -> String {
