@@ -832,6 +832,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 

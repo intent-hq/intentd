@@ -4121,6 +4121,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         created_at: ts.clone(),
         updated_at: ts,
         sandbox_id: None,

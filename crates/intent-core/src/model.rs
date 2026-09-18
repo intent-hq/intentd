@@ -826,6 +826,7 @@ pub fn extract_spec_task_ids(content: &str) -> std::collections::HashSet<String>
 /// (v2.9, additive) is the delegating/spawning agent — the same session value
 /// surfaced as `metadata.createdByAgentId` on full `agent.get` loads — omitted
 /// for root agents so cards can draw the delegation tree from the summary.
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceAgentInfo {
@@ -846,6 +847,11 @@ pub struct WorkspaceAgentInfo {
     /// (monorepo#3789): omitted when `false`, never `false` on the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_background: bool,
+    /// The session's persisted `notifications_muted` flag (the same value
+    /// served as `AgentLite.notificationsMuted`). Additive: omitted when
+    /// `false`, never `false` on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notifications_muted: bool,
 }
 
 /// `Workspace.agentSummary` card aggregate. The iOS coverflow reads the richer
@@ -3047,6 +3053,14 @@ pub struct AgentSession {
     /// `agent.restore` wire method.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_at: Option<String>,
+    /// Daemon-owned per-session notification mute flag, so every client
+    /// (desktop, HUD, iOS) sees the same state. Toggled through
+    /// `agent.update { notificationsMuted }` and served as
+    /// `AgentLite.notificationsMuted` (always present there). Never exposed
+    /// to the agent itself (stripped from every `ws.agent.*` MCP projection).
+    /// Omitted from the session wire form when `false`, like `isBackground`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notifications_muted: bool,
     /// Harness version this session was stamped with at creation
     /// (intent-hq/monorepo#2459). Immutable for the session's life — a daemon
     /// upgrade never changes it, and there is no upgrade/migration/pinning
@@ -3509,6 +3523,11 @@ pub struct AgentLite {
     /// conversation read-only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_at: Option<String>,
+    /// Per-session notification mute flag; mirrors
+    /// [`AgentSession::notifications_muted`]. Always emitted (like
+    /// `metadata.isBackground`) so clients can gate alerts from the list row.
+    #[serde(default)]
+    pub notifications_muted: bool,
     /// Harness version the session was stamped with at creation; mirrors
     /// [`AgentSession::harness_version`] (intent-hq/monorepo#2459).
     #[serde(default = "default_harness_version")]
@@ -3614,6 +3633,7 @@ impl AgentLite {
             session_corrupted: session.session_corrupted,
             pending_delete_at: session.pending_delete_at,
             retired_at: session.retired_at,
+            notifications_muted: session.notifications_muted,
             harness_version: session.harness_version,
             harness_features: session.harness_features,
             metadata,
@@ -5644,6 +5664,7 @@ mod tests {
             is_responding: false,
             parent_agent_id: Some(AgentId::from("agent-root")),
             is_background: true,
+            notifications_muted: true,
         };
         let summary = WorkspaceAgentSummary {
             count: 1,
@@ -6112,17 +6133,20 @@ mod tests {
             is_responding: false,
             parent_agent_id: None,
             is_background: false,
+            notifications_muted: false,
         };
         let v = serde_json::to_value(&agent).unwrap();
         assert!(v.get("specialist").is_none());
         assert!(v.get("lastActivity").is_none());
         assert!(v.get("parentAgentId").is_none());
         assert!(v.get("isBackground").is_none());
+        assert!(v.get("notificationsMuted").is_none());
         assert_eq!(v["status"], "pending");
         assert_eq!(v["isStreaming"], false);
         assert_eq!(v["isResponding"], false);
         let back: WorkspaceAgentInfo = serde_json::from_value(v).unwrap();
         assert!(!back.is_background);
+        assert!(!back.notifications_muted);
     }
 
     /// `AgentLite` carries the nested `metadata` object (`isBackground`/
@@ -6174,6 +6198,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: true,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
             sandbox_id: None,
@@ -6191,6 +6216,8 @@ mod tests {
         );
         let v = serde_json::to_value(&lite).unwrap();
         assert_eq!(v["metadata"]["specialist"], "implementor");
+        // The persisted mute flag is served top-level, always present.
+        assert_eq!(v["notificationsMuted"], true);
         // The question-dismissal marker is lifted out of the free-form session
         // metadata into the AgentLite metadata projection.
         assert_eq!(v["metadata"]["dismissedQuestionsMessageId"], "msg-q1");
@@ -6267,6 +6294,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -6376,6 +6404,7 @@ mod tests {
                 session_corrupted: false,
                 pending_delete_at: None,
                 retired_at: None,
+                notifications_muted: false,
                 created_at: "t0".to_string(),
                 updated_at: "t1".to_string(),
                 sandbox_id: None,
@@ -6465,6 +6494,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -6545,6 +6575,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -6638,6 +6669,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,

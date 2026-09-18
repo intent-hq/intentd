@@ -3670,6 +3670,12 @@ impl Services {
                 if let Ok(session) = self.store.get_agent_session(agent_id).await {
                     data["agentName"] = Value::String(session.name);
                     data["isBackground"] = Value::Bool(session.is_background);
+                    // Mute hint: present only when true (absent ≠ false, like
+                    // `workspaceArchived`) so notification clients stay quiet
+                    // for a muted agent without a follow-up read.
+                    if session.notifications_muted {
+                        data["notificationsMuted"] = Value::Bool(true);
+                    }
                     if let Some(report) = session.completion_report {
                         data["completionReport"] = Value::String(report.clone());
                         data["report"] = Value::String(report);
@@ -4298,6 +4304,9 @@ impl Services {
         if let Ok(session) = self.store.get_agent_session(agent_id).await {
             data["agentName"] = Value::String(session.name);
             data["isBackground"] = Value::Bool(session.is_background);
+            if session.notifications_muted {
+                data["notificationsMuted"] = Value::Bool(true);
+            }
             if let Some(report) = session.completion_report {
                 data["completionReport"] = Value::String(report.clone());
                 data["report"] = Value::String(report);

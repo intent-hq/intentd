@@ -4398,6 +4398,7 @@ impl Services {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: Some(harness_features),
             created_at: now.clone(),
@@ -5232,6 +5233,7 @@ impl Services {
             "imageBlocks",
             "fileBlocks",
             "isBackground",
+            "notificationsMuted",
         ];
         for key in obj.keys() {
             if !allowed.contains(&key.as_str()) {
@@ -5419,6 +5421,13 @@ impl Services {
                     session.is_background = value.as_bool().ok_or_else(|| {
                         Error::InvalidParams(
                             "agent.update: `isBackground` must be a boolean".to_string(),
+                        )
+                    })?;
+                }
+                "notificationsMuted" => {
+                    session.notifications_muted = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams(
+                            "agent.update: `notificationsMuted` must be a boolean".to_string(),
                         )
                     })?;
                 }
@@ -8384,24 +8393,20 @@ impl Services {
         // Everything below this branch (linked-task transition, parent wake,
         // watcher fan-out) stays immediate either way — backend coordination
         // must not wait for the child's turn to end.
+        let raise = crate::DeferredAttention {
+            meta_kind,
+            reason: reason.clone(),
+            saved_at: saved_at.clone(),
+            attention_data: attention_data.clone(),
+        };
         if self.agent_is_busy(caller.clone()) {
-            self.mark_deferred_attention(
-                &caller,
-                crate::DeferredAttention {
-                    meta_kind,
-                    reason: reason.clone(),
-                    saved_at: saved_at.clone(),
-                    attention_data: attention_data.clone(),
-                },
-            );
+            self.mark_deferred_attention(&caller, raise);
         } else {
             self.surface_attention_request(
                 &workspace_id,
                 &caller,
-                meta_kind,
-                &reason,
-                &saved_at,
-                &attention_data,
+                &raise,
+                session.notifications_muted,
             )
             .await;
         }
@@ -8552,7 +8557,10 @@ impl Services {
     ///   survives rehydration — best-effort, the session fields are the
     ///   durable contract;
     /// - the self-sufficient `agent:attention-requested` event (FE sticky
-    ///   toast);
+    ///   toast), stamped `notificationsMuted: true` (present only when true)
+    ///   when the session is muted — the stamp rides the published event
+    ///   ONLY, never the parent/watcher wake payload (the agent must not
+    ///   learn about the flag);
     /// - the debounced lastActivity schedule and the displayStatus
     ///   recompute (a pending request on a top-level agent promotes the
     ///   derived displayStatus to `needs_attention`, §6.5 step 0;
@@ -8561,16 +8569,21 @@ impl Services {
     ///
     /// Callers: the immediate arm of `agent_request_attention_op` (no
     /// in-flight turn) and [`Services::flush_deferred_attention`] (turn-end
-    /// flush of a mid-turn raise).
+    /// flush of a mid-turn raise). `raise` is the payload captured at raise
+    /// time; `notifications_muted` is the session's flag at surfacing time.
     pub(crate) async fn surface_attention_request(
         &self,
         workspace_id: &WorkspaceId,
         caller: &AgentId,
-        meta_kind: &str,
-        reason: &str,
-        saved_at: &str,
-        attention_data: &Value,
+        raise: &crate::DeferredAttention,
+        notifications_muted: bool,
     ) {
+        let crate::DeferredAttention {
+            meta_kind,
+            reason,
+            saved_at,
+            attention_data,
+        } = raise;
         let kind = attention_data
             .get("kind")
             .and_then(Value::as_str)
@@ -8609,11 +8622,15 @@ impl Services {
                 );
             }
         }
+        let mut event_data = attention_data.clone();
+        if notifications_muted {
+            event_data["notificationsMuted"] = Value::Bool(true);
+        }
         self.publish_agent_mutation_event(
             workspace_id,
             caller,
             intent_core::events::AGENT_ATTENTION_REQUESTED,
-            attention_data.clone(),
+            event_data,
         )
         .await;
         // Schedule debounced lastActivity event (§10.1).
@@ -8665,10 +8682,8 @@ impl Services {
             self.surface_attention_request(
                 workspace_id,
                 agent_id,
-                entry.meta_kind,
-                &entry.reason,
-                &entry.saved_at,
-                &entry.attention_data,
+                &entry,
+                session.notifications_muted,
             )
             .await;
         }

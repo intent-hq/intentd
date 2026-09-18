@@ -5160,6 +5160,9 @@ impl AgentManager {
                 if let Some(ref session) = session {
                     data["agentName"] = json!(session.name);
                     data["isBackground"] = json!(session.is_background);
+                    if session.notifications_muted {
+                        data["notificationsMuted"] = json!(true);
+                    }
                     if let Some(ref report) = session.completion_report {
                         // `completionReport` is canonical; `report` is kept
                         // for back-compat with older clients.
@@ -12785,6 +12788,7 @@ mod role_reminder_tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -16186,6 +16190,7 @@ mod agent_retry_tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 

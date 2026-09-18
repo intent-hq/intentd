@@ -825,6 +825,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             metadata: AgentMetadata {
                 is_background: false,
                 specialist: None,

@@ -273,6 +273,7 @@ fn seed_agent_session(ws_id: &WorkspaceId, idx: usize) -> AgentSession {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 

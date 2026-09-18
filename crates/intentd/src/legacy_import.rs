@@ -1727,6 +1727,7 @@ fn session_from_legacy_json(
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         created_at,
         updated_at,
     };

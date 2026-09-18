@@ -3387,6 +3387,7 @@ mod workspace_needs_attention {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 

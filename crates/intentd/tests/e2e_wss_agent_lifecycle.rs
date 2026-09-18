@@ -1577,6 +1577,12 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         json!(false),
         "agent:idle carries isBackground=false for a foreground agent: {idle}"
     );
+    // The mute stamp is present only when the session is muted — absent
+    // (never `false`) for this unmuted agent.
+    assert!(
+        idle.get("notificationsMuted").is_none(),
+        "agent:idle omits notificationsMuted for an unmuted agent: {idle}"
+    );
     // The emit-time waiting flag: this agent parents no pending completion
     // watches, so the idle payload reports `false`.
     assert_eq!(
@@ -1671,6 +1677,213 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         bg_idle["isBackground"],
         json!(true),
         "agent:idle carries isBackground=true for a background agent: {bg_idle}"
+    );
+}
+
+/// Per-agent `notificationsMuted` (PROTOCOL §5.5 / §6): `agent.update
+/// { changes: { notificationsMuted } }` persists the daemon-owned mute flag,
+/// returns it on the `AgentLite`, emits `agent:updated` carrying the change,
+/// and rejects a non-boolean with `-32602`; `agent.get` / `agent.list` /
+/// `agent.getSession` serve the persisted value; the terminal `agent:idle`
+/// of a muted agent is stamped `notificationsMuted: true` (omitted when
+/// unmuted — see the status-lifecycle test above); `false` clears it.
+#[tokio::test]
+async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
+    let Some(script) = gate("WSS notificationsMuted E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "response": "muted turn ok" }).to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-Muted", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    // Fresh sessions are unmuted; the field is always present on AgentLite.
+    assert_eq!(
+        created["agent"]["notificationsMuted"],
+        json!(false),
+        "fresh agent is unmuted: {created}"
+    );
+
+    // Non-boolean → -32602, no state change.
+    let rejected = wss_rpc_envelope(
+        &mut rpc,
+        11,
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "notificationsMuted": "yes" } }),
+    )
+    .await;
+    assert_eq!(
+        rejected["error"]["code"],
+        json!(-32602),
+        "non-boolean notificationsMuted is -32602: {rejected}"
+    );
+    let still = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        still["agent"]["notificationsMuted"],
+        json!(false),
+        "{still}"
+    );
+
+    // Mute: persisted, returned on the AgentLite, and `agent:updated` carries
+    // the change so subscribed clients invalidate their projection.
+    let muted = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "notificationsMuted": true } }),
+    )
+    .await;
+    assert_eq!(muted["success"], true, "{muted}");
+    assert_eq!(
+        muted["agent"]["notificationsMuted"],
+        json!(true),
+        "agent.update returns notificationsMuted=true: {muted}"
+    );
+    let mut updated_payload: Option<Value> = None;
+    for _ in 0..40 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:updated"
+            && ev["data"]["agentId"].as_str() == Some(agent_id.as_str())
+            && ev["data"].get("notificationsMuted").is_some()
+        {
+            updated_payload = Some(ev["data"].clone());
+            break;
+        }
+    }
+    let updated = updated_payload.expect("agent:updated emitted for the mute change");
+    assert_eq!(updated["notificationsMuted"], json!(true), "{updated}");
+
+    // Every read projection serves the persisted value.
+    let got = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(got["agent"]["notificationsMuted"], json!(true), "{got}");
+    let list = wss_rpc(&mut rpc, 15, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let listed = list["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"] == json!(agent_id))
+        .expect("muted agent listed")
+        .clone();
+    assert_eq!(listed["notificationsMuted"], json!(true), "{listed}");
+    let session = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        session["session"]["notificationsMuted"],
+        json!(true),
+        "agent.getSession serves the persisted flag: {session}"
+    );
+
+    // A muted agent's terminal agent:idle is stamped `notificationsMuted: true`
+    // so notification clients can suppress the alert without a follow-up read.
+    let sent = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "drive a turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let mut idle_payload: Option<Value> = None;
+    for _ in 0..160 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"].as_str() == Some(agent_id.as_str()) {
+            idle_payload = Some(ev["data"].clone());
+            break;
+        }
+    }
+    let idle = idle_payload.expect("muted agent emitted terminal agent:idle");
+    assert_eq!(
+        idle["notificationsMuted"],
+        json!(true),
+        "agent:idle carries notificationsMuted=true for a muted agent: {idle}"
+    );
+    assert_eq!(idle["isBackground"], json!(false), "{idle}");
+
+    // `false` clears the flag.
+    let unmuted = wss_rpc(
+        &mut rpc,
+        18,
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "notificationsMuted": false } }),
+    )
+    .await;
+    assert_eq!(
+        unmuted["agent"]["notificationsMuted"],
+        json!(false),
+        "{unmuted}"
+    );
+    let cleared = wss_rpc(
+        &mut rpc,
+        19,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        cleared["agent"]["notificationsMuted"],
+        json!(false),
+        "{cleared}"
     );
 }
 

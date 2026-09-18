@@ -119,6 +119,7 @@ fn session(id: &str, ws: &WorkspaceId, status: AgentStatus, task: Option<&str>) 
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 

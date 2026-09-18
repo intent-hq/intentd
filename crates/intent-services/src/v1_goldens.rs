@@ -1251,6 +1251,7 @@ async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     svc.store()
         .insert_agent_session(&session)
@@ -2066,6 +2067,7 @@ fn golden_isolation_hints() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: None,

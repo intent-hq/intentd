@@ -1990,6 +1990,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .unwrap();
@@ -2038,6 +2039,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .unwrap();
@@ -2100,6 +2102,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .unwrap();
@@ -2192,6 +2195,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .unwrap();
@@ -5231,6 +5235,7 @@ async fn seed_agent_with_task_graph(
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     // The chief row is seeded by migration 0033; every other workspace is
     // created here.
@@ -10812,6 +10817,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 
@@ -11216,6 +11222,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     mgr.services
         .store

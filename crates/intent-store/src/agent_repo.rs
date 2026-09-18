@@ -24,7 +24,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
-    harness_features, retired_at";
+    harness_features, retired_at, notifications_muted";
 
 /// Session metadata needed by the `AgentLite` summary projection.
 /// `system_prompt`, `image_blocks`, and `initial_message` are intentionally
@@ -37,7 +37,7 @@ const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     context_references, file_blocks, is_background, metadata, sandbox_id, \
     sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, \
-    effort_levels, harness_version, harness_features, retired_at";
+    effort_levels, harness_version, harness_features, retired_at, notifications_muted";
 
 /// Aggregate SQL behind [`Store::get_agent_session_message_stats`], extracted
 /// so tests can run `EXPLAIN QUERY PLAN` on the exact production statement
@@ -641,7 +641,8 @@ fn bind_session_insert<'q>(
         .bind(i64::from(task_graph_enabled))
         .bind(&s.harness_version)
         .bind(json_col_to_db(s.harness_features.as_ref())?)
-        .bind(&s.retired_at))
+        .bind(&s.retired_at)
+        .bind(i64::from(s.notifications_muted)))
 }
 
 impl Store {
@@ -668,7 +669,7 @@ impl Store {
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         bind_session_insert(sqlx::query(&sql), s, task_graph_enabled)?
             .execute(self.write_pool())
@@ -735,7 +736,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s, false)?
                 .execute(&mut *tx)
@@ -1922,7 +1923,7 @@ impl Store {
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, file_blocks=?, \
              is_background=?, metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, \
-             stop_reason=?, stop_reason_timestamp=?, reasoning_effort=? \
+             stop_reason=?, stop_reason_timestamp=?, reasoning_effort=?, notifications_muted=? \
              WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -1954,6 +1955,7 @@ impl Store {
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
         .bind(&s.reasoning_effort)
+        .bind(i64::from(s.notifications_muted))
         .bind(&s.id.0)
         .bind(&workspace_id.0)
         .execute(self.write_pool())
@@ -3047,6 +3049,7 @@ fn map_session_row_with_heavy_cols(
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: col(row, "retired_at")?,
+        notifications_muted: col::<i64>(row, "notifications_muted")? != 0,
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
@@ -5712,6 +5715,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
         let err = store
@@ -5835,6 +5839,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -5999,6 +6004,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -9729,6 +9735,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store
             .insert_agent_session(&session)
@@ -9920,6 +9927,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -10216,6 +10224,7 @@ mod tests {
                 session_corrupted: false,
                 pending_delete_at: None,
                 retired_at: None,
+                notifications_muted: false,
             };
             store.insert_agent_session(&session).await.expect("insert");
         }
@@ -14267,6 +14276,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             created_at: ts.clone(),

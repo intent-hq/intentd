@@ -115,7 +115,46 @@ pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> Cow<'static, str>
     Cow::Owned(js)
 }
 
+/// Per-session fields the agent must never learn about: stripped from every
+/// `ws.agent.*` result (however deeply nested) before it reaches the caller.
+/// `notificationsMuted` is a user-facing notification preference served on
+/// the wire `AgentLite` — an agent reading its own or a sibling's mute state
+/// would let it condition behavior on whether the user is watching.
+const AGENT_HIDDEN_FIELDS: &[&str] = &["notificationsMuted"];
+
+/// Recursively remove [`AGENT_HIDDEN_FIELDS`] from `value`.
+fn strip_agent_hidden_fields(value: &mut Value) {
+    match value {
+        Value::Object(obj) => {
+            for key in AGENT_HIDDEN_FIELDS {
+                obj.remove(*key);
+            }
+            for v in obj.values_mut() {
+                strip_agent_hidden_fields(v);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                strip_agent_hidden_fields(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) async fn dispatch(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    method: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let mut out = dispatch_inner(api, ws, caller, method, args).await?;
+    strip_agent_hidden_fields(&mut out);
+    Ok(out)
+}
+
+async fn dispatch_inner(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,
@@ -1711,6 +1750,35 @@ fn merge_ok(mut v: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `notificationsMuted` is a user-facing preference the agent must never
+    /// read: the dispatch-level scrub removes it from a bare `AgentLite`
+    /// (`status`), a list of them (`list`), and a nested `{ agent }` envelope
+    /// (`create` / `delegate` / `wakeOrCreate`), leaving every other key.
+    #[test]
+    fn strip_agent_hidden_fields_removes_notifications_muted_everywhere() {
+        let mut v = json!({
+            "ok": true,
+            "notificationsMuted": true,
+            "agent": { "id": "agent-1", "notificationsMuted": false, "metadata": { "isBackground": true } },
+            "agents": [
+                { "id": "agent-2", "notificationsMuted": true },
+                { "id": "agent-3", "status": "idle" }
+            ],
+        });
+        strip_agent_hidden_fields(&mut v);
+        assert_eq!(
+            v,
+            json!({
+                "ok": true,
+                "agent": { "id": "agent-1", "metadata": { "isBackground": true } },
+                "agents": [
+                    { "id": "agent-2" },
+                    { "id": "agent-3", "status": "idle" }
+                ],
+            })
+        );
+    }
 
     #[test]
     fn agent_list_filter_omits_terminal_rows_by_default() {

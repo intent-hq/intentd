@@ -6439,6 +6439,9 @@ impl Services {
             "agentName": session.name,
             "isBackground": session.is_background,
         });
+        if session.notifications_muted {
+            data["notificationsMuted"] = serde_json::Value::Bool(true);
+        }
         // monorepo#2532 Gap B (PR #1250 review): a stale-provenance marker
         // means the persisted report predates every remaining watcher (they
         // armed AFTER the report) and no child turn ran since — dropping the
@@ -10786,6 +10789,7 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
             is_responding: false,
             parent_agent_id: s.parent_agent_id.clone(),
             is_background: s.is_background,
+            notifications_muted: s.notifications_muted,
         })
         .collect();
     let agent_ids: Vec<_> = live.iter().map(|s| s.id.clone()).collect();
