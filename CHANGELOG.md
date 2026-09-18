@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.78] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(transport)* Drop Chief workspace from workspace subscription deltas ([#1989](https://github.com/intent-hq/intentd/pull/1989))
+- *(agent)* Skip preemption when no live turn is registered ([#1991](https://github.com/intent-hq/intentd/pull/1991))
+- *(pr-monitor)* Dedupe same-name check runs so a cancelled duplicate cannot flap the checklist ([#1985](https://github.com/intent-hq/intentd/pull/1985))
+
+
 ## [0.9.77] - 2026-09-18
 
 ### 🐛 Bug Fixes
