@@ -5211,6 +5211,7 @@ impl Services {
         };
         let mut session = self.store.get_agent_session(&agent_id).await?;
         let prior_model = session.model.clone();
+        let prior_muted = session.notifications_muted;
         let allowed = [
             "status",
             "isActive",
@@ -5436,6 +5437,16 @@ impl Services {
         }
         session.updated_at = now_iso();
         let workspace_id = session.workspace_id.clone();
+        // Muting drops the session out of the workspace unread derivation
+        // (§5.1), so snapshot the unread state BEFORE the write — the
+        // post-write settle below needs it (same contract as `agent.retire`
+        // / `agent.markSeen`).
+        let mute_changed = session.notifications_muted != prior_muted;
+        let unread_before = if mute_changed && session.notifications_muted {
+            Some(self.snapshot_workspace_unread(&workspace_id).await)
+        } else {
+            None
+        };
         self.store
             .update_agent_session(&workspace_id, &session)
             .await?;
@@ -5469,12 +5480,25 @@ impl Services {
             Value::Object(event_data),
         )
         .await;
-        // `status` / `isBackground` feed the needs_attention derivation (a
-        // deleted or background session's pending request/question no longer
-        // counts): recompute-and-compare (§6.5 step 0); other fields skip the
-        // probe entirely.
-        if obj.contains_key("status") || obj.contains_key("isBackground") {
+        // `status` / `isBackground` / `notificationsMuted` feed the
+        // needs_attention derivation (a deleted, background, or muted
+        // session's pending request/question/error no longer counts):
+        // recompute-and-compare (§6.5 step 0); other fields skip the probe
+        // entirely.
+        if obj.contains_key("status") || obj.contains_key("isBackground") || mute_changed {
             self.maybe_emit_display_status_changed(&workspace_id).await;
+        }
+        // A muted session no longer counts toward the workspace's derived
+        // `unread`, so settle the stored flag exactly as the last seen-marker
+        // advance would: when this was the last unread top-level session,
+        // clear the stored `unread` and emit ONE `workspace:attention-changed
+        // { none }` (`review_required` untouched; a still-unread workspace
+        // stays silent). Unmuting writes nothing at the workspace level — an
+        // unmuted session with an unseen assistant tail re-derives `unread`
+        // on the next read (the `agent.restore` precedent).
+        if let Some(before) = unread_before {
+            self.settle_workspace_unread_after_seen(&workspace_id, before)
+                .await;
         }
         let lite = self.project_lite_with_flags(session);
         Ok(json!({ "success": true, "agent": lite }))

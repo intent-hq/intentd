@@ -116,19 +116,21 @@ pub(crate) fn session_message_projections_sql(retired_filter: &str) -> String {
 }
 
 /// SQL predicate selecting an **unread top-level session** row (§5.1): a
-/// non-deleted, non-background, non-retired `agent_session` with no parent
-/// whose newest user/assistant message is an assistant message the
+/// non-deleted, non-background, non-retired, non-muted `agent_session` with
+/// no parent whose newest user/assistant message is an assistant message the
 /// per-agent seen marker (`metadata.lastSeenMessageId`, v4.5) has not caught
 /// up with. Shared by the single-workspace EXISTS probe, the batch list-path
 /// derivation, and the guarded workspace-attention clear so the three can
 /// never drift. Soft-retired sessions (`retired_at` set) are excluded: they
 /// are hidden from `agent.list`, so an unread one could never be focused to
 /// clear the flag; clearing `retired_at` (restore) makes the session count
-/// again.
+/// again. Muted sessions (`notifications_muted`, 0123) are excluded too: the
+/// mute silences every workspace-level surface the derivation feeds, and
+/// unmuting makes the row count again on the next read.
 ///
 /// The seen marker is read with `->>` (NOT `json_extract()`) and the three
 /// consumers force [`UNREAD_TOP_LEVEL_SESSION_INDEX`] via `INDEXED BY`, so
-/// each statement is answered entirely from the 0114/0122 partial covering
+/// each statement is answered entirely from the 0114/0122/0124 partial covering
 /// index instead of fetching every candidate row's metadata JSON from the
 /// main table B-tree — on a ~1GB dogfood DB that difference is ~5.6MB of
 /// scattered page reads vs ~86KB, and cold-cache it pushed the
@@ -146,11 +148,12 @@ pub(crate) const UNREAD_TOP_LEVEL_SESSION_PREDICATE: &str = "parent_agent_id IS 
     AND last_message_id IS NOT NULL \
     AND last_message_role = 'assistant' \
     AND retired_at IS NULL \
+    AND notifications_muted = 0 \
     AND (metadata ->> '$.lastSeenMessageId' IS NULL \
          OR metadata ->> '$.lastSeenMessageId' <> last_message_id)";
 
 /// The 0114 partial covering index (recreated by 0122 with `retired_at IS
-/// NULL` in its WHERE clause) answering
+/// NULL` and by 0124 with `notifications_muted = 0` in its WHERE clause) answering
 /// [`UNREAD_TOP_LEVEL_SESSION_PREDICATE`] statements. Named explicitly (via
 /// `INDEXED BY`) by all three consumers because the planner's stat1
 /// estimates otherwise prefer `idx_agent_parent` (`parent_agent_id IS NULL`
@@ -1449,8 +1452,9 @@ impl Store {
     /// written, paired with their newest non-system message. List enrichment
     /// uses this one-statement projection to preserve the pre-upgrade question
     /// hold fallback without issuing a tail query per session. Soft-retired
-    /// sessions are excluded (a retired agent's stale question must not hold
-    /// the workspace at `needs_attention`).
+    /// and muted sessions are excluded (a retired agent's stale question must
+    /// not hold the workspace at `needs_attention`, and a muted agent feeds no
+    /// workspace-level attention rung).
     ///
     /// # Errors
     ///
@@ -1474,6 +1478,7 @@ impl Store {
              WHERE s.workspace_id IN ({placeholders}) \
                AND s.parent_agent_id IS NULL AND s.is_background = 0 \
                AND s.status != 'deleted' AND s.retired_at IS NULL \
+               AND s.notifications_muted = 0 \
                AND (json_type(s.metadata, '$.pendingQuestionsMessageId') IS NULL \
                     OR json_type(s.metadata, '$.pendingQuestionsMessageId') != 'text')"
         );
@@ -5307,7 +5312,7 @@ mod tests {
     /// being fetched from the main table B-tree again — and no `Column`
     /// read from the `agent_session` table cursor: every predicate term
     /// outside the index columns (`parent_agent_id`, `is_background`,
-    /// `status`, `retired_at`) is satisfied by the partial index's WHERE
+    /// `status`, `retired_at`, `notifications_muted`) is satisfied by the partial index's WHERE
     /// clause only while it is spelled identically there, so a term added to
     /// the predicate but not the index (or vice versa) shows up as a
     /// per-row main-table fetch.
@@ -5388,7 +5393,8 @@ mod tests {
                 "{label} must be answered from the partial unread index alone: a \
                  `Column` read on the agent_session table cursor means a predicate \
                  term is not satisfied by the index WHERE clause (0122 added \
-                 `retired_at IS NULL` to both — keep them spelled identically), \
+                 `retired_at IS NULL` and 0124 `notifications_muted = 0` to both — \
+                 keep them spelled identically), \
                  opcodes: {opcodes:?}"
             );
         }
@@ -5603,6 +5609,151 @@ mod tests {
             .expect("restore"));
         assert_eq!(
             candidates("restored session").await,
+            vec![(agent.clone(), "assistant".to_string())]
+        );
+    }
+
+    /// Flip the persisted `notifications_muted` flag on an existing session
+    /// row (the store-level equivalent of `agent.update { notificationsMuted }`).
+    async fn set_notifications_muted(
+        store: &Store,
+        ws: &WorkspaceId,
+        agent: &AgentId,
+        muted: bool,
+    ) {
+        let mut session = store.get_agent_session(agent).await.expect("load session");
+        session.notifications_muted = muted;
+        store
+            .update_agent_session(ws, &session)
+            .await
+            .expect("persist notifications_muted");
+    }
+
+    /// A muted session (`notifications_muted = 1`) never counts as unread:
+    /// the single-workspace probe, both batch derivations, and the guarded
+    /// settle-clear all ignore it. Unmuting makes the same row unread again —
+    /// the derivation is purely a read over the column.
+    #[tokio::test]
+    async fn unread_derivation_excludes_muted_sessions_until_unmuted() {
+        use intent_core::{now_iso, WorkspaceAttention};
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws = WorkspaceId("ws-unread-muted".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-unread-muted".to_string());
+        seed_unread_top_level_session(&store, &ws, &agent, &ts).await;
+
+        let assert_unread = |expected: bool, label: &'static str| {
+            let store = &store;
+            let ws = &ws;
+            async move {
+                assert_eq!(
+                    store
+                        .workspace_has_unread_top_level_session(ws)
+                        .await
+                        .expect("probe"),
+                    expected,
+                    "{label}: single-workspace probe"
+                );
+                assert_eq!(
+                    store
+                        .workspaces_with_unread_top_level_sessions()
+                        .await
+                        .expect("batch")
+                        .contains(&ws.0),
+                    expected,
+                    "{label}: batch derivation"
+                );
+                assert_eq!(
+                    store
+                        .workspaces_with_unread_top_level_sessions_by_workspace(
+                            std::slice::from_ref(ws)
+                        )
+                        .await
+                        .expect("scoped batch")
+                        .contains(ws),
+                    expected,
+                    "{label}: scoped batch derivation"
+                );
+            }
+        };
+
+        assert_unread(true, "unmuted session").await;
+        assert!(store
+            .set_workspace_attention(&ws, WorkspaceAttention::Unread, None, None)
+            .await
+            .expect("raise unread"));
+        assert!(
+            !store
+                .clear_workspace_unread_if_all_seen(&ws)
+                .await
+                .expect("settle-clear while unmuted"),
+            "settle-clear must decline while the unmuted session is unread"
+        );
+
+        set_notifications_muted(&store, &ws, &agent, true).await;
+        assert_unread(false, "muted session").await;
+        assert!(
+            store
+                .clear_workspace_unread_if_all_seen(&ws)
+                .await
+                .expect("settle-clear after mute"),
+            "settle-clear must clear the flag when the only unread session is muted"
+        );
+        assert_eq!(
+            store.get_workspace(&ws).await.expect("workspace").attention,
+            WorkspaceAttention::None
+        );
+
+        set_notifications_muted(&store, &ws, &agent, false).await;
+        assert_unread(true, "unmuted again").await;
+    }
+
+    /// The legacy question-tail fallback (list path) skips muted sessions —
+    /// a muted agent's trailing question must not hold its workspace at
+    /// `needs_attention` — and picks them up again once unmuted.
+    #[tokio::test]
+    async fn legacy_question_tail_candidates_exclude_muted_sessions_until_unmuted() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws = WorkspaceId("ws-legacy-muted".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-legacy-muted".to_string());
+        seed_unread_top_level_session(&store, &ws, &agent, &ts).await;
+
+        let candidates = |label: &'static str| {
+            let store = &store;
+            let ws = &ws;
+            async move {
+                store
+                    .list_legacy_question_tail_candidates_by_workspace(std::slice::from_ref(ws))
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: legacy candidates: {e}"))
+                    .into_iter()
+                    .map(|(id, _, role, _)| (id, role))
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert_eq!(
+            candidates("unmuted session").await,
+            vec![(agent.clone(), "assistant".to_string())]
+        );
+
+        set_notifications_muted(&store, &ws, &agent, true).await;
+        assert!(
+            candidates("muted session").await.is_empty(),
+            "a muted session is not a legacy question-tail candidate"
+        );
+
+        set_notifications_muted(&store, &ws, &agent, false).await;
+        assert_eq!(
+            candidates("unmuted again").await,
             vec![(agent.clone(), "assistant".to_string())]
         );
     }

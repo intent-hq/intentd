@@ -38717,6 +38717,33 @@ mod turn_end_unread_gate {
         );
     }
 
+    /// A muted top-level foreground session (`notifications_muted`) must NOT
+    /// raise the blue dot at drain end. Unmuting brings the raise back.
+    #[tokio::test]
+    async fn muted_agent_skips_raise_until_unmuted() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        let mut s = session(&agent_id, &h.ws);
+        s.notifications_muted = true;
+        h.store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "a muted agent must not raise the turn-end blue dot"
+        );
+        s.notifications_muted = false;
+        h.store
+            .update_agent_session(&h.ws, &s)
+            .await
+            .expect("unmute session");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "an unmuted top-level foreground agent raises again"
+        );
+    }
+
     /// A genuine store failure FAILS OPEN: a missed blue dot for a real
     /// top-level turn is worse than a spurious one on a rare store fault.
     #[tokio::test]

@@ -971,6 +971,93 @@ async fn blocked_transition_over_wss() {
     );
 }
 
+/// Muted agents over the wire: a top-level pending blocker reads as
+/// `displayStatus: "blocked"`; `agent.update { changes: { notificationsMuted:
+/// true } }` on that agent drops it out of the attention derivation and emits
+/// the `blocked → idle` demotion, and unmuting emits the promotion back.
+#[tokio::test]
+async fn muted_agent_transition_over_wss() {
+    let fx = boot(StubForge::default(), false, None).await;
+    let blocker = top_level_session(&fx.ws_id, "agent-e2e-muted");
+    fx.store
+        .insert_agent_session(&blocker)
+        .await
+        .expect("seed blocker session");
+    fx.store
+        .set_attention_request(&fx.ws_id, &blocker.id, "blocker", "env broken", &now_iso())
+        .await
+        .expect("raise blocker");
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    // Read path serves blocked (seeds the baseline).
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "blocked");
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        10,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["workspace:displayStatus-changed"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let muted = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.update",
+        json!({
+            "workspaceId": fx.ws_id.as_str(),
+            "agentId": blocker.id.0,
+            "changes": { "notificationsMuted": true },
+        }),
+    )
+    .await;
+    assert_eq!(muted["success"], true, "mute ok: {muted}");
+    assert_eq!(muted["agent"]["notificationsMuted"], true, "{muted}");
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "idle" })
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "idle");
+
+    let unmuted = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.update",
+        json!({
+            "workspaceId": fx.ws_id.as_str(),
+            "agentId": blocker.id.0,
+            "changes": { "notificationsMuted": false },
+        }),
+    )
+    .await;
+    assert_eq!(unmuted["success"], true, "unmute ok: {unmuted}");
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "blocked" })
+    );
+}
+
 /// Attention flags over the wire: the `unread` flag is not a displayStatus
 /// axis — `workspace.update { attention: "unread" }` and `workspace.markSeen`
 /// leave `displayStatus: "idle"` and emit no
