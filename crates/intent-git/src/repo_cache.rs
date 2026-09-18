@@ -1283,28 +1283,29 @@ pub(crate) fn remove_remote_local_only(repo: &Repository, name: &str) -> Result<
         Err(e) if e.code() == ErrorCode::NotFound => None,
         Err(e) => return Err(map_git_err(e)),
     };
-    let fetch_specs: Vec<git2::Refspec<'_>> = remote
+    let mut dst_patterns: Vec<Vec<u8>> = remote
         .iter()
         .flat_map(git2::Remote::refspecs)
         .filter(|spec| spec.direction() == Direction::Fetch)
+        .map(|spec| spec.dst_bytes().to_vec())
         .collect();
-    let ref_names: Vec<String> = if fetch_specs.is_empty() {
-        repo.references_glob(&format!("refs/remotes/{name}/*"))
-            .map_err(map_git_err)?
-            .filter_map(|r| r.ok().and_then(|r| r.name().ok().map(str::to_owned)))
-            .collect()
-    } else {
-        repo.references()
-            .map_err(map_git_err)?
-            .filter_map(|r| r.ok().and_then(|r| r.name().ok().map(str::to_owned)))
-            .filter(|ref_name| fetch_specs.iter().any(|spec| spec.dst_matches(ref_name)))
-            .collect()
-    };
-    for ref_name in ref_names {
-        repo.find_reference(&ref_name)
-            .map_err(map_git_err)?
-            .delete()
-            .map_err(map_git_err)?;
+    if dst_patterns.is_empty() {
+        dst_patterns.push(format!("refs/remotes/{name}/*").into_bytes());
+    }
+    // Match and delete on the raw name bytes: a ref name need not be UTF-8,
+    // and a `&str` round-trip would silently skip such a ref.
+    let mut doomed: Vec<git2::Reference<'_>> = Vec::new();
+    for reference in repo.references().map_err(map_git_err)? {
+        let reference = reference.map_err(map_git_err)?;
+        if dst_patterns
+            .iter()
+            .any(|pattern| refspec_pattern_matches(pattern, reference.name_bytes()))
+        {
+            doomed.push(reference);
+        }
+    }
+    for mut reference in doomed {
+        reference.delete().map_err(map_git_err)?;
     }
 
     let mut local = repo
@@ -1349,6 +1350,22 @@ pub(crate) fn remove_remote_local_only(repo: &Repository, name: &str) -> Result<
         local.remove_multivar(&key, ".*").map_err(map_git_err)?;
     }
     Ok(())
+}
+
+/// Whether a refspec destination `pattern` matches the reference `name`, on
+/// raw bytes. libgit2 accepts a refspec side that is either a literal name or
+/// carries exactly one `*`, matched as an unanchored-in-the-middle prefix /
+/// suffix pair — the same shapes `git_refspec_dst_matches` answers.
+fn refspec_pattern_matches(pattern: &[u8], name: &[u8]) -> bool {
+    match pattern.iter().position(|&b| b == b'*') {
+        None => pattern == name,
+        Some(star) => {
+            let (prefix, suffix) = (&pattern[..star], &pattern[star + 1..]);
+            name.len() >= prefix.len() + suffix.len()
+                && name.starts_with(prefix)
+                && name.ends_with(suffix)
+        }
+    }
 }
 
 /// Shared body of the standalone plain-clone provisioners: local `git clone`
@@ -3887,6 +3904,107 @@ mod tests {
         assert!(repo.find_remote("origin").is_err());
         let local = git2::Config::open(&repo_dir.path().join(".git").join("config")).unwrap();
         assert!(local.get_string("remote.origin.url").is_err());
+    }
+
+    /// [`refspec_pattern_matches`] answers the two refspec-side shapes on raw
+    /// bytes: a literal name matches only itself; a single `*` matches any
+    /// (possibly empty, possibly non-UTF-8, `/`-containing) middle.
+    #[test]
+    fn refspec_pattern_matches_literal_and_single_glob_on_bytes() {
+        assert!(refspec_pattern_matches(
+            b"refs/heads/main",
+            b"refs/heads/main"
+        ));
+        assert!(!refspec_pattern_matches(
+            b"refs/heads/main",
+            b"refs/heads/main2"
+        ));
+        assert!(!refspec_pattern_matches(
+            b"refs/heads/main",
+            b"refs/heads/mai"
+        ));
+
+        let glob = b"refs/remotes/upstream/*";
+        assert!(refspec_pattern_matches(glob, b"refs/remotes/upstream/main"));
+        assert!(refspec_pattern_matches(glob, b"refs/remotes/upstream/a/b"));
+        assert!(refspec_pattern_matches(glob, b"refs/remotes/upstream/"));
+        assert!(refspec_pattern_matches(
+            glob,
+            b"refs/remotes/upstream/latin-\xff"
+        ));
+        assert!(!refspec_pattern_matches(glob, b"refs/remotes/upstream"));
+        assert!(!refspec_pattern_matches(glob, b"refs/remotes/other/main"));
+
+        let infix = b"refs/remotes/up*-mirror";
+        assert!(refspec_pattern_matches(
+            infix,
+            b"refs/remotes/upstream-mirror"
+        ));
+        assert!(refspec_pattern_matches(infix, b"refs/remotes/up-mirror"));
+        assert!(!refspec_pattern_matches(infix, b"refs/remotes/upstream"));
+        assert!(!refspec_pattern_matches(infix, b"refs/remotes/u-mirror"));
+    }
+
+    /// [`remove_remote_local_only`] must not skip a remote-tracking ref whose
+    /// name is not valid UTF-8 (`git check-ref-format` accepts such names, and
+    /// `git_remote_delete` removes them): it matches and deletes on the raw
+    /// name bytes, still leaving an unrelated ref intact.
+    #[cfg(unix)]
+    #[test]
+    fn remove_remote_local_only_deletes_non_utf8_ref_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let repo_dir = init_repo("rmremote-nonutf8");
+        commit_file(repo_dir.path(), "a.txt", "one\n");
+        let repo = Repository::open(repo_dir.path()).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.remote_with_fetch(
+            "origin",
+            "https://example.invalid/acme/widget.git",
+            "+refs/heads/*:refs/remotes/upstream/*",
+        )
+        .unwrap();
+        repo.reference("refs/remotes/other/main", head, false, "test")
+            .unwrap();
+        let raw_name: &[u8] = b"refs/remotes/upstream/latin-\xff";
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir.path())
+            .arg("update-ref")
+            .arg(OsStr::from_bytes(raw_name))
+            .arg(head.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "fixture: git update-ref must accept the raw name"
+        );
+        let has_ref = |repo: &Repository, name: &[u8]| {
+            repo.references()
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .any(|r| r.name_bytes() == name)
+        };
+        assert!(
+            has_ref(&repo, raw_name),
+            "fixture must create the non-UTF-8 ref"
+        );
+
+        remove_remote_local_only(&repo, "origin").unwrap();
+
+        assert!(
+            !has_ref(&repo, raw_name),
+            "the non-UTF-8 ref under the fetch destination must be deleted"
+        );
+        assert!(
+            has_ref(&repo, b"refs/remotes/other/main"),
+            "an unrelated ref must survive"
+        );
+        assert!(repo.find_remote("origin").is_err());
     }
 
     /// [`parse_fresh_ttl`] handles the env shapes: unset/garbage fall back to
