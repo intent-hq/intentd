@@ -3055,11 +3055,11 @@ pub struct AgentSession {
     pub retired_at: Option<String>,
     /// Daemon-owned per-session notification mute flag, so every client
     /// (desktop, HUD, iOS) sees the same state. Toggled through
-    /// `agent.update { notificationsMuted }` and served as
-    /// `AgentLite.notificationsMuted` (always present there). Never exposed
-    /// to the agent itself (stripped from every `ws.agent.*` MCP projection).
-    /// Omitted from the session wire form when `false`, like `isBackground`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// `agent.update { notificationsMuted }` and served — always present,
+    /// `false` included — here and as `AgentLite.notificationsMuted`. Never
+    /// exposed to the agent itself (stripped from every `ws.agent.*` and
+    /// `ws.event.*` MCP result).
+    #[serde(default)]
     pub notifications_muted: bool,
     /// Harness version this session was stamped with at creation
     /// (intent-hq/monorepo#2459). Immutable for the session's life — a daemon
@@ -6698,6 +6698,7 @@ mod tests {
                     "contentBlocks": [{ "type": "text", "text": "hi" }],
                     "timestamp": "t0"
                 }],
+                "notificationsMuted": false,
                 "harnessVersion": CURRENT_HARNESS_VERSION,
                 "createdAt": "t0",
                 "updatedAt": "t1"

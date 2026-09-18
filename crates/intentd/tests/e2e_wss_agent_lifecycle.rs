@@ -1771,6 +1771,19 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
         json!(false),
         "{still}"
     );
+    // The session wire form serves the flag always — `false` included.
+    let fresh_session = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        fresh_session["session"]["notificationsMuted"],
+        json!(false),
+        "agent.getSession serves notificationsMuted=false explicitly: {fresh_session}"
+    );
 
     // Mute: persisted, returned on the AgentLite, and `agent:updated` carries
     // the change so subscribed clients invalidate their projection.

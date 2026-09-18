@@ -9602,6 +9602,11 @@ mod wsapi4_bindings_tests {
         /// Agent ids `agent_get` serves with `isBackground: true` metadata
         /// (background-caller denial tests for `create({ topLevel: true })`).
         background_agent_ids: Mutex<Vec<String>>,
+        /// Agent ids `agent_get` / `agent_list` serve with
+        /// `notificationsMuted: true` (MCP scrub tests).
+        muted_agent_ids: Mutex<Vec<String>>,
+        /// When set, overrides the `event_query` result (MCP scrub tests).
+        event_query_result: Mutex<Option<Value>>,
         /// Agent ids `agent_is_retired` reports as retired (same-turn
         /// dispatch-guard tests).
         retired_agent_ids: Mutex<Vec<String>>,
@@ -9730,8 +9735,14 @@ mod wsapi4_bindings_tests {
         fn agent_list(&self, ws: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
             *self.agent_list_calls.lock().unwrap() += 1;
             let rows = self.agent_list_rows.lock().unwrap().clone();
+            let muted = self.muted_agent_ids.lock().unwrap().clone();
             Box::pin(async move {
-                Ok(rows.unwrap_or_else(|| vec![stub_agent("a-1", &ws), stub_agent("a-2", &ws)]))
+                let mut rows =
+                    rows.unwrap_or_else(|| vec![stub_agent("a-1", &ws), stub_agent("a-2", &ws)]);
+                for row in &mut rows {
+                    row.notifications_muted = muted.contains(&row.id.as_str().to_string());
+                }
+                Ok(rows)
             })
         }
 
@@ -9745,12 +9756,14 @@ mod wsapi4_bindings_tests {
             let ws = workspace_id.unwrap_or_else(|| WorkspaceId::from_string("amber-forest"));
             let error = self.agent_get_error.lock().unwrap().clone();
             let is_background = self.background_agent_ids.lock().unwrap().contains(&id);
+            let muted = self.muted_agent_ids.lock().unwrap().contains(&id);
             Box::pin(async move {
                 if let Some(e) = error {
                     return Err(Error::NotFound(e));
                 }
                 let mut agent = stub_agent(&id, &ws);
                 agent.metadata.is_background = is_background;
+                agent.notifications_muted = muted;
                 Ok(agent)
             })
         }
@@ -10067,7 +10080,8 @@ mod wsapi4_bindings_tests {
             params: EventQueryParams,
         ) -> BoxFuture<'_, Result<Value>> {
             self.event_query_calls.lock().unwrap().push(params);
-            Box::pin(async move { Ok(json!([])) })
+            let result = self.event_query_result.lock().unwrap().clone();
+            Box::pin(async move { Ok(result.unwrap_or_else(|| json!([]))) })
         }
 
         fn event_subscribe(
@@ -10294,6 +10308,37 @@ mod wsapi4_bindings_tests {
         assert!(content.ends_with('…'));
         assert_eq!(v["queue"][0]["fromAgentId"], json!("a-9"));
         assert_eq!(v["queue"][0]["fromAgentName"], json!("Nine"));
+    }
+
+    /// `notificationsMuted` is a user-facing preference the agent must never
+    /// read: the `ws.agent.*` dispatch scrubs it from `status` (a bare
+    /// `AgentLite`) and from every `list` row, leaving the other keys intact.
+    #[tokio::test]
+    async fn agent_status_and_list_never_expose_notifications_muted() {
+        let (srv, api) = server();
+        *api.muted_agent_ids.lock().unwrap() = vec!["a-42".to_string(), "a-1".to_string()];
+
+        let resp = call(&srv, "return await ws.agent.status('a-42');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["id"], json!("a-42"));
+        assert!(
+            v.get("notificationsMuted").is_none(),
+            "ws.agent.status must not carry notificationsMuted: {v}"
+        );
+        assert_eq!(v["metadata"]["isBackground"], json!(false));
+
+        let resp = call(&srv, "return await ws.agent.list();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let rows = body(&resp);
+        let rows = rows.as_array().expect("list is an array");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(
+                row.get("notificationsMuted").is_none(),
+                "ws.agent.list row must not carry notificationsMuted: {row}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -11795,6 +11840,75 @@ mod wsapi4_bindings_tests {
         assert_eq!(p.path.as_deref(), Some("src/"));
         assert_eq!(p.minutes_ago, Some(10));
         assert_eq!(p.limit, Some(25));
+    }
+
+    /// Persisted `agent:updated` / `agent:idle` payloads carry the user's
+    /// `notificationsMuted` preference; `ws.event.query` (flat and paginated
+    /// `{ events, nextPageToken }` shapes) and `ws.event.agentActivity(agentId)`
+    /// serve event history, so the `ws.event.*` dispatch scrubs the key from
+    /// every nested `data` object while leaving the rest of the row intact.
+    #[tokio::test]
+    async fn event_query_and_agent_activity_never_expose_notifications_muted() {
+        let (srv, api) = server();
+        let rows = json!([
+            {
+                "eventType": "agent:updated",
+                "actorId": "a-1",
+                "data": { "agentId": "a-1", "notificationsMuted": true, "isBackground": false }
+            },
+            {
+                "eventType": "agent:idle",
+                "actorId": "a-1",
+                "data": { "agentId": "a-1", "notificationsMuted": true }
+            },
+            { "eventType": "file:changed", "actorId": "a-1", "data": { "path": "src/a.rs" } }
+        ]);
+
+        *api.event_query_result.lock().unwrap() = Some(rows.clone());
+        let resp = call(
+            &srv,
+            "return await ws.event.query({ eventType: 'agent:*' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(
+            v,
+            json!([
+                { "eventType": "agent:updated", "actorId": "a-1", "data": { "agentId": "a-1", "isBackground": false } },
+                { "eventType": "agent:idle", "actorId": "a-1", "data": { "agentId": "a-1" } },
+                { "eventType": "file:changed", "actorId": "a-1", "data": { "path": "src/a.rs" } }
+            ]),
+            "flat event.query result must be scrubbed: {v}"
+        );
+
+        *api.event_query_result.lock().unwrap() =
+            Some(json!({ "events": rows, "nextPageToken": "tok-2" }));
+        let resp = call(
+            &srv,
+            "return await ws.event.query({ eventType: 'agent:*', paginate: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["nextPageToken"], json!("tok-2"));
+        for ev in v["events"].as_array().expect("paginated events") {
+            assert!(
+                ev["data"].get("notificationsMuted").is_none(),
+                "paginated event.query row must be scrubbed: {ev}"
+            );
+        }
+
+        let resp = call(&srv, "return await ws.event.agentActivity('a-1');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        for ev in v["events"].as_array().expect("agentActivity events") {
+            assert!(
+                ev["data"].get("notificationsMuted").is_none(),
+                "event.agentActivity row must be scrubbed: {ev}"
+            );
+        }
+        assert_eq!(v["events"][0]["data"]["isBackground"], json!(false));
     }
 
     #[tokio::test]
