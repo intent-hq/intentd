@@ -4702,7 +4702,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// credential this host minted earlier (another workspace's join);
     /// its hash resolves the principal like the `/ws` bearer gate does —
     /// unknown or revoked is [`crate::InviteErrorKind::CredentialInvalid`]
-    /// (`credential-invalid`). The invite is then validated like
+    /// (`credential-invalid`); one bound to the primary principal (the host
+    /// owner's own account) is [`crate::InviteErrorKind::OwnerSelfJoin`]
+    /// (`owner-self-join`). The invite is then validated like
     /// [`Self::invite_inspect`], a pin is checked against the
     /// principal's stored `github_user_id` (`invite-pin-mismatch`), and the
     /// join commits with the stored identity (no GitHub call, no profile
@@ -4755,7 +4757,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// [`crate::InviteErrorKind::ProofInvalid`]
     /// (any mismatch, an unknown gist, or a nonce not issued for this invite
     /// / already consumed), [`crate::InviteErrorKind::ProofExpired`],
-    /// [`crate::InviteErrorKind::GithubUnreachable`]; a closed invite, a pin
+    /// [`crate::InviteErrorKind::GithubUnreachable`];
+    /// [`crate::InviteErrorKind::OwnerSelfJoin`] (`owner-self-join`) when
+    /// the proven account is the primary principal's own — the host owner
+    /// cannot join its own host as a guest and no credential is minted; a
+    /// closed invite, a pin
     /// mismatch and a full workspace answer their existing kinds. The nonce
     /// is consumed by the first attempt that reaches the verification,
     /// except when GitHub was unreachable (the guest may retry).

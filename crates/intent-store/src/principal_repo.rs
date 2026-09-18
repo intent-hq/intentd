@@ -73,6 +73,11 @@ pub enum InviteJoinOutcome {
     /// principal at the moment of the join (unknown, revoked, or another
     /// principal's); nothing was written and the invite stays open.
     CredentialInvalid,
+    /// `identity.github_user_id` is the primary principal's own account: the
+    /// host owner cannot join its own host as a guest, and no per-principal
+    /// credential is minted for the primary row. Nothing was written and the
+    /// invite stays open.
+    OwnerSelfJoin,
 }
 
 impl Store {
@@ -899,7 +904,10 @@ impl Store {
     /// invite was no longer open at redemption; or
     /// [`InviteJoinOutcome::WorkspaceFull`] when the workspace already has
     /// `max_guests` collaborators and the joining account is not one of them
-    /// (a returning collaborator re-joining takes no new seat). Every refusal
+    /// (a returning collaborator re-joining takes no new seat); or
+    /// [`InviteJoinOutcome::OwnerSelfJoin`] when the account is the primary
+    /// principal's own (the owner never holds a per-principal credential).
+    /// Every refusal
     /// (including [`InviteJoinOutcome::CredentialInvalid`] below) is decided
     /// first, inside the transaction, so it writes nothing at all — and,
     /// under `BEGIN IMMEDIATE`, two concurrent joins cannot both pass the cap
@@ -970,6 +978,12 @@ impl Store {
                 .map_err(|e| Error::Internal(format!("invite join principal lookup failed: {e}")))?
                 .as_ref()
                 .map(map_principal_row);
+            // The owner's own account resolves to the primary row: refuse
+            // before any write, so the primary principal never gains a
+            // per-principal credential or a redeemed invite.
+            if existing.as_ref().is_some_and(|p| p.is_primary) {
+                return Ok(InviteJoinOutcome::OwnerSelfJoin);
+            }
             // Guest-cap check, same transaction as the membership insert: a
             // seat is only needed when the account is not already a member.
             let already_member = match &existing {
