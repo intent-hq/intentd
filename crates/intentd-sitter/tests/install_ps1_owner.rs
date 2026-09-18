@@ -119,9 +119,11 @@ fn run_owner_check(pwsh: &Path, cwd: &Path, data_dir: &str) -> Verdict {
 /// corrupt, every pwsh dies with `Stack overflow.` before running a line of
 /// script, and every test here fails with an opaque driver error. That is
 /// what took CI down on 2026-09-18 (intent-hq/intent#5367): the tinybox
-/// slots share one `$HOME`, so concurrent pwsh processes — the parallel
-/// tests here included — raced on the shared file. A per-run cache dir
-/// keeps this suite's pwsh from ever reading or writing shared state.
+/// slots share one `$HOME`, so every slot replayed the same corrupt file —
+/// most plausibly the work of concurrent pwsh processes (the parallel tests
+/// here among them) racing on its rewrite, though the writer was never
+/// pinned down. A per-run cache dir keeps this suite's pwsh from ever
+/// reading or writing the shared PowerShell cache.
 fn run_owner_check_with(
     pwsh: &Path,
     cwd: &Path,
