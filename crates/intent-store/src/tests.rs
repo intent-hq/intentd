@@ -8989,6 +8989,125 @@ async fn count_workspace_guests_counts_collaborators_and_open_invites() {
     );
 }
 
+/// An unpinned invite redeemed BEFORE migration 0129 was single-use when its
+/// owner shared it and must stay exhausted after the upgrade: the migration
+/// closes it (revoked at its redemption instant) so it neither lists as open
+/// nor admits another join, while a pinned redeemed row and a never-redeemed
+/// unpinned row are left alone. Fresh DBs run the migration against an empty
+/// table, so seed the pre-0129 shapes and re-execute the migration's embedded
+/// UPDATEs (ALTER skipped) — twice, since a second pass over the same
+/// pre-upgrade state must change nothing more.
+#[tokio::test]
+async fn invite_reusable_migration_keeps_pre_upgrade_redeemed_links_exhausted() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Invites", false))
+        .await
+        .expect("insert ws");
+    let primary = store.get_primary_principal().await.expect("primary").id;
+    let guest = guest_identity(77);
+    store.upsert_principal(&guest).await.expect("principal");
+    let redeemed_at = "2026-01-01T00:00:00.000Z";
+
+    for id in ["pre-unpinned", "pre-pinned", "pre-open"] {
+        let mut invite = guest_invite(id, &ws, &primary);
+        if id == "pre-pinned" {
+            invite.pin_github_user_id = Some(77);
+            invite.pin_login = Some("guest-77".to_string());
+        }
+        if id != "pre-open" {
+            invite.redeemed_at = Some(redeemed_at.to_string());
+            invite.redeemed_by_principal_id = Some(guest.id.clone());
+        }
+        store
+            .insert_workspace_invite(&invite)
+            .await
+            .expect("insert invite");
+    }
+
+    let migration = crate::MIGRATOR
+        .migrations
+        .iter()
+        .find(|m| m.version == 129)
+        .expect("migration 0129 present");
+    let sql: String = migration
+        .sql
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let replay = || async {
+        for statement in sql.split(';') {
+            let body = statement.trim();
+            if body.is_empty() || body.starts_with("ALTER TABLE") {
+                continue;
+            }
+            sqlx::query(body)
+                .execute(store.write_pool())
+                .await
+                .expect("run migration statement");
+        }
+    };
+    replay().await;
+    replay().await;
+
+    let store_ref = &store;
+    let read = |id: &'static str| async move {
+        store_ref
+            .get_workspace_invite(id)
+            .await
+            .expect("get")
+            .expect("row")
+    };
+    let pre_unpinned = read("pre-unpinned").await;
+    assert_eq!(
+        pre_unpinned.revoked_at.as_deref(),
+        Some(redeemed_at),
+        "a pre-upgrade redeemed unpinned link is closed at its redemption instant"
+    );
+    assert_eq!(pre_unpinned.redemption_count, 1);
+    assert!(!pre_unpinned.is_open_at(&now_iso()));
+    let pre_pinned = read("pre-pinned").await;
+    assert_eq!(pre_pinned.revoked_at, None, "a pinned row is left alone");
+    assert_eq!(pre_pinned.redemption_count, 1);
+    assert!(!pre_pinned.is_open_at(&now_iso()));
+    let pre_open = read("pre-open").await;
+    assert_eq!(pre_open.revoked_at, None);
+    assert_eq!(pre_open.redemption_count, 0);
+    assert!(pre_open.is_open_at(&now_iso()));
+
+    let open_ids: Vec<String> = store
+        .list_open_workspace_invites(&ws)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(open_ids, ["pre-open"]);
+    assert_eq!(
+        store
+            .join_workspace_by_invite("pre-unpinned", &ws, &guest_identity(78), "cred-78", None, 8)
+            .await
+            .expect("join"),
+        crate::InviteJoinOutcome::Closed,
+        "a pre-upgrade redeemed unpinned link admits nobody"
+    );
+    assert!(matches!(
+        store
+            .join_workspace_by_invite("pre-open", &ws, &guest_identity(78), "cred-78", None, 8)
+            .await
+            .expect("join"),
+        crate::InviteJoinOutcome::Joined(_)
+    ));
+    // Redeemed under the reusable rule (after the upgrade): stays open.
+    let pre_open = read("pre-open").await;
+    assert_eq!(pre_open.revoked_at, None);
+    assert_eq!(pre_open.redemption_count, 1);
+    assert!(pre_open.is_open_at(&now_iso()));
+}
+
 /// The join transaction refuses a new collaborator once the workspace holds
 /// `max_guests` of them, writes nothing (the invite stays open, no principal
 /// or credential row lands), still admits an account that is already a
