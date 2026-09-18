@@ -13792,7 +13792,9 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
         "editQueuedMessage by the owner stays byte-identical"
     );
     // … and a collaborator's edit of an agent-to-agent entry (not
-    // human-authored) gains no preamble.
+    // human-authored) gains no preamble — an intentional exception: the
+    // entry's sender stays the originating agent (A2A header), so the sender
+    // preamble would misattribute it; the edit is recorded by the stamp.
     let (a2a, _) = svc.enqueue_message(
         &agent,
         "from agent".into(),
@@ -14030,6 +14032,147 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
             first_user_text(&svc, &out).await,
             text,
             "{label}: agentInstructions must stay byte-identical"
+        );
+    }
+}
+
+/// Multiplayer — `agent.appendMessage` with `role: user` is human-authored
+/// and model-facing on the next turn: a collaborator's row carries the
+/// sender preamble in every supported `content` shape (string, block array
+/// on its first text block, text-less block array via a leading text block;
+/// exact-match idempotent), while the owner-role wire caller, the
+/// administrator, an absent caller, an agent caller and every non-`user`
+/// role stay byte-identical.
+#[intent_test_macros::daemon_test]
+async fn collaborator_sender_preamble_on_append_message_user_rows() {
+    use intent_core::{with_caller, Caller, Principal, PrincipalId};
+
+    let (_t, svc, ws) = setup().await;
+    let owner = svc
+        .store()
+        .get_workspace_owner_principal_id(&ws)
+        .await
+        .expect("owner lookup")
+        .expect("workspace owner");
+    let guest = PrincipalId::new();
+    svc.store()
+        .upsert_principal(&Principal {
+            id: guest.clone(),
+            github_user_id: None,
+            login: Some("octocat".into()),
+            display_name: Some("The Octocat".into()),
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("principal");
+    svc.store()
+        .add_workspace_member(&ws, &guest, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .expect("guest membership");
+    let wire = |p: &PrincipalId| Caller::Wire {
+        principal_id: p.clone(),
+        is_administrator: false,
+    };
+    let preamble = crate::harness::latest().collaborator_sender_preamble(
+        Some("octocat"),
+        Some("The Octocat"),
+        &guest.0,
+    );
+    let annotated = |text: &str| format!("{preamble}\n\n{text}");
+    let agent = create_agent(&svc, &ws, "Appended").await;
+    let append = |caller: Option<Caller>, role: &str, content: serde_json::Value| {
+        let svc = svc.clone();
+        let agent = agent.clone();
+        let ws = ws.clone();
+        let role = role.to_string();
+        async move {
+            let call = svc.agent_append_message(agent, Some(ws), role, content, None);
+            match caller {
+                Some(caller) => with_caller(caller, call).await,
+                None => call.await,
+            }
+            .expect("appendMessage")["message"]["contentBlocks"]
+                .clone()
+        }
+    };
+
+    // String content.
+    assert_eq!(
+        append(Some(wire(&guest)), "user", json!("plain")).await,
+        json!(annotated("plain")),
+        "collaborator user row (string) carries the preamble"
+    );
+    // Block array: the first text block is annotated, the rest untouched.
+    assert_eq!(
+        append(
+            Some(wire(&guest)),
+            "user",
+            json!([
+                { "type": "image", "data": "AAAA", "mimeType": "image/png" },
+                { "type": "text", "text": "first" },
+                { "type": "text", "text": "second" },
+            ]),
+        )
+        .await,
+        json!([
+            { "type": "image", "data": "AAAA", "mimeType": "image/png" },
+            { "type": "text", "text": annotated("first") },
+            { "type": "text", "text": "second" },
+        ]),
+        "collaborator user row (blocks) annotates the first text block"
+    );
+    // Text-less block array: a leading text block carries the preamble.
+    assert_eq!(
+        append(
+            Some(wire(&guest)),
+            "user",
+            json!([{ "type": "image", "data": "AAAA", "mimeType": "image/png" }]),
+        )
+        .await,
+        json!([
+            { "type": "text", "text": preamble },
+            { "type": "image", "data": "AAAA", "mimeType": "image/png" },
+        ]),
+        "collaborator user row without text gains a leading preamble block"
+    );
+    // Idempotent: an already-annotated body is not annotated twice.
+    assert_eq!(
+        append(Some(wire(&guest)), "user", json!(annotated("again"))).await,
+        json!(annotated("again")),
+        "exact-match idempotency"
+    );
+
+    // Byte-identical controls: non-user roles by the collaborator; user rows
+    // by the owner role, the administrator, an absent caller, an agent.
+    for role in ["assistant", "system"] {
+        let content = json!([{ "type": "text", "text": format!("{role} row") }]);
+        assert_eq!(
+            append(Some(wire(&guest)), role, content.clone()).await,
+            content,
+            "collaborator {role} row must stay byte-identical"
+        );
+    }
+    let admin = Caller::Wire {
+        principal_id: owner.clone(),
+        is_administrator: true,
+    };
+    let peer = Caller::Agent {
+        agent_id: AgentId::from("agent-peer"),
+    };
+    for (label, caller) in [
+        ("owner role", Some(wire(&owner))),
+        ("administrator", Some(admin)),
+        ("absent caller", None),
+        ("agent caller", Some(peer)),
+    ] {
+        let content = json!([{ "type": "text", "text": format!("control {label}") }]);
+        assert_eq!(
+            append(caller, "user", content.clone()).await,
+            content,
+            "{label}: user row must stay byte-identical"
         );
     }
 }
