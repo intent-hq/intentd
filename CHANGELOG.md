@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.73] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(hooks)* Default hook.list to active hooks and lighten retired rows ([#1971](https://github.com/intent-hq/intentd/pull/1971))
+
+
 ## [0.9.72] - 2026-09-17
 
 ### 🐛 Bug Fixes
