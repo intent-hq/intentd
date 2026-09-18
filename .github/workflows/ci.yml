@@ -18,13 +18,15 @@ on:
   # Merge-queue runs (intent-hq/monorepo#2893): the queue tests the actual
   # merged tree before it lands on main. CI is tiered by event: pull_request
   # runs the fast feedback jobs (check / build / pr-title / conflict-markers /
-  # deb-packaging / release-scripts); merge_group additionally runs the
-  # instrumented coverage jobs (coverage-e2e / coverage-all), which are
-  # merge_group-ONLY — they no longer run on pull_request, so a PR's ~20 min
-  # coverage wall time is paid once, on the merged tree, instead of on every
-  # push to the PR. The gate is event-aware about this (see the gate
-  # comment): it requires the coverage jobs outright on merge_group and
-  # accepts their skip on pull_request / push. The build job's target-gated
+  # deb-packaging / release-scripts) plus coverage-changed, which runs only
+  # the PR's own changed tests under llvm-cov (pull_request-ONLY; see its
+  # comment); merge_group additionally runs the full instrumented coverage
+  # jobs (coverage-e2e / coverage-all), which are merge_group-ONLY — they no
+  # longer run on pull_request, so a PR's ~20 min coverage wall time is paid
+  # once, on the merged tree, instead of on every push to the PR. The gate is
+  # event-aware about this (see the gate comment): it requires the coverage
+  # jobs outright on merge_group and accepts their skip on pull_request /
+  # push, and the reverse for coverage-changed. The build job's target-gated
   # clippy step runs on both pull_request and merge_group (see its comment),
   # so the queue lints the merged tree's macOS / Windows-only code too.
   # Merge groups are created by the repo's own ruleset from already-filed
@@ -57,8 +59,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Decides where the heavy Linux jobs (check / coverage-e2e / coverage-all)
-  # run: the local tinybox runner when it is confirmed healthy, or
+  # Decides where the heavy Linux jobs (check / coverage-e2e / coverage-all /
+  # coverage-changed) run: the local tinybox runner when it is confirmed healthy, or
   # GitHub-hosted larger runners otherwise. Runs on a GitHub-hosted runner so
   # the burst decision is independent of the tinybox queue: when the probe
   # ran on tinybox it queued behind the very backlog it measures (and
@@ -72,12 +74,13 @@ jobs:
   # GitHub-hosted macOS runner (see the build job's matrix).
   route:
     # Skipped on push to main: its only consumers (check / coverage-e2e /
-    # coverage-all) are push-skipped as redundant (see the `on: push`
-    # comment) and the build matrix is intentionally not routed, so the
-    # probe would spend API calls placing jobs that never run.
+    # coverage-all / coverage-changed) are push-skipped as redundant (see the
+    # `on: push` comment) and the build matrix is intentionally not routed, so
+    # the probe would spend API calls placing jobs that never run.
     # Also skipped on fork PRs (see the `pull_request` trigger comment):
     # route's skip cascades over the needs chain, skipping check /
-    # coverage-e2e / coverage-all, so fork PRs can never reach tinybox.
+    # coverage-e2e / coverage-all / coverage-changed, so fork PRs can never
+    # reach tinybox.
     # Runs on merge_group (see the trigger comment) — merge groups come from
     # the repo's own ruleset, so no same-repo guard applies there.
     if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
@@ -1048,6 +1051,186 @@ jobs:
         if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
         run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
+  # pull_request-ONLY counterpart of coverage-e2e / coverage-all
+  # (intent-hq/intentd#1947): a test that was 20/20 green on its PR failed only
+  # under the merge queue's llvm-cov instrumentation and ejected the PR, so
+  # every same-repo PR now runs the nextest selection derived from its own
+  # changed paths (scripts/changed-tests.sh --instrumented — the same env,
+  # flags and auggie_context_e2e exclusion as scripts/coverage-e2e.sh) under
+  # instrumentation before it can be enqueued. The full instrumented suite
+  # stays merge_group-only (intent-hq/intent#4260). Two phases: a cheap
+  # bash+git dry run FIRST computes the selection, and every heavy step
+  # (disk preflight, libssl, toolchain, caches, cargo-llvm-cov / nextest
+  # install, the run itself) is gated on it having found something, so a PR
+  # without crates/ changes finishes in seconds. Gated like check on
+  # pull_request: required outright by the gate there (a skip after a route
+  # failure fails the gate), accepted as skipped on merge_group / push where
+  # it is job-level skipped by design. github.event.pull_request is only
+  # read inside the job (absent on merge_group, where the job never runs).
+  coverage-changed:
+    needs: route
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' }}
+    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      # Same value and rationale as coverage-e2e (co-tenancy on tinybox,
+      # matches the 16-core burst runner).
+      NEXTEST_TEST_THREADS: 16
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    steps:
+      # Depth 2 keeps both parents of the PR merge commit (base and head), so
+      # the selection's merge base resolves to the PR base; the explicit
+      # fetch below pins the base commit even when the merge ref is the
+      # branch head itself (no merge commit).
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Fetch PR base commit
+        run: git fetch --no-tags --depth=1 origin "$BASE_SHA"
+      - name: Select changed tests (dry run)
+        id: select
+        run: |
+          set -euo pipefail
+          plan="$RUNNER_TEMP/coverage-changed-plan.txt"
+          ./scripts/changed-tests.sh --instrumented --dry-run --base "$BASE_SHA" | tee "$plan"
+          if grep -q 'cargo llvm-cov' "$plan"; then
+            echo "has_selection=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_selection=false" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "## coverage-changed selection"
+            echo ""
+            echo "\`\`\`"
+            cat "$plan"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # Fail-fast disk preflight — see the `check` job's comment for the full
+      # rationale (monorepo#1253). 30 GiB like coverage-e2e: this job shares
+      # coverage-e2e's per-slot target dir (see "Point CARGO_TARGET_DIR
+      # outside the work dir" below), so the own-dir skip must name it.
+      - name: Disk-space preflight (tinybox only)
+        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
+        env:
+          NEED_GIB: 30
+          JOB_TARGET_SUBDIR: coverage-e2e
+        run: |
+          set -euo pipefail
+          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
+          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
+          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
+          # Same two tiers as the `check` job's preflight (see its comment):
+          # selection in scripts/ci-target-slot.sh purge-candidates, a live
+          # is-purgeable recheck before each rm, this loop only deletes
+          # until the need is met.
+          evict_until_free() {
+            local verb="$1" quiet_min="$2" dir
+            shift 2
+            while IFS= read -r dir; do
+              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
+              echo "$verb: $dir"
+              rm -rf -- "$dir" || true
+              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
+            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
+          }
+          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
+          evict_until_free pruning 2880 --skip-dir "$own_dir"
+          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
+            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
+            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
+          fi
+          free="$(free_gib)"
+          if [ "$free" -lt "$NEED_GIB" ]; then
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
+            exit 1
+          fi
+      # See the `check` job's comment: tinybox lacks the OpenSSL headers.
+      - name: Install libssl-dev if missing
+        if: steps.select.outputs.has_selection == 'true'
+        run: |
+          if ! pkg-config --exists openssl; then
+            for i in 1 2 3; do
+              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
+              if [ "$i" -eq 3 ]; then exit 1; fi
+              sleep $((i * 15))
+            done
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
+          fi
+      # Deliberately SHARES coverage-e2e's per-slot target dir instead of
+      # keying its own: a runner slot executes one job at a time, so the two
+      # never overlap on the same dir, both build the same instrumented
+      # profile, and sharing keeps the multi-GiB instrumented dependency
+      # cache warm across PR runs and queue runs alike (a separate dir would
+      # rebuild it from scratch on every slot). This job never runs `cargo
+      # llvm-cov clean`, so it cannot delete coverage-e2e's artifacts.
+      # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
+      # step (intent-hq/intent#5256); released by the job's last step.
+      - name: Point CARGO_TARGET_DIR outside the work dir
+        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
+        run: |
+          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e"
+          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
+          ./scripts/ci-target-slot.sh mark "$target_dir"
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        if: steps.select.outputs.has_selection == 'true'
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
+        if: steps.select.outputs.has_selection == 'true'
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: llvm-tools-preview
+      # Ephemeral GitHub-hosted runners have no persistent target dir, so
+      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
+      # Own key rather than coverage-e2e's: rust-cache never re-saves on an
+      # exact hit, so a partial cache saved here would shadow the full
+      # coverage-e2e cache until the lockfile changes.
+      - name: Rust cache (burst runner only)
+        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gh-burst-coverage-changed
+      # Node is required (not preinstalled on tinybox): the ACP e2e tests
+      # spawn the mock-acp-agent.mjs fixture and self-skip without it.
+      - uses: actions/setup-node@v7
+        if: steps.select.outputs.has_selection == 'true'
+        with:
+          node-version: 22
+      # Per-slot install-action HOME — see coverage-e2e's comment
+      # (monorepo#1239).
+      - name: Key install-action dirs per runner slot
+        if: steps.select.outputs.has_selection == 'true'
+        run: |
+          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
+            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
+          else
+            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
+      - uses: taiki-e/install-action@cargo-llvm-cov
+        if: steps.select.outputs.has_selection == 'true'
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
+      - uses: taiki-e/install-action@nextest
+        if: steps.select.outputs.has_selection == 'true'
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
+      - name: Run changed tests under llvm-cov
+        if: steps.select.outputs.has_selection == 'true'
+        run: ./scripts/changed-tests.sh --instrumented --base "$BASE_SHA"
+      # Release the `.in-use` marker — see the `check` job's last step
+      # (intent-hq/intent#5256). CARGO_TARGET_DIR is empty when the
+      # selection was empty or on burst runners, so this is a no-op there.
+      - name: Release per-slot target dir
+        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
+        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
+
   pr-title:
     runs-on: ubuntu-latest
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
@@ -1184,11 +1367,14 @@ jobs:
   # without a marker is left untouched — never collapsed to one section)
   # and scripts/notify-fixed-issues.sh (a mention-only reference or an open
   # issue never earns a release comment; a closed issue with a delivered
-  # linked fix PR does), plus the tinybox CI helpers
+  # linked fix PR does), the tinybox CI helpers
   # (intent-hq/intent#5256): scripts/ci-lld-retry.sh (the rust-lld
   # vanished-object signature earns exactly one retry; a genuine lint fails
   # fast) and scripts/ci-target-slot.sh (a dir with a fresh `.in-use` marker
-  # is never a purge candidate; an unmarked idle one is). Seconds-long like
+  # is never a purge candidate; an unmarked idle one is), plus the
+  # stubbed-cargo harness for scripts/changed-tests.sh (the changed-tests
+  # selection the monorepo's `make test-changed` delegates to, and its
+  # --instrumented llvm-cov form; intent-hq/intentd#1947). Seconds-long like
   # the other utility jobs, so it runs directly on ubuntu-latest.
   release-scripts:
     runs-on: ubuntu-latest
@@ -1206,6 +1392,8 @@ jobs:
         run: ./scripts/test-ci-lld-retry.sh
       - name: Test ci-target-slot.sh
         run: ./scripts/test-ci-target-slot.sh
+      - name: Test changed-tests.sh
+        run: ./scripts/test-changed-tests.sh
 
   # install.ps1's Windows-only paths (intent-hq/intent#3229): the `check`
   # job's install_ps1_owner suite runs the installer's ownership check under
@@ -1257,8 +1445,8 @@ jobs:
           if ($result.PassedCount -eq 0) { throw 'install.ps1 Pester tests: nothing ran' }
 
   # Single required status check for branch protection: fans in check, build,
-  # coverage-e2e, coverage-all, pr-title, conflict-markers, deb-packaging,
-  # release-scripts, and install-ps1 (ported from cloudlands-fe's "CI Gate"
+  # coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers,
+  # deb-packaging, release-scripts, and install-ps1 (ported from cloudlands-fe's "CI Gate"
   # pattern — see packages/cloudlands-fe/.github/workflows/intent-pr.yml).
   # build / deb-packaging / release-scripts / install-ps1 must succeed
   # outright: none carries an
@@ -1273,17 +1461,21 @@ jobs:
   # so on merge_group they must succeed outright — a skip there (e.g. after a
   # route failure) fails the gate, so the queue can never land a tree whose
   # coverage run did not happen — while on pull_request and push, where they
-  # are job-level skipped by design, the gate accepts skipped. pr-title /
+  # are job-level skipped by design, the gate accepts skipped. coverage-changed
+  # is the mirror image: pull_request-only (see its comment), so on
+  # pull_request it must succeed outright like check — a skip there (route
+  # failure) fails the gate — while on merge_group and push, where it is
+  # job-level skipped by design, the gate accepts skipped. pr-title /
   # conflict-markers accept success OR skipped since
   # both carry `if: github.event_name == 'pull_request'` and are legitimately
   # skipped on push and merge_group runs (PR-metadata checks, already
   # validated on the PR) — requiring strict success there would fail the
   # gate outside pull_request events. Net per event: pull_request requires
-  # check / build / deb-packaging / release-scripts / install-ps1 / pr-title /
-  # conflict-markers; merge_group requires check / build / deb-packaging /
-  # release-scripts / install-ps1 / coverage-e2e / coverage-all against the
-  # queue's merged tree; push requires build / deb-packaging /
-  # release-scripts / install-ps1.
+  # check / build / coverage-changed / deb-packaging / release-scripts /
+  # install-ps1 / pr-title / conflict-markers; merge_group requires check /
+  # build / deb-packaging / release-scripts / install-ps1 / coverage-e2e /
+  # coverage-all against the queue's merged tree; push requires build /
+  # deb-packaging / release-scripts / install-ps1.
   gate:
     name: CI Gate
     # Seconds-long job: pinned to ubuntu-latest (see pr-title).
@@ -1294,7 +1486,7 @@ jobs:
     # would run the gate against all-skipped needs and report a spurious
     # failure on PRs that get no CI by policy.
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: [check, build, coverage-e2e, coverage-all, pr-title, conflict-markers, deb-packaging, release-scripts, install-ps1]
+    needs: [check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, deb-packaging, release-scripts, install-ps1]
     steps:
       - name: Check results
         run: |
@@ -1319,6 +1511,24 @@ jobs:
           elif [ "${{ needs.check.result }}" != "success" ]; then
             echo "One or more required jobs failed"
             exit 1
+          fi
+          # Event-aware on purpose: coverage-changed is pull_request-only, so
+          # there it must succeed outright (a skip after a route failure must
+          # not let an uninstrumented PR through); on merge_group and push it
+          # is job-skipped by design and the gate accepts skipped.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if [ "${{ needs.coverage-changed.result }}" != "success" ]; then
+              echo "coverage-changed must succeed outright on pull_request"
+              exit 1
+            fi
+          else
+            case "${{ needs.coverage-changed.result }}" in
+              success|skipped) ;;
+              *)
+                echo "coverage-changed did not succeed or skip"
+                exit 1
+                ;;
+            esac
           fi
           # Event-aware on purpose: coverage-e2e / coverage-all are
           # merge_group-only, so on merge_group they must succeed outright

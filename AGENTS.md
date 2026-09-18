@@ -204,6 +204,7 @@ make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D
 make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
 make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes
 make gate     # check, then test
+scripts/changed-tests.sh --instrumented  # (from packages/intentd) the same changed selection under cargo llvm-cov — what CI's coverage-changed job runs on every PR
 ```
 
 The raw equivalents in `packages/intentd` are `cargo fmt --check`,
