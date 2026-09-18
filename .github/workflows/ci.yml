@@ -459,39 +459,82 @@ jobs:
       # The cache probe runs the binary, so an executable-but-broken cache
       # self-heals by reinstalling, and the whole slot dir is wiped before a
       # (re)install so a version bump never strands old $version dirs.
+      #
+      # `pwsh --version` proves only that the binary runs; it never brings up
+      # a runspace. On 2026-09-18 every check run on tinybox went red with 14
+      # opaque driver failures (intent-hq/intent#5367, run 35346259015)
+      # because pwsh died with `Stack overflow.` during startup: the
+      # multicore-JIT profile it replays on every start
+      # (~/.cache/powershell/StartupProfileData-NonInteractive, rewritten
+      # non-atomically at every exit) had been corrupted, and the tinybox
+      # slots share one $HOME, so every slot read the same broken file. Two
+      # guards below: this step and the guard-test step point XDG_CACHE_HOME
+      # at a job-private dir under $RUNNER_TEMP (harmless on burst runners),
+      # so CI's own pwsh never reads or writes the shared home cache — the
+      # test harness additionally gives each spawned pwsh its own cache dir;
+      # and a runspace-initialising probe fails this step with host
+      # diagnostics when pwsh cannot start, so a recurrence reads as an
+      # environment failure here rather than as 14 test failures below.
       - name: Provision PowerShell (pwsh) if missing
+        env:
+          XDG_CACHE_HOME: ${{ runner.temp }}/xdg-cache
         run: |
           set -euo pipefail
+          mkdir -p "$XDG_CACHE_HOME"
           if command -v pwsh >/dev/null 2>&1; then
-            echo "pwsh already on PATH: $(command -v pwsh) ($(pwsh --version))"
-            exit 0
+            pwsh_bin=$(command -v pwsh)
+            echo "pwsh already on PATH: $pwsh_bin ($("$pwsh_bin" --version))"
+          else
+            version=7.4.6
+            sha256=6f6015203c47806c5cc444c19d8ed019695e610fbd948154264bf9ca8e157561
+            slotdir="$HOME/ci-pwsh/${RUNNER_NAME:-local}"
+            dest="$slotdir/$version"
+            if ! "$dest/pwsh" --version >/dev/null 2>&1; then
+              rm -rf "$slotdir"
+              tmp=$(mktemp -d)
+              curl -fsSL --retry 3 -o "$tmp/pwsh.tar.gz" \
+                "https://github.com/PowerShell/PowerShell/releases/download/v${version}/powershell-${version}-linux-x64.tar.gz"
+              echo "$sha256  $tmp/pwsh.tar.gz" | sha256sum -c -
+              mkdir -p "$dest"
+              tar -xzf "$tmp/pwsh.tar.gz" -C "$dest"
+              chmod +x "$dest/pwsh"
+              rm -rf "$tmp"
+            fi
+            echo "$dest" >> "$GITHUB_PATH"
+            pwsh_bin="$dest/pwsh"
+            "$pwsh_bin" --version
           fi
-          version=7.4.6
-          sha256=6f6015203c47806c5cc444c19d8ed019695e610fbd948154264bf9ca8e157561
-          slotdir="$HOME/ci-pwsh/${RUNNER_NAME:-local}"
-          dest="$slotdir/$version"
-          if ! "$dest/pwsh" --version >/dev/null 2>&1; then
-            rm -rf "$slotdir"
-            tmp=$(mktemp -d)
-            curl -fsSL --retry 3 -o "$tmp/pwsh.tar.gz" \
-              "https://github.com/PowerShell/PowerShell/releases/download/v${version}/powershell-${version}-linux-x64.tar.gz"
-            echo "$sha256  $tmp/pwsh.tar.gz" | sha256sum -c -
-            mkdir -p "$dest"
-            tar -xzf "$tmp/pwsh.tar.gz" -C "$dest"
-            chmod +x "$dest/pwsh"
-            rm -rf "$tmp"
+          echo "XDG_CACHE_HOME=$XDG_CACHE_HOME"
+          probe_rc=0
+          probe_out=$("$pwsh_bin" -NoProfile -NonInteractive -Command 'Write-Output pwsh-ok' 2>&1) || probe_rc=$?
+          if [[ $probe_rc -ne 0 || "$probe_out" != *pwsh-ok* ]]; then
+            echo "pwsh startup probe failed (rc=$probe_rc):"
+            echo "$probe_out"
+            echo "--- host diagnostics ---"
+            echo "ulimit -s: $(ulimit -s)"
+            free -m | head -2
+            for cache in "$XDG_CACHE_HOME/powershell" "$HOME/.cache/powershell"; do
+              echo "$cache:"
+              ls -l --time-style=full-iso "$cache" 2>&1 || true
+            done
+            echo "::error::pwsh cannot initialise a runspace on ${RUNNER_NAME:-this runner} (intent-hq/intent#5367). Likely a corrupt PowerShell startup profile — on 2026-09-18 it was the shared \$HOME/.cache/powershell/StartupProfileData-NonInteractive; see the diagnostics above and the issue for the fix."
+            exit 1
           fi
-          echo "$dest" >> "$GITHUB_PATH"
-          "$dest/pwsh" --version
+          echo "pwsh startup probe: $probe_out"
       # INTENTD_CI_EXPECT_PWSH makes a missing pwsh FAIL these tests instead
       # of skipping (see install_ps1_owner.rs), so a broken provisioning step
       # above can never quietly turn this suite back into a no-op. The suite
       # runs here rather than relying on coverage-all, where a pwsh-less
-      # runner would skip it silently.
+      # runner would skip it silently. XDG_CACHE_HOME matches the provisioning
+      # step's job-private cache (intent-hq/intent#5367, see above); the
+      # harness narrows it further to a per-run dir for each pwsh it spawns.
       - name: Installer guard tests (install_ps1_owner)
         env:
           INTENTD_CI_EXPECT_PWSH: 1
-        run: cargo test -p intentd-sitter --test install_ps1_owner
+          XDG_CACHE_HOME: ${{ runner.temp }}/xdg-cache
+        run: |
+          echo "pwsh: $(command -v pwsh) ($(pwsh --version)); XDG_CACHE_HOME=$XDG_CACHE_HOME; ulimit -s: $(ulimit -s)"
+          cargo test -p intentd-sitter --test install_ps1_owner
       # Release the `.in-use` marker the CARGO_TARGET_DIR step wrote
       # (intent-hq/intent#5256). `always()` so a failed or cancelled job
       # does not leave a live marker behind; a runner that dies mid-job
