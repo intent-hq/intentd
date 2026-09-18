@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.75] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(git)* Remove origin and overlay-fetch safely under a global remote.origin.prune ([#1975](https://github.com/intent-hq/intentd/pull/1975))
+
+
 ## [0.9.74] - 2026-09-18
 
 ### 🐛 Bug Fixes
