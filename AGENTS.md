@@ -203,6 +203,7 @@ pass. Run them from the monorepo root via the top-level `Makefile`:
 make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
 make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
 make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes
+make coverage-changed  # the same changed selection under cargo llvm-cov (BASE=<ref>, DRY_RUN=1 prints the plan) — the local equivalent of CI's pull_request coverage-changed job
 make gate     # check, then test
 scripts/changed-tests.sh --instrumented  # (from packages/intentd) the same changed selection under cargo llvm-cov — what CI's coverage-changed job runs on every PR
 ```
