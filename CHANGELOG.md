@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.76] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(acp)* Classify missing bare-command launches and harden Antigravity e2es under load ([#1978](https://github.com/intent-hq/intentd/pull/1978))
+
+
 ## [0.9.75] - 2026-09-18
 
 ### 🐛 Bug Fixes
