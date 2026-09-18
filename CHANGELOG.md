@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.74] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- Make agent questions and blockers plain and self-contained ([#1798](https://github.com/intent-hq/intentd/pull/1798))
+
+
 ## [0.9.73] - 2026-09-18
 
 ### 🐛 Bug Fixes
