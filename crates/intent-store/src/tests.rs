@@ -8792,6 +8792,7 @@ async fn workspace_invite_secret_round_trips_and_legacy_rows_read_none() {
         redeemed_at: None,
         redeemed_by_principal_id: None,
         revoked_at: None,
+        redemption_count: 0,
     };
     store
         .insert_workspace_invite(&minted)
@@ -8852,6 +8853,7 @@ fn guest_invite(id: &str, ws: &WorkspaceId, by: &PrincipalId) -> WorkspaceInvite
         redeemed_at: None,
         redeemed_by_principal_id: None,
         revoked_at: None,
+        redemption_count: 0,
     }
 }
 
@@ -8869,7 +8871,8 @@ fn guest_identity(github_user_id: i64) -> Principal {
 }
 
 /// `count_workspace_guests` counts collaborators (never the owner) and open
-/// invites (never redeemed / revoked / expired ones), per workspace.
+/// invites (never revoked / expired ones, nor a redeemed pinned one; a
+/// redeemed unpinned invite is reusable and still open), per workspace.
 #[tokio::test]
 async fn count_workspace_guests_counts_collaborators_and_open_invites() {
     let tmp = TempDb::new();
@@ -8895,9 +8898,16 @@ async fn count_workspace_guests_counts_collaborators_and_open_invites() {
         .add_workspace_member(&ws, &guest.id, WorkspaceRole::Collaborator)
         .await
         .expect("member");
-    for id in ["open-1", "open-2", "revoked", "redeemed", "expired"] {
+    for id in [
+        "open-1", "open-2", "revoked", "redeemed", "reused", "expired",
+    ] {
+        let mut invite = guest_invite(id, &ws, &primary);
+        if id == "redeemed" {
+            invite.pin_github_user_id = Some(77);
+            invite.pin_login = Some("guest-77".to_string());
+        }
         store
-            .insert_workspace_invite(&guest_invite(id, &ws, &primary))
+            .insert_workspace_invite(&invite)
             .await
             .expect("insert invite");
     }
@@ -8913,6 +8923,40 @@ async fn count_workspace_guests_counts_collaborators_and_open_invites() {
         .redeem_workspace_invite("redeemed", &guest.id)
         .await
         .expect("redeem"));
+    assert!(
+        !store
+            .redeem_workspace_invite("redeemed", &guest.id)
+            .await
+            .expect("redeem again"),
+        "a pinned invite is single-use"
+    );
+    assert!(store
+        .redeem_workspace_invite("reused", &guest.id)
+        .await
+        .expect("redeem reusable"));
+    assert!(
+        store
+            .redeem_workspace_invite("reused", &guest.id)
+            .await
+            .expect("redeem reusable again"),
+        "an unpinned invite stays open across redemptions"
+    );
+    let reused = store
+        .get_workspace_invite("reused")
+        .await
+        .expect("get")
+        .expect("row");
+    assert!(reused.is_reusable());
+    assert_eq!(reused.redemption_count, 2);
+    assert!(reused.is_open_at(&now_iso()));
+    let redeemed = store
+        .get_workspace_invite("redeemed")
+        .await
+        .expect("get")
+        .expect("row");
+    assert!(!redeemed.is_reusable());
+    assert_eq!(redeemed.redemption_count, 1);
+    assert!(!redeemed.is_open_at(&now_iso()));
     sqlx::query("UPDATE workspace_invite SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
         .bind("expired")
         .execute(store.write_pool())
@@ -8924,10 +8968,18 @@ async fn count_workspace_guests_counts_collaborators_and_open_invites() {
         counted,
         crate::WorkspaceGuestCount {
             collaborators: 1,
-            open_invites: 2,
+            open_invites: 3,
         }
     );
-    assert_eq!(counted.committed(), 3);
+    assert_eq!(counted.committed(), 4);
+    let open_ids: Vec<String> = store
+        .list_open_workspace_invites(&ws)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(open_ids, ["open-1", "open-2", "reused"]);
     assert_eq!(
         store.count_workspace_guests(&other).await.expect("count"),
         crate::WorkspaceGuestCount {
@@ -9017,10 +9069,50 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
         crate::InviteJoinOutcome::Joined(store.get_principal(&seated.id).await.expect("principal")),
         "an already-seated account re-joins without a new seat"
     );
+    let second = store
+        .get_workspace_invite("second")
+        .await
+        .expect("get")
+        .expect("row");
     assert_eq!(
-        join(store.clone(), "second", ws.clone(), 1, 1).await,
+        second.redeemed_by_principal_id.as_ref(),
+        Some(&seated.id),
+        "the re-join is stamped as the last redemption"
+    );
+    assert_eq!(
+        second.redemption_count, 0,
+        "a member's re-join creates no membership and is not counted"
+    );
+    assert!(
+        second.is_open_at(&now_iso()),
+        "an unpinned invite stays open after a redemption"
+    );
+    assert_eq!(
+        store
+            .get_workspace_invite("closed-door")
+            .await
+            .expect("get")
+            .expect("row")
+            .redemption_count,
+        1,
+        "the first seat's join is one counted redemption"
+    );
+    // A pinned invite is single-use: the same re-join closes it.
+    let mut pinned = guest_invite("pinned", &ws, &primary);
+    pinned.pin_github_user_id = Some(1);
+    pinned.pin_login = Some("guest-1".to_string());
+    store
+        .insert_workspace_invite(&pinned)
+        .await
+        .expect("insert invite");
+    assert_eq!(
+        join(store.clone(), "pinned", ws.clone(), 1, 1).await,
+        crate::InviteJoinOutcome::Joined(store.get_principal(&seated.id).await.expect("principal")),
+    );
+    assert_eq!(
+        join(store.clone(), "pinned", ws.clone(), 1, 1).await,
         crate::InviteJoinOutcome::Closed,
-        "the re-join consumed the invite"
+        "the re-join consumed the pinned invite"
     );
 
     // Race for the last seat: cap 2 with one seated collaborator and many
@@ -9060,9 +9152,9 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
         store.count_workspace_guests(&ws).await.expect("count"),
         crate::WorkspaceGuestCount {
             collaborators: 2,
-            open_invites: 7,
+            open_invites: 10,
         },
-        "refused joins leave their invites open"
+        "refused joins leave their invites open, and unpinned redeemed ones stay open too"
     );
 }
 
