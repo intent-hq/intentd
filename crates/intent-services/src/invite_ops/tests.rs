@@ -1979,6 +1979,99 @@ async fn prove_enforces_the_pin_on_the_proven_account() {
     assert_eq!(invite_kind(&r), InviteErrorKind::PinMismatch);
 }
 
+/// The host owner's own GitHub account cannot join its own host as a guest:
+/// a proof that resolves to the primary principal's `github_user_id` is
+/// refused `OwnerSelfJoin` at `invite.prove` — before any credential is
+/// minted — and so is an `invite.accept` presenting a credential bound to the
+/// primary row. The primary principal ends with no per-principal credential,
+/// the invite stays open, and its membership is untouched (a guest window on
+/// the owner's account, which would report `myRole: owner` over a
+/// non-administrator credential, can never come to exist).
+#[tokio::test]
+async fn prove_and_accept_refuse_the_host_owners_own_account() {
+    let tmp = TempDb::new();
+    let mut f = fixture(&tmp).await;
+    let mut primary = f.store.get_primary_principal().await.expect("primary");
+    primary.github_user_id = Some(4242);
+    primary.login = Some("guest".into());
+    f.store
+        .upsert_principal(&primary)
+        .await
+        .expect("seed identity");
+    let created = f.create_invite(None).await;
+    let (invite_id, secret) = (
+        id_of(&created),
+        created["secret"].as_str().unwrap().to_string(),
+    );
+
+    // prove: the forge proves "guest" (4242) — the owner's own account.
+    let nonce = nonce_of(
+        &f.services
+            .invite_challenge_op(&invite_id, &secret)
+            .await
+            .expect("challenge"),
+    );
+    with_forge(&mut f, vec![("g", Ok(gist("guest", Some(&nonce))))]);
+    let r = f
+        .services
+        .invite_prove_op(&invite_id, &secret, &nonce, "g", "guest")
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::OwnerSelfJoin);
+
+    // accept: a credential that resolves to the primary row (as minted
+    // before this guard existed) identifies the owner, not a guest.
+    f.store
+        .insert_principal_credential(&f.primary, &hash_secret("owner-token"))
+        .await
+        .expect("legacy owner credential");
+    let r = f
+        .services
+        .invite_accept_op(&invite_id, &secret, "owner-token")
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::OwnerSelfJoin);
+
+    // The shared first-join path refuses on the resolved account alone (the
+    // store transaction carries the same guard for anything past it).
+    let r = f
+        .services
+        .complete_invite_join(&invite_id, &identity("guest", 4242))
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::OwnerSelfJoin);
+
+    let creds = f
+        .store
+        .list_principal_credentials(&f.primary)
+        .await
+        .expect("credentials");
+    assert_eq!(
+        creds.len(),
+        1,
+        "only the seeded row: no join minted a credential for the primary principal"
+    );
+    assert_eq!(creds[0].token_hash, hash_secret("owner-token"));
+    assert_eq!(
+        f.store
+            .get_workspace_member_role(&f.ws, &f.primary)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Collaborator),
+        "the fixture's demoted primary seat is untouched"
+    );
+    let invite = f
+        .store
+        .get_workspace_invite(&invite_id)
+        .await
+        .expect("get")
+        .expect("row");
+    assert!(invite.redeemed_at.is_none(), "the invite stays open");
+    assert_eq!(
+        InviteErrorKind::OwnerSelfJoin.as_str(),
+        "owner-self-join",
+        "stable wire code"
+    );
+    assert_eq!(InviteErrorKind::OwnerSelfJoin.code(), -32602);
+}
+
 /// Under concurrent `invite.prove` attempts on one nonce exactly one reaches
 /// the verification (and joins); every other one is refused — `ProofInvalid`
 /// when it lost the nonce race, `Redeemed` when it arrived after the join.
