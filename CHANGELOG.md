@@ -2,6 +2,61 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.73] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(hooks)* Default hook.list to active hooks and lighten retired rows ([#1971](https://github.com/intent-hq/intentd/pull/1971))
+
+
+## [0.9.72] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(sourcecontrol)* Propagate RateLimited from the nested branch_rules read ([#1966](https://github.com/intent-hq/intentd/pull/1966))
+
+### 📚 Documentation
+
+- *(tests)* Describe the merged interrupt slot-release ordering in the WSS queued-spawn e2e ([#1961](https://github.com/intent-hq/intentd/pull/1961))
+
+
+## [0.9.71] - 2026-09-17
+
+### 🚀 Features
+
+- *(pr-monitor)* Stretch the sweep cadence on the remaining forge quota ([#1948](https://github.com/intent-hq/intentd/pull/1948))
+
+### 🐛 Bug Fixes
+
+- *(agent-manager)* Release the busy slot before waking a queued process-slot waiter ([#1952](https://github.com/intent-hq/intentd/pull/1952))
+- *(pr-monitor)* Sample pausedUntil after snapshot reads and cover it over WSS ([#1954](https://github.com/intent-hq/intentd/pull/1954))
+
+### ⚡ Performance
+
+- *(pr-monitor)* Fold one PR poll into a single GraphQL observation ([#1949](https://github.com/intent-hq/intentd/pull/1949))
+
+
+## [0.9.70] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Surface the forge rate-limit pause on every active monitor ([#1945](https://github.com/intent-hq/intentd/pull/1945))
+
+
+## [0.9.69] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(agent-manager)* Gate memory budget on host headroom and emit resumed on timed admission ([#1947](https://github.com/intent-hq/intentd/pull/1947))
+
+
+## [0.9.68] - 2026-09-17
+
+### 🧪 Testing
+
+- *(install.ps1)* Pester coverage for the startup wait and Scheduled Task registration ([#1944](https://github.com/intent-hq/intentd/pull/1944))
+
+
 ## [0.9.67] - 2026-09-17
 
 ### 🐛 Bug Fixes

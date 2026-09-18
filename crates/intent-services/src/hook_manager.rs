@@ -1103,20 +1103,26 @@ impl Services {
     }
 
     /// `hook.list`: hooks in a workspace (optionally one agent's), oldest
-    /// first, as `{ hooks: [Hook] }`.
+    /// first, as `{ hooks: [Hook] }`. By default only ACTIVE
+    /// (`scheduled`/`running`) hooks are listed, as full rows (the FE chip
+    /// row reads `code` for its expanded view). With `include_retired`, the
+    /// terminal rows (`dispatched`/`evicted`/`cancelled`/`expired`) are
+    /// listed too, as a LIGHT projection — `code`, `lastState` and
+    /// `lastLogs` omitted — so a long-lived workspace's retired history never
+    /// inflates the frame (intent-hq/intent#5307); `hook.get` remains the
+    /// full-row recovery path. The state filter and the projection are
+    /// applied in SQL ([`Store::list_hook_rows`]), so the handler is
+    /// O(rows returned) and never hydrates a retired row's blobs.
     pub(crate) async fn hook_list_op(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: Option<&AgentId>,
+        include_retired: bool,
     ) -> Result<Value> {
-        let hooks = match agent_id {
-            Some(a) => self.store.list_hooks_by_agent(a).await?,
-            None => self.store.list_hooks_by_workspace(workspace_id).await?,
-        };
-        let hooks: Vec<Hook> = hooks
-            .into_iter()
-            .filter(|h| &h.workspace_id == workspace_id)
-            .collect();
+        let hooks = self
+            .store
+            .list_hook_rows(workspace_id, agent_id, include_retired)
+            .await?;
         Ok(json!({ "hooks": hooks }))
     }
 
@@ -2833,7 +2839,7 @@ mod tests {
         assert_eq!(hook.name, name);
         assert_eq!(hook.state, HookState::Scheduled);
         // Round-trips through list untouched.
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         let hooks = listed["hooks"].as_array().unwrap();
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0]["name"], json!(name));
@@ -2861,7 +2867,7 @@ mod tests {
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
         assert!(stored.perpetual);
         // `hook.list` carries both fields (camelCase).
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         let hooks = listed["hooks"].as_array().unwrap();
         assert_eq!(hooks[0]["perpetual"], json!(true));
         assert_eq!(hooks[0]["dispatchCount"], json!(0));
@@ -2910,8 +2916,85 @@ mod tests {
         assert!(types.contains(&HOOK_RUN_COMPLETED.to_string()), "{types:?}");
         assert!(types.contains(&HOOK_SCHEDULED.to_string()), "{types:?}");
         // list surfaces it.
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         assert_eq!(listed["hooks"].as_array().unwrap().len(), 1);
+    }
+
+    /// Regression (intent-hq/intent#5307): `hook.list` is active-only by
+    /// default, and `includeRetired` appends the terminal rows as a light
+    /// projection — `code` / `lastState` / `lastLogs` omitted — while active
+    /// rows keep the full shape (the FE chip row reads `code`). The
+    /// unscoped (workspace-wide) and agent-scoped reads behave the same.
+    #[tokio::test]
+    async fn list_defaults_to_active_and_lightens_retired_rows() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // A dispatching hook retires on its validation run, carrying state
+        // and logs the light projection must drop.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "retired",
+                    "code": "console.log('fired'); \
+                             return { dispatch: true, message: 'done', state: { n: 1 } };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule dispatching hook");
+        assert_eq!(out["dispatched"], json!(true));
+        let retired: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(retired.state, HookState::Dispatched);
+        assert!(retired.last_state.is_some() && retired.last_logs.is_some());
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "active",
+                    "code": "return { dispatch: false, state: { n: 2 } };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule active hook");
+        let active: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(active.state, HookState::Scheduled);
+
+        for agent in [None, Some(&owner)] {
+            // Default: the active row only, full shape.
+            let listed = svc.hook_list_op(&ws, agent, false).await.unwrap();
+            let hooks = listed["hooks"].as_array().unwrap();
+            assert_eq!(hooks.len(), 1, "active only by default: {listed}");
+            assert_eq!(hooks[0]["hookId"], json!(active.hook_id));
+            assert_eq!(hooks[0]["code"], json!(active.code));
+            assert_eq!(hooks[0]["lastState"], json!("{\"n\":2}"));
+
+            // includeRetired: both rows, oldest first; the retired one light.
+            let listed = svc.hook_list_op(&ws, agent, true).await.unwrap();
+            let hooks = listed["hooks"].as_array().unwrap();
+            assert_eq!(hooks.len(), 2, "{listed}");
+            let light = &hooks[0];
+            assert_eq!(light["hookId"], json!(retired.hook_id));
+            assert_eq!(light["state"], json!("dispatched"));
+            assert_eq!(light["name"], json!("retired"));
+            assert_eq!(light["agentId"], json!(owner));
+            assert_eq!(light["runCount"], json!(1));
+            assert_eq!(light["dispatchCount"], json!(1));
+            assert_eq!(light["perpetual"], json!(false));
+            assert!(light["createdAt"].is_string(), "{light}");
+            for heavy in ["code", "lastState", "lastLogs"] {
+                assert!(
+                    light.get(heavy).is_none(),
+                    "retired row must omit `{heavy}`: {light}"
+                );
+            }
+            let full = &hooks[1];
+            assert_eq!(full["hookId"], json!(active.hook_id));
+            assert_eq!(full["code"], json!(active.code), "active row keeps code");
+            assert_eq!(full["lastState"], json!("{\"n\":2}"));
+        }
     }
 
     /// Idle-visibility gating: the `waitingOnHooks` stamp applied by every
@@ -5295,7 +5378,7 @@ mod tests {
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
         assert_eq!(stored.last_logs, hook.last_logs);
         // hook.list serializes lastLogs.
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         assert_eq!(
             listed["hooks"][0]["lastLogs"],
             json!("checked 3 PRs\n{\"ok\":true}")
@@ -5344,7 +5427,7 @@ mod tests {
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         assert_eq!(hook.last_logs, None);
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         assert_eq!(listed["hooks"][0].get("lastLogs"), None);
         // No `[hook logs]` section on a log-free run's wake path either.
         let session = svc.store().get_agent_session(&owner).await.unwrap();
@@ -5714,7 +5797,7 @@ mod tests {
         // The validation (arming) run persisted its state.
         assert_eq!(hook.last_state.as_deref(), Some("{\"n\":1}"));
         // hook.list serializes lastState.
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         assert_eq!(listed["hooks"][0]["lastState"], json!("{\"n\":1}"));
         // Second run reads the injected state and advances it.
         svc.hook_run_now_op(&ws, &hook.hook_id)
@@ -5813,7 +5896,7 @@ mod tests {
             !err.contains("echo broken"),
             "raw args must not persist: {err}"
         );
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         assert_eq!(
             listed["hooks"][0]["lastError"].as_str(),
             hook.last_error.as_deref()
@@ -6209,7 +6292,7 @@ mod tests {
         assert_eq!(ttl_of(&hook), 300_000);
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
         assert_eq!(stored.expires_at, hook.expires_at);
-        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         let mid = listed["hooks"]
             .as_array()
             .unwrap()

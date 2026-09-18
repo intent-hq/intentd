@@ -809,12 +809,39 @@ fn number(
 }
 
 /// Catalog max for `agents.memoryBudgetMb` when total RAM cannot be detected
-/// (RAM detection supports Linux and macOS only), and the ceiling on the
-/// detected value. Matches the static bound
+/// ([`host_total_memory_bytes`] is `None`), and the ceiling on the detected
+/// value. Matches the static bound
 /// [`intent_core::settings_file::SettingsFile`] enforces when parsing
 /// `config.toml`, which stays machine-independent on purpose: a config file
 /// written on one seat must not fail to parse on another.
 const MEMORY_BUDGET_MAX_MB_FALLBACK: f64 = 1_024_000.0;
+
+/// Total physical RAM in bytes, or `None` where `sysinfo` reports it as `0`
+/// (its "unknown" on unsupported platforms).
+///
+/// The **one** RAM reading behind the `agents.memoryBudgetMb` contract: boot
+/// wiring feeds it to [`agent_memory_budget_bytes`] to install the auto budget,
+/// and the catalog derives the advertised `max` and `defaultValue` from it. The
+/// two must not detect RAM independently — an earlier catalog read used the
+/// Linux/macOS-only `/proc/meminfo` / `hw.memsize` probe while boot used
+/// `sysinfo`, so a 32 GiB Windows host installed 12,288 MB and advertised the
+/// 4,096 MB floor as its default.
+///
+/// Detected **once** and cached: `definitions()` is rebuilt by every
+/// `settings.list` / `settings.get`, and the Linux detection reads
+/// `/proc/meminfo`, so computing it inline would put a synchronous file read on
+/// a client-facing read path. Installed physical RAM cannot change under a live
+/// process, so this is the degenerate case of the derived-field ladder — the
+/// value is invalidated by nothing, and one read off the first call is enough.
+#[must_use]
+pub fn host_total_memory_bytes() -> Option<u64> {
+    static DETECTED: OnceLock<Option<u64>> = OnceLock::new();
+    *DETECTED.get_or_init(|| {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        Some(sys.total_memory()).filter(|&bytes| bytes > 0)
+    })
+}
 
 /// Catalog max for `agents.memoryBudgetMb`: total physical RAM in MB, so the
 /// FE renders a slider over the range the setting can meaningfully take,
@@ -840,15 +867,10 @@ const MEMORY_BUDGET_MAX_MB_FALLBACK: f64 = 1_024_000.0;
 /// The divergence is **one-directional**: this bound is never looser than the
 /// parse bound. See [`memory_budget_max_mb_for`] for why that matters.
 ///
-/// Detected **once** and cached: `definitions()` is rebuilt by every
-/// `settings.list` / `settings.get`, and the Linux detection reads
-/// `/proc/meminfo`, so computing it inline would put a synchronous file read on
-/// a client-facing read path. Installed physical RAM cannot change under a live
-/// process, so this is the degenerate case of the derived-field ladder — the
-/// value is invalidated by nothing, and one read off the first call is enough.
+/// Reads the cached [`host_total_memory_bytes`] — the same reading boot
+/// installs the auto budget from.
 fn memory_budget_max_mb() -> f64 {
-    static DETECTED: OnceLock<f64> = OnceLock::new();
-    *DETECTED.get_or_init(|| memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes()))
+    memory_budget_max_mb_for(host_total_memory_bytes())
 }
 
 /// [`memory_budget_max_mb`] against an explicit detection result, so every
@@ -876,6 +898,49 @@ fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
         Some(bytes) => ((bytes / (1024 * 1024)) as f64).min(MEMORY_BUDGET_MAX_MB_FALLBACK),
         None => MEMORY_BUDGET_MAX_MB_FALLBACK,
     }
+}
+
+/// Catalog default for `agents.memoryBudgetMb`: the budget the *absent* key
+/// (auto) resolves to on this host, in MB — the same figure boot wiring
+/// installs through [`agent_memory_budget_bytes`] via
+/// [`crate::agent_manager::recommended_memory_budget_bytes`].
+///
+/// The wire `value` stays `null` while the key is absent (the registry reads
+/// the file, not the catalog), so `defaultValue` is what lets a client tell
+/// "auto, currently N MB" apart from an explicit `0` (off). Without it the FE
+/// rendered the absent key as "Off" while the daemon was enforcing a budget.
+/// Should the auto policy ever resolve to off, this must follow and advertise
+/// `0` — the default describes what auto *does*, not a suggested value.
+///
+/// Reads the cached [`host_total_memory_bytes`] — the same reading boot
+/// installs the auto budget from — so the two agree on every platform
+/// `sysinfo` supports, not only where the older Linux/macOS probe did.
+fn memory_budget_default_mb() -> f64 {
+    memory_budget_default_mb_for(host_total_memory_bytes())
+}
+
+/// [`memory_budget_default_mb`] against an explicit detection result, so the
+/// detected and undetected branches are both testable on one host.
+///
+/// An undetected total is treated as `0`, which the recommendation floors to
+/// its 4 GB minimum — matching what boot installs when `sysinfo` reports no
+/// RAM, so the advertised default never describes a budget the daemon does
+/// not actually run.
+///
+/// The result is **clamped** to [`memory_budget_max_mb_for`] the same total:
+/// `defaultValue` must satisfy the numeric schema it ships in. Above roughly
+/// 2 TiB the recommendation `(RAM − 8 GiB) / 2` outgrows the 1,024,000 MB
+/// parse bound the max is capped at, and below 4 GiB of RAM the 4 GiB floor
+/// outgrows the RAM-sized max; unclamped, either advertises a default the
+/// catalog itself rejects and no client can write back. In those two corners
+/// the daemon still runs the unclamped recommendation — the clamp keeps the
+/// wire description settable, it does not change the policy.
+// MiB counts above 2^53 do not occur; loss-free in f64.
+#[expect(clippy::cast_precision_loss)]
+fn memory_budget_default_mb_for(total_memory_bytes: Option<u64>) -> f64 {
+    let bytes =
+        crate::agent_manager::recommended_memory_budget_bytes(total_memory_bytes.unwrap_or(0));
+    ((bytes / (1024 * 1024)) as f64).min(memory_budget_max_mb_for(total_memory_bytes))
 }
 
 fn enumerated(
@@ -1463,18 +1528,19 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(200.0), // Upper bound to prevent resource exhaustion
             0.0,
         ),
-        // No `default_value`: the default is the *absent* key (auto, derived
-        // from system RAM), which `number()` cannot express (monorepo#2063).
+        // The default is the *absent* key (auto, monorepo#2063); `default_value`
+        // advertises the budget auto resolves to on this host so a client can
+        // tell auto apart from an explicit 0 while `value` reads null.
         SettingDefinition {
             path: "agents.memoryBudgetMb",
             label: "Agent memory budget (MB)",
-            description: "Aggregate resident memory the daemon's whole child-process tree may use before it reclaims: new agent spawns queue behind idle-process eviction, and a background sweep drains idle agents largest-first while over budget (absent = auto, derived from system RAM; 0 = off; nothing running is ever killed; changes apply on daemon restart)",
+            description: "Aggregate resident memory of the daemon's whole child-process tree. The budget reclaims only when two conditions hold at once: the tree is over budget AND the host's available memory is below 8 GiB plus one provisional agent (~660 MB); then new agent spawns queue behind idle-process eviction and a background sweep drains idle agents largest-first. An over-budget tree on a host with more available memory than that is left alone, whatever the budget value. When available memory cannot be sampled the budget is strict: over budget alone reclaims (absent = auto, the RAM-derived budget advertised as this setting's default; 0 = off; nothing running is ever killed; changes apply on daemon restart)",
             category: "agents",
             ty: SettingType::Number {
                 min: Some(0.0),
                 max: Some(memory_budget_max_mb()),
             },
-            default_value: None,
+            default_value: Some(json!(memory_budget_default_mb())),
             sensitive: false,
             read_only: false,
             token_impact: None,
@@ -1727,6 +1793,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(60.0),
             Some(5_000.0),
             1_500.0,
+        ),
+        number(
+            "prMonitor.quotaSharePercent",
+            "PR monitor quota share percent",
+            "Share of the forge's REMAINING core quota (read once per tick from its quota-free rate_limit probe) the centralized loop may plan to spend before the window resets — the per-PR interval stretches above the hourly-budget cadence once PRs × 3 × secondsToReset would exceed that share of the remaining quota, so the monitor slows down before the shared rate-limit pause has to stop it; never below pollSeconds. A host without the signal uses the hourly budget alone (minimum 1, maximum 100)",
+            "prMonitor",
+            Some(1.0),
+            Some(100.0),
+            50.0,
         ),
         boolean(
             "updates.checkOnIdle",
@@ -3011,8 +3086,10 @@ mod tests {
     /// matrix (monorepo#2063): absent = auto (resolves to the recommended budget
     /// derived from system RAM), explicit 0 = off (a 0 must stay `None` rather
     /// than becoming a 0-byte budget that would refuse every spawn), positive =
-    /// MB converted to bytes. The catalog carries no `default_value` because the
-    /// default is the absent key.
+    /// MB converted to bytes. The default is the absent key, and the catalog
+    /// advertises the budget auto resolves to on this host as `default_value`
+    /// so a client can tell auto apart from an explicit 0 while `value` is
+    /// null.
     #[test]
     fn agent_memory_budget_matrix_absent_auto_zero_off_positive_bytes() {
         use crate::agent_manager::recommended_memory_budget_bytes;
@@ -3029,7 +3106,15 @@ mod tests {
         // usable range rather than a degenerate 0..0.
         assert_eq!(max, Some(memory_budget_max_mb()));
         assert!(max.expect("bounded") > 0.0);
-        assert_eq!(def.default_value, None, "the default is the absent key");
+        assert_eq!(
+            def.default_value,
+            Some(json!(memory_budget_default_mb())),
+            "the default advertises the auto budget for this host"
+        );
+        assert!(
+            memory_budget_default_mb() > 0.0,
+            "auto never resolves to off, so the advertised default is never 0"
+        );
         assert!(KNOWN_PATHS.contains(&"agents.memoryBudgetMb"));
 
         let mut settings = SettingsFile::default();
@@ -3083,11 +3168,125 @@ mod tests {
             MEMORY_BUDGET_MAX_MB_FALLBACK
         );
 
-        // The wired-up form agrees with the injectable one on this host.
+        // The wired-up form agrees with the injectable one on this host, fed
+        // from the same reading boot installs the auto budget from.
         assert_eq!(
             memory_budget_max_mb(),
-            memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes()),
+            memory_budget_max_mb_for(host_total_memory_bytes()),
         );
+    }
+
+    /// The `agents.memoryBudgetMb` catalog default is the budget the absent
+    /// key resolves to — `recommended_memory_budget_bytes` in MB — so what
+    /// `settings.get` advertises as `defaultValue` is what boot installs when
+    /// the key is absent: `(RAM − 8 GB) / 2` floored at 4 GB, and the 4 GB
+    /// floor where RAM is undetected (boot sees a 0 total there too). It is
+    /// never 0, because auto never resolves to off.
+    ///
+    /// Both sides read [`host_total_memory_bytes`], so the agreement asserted
+    /// here holds on every platform `sysinfo` detects RAM on — not only where
+    /// the older Linux/macOS probe did, which left Windows advertising the
+    /// 4,096 MB floor while boot installed the real recommendation.
+    #[test]
+    // Asserting exact whole-valued MB figures; the MiB count fits in f64 exactly.
+    #[expect(clippy::float_cmp, clippy::cast_precision_loss)]
+    fn memory_budget_default_is_the_auto_budget_in_mb() {
+        use crate::agent_manager::recommended_memory_budget_bytes;
+        assert_eq!(
+            memory_budget_default_mb_for(Some(48 * 1024 * 1024 * 1024)),
+            20_480.0
+        );
+        assert_eq!(
+            memory_budget_default_mb_for(Some(16 * 1024 * 1024 * 1024)),
+            4_096.0
+        );
+        assert_eq!(memory_budget_default_mb_for(Some(0)), 4_096.0);
+        assert_eq!(memory_budget_default_mb_for(None), 4_096.0);
+
+        // The wired-up form agrees with the injectable one and with the byte
+        // figure boot installs on this host — clamped to the catalog max, as
+        // the advertised default is (a sub-4 GiB or >~2 TiB host binds it).
+        let detected = host_total_memory_bytes();
+        assert_eq!(
+            memory_budget_default_mb(),
+            memory_budget_default_mb_for(detected)
+        );
+        let settings = SettingsFile::default();
+        let installed = agent_memory_budget_bytes(&settings, detected.unwrap_or(0))
+            .expect("absent key resolves to a budget");
+        assert_eq!(
+            installed,
+            recommended_memory_budget_bytes(detected.unwrap_or(0))
+        );
+        assert_eq!(
+            memory_budget_default_mb(),
+            ((installed / (1024 * 1024)) as f64).min(memory_budget_max_mb_for(detected))
+        );
+        assert!(memory_budget_default_mb() > 0.0);
+    }
+
+    /// `defaultValue` never exceeds the catalog `max` it ships beside: above
+    /// roughly 2 TiB the recommendation `(RAM − 8 GiB) / 2` outgrows the
+    /// 1,024,000 MB parse bound the max is capped at, and unclamped the catalog
+    /// would advertise a default its own numeric schema rejects — a figure no
+    /// client could write back through `settings.update`. The clamp also
+    /// binds at the other end, where the 4 GiB floor outgrows a sub-4 GiB
+    /// host's RAM-sized max.
+    #[test]
+    // Asserting exact whole-valued MB figures; the MiB count fits in f64 exactly.
+    #[expect(clippy::float_cmp)]
+    fn memory_budget_default_is_clamped_to_the_catalog_max() {
+        const TIB: u64 = 1024 * 1024 * 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        // 3 TiB: the unclamped recommendation is 1,568,768 MB.
+        assert_eq!(
+            memory_budget_default_mb_for(Some(3 * TIB)),
+            MEMORY_BUDGET_MAX_MB_FALLBACK
+        );
+        assert_eq!(
+            memory_budget_default_mb_for(Some(3 * TIB)),
+            memory_budget_max_mb_for(Some(3 * TIB))
+        );
+        // 2 TiB exactly: 1,044,480 MB unclamped, already above the bound.
+        assert_eq!(
+            memory_budget_default_mb_for(Some(2 * TIB)),
+            MEMORY_BUDGET_MAX_MB_FALLBACK
+        );
+        // 1 TiB: the max is capped but the 520,192 MB recommendation is not.
+        assert_eq!(memory_budget_default_mb_for(Some(TIB)), 520_192.0);
+
+        // Sub-4 GiB host: the 4 GiB floor is above the RAM-sized max.
+        assert_eq!(memory_budget_default_mb_for(Some(2 * GIB)), 2_048.0);
+        assert_eq!(
+            memory_budget_default_mb_for(Some(2 * GIB)),
+            memory_budget_max_mb_for(Some(2 * GIB))
+        );
+
+        for total in [
+            None,
+            Some(0),
+            Some(2 * GIB),
+            Some(16 * GIB),
+            Some(TIB),
+            Some(3 * TIB),
+        ] {
+            assert!(
+                memory_budget_default_mb_for(total) <= memory_budget_max_mb_for(total),
+                "default above max for {total:?}"
+            );
+        }
+
+        // ...and on this host, where the catalog actually ships the pair.
+        let def = find_definition("agents.memoryBudgetMb").expect("in catalog");
+        let SettingType::Number { max: Some(max), .. } = &def.ty else {
+            panic!("agents.memoryBudgetMb is a bounded number");
+        };
+        let default = def.default_value.as_ref().and_then(Value::as_f64);
+        assert_eq!(default, Some(memory_budget_default_mb()));
+        assert!(default.expect("advertised") <= *max);
+        def.validate(&json!(default))
+            .expect("the advertised default must pass the catalog's own schema");
     }
 
     /// The catalog bound may be tighter than the `config.toml` parse bound but
@@ -4126,10 +4325,11 @@ mod tests {
         );
     }
 
-    /// `[prMonitor]` exposes three TOML-backed numbers: `debounceSeconds`
-    /// (default 60, floor 10), `pollSeconds` (default 30, floor 10) and
-    /// `hourlyRequestBudget` (default 1500, floor 60, max 5000) — the latter
-    /// two are config-file keys the Settings UI does not surface. All
+    /// `[prMonitor]` exposes four TOML-backed numbers: `debounceSeconds`
+    /// (default 60, floor 10), `pollSeconds` (default 30, floor 10),
+    /// `hourlyRequestBudget` (default 1500, floor 60, max 5000) and
+    /// `quotaSharePercent` (default 50, floor 1, max 100) — the latter
+    /// three are config-file keys the Settings UI does not surface. All
     /// round-trip through the registry-wired service and reject sub-floor
     /// values.
     #[tokio::test]
@@ -4138,6 +4338,7 @@ mod tests {
             ("prMonitor.debounceSeconds", 60.0, 10.0),
             ("prMonitor.pollSeconds", 30.0, 10.0),
             ("prMonitor.hourlyRequestBudget", 1500.0, 60.0),
+            ("prMonitor.quotaSharePercent", 50.0, 1.0),
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");
@@ -4163,6 +4364,16 @@ mod tests {
             ),
             "hourlyRequestBudget caps at 5000"
         );
+        assert!(
+            matches!(
+                find_definition("prMonitor.quotaSharePercent").unwrap().ty,
+                SettingType::Number {
+                    max: Some(100.0),
+                    ..
+                }
+            ),
+            "quotaSharePercent caps at 100"
+        );
         // The catalog range and the read-time clamp constants must agree.
         assert_eq!(
             intent_core::config::MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
@@ -4176,6 +4387,12 @@ mod tests {
             intent_core::config::DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
             1500
         );
+        assert_eq!(intent_core::config::MIN_PR_MONITOR_QUOTA_SHARE_PERCENT, 1);
+        assert_eq!(intent_core::config::MAX_PR_MONITOR_QUOTA_SHARE_PERCENT, 100);
+        assert_eq!(
+            intent_core::config::DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
+            50
+        );
 
         let tag = uuid::Uuid::new_v4();
         let tmp = std::env::temp_dir().join(format!("intentd-settings-prmon-{tag}.db"));
@@ -4187,20 +4404,21 @@ mod tests {
         let secrets = AsyncSecretStore::new(secrets);
         let svc = SettingsService::new(&store, &secrets, Some(&registry));
 
-        for (path, default) in [
-            ("prMonitor.debounceSeconds", 60.0),
-            ("prMonitor.pollSeconds", 30.0),
-            ("prMonitor.hourlyRequestBudget", 1500.0),
+        for (path, default, updated, rejected) in [
+            ("prMonitor.debounceSeconds", 60.0, 120, 5),
+            ("prMonitor.pollSeconds", 30.0, 120, 5),
+            ("prMonitor.hourlyRequestBudget", 1500.0, 120, 5),
+            ("prMonitor.quotaSharePercent", 50.0, 25, 0),
         ] {
             let got = svc.get(path).await.expect("get");
             assert_eq!(got["value"], json!(default), "{path} default");
             assert_eq!(got["origin"], json!("default"), "{path} origin");
 
-            svc.update(&json!([{ "path": path, "value": 120 }]))
+            svc.update(&json!([{ "path": path, "value": updated }]))
                 .await
                 .expect("update");
             let got = svc.get(path).await.expect("get");
-            assert_eq!(got["value"], json!(120.0), "{path} updated");
+            assert_eq!(got["value"], json!(f64::from(updated)), "{path} updated");
             assert_eq!(got["origin"], json!("file"), "{path} origin");
             assert_eq!(
                 store.get_setting(path).await.expect("read settings table"),
@@ -4210,7 +4428,7 @@ mod tests {
 
             // Sub-floor values reject before anything is written.
             let err = svc
-                .update(&json!([{ "path": path, "value": 5 }]))
+                .update(&json!([{ "path": path, "value": rejected }]))
                 .await
                 .expect_err("sub-floor value must reject");
             assert!(matches!(err, Error::InvalidParams(_)), "{err}");

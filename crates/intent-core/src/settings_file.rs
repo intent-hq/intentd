@@ -39,15 +39,16 @@ use crate::config::{
     DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS, DEFAULT_HOOKS_MAX_PER_AGENT,
     DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS, DEFAULT_MAX_TOP_LEVEL_AGENTS,
     DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
-    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
-    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
-    DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, DEFAULT_UPDATES_CHECK_ON_IDLE,
-    DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, DEFAULT_UPDATES_IDLE_GRACE_SECONDS,
-    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
-    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
-    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
-    MAX_CONCURRENT_ADAPTERS_LIMIT, MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
-    MIN_UPDATES_IDLE_GRACE_SECONDS, TOOL_PAYLOAD_RETENTION_DAYS_MAX,
+    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
+    DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
+    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
+    DEFAULT_UPDATES_CHECK_ON_IDLE, DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+    DEFAULT_UPDATES_IDLE_GRACE_SECONDS, DEFAULT_WAKE_RESUME_ENABLED,
+    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
+    DEFAULT_WORKSPACE_API_TOON_OUTPUT, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
+    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN, MAX_CONCURRENT_ADAPTERS_LIMIT,
+    MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, MIN_UPDATES_IDLE_GRACE_SECONDS,
+    TOOL_PAYLOAD_RETENTION_DAYS_MAX,
 };
 use crate::error::{Error, Result};
 
@@ -680,10 +681,13 @@ pub struct AgentsSettings {
     /// on system RAM; changes apply on daemon restart; max 200).
     pub max_concurrent: u32,
     /// `agents.memoryBudgetMb` — aggregate resident-memory budget for the
-    /// daemon's whole child-process tree, above which new agent spawns queue
-    /// behind idle-process eviction instead of starting immediately and the
-    /// periodic reap sweep drains idle agents largest-first without waiting
-    /// for a spawn or the idle TTL (monorepo#2063 level 2). Absent
+    /// daemon's whole child-process tree. It reclaims only while the tree is
+    /// over budget *and* the host's available memory is below 8 GiB plus one
+    /// provisional agent: then new agent spawns queue behind idle-process
+    /// eviction instead of starting immediately and the periodic reap sweep
+    /// drains idle agents largest-first without waiting for a spawn or the
+    /// idle TTL (monorepo#2063 level 2); when available memory cannot be
+    /// sampled, over budget alone reclaims. Absent
     /// (`None`, the default) = auto (budget derived from system RAM); explicit
     /// `0` = off — preserved because config files written before the auto
     /// default carried a literal `memoryBudgetMb = 0` meaning off, and per the
@@ -1022,6 +1026,13 @@ pub struct PrMonitorSettings {
     /// request is counted or blocked against it (config-file key; not
     /// exposed in the Settings UI).
     pub hourly_request_budget: u64,
+    /// `prMonitor.quotaSharePercent` — the share of the forge's REMAINING
+    /// quota (read once per tick from its quota-free `rate_limit` probe)
+    /// the loop may plan to spend before the window resets. Stretches the
+    /// per-PR interval ahead of exhaustion; a host without the signal
+    /// falls back to the hourly-budget model alone (config-file key; not
+    /// exposed in the Settings UI).
+    pub quota_share_percent: u64,
 }
 
 impl Default for PrMonitorSettings {
@@ -1030,6 +1041,7 @@ impl Default for PrMonitorSettings {
             debounce_seconds: DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
             poll_seconds: DEFAULT_PR_MONITOR_POLL_SECONDS,
             hourly_request_budget: DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            quota_share_percent: DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
         }
     }
 }
@@ -1680,25 +1692,33 @@ level = "info"
 # idle, up to 9.6 GB running a test suite), so slot count does not predict
 # memory -- idleReapMinutes and memoryBudgetMb are the memory bounds.
 maxConcurrent = 0
-# Agent memory budget (MB) -- aggregate resident memory the daemon's whole
-# child-process tree may use before it reclaims: new agent spawns queue behind
-# idle-process eviction, and a background sweep drains idle agents
-# largest-first while over budget (nothing running is ever killed; changes
-# apply on daemon restart).
+# Agent memory budget (MB) -- aggregate resident memory of the daemon's whole
+# child-process tree. The budget reclaims only when two conditions hold at
+# once: the tree is over budget AND the host's available memory is below
+# 8 GiB plus one provisional agent (~660 MB). Then new agent spawns queue
+# behind idle-process eviction, and a background sweep drains idle agents
+# largest-first (nothing running is ever killed; changes apply on daemon
+# restart). An over-budget tree on a host with more available memory than
+# that is left alone, whatever the budget value -- the tree sums resident
+# set sizes of every descendant (dev servers, test runs, headless browsers
+# included, shared pages double-counted), so a small budget on a large host
+# is crossed while tens of gigabytes are still free. When available memory
+# cannot be sampled the budget is strict: over budget alone reclaims.
 # Absent (the default, as in this file) = auto: the daemon picks the budget
 # ((RAM - 8 GB) / 2, min 4 GB). Explicit 0 = off, always. Upgrade note:
 # config files written before this key defaulted to auto carry a literal
 # `memoryBudgetMb = 0`, which stays off -- delete the line to opt into
 # auto. A positive value is the budget in MB (max 1024000). A soft
-# admission gate rather than a ceiling: measured transient overshoot of
-# 65-105% and steady state ~16% over, so budget for roughly 2x the configured
-# value as the transient. The overshoot is a fixed offset, not proportional
-# to demand -- at 1500 MB a 20-agent burst peaked the same as an 8-agent one
-# (3.06 vs 3.09 GB) where the same 20-agent burst unbounded reached 12.37 GB.
-# That 2x rule sizes the admission transient for a burst of comparable
-# agents; the gate runs at spawn only, so an already-admitted agent whose own
-# workload grows (a test suite) is never re-checked and can carry the tree
-# past the budget by itself.
+# admission gate rather than a ceiling: under the strict (host short)
+# policy the measured transient overshoot was 65-105% and steady state ~16%
+# over, so budget for roughly 2x the configured value as the transient. The
+# overshoot is a fixed offset, not proportional to demand -- at 1500 MB a
+# 20-agent burst peaked the same as an 8-agent one (3.06 vs 3.09 GB) where
+# the same 20-agent burst unbounded reached 12.37 GB. That 2x rule sizes
+# the admission transient for a burst of comparable agents; the gate runs
+# at spawn only, so an already-admitted agent whose own workload grows (a
+# test suite) is never re-checked and can carry the tree past the budget by
+# itself.
 # memoryBudgetMb = 8192
 # ACP Node heap limit (MB) -- V8 --max-old-space-size cap injected via
 # NODE_OPTIONS into Node/Electron ACP provider processes (1024-65536; applies
@@ -1830,6 +1850,13 @@ pollSeconds = 30
 # exceeds it; requests are not counted or blocked against it (minimum 60,
 # maximum 5000).
 hourlyRequestBudget = 1500
+# PR monitor quota share percent -- the share of the forge's REMAINING core
+# quota (read once per tick from its quota-free rate_limit probe) the loop
+# may plan to spend before the window resets; the per-PR interval stretches
+# ahead of exhaustion so the monitor slows down before the rate-limit pause
+# has to stop it. A host without the signal uses the hourly budget alone
+# (minimum 1, maximum 100).
+quotaSharePercent = 50
 
 [updates]
 # Check for updates when idle -- ask the sitter (via SIGUSR2) to check for
@@ -2713,6 +2740,10 @@ mod tests {
             parsed.pr_monitor.hourly_request_budget,
             DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET
         );
+        assert_eq!(
+            parsed.pr_monitor.quota_share_percent,
+            DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT
+        );
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[prMonitor]"));
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
         assert_eq!(templated.pr_monitor, parsed.pr_monitor);
@@ -2990,13 +3021,14 @@ mod tests {
     #[test]
     fn pr_monitor_explicit_override_parses() {
         let parsed = SettingsFile::parse_str(
-            "[agentFeatures]\nprMonitor = false\n\n[prMonitor]\ndebounceSeconds = 15\npollSeconds = 90\nhourlyRequestBudget = 500\n",
+            "[agentFeatures]\nprMonitor = false\n\n[prMonitor]\ndebounceSeconds = 15\npollSeconds = 90\nhourlyRequestBudget = 500\nquotaSharePercent = 25\n",
         )
         .expect("override parses");
         assert!(!parsed.agent_features.pr_monitor);
         assert_eq!(parsed.pr_monitor.debounce_seconds, 15);
         assert_eq!(parsed.pr_monitor.poll_seconds, 90);
         assert_eq!(parsed.pr_monitor.hourly_request_budget, 500);
+        assert_eq!(parsed.pr_monitor.quota_share_percent, 25);
     }
 
     #[test]

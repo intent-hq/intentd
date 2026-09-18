@@ -27,8 +27,9 @@ pub use model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Review, ReviewComment, ReviewDecision,
-    ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+    PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
+    ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
+    ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
 };
 pub use registry::{GithubSettings, SourceControlRegistry, SourceControlSettings};
 pub use token::TokenSource;
@@ -51,14 +52,16 @@ pub trait SourceControl: Send + Sync {
     /// Auth / connectivity probe (used by `settings`/`doctor`).
     async fn check_auth(&self) -> Result<AuthStatus>;
 
-    /// When the host's REST core quota resets, as a unix timestamp (seconds),
-    /// queried after a call failed with [`Error::RateLimited`] so background
-    /// sweeps can pause until the window turns over (monorepo#2961). GitHub's
+    /// The host's REST core quota — when it resets (unix seconds), how many
+    /// requests remain, and the window's limit — queried after a call
+    /// failed with [`Error::RateLimited`] so background sweeps can pause
+    /// until the window turns over, and re-probed while paused so the pause
+    /// lifts early once the quota has recovered (monorepo#2961). GitHub's
     /// `GET /rate_limit` is free (does not count against the quota). Hosts
-    /// without the signal return `Ok(None)` (the default) and callers fall
-    /// back to a fixed pause.
-    async fn rate_limit_reset_at(&self) -> Result<Option<u64>> {
-        Ok(None)
+    /// without the signal return the all-`None` default and callers fall
+    /// back to a fixed pause that runs its full window.
+    async fn rate_limit_status(&self) -> Result<RateLimitStatus> {
+        Ok(RateLimitStatus::default())
     }
 
     /// Authenticated user identity (`GET /user`). Backs `github.getUser`.
@@ -168,15 +171,41 @@ pub trait SourceControl: Send + Sync {
     ///
     /// Sub-reads degrade individually — unreadable branch rules yield
     /// `branch_rules: None`, a missing rollup yields `checks_known: false` —
-    /// so a partially-visible forge still produces a usable probe. Hosts
-    /// without the signals return [`Error::Unsupported`] (the default
-    /// implementation).
+    /// so a partially-visible forge still produces a usable probe. Quota
+    /// exhaustion is the one non-degrading failure: [`Error::RateLimited`]
+    /// from any sub-read propagates so callers pause instead of persisting
+    /// a degraded probe as a successful read. Hosts without the signals
+    /// return [`Error::Unsupported`] (the default implementation).
     async fn merge_requirements(
         &self,
         _repo: &RepoRef,
         _number: u64,
     ) -> Result<MergeRequirementSignals> {
         Err(Error::Unsupported("merge requirements probe".to_string()))
+    }
+
+    /// The merge-relevant rules of one branch (GitHub
+    /// `GET /repos/{owner}/{repo}/rules/branches/{branch}`) — the base-branch
+    /// sub-read of [`merge_requirements`](Self::merge_requirements), exposed
+    /// on its own so a caller holding a [`PrObservation`] can read the rules
+    /// only when it needs them. Hosts without the endpoint return
+    /// [`Error::Unsupported`] (the default implementation).
+    async fn branch_rules(&self, _repo: &RepoRef, _branch: &str) -> Result<BranchRules> {
+        Err(Error::Unsupported("branch rules".to_string()))
+    }
+
+    /// Everything the PR monitor's per-poll snapshot needs, in ONE round
+    /// trip: the [`PullRequest`], the [`MergeRequirementSignals`] (minus the
+    /// base branch's rules, see [`PrObservation`]), the submitted reviews,
+    /// the review-thread tally and the conversation-comment count. Replaces
+    /// the `get_pr` / `merge_requirements` / `list_reviews` /
+    /// `get_review_threads` / `list_comments` sequence on hosts that can
+    /// fold it (GitHub GraphQL). `Ok(None)` — the default — means the host
+    /// has no folded read and callers take the per-signal reads instead;
+    /// an `Err` fails the observation the same way a failing `get_pr`
+    /// would, [`Error::RateLimited`] included.
+    async fn pr_observation(&self, _repo: &RepoRef, _number: u64) -> Result<Option<PrObservation>> {
+        Ok(None)
     }
 
     /// List issue/PR (conversation) comments.

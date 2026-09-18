@@ -3722,7 +3722,12 @@ async fn dispatch(
         // surfaces as `-32602` (`Error::NotFound` → invalid params).
         "hook.list" => {
             let ws = require_ws_note(params)?;
-            api.hook_list(ws, None).await.map_err(domain_to_rpc)
+            // Active hooks only by default; `includeRetired` appends the
+            // terminal rows as a light projection (no code/lastState/lastLogs).
+            let include_retired = opt_bool(params, "includeRetired").unwrap_or(false);
+            api.hook_list(ws, None, include_retired)
+                .await
+                .map_err(domain_to_rpc)
         }
         "hook.cancel" => {
             let ws = require_ws_note(params)?;

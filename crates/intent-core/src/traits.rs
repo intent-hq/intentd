@@ -6632,13 +6632,16 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `ws.hook.list` / wire `hook.list`: hooks in a workspace, optionally
-    /// narrowed to one owning agent, as `{ hooks: [Hook] }`.
+    /// narrowed to one owning agent, as `{ hooks: [Hook] }`. Active hooks
+    /// only by default (full rows); `include_retired` appends the terminal
+    /// rows as a light projection without `code` / `lastState` / `lastLogs`.
     fn hook_list(
         &self,
         workspace_id: WorkspaceId,
         agent_id: Option<AgentId>,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, agent_id);
+        let _ = (workspace_id, agent_id, include_retired);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::hook_list not implemented".to_string(),

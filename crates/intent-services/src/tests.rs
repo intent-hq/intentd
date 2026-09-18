@@ -15269,9 +15269,9 @@ mod pr {
         AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor,
         Error as ScError, Issue, IssueQuery, MergeMethod, MergeOptions, MergeOutcome,
         MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
-        PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review, ReviewComment,
-        ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck,
-        ScCapabilities, SourceControl, UserIdentity,
+        PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Result as ScResult, Review,
+        ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
+        RollupCheck, ScCapabilities, SourceControl, UserIdentity,
     };
     use intent_store::Store;
     use serde_json::json;
@@ -15363,16 +15363,23 @@ mod pr {
         /// `get_pr` still succeeds), exercising the merged/closed relink
         /// discovery hitting the quota mid-refresh (monorepo#2961).
         rate_limited_list_prs: bool,
-        /// What `rate_limit_reset_at` reports (`None` mirrors a host
+        /// The reset `rate_limit_status` reports (`None` mirrors a host
         /// without the signal → fallback pause).
         rate_limit_reset: Option<u64>,
-        /// How many times `rate_limit_reset_at` was probed.
+        /// The `remaining` / `limit` `rate_limit_status` reports (`None`
+        /// mirrors a host without the signal → the pause runs its window).
+        rate_limit_remaining: Option<u64>,
+        rate_limit_limit: Option<u64>,
+        /// How many times `rate_limit_status` was probed.
         seen_reset_probes: std::sync::Mutex<u64>,
         /// Every [`PrQuery`] handed to `list_prs`, in call order (the
         /// `github.pulls.search` `repos` tests assert `extra_repos`).
         seen_pr_queries: std::sync::Mutex<Vec<PrQuery>>,
         /// Every [`IssueQuery`] handed to `list_issues`, in call order.
         seen_issue_queries: std::sync::Mutex<Vec<IssueQuery>>,
+        /// Runs at the start of every `list_comments` (the last forge read
+        /// of `pr_state`), so a test can move daemon state mid-snapshot.
+        on_list_comments: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     /// The blended multi-repo page a forge answers for a search whose
@@ -15551,9 +15558,13 @@ mod pr {
                 updated_at: String::new(),
             })
         }
-        async fn rate_limit_reset_at(&self) -> ScResult<Option<u64>> {
+        async fn rate_limit_status(&self) -> ScResult<RateLimitStatus> {
             *self.seen_reset_probes.lock().unwrap() += 1;
-            Ok(self.rate_limit_reset)
+            Ok(RateLimitStatus {
+                reset_at: self.rate_limit_reset,
+                remaining: self.rate_limit_remaining,
+                limit: self.rate_limit_limit,
+            })
         }
         async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
             self.seen_get_pr.lock().unwrap().push(number);
@@ -15698,6 +15709,9 @@ mod pr {
             }
         }
         async fn list_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Comment>> {
+            if let Some(hook) = self.on_list_comments.lock().unwrap().as_ref() {
+                hook();
+            }
             Ok(vec![Comment {
                 id: "1".into(),
                 author: "u".into(),
@@ -16767,6 +16781,52 @@ mod pr {
             .expect("snapshot");
         assert_eq!(v["repo"], "acme/widgets");
         assert_eq!(v["prNumber"], 42);
+    }
+
+    /// `pausedUntil` on the snapshot describes the global rate-limit gate as
+    /// of the snapshot's COMPLETION, not its start: the gate is sampled after
+    /// the awaited forge reads, so a pause opened while they were in flight
+    /// is carried (RFC 3339, the gate's deadline) and a pause lifted while
+    /// they were in flight is omitted — never a stale value either way.
+    #[tokio::test]
+    async fn state_snapshot_paused_until_reflects_the_gate_after_the_forge_reads() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, ws) = setup_with_shared(forge.clone(), true).await;
+
+        // Gate open at the start, paused by the last forge read.
+        let gate = svc.sweep_rate_limit.clone();
+        *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
+            assert!(gate.pause_for(std::time::Duration::from_secs(3600)));
+        }));
+        let v = svc.pr_state(ws.clone(), 42, None).await.expect("snapshot");
+        let until = svc
+            .sweep_rate_limit_paused_until()
+            .expect("the read left the gate paused");
+        assert_eq!(
+            v["pausedUntil"],
+            json!(until),
+            "a pause opened during the reads is on the snapshot: {v}"
+        );
+        assert!(
+            time::OffsetDateTime::parse(&until, &time::format_description::well_known::Rfc3339)
+                .is_ok(),
+            "pausedUntil is RFC 3339: {until}"
+        );
+
+        // Gate paused at the start, lifted by the last forge read.
+        let gate = svc.sweep_rate_limit.clone();
+        *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
+            assert!(gate.lift());
+        }));
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        assert!(
+            svc.sweep_rate_limit_paused_until().is_none(),
+            "the read left the gate open"
+        );
+        assert!(
+            v.get("pausedUntil").is_none(),
+            "a pause lifted during the reads is not retained: {v}"
+        );
     }
 
     #[tokio::test]
@@ -19629,7 +19689,9 @@ mod pr {
     /// The PR-refresh sweep shares the same global gate: a rate-limited
     /// workspace refresh pauses the forge work for every subsequent
     /// workspace in this and later sweeps (until the window resets), while
-    /// the sweep itself keeps running its local, forge-free steps.
+    /// the sweep itself keeps running its local, forge-free steps. A paused
+    /// tick spends exactly one quota-free probe on the early-lift check; a
+    /// host without a `remaining` signal never lifts early.
     #[tokio::test]
     async fn pr_refresh_sweep_rate_limit_pauses_all_workspaces() {
         let tmp = TempDb::new();
@@ -19659,10 +19721,57 @@ mod pr {
         );
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
 
-        // The next tick is still inside the pause window: zero forge calls.
+        // The next tick is still inside the pause window: zero forge calls,
+        // one free probe for the early lift (no `remaining` → deadline kept).
         svc.refresh_all_workspace_prs(1).await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
+        assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 2);
+        assert!(svc.sweeps_rate_limited(), "the deadline stands");
+    }
+
+    /// A paused PR-refresh tick whose probe reports the quota recovered
+    /// lifts the pause and refreshes in the SAME tick: the forge is called
+    /// again (here re-tripping the limit, which re-pauses — a fresh window).
+    #[tokio::test]
+    async fn pr_refresh_sweep_lifts_the_pause_early_when_the_quota_recovered() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.branch = "feature".into();
+        ws.repository_owner = Some("o".into());
+        ws.repository_name = Some("r".into());
+        ws.pr_number = Some(42);
+        ws.updated_at = now_iso();
+        store.insert_workspace(&ws).await.expect("ws");
+        let sc = Arc::new(StubForge {
+            rate_limited: true,
+            rate_limit_reset: Some(u64::MAX / 2),
+            rate_limit_remaining: Some(5_000),
+            rate_limit_limit: Some(5_000),
+            ..Default::default()
+        });
+        let svc = Services::new(store).with_source_control(sc.clone());
+
+        svc.refresh_all_workspace_prs(0).await;
+        assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
+        let first_deadline = svc.sweep_rate_limit_paused_until().unwrap();
+
+        // Tick 1: the early-lift probe reports a full window → the gate
+        // lifts and the workspace is refreshed in this tick; its fetch trips
+        // the limit again, opening a NEW window (its own reset probe).
+        svc.refresh_all_workspace_prs(1).await;
+        assert_eq!(
+            sc.seen_get_pr.lock().unwrap().len(),
+            2,
+            "the lifted tick refreshes instead of skipping"
+        );
+        assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 3);
+        assert!(
+            svc.sweep_rate_limit_paused_until().unwrap() >= first_deadline,
+            "the re-trip opened a fresh window"
+        );
     }
 
     /// The stale-pool heal stops at the FIRST rate-limited re-fetch instead

@@ -15648,6 +15648,452 @@ async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
     );
 }
 
+/// A queued admission is observable on the real wire exactly once: with the
+/// slot cap pinned to one (`agents.maxConcurrent = 1`, budget off) and one
+/// agent mid-turn, a second agent's first turn parks its spawn — the wire
+/// carries `agent:process:queued` — and interrupting the first agent frees
+/// the slot and wakes it: exactly one `agent:process:resumed` for the second
+/// agent with the §6.7 payload (`agentId`, `used`, `cap`) and the `"slots"`
+/// reason it parked under, before its own turn streams to `agent:stream:end`.
+/// A second `resumed` — the timeout/wakeup double-emit this pins against —
+/// would land before that `stream:end`, so draining to it is the check.
+///
+/// The slot is freed with `agent.stop` (interrupt): the interrupt first marks
+/// the holder's process idle WITHOUT waking (`mark_idle_slot_held`), then its
+/// `end_turn` releases the busy slot and only then wakes the waiter
+/// (`release_slot_sync` → `wake_waiter_if_idle`, intent-hq/intent#5253), so
+/// the woken waiter's claim on the idle holder succeeds and it admits in one
+/// pass. The natural-turn-end route is pinned separately by
+/// `natural_turn_end_admits_queued_spawn_in_one_pass_over_wss`.
+#[tokio::test]
+async fn queued_spawn_resumes_exactly_once_over_wss() {
+    let Some(script) = gate("WSS queued-spawn resumed E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // One slot, no memory budget: only the concurrency cap gates admission,
+    // so the queued/resumed reason is deterministically `"slots"`.
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[agents]\nmaxConcurrent = 1\nmemoryBudgetMb = 0\n",
+    )
+    .expect("seed config.toml with agents.maxConcurrent");
+    // Every mock child holds its first turn open for a while before
+    // streaming, so the first agent is verifiably mid-turn (slot held) when
+    // the second agent's spawn asks for admission, and still mid-turn when
+    // the interrupt below frees the slot.
+    let behavior = json!({ "response": "hello from mock", "firstTurnDelayMs": 6000 }).to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE any turn so no process event is missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created_a = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Holder", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let holder = created_a["agent"]["id"]
+        .as_str()
+        .expect("holder agent id")
+        .to_string();
+    let created_b = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Waiter", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let waiter = created_b["agent"]["id"]
+        .as_str()
+        .expect("waiter agent id")
+        .to_string();
+
+    // The holder's first turn spawns its child (lazy spawn) and takes the
+    // only slot. Wait for the `phase: "prompt"` turn-startup
+    // `agent:stream:status` specifically: it is published inside the prompt
+    // turn, after the spawned child is registered and the process marked
+    // active, so once it is on the wire the slot is verifiably held and
+    // nothing is idle to evict. The earlier `launch` / `init` /
+    // `session-create` hints precede registration — admission counts
+    // registered processes only, so a waiter sent on one of those still
+    // finds the cap unoccupied and runs concurrently (that window is wide
+    // enough under coverage instrumentation to lose the race every time).
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": holder, "content": "hold the slot" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "holder sendMessage ok: {sent}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("the holder's turn started on the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(holder.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("holder turn must not fail: {ev}"),
+            Some("agent:stream:end") => panic!("holder turn ended before the waiter queued: {ev}"),
+            Some("agent:stream:status") if ev["data"]["phase"] == "prompt" => break,
+            _ => {}
+        }
+    }
+
+    // The waiter's first turn asks for a slot while the holder is mid-turn:
+    // its spawn queues, and the holder's turn end frees the slot and wakes it.
+    let sent = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": waiter, "content": "wait for a slot" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "waiter sendMessage ok: {sent}");
+
+    // The waiter parks: `agent:process:queued` with the `"slots"` reason.
+    let mut queued_frames: Vec<Value> = Vec::new();
+    let mut resumed_frames: Vec<Value> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while queued_frames.is_empty() {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("agent:process:queued reached the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(waiter.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("waiter turn must not fail: {ev}"),
+            Some("agent:process:queued") => queued_frames.push(ev.clone()),
+            Some("agent:process:resumed") => panic!("resumed before the slot freed: {ev}"),
+            Some("agent:stream:end") => panic!("the waiter ran without queueing: {ev}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        queued_frames[0]["data"]["reason"], "slots",
+        "queued behind the concurrency cap: {}",
+        queued_frames[0]
+    );
+
+    // Interrupt the holder mid-turn: its process is marked idle without a
+    // wake, then its busy slot is released and that release wakes the waiter,
+    // which admits (evicting the idle holder for the slot).
+    let stopped = wss_rpc(&mut rpc, 14, "agent.stop", json!({ "agentId": holder })).await;
+    assert_eq!(stopped["success"], true, "holder stop ok: {stopped}");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("the waiter's turn reached stream:end on the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(waiter.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("waiter turn must not fail: {ev}"),
+            Some("agent:process:queued") => queued_frames.push(ev.clone()),
+            Some("agent:process:resumed") => resumed_frames.push(ev.clone()),
+            Some("agent:stream:end") => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        queued_frames.len(),
+        1,
+        "the waiter's spawn queued exactly once: {queued_frames:?}"
+    );
+    assert_eq!(
+        resumed_frames.len(),
+        1,
+        "exactly one agent:process:resumed per queued→admitted transition: {resumed_frames:?}"
+    );
+    let resumed = &resumed_frames[0];
+    let data = &resumed["data"];
+    assert_eq!(data["agentId"].as_str(), Some(waiter.as_str()));
+    assert_eq!(
+        data["reason"], "slots",
+        "resumed echoes the reason it parked under: {resumed}"
+    );
+    assert!(data["used"].is_u64(), "used is numeric: {resumed}");
+    assert_eq!(
+        data["cap"],
+        json!(1),
+        "cap is the pinned slot cap: {resumed}"
+    );
+}
+
+/// intent-hq/intent#5253 over the real WSS wire: a NATURAL turn end frees the
+/// slot for a queued spawn in one pass. Same harness as
+/// `queued_spawn_resumes_exactly_once_over_wss` (cap pinned to one, budget
+/// off, the waiter's spawn parks behind the holder's turn) but the holder's
+/// turn is allowed to run out instead of being interrupted. Before the fix the
+/// worker marked the holder's process idle — waking the waiter — BEFORE its
+/// `end_turn` released the busy slot, so the woken waiter lost its claim on
+/// the still-busy holder, re-queued (a second `agent:process:queued`) and only
+/// admitted on its next 5 s re-check. Asserts, for the waiter: exactly one
+/// `queued`, exactly one `resumed`, and the `resumed` landing well inside the
+/// re-check period after the holder's terminal `agent:stream:end`.
+#[tokio::test]
+async fn natural_turn_end_admits_queued_spawn_in_one_pass_over_wss() {
+    let Some(script) = gate("WSS natural-turn-end queued-spawn E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // One slot, no memory budget: only the concurrency cap gates admission.
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[agents]\nmaxConcurrent = 1\nmemoryBudgetMb = 0\n",
+    )
+    .expect("seed config.toml with agents.maxConcurrent");
+    // Every mock child holds its first turn open for a while before
+    // streaming: long enough that the holder is verifiably mid-turn when the
+    // waiter asks for admission, short enough that the holder's turn then
+    // ends on its own well inside the test's deadlines.
+    let behavior = json!({ "response": "hello from mock", "firstTurnDelayMs": 3000 }).to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE any turn so no process event is missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created_a = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Holder", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let holder = created_a["agent"]["id"]
+        .as_str()
+        .expect("holder agent id")
+        .to_string();
+    let created_b = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Waiter", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let waiter = created_b["agent"]["id"]
+        .as_str()
+        .expect("waiter agent id")
+        .to_string();
+
+    // The holder's first turn takes the only slot; wait for its `phase:
+    // "prompt"` status (published after the child is registered and marked
+    // active — see the interrupt variant for why the earlier hints are not
+    // enough) so the waiter's spawn verifiably finds the cap occupied.
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": holder, "content": "hold the slot" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "holder sendMessage ok: {sent}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("the holder's turn started on the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(holder.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("holder turn must not fail: {ev}"),
+            Some("agent:stream:end") => panic!("holder turn ended before the waiter queued: {ev}"),
+            Some("agent:stream:status") if ev["data"]["phase"] == "prompt" => break,
+            _ => {}
+        }
+    }
+
+    // The waiter's first turn asks for a slot while the holder is mid-turn.
+    let sent = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": waiter, "content": "wait for a slot" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "waiter sendMessage ok: {sent}");
+
+    // The waiter parks: `agent:process:queued` with the `"slots"` reason,
+    // before the holder's turn ends.
+    let mut queued_frames: Vec<Value> = Vec::new();
+    let mut resumed_frames: Vec<Value> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while queued_frames.is_empty() {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("agent:process:queued reached the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        let agent_id = ev["data"]["agentId"].as_str();
+        assert!(
+            !(agent_id == Some(holder.as_str()) && ev["type"] == "agent:stream:end"),
+            "holder turn ended before the waiter queued: {ev}"
+        );
+        if agent_id != Some(waiter.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("waiter turn must not fail: {ev}"),
+            Some("agent:process:queued") => queued_frames.push(ev.clone()),
+            Some("agent:process:resumed") => panic!("resumed before the slot freed: {ev}"),
+            Some("agent:stream:end") => panic!("the waiter ran without queueing: {ev}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        queued_frames[0]["data"]["reason"], "slots",
+        "queued behind the concurrency cap: {}",
+        queued_frames[0]
+    );
+
+    // No interrupt: the holder's turn runs out on its own. Its terminal
+    // `agent:stream:end` is the moment the slot starts to free; the waiter's
+    // `resumed` must follow it on the wakeup path, not on the timed re-check.
+    let mut holder_ended_at: Option<tokio::time::Instant> = None;
+    let mut waiter_resumed_at: Option<tokio::time::Instant> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("the waiter's turn reached stream:end on the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        let agent_id = ev["data"]["agentId"].as_str();
+        if agent_id == Some(holder.as_str()) {
+            match ev["type"].as_str() {
+                Some("agent:failed") => panic!("holder turn must not fail: {ev}"),
+                Some("agent:stream:end") => holder_ended_at = Some(tokio::time::Instant::now()),
+                _ => {}
+            }
+            continue;
+        }
+        if agent_id != Some(waiter.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("waiter turn must not fail: {ev}"),
+            Some("agent:process:queued") => queued_frames.push(ev.clone()),
+            Some("agent:process:resumed") => {
+                waiter_resumed_at = Some(tokio::time::Instant::now());
+                resumed_frames.push(ev.clone());
+            }
+            Some("agent:stream:end") => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        queued_frames.len(),
+        1,
+        "the waiter's spawn queued exactly once — no re-queue after the holder's natural turn end: {queued_frames:?}"
+    );
+    assert_eq!(
+        resumed_frames.len(),
+        1,
+        "exactly one agent:process:resumed per queued→admitted transition: {resumed_frames:?}"
+    );
+    let holder_ended_at = holder_ended_at.expect("the holder's turn ended naturally on the wire");
+    let waiter_resumed_at = waiter_resumed_at.expect("resumed timestamp recorded");
+    assert!(
+        waiter_resumed_at >= holder_ended_at,
+        "the waiter resumed only after the holder's turn ended"
+    );
+    // The timed re-check is 5 s (`BUDGET_RECHECK`); a wakeup-path admission is
+    // milliseconds behind the holder's turn end.
+    let admit_latency = waiter_resumed_at.duration_since(holder_ended_at);
+    assert!(
+        admit_latency < Duration::from_secs(4),
+        "the waiter admitted on the slot-release wakeup, not the timed re-check: {admit_latency:?}"
+    );
+    let resumed = &resumed_frames[0];
+    let data = &resumed["data"];
+    assert_eq!(data["agentId"].as_str(), Some(waiter.as_str()));
+    assert_eq!(
+        data["reason"], "slots",
+        "resumed echoes the reason it parked under: {resumed}"
+    );
+    assert!(data["used"].is_u64(), "used is numeric: {resumed}");
+    assert_eq!(
+        data["cap"],
+        json!(1),
+        "cap is the pinned slot cap: {resumed}"
+    );
+}
+
 /// intent-hq/monorepo#3039 over the real WSS wire: `agent.stop` against a
 /// WEDGED transport must still surface the client-visible terminal state.
 /// The mock streams one chunk, then STOPS draining its stdin and floods

@@ -389,6 +389,19 @@ pub struct AuthStatus {
     pub scopes: Vec<String>,
 }
 
+/// The host's REST core quota as reported by its quota-free probe
+/// ([`crate::SourceControl::rate_limit_status`]); every field is `None`
+/// when the host lacks the signal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateLimitStatus {
+    /// When the quota window resets, as a unix timestamp (seconds).
+    pub reset_at: Option<u64>,
+    /// Requests left in the current window.
+    pub remaining: Option<u64>,
+    /// The window's full request quota.
+    pub limit: Option<u64>,
+}
+
 /// Capabilities a concrete host may or may not support (FE gates UI on these).
 // One bool per independent capability; the flat shape IS the wire contract.
 #[expect(clippy::struct_excessive_bools)]
@@ -468,7 +481,9 @@ pub struct MergeRequirementSignals {
     /// the host did not report the rollup at all.
     pub checks_known: bool,
     /// Base-branch rules, or `None` when they are unreadable (missing scope,
-    /// unsupported endpoint) — a degraded but non-fatal probe.
+    /// unsupported endpoint) — a degraded but non-fatal probe. Quota
+    /// exhaustion on that read is never folded into `None`; it fails the
+    /// probe with [`crate::Error::RateLimited`].
     pub branch_rules: Option<BranchRules>,
     /// Whether the PR is currently queued in the host's merge queue (GitHub
     /// GraphQL `isInMergeQueue`). `None` when the host does not report it.
@@ -478,4 +493,36 @@ pub struct MergeRequirementSignals {
     /// not report it (no merge-queue support) or the PR was never ejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_removal: Option<MergeQueueRemoval>,
+}
+
+/// Tallies of a pull request's inline review threads: the total number of
+/// review comments across every thread (replies included) and the number of
+/// unresolved threads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewThreadTally {
+    pub review_comment_count: i64,
+    pub unresolved: i64,
+}
+
+/// Everything the PR monitor's per-poll snapshot needs about one pull
+/// request, read by [`crate::SourceControl::pr_observation`] in ONE forge
+/// round trip where the host can fold it (GitHub GraphQL): the
+/// [`PullRequest`] itself, the merge-requirement signals, the submitted
+/// reviews, the review-thread tally, and the conversation-comment count.
+///
+/// The bounded windows degrade to `None` rather than truncating silently:
+/// `reviews` is `None` when the PR has more reviews than one window carries,
+/// `threads` when it has more review threads — callers then take the paged
+/// per-signal reads for that piece only. `signals.branch_rules` is `None`
+/// unless the host folded the base branch's rules in; callers read them via
+/// [`crate::SourceControl::branch_rules`] when they need them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrObservation {
+    pub pr: PullRequest,
+    pub signals: MergeRequirementSignals,
+    pub reviews: Option<Vec<Review>>,
+    pub threads: Option<ReviewThreadTally>,
+    pub conversation_count: i64,
 }

@@ -162,6 +162,24 @@ pub const MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 60;
 /// (the settings catalog also rejects them up front).
 pub const MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 5000;
 
+/// Default for `prMonitor.quotaSharePercent` — the share of the forge's
+/// REMAINING core quota (as reported by its quota-free `rate_limit` probe)
+/// the PR-monitor loop may plan to spend before the window resets. The
+/// hourly budget plans the steady state; this stretches the per-PR
+/// interval ahead of exhaustion once the quota is running low (agents'
+/// own `gh` use, the PR-refresh sweep, and paginated reads all draw on the
+/// same window), so the monitor slows down BEFORE the shared rate-limit
+/// pause has to stop it. Half leaves the other half for everything else.
+pub const DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT: u64 = 50;
+
+/// Floor for `prMonitor.quotaSharePercent`. Sub-floor values (notably `0`,
+/// which would plan no polling at all) are clamped up at read time.
+pub const MIN_PR_MONITOR_QUOTA_SHARE_PERCENT: u64 = 1;
+
+/// Ceiling for `prMonitor.quotaSharePercent` — the whole remaining quota.
+/// Over-ceiling values are clamped down at read time.
+pub const MAX_PR_MONITOR_QUOTA_SHARE_PERCENT: u64 = 100;
+
 /// Default quiet window a changed PR must observe before its consolidated
 /// wake is delivered (`prMonitor.debounceSeconds`).
 pub const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;

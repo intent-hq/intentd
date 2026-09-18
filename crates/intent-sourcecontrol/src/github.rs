@@ -19,8 +19,9 @@ use crate::model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Review, ReviewComment, ReviewDecision,
-    ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+    PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
+    ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
+    ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
 };
 use crate::SourceControl;
 
@@ -934,17 +935,262 @@ const MERGE_QUEUE_TIMELINE_SELECTION: &str = "
         }
       }";
 
-/// [`MERGE_REQUIREMENTS_QUERY`] minus the merge-queue selections
-/// (`isInMergeQueue` and the removal-event timeline items), for hosts whose
-/// GraphQL schema predates merge queues (older GHES): GraphQL rejects the
-/// WHOLE query on an unknown field, so the probe retries once with this
-/// selection and the signals degrade to `None` instead of failing the entire
-/// checklist. A schema lacking `isInMergeQueue` also lacks
-/// `RemovedFromMergeQueueEvent`, so both go together.
-fn merge_requirements_query_without_merge_queue() -> String {
-    MERGE_REQUIREMENTS_QUERY
+/// A per-PR `query` ([`MERGE_REQUIREMENTS_QUERY`] or
+/// [`PR_OBSERVATION_QUERY`], which embed the selections verbatim) minus the
+/// merge-queue selections (`isInMergeQueue` and the removal-event timeline
+/// items), for hosts whose GraphQL schema predates merge queues (older
+/// GHES): GraphQL rejects the WHOLE query on an unknown field, so the read
+/// retries once with this selection and the signals degrade to `None`
+/// instead of failing the entire checklist. A schema lacking
+/// `isInMergeQueue` also lacks `RemovedFromMergeQueueEvent`, so both go
+/// together.
+fn without_merge_queue_selections(query: &str) -> String {
+    query
         .replace("\n      isInMergeQueue", "")
         .replace(MERGE_QUEUE_TIMELINE_SELECTION, "")
+}
+
+/// The PR monitor's folded per-poll read ([`SourceControl::pr_observation`]):
+/// [`MERGE_REQUIREMENTS_QUERY`]'s selections plus the [`PullRequest`]
+/// fields, the last window of reviews, the review-thread tally and the
+/// conversation-comment count — ONE GraphQL request in place of the
+/// `GET /pulls/{n}` + probe + `GET /pulls/{n}/reviews` + review-threads +
+/// `GET /issues/{n}/comments` sequence. Measured against api.github.com on
+/// a 21-review / 8-thread / 20-context PR: `rateLimit.cost` 1,
+/// `nodeCount` 302 (the `totalCount`-only connections request no nodes).
+///
+/// Windows: `reviews(last: 100)` and `reviewThreads(first: 100)` are single
+/// pages; `pageInfo` tells the caller when a PR outgrew them so it can take
+/// the paged reads instead of trusting a truncated tally. `contexts(first:
+/// 100)` keeps the probe's known ceiling.
+///
+/// Count parity: the `totalCount`s are unbounded, but the per-signal reads
+/// they replace are not — `list_comments` is a single `per_page=100` page
+/// and [`REVIEW_THREADS_QUERY`] selects `comments(first: 100)` per thread —
+/// so the parse saturates each count at the same ceiling
+/// ([`OBSERVED_COUNT_CEILING`]). Otherwise a poll that fell back to the
+/// per-signal reads on a busy PR would report a different count for the
+/// same forge state and fabricate a new-comment change.
+const PR_OBSERVATION_QUERY: &str = r"
+query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $prNumber) {
+      number
+      url
+      title
+      body
+      state
+      isDraft
+      headRefName
+      headRefOid
+      author { login }
+      mergeable
+      createdAt
+      updatedAt
+      mergeStateStatus
+      isInMergeQueue
+      timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        nodes {
+          ... on RemovedFromMergeQueueEvent {
+            createdAt
+            reason
+          }
+        }
+      }
+      reviewDecision
+      baseRefName
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              contexts(first: 100) {
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    status
+                    conclusion
+                    detailsUrl
+                    isRequired(pullRequestNumber: $prNumber)
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                    targetUrl
+                    isRequired(pullRequestNumber: $prNumber)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      reviews(last: 100) {
+        pageInfo { hasPreviousPage }
+        nodes { author { login } state submittedAt }
+      }
+      reviewThreads(first: 100) {
+        pageInfo { hasNextPage }
+        nodes {
+          isResolved
+          comments { totalCount }
+        }
+      }
+      comments { totalCount }
+    }
+  }
+}
+";
+
+/// Map the `pullRequest` node of [`PR_OBSERVATION_QUERY`] onto the same
+/// [`PullRequest`] `GET /pulls/{n}` yields: GraphQL's `mergeable`
+/// (`MERGEABLE`/`CONFLICTING`/`UNKNOWN`) becomes the REST tri-state bool,
+/// `mergeStateStatus` lowercased IS REST `mergeable_state` (same value set),
+/// and an empty `body` maps to `None` as REST reports it.
+fn map_graphql_pull(pr: &Value) -> Result<PullRequest> {
+    let text = |key: &str| pr.get(key).and_then(Value::as_str);
+    let owned = |key: &str| text(key).unwrap_or_default().to_string();
+    let number = pr
+        .get("number")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| Error::Decode("pullRequest node missing `number`".to_string()))?;
+    let state = match text("state") {
+        Some("MERGED") => PrState::Merged,
+        Some("CLOSED") => PrState::Closed,
+        _ => PrState::Open,
+    };
+    let mergeable = match text("mergeable") {
+        Some("MERGEABLE") => Some(true),
+        Some("CONFLICTING") => Some(false),
+        _ => None,
+    };
+    Ok(PullRequest {
+        number,
+        url: owned("url"),
+        title: owned("title"),
+        body: text("body").filter(|b| !b.is_empty()).map(String::from),
+        state,
+        draft: pr.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+        source_branch: owned("headRefName"),
+        target_branch: owned("baseRefName"),
+        author: graphql_login(pr.get("author")),
+        mergeable,
+        mergeable_state: text("mergeStateStatus").map(str::to_ascii_lowercase),
+        head_sha: text("headRefOid").map(String::from),
+        created_at: owned("createdAt"),
+        updated_at: owned("updatedAt"),
+    })
+}
+
+/// `author { login }` → login, `"unknown"` for a deleted account (`null`
+/// author) — parity with the REST [`login_of`].
+fn graphql_login(author: Option<&Value>) -> String {
+    author
+        .and_then(|a| a.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// The merge-requirement signals a merge-requirements-shaped GraphQL
+/// payload carries (everything but the base branch's rules, which are a
+/// separate REST read).
+fn parse_merge_requirement_signals(data: &Value) -> MergeRequirementSignals {
+    let pr = data.pointer("/repository/pullRequest");
+    let rollup = data
+        .pointer(ROLLUP_CONTEXTS_POINTER)
+        .and_then(Value::as_array);
+    MergeRequirementSignals {
+        merge_state_status: pr
+            .and_then(|p| p.get("mergeStateStatus"))
+            .and_then(Value::as_str)
+            .map(String::from),
+        review_decision: parse_review_decision(data),
+        checks: rollup
+            .map(|nodes| nodes.iter().filter_map(map_rollup_context).collect())
+            .unwrap_or_default(),
+        checks_known: rollup.is_some(),
+        branch_rules: None,
+        // Absent on hosts that do not report it: degrades to `None`.
+        is_in_merge_queue: pr
+            .and_then(|p| p.get("isInMergeQueue"))
+            .and_then(Value::as_bool),
+        merge_queue_removal: parse_merge_queue_removal(pr),
+    }
+}
+
+/// The `reviews(last: 100)` window of [`PR_OBSERVATION_QUERY`] as
+/// [`Review`]s (bodies are not selected), or `None` when `hasPreviousPage`
+/// says the PR has more reviews than the window carries.
+fn parse_observed_reviews(pr: &Value) -> Option<Vec<Review>> {
+    let reviews = pr.get("reviews")?;
+    if reviews
+        .pointer("/pageInfo/hasPreviousPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let nodes = reviews.get("nodes").and_then(Value::as_array)?;
+    Some(
+        nodes
+            .iter()
+            .map(|r| Review {
+                author: graphql_login(r.get("author")),
+                verdict: verdict_from_state(r.get("state").and_then(Value::as_str).unwrap_or("")),
+                body: None,
+                submitted_at: r
+                    .get("submittedAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect(),
+    )
+}
+
+/// The ceiling a folded `totalCount` saturates at so it equals what the
+/// per-signal read reports: one `per_page=100` page of conversation
+/// comments, `comments(first: 100)` per review thread.
+const OBSERVED_COUNT_CEILING: i64 = REST_MAX_PER_PAGE as i64;
+
+/// A `{ totalCount }` selection saturated at [`OBSERVED_COUNT_CEILING`];
+/// `0` when absent.
+fn observed_count(connection: Option<&Value>) -> i64 {
+    connection
+        .and_then(|c| c.get("totalCount"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .min(OBSERVED_COUNT_CEILING)
+}
+
+/// The `reviewThreads(first: 100)` window of [`PR_OBSERVATION_QUERY`] as a
+/// [`ReviewThreadTally`], or `None` when `hasNextPage` says the PR has more
+/// threads than the window carries. Each thread's comment count saturates
+/// at [`OBSERVED_COUNT_CEILING`], as the paged read's `comments(first: 100)`
+/// does.
+fn parse_observed_threads(pr: &Value) -> Option<ReviewThreadTally> {
+    let threads = pr.get("reviewThreads")?;
+    if threads
+        .pointer("/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let nodes = threads.get("nodes").and_then(Value::as_array)?;
+    let mut tally = ReviewThreadTally::default();
+    for thread in nodes {
+        tally.review_comment_count += observed_count(thread.get("comments"));
+        if !thread
+            .get("isResolved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            tally.unresolved += 1;
+        }
+    }
+    Some(tally)
 }
 
 /// True when a merge-requirements probe error is GraphQL rejecting one of the
@@ -1140,11 +1386,19 @@ impl SourceControl for GitHubSourceControl {
         }
     }
 
-    async fn rate_limit_reset_at(&self) -> Result<Option<u64>> {
+    async fn rate_limit_status(&self) -> Result<RateLimitStatus> {
         // `GET /rate_limit` is quota-free, so it stays usable while the core
         // quota is exhausted (monorepo#2961).
         let v: Value = self.client.get("/rate_limit", None::<&()>).await?;
-        Ok(v.pointer("/resources/core/reset").and_then(Value::as_u64))
+        let core = |field: &str| {
+            v.pointer(&format!("/resources/core/{field}"))
+                .and_then(Value::as_u64)
+        };
+        Ok(RateLimitStatus {
+            reset_at: core("reset"),
+            remaining: core("remaining"),
+            limit: core("limit"),
+        })
     }
 
     async fn get_user(&self) -> Result<UserIdentity> {
@@ -1487,92 +1741,62 @@ impl SourceControl for GitHubSourceControl {
         repo: &RepoRef,
         number: u64,
     ) -> Result<MergeRequirementSignals> {
-        let variables = json!({
-            "owner": repo.owner,
-            "repo": repo.name,
-            "prNumber": number,
-        });
-        let payload = json!({
-            "query": MERGE_REQUIREMENTS_QUERY,
-            "variables": variables,
-        });
-        // Schema tolerance: a host whose GraphQL schema lacks
-        // `isInMergeQueue` (older GHES) rejects the WHOLE query, so retry
-        // once without that selection — the signal degrades to `None`
-        // instead of failing the entire checklist.
-        let resp: Value = match self.client.graphql(&payload).await {
-            Ok(resp) => resp,
-            Err(err) => {
-                let err = Error::from(err);
-                if !merge_queue_field_unsupported(&err) {
-                    return Err(err);
-                }
-                tracing::debug!(
-                    pr_number = number,
-                    "merge_requirements: host schema lacks isInMergeQueue, retrying without it"
-                );
-                let fallback = json!({
-                    "query": merge_requirements_query_without_merge_queue(),
-                    "variables": variables,
-                });
-                self.client.graphql(&fallback).await?
-            }
-        };
-        let data = graphql_data(resp)?;
-        let pr = data.pointer("/repository/pullRequest");
-        let merge_state_status = pr
-            .and_then(|p| p.get("mergeStateStatus"))
-            .and_then(Value::as_str)
-            .map(String::from);
-        // Absent on hosts that do not report it: degrades to `None`.
-        let is_in_merge_queue = pr
-            .and_then(|p| p.get("isInMergeQueue"))
-            .and_then(Value::as_bool);
-        let merge_queue_removal = parse_merge_queue_removal(pr);
-        let rollup = data
-            .pointer(ROLLUP_CONTEXTS_POINTER)
-            .and_then(Value::as_array);
-        let checks = rollup
-            .map(|nodes| nodes.iter().filter_map(map_rollup_context).collect())
-            .unwrap_or_default();
+        let data = self
+            .graphql_tolerating_merge_queue_schema(MERGE_REQUIREMENTS_QUERY, repo, number)
+            .await?;
+        let mut signals = parse_merge_requirement_signals(&data);
 
         // The base branch's rules are a separate REST read whose endpoint may
         // be unreadable (older GHES, a token without the scope); that degrades
-        // to `None` instead of failing the probe.
-        let branch_rules = match pr
-            .and_then(|p| p.get("baseRefName"))
+        // to `None` instead of failing the probe. Quota exhaustion is the one
+        // exception: it propagates so the caller pauses instead of persisting
+        // a degraded checklist as a successful poll (intent-hq/intent#5281).
+        let base = data
+            .pointer("/repository/pullRequest/baseRefName")
             .and_then(Value::as_str)
-            .filter(|b| !b.is_empty())
-        {
-            Some(base) => {
-                let route = Self::repo_path(
-                    repo,
-                    &format!("/rules/branches/{}", encode_path_segments(base)),
-                );
-                match self.client.get::<Value, _, ()>(&route, None::<&()>).await {
-                    Ok(v) => Some(map_branch_rules(&v)),
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            pr_number = number,
-                            "merge_requirements: branch rules unreadable, degrading"
-                        );
-                        None
-                    }
+            .filter(|b| !b.is_empty());
+        if let Some(base) = base {
+            signals.branch_rules = match self.branch_rules(repo, base).await {
+                Ok(rules) => Some(rules),
+                Err(e @ Error::RateLimited(_)) => return Err(e),
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        pr_number = number,
+                        "merge_requirements: branch rules unreadable, degrading"
+                    );
+                    None
                 }
-            }
-            None => None,
-        };
+            };
+        }
+        Ok(signals)
+    }
 
-        Ok(MergeRequirementSignals {
-            merge_state_status,
-            review_decision: parse_review_decision(&data),
-            checks,
-            checks_known: rollup.is_some(),
-            branch_rules,
-            is_in_merge_queue,
-            merge_queue_removal,
-        })
+    async fn branch_rules(&self, repo: &RepoRef, branch: &str) -> Result<BranchRules> {
+        let route = Self::repo_path(
+            repo,
+            &format!("/rules/branches/{}", encode_path_segments(branch)),
+        );
+        let v: Value = self.client.get(&route, None::<&()>).await?;
+        Ok(map_branch_rules(&v))
+    }
+
+    async fn pr_observation(&self, repo: &RepoRef, number: u64) -> Result<Option<PrObservation>> {
+        let data = self
+            .graphql_tolerating_merge_queue_schema(PR_OBSERVATION_QUERY, repo, number)
+            .await?;
+        let pr = data
+            .pointer("/repository/pullRequest")
+            .filter(|p| !p.is_null())
+            .ok_or_else(|| Error::NotFound(format!("PR #{number} not found")))?;
+        Ok(Some(PrObservation {
+            pr: map_graphql_pull(pr)?,
+            signals: parse_merge_requirement_signals(&data),
+            reviews: parse_observed_reviews(pr),
+            threads: parse_observed_threads(pr),
+            // Saturated like `list_comments`' single page below.
+            conversation_count: observed_count(pr.get("comments")),
+        }))
     }
 
     // Known ceiling: a single `per_page=100` page (newest first), not a full
@@ -1839,6 +2063,44 @@ impl GitHubSourceControl {
         Ok(out)
     }
 
+    /// Run a per-PR GraphQL `query` (the merge-requirements probe or the
+    /// folded PR observation) and return its `data`. Schema tolerance: a
+    /// host whose GraphQL schema lacks `isInMergeQueue` (older GHES) rejects
+    /// the WHOLE query, so retry once without the merge-queue selections —
+    /// those signals degrade to `None` instead of failing the entire read.
+    async fn graphql_tolerating_merge_queue_schema(
+        &self,
+        query: &str,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Value> {
+        let variables = json!({
+            "owner": repo.owner,
+            "repo": repo.name,
+            "prNumber": number,
+        });
+        let payload = json!({ "query": query, "variables": variables });
+        let resp: Value = match self.client.graphql(&payload).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                let err = Error::from(err);
+                if !merge_queue_field_unsupported(&err) {
+                    return Err(err);
+                }
+                tracing::debug!(
+                    pr_number = number,
+                    "merge_requirements: host schema lacks isInMergeQueue, retrying without it"
+                );
+                let fallback = json!({
+                    "query": without_merge_queue_selections(query),
+                    "variables": variables,
+                });
+                self.client.graphql(&fallback).await?
+            }
+        };
+        graphql_data(resp)
+    }
+
     async fn set_thread_resolution(&self, thread_id: &str, resolve: bool) -> Result<bool> {
         let (mutation, field) = if resolve {
             (
@@ -2031,7 +2293,7 @@ mod tests {
         // The degraded query differs from the primary by exactly the
         // `isInMergeQueue` line and the removal-event timeline block —
         // everything else survives verbatim.
-        let fallback = merge_requirements_query_without_merge_queue();
+        let fallback = without_merge_queue_selections(MERGE_REQUIREMENTS_QUERY);
         assert!(!fallback.contains("isInMergeQueue"));
         assert!(!fallback.contains("timelineItems"));
         assert!(!fallback.contains("RemovedFromMergeQueueEvent"));
@@ -2054,6 +2316,150 @@ mod tests {
                 - 1
                 - MERGE_QUEUE_TIMELINE_SELECTION.matches('\n').count(),
             "exactly the merge-queue lines removed"
+        );
+    }
+
+    #[test]
+    fn pr_observation_query_embeds_the_probe_and_strips_the_same_way() {
+        // The folded read carries every probe selection verbatim (so the
+        // same parser serves both) and the schema fallback strips exactly
+        // the merge-queue lines from it too.
+        for probe_selection in [
+            "mergeStateStatus",
+            "isInMergeQueue",
+            "reviewDecision",
+            "baseRefName",
+            "statusCheckRollup",
+            "isRequired(pullRequestNumber: $prNumber)",
+        ] {
+            assert!(PR_OBSERVATION_QUERY.contains(probe_selection));
+        }
+        assert!(PR_OBSERVATION_QUERY.contains(MERGE_QUEUE_TIMELINE_SELECTION));
+        let fallback = without_merge_queue_selections(PR_OBSERVATION_QUERY);
+        assert!(!fallback.contains("isInMergeQueue"));
+        assert!(!fallback.contains("timelineItems"));
+        assert_eq!(
+            fallback.lines().count(),
+            PR_OBSERVATION_QUERY.lines().count()
+                - 1
+                - MERGE_QUEUE_TIMELINE_SELECTION.matches('\n').count(),
+        );
+    }
+
+    #[test]
+    fn graphql_pull_maps_onto_the_rest_shape() {
+        let pr = json!({
+            "number": 42,
+            "url": "https://github.com/o/r/pull/42",
+            "title": "Add thing",
+            "body": "",
+            "state": "OPEN",
+            "isDraft": true,
+            "headRefName": "feature",
+            "headRefOid": "abc123",
+            "baseRefName": "main",
+            "author": null,
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-02T00:00:00Z",
+        });
+        let mapped = map_graphql_pull(&pr).unwrap();
+        assert_eq!(
+            mapped,
+            PullRequest {
+                number: 42,
+                url: "https://github.com/o/r/pull/42".into(),
+                title: "Add thing".into(),
+                body: None,
+                state: PrState::Open,
+                draft: true,
+                source_branch: "feature".into(),
+                target_branch: "main".into(),
+                author: "unknown".into(),
+                mergeable: Some(false),
+                mergeable_state: Some("dirty".into()),
+                head_sha: Some("abc123".into()),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-02T00:00:00Z".into(),
+            }
+        );
+        let merged = json!({ "number": 1, "state": "MERGED", "mergeable": "UNKNOWN", "author": { "login": "octocat" } });
+        let merged = map_graphql_pull(&merged).unwrap();
+        assert_eq!(merged.state, PrState::Merged);
+        assert_eq!(merged.mergeable, None);
+        assert_eq!(merged.mergeable_state, None);
+        assert_eq!(merged.author, "octocat");
+        assert!(map_graphql_pull(&json!({ "state": "OPEN" })).is_err());
+    }
+
+    #[test]
+    fn observed_windows_degrade_to_none_when_exhausted() {
+        let pr = json!({
+            "reviews": {
+                "pageInfo": { "hasPreviousPage": false },
+                "nodes": [
+                    { "author": { "login": "a" }, "state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z" },
+                    { "author": null, "state": "COMMENTED", "submittedAt": null },
+                ]
+            },
+            "reviewThreads": {
+                "pageInfo": { "hasNextPage": false },
+                "nodes": [
+                    { "isResolved": true, "comments": { "totalCount": 2 } },
+                    { "isResolved": false, "comments": { "totalCount": 3 } },
+                ]
+            },
+        });
+        let reviews = parse_observed_reviews(&pr).expect("window complete");
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].verdict, ReviewVerdict::Approve);
+        assert_eq!(reviews[1].author, "unknown");
+        assert_eq!(reviews[1].verdict, ReviewVerdict::Comment);
+        assert_eq!(
+            parse_observed_threads(&pr),
+            Some(ReviewThreadTally {
+                review_comment_count: 5,
+                unresolved: 1,
+            })
+        );
+
+        let overflowing = json!({
+            "reviews": { "pageInfo": { "hasPreviousPage": true }, "nodes": [] },
+            "reviewThreads": { "pageInfo": { "hasNextPage": true }, "nodes": [] },
+        });
+        assert_eq!(parse_observed_reviews(&overflowing), None);
+        assert_eq!(parse_observed_threads(&overflowing), None);
+        assert_eq!(parse_observed_reviews(&json!({})), None);
+        assert_eq!(parse_observed_threads(&json!({})), None);
+    }
+
+    /// The folded `totalCount`s saturate where the per-signal reads do —
+    /// `list_comments` at one `per_page=100` page, a thread's comments at
+    /// `comments(first: 100)` — so a fallback poll reports the same count.
+    #[test]
+    fn observed_counts_saturate_at_the_per_signal_ceiling() {
+        assert_eq!(observed_count(None), 0);
+        assert_eq!(observed_count(Some(&json!({ "totalCount": 7 }))), 7);
+        assert_eq!(observed_count(Some(&json!({ "totalCount": 100 }))), 100);
+        assert_eq!(observed_count(Some(&json!({ "totalCount": 101 }))), 100);
+        assert_eq!(observed_count(Some(&json!({ "totalCount": 5000 }))), 100);
+
+        let pr = json!({
+            "reviewThreads": {
+                "pageInfo": { "hasNextPage": false },
+                "nodes": [
+                    { "isResolved": false, "comments": { "totalCount": 250 } },
+                    { "isResolved": true, "comments": { "totalCount": 3 } },
+                ]
+            },
+        });
+        assert_eq!(
+            parse_observed_threads(&pr),
+            Some(ReviewThreadTally {
+                review_comment_count: 103,
+                unresolved: 1,
+            })
         );
     }
 

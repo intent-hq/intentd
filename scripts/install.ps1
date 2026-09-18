@@ -385,6 +385,11 @@ if ($serviceMode -eq 'yes') {
     } else {
         $autoResume = 'auto'
     }
+    # >>> BEGIN service-task-register (extracted verbatim and executed by
+    # scripts/install.ps1.Tests.ps1 with the ScheduledTasks cmdlets that touch
+    # the Task Scheduler service mocked; keep this block free of anything
+    # that needs the rest of the script beyond $dest and the env vars it
+    # reads)
     # Per-user Scheduled Task at logon: no admin rights needed, and -Force
     # makes re-runs update the existing task instead of duplicating it.
     $taskName = if ($env:INTENTD_SERVICE_NAME) { $env:INTENTD_SERVICE_NAME } else { 'intentd' }
@@ -436,8 +441,14 @@ if ($serviceMode -eq 'yes') {
     $logOffset = 0
     if (Test-Path $logFile) { $logOffset = (Get-Item $logFile).Length }
     Start-ScheduledTask -TaskName $taskName
+    # <<< END service-task-register
     Write-Host "install.ps1: scheduled task '$taskName' registered (runs at logon) and started"
 
+    # >>> BEGIN service-startup-wait (extracted verbatim and executed by
+    # scripts/install.ps1.Tests.ps1 against a fake $dest and a scripted
+    # $logFile, with Start-Sleep mocked; keep this block free of anything
+    # that needs the rest of the script beyond $dest, $logFile, $logOffset,
+    # $taskName and $autoResume)
     # This run's slice of the service log, bounded to 40 lines. Empty when
     # there is nothing to read; a file shorter than the noted offset was
     # rotated or replaced, so read it whole. The offset is a byte count taken
@@ -563,6 +574,7 @@ if ($serviceMode -eq 'yes') {
             Write-Warning "install.ps1: the daemon has not responded in ${waited}s and nothing in this run's service log reports a failure - this install could not tell whether the daemon binary is still downloading or the task is stuck.`nThe task is registered and started; its output is in $logFile.`nCheck on it with: intentd status`nIf it is still not responding in a few minutes, restart it and re-read that log:`n  $restartHint$autoResumeNote"
         }
     }
+    # <<< END service-startup-wait
     # 'auto' is the daemon default — nothing to write. A failure is a warning,
     # not a fatal install error: the setting can be changed later with the
     # same command. Only attempted once the daemon actually answered: an

@@ -128,6 +128,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "prMonitor.debounceSeconds",
     "prMonitor.pollSeconds",
     "prMonitor.hourlyRequestBudget",
+    "prMonitor.quotaSharePercent",
     "updates.checkOnIdle",
     "updates.idleCheckIntervalMinutes",
     "updates.idleGraceSeconds",

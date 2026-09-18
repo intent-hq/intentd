@@ -1077,8 +1077,10 @@ fn assert_success_envelope(resp: &Value, id: i64) {
 
 #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// The `agents` memory knobs as clients actually receive them (monorepo#2109):
-/// `agents.memoryBudgetMb` advertises a machine-derived `max`, and
-/// `agents.idleReapMinutes` advertises the shipped 10-minute default.
+/// `agents.memoryBudgetMb` advertises a machine-derived `max` and the
+/// machine-derived auto budget as `defaultValue` (while its `value` stays
+/// null until the key is written), and `agents.idleReapMinutes` advertises
+/// the shipped 10-minute default.
 ///
 /// The bound assertions are deliberately host-independent — a CI runner's RAM
 /// is not knowable here — so this pins the contract rather than a number:
@@ -1136,17 +1138,20 @@ async fn agent_memory_knobs_over_wss() {
     assert_eq!(entry["type"], json!("number"));
     assert_eq!(entry["category"], json!("agents"));
     assert_eq!(entry["min"], json!(0.0), "{entry}");
-    // The default is the *absent* key (auto, monorepo#2063): the wire entry
-    // omits `defaultValue` entirely (indexing would read an absent key as
-    // null too, so assert on the object) while `value` is always present and
-    // explicitly null on a fresh install.
+    // The default is the *absent* key (auto, monorepo#2063): `value` is always
+    // present and explicitly null on a fresh install, while `defaultValue`
+    // carries the RAM-derived budget auto resolves to on this host — positive,
+    // never 0, so a client can tell auto apart from an explicit 0 (off).
     let entry_obj = entry.as_object().expect("entry is an object");
-    assert!(
-        !entry_obj.contains_key("defaultValue"),
-        "defaultValue must be omitted, not null: {entry}"
-    );
     assert!(entry_obj.contains_key("value"), "{entry}");
     assert_eq!(entry["value"], Value::Null, "{entry}");
+    let default = entry["defaultValue"].as_f64().unwrap_or_else(|| {
+        panic!("{budget} must advertise the auto budget as defaultValue: {entry}")
+    });
+    assert!(
+        default > 0.0,
+        "auto never resolves to off, so the advertised default is never 0: {entry}"
+    );
     let max = entry["max"]
         .as_f64()
         .unwrap_or_else(|| panic!("{budget} must advertise a max: {entry}"));
@@ -1155,6 +1160,35 @@ async fn agent_memory_knobs_over_wss() {
         max <= PARSE_BOUND_MB,
         "advertised max {max} exceeds the config.toml parse bound — settings.update would \
          accept a value the write path then rejects: {entry}",
+    );
+    // The advertised default is the budget this daemon actually installed for
+    // the absent key — `system.status` reports it in bytes — not merely some
+    // positive figure. Boot and the catalog must read the same RAM source: a
+    // catalog-side probe that failed where boot's succeeded once advertised
+    // the 4,096 MB floor on a host running a 12,288 MB budget. The default is
+    // also clamped to `max` so it stays writable through the schema it ships
+    // in; on this host that clamp binds only if RAM is under 4 GiB or over
+    // roughly 2 TiB.
+    let status = wss_rpc(&mut ws, 11, "system.status", json!({})).await;
+    assert_success_envelope(&status, 11);
+    let installed_bytes = status["result"]["agentMemoryBudgetBytes"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("auto installs a budget on a fresh install: {status}"));
+    // MiB counts above 2^53 do not occur; loss-free in f64.
+    #[expect(clippy::cast_precision_loss)]
+    let installed_mb = (installed_bytes / (1024 * 1024)) as f64;
+    // Both sides are whole MiB counts, exact in f64.
+    #[expect(clippy::float_cmp)]
+    let matches_installed = default == installed_mb.min(max);
+    assert!(
+        matches_installed,
+        "defaultValue {default} must equal the installed auto budget in MB (agentMemoryBudgetBytes \
+         {installed_bytes} = {installed_mb} MB), clamped to max {max}: {entry}",
+    );
+    assert!(
+        default <= max,
+        "defaultValue {default} above max {max} — the catalog advertises a default its own \
+         schema rejects: {entry}",
     );
 
     let entry = settings
@@ -1226,6 +1260,13 @@ async fn agent_memory_knobs_over_wss() {
     assert_success_envelope(&resp, 10);
     assert_eq!(resp["result"]["value"], Value::Null, "{resp}");
     assert_eq!(resp["result"]["origin"], json!("default"), "{resp}");
+    // ...and `settings.get` still advertises the effective auto budget, so a
+    // client reading a null value can render "Auto (N MB)" rather than "Off".
+    assert_eq!(
+        resp["result"]["definition"]["defaultValue"].as_f64(),
+        Some(default),
+        "{resp}"
+    );
 }
 
 /// Read one account straight from the daemon's secrets file, bypassing the
