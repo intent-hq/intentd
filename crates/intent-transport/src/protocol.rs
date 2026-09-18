@@ -537,7 +537,19 @@
 //! principal never receives a per-principal credential, and the invite
 //! stays open. The gist proof replaces the host-side device flow:
 //! `invite.redeem` is no longer served (an `/invite` connection naming it
-//! gets `-32001` like any other non-invite method). The catalog contains
+//! gets `-32001` like any other non-invite method). Also within 10.3,
+//! reusable invite links (additive): an unpinned invite is redeemable by
+//! any number of distinct GitHub accounts until it expires or is revoked
+//! (each redemption is one more collaborator, a member re-joining is
+//! idempotent and not counted; the seat cap and expiry apply per
+//! redemption), while a pinned invite stays single-use; `invite-redeemed`
+//! is therefore only ever answered for a pinned link. Invite rows
+//! (`workspace.invite.list`, the `invite` of `workspace.invite.create`)
+//! carry the additive `reusable` (`true` iff unpinned) and
+//! `redemptionCount`, with `redeemedAt` / `redeemedByPrincipalId` naming
+//! the latest redemption; `openInviteCount` / `guestCount` count a
+//! reusable invite as open while it is unexpired and unrevoked, redeemed
+//! or not. The catalog contains
 //! 326 router methods, 56 fast-path methods, and two aliases: 384
 //! client-callable names.
 

@@ -4,14 +4,18 @@
 //! `invite.accept` on the unauthenticated `/invite` side, plus
 //! `workspace.members.leave` / `principal.revokeSelf`.
 //!
-//! An invite is a single-use, expiring `(id, secret)` pair; a join matches
-//! the hex SHA-256 of the secret, and the plaintext is kept only so the
-//! owner can copy the link again (`invites[].url` on `.list`, built through
-//! the transport's [`intent_core::InviteLinkBuilder`]; the secret itself
-//! never serialises). The daemon learns *who* the invitee is (stable
-//! `github_user_id`) and nothing else. The joined principal is minted (or
-//! reused, keyed by `github_user_id`), added as a `collaborator`, and
-//! issued a fresh per-principal credential that is returned exactly once.
+//! An invite is an expiring `(id, secret)` pair; a join matches the hex
+//! SHA-256 of the secret, and the plaintext is kept only so the owner can
+//! copy the link again (`invites[].url` on `.list`, built through the
+//! transport's [`intent_core::InviteLinkBuilder`]; the secret itself never
+//! serialises). An unpinned invite is **reusable**: any number of distinct
+//! GitHub accounts may redeem it until it expires or is revoked (each join
+//! is one more collaborator, a member re-joining is idempotent); a pinned
+//! invite is single-use and closes on its redemption. The daemon learns
+//! *who* the invitee is (stable `github_user_id`) and nothing else. The
+//! joined principal is minted (or reused, keyed by `github_user_id`), added
+//! as a `collaborator`, and issued a fresh per-principal credential that is
+//! returned exactly once.
 //!
 //! A first-time guest proves its identity from its **own** daemon (gist
 //! identity proof): `invite.challenge` issues a single-use nonce bound to
@@ -173,16 +177,19 @@ pub(crate) fn hash_secret(secret: &str) -> String {
 }
 
 /// The invite's wire shape (`secret` / `secretHash` never included), plus
-/// `url` when the row still holds its secret and a link envelope resolved.
+/// `reusable` (derived from the pin, see [`WorkspaceInvite::is_reusable`])
+/// and `url` when the row still holds its secret and a link envelope
+/// resolved.
 pub(crate) fn invite_to_wire(
     invite: &WorkspaceInvite,
     envelope: Option<&dyn InviteLinkEnvelope>,
 ) -> Value {
     let mut wire = serde_json::to_value(invite).unwrap_or_else(|_| json!({ "id": invite.id }));
-    if let (Some(env), Some(secret), Some(obj)) =
-        (envelope, invite.secret.as_deref(), wire.as_object_mut())
-    {
-        obj.insert("url".into(), env.invite_url(&invite.id, secret).into());
+    if let Some(obj) = wire.as_object_mut() {
+        obj.insert("reusable".into(), invite.is_reusable().into());
+        if let (Some(env), Some(secret)) = (envelope, invite.secret.as_deref()) {
+            obj.insert("url".into(), env.invite_url(&invite.id, secret).into());
+        }
     }
     wire
 }
@@ -213,11 +220,12 @@ fn hashes_match(a: &str, b: &str) -> bool {
 }
 
 /// The terminal [`InviteErrorKind`] for an invite that is not open at `now`
-/// (`None` when it is open).
+/// (`None` when it is open). `Redeemed` is reachable only for a pinned,
+/// single-use invite: a reusable one is never closed by its redemptions.
 fn closed_kind(invite: &WorkspaceInvite, now: &str) -> Option<InviteErrorKind> {
     if invite.revoked_at.is_some() {
         Some(InviteErrorKind::Revoked)
-    } else if invite.redeemed_at.is_some() {
+    } else if !invite.is_reusable() && invite.redeemed_at.is_some() {
         Some(InviteErrorKind::Redeemed)
     } else if invite.expires_at.as_str() <= now {
         Some(InviteErrorKind::Expired)
@@ -419,6 +427,7 @@ impl Services {
             redeemed_at: None,
             redeemed_by_principal_id: None,
             revoked_at: None,
+            redemption_count: 0,
         };
         // The insert is what locks the primary identity, so it is
         // serialised with the identity transition and the creator's
@@ -866,8 +875,10 @@ impl Services {
     /// transaction
     /// ([`intent_store::Store::join_workspace_by_invite`]) mint or reuse the
     /// principal keyed by `identity.github_user_id`, redeem the invite (the
-    /// conditional UPDATE is the single-use guard), add the `collaborator`
-    /// membership, record a fresh per-principal credential and consume
+    /// conditional UPDATE is the single-use guard of a pinned invite; a
+    /// reusable one stays open), add the `collaborator` membership (a
+    /// returning member's re-join is idempotent), record a fresh
+    /// per-principal credential and consume
     /// `rotate_from_hash` (the credential an `invite.accept` presented) when
     /// given — a hash that is not exactly one active credential of the
     /// joining principal at that moment refuses the whole join as

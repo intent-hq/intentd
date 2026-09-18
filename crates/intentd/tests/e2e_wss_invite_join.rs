@@ -1465,3 +1465,219 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         "reconnect did not refill the bucket: {after:?}"
     );
 }
+
+/// An UNPINNED link is reusable over the wire: `workspace.invite.create`
+/// answers `reusable: true` / `redemptionCount: 0`; two distinct accounts
+/// (guest, intruder) prove on the same link and both join; the row stays
+/// open (`invite.list`, `openInviteCount`, `redemptionCount: 2`, the
+/// latest redeemer stamped); a member re-proving is idempotent (no third
+/// membership, not counted); `workspace.invite.revoke` closes it and the
+/// next challenge is `invite-revoked`.
+#[tokio::test]
+async fn unpinned_invite_link_is_reusable_until_revoked_over_wss() {
+    let mock = spawn_mock_github().await;
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let secrets_s = data_dir.join("secrets.json").to_string_lossy().to_string();
+    let tailcat = write_fake_tailcat(&data_dir).to_string_lossy().to_string();
+    let env: [(&str, &str); 7] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_SECRETS_FILE", &secrets_s),
+        ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
+        ("INTENTD_GITHUB_API_BASE_URI", &mock.base_uri),
+        ("INTENTD_TAILCAT_BIN", &tailcat),
+        ("GITHUB_TOKEN", OWNER_TOKEN),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut owner = connect_ws(port, cfg.clone(), TOKEN).await;
+    let v = wss_rpc(
+        &mut owner,
+        1,
+        "workspace.create",
+        json!({ "title": "Reusable E2E" }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "workspace.create: {v}");
+    let ws_id = v["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // 1. An unpinned invite is reusable on the wire from the start.
+    let v = wss_rpc(
+        &mut owner,
+        2,
+        "workspace.invite.create",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "invite.create: {v}");
+    let r = &v["result"];
+    let invite_id = r["invite"]["id"].as_str().expect("invite id").to_string();
+    let secret = r["secret"].as_str().expect("secret").to_string();
+    assert_eq!(r["invite"]["reusable"], json!(true), "{r}");
+    assert_eq!(r["invite"]["redemptionCount"], json!(0), "{r}");
+    assert!(r["invite"].get("pinGithubUserId").is_none(), "{r}");
+
+    // 2. Two distinct accounts redeem the same link.
+    let mut principal_ids = Vec::new();
+    for (n, (login, gist)) in [("guest", "reuseguest"), ("intruder", "reuseintruder")]
+        .into_iter()
+        .enumerate()
+    {
+        let id = 10 + i64::try_from(n).expect("small");
+        let mut prover = connect_invite(port, cfg.clone()).await;
+        let c = challenge(&mut prover, id, &invite_id, &secret).await;
+        assert_eq!(c["workspaceId"], json!(ws_id), "{login}: {c}");
+        let nonce = c["nonce"].as_str().expect("nonce").to_string();
+        let after = chrono::Utc::now().to_rfc3339();
+        mock.script_gist(gist, login, &after, Some(&nonce));
+        let v = prove(
+            &mut prover,
+            id + 10,
+            &invite_id,
+            &secret,
+            &nonce,
+            gist,
+            login,
+        )
+        .await;
+        assert!(v.get("error").is_none(), "invite.prove ({login}): {v}");
+        assert_eq!(v["result"]["status"], json!("authorized"));
+        assert_eq!(v["result"]["login"], json!(login));
+        assert_eq!(v["result"]["workspaceId"], json!(ws_id));
+        let pid = v["result"]["principalId"]
+            .as_str()
+            .expect("principalId")
+            .to_string();
+        let token = v["result"]["token"].as_str().expect("token").to_string();
+        let mut member = connect_ws(port, cfg.clone(), &token).await;
+        let v = wss_rpc(
+            &mut member,
+            id + 20,
+            "workspace.get",
+            json!({ "workspaceId": ws_id }),
+        )
+        .await;
+        assert_eq!(
+            v["result"]["workspace"]["myRole"],
+            json!("collaborator"),
+            "{login}: {v}"
+        );
+        principal_ids.push(pid);
+    }
+    assert_ne!(principal_ids[0], principal_ids[1]);
+
+    // 3. Still open, both redemptions counted, the latest redeemer stamped.
+    let v = wss_rpc(
+        &mut owner,
+        3,
+        "workspace.invite.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let invites = v["result"]["invites"].as_array().expect("invites");
+    assert_eq!(invites.len(), 1, "the reusable invite is still open: {v}");
+    let listed = &invites[0];
+    assert_eq!(listed["id"], json!(invite_id));
+    assert_eq!(listed["reusable"], json!(true));
+    assert_eq!(listed["redemptionCount"], json!(2));
+    assert_eq!(listed["redeemedByPrincipalId"], json!(principal_ids[1]));
+    assert!(listed["redeemedAt"].is_string(), "{listed}");
+    let v = wss_rpc(
+        &mut owner,
+        4,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(v["result"]["workspace"]["memberCount"], json!(3), "{v}");
+    assert_eq!(v["result"]["workspace"]["openInviteCount"], json!(1), "{v}");
+
+    // 4. A member re-proving on the same link is idempotent: same principal,
+    //    no third membership, not a counted redemption.
+    let mut again = connect_invite(port, cfg.clone()).await;
+    let c = challenge(&mut again, 30, &invite_id, &secret).await;
+    let nonce = c["nonce"].as_str().expect("nonce").to_string();
+    let after = chrono::Utc::now().to_rfc3339();
+    mock.script_gist("reuseguestagain", "guest", &after, Some(&nonce));
+    let v = prove(
+        &mut again,
+        31,
+        &invite_id,
+        &secret,
+        &nonce,
+        "reuseguestagain",
+        "guest",
+    )
+    .await;
+    assert!(v.get("error").is_none(), "re-prove: {v}");
+    assert_eq!(v["result"]["principalId"], json!(principal_ids[0]));
+    drop(again);
+    let v = wss_rpc(
+        &mut owner,
+        5,
+        "workspace.invite.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        v["result"]["invites"][0]["redemptionCount"],
+        json!(2),
+        "{v}"
+    );
+    let v = wss_rpc(
+        &mut owner,
+        6,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(v["result"]["workspace"]["memberCount"], json!(3), "{v}");
+
+    // 5. Revocation is what closes it.
+    let v = wss_rpc(
+        &mut owner,
+        7,
+        "workspace.invite.revoke",
+        json!({ "workspaceId": ws_id, "inviteId": invite_id }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "invite.revoke: {v}");
+    let v = wss_rpc(
+        &mut owner,
+        8,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(v["result"]["workspace"]["openInviteCount"], json!(0), "{v}");
+    let mut late = connect_invite(port, cfg.clone()).await;
+    let v = admitted_rpc(
+        &mut late,
+        40,
+        "invite.challenge",
+        json!({ "inviteId": invite_id, "secret": secret }),
+    )
+    .await;
+    assert_eq!(v["error"]["data"]["code"], json!("invite-revoked"), "{v}");
+    assert_eq!(
+        mock.flows.load(Ordering::SeqCst),
+        0,
+        "no join started a device flow"
+    );
+}
