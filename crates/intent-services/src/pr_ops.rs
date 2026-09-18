@@ -2392,6 +2392,21 @@ mod tests {
                 Some("https://ci/run/2026-09-18T11:32:04Z")
             );
         }
+        // A green status never covers for a check run that only ever got
+        // cancelled: the run is still the name's live run, and it failed.
+        for order in both_orders(
+            run(CheckState::Cancelled, live),
+            status(CheckState::Success),
+        ) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.total, req.checks.passed, req.checks.failed),
+                (1, 0, 1),
+                "{:?}",
+                req.checks.items
+            );
+            assert_eq!(req.checks.failing_required, vec!["build".to_string()]);
+        }
         // The cancelled duplicate still collapses onto the live run when a
         // status shares the name, and the status's failure still counts.
         let triple = [
