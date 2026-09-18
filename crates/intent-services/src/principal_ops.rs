@@ -202,9 +202,11 @@ pub(crate) fn prepend_collaborator_preamble(content: &mut String, preamble: &str
 /// [`prepend_collaborator_preamble`] over a transcript row's `content`
 /// `Value` (`agent.appendMessage`): a string is annotated in place; a
 /// content-block array is annotated on its first `type: "text"` block, or
-/// gains a leading text block carrying just the preamble when it has none
-/// (image / file-only rows) so the model still sees the sender. Any other
-/// shape carries no text the daemon can annotate and is left unchanged.
+/// gains a leading text block carrying the preamble in its canonical
+/// `{preamble}\n\n` shape when it has none (image / file-only rows) so the
+/// model still sees the sender and a second pass recognises that block as
+/// already annotated. Any other shape carries no text the daemon can
+/// annotate and is left unchanged.
 pub(crate) fn prepend_collaborator_preamble_value(content: &mut Value, preamble: &str) {
     match content {
         Value::String(text) => prepend_collaborator_preamble(text, preamble),
@@ -214,9 +216,12 @@ pub(crate) fn prepend_collaborator_preamble_value(content: &mut Value, preamble:
                     .then(|| block.get_mut("text"))
                     .flatten()
             });
-            match first_text {
-                Some(Value::String(text)) => prepend_collaborator_preamble(text, preamble),
-                _ => blocks.insert(0, json!({ "type": "text", "text": preamble })),
+            if let Some(Value::String(text)) = first_text {
+                prepend_collaborator_preamble(text, preamble);
+            } else {
+                let mut text = String::new();
+                prepend_collaborator_preamble(&mut text, preamble);
+                blocks.insert(0, json!({ "type": "text", "text": text }));
             }
         }
         _ => {}
