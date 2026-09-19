@@ -525,19 +525,25 @@ pub(crate) fn build_repo_search_query(input: &str) -> String {
 }
 
 /// Rewrite raw user-search input into GitHub `/search/users` syntax: trim, drop
-/// one leading `@`, then narrow to login matches on user accounts
-/// (`<q> in:login type:user`). Empty input yields an empty query so the caller
-/// can skip the network round trip.
+/// one leading `@`, keep only the leading run of login characters (ASCII
+/// alphanumerics and `-`, GitHub's login alphabet), then narrow to login
+/// matches on user accounts (`<prefix> in:login type:user`). Cutting at the
+/// first non-login character keeps the input from reaching GitHub's search
+/// parser as syntax — `alice in:name`, `foo OR bar` and `repos:>100` search
+/// the logins `alice`, `foo` and `repos`, never a qualifier or a boolean.
+/// Input with no login prefix yields an empty query so the caller can skip
+/// the network round trip.
 pub(crate) fn build_user_search_query(input: &str) -> String {
-    let trimmed = input
-        .trim()
-        .strip_prefix('@')
-        .unwrap_or(input.trim())
-        .trim();
-    if trimmed.is_empty() {
+    let trimmed = input.trim();
+    let trimmed = trimmed.strip_prefix('@').unwrap_or(trimmed).trim_start();
+    let prefix_len = trimmed
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(trimmed.len());
+    let prefix = &trimmed[..prefix_len];
+    if prefix.is_empty() {
         return String::new();
     }
-    format!("{trimmed} in:login type:user")
+    format!("{prefix} in:login type:user")
 }
 
 pub(crate) fn map_review(value: Value) -> Result<Review> {
@@ -3053,9 +3059,47 @@ mod tests {
             build_user_search_query("  @octocat  "),
             "octocat in:login type:user"
         );
+        assert_eq!(
+            build_user_search_query("octo-cat42"),
+            "octo-cat42 in:login type:user"
+        );
         assert_eq!(build_user_search_query("@"), "");
         assert_eq!(build_user_search_query("   "), "");
         assert_eq!(build_user_search_query(""), "");
+    }
+
+    /// Search syntax never leaks through: the query is cut at the first
+    /// non-login character, so qualifiers, booleans, quotes and parentheses
+    /// in the typed text can neither widen the login-prefix contract nor
+    /// break the forge request.
+    #[test]
+    fn user_search_query_keeps_only_the_login_prefix() {
+        assert_eq!(
+            build_user_search_query("alice in:name"),
+            "alice in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("foo OR bar"),
+            "foo in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("repos:>100"),
+            "repos in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("@bob@example.com"),
+            "bob in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("octo\"cat"),
+            "octo in:login type:user"
+        );
+        // A bare qualifier is just the login prefix before its colon.
+        assert_eq!(build_user_search_query("in:name"), "in in:login type:user");
+        // No login prefix at all: nothing to search.
+        assert_eq!(build_user_search_query("(x)"), "");
+        assert_eq!(build_user_search_query("\"quoted\""), "");
+        assert_eq!(build_user_search_query("@ (x)"), "");
     }
 
     #[test]
