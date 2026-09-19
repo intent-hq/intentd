@@ -299,55 +299,35 @@ async fn run_fm(bin: &Path, args: &[&str], timeout: Duration) -> FmRun {
     }
 }
 
-/// Longest stderr excerpt carried into a reason string (and thus into logs).
-const STDERR_SUMMARY_MAX_CHARS: usize = 200;
-
-/// First non-empty stderr line, sanitized for a reason string that reaches
-/// clients and logs: control characters (and any embedded newline / escape
-/// sequence) are dropped and the line is bounded at
-/// [`STDERR_SUMMARY_MAX_CHARS`] characters with a `…` marker.
-fn stderr_summary(output: &std::process::Output) -> String {
-    let raw = String::from_utf8_lossy(&output.stderr);
-    let Some(line) = raw.lines().map(str::trim).find(|l| !l.is_empty()) else {
-        return String::new();
-    };
-    let mut out: String = line
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(STDERR_SUMMARY_MAX_CHARS)
-        .collect();
-    if line.chars().filter(|c| !c.is_control()).count() > STDERR_SUMMARY_MAX_CHARS {
-        out.push('…');
-    }
-    out
-}
-
-/// Run one probe subcommand and map its outcome to an unavailability reason,
-/// or `None` when it exited 0.
-async fn probe_step(bin: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+/// Run one probe subcommand and map its outcome to a classified
+/// unavailability reason, or `None` when it exited 0. Child stderr is only
+/// *inspected* for [`LICENCE_GATE_MARKER`] and never echoed: an
+/// [`FM_BIN_ENV`] override could print inherited environment, and reasons
+/// reach clients and logs. `not_ready` names the non-zero-exit condition
+/// for this subcommand (e.g. "system model unavailable").
+async fn probe_step(
+    bin: &Path,
+    args: &[&str],
+    not_ready: &str,
+    timeout: Duration,
+) -> Option<String> {
     let what = format!("fm {}", args.join(" "));
     match run_fm(bin, args, timeout).await {
         FmRun::NotFound => Some(format!("fm CLI not found at {}", bin.display())),
-        FmRun::Spawn(e) => Some(format!("failed to run `{what}`: {e}")),
+        FmRun::Spawn(e) => Some(format!("failed to run `{what}`: {}", e.kind())),
         FmRun::TimedOut => Some(format!(
             "`{what}` timed out after {}s",
             timeout.as_secs_f64()
         )),
         FmRun::Exited(output) if output.status.success() => None,
         FmRun::Exited(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains(LICENCE_GATE_MARKER) {
+            if String::from_utf8_lossy(&output.stderr).contains(LICENCE_GATE_MARKER) {
                 return Some(
                     "fm licence not accepted; run `sudo fm license` once on this Mac".to_string(),
                 );
             }
             let code = output.status.code().unwrap_or(-1);
-            let summary = stderr_summary(&output);
-            Some(if summary.is_empty() {
-                format!("`{what}` exited with code {code}")
-            } else {
-                format!("`{what}` exited with code {code}: {summary}")
-            })
+            Some(format!("{not_ready} (`{what}` exited with code {code})"))
         }
     }
 }
@@ -355,10 +335,19 @@ async fn probe_step(bin: &Path, args: &[&str], timeout: Duration) -> Option<Stri
 /// The uncached probe: `fm available` (system model ready) then
 /// `fm license --status` (licence accepted), both exit 0.
 async fn run_probe(bin: &Path, timeout: Duration) -> FmAvailability {
-    if let Some(reason) = probe_step(bin, &["available"], timeout).await {
+    if let Some(reason) =
+        probe_step(bin, &["available"], "fm system model unavailable", timeout).await
+    {
         return FmAvailability::unavailable(reason);
     }
-    if let Some(reason) = probe_step(bin, &["license", "--status"], timeout).await {
+    if let Some(reason) = probe_step(
+        bin,
+        &["license", "--status"],
+        "fm licence status not ok",
+        timeout,
+    )
+    .await
+    {
         return FmAvailability::unavailable(reason);
     }
     FmAvailability::available()
@@ -459,19 +448,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn available_nonzero_is_reported_with_code_and_stderr() {
+    async fn available_nonzero_is_classified_without_echoing_stderr() {
         let (_dir, bin, log) = fake_fm(
             "avail-fail",
-            "echo \"$*\" >> \"$LOG\"\necho 'model not ready' >&2\nexit 1",
+            "echo \"$*\" >> \"$LOG\"\necho 'SECRET_TOKEN=abc123 model not ready' >&2\nexit 1",
         );
         let v = backend(bin, LONG_TTL).probe().await;
         assert!(!v.available);
         let reason = v.reason.unwrap();
-        assert!(
-            reason.contains("`fm available` exited with code 1"),
-            "{reason}"
+        assert_eq!(
+            reason,
+            "fm system model unavailable (`fm available` exited with code 1)"
         );
-        assert!(reason.contains("model not ready"), "{reason}");
+        assert!(!reason.contains("SECRET_TOKEN"), "{reason}");
         assert_eq!(calls(&log), vec!["available"], "license is not consulted");
     }
 
@@ -484,9 +473,9 @@ mod tests {
         let v = backend(bin, LONG_TTL).probe().await;
         assert!(!v.available);
         let reason = v.reason.unwrap();
-        assert!(
-            reason.contains("`fm license --status` exited with code 3"),
-            "{reason}"
+        assert_eq!(
+            reason,
+            "fm licence status not ok (`fm license --status` exited with code 3)"
         );
         assert_eq!(calls(&log), vec!["available", "license --status"]);
     }
@@ -622,26 +611,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stderr_summary_is_single_line_bounded_and_control_free() {
-        let long = "x".repeat(STDERR_SUMMARY_MAX_CHARS + 50);
+    async fn licence_marker_is_detected_but_surrounding_stderr_is_not_echoed() {
         let (_dir, bin, _log) = fake_fm(
-            "stderr",
-            &format!(
-                "printf '\\n  \\033[31mbad\\tthing\\033[0m {long}\\nsecond line\\n' >&2\nexit 7"
-            ),
+            "marker-noise",
+            "echo 'HOME=/Users/leaked YOU HAVE NOT AGREED TO THE APPLE FOUNDATION MODELS CLI LEGAL NOTICE trailing' >&2\nexit 1",
         );
         let v = backend(bin, LONG_TTL).probe().await;
         let reason = v.reason.unwrap();
-        assert!(
-            reason.starts_with("`fm available` exited with code 7: "),
-            "{reason}"
+        assert_eq!(
+            reason,
+            "fm licence not accepted; run `sudo fm license` once on this Mac"
         );
-        let summary = reason.split_once(": ").unwrap().1;
-        assert!(summary.starts_with("[31mbad"), "{summary}");
-        assert!(!summary.contains("second line"), "{summary}");
-        assert!(summary.ends_with('…'), "{summary}");
-        assert_eq!(summary.chars().count(), STDERR_SUMMARY_MAX_CHARS + 1);
-        assert!(summary.chars().all(|c| !c.is_control()), "{summary}");
+        assert!(!reason.contains("leaked"), "{reason}");
     }
 
     #[test]
