@@ -514,7 +514,7 @@
 //! rebuilt from the stored secret — omitted when the row predates the
 //! stored secret or no link can be built right now (listener down, no
 //! dialable route); the secret itself never appears as a field. Also within
-//! 10.2, guest caps: `workspace.invite.create` refuses with
+//! 10.3, guest caps: `workspace.invite.create` refuses with
 //! `error.data.code` `guest-limit` once a workspace's collaborators plus
 //! open invites reach `sharing.maxGuestsPerWorkspace`, the join refuses with
 //! `workspace-full` (the invite stays open) once its collaborators do, and
