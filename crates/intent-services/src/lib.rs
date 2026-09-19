@@ -485,6 +485,12 @@ pub struct Services {
     /// hermetically through the real discovery.
     #[expect(clippy::option_option)] // the nesting IS the no-override vs pinned distinction
     one_shot_npx: Option<Option<PathBuf>>,
+    /// The macOS 27 `fm` on-device one-shot backend for `agent.completeOnce`
+    /// (§5.32): a TTL-cached usability probe plus the `fm respond` runner.
+    /// Production composition builds it from the environment
+    /// (`FmBackend::from_env`); tests inject a fake binary via
+    /// `with_fm_backend`. Shared across clones.
+    fm_backend: Arc<fm_backend::FmBackend>,
     /// Test-only override (milliseconds) for the auto-commit message
     /// generation timeout. Production composition leaves this `None` and the
     /// idle auto-commit path uses its ~30s default; tests compress it so the
@@ -1242,6 +1248,7 @@ impl Services {
             auggie_bin: None,
             branches_ls_remote_base: None,
             one_shot_npx: None,
+            fm_backend: Arc::new(fm_backend::FmBackend::from_env()),
             auto_commit_timeout_ms: None,
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
@@ -4121,6 +4128,14 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_one_shot_npx(mut self, npx: Option<PathBuf>) -> Self {
         self.one_shot_npx = Some(npx);
+        self
+    }
+
+    /// Replace the `fm` one-shot backend (`agent.completeOnce` §5.32) with
+    /// one over a fake binary so the on-device route is testable on any host.
+    #[cfg(test)]
+    pub(crate) fn with_fm_backend(mut self, backend: Arc<fm_backend::FmBackend>) -> Self {
+        self.fm_backend = backend;
         self
     }
 

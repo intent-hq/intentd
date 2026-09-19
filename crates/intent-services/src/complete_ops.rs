@@ -16,6 +16,16 @@
 //! unset/undecidable settings and a provider whose adapter cannot be resolved
 //! — returns `{ available: false, reason }` rather than an error.
 //!
+//! Before either provider route, an eligible call may run on the on-device
+//! macOS 27 `fm` model ([`crate::fm_backend`]): `quickActions.localModel` is
+//! `auto`, the call's `type` is `fast` or unset (commit / pr / review stay on
+//! the providers), prompt + system prompt fit [`FM_PROMPT_BYTE_BUDGET`], and
+//! the cached probe reports `fm` usable. Any `fm` failure — non-zero exit
+//! (context overflow, licence gate), timeout, empty reply, guardrail marker —
+//! is logged at debug and falls through to the provider route unchanged, so
+//! the caller never sees an `fm`-specific error and the §5.32 result shape is
+//! untouched.
+//!
 //! The ACP route is bounded: adapters are claimed from the daemon-wide
 //! ephemeral-adapter semaphore ([`crate::acp_adapter`],
 //! `agents.maxConcurrentAdapters`, monorepo#2062), so a fan-out of quick
@@ -28,6 +38,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use intent_core::settings_file::{QuickActionsLocalModel, SettingsFile};
 use intent_core::{Error, Result, WorkspaceId};
 use serde_json::{json, Value};
 
@@ -41,6 +52,19 @@ use crate::Services;
 /// Providers served by the ephemeral ACP one-shot runner. Every other
 /// provider (and unset/undecidable settings) resolves the gate closed.
 const ACP_ONE_SHOT_PROVIDERS: &[&str] = &["claude-code", "codex", "pi"];
+
+/// Largest prompt + system prompt (bytes) the `fm` route accepts. The
+/// on-device model has a hard 8,132-prompt-token ceiling and overflow is a
+/// non-zero exit; ~24 KB is ≈7k tokens at a conservative 3.5 bytes/token,
+/// leaving headroom so the overflow fallback rarely has to fire.
+pub(crate) const FM_PROMPT_BYTE_BUDGET: usize = 24 * 1024;
+
+/// Whether a quick-action `type` may run on `fm`: `fast` and the unset type
+/// (the slug / note-status callers send none). `commit`, `pr`, and `review`
+/// stay on the provider route.
+fn fm_eligible_type(quick_action_type: Option<&str>) -> bool {
+    matches!(quick_action_type, None | Some("fast"))
+}
 
 /// System prompt for a claude-code one-shot whose caller supplied none. The
 /// adapter treats an absent (or empty) `_meta.systemPrompt` as "use the
@@ -347,6 +371,10 @@ impl Services {
     /// caller's optional `type` hint keying the override map. The chain
     /// resolves to a `(provider, model)` pair, so a legacy compound value
     /// naming another registered provider routes the one-shot there.
+    ///
+    /// Once the provider gate is open, an eligible call is first offered to
+    /// the on-device `fm` backend ([`Self::try_fm_completion`]); any `fm`
+    /// miss falls through to the resolved provider route unchanged.
     pub(crate) async fn agent_complete_once_op(
         &self,
         prompt: String,
@@ -409,6 +437,19 @@ impl Services {
             .filter(|s| !s.is_empty());
         let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
+        if let Some(text) = self
+            .try_fm_completion(
+                &settings,
+                quick_action_type.as_deref(),
+                system_prompt,
+                &prompt,
+                timeout,
+            )
+            .await
+        {
+            return Ok(json!({ "text": text }));
+        }
+
         if run_provider != "auggie" {
             return self
                 .complete_once_via_acp(
@@ -466,6 +507,62 @@ impl Services {
         .await?;
         let text = clean_agent_message(&stdout);
         Ok(json!({ "text": text }))
+    }
+
+    /// The on-device `fm` attempt: `Some(text)` when the call is eligible
+    /// (setting `auto`, [`fm_eligible_type`], within
+    /// [`FM_PROMPT_BYTE_BUDGET`]), the probe reports `fm` usable, and
+    /// `fm respond` returned a usable reply; `None` otherwise, with the reason
+    /// logged at debug so the caller falls through to its provider route. The
+    /// cheap gates run before the probe so an ineligible call never spawns.
+    async fn try_fm_completion(
+        &self,
+        settings: &SettingsFile,
+        quick_action_type: Option<&str>,
+        system_prompt: Option<&str>,
+        prompt: &str,
+        timeout_ms: u64,
+    ) -> Option<String> {
+        if settings.quick_actions.local_model != QuickActionsLocalModel::Auto {
+            return None;
+        }
+        if !fm_eligible_type(quick_action_type) {
+            return None;
+        }
+        let bytes = prompt.len() + system_prompt.map_or(0, str::len);
+        if bytes > FM_PROMPT_BYTE_BUDGET {
+            tracing::debug!(
+                target: "fm_backend",
+                bytes,
+                budget = FM_PROMPT_BYTE_BUDGET,
+                "completeOnce prompt over the fm byte budget; using provider route"
+            );
+            return None;
+        }
+        let verdict = self.fm_backend.probe().await;
+        if !verdict.available {
+            tracing::debug!(
+                target: "fm_backend",
+                reason = verdict.reason.as_deref().unwrap_or(""),
+                "fm unavailable for completeOnce; using provider route"
+            );
+            return None;
+        }
+        match self
+            .fm_backend
+            .respond(system_prompt, prompt, Duration::from_millis(timeout_ms))
+            .await
+        {
+            Ok(text) => Some(text),
+            Err(failure) => {
+                tracing::debug!(
+                    target: "fm_backend",
+                    failure = %failure,
+                    "fm completion failed; falling back to provider route"
+                );
+                None
+            }
+        }
     }
 
     /// The non-auggie route: run `prompt` (+ `system_prompt`, shaped per
@@ -1647,5 +1744,242 @@ rl.on('line', (line) => {
             !v["text"].as_str().unwrap().contains("--model"),
             "providerSettings must not resolve a model, got {v:?}"
         );
+    }
+
+    // ---- on-device fm route (quickActions.localModel = auto) ----
+
+    /// Fake `fm` inside an RAII temp dir: `body` runs with `$1` = subcommand
+    /// (`available` / `license` / `respond`), the prompt on stdin for
+    /// `respond`, and `$LOG` = a file every invocation appends its argv to.
+    #[cfg(unix)]
+    fn fake_fm(tag: &str, body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::tests::test_tempdir(&format!("intentd-complete-fm-{tag}-"));
+        let bin = dir.path().join("fm");
+        let log = dir.path().join("calls.log");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nLOG='{}'\necho \"$*\" >> \"$LOG\"\n{body}\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, bin, log)
+    }
+
+    /// Fake `fm` whose probe passes and whose `respond` runs `respond_body`
+    /// (stdin = prompt).
+    #[cfg(unix)]
+    fn fake_fm_available(tag: &str, respond_body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        fake_fm(
+            tag,
+            &format!("[ \"$1\" = respond ] || exit 0\n{respond_body}"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn fm_calls(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Services over a fake auggie (provider gate open) and a fake `fm`, with
+    /// `quickActions.localModel` set to `local_model`.
+    #[cfg(unix)]
+    async fn services_with_fm(
+        auggie: PathBuf,
+        fm: PathBuf,
+        local_model: &str,
+    ) -> (TempDb, Services) {
+        let (tmp, services) = services_with_bin(auggie).await;
+        let registry = crate::SettingsRegistry::load(tmp.dir.path().join("config.toml"))
+            .expect("load registry");
+        registry
+            .apply(&[
+                (
+                    "model.defaultProvider".to_string(),
+                    serde_json::json!("auggie"),
+                ),
+                (
+                    "quickActions.localModel".to_string(),
+                    serde_json::json!(local_model),
+                ),
+            ])
+            .expect("apply fm settings");
+        let backend = std::sync::Arc::new(crate::fm_backend::FmBackend::new(
+            Some(fm),
+            Duration::from_secs(3600),
+            Duration::from_secs(5),
+        ));
+        let services = services
+            .with_settings_registry(std::sync::Arc::new(registry))
+            .with_fm_backend(backend);
+        (tmp, services)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_eligible_call_uses_fm() {
+        // Setting auto + probe ok + no type + small prompt ⇒ the reply comes
+        // from `fm respond` (prompt over stdin, system prompt via -i) and
+        // the auggie fake never runs.
+        let (_auggie_dir, auggie) = fake_auggie("fm-unused", "printf '🤖\\nfrom-auggie\\n'");
+        let (_fm_dir, fm, log) = fake_fm_available("eligible", "printf 'fm says: '\ncat");
+        let (_tmp, services) = services_with_fm(auggie, fm, "auto").await;
+        let v = services
+            .agent_complete_once_op(
+                "make a slug".into(),
+                Some("be terse".into()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, serde_json::json!({ "text": "fm says: make a slug" }));
+        assert_eq!(
+            fm_calls(&log),
+            vec![
+                "available",
+                "license --status",
+                "respond --no-stream --greedy -i be terse",
+            ]
+        );
+
+        // `type: fast` is eligible too, and the fresh probe is not re-run.
+        let v = services
+            .agent_complete_once_op("x".into(), None, None, Some("fast".into()), None, None)
+            .await
+            .unwrap();
+        assert_eq!(v["text"], "fm says: x");
+        assert_eq!(fm_calls(&log).len(), 4);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_oversize_prompt_skips_fm() {
+        let (_auggie_dir, auggie) = fake_auggie("fm-oversize", "printf '🤖\\nfrom-auggie\\n'");
+        let (_fm_dir, fm, log) = fake_fm_available("oversize", "cat");
+        let (_tmp, services) = services_with_fm(auggie, fm, "auto").await;
+        let prompt = "x".repeat(FM_PROMPT_BYTE_BUDGET + 1);
+        let v = services
+            .agent_complete_once_op(prompt, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(v["text"], "from-auggie");
+        assert!(
+            fm_calls(&log).is_empty(),
+            "an oversize prompt never probes or spawns fm"
+        );
+
+        // System prompt bytes count against the same budget.
+        let prompt = "x".repeat(FM_PROMPT_BYTE_BUDGET - 1);
+        let v = services
+            .agent_complete_once_op(prompt, Some("sys".into()), None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(v["text"], "from-auggie");
+        assert!(fm_calls(&log).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_falls_back_to_provider_on_fm_failure() {
+        let (_auggie_dir, auggie) = fake_auggie("fm-fallback", "printf '🤖\\nfrom-auggie\\n'");
+        for (tag, body) in [
+            (
+                "exit",
+                "cat > /dev/null\necho 'context size exceeded' >&2\nexit 1",
+            ),
+            (
+                "guardrail",
+                "cat > /dev/null\necho '[Content blocked by safety guardrails.]'",
+            ),
+            ("empty", "cat > /dev/null\nprintf '  \\n'"),
+        ] {
+            let (_fm_dir, fm, log) = fake_fm_available(tag, body);
+            let (_tmp, services) = services_with_fm(auggie.clone(), fm, "auto").await;
+            let v = services
+                .agent_complete_once_op("hi".into(), None, None, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(v, serde_json::json!({ "text": "from-auggie" }), "{tag}");
+            assert_eq!(
+                fm_calls(&log).last().map(String::as_str),
+                Some("respond --no-stream --greedy"),
+                "{tag}: fm was attempted first"
+            );
+        }
+
+        // An unusable probe never reaches `respond`.
+        let (_fm_dir, fm, log) = fake_fm("probe-fail", "exit 1");
+        let (_tmp, services) = services_with_fm(auggie.clone(), fm, "auto").await;
+        let v = services
+            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(v["text"], "from-auggie");
+        assert_eq!(fm_calls(&log), vec!["available"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_fm_timeout_falls_back_to_provider() {
+        let (_auggie_dir, auggie) = fake_auggie("fm-timeout", "printf '🤖\\nfrom-auggie\\n'");
+        let (_fm_dir, fm, _log) = fake_fm_available("timeout", "cat > /dev/null\nsleep 30");
+        let (_tmp, services) = services_with_fm(auggie, fm, "auto").await;
+        let v = services
+            .agent_complete_once_op("hi".into(), None, None, None, None, Some(200))
+            .await
+            .unwrap();
+        assert_eq!(v["text"], "from-auggie");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_setting_off_never_spawns_fm() {
+        let (_auggie_dir, auggie) = fake_auggie("fm-off", "printf '🤖\\nfrom-auggie\\n'");
+        let (_fm_dir, fm, log) = fake_fm_available("off", "cat");
+        let (_tmp, services) = services_with_fm(auggie, fm, "off").await;
+        let v = services
+            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(v, serde_json::json!({ "text": "from-auggie" }));
+        assert!(fm_calls(&log).is_empty(), "off must not even probe");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_provider_bound_types_never_use_fm() {
+        let (_auggie_dir, auggie) = fake_auggie("fm-types", "printf '🤖\\nfrom-auggie\\n'");
+        let (_fm_dir, fm, log) = fake_fm_available("types", "cat");
+        let (_tmp, services) = services_with_fm(auggie, fm, "auto").await;
+        for ty in ["commit", "pr", "review"] {
+            let v = services
+                .agent_complete_once_op("hi".into(), None, None, Some(ty.into()), None, None)
+                .await
+                .unwrap();
+            assert_eq!(v["text"], "from-auggie", "{ty}");
+        }
+        assert!(
+            fm_calls(&log).is_empty(),
+            "commit/pr/review never probe or spawn fm"
+        );
+    }
+
+    #[test]
+    fn fm_eligible_type_allows_only_fast_or_unset() {
+        assert!(fm_eligible_type(None));
+        assert!(fm_eligible_type(Some("fast")));
+        for ty in ["commit", "pr", "review", "walkthrough", ""] {
+            assert!(!fm_eligible_type(Some(ty)), "{ty:?}");
+        }
     }
 }

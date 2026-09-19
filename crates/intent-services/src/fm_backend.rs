@@ -20,6 +20,12 @@
 //! The binary path is overridable with the [`FM_BIN_ENV`] environment
 //! variable, which also lifts the platform gate so a fake script can drive
 //! the probe in tests on any host.
+//!
+//! [`FmBackend::respond`] is the one-shot itself: `fm respond --no-stream
+//! --greedy [-i <instructions>]` with the prompt on stdin, bounded by the
+//! caller's timeout. Its failures are classified ([`FmRespondFailure`]) the
+//! same way as probe reasons — child stderr is inspected, never echoed — so
+//! `agent.completeOnce` can log them and fall through to its provider route.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -27,6 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::OnceCell;
 
 /// Where macOS 27 ships the CLI.
@@ -43,6 +50,43 @@ pub const FM_PROBE_TTL: Duration = Duration::from_secs(5 * 60);
 pub const FM_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Distinctive stderr text `fm` prints before the licence is accepted.
 pub const LICENCE_GATE_MARKER: &str = "NOT AGREED TO THE APPLE FOUNDATION MODELS CLI LEGAL NOTICE";
+/// The whole reply `fm respond` prints when the safety guardrails block the
+/// output; never a usable completion.
+pub const GUARDRAIL_BLOCKED_MARKER: &str = "[Content blocked by safety guardrails.]";
+
+/// Why an [`FmBackend::respond`] attempt produced no usable completion. Each
+/// variant is a classified condition, never child output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FmRespondFailure {
+    /// The host cannot run `fm` at all (non-macOS, no override).
+    HostUnsupported,
+    /// The binary is missing at the resolved path.
+    NotFound,
+    /// Spawning or waiting on the child failed.
+    Spawn(std::io::ErrorKind),
+    /// The child outlived the caller's timeout and was killed.
+    TimedOut(Duration),
+    /// The child exited non-zero (context overflow, licence gate, …).
+    Exited(i32),
+    /// Exit 0 with nothing but whitespace on stdout.
+    Empty,
+    /// The reply was exactly [`GUARDRAIL_BLOCKED_MARKER`].
+    GuardrailBlocked,
+}
+
+impl std::fmt::Display for FmRespondFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HostUnsupported => write!(f, "host cannot run fm"),
+            Self::NotFound => write!(f, "fm CLI not found"),
+            Self::Spawn(kind) => write!(f, "failed to run `fm respond`: {kind}"),
+            Self::TimedOut(t) => write!(f, "`fm respond` timed out after {}ms", t.as_millis()),
+            Self::Exited(code) => write!(f, "`fm respond` exited with code {code}"),
+            Self::Empty => write!(f, "`fm respond` produced empty output"),
+            Self::GuardrailBlocked => write!(f, "`fm respond` output blocked by safety guardrails"),
+        }
+    }
+}
 
 /// Whether the `fm` backend can serve a completion, with a human-readable
 /// `reason` when it cannot.
@@ -194,6 +238,53 @@ impl FmBackend {
         self.run_and_record(&bin, &cell).await
     }
 
+    /// One greedy, non-streaming completion: `fm respond --no-stream --greedy
+    /// [-i <instructions>]` with `prompt` written to stdin (never argv — no
+    /// argv length limit, nothing in process listings), bounded by `timeout`
+    /// with a process-group kill on expiry. The trimmed stdout is the reply;
+    /// a non-zero exit, timeout, empty reply, or the
+    /// [`GUARDRAIL_BLOCKED_MARKER`] is a classified [`FmRespondFailure`].
+    /// This does not consult the probe cache — the caller gates on
+    /// [`FmBackend::probe`] first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`FmRespondFailure`] naming why no reply was produced:
+    /// no `fm` binary on this host, a spawn failure, a non-zero exit, the
+    /// `timeout` elapsing, an empty reply, or a guardrail-blocked reply.
+    pub async fn respond(
+        &self,
+        instructions: Option<&str>,
+        prompt: &str,
+        timeout: Duration,
+    ) -> std::result::Result<String, FmRespondFailure> {
+        let Some(bin) = self.bin.as_deref() else {
+            return Err(FmRespondFailure::HostUnsupported);
+        };
+        let mut args = vec!["respond", "--no-stream", "--greedy"];
+        if let Some(instructions) = instructions {
+            args.extend(["-i", instructions]);
+        }
+        match run_fm(bin, &args, Some(prompt.as_bytes()), timeout).await {
+            FmRun::NotFound => Err(FmRespondFailure::NotFound),
+            FmRun::Spawn(e) => Err(FmRespondFailure::Spawn(e.kind())),
+            FmRun::TimedOut => Err(FmRespondFailure::TimedOut(timeout)),
+            FmRun::Exited(output) if !output.status.success() => {
+                Err(FmRespondFailure::Exited(output.status.code().unwrap_or(-1)))
+            }
+            FmRun::Exited(output) => {
+                let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if text.is_empty() {
+                    Err(FmRespondFailure::Empty)
+                } else if text == GUARDRAIL_BLOCKED_MARKER {
+                    Err(FmRespondFailure::GuardrailBlocked)
+                } else {
+                    Ok(text)
+                }
+            }
+        }
+    }
+
     fn host_unsupported() -> FmAvailability {
         FmAvailability::unavailable("fm backend requires macOS 27 (host is not macOS)")
     }
@@ -264,24 +355,33 @@ enum FmRun {
     TimedOut,
 }
 
-/// Spawn `bin args…` with no stdin, bounded by `timeout`; on expiry the
-/// whole process group is killed (`kill_on_drop` covers the direct child on
-/// non-unix).
-async fn run_fm(bin: &Path, args: &[&str], timeout: Duration) -> FmRun {
+/// Spawn `bin args…` — `stdin` piped in when given, else closed — bounded by
+/// `timeout`; on expiry the whole process group is killed (`kill_on_drop`
+/// covers the direct child on non-unix).
+async fn run_fm(bin: &Path, args: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> FmRun {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FmRun::NotFound,
         Err(e) => return FmRun::Spawn(e),
     };
     let pid = child.id();
+    if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        // A failed write is non-fatal — the child may have already exited.
+        // Dropping the pipe closes it so a read-to-EOF child proceeds.
+        let _ = pipe.write_all(bytes).await;
+    }
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => FmRun::Exited(output),
         Ok(Err(e)) => FmRun::Spawn(e),
@@ -312,7 +412,7 @@ async fn probe_step(
     timeout: Duration,
 ) -> Option<String> {
     let what = format!("fm {}", args.join(" "));
-    match run_fm(bin, args, timeout).await {
+    match run_fm(bin, args, None, timeout).await {
         FmRun::NotFound => Some(format!("fm CLI not found at {}", bin.display())),
         FmRun::Spawn(e) => Some(format!("failed to run `{what}`: {}", e.kind())),
         FmRun::TimedOut => Some(format!(
@@ -623,6 +723,96 @@ mod tests {
             "fm licence not accepted; run `sudo fm license` once on this Mac"
         );
         assert!(!reason.contains("leaked"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn respond_pipes_prompt_over_stdin_and_returns_trimmed_reply() {
+        // The fake records argv and echoes stdin back, so both the flag set
+        // and the stdin route are observable in one call.
+        let (_dir, bin, log) = fake_fm(
+            "respond-ok",
+            "echo \"$*\" >> \"$LOG\"\nprintf '  '\ncat\nprintf '\\n\\n'",
+        );
+        let backend = backend(bin, LONG_TTL);
+        let reply = backend
+            .respond(Some("be terse"), "make a slug", TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(reply, "make a slug");
+        assert_eq!(
+            calls(&log),
+            vec!["respond --no-stream --greedy -i be terse"],
+            "instructions ride -i; the prompt never reaches argv"
+        );
+        let reply = backend.respond(None, "no system", TIMEOUT).await.unwrap();
+        assert_eq!(reply, "no system");
+        assert_eq!(calls(&log)[1], "respond --no-stream --greedy");
+    }
+
+    #[tokio::test]
+    async fn respond_classifies_failures_without_echoing_stderr() {
+        let (_dir, bin, _log) = fake_fm(
+            "respond-exit",
+            "cat > /dev/null\necho 'SECRET=leak transcript exceeded' >&2\nexit 1",
+        );
+        let err = backend(bin, LONG_TTL)
+            .respond(None, "p", TIMEOUT)
+            .await
+            .unwrap_err();
+        assert_eq!(err, FmRespondFailure::Exited(1));
+        assert!(!err.to_string().contains("leak"));
+
+        let (_dir, bin, _log) = fake_fm("respond-empty", "cat > /dev/null\nprintf '  \\n'");
+        assert_eq!(
+            backend(bin, LONG_TTL)
+                .respond(None, "p", TIMEOUT)
+                .await
+                .unwrap_err(),
+            FmRespondFailure::Empty
+        );
+
+        let (_dir, bin, _log) = fake_fm(
+            "respond-guardrail",
+            "cat > /dev/null\necho '[Content blocked by safety guardrails.]'",
+        );
+        assert_eq!(
+            backend(bin, LONG_TTL)
+                .respond(None, "p", TIMEOUT)
+                .await
+                .unwrap_err(),
+            FmRespondFailure::GuardrailBlocked
+        );
+
+        let dir = crate::tests::test_tempdir("intentd-fm-respond-missing-");
+        assert_eq!(
+            backend(dir.path().join("fm"), LONG_TTL)
+                .respond(None, "p", TIMEOUT)
+                .await
+                .unwrap_err(),
+            FmRespondFailure::NotFound
+        );
+        assert_eq!(
+            Arc::new(FmBackend::new(None, LONG_TTL, TIMEOUT))
+                .respond(None, "p", TIMEOUT)
+                .await
+                .unwrap_err(),
+            FmRespondFailure::HostUnsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_times_out_and_reaps() {
+        let (_dir, bin, _log) = fake_fm("respond-slow", "cat > /dev/null\nsleep 30");
+        let started = Instant::now();
+        let err = backend(bin, LONG_TTL)
+            .respond(None, "p", Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert_eq!(err, FmRespondFailure::TimedOut(Duration::from_millis(200)));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "child was reaped"
+        );
     }
 
     #[test]
